@@ -154,9 +154,6 @@ describe("AdminTranscodingPanel", () => {
     });
     await render(SETTINGS);
 
-    await act(async () => {
-      input("启用服务端转码")?.click();
-    });
     await chooseLuxOption(container, "硬件编码器", "VideoToolbox");
     await chooseLuxOption(container, "软件编码 preset", "fast");
     await chooseLuxOption(container, "最大输出分辨率", "1080p");
@@ -166,6 +163,9 @@ describe("AdminTranscodingPanel", () => {
     await type("硬件设备路径", "/dev/dri/renderD129");
     await act(async () => {
       input("启用硬件解码")?.click();
+    });
+    await act(async () => {
+      input("启用服务端转码")?.click();
     });
 
     await act(async () => {
@@ -195,6 +195,19 @@ describe("AdminTranscodingPanel", () => {
       },
     });
     expect(container.textContent).toContain("设置已保存，将在新的播放会话生效");
+  });
+
+  it("only offers hardware decode while transcoding is on and a hardware encoder is chosen", async () => {
+    await render(SETTINGS);
+    expect(input("启用硬件解码")?.disabled).toBe(true);
+
+    await chooseLuxOption(container, "硬件编码器", "VideoToolbox");
+    expect(input("启用硬件解码")?.disabled).toBe(false);
+
+    await act(async () => {
+      input("启用服务端转码")?.click();
+    });
+    expect(input("启用硬件解码")?.disabled).toBe(true);
   });
 
   it("keeps the draft visible when the server rejects a value", async () => {

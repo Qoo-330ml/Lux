@@ -2225,6 +2225,15 @@ struct MaxBitrateFixture {
 
 impl MaxBitrateFixture {
     async fn new(source_bitrate: Option<i64>) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::with_media(source_bitrate, None).await
+    }
+
+    /// The same fixture with a planted video dimension, so a resolution ceiling test can assert the
+    /// scale filter and the reported heights without running ffprobe.
+    async fn with_media(
+        source_bitrate: Option<i64>,
+        source_height: Option<i64>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = tempfile::tempdir()?;
         let config_dir = temp_dir.path().join("config");
         let config = Config {
@@ -2263,6 +2272,21 @@ impl MaxBitrateFixture {
                 .bind(&source_id)
                 .execute(database.pool())
                 .await?;
+        }
+        if let Some(height) = source_height {
+            // A stored video stream stands in for a completed probe: playback reads only the
+            // persisted details, never ffprobe.
+            let width = (height * 16 / 9) / 2 * 2;
+            sqlx::query(
+                "INSERT INTO media_streams (
+                     id, media_source_id, stream_index, stream_type, codec, details_json
+                 ) VALUES (?, ?, 0, 'VIDEO', 'hevc', ?)",
+            )
+            .bind(format!("{source_id}-video"))
+            .bind(&source_id)
+            .bind(json!({ "Height": height, "Width": width }).to_string())
+            .execute(database.pool())
+            .await?;
         }
 
         let args_path = temp_dir.path().join("ffmpeg-args.txt");
@@ -2333,40 +2357,70 @@ impl MaxBitrateFixture {
         })
     }
 
-    /// Stores the administrator's transcoding policy; `maxVideoBitrateKbps` caps every encode.
-    async fn set_max_video_bitrate_kbps(
+    /// Replaces the administrator's transcoding policy.
+    async fn set_transcoding_settings(
         &self,
-        kbps: i64,
+        settings: Value,
     ) -> Result<(), Box<dyn std::error::Error>> {
         sqlx::query(
             "INSERT INTO server_settings (key, value) VALUES ('transcoding', ?)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         )
-        .bind(json!({ "maxVideoBitrateKbps": kbps }).to_string())
+        .bind(settings.to_string())
         .execute(self.database.pool())
         .await?;
         Ok(())
     }
 
-    /// The `-b:v` FFmpeg was started with, once the (asynchronous) child recorded its arguments.
-    async fn ffmpeg_video_bitrate(&self) -> Result<String, Box<dyn std::error::Error>> {
+    /// Stores the administrator's transcoding policy; `maxVideoBitrateKbps` caps every encode.
+    async fn set_max_video_bitrate_kbps(
+        &self,
+        kbps: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.set_transcoding_settings(json!({ "maxVideoBitrateKbps": kbps }))
+            .await
+    }
+
+    /// Stores the administrator's global output height cap, which every encode is scaled to at
+    /// most.
+    async fn set_max_output_height(&self, height: i64) -> Result<(), Box<dyn std::error::Error>> {
+        self.set_transcoding_settings(json!({ "maxOutputHeight": height }))
+            .await
+    }
+
+    /// The command line FFmpeg was started with, once the (asynchronous) child recorded it.
+    async fn ffmpeg_arguments(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let mut arguments = String::new();
         for _ in 0..250 {
             if let Ok(captured) = tokio::fs::read_to_string(&self.args_path).await
-                && captured.contains("-b:v")
+                && !captured.is_empty()
             {
                 arguments = captured;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        let arguments: Vec<&str> = arguments.lines().collect();
+        assert!(
+            !arguments.is_empty(),
+            "FFmpeg arguments were not captured before the timeout"
+        );
+        Ok(arguments.lines().map(str::to_owned).collect())
+    }
+
+    /// The value that follows `flag` on the captured command line.
+    async fn ffmpeg_argument(&self, flag: &str) -> Result<String, Box<dyn std::error::Error>> {
+        let arguments = self.ffmpeg_arguments().await?;
         arguments
             .iter()
-            .position(|argument| *argument == "-b:v")
+            .position(|argument| argument == flag)
             .and_then(|index| arguments.get(index + 1))
-            .map(|value| (*value).to_owned())
-            .ok_or_else(|| "FFmpeg arguments were not captured before the timeout".into())
+            .cloned()
+            .ok_or_else(|| format!("FFmpeg was not started with {flag}").into())
+    }
+
+    /// The `-b:v` FFmpeg was started with, once the (asynchronous) child recorded its arguments.
+    async fn ffmpeg_video_bitrate(&self) -> Result<String, Box<dyn std::error::Error>> {
+        self.ffmpeg_argument("-b:v").await
     }
 
     async fn stats(&self, session_id: &str) -> Result<Value, Box<dyn std::error::Error>> {
@@ -2396,6 +2450,22 @@ impl MaxBitrateFixture {
             .await?;
         assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
         Ok(())
+    }
+
+    async fn create_bootstrap(
+        &self,
+        body: Value,
+    ) -> Result<(reqwest::StatusCode, Value), Box<dyn std::error::Error>> {
+        let response = self
+            .client
+            .post(format!("{}/api/v1/playback/bootstrap", self.base_url))
+            .header(COOKIE, &self.cookies)
+            .header("x-csrf-token", &self.csrf_cookie)
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        Ok((status, response.json::<Value>().await?))
     }
 
     async fn create_session(
@@ -2770,6 +2840,450 @@ async fn web_playback_reports_the_applied_video_bitrate_below_the_administrator_
     assert_eq!(capped_without_ceiling["bitrate"]["limited"], json!(true));
     assert_eq!(fixture.ffmpeg_video_bitrate().await?, "2000000");
 
+    fixture.server.abort();
+    Ok(())
+}
+
+/// A source taller than the requested ceiling is re-encoded and scaled: the plan leaves Direct
+/// Play, FFmpeg is started with the `scale=-2:min(ih,1080)` filter and the height-ladder bitrate,
+/// and the response reports the heights the player will actually see.
+#[tokio::test]
+async fn web_playback_scales_a_taller_source_to_the_requested_max_height()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = MaxBitrateFixture::with_media(Some(20_000_000), Some(2_160)).await?;
+
+    let (status, created) = fixture
+        .create_session(json!({
+            "itemId": fixture.item_id,
+            "sourceId": fixture.source_id,
+            "maxHeight": 1080,
+            "capabilities": {
+                "directPlay": true,
+                "hls": true,
+                "videoCopyToFmp4": true,
+                "audioCopyToFmp4": true,
+                "softwareTranscode": true
+            }
+        }))
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        created["plan"]["type"],
+        json!("SERVER_HLS"),
+        "Direct Play and Remux would hand the browser the original 2160p picture: {created}"
+    );
+    assert_eq!(created["tier"], json!(4));
+    assert_eq!(created["resolution"]["sourceHeight"], json!(2160));
+    assert_eq!(created["resolution"]["maxHeight"], json!(1080));
+    assert_eq!(created["resolution"]["targetHeight"], json!(1080));
+    assert_eq!(created["resolution"]["limited"], json!(true));
+    assert_eq!(
+        created["bitrate"]["targetBitrate"],
+        json!(8_000_000),
+        "a 1080p output derives 8 Mbit/s, below the 20 Mbit/s source"
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .ok_or("missing scaled session id")?
+        .to_owned();
+
+    assert_eq!(
+        fixture.ffmpeg_argument("-vf").await?,
+        "scale=-2:min(ih\\,1080)",
+        "the encoder must scale to the requested height"
+    );
+    assert_eq!(
+        fixture.ffmpeg_video_bitrate().await?,
+        "8000000",
+        "the reported target must equal the -b:v FFmpeg was started with"
+    );
+
+    let stats = fixture.stats(&session_id).await?;
+    assert_eq!(stats["plan"], json!("SERVER_HLS"));
+    assert_eq!(stats["output"]["videoHeight"], json!(1080));
+    assert_eq!(
+        stats["output"]["videoWidth"],
+        json!(1920),
+        "the width follows FFmpeg's proportional -2 scaling"
+    );
+    assert_eq!(stats["output"]["videoBitrate"], json!(8_000_000));
+
+    fixture.stop_session(&session_id).await?;
+    fixture.server.abort();
+    Ok(())
+}
+
+/// Both ceilings can be sent together: the stricter one bounds the encoder, and the response still
+/// describes each request value separately.
+#[tokio::test]
+async fn web_playback_applies_the_stricter_of_both_ceilings()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = MaxBitrateFixture::with_media(Some(20_000_000), Some(2_160)).await?;
+
+    let (status, created) = fixture
+        .create_session(json!({
+            "itemId": fixture.item_id,
+            "sourceId": fixture.source_id,
+            "maxHeight": 1080,
+            "maxBitrate": 4_000_000,
+            "capabilities": {
+                "directPlay": true,
+                "hls": true,
+                "softwareTranscode": true
+            }
+        }))
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(created["plan"]["type"], json!("SERVER_HLS"));
+    assert_eq!(created["resolution"]["targetHeight"], json!(1080));
+    assert_eq!(created["resolution"]["limited"], json!(true));
+    assert_eq!(created["bitrate"]["maxBitrate"], json!(4_000_000));
+    assert_eq!(
+        created["bitrate"]["targetBitrate"],
+        json!(4_000_000),
+        "4 Mbit/s is stricter than the 8 Mbit/s the height ladder derives"
+    );
+    assert_eq!(
+        fixture.ffmpeg_argument("-vf").await?,
+        "scale=-2:min(ih\\,1080)"
+    );
+    assert_eq!(fixture.ffmpeg_video_bitrate().await?, "4000000");
+
+    let session_id = created["sessionId"]
+        .as_str()
+        .ok_or("missing limited session id")?
+        .to_owned();
+    fixture.stop_session(&session_id).await?;
+    fixture.server.abort();
+    Ok(())
+}
+
+/// A source already inside the ceiling keeps Direct Play: a resolution ceiling never upgrades or
+/// downscales a picture that already fits.
+#[tokio::test]
+async fn web_playback_keeps_direct_play_when_the_source_fits_the_resolution()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = MaxBitrateFixture::with_media(Some(4_000_000), Some(720)).await?;
+
+    let (status, within) = fixture
+        .create_session(json!({
+            "itemId": fixture.item_id,
+            "sourceId": fixture.source_id,
+            "maxHeight": 1080,
+            "capabilities": {
+                "directPlay": true,
+                "hls": true,
+                "softwareTranscode": true
+            }
+        }))
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        within["plan"]["type"],
+        json!("DIRECT"),
+        "a 720p source under a 1080p ceiling plays as-is: {within}"
+    );
+    assert_eq!(within["resolution"]["sourceHeight"], json!(720));
+    assert_eq!(within["resolution"]["maxHeight"], json!(1080));
+    assert_eq!(
+        within["resolution"]["targetHeight"],
+        json!(720),
+        "the output keeps the source height"
+    );
+    assert_eq!(within["resolution"]["limited"], json!(false));
+    assert_eq!(within["bitrate"]["targetBitrate"], Value::Null);
+    assert!(
+        !fixture.args_path.exists(),
+        "a direct plan must not start FFmpeg"
+    );
+
+    fixture.server.abort();
+    Ok(())
+}
+
+/// An unprobed source has no known height, so the ceiling cannot be honoured and the decision stays
+/// exactly as it was: the server never transcodes a file it cannot prove is too tall.
+#[tokio::test]
+async fn web_playback_ignores_the_resolution_of_an_unprobed_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = MaxBitrateFixture::with_media(None, None).await?;
+
+    let (status, created) = fixture
+        .create_session(json!({
+            "itemId": fixture.item_id,
+            "sourceId": fixture.source_id,
+            "maxHeight": 480,
+            "capabilities": {
+                "directPlay": true,
+                "hls": true,
+                "softwareTranscode": true
+            }
+        }))
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(created["plan"]["type"], json!("DIRECT"));
+    assert_eq!(created["resolution"]["sourceHeight"], Value::Null);
+    assert_eq!(created["resolution"]["maxHeight"], json!(480));
+    assert_eq!(created["resolution"]["limited"], json!(false));
+    assert_eq!(created["bitrate"]["targetBitrate"], Value::Null);
+    assert!(!fixture.args_path.exists());
+
+    fixture.server.abort();
+    Ok(())
+}
+
+/// `.strm` keeps its Direct-only rule and a height outside the accepted range is a malformed
+/// request, exactly like the bitrate ceiling.
+#[tokio::test]
+async fn web_playback_ignores_the_max_height_for_strm_and_rejects_an_invalid_value()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = MaxBitrateFixture::with_media(Some(20_000_000), Some(2_160)).await?;
+    let root = fixture._temp_dir.path().join("Movies");
+    tokio::fs::write(
+        root.join("Remote Height Movie 2026.strm"),
+        "http://media.example.test/media.mp4\n",
+    )
+    .await?;
+    LibraryScanner::new(fixture.database.clone())
+        .scan_movie_library(fixture.library_id)
+        .await?;
+    let (strm_item_id, strm_source_id): (String, String) = sqlx::query_as(
+        "SELECT mi.id, ms.id
+         FROM media_items mi
+         JOIN media_sources ms ON ms.item_id = mi.id
+         WHERE ms.source_kind = 'STRM_URL'
+         LIMIT 1",
+    )
+    .fetch_one(fixture.database.pool())
+    .await?;
+
+    let (status, strm_direct) = fixture
+        .create_session(json!({
+            "itemId": strm_item_id,
+            "sourceId": strm_source_id,
+            "maxHeight": 480,
+            "capabilities": {
+                "directPlay": true,
+                "hls": true,
+                "softwareTranscode": true
+            }
+        }))
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        strm_direct["plan"]["type"],
+        json!("DIRECT"),
+        "a .strm never leaves Direct Play for a resolution ceiling"
+    );
+    assert_eq!(strm_direct["resolution"]["limited"], json!(false));
+    assert_eq!(
+        strm_direct["resolution"]["targetHeight"],
+        Value::Null,
+        "a .strm probe recorded no height, so no output height is claimed"
+    );
+    assert_eq!(strm_direct["bitrate"]["targetBitrate"], Value::Null);
+
+    // A browser that cannot consume HLS gets the existing unsupported reason instead of a plan
+    // that would silently keep the original picture.
+    let (status, unsupported) = fixture
+        .create_session(json!({
+            "itemId": fixture.item_id,
+            "sourceId": fixture.source_id,
+            "maxHeight": 480,
+            "capabilities": {
+                "directPlay": true,
+                "hls": false,
+                "softwareTranscode": true
+            }
+        }))
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(unsupported["plan"]["type"], json!("UNSUPPORTED"));
+    assert_eq!(
+        unsupported["plan"]["reason"],
+        json!("BROWSER_CANNOT_CONSUME_HLS")
+    );
+    assert_eq!(unsupported["sessionId"], Value::Null);
+    assert_eq!(unsupported["resolution"]["limited"], json!(false));
+    let hls_sessions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM web_playback_sessions WHERE plan = 'SERVER_HLS'")
+            .fetch_one(fixture.database.pool())
+            .await?;
+    assert_eq!(hls_sessions, 0, "an unsupported plan starts no session");
+
+    for invalid in [143, 4_321, 0, -720] {
+        let (status, body) = fixture
+            .create_session(json!({
+                "itemId": fixture.item_id,
+                "sourceId": fixture.source_id,
+                "maxHeight": invalid,
+                "capabilities": { "directPlay": true, "hls": true }
+            }))
+            .await?;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "{invalid}p must be refused as a malformed request"
+        );
+        assert_eq!(body["error"]["code"], json!("INVALID_REQUEST"));
+    }
+
+    fixture.server.abort();
+    Ok(())
+}
+
+/// `/playback/bootstrap` accepts the same ceiling, so the detail page can start a session with the
+/// quality the player already picked.
+#[tokio::test]
+async fn web_playback_bootstrap_accepts_the_max_height() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = MaxBitrateFixture::with_media(Some(20_000_000), Some(2_160)).await?;
+
+    let (status, body) = fixture
+        .create_bootstrap(json!({
+            "itemId": fixture.item_id,
+            "sourceId": fixture.source_id,
+            "maxHeight": 480,
+            "capabilities": {
+                "directPlay": true,
+                "hls": true,
+                "softwareTranscode": true
+            }
+        }))
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let session = &body["session"];
+    assert_eq!(session["plan"]["type"], json!("SERVER_HLS"));
+    assert_eq!(session["resolution"]["sourceHeight"], json!(2160));
+    assert_eq!(session["resolution"]["maxHeight"], json!(480));
+    assert_eq!(session["resolution"]["targetHeight"], json!(480));
+    assert_eq!(session["resolution"]["limited"], json!(true));
+    assert_eq!(
+        session["bitrate"]["targetBitrate"],
+        json!(2_000_000),
+        "a 480p output derives 2 Mbit/s"
+    );
+    assert_eq!(
+        fixture.ffmpeg_argument("-vf").await?,
+        "scale=-2:min(ih\\,480)"
+    );
+
+    let session_id = session["sessionId"]
+        .as_str()
+        .ok_or("missing bootstrap session id")?
+        .to_owned();
+    fixture.stop_session(&session_id).await?;
+    fixture.server.abort();
+    Ok(())
+}
+
+/// An odd ceiling cannot reach the encoder as-is: H.264 would refuse it with "height not divisible
+/// by 2", so the height is rounded down before the scale filter and reported rounded as well.
+#[tokio::test]
+async fn web_playback_rounds_an_odd_max_height_down_to_even()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = MaxBitrateFixture::with_media(Some(20_000_000), Some(2_160)).await?;
+
+    let (status, created) = fixture
+        .create_session(json!({
+            "itemId": fixture.item_id,
+            "sourceId": fixture.source_id,
+            "maxHeight": 1081,
+            "capabilities": {
+                "directPlay": true,
+                "hls": true,
+                "softwareTranscode": true
+            }
+        }))
+        .await?;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "an odd ceiling must still produce a playable plan, not an encode failure: {created}"
+    );
+    assert_eq!(created["plan"]["type"], json!("SERVER_HLS"));
+    assert_eq!(created["tier"], json!(4));
+    assert_eq!(
+        created["resolution"]["maxHeight"],
+        json!(1081),
+        "the request is reported as the client sent it"
+    );
+    assert_eq!(
+        created["resolution"]["targetHeight"],
+        json!(1080),
+        "the output height is the rounded ceiling"
+    );
+    assert_eq!(created["resolution"]["limited"], json!(true));
+    assert_eq!(
+        created["bitrate"]["targetBitrate"],
+        json!(8_000_000),
+        "the bitrate ladder follows the rounded 1080p output"
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .ok_or("missing odd-height session id")?
+        .to_owned();
+
+    assert_eq!(
+        fixture.ffmpeg_argument("-vf").await?,
+        "scale=-2:min(ih\\,1080)",
+        "the encoder must never receive an odd height"
+    );
+    assert_eq!(fixture.ffmpeg_video_bitrate().await?, "8000000");
+
+    fixture.stop_session(&session_id).await?;
+    fixture.server.abort();
+    Ok(())
+}
+
+/// The administrator's global height cap is part of the real output height, so it decides which
+/// bitrate rung the derived `-b:v` comes from.
+#[tokio::test]
+async fn web_playback_derives_the_bitrate_from_the_administrator_capped_height()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = MaxBitrateFixture::with_media(Some(20_000_000), Some(2_160)).await?;
+    fixture.set_max_output_height(480).await?;
+
+    let (status, created) = fixture
+        .create_session(json!({
+            "itemId": fixture.item_id,
+            "sourceId": fixture.source_id,
+            "maxHeight": 1080,
+            "capabilities": {
+                "directPlay": true,
+                "hls": true,
+                "softwareTranscode": true
+            }
+        }))
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(created["plan"]["type"], json!("SERVER_HLS"));
+    assert_eq!(created["resolution"]["maxHeight"], json!(1080));
+    assert_eq!(
+        created["resolution"]["targetHeight"],
+        json!(480),
+        "the administrator cap is the smallest known ceiling: {created}"
+    );
+    assert_eq!(created["resolution"]["limited"], json!(true));
+    assert_eq!(
+        created["bitrate"]["targetBitrate"],
+        json!(2_000_000),
+        "480p derives 2 Mbit/s, not the 8 Mbit/s the requested 1080p would"
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .ok_or("missing capped-height session id")?
+        .to_owned();
+
+    assert_eq!(
+        fixture.ffmpeg_argument("-vf").await?,
+        "scale=-2:min(ih\\,480)"
+    );
+    assert_eq!(fixture.ffmpeg_video_bitrate().await?, "2000000");
+    let stats = fixture.stats(&session_id).await?;
+    assert_eq!(stats["output"]["videoHeight"], json!(480));
+    assert_eq!(stats["output"]["videoBitrate"], json!(2_000_000));
+
+    fixture.stop_session(&session_id).await?;
     fixture.server.abort();
     Ok(())
 }

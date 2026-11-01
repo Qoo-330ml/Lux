@@ -5570,8 +5570,23 @@ pub(crate) struct StoredPlaybackSource {
     /// `None` until the source was probed. Playback uses it to decide whether a caller's output
     /// ceiling can still be met by Direct Play or a copy tier.
     pub(crate) bitrate: Option<i64>,
+    /// Height of the first video stream in pixels, read from the stored probe details.
+    ///
+    /// `None` until the source was probed (or when the probe recorded no height). Playback uses it
+    /// to decide whether a caller's resolution ceiling forces a re-encode.
+    pub(crate) video_height: Option<i64>,
     pub(crate) root_path: String,
     pub(crate) relative_path: String,
+}
+
+/// Probed pixel dimensions of a media source's first video stream.
+///
+/// Either side can be missing: a probe or NFO sidecar may record only one of them, and an
+/// unprobed source records neither.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct StoredVideoDimensions {
+    pub(crate) width: Option<i64>,
+    pub(crate) height: Option<i64>,
 }
 
 #[derive(Clone, Debug)]

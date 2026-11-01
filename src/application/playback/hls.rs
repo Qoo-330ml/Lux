@@ -19,7 +19,7 @@ use tokio::{
     time::sleep,
 };
 
-use super::decision::ServerTier;
+use super::decision::{ServerTier, even_output_height};
 
 const MAX_REMUX_SESSIONS: usize = 4;
 const MAX_HARDWARE_SESSIONS: usize = 2;
@@ -166,6 +166,8 @@ pub(crate) struct HlsStartOptions {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct HlsWebStartOptions {
     pub(crate) video_bitrate: Option<i64>,
+    /// Caller-selected output height ceiling; the administrator's cap still applies on top.
+    pub(crate) video_height: Option<u32>,
     pub(crate) start_time_ticks: Option<i64>,
     pub(crate) runtime_ticks: Option<i64>,
     pub(crate) audio_stream_index: Option<i64>,
@@ -337,6 +339,25 @@ pub(crate) fn effective_video_bitrate(requested: Option<i64>, admin_cap_bps: i64
         (None, Some(cap)) => Some(cap),
         (None, None) => None,
     }
+}
+
+/// The output height cap one session actually encodes to.
+///
+/// `admin_cap` is the administrator's global `encoding.max_output_height` (`0` means no cap) and
+/// `requested` the caller's resolution ceiling. The narrower of the two wins, so a caller can ask
+/// for less than the administrator allows but never for more. A cap of `0` produces no scale
+/// filter at all, which keeps the original picture untouched.
+pub(crate) fn effective_max_output_height(admin_cap: u32, requested: Option<u32>) -> u32 {
+    let cap = match requested {
+        Some(requested) if requested > 0 => match admin_cap {
+            0 => requested,
+            admin_cap => requested.min(admin_cap),
+        },
+        _ => admin_cap,
+    };
+    // H.264 and every hardware encoder Lux starts require even picture dimensions, so an odd
+    // ceiling (1081p) has to become an even one (1080p) before it reaches `scale=-2:min(ih,N)`.
+    u32::try_from(even_output_height(i64::from(cap))).unwrap_or(0)
 }
 
 /// Remembers which generation served a segment without letting the map grow without bound.
@@ -753,6 +774,7 @@ impl HlsManager {
             input,
             HlsWebStartOptions {
                 video_bitrate,
+                video_height: None,
                 start_time_ticks,
                 runtime_ticks,
                 audio_stream_index: None,
@@ -768,6 +790,10 @@ impl HlsManager {
         input: &Path,
         options: HlsWebStartOptions,
     ) -> Result<(), HlsError> {
+        let runtime = self.runtime_snapshot();
+        let mut encoding = FfmpegEncodingOptions::from_runtime(&runtime);
+        encoding.max_output_height =
+            effective_max_output_height(runtime.max_output_height, options.video_height);
         self.start_process(
             session_id,
             HlsProcessSpecification {
@@ -777,7 +803,7 @@ impl HlsManager {
                 audio_stream_index: options.audio_stream_index,
                 emby_vod: false,
                 segment_container: HlsSegmentContainer::FragmentedMp4,
-                encoding: FfmpegEncodingOptions::from_runtime(&self.runtime_snapshot()),
+                encoding,
             },
             options.start_time_ticks,
             options.runtime_ticks,
@@ -1592,6 +1618,16 @@ impl HlsManager {
         quota.total_bytes = total;
         quota.checked_at = Some(Instant::now());
         Ok(total)
+    }
+
+    /// The output height cap the running session was started with; `0` means no scaling.
+    ///
+    /// Captured with the session so a later policy change never rewrites what the running FFmpeg
+    /// produces. `None` when no process holds the session (Direct Play, or already stopped).
+    pub(crate) async fn output_height_cap(&self, session_id: &str) -> Option<u32> {
+        let processes = self.processes.read().await;
+        let process = processes.get(session_id)?;
+        Some(process.specification.encoding.max_output_height)
     }
 
     /// Bitrate of the newest media segment, measured from the file FFmpeg just closed.
@@ -4043,6 +4079,100 @@ while :; do sleep 1; done
         assert!(!args.iter().any(|value| value == "-vf"));
         assert!(!args.iter().any(|value| value == "-b:v"));
         assert!(args.windows(2).any(|pair| pair == ["-preset", "veryfast"]));
+    }
+
+    #[test]
+    fn the_requested_height_is_capped_by_the_administrator_limit() {
+        use super::effective_max_output_height;
+        assert_eq!(effective_max_output_height(0, None), 0);
+        assert_eq!(
+            effective_max_output_height(0, Some(1_080)),
+            1_080,
+            "without an administrator cap the caller's ceiling is the only one"
+        );
+        assert_eq!(
+            effective_max_output_height(2_160, None),
+            2_160,
+            "the administrator cap applies even without a caller request"
+        );
+        assert_eq!(
+            effective_max_output_height(720, Some(1_080)),
+            720,
+            "a caller can ask for less than the administrator allows, never more"
+        );
+        assert_eq!(
+            effective_max_output_height(2_160, Some(1_080)),
+            1_080,
+            "the narrower ceiling wins"
+        );
+        assert_eq!(
+            effective_max_output_height(2_160, Some(0)),
+            2_160,
+            "a zero request means no caller ceiling"
+        );
+        assert_eq!(
+            effective_max_output_height(0, Some(1_081)),
+            1_080,
+            "H.264 cannot encode an odd height, so an odd ceiling is rounded down"
+        );
+        assert_eq!(
+            effective_max_output_height(2_160, Some(145)),
+            144,
+            "rounding down never leaves the accepted height band"
+        );
+        assert_eq!(
+            effective_max_output_height(481, None),
+            480,
+            "an odd administrator cap is rounded for the same reason"
+        );
+    }
+
+    #[test]
+    fn a_resolution_limited_session_scales_down_in_the_filter_chain() {
+        let runtime = super::RuntimeTranscodeConfig {
+            max_output_height: 0,
+            ..super::RuntimeTranscodeConfig::default()
+        };
+        let mut encoding = super::FfmpegEncodingOptions::from_runtime(&runtime);
+        encoding.max_output_height =
+            super::effective_max_output_height(runtime.max_output_height, Some(1_080));
+        assert_eq!(
+            super::video_filter_chain(&encoding, ServerTier::SoftwareTranscode).as_deref(),
+            Some("scale=-2:min(ih\\,1080)"),
+            "the caller's ceiling becomes the -2:min(ih,N) scale filter"
+        );
+
+        // The administrator's global cap narrows the caller's ceiling, and both stay in one filter.
+        let capped = super::RuntimeTranscodeConfig {
+            max_output_height: 720,
+            ..super::RuntimeTranscodeConfig::default()
+        };
+        let mut encoding = super::FfmpegEncodingOptions::from_runtime(&capped);
+        encoding.max_output_height =
+            super::effective_max_output_height(capped.max_output_height, Some(1_080));
+        assert_eq!(
+            super::video_filter_chain(&encoding, ServerTier::SoftwareTranscode).as_deref(),
+            Some("scale=-2:min(ih\\,720)")
+        );
+
+        // An odd ceiling becomes an even filter height instead of failing the encoder with
+        // "height not divisible by 2".
+        let mut encoding = super::FfmpegEncodingOptions::from_runtime(&runtime);
+        encoding.max_output_height =
+            super::effective_max_output_height(runtime.max_output_height, Some(1_081));
+        assert_eq!(
+            super::video_filter_chain(&encoding, ServerTier::SoftwareTranscode).as_deref(),
+            Some("scale=-2:min(ih\\,1080)")
+        );
+
+        // A session without either ceiling keeps the original picture.
+        let mut uncapped = super::FfmpegEncodingOptions::from_runtime(&runtime);
+        uncapped.max_output_height =
+            super::effective_max_output_height(runtime.max_output_height, None);
+        assert_eq!(
+            super::video_filter_chain(&uncapped, ServerTier::SoftwareTranscode),
+            None
+        );
     }
 
     #[test]
