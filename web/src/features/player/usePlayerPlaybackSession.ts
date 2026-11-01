@@ -21,6 +21,11 @@ type PlayerPlaybackSessionOptions = {
   requestedSubtitleStreamIndex: string | null;
   requestedMaxBitrate: string | null;
   playbackAttempt: number;
+  /**
+   * The previous native Direct Play attempt decoded no audio at all, so the fallback request must
+   * not offer the audio track as a copy again.
+   */
+  forceAudioTranscode?: boolean;
 };
 
 export type PlayerPlaybackSession = {
@@ -57,6 +62,7 @@ export function usePlayerPlaybackSession({
   requestedSubtitleStreamIndex,
   requestedMaxBitrate,
   playbackAttempt,
+  forceAudioTranscode = false,
 }: PlayerPlaybackSessionOptions): PlayerPlaybackSession {
   // Out-of-contract URL values are dropped instead of being sent: the API
   // rejects them with 400 and the player would have no recoverable UI state.
@@ -136,6 +142,7 @@ export function usePlayerPlaybackSession({
     sessionGateKey,
     sessionStartedRef,
     playbackSessionIdRef,
+    forceAudioTranscode,
   });
   const playbackSession = playbackBootstrap.isPlaceholderData
     ? webPlaybackSession.data
@@ -236,6 +243,7 @@ type WebPlaybackSessionQueryOptions = {
   sessionGateKey: string;
   sessionStartedRef: { current: boolean };
   playbackSessionIdRef: { current: string | null };
+  forceAudioTranscode: boolean;
 };
 
 function useWebPlaybackSessionQuery({
@@ -251,8 +259,11 @@ function useWebPlaybackSessionQuery({
   sessionGateKey,
   sessionStartedRef,
   playbackSessionIdRef,
+  forceAudioTranscode,
 }: WebPlaybackSessionQueryOptions) {
-  const capabilities = webPlaybackCapabilities(source, playbackAttempt);
+  // A retry that follows a silent native track declares the audio track non-copyable, so the
+  // server's existing capabilities decision picks the audio-transcode tier.
+  const capabilities = webPlaybackCapabilities(source, playbackAttempt, undefined, { forceAudioTranscode });
   return useQuery({
     queryKey: queryKeys.webPlaybackSession(
       itemId,

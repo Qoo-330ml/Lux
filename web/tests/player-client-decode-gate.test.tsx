@@ -252,6 +252,104 @@ describe("PlayerPage client decode gate", () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("MKV MSE SourceBuffer append failed"));
   });
 
+  it("sends an MPEG-4 Part 2 Matroska to server transcoding instead of playing only its audio", async () => {
+    // Chromium answers “maybe” for the Matroska container and this codec hint, then decodes no video
+    // frame at all — the real “有声音无画面” report for Test MPEG4 360p.
+    vi.stubGlobal("MediaSource", { isTypeSupported: () => true });
+    vi.stubGlobal("Worker", class Worker {});
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockImplementation((mime: string) =>
+      mime.startsWith("video/x-matroska") ? "maybe" : "",
+    );
+    const session = firstSessionDirectThenServerHls();
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-mpeg4",
+      title: "Test MPEG4 360p",
+      itemType: "MOVIE",
+      mediaSources: [matroskaSource([
+        { index: 0, type: "VIDEO", codec: "mpeg4", details: { Width: 640, Height: 360 } },
+        { index: 1, type: "AUDIO", codec: "mp3" },
+      ])],
+    });
+
+    await renderPlayer("movie-mpeg4");
+
+    expect(engineState.mkvEngines).toBe(0);
+    expect(session).toHaveBeenCalledTimes(2);
+    expect(session.mock.calls[0]?.[2]).toMatchObject({ directPlay: true });
+    expect(session.mock.calls[1]?.[2]).toMatchObject({ directPlay: false, videoCopyToFmp4: false });
+    expect(engineState.hlsEngines).toBe(1);
+    expect(container?.textContent).toContain("已切换为服务器转码");
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("native-codec-unsupported"));
+  });
+
+  it("never re-claims an AC-3 audio copy on the fallback request", async () => {
+    // Win11 Edge without the Dolby extension: `canPlayType` answers for AC-3 and H.264 while the
+    // element decodes no AC-3 frame, so the retry must let the server transcode the audio track.
+    vi.stubGlobal("MediaSource", {
+      isTypeSupported: (mime: string) => mime === 'video/mp4; codecs="avc1.64002a"'
+        || mime === 'audio/mp4; codecs="ac-3"',
+    });
+    vi.stubGlobal("Worker", class Worker {});
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockImplementation((mime: string) =>
+      mime === 'audio/mp4; codecs="ac-3"' || mime === 'video/mp4; codecs="avc1"' ? "probably" : "",
+    );
+    const session = firstSessionDirectThenServerHls();
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-h264-10bit-ac3",
+      title: "Test H264 10bit",
+      itemType: "MOVIE",
+      mediaSources: [matroskaSource([
+        { index: 0, type: "VIDEO", codec: "h264", details: { Width: 1920, Height: 1080, PixelFormat: "yuv420p10le" } },
+        { index: 1, type: "AUDIO", codec: "AC3" },
+      ])],
+    });
+
+    await renderPlayer("movie-h264-10bit-ac3");
+
+    expect(session).toHaveBeenCalledTimes(2);
+    expect(session.mock.calls[1]?.[2]).toMatchObject({
+      videoCopyToFmp4: true,
+      audioCopyToFmp4: false,
+    });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("client-codec-unsupported"));
+  });
+
+  it("keeps an H.264 plus AAC Matroska that the element plays on native Direct Play", async () => {
+    vi.stubGlobal("MediaSource", { isTypeSupported: () => true });
+    vi.stubGlobal("Worker", class Worker {});
+    vi.stubGlobal("VideoEncoder", class VideoEncoder {
+      static isConfigSupported() { return Promise.resolve({ supported: true }); }
+    });
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType").mockImplementation((mime: string) =>
+      mime.startsWith("video/x-matroska") ? "probably" : "",
+    );
+    const session = vi.spyOn(api, "createWebPlaybackSession").mockImplementation(async (_itemId, sourceId) => ({
+      sessionId: "web-direct-mkv",
+      playSessionId: "lux-web:web-direct-mkv",
+      sourceId,
+      tier: 0,
+      expiresAt: 1_900_000_000,
+      plan: DIRECT_PLAN,
+    }));
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-h264-aac-mkv",
+      title: "H.264 AAC",
+      itemType: "MOVIE",
+      mediaSources: [matroskaSource([
+        { index: 0, type: "VIDEO", codec: "h264", details: { Width: 1920, Height: 1080, PixelFormat: "yuv420p" } },
+        { index: 1, type: "AUDIO", codec: "AAC" },
+      ])],
+    });
+
+    await renderPlayer("movie-h264-aac-mkv");
+
+    expect(engineState.mkvEngines).toBe(0);
+    expect(session).toHaveBeenCalledTimes(1);
+    expect(session.mock.calls[0]?.[2]).toMatchObject({ directPlay: true });
+    expect(container?.textContent).not.toContain("已切换为服务器转码");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
   it("leaves an 8-bit 1080p H.264 MP4 on native Direct Play", async () => {
     vi.stubGlobal("MediaSource", { isTypeSupported: () => true });
     vi.stubGlobal("Worker", class Worker {});

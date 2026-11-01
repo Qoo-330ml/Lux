@@ -18,17 +18,22 @@ import {
 import {
   CLIENT_FIRST_SEGMENT_TIMEOUT_MS,
   DIRECT_FIRST_FRAME_TIMEOUT_MS,
+  NATIVE_SILENT_POLL_MS,
   evaluateClientDecodeWatchdog,
   evaluateDirectPlayWatchdog,
+  evaluateNativeSilentFailure,
   markClientDecodeFirstSegment,
   recordClientDecodeSpeedSample,
+  sampleNativeSilentPlayback,
   startClientDecodeWatchdog,
+  startNativeSilentPlaybackClock,
   type ClientDecodeWatchdog,
 } from "./client-decode-watchdog";
 import {
   clientDecodeFallbackDiagnostic,
   playbackFallbackDiagnostic,
   type ClientDecodeFallbackReason,
+  type PlaybackFallbackOptions,
 } from "./client-decode-fallback";
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
@@ -51,6 +56,27 @@ function playbackFailureDetail(cause: unknown) {
     return (cause as { message: string }).message;
   }
   return typeof cause === "string" ? cause : undefined;
+}
+
+/** Chromium's count of decoded audio bytes; `undefined` when the browser does not expose it. */
+function nativeAudioDecodedBytes(element: HTMLVideoElement) {
+  const value = (element as HTMLVideoElement & { webkitAudioDecodedByteCount?: unknown })
+    .webkitAudioDecodedByteCount;
+  return typeof value === "number" ? value : undefined;
+}
+
+/**
+ * Safari's audio track list length; `undefined` when it cannot be used as a silence signal.
+ *
+ * Chromium reports the truthful decoded-byte counter above, so its track list is ignored, and an
+ * element that has not reached `HAVE_CURRENT_DATA` is still buffering rather than decoding silence.
+ */
+function nativeAudioTrackCount(element: HTMLVideoElement) {
+  if (typeof nativeAudioDecodedBytes(element) === "number") return undefined;
+  if (element.readyState < 2) return undefined;
+  const length = (element as HTMLVideoElement & { audioTracks?: { length?: unknown } })
+    .audioTracks?.length;
+  return typeof length === "number" ? length : undefined;
 }
 
 const HEVC_RUNTIME_ASSETS = {
@@ -103,6 +129,7 @@ type PlaybackRuntimeOptions = {
   requestServerFallback: (
     reason?: unknown,
     clientDecodeFallback?: ClientDecodeFallbackReason,
+    options?: PlaybackFallbackOptions,
   ) => Promise<boolean>;
   setCurrentTime: (value: number) => void;
   setDuration: (value: number) => void;
@@ -360,8 +387,12 @@ export function usePlaybackRuntime({
     // themselves and report their own failures.
     const ladderKind = playbackPlan?.type === "DIRECT" ? candidate?.kind : undefined;
     let metadataLoaded = false;
+    // The silent-failure clock only counts playback after metadata, so a slow first byte cannot look
+    // like a source the element fails to decode.
+    let silentClock = startNativeSilentPlaybackClock();
     const handleLoadedMetadata = () => {
       metadataLoaded = true;
+      silentClock = startNativeSilentPlaybackClock();
       if (!cancelled && ladderKind && activeEngine.kind === "native") rememberCandidate(ladderKind);
     };
     initialEngine.element.addEventListener("loadedmetadata", handleLoadedMetadata);
@@ -387,6 +418,7 @@ export function usePlaybackRuntime({
       cause: unknown,
       reason?: ClientDecodeFallbackReason,
       detail?: string,
+      options?: PlaybackFallbackOptions,
     ) => {
       if (cancelled || fallbackRequested) return false;
       fallbackRequested = true;
@@ -400,12 +432,16 @@ export function usePlaybackRuntime({
           ? clientDecodeFallbackDiagnostic(reason, message)
           : playbackFallbackDiagnostic(message));
       }
-      const reloadPending = await requestServerFallback(cause, reason);
+      const reloadPending = await requestServerFallback(cause, reason, options);
       if (!cancelled) settleAutoStartPlaybackAfterFailure(autoStartGateRef.current, reloadPending);
       return reloadPending;
     };
-    const requestClientDecodeFallback = (reason: ClientDecodeFallbackReason, detail?: string) => {
-      void requestDirectFallback(new Error(`client decode fallback: ${reason}`), reason, detail)
+    const requestClientDecodeFallback = (
+      reason: ClientDecodeFallbackReason,
+      detail?: string,
+      options?: PlaybackFallbackOptions,
+    ) => {
+      void requestDirectFallback(new Error(`client decode fallback: ${reason}`), reason, detail, options)
         .catch(() => undefined);
     };
     const startClientWatchdog = () => {
@@ -442,6 +478,44 @@ export function usePlaybackRuntime({
           })
           .catch(() => undefined);
       }, DIRECT_FIRST_FRAME_TIMEOUT_MS);
+    // Native playback can fail *silently*: a Chromium element opens a Matroska whose video codec it
+    // cannot decode and plays only the audio track (`currentTime` advances, `readyState` reaches 4,
+    // `videoWidth` stays 0), and an Edge without the Dolby extension claims AC-3 while decoding no
+    // audio frame. Neither fires `error`, so without this poll the viewer keeps a silent black
+    // surface and the session never asks for server transcoding.
+    const hasVideoStream = (source?.streams ?? [])
+      .some((stream) => (stream.type ?? "").toUpperCase() === "VIDEO");
+    const hasAudioStream = (source?.streams ?? [])
+      .some((stream) => (stream.type ?? "").toUpperCase() === "AUDIO");
+    const silentWatchdogInterval = playbackPlan?.type === "DIRECT" && !remoteHttpSource
+      ? window.setInterval(() => {
+        if (cancelled || fallbackRequested || activeEngine.kind !== "native" || !metadataLoaded) return;
+        const element = initialEngine.element;
+        silentClock = sampleNativeSilentPlayback(silentClock, {
+          nowMs: Date.now(),
+          currentTime: element.currentTime,
+          paused: element.paused,
+          seeking: element.seeking,
+        });
+        const failure = evaluateNativeSilentFailure({
+          hasVideoStream,
+          hasAudioStream,
+          playedMs: silentClock.playedMs,
+          videoWidth: element.videoWidth,
+          audioDecodedBytes: nativeAudioDecodedBytes(element),
+          audioTrackCount: nativeAudioTrackCount(element),
+        });
+        if (failure === "silent-video") {
+          requestClientDecodeFallback(failure, "native element produced no video frame");
+        } else if (failure === "silent-audio") {
+          // The element decoded no audio at all, so the retry must re-encode the audio track even
+          // when the browser claims to support its codec.
+          requestClientDecodeFallback(failure, "native element decoded no audio", {
+            forceAudioTranscode: true,
+          });
+        }
+      }, NATIVE_SILENT_POLL_MS)
+      : undefined;
     const load = async () => {
       try {
         setClientEngineActive(false);
@@ -545,6 +619,7 @@ export function usePlaybackRuntime({
       window.clearTimeout(candidateTimeout);
       window.clearTimeout(firstSegmentTimeout);
       window.clearTimeout(nativeStallTimeout);
+      window.clearInterval(silentWatchdogInterval);
       initialEngine.element.removeEventListener("loadedmetadata", handleLoadedMetadata);
       if ((remoteHttpSource || candidates.length > 1) && source?.id) {
         const video = activeEngine.element;

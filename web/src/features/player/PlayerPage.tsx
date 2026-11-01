@@ -59,7 +59,7 @@ import {
   type PlayerFailure,
 } from "./components/player-diagnostics";
 import { playbackNoticeFor, playbackNoticeSummary } from "./playback-notices";
-import type { ClientDecodeFallbackReason } from "./client-decode-fallback";
+import type { ClientDecodeFallbackReason, PlaybackFallbackOptions } from "./client-decode-fallback";
 import { usePlayerPlatform } from "./components/player-platform";
 import { usePlaybackReporting } from "./usePlaybackReporting";
 import { useCaptionSelection } from "./useCaptionSelection";
@@ -89,6 +89,8 @@ export function PlayerPage() {
   const [fallbackSpeedX, setFallbackSpeedX] = useState<number | null>(null);
   const [clientEngineActive, setClientEngineActive] = useState(false);
   const [clientDecodeFallback, setClientDecodeFallback] = useState<ClientDecodeFallbackReason | null>(null);
+  // Set when the native element decoded no audio frame: the fallback session must re-encode audio.
+  const [forceAudioTranscode, setForceAudioTranscode] = useState(false);
 
   // Playback control states
   const [currentTime, setCurrentTime] = useState(0);
@@ -145,6 +147,7 @@ export function PlayerPage() {
     requestedSubtitleStreamIndex,
     requestedMaxBitrate,
     playbackAttempt,
+    forceAudioTranscode,
   });
 
   const sessionFailed = Boolean(playbackBootstrap.error || webPlaybackSession.error);
@@ -420,8 +423,12 @@ export function PlayerPage() {
   const requestServerFallback = useCallback(async (
     reason?: unknown,
     clientDecodeFallbackReason?: ClientDecodeFallbackReason,
+    options?: PlaybackFallbackOptions,
   ): Promise<boolean> => {
     if (clientDecodeFallbackReason) setClientDecodeFallback(clientDecodeFallbackReason);
+    // A silent native audio track is not a container/codec guess any more: the retry must re-encode
+    // the audio track even when the browser claims to decode it.
+    if (options?.forceAudioTranscode) setForceAudioTranscode(true);
     if (playbackPlan?.type === "DIRECT" && hasNextCandidate) {
       if (candidate && candidate.kind === rememberedCandidate()) clearRememberedCandidate();
       setCandidateOffset((offset) => offset + 1);
@@ -471,6 +478,7 @@ export function PlayerPage() {
     setClientEngineActive(false);
     setFallbackSpeedX(null);
     setClientDecodeFallback(null);
+    setForceAudioTranscode(false);
     currentTimeRef.current = 0;
     durationRef.current = 0;
     bufferedEndRef.current = 0;
