@@ -90,4 +90,17 @@ describe("webPlaybackCapabilities", () => {
     expect(capabilities.audioCopyToFmp4).toBe(false);
     expect(capabilities.videoCopyToFmp4).toBe(true);
   });
+
+  it("only narrows the claims of a retry, never of the first attempt", () => {
+    // The flag exists for the fallback request; a first attempt must keep describing the browser.
+    const capabilities = webPlaybackCapabilities(
+      sourceWith("h264", "aac"),
+      0,
+      lyingBrowser(),
+      { forceAudioTranscode: true },
+    );
+
+    expect(capabilities.directPlay).toBe(true);
+    expect(capabilities.audioCopyToFmp4).toBe(true);
+  });
 });

@@ -47,8 +47,8 @@ export function webPlaybackCapabilities(
   const distrustClaims = attempt > 0;
   const videoCopyToFmp4 = !(distrustClaims && isUntrustworthyCopyCodec(videoCodec))
     && supportsMp4Codec(video, "video", videoCodec);
-  const audioCopyToFmp4 = options.forceAudioTranscode !== true
-    && !(distrustClaims && isUntrustworthyCopyCodec(audioCodec))
+  const audioCopyToFmp4 = !(distrustClaims
+    && (options.forceAudioTranscode === true || isUntrustworthyCopyCodec(audioCodec)))
     && (!audioCodec || supportsMp4Codec(video, "audio", audioCodec));
   return {
     directPlay: attempt === 0,
