@@ -23,6 +23,8 @@ import {
 
 type PlayerVideoSurfaceProps = {
   streamUrl: string;
+  /** Keep the existing video element mounted while a replacement session loads. */
+  keepVideoMounted?: boolean;
   deferNativeSource?: boolean;
   corsEnabled?: boolean;
   poster?: string | null;
@@ -71,6 +73,7 @@ type PlayerVideoSurfaceProps = {
 
 export function PlayerVideoSurface({
   streamUrl,
+  keepVideoMounted = false,
   deferNativeSource = false,
   corsEnabled = true,
   poster,
@@ -276,12 +279,12 @@ export function PlayerVideoSurface({
 
   return (
     <div ref={frameRef} className="lux-player-frame">
-      {streamUrl ? (
+      {streamUrl || keepVideoMounted ? (
         <video
           ref={setVideoElementRef}
           className="lux-video"
           crossOrigin={corsEnabled ? "anonymous" : undefined}
-          src={deferNativeSource ? undefined : streamUrl}
+          src={deferNativeSource ? undefined : streamUrl || undefined}
           poster={poster ?? undefined}
           preload="metadata"
           loop={presentation.loop}

@@ -71,6 +71,20 @@ export function shouldShowAudioTrackSelector(options: readonly AudioTrackOption[
   return options.length > 1;
 }
 
+/** Position of the audio selection in both playback query key layouts. */
+export function audioParamFromQueryKey(key: readonly unknown[]): string {
+  const value = key[3];
+  return typeof value === "string" ? value : "default";
+}
+
+/**
+ * STRM Direct Play ignores `audioStreamIndex`, so the player must not offer a
+ * selection that cannot change the audible track.
+ */
+export function supportsAudioTrackSwitching(source: MediaSource | undefined): boolean {
+  return source?.sourceKind !== "STRM_URL";
+}
+
 /**
  * Returns a copy of the current URL parameters with the new audio selection.
  * The first audio stream is the server-side default, so it is represented by an

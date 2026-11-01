@@ -270,7 +270,8 @@ export function PlayerPage() {
     streamUrl,
     playing,
     playbackRate,
-    sessionFailed: Boolean(playbackBootstrap.error || webPlaybackSession.error),
+    sessionFailed: Boolean(playbackBootstrap.error || webPlaybackSession.error)
+      || playbackPlan?.type === "UNSUPPORTED",
     videoRef,
     reportPlayback,
     resetControlsTimeout,
@@ -515,9 +516,13 @@ export function PlayerPage() {
   const planFailure = playbackPlan?.type === "UNSUPPORTED"
     ? playerFailure("BROWSER_UNSUPPORTED")
     : null;
-  const surfaceFailure = playbackFailure
-    ?? planFailure
-    ?? (!streamUrl ? playerFailure("SERVER_PLAN_FAILED") : null);
+  // A track switch intentionally clears the session plan while the replacement
+  // session starts; keep the existing surface mounted without a failure layer.
+  const surfaceFailure = switchingAudioTrack
+    ? null
+    : playbackFailure
+      ?? planFailure
+      ?? (!streamUrl ? playerFailure("SERVER_PLAN_FAILED") : null);
   const sourceOptions: PlayerSettingsSourceOption[] = (media.mediaSources ?? []).map((entry, index) => ({
     id: entry.id,
     label: entry.qualityLabel || `版本 ${index + 1}`,
@@ -539,6 +544,7 @@ export function PlayerPage() {
     >
       <PlayerVideoSurface
         streamUrl={streamUrl}
+        keepVideoMounted={switchingAudioTrack}
         deferNativeSource={isMatroskaSource(source) && !remoteHttpSource}
         corsEnabled={source?.sourceKind !== "STRM_URL"}
         poster={poster}
@@ -580,7 +586,7 @@ export function PlayerPage() {
         onCaptionTrackError={() => setCaptionStatus("字幕加载失败")}
         errorMessage={null}
         failure={surfaceFailure}
-        showError={failedStreamUrl === streamUrl || !streamUrl}
+        showError={!switchingAudioTrack && (failedStreamUrl === streamUrl || !streamUrl)}
         onRetry={() => window.location.reload()}
         onBack={handleBack}
       />

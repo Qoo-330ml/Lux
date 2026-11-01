@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { MediaSource } from "../src/lib/api/types";
 import {
+  audioParamFromQueryKey,
   audioTrackOptions,
   audioTrackSwitchParams,
   resolveSelectedAudioTrackIndex,
   shouldShowAudioTrackSelector,
+  supportsAudioTrackSwitching,
 } from "../src/features/player/audio-track-selection";
 
 function source(streams: MediaSource["streams"]): MediaSource {
@@ -79,6 +81,22 @@ describe("player audio track selection", () => {
       isCurrent: false,
     });
     expect(options[2].label).not.toContain("默认");
+  });
+
+  it("reads the audio selection from both playback query key layouts", () => {
+    expect(audioParamFromQueryKey(["playback-bootstrap", "item", "source", "2", "7", 0])).toBe("2");
+    expect(audioParamFromQueryKey(["web-playback-session", "item", "source", "2", "7", 0])).toBe("2");
+    expect(audioParamFromQueryKey(["web-playback-session", "item", "source", "default", "7", 0])).toBe("default");
+  });
+
+  it("does not mark a current track when the URL has no explicit selection", () => {
+    expect(audioTrackOptions(multiTrackSource, null).every((option) => !option.isCurrent)).toBe(true);
+  });
+
+  it("does not offer switching for STRM sources", () => {
+    expect(supportsAudioTrackSwitching({ ...multiTrackSource, sourceKind: "LOCAL_FILE" })).toBe(true);
+    expect(supportsAudioTrackSwitching({ ...multiTrackSource, sourceKind: "STRM_URL" })).toBe(false);
+    expect(supportsAudioTrackSwitching(undefined)).toBe(true);
   });
 
   it("only offers the switcher when the source has more than one audio stream", () => {

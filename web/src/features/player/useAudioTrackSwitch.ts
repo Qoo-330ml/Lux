@@ -2,9 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { MediaSource } from "../../lib/api/types";
 import {
+  audioParamFromQueryKey,
   audioTrackOptions,
   audioTrackSwitchParams,
   resolveSelectedAudioTrackIndex,
+  supportsAudioTrackSwitching,
 } from "./audio-track-selection";
 import type { PlaybackReporting } from "./usePlaybackReporting";
 
@@ -15,6 +17,8 @@ type PendingResume = {
   targetParam: string | null;
   position: number;
   playbackRate: number;
+  volume: number;
+  muted: boolean;
   playing: boolean;
   /** URL value to restore when the new session cannot be created. */
   previousParam: string | null;
@@ -47,12 +51,6 @@ function normalizeParam(value: string | null | undefined): string | null {
   return value?.trim() || null;
 }
 
-function audioParamFromQueryKey(prefix: unknown, key: readonly unknown[]): string {
-  const rest = key.slice(2);
-  const value = prefix === "playback-bootstrap" ? rest[1] : rest[2];
-  return typeof value === "string" ? value : "default";
-}
-
 /**
  * Owns the in-player audio track switch. Switching rebuilds the playback
  * session through the existing `audioStreamIndex` URL parameter, so the URL
@@ -78,15 +76,31 @@ export function useAudioTrackSwitch({
   const [switching, setSwitching] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const pendingRef = useRef<PendingResume | null>(null);
-  const selectedAudioStreamIndex = resolveSelectedAudioTrackIndex(source, requestedAudioStreamIndex);
+  const revertSwitch = useCallback((pending: PendingResume, message: string) => {
+    setNotice(message);
+    const reverted = new URLSearchParams(searchParams);
+    if (pending.previousParam) reverted.set("audioStreamIndex", pending.previousParam);
+    else reverted.delete("audioStreamIndex");
+    setSearchParams(reverted);
+    void queryClient.resetQueries({ queryKey: ["playback-bootstrap"] });
+    void queryClient.resetQueries({ queryKey: ["web-playback-session"] });
+  }, [queryClient, searchParams, setSearchParams]);
+  const explicitAudioStreamIndex = normalizeParam(requestedAudioStreamIndex);
+  const selectedAudioStreamIndex = resolveSelectedAudioTrackIndex(source, explicitAudioStreamIndex);
+  // Direct Play cannot select a non-first STRM audio stream, so those sources
+  // never expose the track switcher. Without an explicit URL selection the
+  // browser may pick any Direct Play track, so no option is marked "current".
   const audioTracks = useMemo(
-    () => audioTrackOptions(source, selectedAudioStreamIndex),
-    [source, selectedAudioStreamIndex],
+    () => supportsAudioTrackSwitching(source)
+      ? audioTrackOptions(source, explicitAudioStreamIndex)
+      : [],
+    [explicitAudioStreamIndex, source],
   );
 
   const switchAudioTrack = useCallback((index: string) => {
     const targetIndex = index.trim();
-    if (!source || switching || !targetIndex || targetIndex === selectedAudioStreamIndex) return;
+    if (!source || !supportsAudioTrackSwitching(source)) return;
+    if (switching || !targetIndex || targetIndex === selectedAudioStreamIndex) return;
     const isAudioTrack = (source.streams ?? []).some(
       (stream) => (stream.type ?? "").toUpperCase() === "AUDIO" && String(stream.index) === targetIndex,
     );
@@ -94,22 +108,26 @@ export function useAudioTrackSwitch({
     // Cached bootstrap/session entries for other audio variants reference
     // sessions that were stopped when this player left them. Dropping them
     // forces a fresh session when the user later switches back.
-    const currentAudioKey = normalizeParam(requestedAudioStreamIndex) ?? "default";
+    const currentAudioKey = explicitAudioStreamIndex ?? "default";
     queryClient.removeQueries({
       predicate: (query) => {
         const [prefix, queryItemId] = query.queryKey;
         if (queryItemId !== itemId) return false;
         if (prefix !== "playback-bootstrap" && prefix !== "web-playback-session") return false;
-        return audioParamFromQueryKey(prefix, query.queryKey) !== currentAudioKey;
+        return audioParamFromQueryKey(query.queryKey) !== currentAudioKey;
       },
     });
     const video = videoRef.current;
     const position = video && Number.isFinite(video.currentTime) ? Math.max(0, video.currentTime) : 0;
+    const volume = video && Number.isFinite(video.volume) ? Math.max(0, Math.min(1, video.volume)) : 1;
+    const muted = video ? video.muted : false;
     const nextParams = audioTrackSwitchParams(searchParams, targetIndex, source);
     pendingRef.current = {
       targetParam: normalizeParam(nextParams.get("audioStreamIndex")),
       position,
       playbackRate,
+      volume,
+      muted,
       playing,
       previousParam: normalizeParam(searchParams.get("audioStreamIndex")),
     };
@@ -127,11 +145,11 @@ export function useAudioTrackSwitch({
     }
   }, [
     itemId,
+    explicitAudioStreamIndex,
     playbackRate,
     playing,
     queryClient,
     reportPlayback,
-    requestedAudioStreamIndex,
     resetControlsTimeout,
     searchParams,
     selectedAudioStreamIndex,
@@ -162,6 +180,8 @@ export function useAudioTrackSwitch({
         if (Math.abs(video.currentTime - target) > 0.25) video.currentTime = target;
       }
       video.playbackRate = pending.playbackRate;
+      video.volume = pending.volume;
+      video.muted = pending.muted;
       if (pending.playing) {
         void video.play().catch(() => {
           if (!cancelled) setNotice("已切换音轨，但浏览器阻止了自动播放，请手动继续。");
@@ -181,34 +201,35 @@ export function useAudioTrackSwitch({
     video.addEventListener("canplay", apply);
     video.addEventListener("loadeddata", apply);
     applyWhenReady();
-    const timeout = window.setTimeout(() => {
-      if (cancelled || applied) return;
-      pendingRef.current = null;
-      setSwitching(false);
-      setNotice("音轨已切换，但未能恢复原来的播放位置。");
-    }, RESUME_TIMEOUT_MS);
 
     return () => {
       cancelled = true;
-      window.clearTimeout(timeout);
       video.removeEventListener("canplay", apply);
       video.removeEventListener("loadeddata", apply);
     };
   }, [requestedAudioStreamIndex, sessionFailed, streamUrl, videoRef]);
 
   useEffect(() => {
+    if (!switching) return undefined;
+    // The replacement plan can be UNSUPPORTED and never produce a stream URL,
+    // so the timeout must not depend on `streamUrl` changing.
+    const timeout = window.setTimeout(() => {
+      const pending = pendingRef.current;
+      if (!pending) return;
+      pendingRef.current = null;
+      setSwitching(false);
+      revertSwitch(pending, "音轨切换超时，已恢复原音轨。");
+    }, RESUME_TIMEOUT_MS);
+    return () => window.clearTimeout(timeout);
+  }, [revertSwitch, switching]);
+
+  useEffect(() => {
     const pending = pendingRef.current;
     if (!pending || !sessionFailed) return;
     pendingRef.current = null;
     setSwitching(false);
-    setNotice("音轨切换失败，已恢复原音轨。");
-    const reverted = new URLSearchParams(searchParams);
-    if (pending.previousParam) reverted.set("audioStreamIndex", pending.previousParam);
-    else reverted.delete("audioStreamIndex");
-    setSearchParams(reverted);
-    void queryClient.resetQueries({ queryKey: ["playback-bootstrap"] });
-    void queryClient.resetQueries({ queryKey: ["web-playback-session"] });
-  }, [queryClient, searchParams, sessionFailed, setSearchParams]);
+    revertSwitch(pending, "音轨切换失败，已恢复原音轨。");
+  }, [revertSwitch, sessionFailed]);
 
   return {
     audioTracks,
