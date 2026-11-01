@@ -87,7 +87,7 @@
 }
 
 .lux-bento-card-hero {
-  grid-column: span 4;
+  grid-column: span 3;
   min-height: 128px;
   padding: 16px;
   background: radial-gradient(100% 120% at 0% 0%, color-mix(in srgb, var(--lux-accent) 5%, transparent) 0%, transparent 72%),
@@ -99,19 +99,22 @@
   min-height: 116px;
 }
 
-.lux-bento-card-cpu {
-  grid-column: span 2;
-  min-height: 116px;
+.lux-bento-card-resources {
+  grid-column: span 6;
+  padding: 18px 20px;
 }
 
-.lux-bento-card-mem {
-  grid-column: span 1;
-  min-height: 116px;
+.lux-bento-resource-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 28px;
 }
 
-.lux-bento-card-storage {
-  grid-column: span 2;
-  min-height: 116px;
+.lux-bento-meter { min-width: 0; }
+
+.lux-bento-meter + .lux-bento-meter {
+  padding-left: 28px;
+  border-left: 1px solid var(--lux-line-soft);
 }
 
 .lux-now-playing-body { display: flex; gap: 12px; align-items: flex-start; padding: 14px 14px 0; }
@@ -2256,37 +2259,27 @@ html[data-lux-theme="light"] .lux-admin-library-page .lux-library-dialog input,
 html[data-lux-theme="light"] .lux-admin-library-page .lux-library-dialog select { color: var(--lux-text); background: rgba(28,28,34,.035); }
 
 @media (max-width: 1024px) {
-  .lux-bento-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-  .lux-bento-card-hero {
-    grid-column: span 2;
-  }
-  .lux-bento-card-users {
-    grid-column: span 1;
-  }
-  .lux-bento-card-cpu {
-    grid-column: span 1;
-  }
-  .lux-bento-card-mem {
-    grid-column: span 1;
-  }
-  .lux-bento-card-storage {
-    grid-column: span 1;
-  }
+  .lux-bento-card-hero { grid-column: span 6; }
+  .lux-bento-card-media-count,
+  .lux-bento-card-users { grid-column: span 2; }
 }
 
 @media (max-width: 640px) {
-  .lux-bento-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
+  .lux-bento-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; }
   .lux-bento-card-hero,
-  .lux-bento-card-users,
-  .lux-bento-card-cpu,
-  .lux-bento-card-mem,
-  .lux-bento-card-storage {
-    grid-column: span 2;
-  }
+  .lux-bento-card-resources { grid-column: span 6; }
+  .lux-bento-card-media-count,
+  .lux-bento-card-users { grid-column: span 2; min-height: 0; padding: 12px; }
+  .lux-bento-card-hero { min-height: 0; padding: 12px 14px; }
+  .lux-bento-card-resources { padding: 14px; }
+  .lux-bento-resource-list { grid-template-columns: 1fr; gap: 16px; }
+  .lux-bento-meter + .lux-bento-meter { padding-left: 0; border-left: 0; }
+  .lux-bento-card-media-count .lux-bento-card-header,
+  .lux-bento-card-users .lux-bento-card-header { margin-bottom: 0; }
+  .lux-bento-card-media-count .lux-bento-metric-body,
+  .lux-bento-card-users .lux-bento-metric-body { margin: 2px 0 0; }
+  .lux-bento-big-num { font-size: 1.3rem !important; }
+  .lux-bento-card:hover { transform: none; }
 }
 
 @media (max-width: 900px) {
@@ -2663,31 +2656,4 @@ html[data-lux-theme="light"] .lux-operations-log-details { background: rgba(28,2
 
 @media (prefers-reduced-motion: reduce) {
   .lux-admin-more-sheet { animation: none; }
-}
-
-/* Phone dashboard: media/user counts share one row, resource cards shrink to slim rows. */
-@media (max-width: 640px) {
-  .lux-bento-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; }
-  .lux-bento-card-hero,
-  .lux-bento-card-cpu,
-  .lux-bento-card-mem,
-  .lux-bento-card-storage { grid-column: span 6; }
-  .lux-bento-card-media-count,
-  .lux-bento-card-users { grid-column: span 2; min-height: 0; padding: 12px; }
-  .lux-bento-card-cpu,
-  .lux-bento-card-mem,
-  .lux-bento-card-storage,
-  .lux-bento-card-hero { min-height: 0; padding: 12px 14px; }
-  .lux-bento-card-media-count .lux-bento-card-header,
-  .lux-bento-card-users .lux-bento-card-header { margin-bottom: 0; }
-  .lux-bento-card-media-count .lux-bento-metric-body,
-  .lux-bento-card-users .lux-bento-metric-body { margin: 2px 0 0; }
-  .lux-bento-big-num { font-size: 1.3rem !important; }
-  .lux-bento-card-cpu .lux-bento-card-header,
-  .lux-bento-card-mem .lux-bento-card-header,
-  .lux-bento-card-storage .lux-bento-card-header { margin-bottom: 0; }
-  .lux-bento-card-cpu .lux-bento-metric-body,
-  .lux-bento-card-mem .lux-bento-metric-body,
-  .lux-bento-card-storage .lux-bento-metric-body { margin: 4px 0 0; }
-  .lux-bento-card:hover { transform: none; }
 }

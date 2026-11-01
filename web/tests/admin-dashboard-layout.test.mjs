@@ -87,7 +87,7 @@ test("dashboard overview uses modern bento box grid rhythm", () => {
   assert.match(bentoCardRule, /border-radius:\s*16px/);
   assert.match(bentoCardRule, /background:\s*rgba\(255,\s*255,\s*255,\s*(?:0)?\.008\)/);
   assert.match(bentoCardRule, /box-shadow:/);
-  assert.match(bentoHeroRule, /grid-column:\s*span 4/);
+  assert.match(bentoHeroRule, /grid-column:\s*span 3/);
   assert.match(bentoHeroRule, /min-height:\s*128px/);
   assert.match(heroRuntimeRule, /white-space:\s*nowrap/);
   assert.doesNotMatch(stylesheet, /\.lux-bento-hero-icon\s*\{/);
@@ -114,16 +114,18 @@ test("dashboard overview uses modern bento box grid rhythm", () => {
   assert.doesNotMatch(stylesheet, /\.lux-admin-overview-metrics\s*\{/);
 });
 
-test("mobile dashboard places only the movie and series count cards side by side", () => {
-  assert.match(
-    stylesheet,
-    /@media \(max-width: 640px\) \{\s*\.lux-bento-grid\s*\{\s*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/,
-  );
-  assert.match(
-    stylesheet,
-    /@media \(max-width: 640px\) \{[\s\S]*?\.lux-bento-card-hero,\s*\.lux-bento-card-users,\s*\.lux-bento-card-cpu,\s*\.lux-bento-card-mem,\s*\.lux-bento-card-storage\s*\{\s*grid-column:\s*span 2;/,
-  );
+test("mobile dashboard shows the three counts in one row above a single resource card", () => {
+  const phone = mediaStyles("@media (max-width: 640px)");
+  assert.match(extractBlock(phone, ".lux-bento-grid"), /grid-template-columns:\s*repeat\(6,\s*minmax\(0,\s*1fr\)\)/);
+  assert.match(phone, /\.lux-bento-card-hero,\s*\.lux-bento-card-resources\s*\{\s*grid-column:\s*span 6;/);
+  assert.match(phone, /\.lux-bento-card-media-count,\s*\.lux-bento-card-users\s*\{[^}]*grid-column:\s*span 2;/);
   assert.match(stylesheet, /\.lux-bento-card-media-count\s*\{\s*grid-column:\s*span 1;/);
+});
+
+test("desktop dashboard lays the resource card out as three columns", () => {
+  assert.match(extractBlock(stylesheet, ".lux-bento-card-resources {"), /grid-column:\s*span 6/);
+  assert.match(extractBlock(stylesheet, ".lux-bento-resource-list {"), /grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
+  assert.doesNotMatch(stylesheet, /\.lux-bento-card-(?:cpu|mem|storage)\s*\{/);
 });
 
 test("light mode preserves the same flat admin surfaces", () => {

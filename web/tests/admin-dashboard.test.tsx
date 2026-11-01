@@ -161,9 +161,13 @@ describe("AdminDashboardPage", () => {
     expect(overview?.textContent).not.toContain("元数据已就绪");
     expect(overview?.textContent).not.toContain("进入媒体库");
     expect(overview?.querySelector(".lux-bento-card-users .lux-bento-card-footer")).toBeNull();
-    expect(overview?.querySelector(".lux-bento-card-cpu .lux-bento-card-footer")).toBeNull();
-    expect(overview?.querySelector(".lux-bento-card-mem .lux-bento-card-footer")).toBeNull();
-    expect(overview?.querySelector(".lux-bento-card-storage .lux-bento-card-footer")).toBeNull();
+    const resourceCards = overview?.querySelectorAll(".lux-bento-card-resources") ?? [];
+    expect(resourceCards).toHaveLength(1);
+    expect([...resourceCards[0].querySelectorAll(".lux-bento-meter .lux-bento-card-title")].map((title) => title.textContent))
+      .toEqual(["CPU 占用", "内存占用", "存储空间"]);
+    expect(resourceCards[0].querySelectorAll('[role="progressbar"]').length).toBeGreaterThan(0);
+    expect(resourceCards[0].querySelector(".lux-bento-card-footer")).toBeNull();
+    expect(overview?.querySelector(".lux-bento-card-cpu, .lux-bento-card-mem, .lux-bento-card-storage")).toBeNull();
     expect(overview?.textContent).not.toContain("个配置账户");
     expect(overview?.textContent).not.toContain("总核心");
     expect(overview?.textContent).not.toContain("常驻内存");

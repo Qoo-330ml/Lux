@@ -144,66 +144,36 @@ export function AdminDashboardPage() {
             </div>
           </div>
 
-          {/* CPU Card */}
-          <div className="lux-bento-card lux-bento-card-cpu">
-            <div className="lux-bento-card-header">
-              <span className="lux-bento-card-title"><span className="lux-bento-icon-tile is-cpu" aria-hidden="true"><Cpu size={14} strokeWidth={1.8} /></span>CPU 占用</span>
-              {health.resources.cpu.available && health.resources.cpu.usagePercent !== null ? (
-                <span className="lux-bento-badge-accent">{health.resources.cpu.usagePercent.toFixed(1)}%</span>
-              ) : null}
-            </div>
-            <div className="lux-bento-metric-body">
-              <strong className="lux-admin-overview-metric-value">{formatCpu(health.resources.cpu)}</strong>
-              {health.resources.cpu.available && health.resources.cpu.usagePercent !== null ? (
-                <div className="lux-bento-progress-track">
-                  <div
-                    className="lux-bento-progress-fill is-cpu"
-                    role="progressbar"
-                    aria-label="CPU 使用率"
-                    aria-valuemin={0}
-                    aria-valuemax={100}
-                    aria-valuenow={health.resources.cpu.usagePercent}
-                    style={{ width: `${Math.min(100, Math.max(0, health.resources.cpu.usagePercent))}%` }}
-                  />
-                </div>
-              ) : null}
-            </div>
-          </div>
-
-          {/* Memory Card */}
-          <div className="lux-bento-card lux-bento-card-mem">
-            <div className="lux-bento-card-header">
-              <span className="lux-bento-card-title">内存占用</span>
-              <span className="lux-bento-icon-tile is-memory" aria-hidden="true"><MemoryStick size={14} strokeWidth={1.8} /></span>
-            </div>
-            <div className="lux-bento-metric-body">
-              <strong className="lux-admin-overview-metric-value">{formatMemory(health.resources.memory)}</strong>
-            </div>
-          </div>
-
-          {/* Storage Card */}
-          <div className="lux-bento-card lux-bento-card-storage">
-            <div className="lux-bento-card-header">
-              <span className="lux-bento-card-title"><span className="lux-bento-icon-tile is-storage" aria-hidden="true"><Database size={14} strokeWidth={1.8} /></span>存储空间</span>
-              {health.resources.mediaStorage.available && health.resources.mediaStorage.usagePercent !== null ? (
-                <span className="lux-bento-badge-purple">{health.resources.mediaStorage.usagePercent.toFixed(1)}% 已用</span>
-              ) : null}
-            </div>
-            <div className="lux-bento-metric-body">
-              <strong className="lux-admin-overview-metric-value">{formatStorage(health.resources.mediaStorage)}</strong>
-              {health.resources.mediaStorage.available && health.resources.mediaStorage.usagePercent !== null ? (
-                <div className="lux-bento-progress-track">
-                  <div
-                    className="lux-bento-progress-fill is-storage"
-                    role="progressbar"
-                    aria-label="存储空间使用率"
-                    aria-valuemin={0}
-                    aria-valuemax={100}
-                    aria-valuenow={health.resources.mediaStorage.usagePercent}
-                    style={{ width: `${Math.min(100, Math.max(0, health.resources.mediaStorage.usagePercent))}%` }}
-                  />
-                </div>
-              ) : null}
+          {/* Resources: one card, three meters */}
+          <div className="lux-bento-card lux-bento-card-resources">
+            <div className="lux-bento-resource-list">
+              <ResourceMeter
+                title="CPU 占用"
+                tile={<span className="lux-bento-icon-tile is-cpu" aria-hidden="true"><Cpu size={14} strokeWidth={1.8} /></span>}
+                badge={health.resources.cpu.available && health.resources.cpu.usagePercent !== null
+                  ? <span className="lux-bento-badge-accent">{health.resources.cpu.usagePercent.toFixed(1)}%</span>
+                  : null}
+                value={formatCpu(health.resources.cpu)}
+                percent={health.resources.cpu.available ? health.resources.cpu.usagePercent : null}
+                fillClass="is-cpu"
+                progressLabel="CPU 使用率"
+              />
+              <ResourceMeter
+                title="内存占用"
+                tile={<span className="lux-bento-icon-tile is-memory" aria-hidden="true"><MemoryStick size={14} strokeWidth={1.8} /></span>}
+                value={formatMemory(health.resources.memory)}
+              />
+              <ResourceMeter
+                title="存储空间"
+                tile={<span className="lux-bento-icon-tile is-storage" aria-hidden="true"><Database size={14} strokeWidth={1.8} /></span>}
+                badge={health.resources.mediaStorage.available && health.resources.mediaStorage.usagePercent !== null
+                  ? <span className="lux-bento-badge-purple">{health.resources.mediaStorage.usagePercent.toFixed(1)}% 已用</span>
+                  : null}
+                value={formatStorage(health.resources.mediaStorage)}
+                percent={health.resources.mediaStorage.available ? health.resources.mediaStorage.usagePercent : null}
+                fillClass="is-storage"
+                progressLabel="存储空间使用率"
+              />
             </div>
           </div>
         </div>
@@ -235,6 +205,43 @@ export function AdminDashboardPage() {
         <AdminDashboardActivity events={recentPlaybackActivity} />
       </section>
 
+    </div>
+  );
+}
+
+interface ResourceMeterProps {
+  title: string;
+  tile: ReactNode;
+  badge?: ReactNode;
+  value: string;
+  percent?: number | null;
+  fillClass?: string;
+  progressLabel?: string;
+}
+
+function ResourceMeter({ title, tile, badge, value, percent = null, fillClass = "", progressLabel }: ResourceMeterProps) {
+  return (
+    <div className="lux-bento-meter">
+      <div className="lux-bento-card-header">
+        <span className="lux-bento-card-title">{tile}{title}</span>
+        {badge}
+      </div>
+      <div className="lux-bento-metric-body">
+        <strong className="lux-admin-overview-metric-value">{value}</strong>
+        {percent !== null ? (
+          <div className="lux-bento-progress-track">
+            <div
+              className={`lux-bento-progress-fill ${fillClass}`.trim()}
+              role="progressbar"
+              aria-label={progressLabel}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={percent}
+              style={{ width: `${Math.min(100, Math.max(0, percent))}%` }}
+            />
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 }
