@@ -15,6 +15,7 @@ import { usePlayerKeyboardShortcuts } from "./usePlayerKeyboardShortcuts";
 import { usePlayerScreenshot } from "./usePlayerScreenshot";
 import { usePlayerInfoPanel } from "./usePlayerInfoPanel";
 import { usePlayerPlaybackSession } from "./usePlayerPlaybackSession";
+import { useAudioTrackSwitch } from "./useAudioTrackSwitch";
 import { usePlayerVideoElement } from "./usePlayerVideoElement";
 import { usePlayerNavigation } from "./usePlayerNavigation";
 import { usePlaybackSessionGate } from "./usePlaybackSessionGate";
@@ -251,6 +252,27 @@ export function PlayerPage() {
     seekTo,
     seekRelative,
     setIsPointerInteracting,
+    resetControlsTimeout,
+  });
+
+  const {
+    audioTracks,
+    selectedAudioStreamIndex,
+    switching: switchingAudioTrack,
+    notice: audioTrackNotice,
+    switchAudioTrack,
+  } = useAudioTrackSwitch({
+    itemId,
+    source,
+    requestedAudioStreamIndex,
+    searchParams,
+    setSearchParams,
+    streamUrl,
+    playing,
+    playbackRate,
+    sessionFailed: Boolean(playbackBootstrap.error || webPlaybackSession.error),
+    videoRef,
+    reportPlayback,
     resetControlsTimeout,
   });
 
@@ -608,6 +630,13 @@ export function PlayerPage() {
           sources={sourceOptions}
           selectedSourceId={source?.id ?? ""}
           onSourceChange={(sourceId) => setSearchParams({ sourceId })}
+          audioTracks={{
+            tracks: audioTracks,
+            selectedIndex: selectedAudioStreamIndex,
+            switching: switchingAudioTrack,
+            notice: audioTrackNotice,
+            onSelect: switchAudioTrack,
+          }}
           presentation={{
             loop: loopPlayback,
             aspectRatio,
