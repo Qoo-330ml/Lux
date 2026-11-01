@@ -154,6 +154,12 @@ export function qualityStatusText(
 ): string {
   const target = qualityRateLabel(bitrate?.targetBitrate);
   if (bitrate?.limited && target) return `已限制到 ${target}`;
-  if (selectedMaxBitrate !== null) return "原画（源码率未超过所选上限）";
+  if (selectedMaxBitrate !== null) {
+    // The server never upgrades an unprobed source, so the ceiling cannot have
+    // been exceeded — but saying "not exceeded" would claim knowledge we lack.
+    return bitrate && bitrate.sourceBitrate === null
+      ? "原画（源码率未知，未触发限制）"
+      : "原画（源码率未超过所选上限）";
+  }
   return "原画（自动）";
 }

@@ -139,6 +139,10 @@ describe("player quality status", () => {
     expect(qualityStatusText(undefined, null)).toBe("原画（自动）");
     expect(qualityStatusText(bitrate({ maxBitrate: 4_000_000 }), 4_000_000))
       .toBe("原画（源码率未超过所选上限）");
+    // An unprobed source never triggers an upgrade, so the ceiling is not
+    // exceeded — and the wording must not claim the source rate is known.
+    expect(qualityStatusText(bitrate({ sourceBitrate: null, maxBitrate: 4_000_000 }), 4_000_000))
+      .toBe("原画（源码率未知，未触发限制）");
   });
 });
 
