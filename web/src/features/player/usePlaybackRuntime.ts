@@ -19,6 +19,7 @@ import {
   CLIENT_FIRST_SEGMENT_TIMEOUT_MS,
   DIRECT_FIRST_FRAME_TIMEOUT_MS,
   evaluateClientDecodeWatchdog,
+  evaluateDirectPlayWatchdog,
   markClientDecodeFirstSegment,
   recordClientDecodeSpeedSample,
   startClientDecodeWatchdog,
@@ -388,11 +389,18 @@ export function usePlaybackRuntime({
       window.clearTimeout(firstSegmentTimeout);
     };
     // A native Direct Play element that never reaches HAVE_CURRENT_DATA is stuck too: Chromium opens
-    // Matroska whose video codec it cannot decode without firing `error` or `loadedmetadata`.
-    const nativeStallTimeout = playbackPlan?.type === "DIRECT" && !hasNextCandidate
-      ? window.setTimeout(() => {
+    // Matroska whose video codec it cannot decode without firing `error` or `loadedmetadata`. Remote
+    // `.strm` sources are exempt: they have no server transcoding to fall back to, so a slow download
+    // must keep buffering instead of turning into a failure.
+    const nativeWatchdog = playbackPlan?.type === "DIRECT" && !hasNextCandidate && !remoteHttpSource
+      ? startClientDecodeWatchdog(Date.now())
+      : null;
+    const nativeStallTimeout = nativeWatchdog === null
+      ? undefined
+      : window.setTimeout(() => {
         if (cancelled || fallbackRequested || activeEngine.kind !== "native") return;
         if (initialEngine.element.readyState >= 2) return;
+        if (!evaluateDirectPlayWatchdog(nativeWatchdog, Date.now())) return;
         fallbackRequested = true;
         console.warn(clientDecodeFallbackDiagnostic("stalled", "direct play produced no frame"));
         void requestServerFallback(new Error("direct play produced no frame"), "stalled")
@@ -400,8 +408,7 @@ export function usePlaybackRuntime({
             if (!cancelled) settleAutoStartPlaybackAfterFailure(autoStartGateRef.current, reloadPending);
           })
           .catch(() => undefined);
-      }, DIRECT_FIRST_FRAME_TIMEOUT_MS)
-      : undefined;
+      }, DIRECT_FIRST_FRAME_TIMEOUT_MS);
     const load = async () => {
       try {
         setClientEngineActive(false);

@@ -60,9 +60,11 @@ const plan: WebPlaybackPlan = { type: "DIRECT", url: "/api/v1/playback/sessions/
 function Harness({
   requestServerFallback,
   playbackSource = source,
+  remoteHttpSource = false,
 }: {
   requestServerFallback: (reason?: unknown, clientDecodeFallback?: string) => Promise<boolean>;
   playbackSource?: MediaSource;
+  remoteHttpSource?: boolean;
 }) {
   const playbackDataRef = useRef(undefined) as never;
   const hasRestoredPositionRef = useRef(false);
@@ -83,7 +85,7 @@ function Harness({
     candidate: undefined,
     candidates: [],
     hasNextCandidate: false,
-    remoteHttpSource: false,
+    remoteHttpSource,
     clientMkvSourceUrl: null,
     playbackDataRef,
     hasRestoredPositionRef,
@@ -139,7 +141,11 @@ describe("client decode first-segment watchdog", () => {
     vi.restoreAllMocks();
   });
 
-  async function renderHarness(onFallback: () => void, playbackSource?: MediaSource) {
+  async function renderHarness(
+    onFallback: () => void,
+    playbackSource?: MediaSource,
+    remoteHttpSource = false,
+  ) {
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -148,7 +154,13 @@ describe("client decode first-segment watchdog", () => {
       return true;
     });
     await act(async () => {
-      root?.render(<Harness requestServerFallback={requestServerFallback} playbackSource={playbackSource} />);
+      root?.render(
+        <Harness
+          requestServerFallback={requestServerFallback}
+          playbackSource={playbackSource}
+          remoteHttpSource={remoteHttpSource}
+        />,
+      );
     });
     return requestServerFallback;
   }
@@ -251,6 +263,27 @@ describe("client decode first-segment watchdog", () => {
     expect(requestServerFallback).toHaveBeenCalledTimes(1);
     expect(requestServerFallback.mock.calls[0]?.[1]).toBe("stalled");
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("direct play produced no frame"));
+  });
+
+  it("keeps waiting on a remote STRM source that has no server fallback", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const remote: MediaSource = {
+      id: "source-remote",
+      isDefault: true,
+      sourceKind: "STRM_URL",
+      externalUrl: "https://media.example.test/video.mp4",
+      container: "mp4",
+      streams: [{ index: 0, type: "VIDEO", codec: "h264", details: { Width: 1920, Height: 1080 } }],
+    };
+    const requestServerFallback = await renderHarness(() => undefined, remote, true);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(DIRECT_FIRST_FRAME_TIMEOUT_MS * 3);
+    });
+
+    expect(requestServerFallback).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it("keeps a client engine that produces its first segment in time", async () => {
