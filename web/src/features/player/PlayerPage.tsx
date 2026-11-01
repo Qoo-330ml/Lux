@@ -281,6 +281,7 @@ export function PlayerPage() {
     switchAudioTrack,
   } = useAudioTrackSwitch({
     itemId,
+    playbackKey,
     source,
     requestedAudioStreamIndex,
     searchParams,
@@ -294,7 +295,6 @@ export function PlayerPage() {
     reportPlayback,
     resetControlsTimeout,
   });
-
 
   const nextEpisodeId = episodeNavigation?.nextEpisodeId ?? null;
   const { autoPlayEnabled, setAutoPlayEnabled } = useAutoPlayNextPreference();

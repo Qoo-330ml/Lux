@@ -387,6 +387,95 @@ describe("PlayerPage audio track switching", () => {
     expect(select?.getAttribute("disabled")).toBeNull();
   });
 
+  it("cancels the pending switch when navigating to the next episode", async () => {
+    const episodes = {
+      "episode-audio-1": {
+        id: "episode-audio-1",
+        title: "第一集",
+        itemType: "EPISODE" as const,
+        seriesId: "series-audio",
+        parentId: "season-audio",
+        indexNumber: 1,
+        mediaSources: [item.mediaSources[0]],
+      },
+      "episode-audio-2": {
+        id: "episode-audio-2",
+        title: "第二集",
+        itemType: "EPISODE" as const,
+        seriesId: "series-audio",
+        parentId: "season-audio",
+        indexNumber: 2,
+        mediaSources: [{
+          id: "source-next",
+          isDefault: true,
+          sourceKind: "LOCAL_FILE",
+          durationTicks: 1_200_000_000,
+          streams: [
+            { index: 0, type: "VIDEO", codec: "hevc" },
+            { index: 1, type: "AUDIO", codec: "aac" },
+          ],
+        }],
+      },
+    };
+    vi.mocked(api.item).mockImplementation(async (itemId) => {
+      return episodes[itemId as keyof typeof episodes] ?? episodes["episode-audio-1"];
+    });
+    vi.spyOn(api, "children").mockResolvedValue({ items: Object.values(episodes) });
+
+    let releaseBootstrap: (() => void) | undefined;
+    const bootstrapGate = new Promise<void>((resolve) => {
+      releaseBootstrap = resolve;
+    });
+    const originalBootstrap = vi.mocked(api.createWebPlaybackBootstrap).getMockImplementation();
+    vi.mocked(api.createWebPlaybackBootstrap).mockImplementation(async (
+      itemId,
+      sourceId,
+      capabilities,
+      signal,
+      selection,
+    ) => {
+      if (itemId === "episode-audio-1" && !selection?.audioStreamIndex) await bootstrapGate;
+      if (!originalBootstrap) throw new Error("bootstrap mock missing");
+      return originalBootstrap(itemId, sourceId, capabilities, signal, selection);
+    });
+
+    await renderPlayer("/watch/episode-audio-1?audioStreamIndex=2");
+
+    const firstVideo = container?.querySelector<HTMLVideoElement>("video");
+    if (!firstVideo) throw new Error("video element was not rendered");
+    primeVideo(firstVideo);
+    firstVideo.currentTime = 48;
+    firstVideo.volume = 0.4;
+    firstVideo.muted = true;
+    await act(async () => firstVideo.dispatchEvent(new Event("play")));
+
+    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    if (!settings) throw new Error("settings control was not rendered");
+    await act(async () => settings.click());
+    expect(luxSelectValue(container!, "选择音轨")).toBe("2");
+
+    await chooseLuxOptionByValue(container!, "选择音轨", "1");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    const next = container?.querySelector<HTMLButtonElement>('[aria-label="下一集"]');
+    if (!next) throw new Error("next episode control was not rendered");
+    await act(async () => next.click());
+    releaseBootstrap?.();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    expect(container?.querySelector('[data-testid="current-location"]')?.textContent)
+      .toBe("/watch/episode-audio-2");
+    const nextVideo = await settleReplacement("source-next");
+    expect(nextVideo.currentTime).toBe(0);
+    expect(nextVideo.volume).toBe(1);
+    expect(nextVideo.muted).toBe(false);
+    expect(play).not.toHaveBeenCalled();
+  });
+
   it("creates a fresh session when switching back to the first audio track", async () => {
     await renderPlayer("/watch/movie-audio?subtitleStreamIndex=7");
 
@@ -446,6 +535,49 @@ describe("PlayerPage audio track switching", () => {
     expect(container?.querySelector('[aria-label="选择音轨"]')).toBeNull();
   });
 
+  it("does not resurrect an abandoned target URL after the switch times out", async () => {
+    let resolveReport: (() => void) | undefined;
+    const reportGate = new Promise<{ accepted: boolean; duplicate: boolean; stale: boolean }>((resolve) => {
+      resolveReport = () => resolve({ accepted: true, duplicate: false, stale: false });
+    });
+    vi.mocked(api.webPlaybackEvent).mockImplementation(() => reportGate);
+    const timeoutSpy = vi.spyOn(window, "setTimeout");
+    await renderPlayer("/watch/movie-audio");
+
+    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    if (!settings) throw new Error("settings control was not rendered");
+    await act(async () => settings.click());
+
+    await chooseLuxOptionByValue(container!, "选择音轨", "2");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    // The URL must still be untouched while the position report is in flight.
+    expect(container?.querySelector('[data-testid="current-location"]')?.textContent)
+      .toBe("/watch/movie-audio");
+
+    const timeout = timeoutSpy.mock.calls.find(([, delay]) => delay === 15_000);
+    if (!timeout) throw new Error("switch timeout was not scheduled");
+    await act(async () => {
+      (timeout[0] as () => void)();
+      await Promise.resolve();
+    });
+
+    expect(container?.querySelector('[data-testid="current-location"]')?.textContent)
+      .toBe("/watch/movie-audio");
+    expect(container?.textContent).toContain("音轨切换超时，已恢复原音轨。");
+
+    resolveReport?.();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    expect(container?.querySelector('[data-testid="current-location"]')?.textContent)
+      .toBe("/watch/movie-audio");
+    expect(container?.textContent).not.toContain("正在切换音轨");
+  });
+
   it("reverts the URL and reports a notice when the new session fails", async () => {
     const originalBootstrap = vi.mocked(api.createWebPlaybackBootstrap).getMockImplementation();
     vi.mocked(api.createWebPlaybackBootstrap).mockImplementation(async (
@@ -494,5 +626,7 @@ describe("PlayerPage audio track switching", () => {
       .toBe("/watch/movie-audio");
     expect(container?.textContent).toContain("音轨切换失败，已恢复原音轨。");
     expect(container?.querySelector('[aria-label="选择音轨"]')).not.toBeNull();
+    expect(vi.mocked(api.createWebPlaybackBootstrap).mock.calls
+      .filter((call) => call[4]?.audioStreamIndex === 2)).toHaveLength(1);
   });
 });
