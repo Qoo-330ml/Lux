@@ -108,16 +108,19 @@ export function useAudioTrackSwitch({
   const switchAudioTrack = useCallback((index: string) => {
     const targetIndex = index.trim();
     if (!source || !supportsAudioTrackSwitching(source)) return;
-    // Only the explicit URL selection can make this a no-op. Without one the
-    // audible track is unproven, so choosing the first audio stream must still
-    // rebuild the session: Direct Play needs the explicit index to pin it.
-    if (switching || !targetIndex || targetIndex === explicitAudioStreamIndex) return;
+    if (switching || !targetIndex) return;
     const isAudioTrack = (source.streams ?? []).some(
       (stream) => (stream.type ?? "").toUpperCase() === "AUDIO" && String(stream.index) === targetIndex,
     );
     if (!isAudioTrack) return;
-    beginSwitch(audioTrackSwitchParams(searchParams, targetIndex, source, audioTrackOwner));
-  }, [audioTrackOwner, beginSwitch, explicitAudioStreamIndex, searchParams, source, switching]);
+    const nextParams = audioTrackSwitchParams(searchParams, targetIndex, source, audioTrackOwner);
+    // The selection is a no-op exactly when the URL would not change: the same
+    // explicit index is chosen again, or a server session is asked for the first
+    // audio stream it already maps. Rebuilding the session for that would only cost
+    // a reload, and an unconfirmed Direct Play choice always changes the URL.
+    if (nextParams.toString() === searchParams.toString()) return;
+    beginSwitch(nextParams);
+  }, [audioTrackOwner, beginSwitch, searchParams, source, switching]);
 
   return {
     audioTracks,
