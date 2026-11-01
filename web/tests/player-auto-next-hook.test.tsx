@@ -20,7 +20,7 @@ function Probe({
   playbackKey = "episode-1:default",
   onNavigateNextEpisode = () => undefined,
 }: ProbeProps) {
-  const { countdown, handleEnded, playNow, cancel } = useAutoPlayNext({
+  const { countdown, handleEnded, playNow, cancel, interrupt } = useAutoPlayNext({
     playbackKey,
     nextEpisodeId,
     enabled,
@@ -31,6 +31,7 @@ function Probe({
       <button type="button" data-testid="ended" onClick={handleEnded}>结束</button>
       <button type="button" data-testid="play-now" onClick={playNow}>立即播放</button>
       <button type="button" data-testid="cancel" onClick={cancel}>取消</button>
+      <button type="button" data-testid="interrupt" onClick={interrupt}>继续观看</button>
       <output data-testid="countdown">{countdown ? countdown.secondsLeft : "hidden"}</output>
     </>
   );
@@ -56,6 +57,7 @@ describe("LuxPlayer auto play next wiring", () => {
       ended: () => container?.querySelector<HTMLButtonElement>("[data-testid='ended']"),
       playNow: () => container?.querySelector<HTMLButtonElement>("[data-testid='play-now']"),
       cancel: () => container?.querySelector<HTMLButtonElement>("[data-testid='cancel']"),
+      interrupt: () => container?.querySelector<HTMLButtonElement>("[data-testid='interrupt']"),
       countdown: () => container?.querySelector("[data-testid='countdown']")?.textContent,
     };
   }
@@ -129,5 +131,23 @@ describe("LuxPlayer auto play next wiring", () => {
 
     await act(async () => root?.render(<Probe enabled={false} />));
     expect(ui.countdown()).toBe("hidden");
+  });
+
+  it("drops the countdown when the viewer resumes playback or seeks", async () => {
+    vi.useFakeTimers();
+    const onNavigate = vi.fn();
+    const ui = await render({ onNavigateNextEpisode: onNavigate });
+
+    await act(async () => ui.ended()?.click());
+    expect(ui.countdown()).toBe("10");
+
+    await act(async () => ui.interrupt()?.click());
+    expect(ui.countdown()).toBe("hidden");
+    await act(async () => vi.advanceTimersByTime(20_000));
+    expect(onNavigate).not.toHaveBeenCalled();
+
+    // Reaching the end again after an interruption offers the card again.
+    await act(async () => ui.ended()?.click());
+    expect(ui.countdown()).toBe("10");
   });
 });

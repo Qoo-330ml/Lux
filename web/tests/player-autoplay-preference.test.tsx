@@ -12,6 +12,7 @@ import {
   saveAccountSettings,
   DEFAULT_ACCOUNT_SETTINGS,
 } from "../src/features/account/account-settings";
+import { ApiError } from "../src/lib/api/client";
 import {
   readAutoPlayNextEpisodePreference,
   syncAutoPlayNextEpisodePreference,
@@ -120,6 +121,57 @@ describe("LuxPlayer auto play next preference storage", () => {
 
     expect(await syncAutoPlayNextEpisodePreference(false, "user-1")).toBeNull();
   });
+
+  it("re-reads once and retries when another device bumped the preference version", async () => {
+    const conflict = new ApiError("版本冲突", { code: "VERSION_CONFLICT", status: 409 });
+    const get = vi.spyOn(api, "accountPreferences")
+      .mockResolvedValueOnce({ ...PREFERENCES, version: 4 })
+      .mockResolvedValueOnce({ ...PREFERENCES, version: 5 });
+    const update = vi.spyOn(api, "updateAccountPreferences")
+      .mockRejectedValueOnce(conflict)
+      .mockResolvedValueOnce({ ...PREFERENCES, autoPlayNextEpisode: false, version: 6 });
+
+    const saved = await syncAutoPlayNextEpisodePreference(false, "user-1");
+
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(update).toHaveBeenCalledTimes(2);
+    expect(update).toHaveBeenNthCalledWith(1, expect.objectContaining({ expectedVersion: 4 }));
+    expect(update).toHaveBeenNthCalledWith(2, expect.objectContaining({ expectedVersion: 5 }));
+    expect(saved?.version).toBe(6);
+  });
+
+  it("serializes consecutive toggles instead of racing them", async () => {
+    const log: string[] = [];
+    let releaseFirstPatch: (() => void) | undefined;
+    vi.spyOn(api, "accountPreferences").mockImplementation(async () => {
+      log.push("get");
+      // The first read still reports the old value; the second one observes the
+      // patch that the queued first sync already wrote.
+      const patched = log.some((entry) => entry === "patch:false");
+      return { ...PREFERENCES, autoPlayNextEpisode: !patched };
+    });
+    vi.spyOn(api, "updateAccountPreferences").mockImplementation(async (input) => {
+      log.push(`patch:${input.autoPlayNextEpisode}`);
+      if (input.autoPlayNextEpisode === false) {
+        await new Promise<void>((resolve) => {
+          releaseFirstPatch = resolve;
+        });
+      }
+      return { ...PREFERENCES, autoPlayNextEpisode: input.autoPlayNextEpisode, version: 5 };
+    });
+
+    const first = syncAutoPlayNextEpisodePreference(false, "user-1");
+    const second = syncAutoPlayNextEpisodePreference(true, "user-1");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(log).toEqual(["get", "patch:false"]);
+
+    releaseFirstPatch?.();
+    await first;
+    await second;
+    expect(log).toEqual(["get", "patch:false", "get", "patch:true"]);
+  });
 });
 
 describe("LuxPlayer auto play next preference hook", () => {
@@ -184,6 +236,86 @@ describe("LuxPlayer auto play next preference hook", () => {
     );
     expect(queryClient.getQueryData<AccountPreferences>(queryKeys.accountPreferences("user-1"))?.version)
       .toBe(5);
+  });
+
+  it("uses the cached account preference when local storage has no record", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(queryKeys.me, session("user-1"));
+    queryClient.setQueryData(queryKeys.accountPreferences("user-1"), {
+      ...PREFERENCES,
+      autoPlayNextEpisode: false,
+      version: 3,
+    });
+    const get = vi.spyOn(api, "accountPreferences");
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    await act(async () => root?.render(
+      <QueryClientProvider client={queryClient}>
+        <Probe />
+      </QueryClientProvider>,
+    ));
+
+    const toggle = container.querySelector<HTMLButtonElement>("[data-testid='toggle']");
+    expect(toggle?.dataset.enabled).toBe("false");
+    expect(readAccountSettings("user-1").autoPlayNextEpisode).toBe(false);
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it("loads the account preference once when local storage is empty", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(queryKeys.me, session("user-1"));
+    const get = vi.spyOn(api, "accountPreferences").mockResolvedValue({
+      ...PREFERENCES,
+      autoPlayNextEpisode: false,
+      version: 3,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    await act(async () => root?.render(
+      <QueryClientProvider client={queryClient}>
+        <Probe />
+      </QueryClientProvider>,
+    ));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const toggle = container.querySelector<HTMLButtonElement>("[data-testid='toggle']");
+    expect(toggle?.dataset.enabled).toBe("false");
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(readAccountSettings("user-1").autoPlayNextEpisode).toBe(false);
+    expect(queryClient.getQueryData<AccountPreferences>(queryKeys.accountPreferences("user-1"))?.version)
+      .toBe(3);
+  });
+
+  it("keeps a stored local preference instead of loading it again", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(queryKeys.me, session("user-1"));
+    saveAccountSettings({ ...DEFAULT_ACCOUNT_SETTINGS, autoPlayNextEpisode: true }, "user-1");
+    const get = vi.spyOn(api, "accountPreferences").mockResolvedValue({
+      ...PREFERENCES,
+      autoPlayNextEpisode: false,
+      version: 3,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    await act(async () => root?.render(
+      <QueryClientProvider client={queryClient}>
+        <Probe />
+      </QueryClientProvider>,
+    ));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector<HTMLButtonElement>("[data-testid='toggle']")?.dataset.enabled).toBe("true");
+    expect(get).not.toHaveBeenCalled();
   });
 
   it("stays usable without a cached session by keeping the preference in local storage", async () => {

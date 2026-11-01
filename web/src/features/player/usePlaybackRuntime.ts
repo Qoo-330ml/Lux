@@ -69,6 +69,8 @@ type PlaybackRuntimeOptions = {
   onPlaybackEnded?: () => void;
   /** One-shot request: start playing once this session finished loading. */
   autoStartPlayback?: boolean;
+  /** The viewer resumed playback or moved the playhead inside this episode. */
+  onPlaybackInterrupted?: () => void;
   requestServerFallback: (reason?: unknown) => Promise<void>;
   setCurrentTime: (value: number) => void;
   setDuration: (value: number) => void;
@@ -115,6 +117,7 @@ export function usePlaybackRuntime({
   markStarted,
   onPlaybackEnded,
   autoStartPlayback,
+  onPlaybackInterrupted,
   requestServerFallback,
   setCurrentTime,
   setDuration,
@@ -132,6 +135,7 @@ export function usePlaybackRuntime({
   // The ended callback is read through a ref so a changing page callback never
   // re-runs the engine loading effect below.
   const onPlaybackEndedRef = useRef(onPlaybackEnded);
+  const onPlaybackInterruptedRef = useRef(onPlaybackInterrupted);
   // The auto start request survives the page stripping the router marker right
   // after mount, and is consumed once so a source switch does not replay it.
   const autoStartGateRef = useRef(createAutoStartPlaybackGate(autoStartPlayback === true));
@@ -139,6 +143,10 @@ export function usePlaybackRuntime({
   useEffect(() => {
     onPlaybackEndedRef.current = onPlaybackEnded;
   }, [onPlaybackEnded]);
+
+  useEffect(() => {
+    onPlaybackInterruptedRef.current = onPlaybackInterrupted;
+  }, [onPlaybackInterrupted]);
 
   useEffect(() => {
     if (autoStartPlayback) autoStartGateRef.current.request();
@@ -230,6 +238,7 @@ export function usePlaybackRuntime({
           void restoreEngineHandoff();
           break;
         case "PLAYING":
+          onPlaybackInterruptedRef.current?.();
           markStarted();
           setPlaying(true);
           setControlsVisible(true);
@@ -253,6 +262,7 @@ export function usePlaybackRuntime({
           break;
         case "SEEKED":
           syncSnapshot(event.snapshot, true);
+          onPlaybackInterruptedRef.current?.();
           break;
         case "TIME_UPDATE":
           syncSnapshot(event.snapshot);
@@ -370,8 +380,9 @@ export function usePlaybackRuntime({
         );
         if (!cancelled) await restoreEngineHandoff();
         if (!cancelled && autoStartGateRef.current.consume()) {
-          // A rejected play() (browser autoplay policy) leaves the player paused on
-          // the normal play affordance instead of surfacing a playback failure.
+          // A browser autoplay policy rejection leaves the player paused on the
+          // normal play affordance; any other error is rethrown into the existing
+          // playback failure handling of this load() call.
           await attemptAutoStartPlayback(() => runtime.play());
         }
         if (!cancelled && activeEngine.performance)

@@ -150,6 +150,7 @@ export function PlayerControls({
         currentTime={currentTime}
         duration={duration}
         creditsStart={creditsStart}
+        introRange={introSkip}
         hasNextEpisode={hasNextEpisode}
         onSkip={onSkipCredits}
       />

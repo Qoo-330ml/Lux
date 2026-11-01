@@ -53,17 +53,24 @@ describe("LuxPlayer auto start attempt", () => {
     expect(play).toHaveBeenCalledTimes(1);
   });
 
-  it("swallows a browser autoplay rejection and keeps the player paused", async () => {
-    const blocked = vi.fn().mockRejectedValue(
+  it("treats a browser autoplay policy rejection as a silent fallback", async () => {
+    const notAllowed = vi.fn().mockRejectedValue(
       new DOMException("play() failed because the user didn't interact", "NotAllowedError"),
     );
+    const aborted = vi.fn().mockRejectedValue(
+      new DOMException("The play() request was interrupted", "AbortError"),
+    );
 
-    await expect(attemptAutoStartPlayback(blocked)).resolves.toBe("blocked");
+    await expect(attemptAutoStartPlayback(notAllowed)).resolves.toBe("blocked");
+    await expect(attemptAutoStartPlayback(aborted)).resolves.toBe("blocked");
   });
 
-  it("does not rethrow other playback errors either", async () => {
-    const failed = vi.fn().mockRejectedValue(new Error("媒体源不可用"));
+  it("lets other playback errors reach the existing failure path", async () => {
+    const unsupported = new DOMException("no supported source", "NotSupportedError");
 
-    await expect(attemptAutoStartPlayback(failed)).resolves.toBe("blocked");
+    await expect(attemptAutoStartPlayback(vi.fn().mockRejectedValue(unsupported)))
+      .rejects.toBe(unsupported);
+    await expect(attemptAutoStartPlayback(vi.fn().mockRejectedValue(new Error("媒体源不可用"))))
+      .rejects.toThrow("媒体源不可用");
   });
 });

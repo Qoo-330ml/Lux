@@ -40,10 +40,20 @@ export function createAutoStartPlaybackGate(pending: boolean): AutoStartPlayback
 
 export type AutoStartPlaybackOutcome = "played" | "blocked";
 
+/** Browser autoplay policy rejections that only mean "wait for a user gesture". */
+const AUTO_PLAY_POLICY_ERROR_NAMES = new Set(["NotAllowedError", "AbortError"]);
+
+export function isAutoPlayPolicyError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const name = (error as { name?: unknown }).name;
+  return typeof name === "string" && AUTO_PLAY_POLICY_ERROR_NAMES.has(name);
+}
+
 /**
- * Attempts playback without treating a browser autoplay rejection as a failure:
- * the player stays paused on the normal "play" affordance instead of reporting an
- * error the user cannot act on.
+ * Attempts playback after an automatic episode jump. A policy rejection only
+ * leaves the player paused on the normal "play" affordance; every other failure is
+ * rethrown so it reaches the existing playback failure path instead of being
+ * silently swallowed.
  */
 export async function attemptAutoStartPlayback(
   play: () => Promise<void>,
@@ -51,7 +61,8 @@ export async function attemptAutoStartPlayback(
   try {
     await play();
     return "played";
-  } catch {
-    return "blocked";
+  } catch (error) {
+    if (isAutoPlayPolicyError(error)) return "blocked";
+    throw error;
   }
 }

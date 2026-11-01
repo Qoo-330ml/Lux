@@ -1,18 +1,21 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { AccountPreferences, AuthSession } from "../../lib/api/types";
 import {
+  autoPlayNextEpisodeFromPreferences,
+  hasStoredPlaybackPreferences,
   readAutoPlayNextEpisodePreference,
   syncAutoPlayNextEpisodePreference,
   writeAutoPlayNextEpisodePreference,
 } from "./player-preferences";
 
 /**
- * The player settings switch for "自动连播下一集". The value comes from the
- * account preference cache (or local storage), and toggling applies immediately
- * before a best-effort account sync.
+ * The player settings switch for "自动连播下一集". A stored local copy wins;
+ * otherwise the account preference (cached query or one server read) seeds both
+ * the switch and the local copy. Toggling applies immediately before a queued,
+ * best-effort account sync.
  */
 export function useAutoPlayNextPreference(): {
   autoPlayEnabled: boolean;
@@ -30,6 +33,36 @@ export function useAutoPlayNextPreference(): {
   const [autoPlayEnabled, setAutoPlayEnabledState] = useState(
     () => readAutoPlayNextEpisodePreference(userId),
   );
+
+  const needsAccountPreference = Boolean(userId) && !hasStoredPlaybackPreferences(userId);
+  useEffect(() => {
+    if (!userId || !needsAccountPreference) return undefined;
+    const cached = queryClient.getQueryData<AccountPreferences>(
+      queryKeys.accountPreferences(userId),
+    );
+    if (cached) {
+      const enabled = autoPlayNextEpisodeFromPreferences(cached);
+      setAutoPlayEnabledState(enabled);
+      writeAutoPlayNextEpisodePreference(enabled, userId);
+      return undefined;
+    }
+    let cancelled = false;
+    void api.accountPreferences()
+      .then((preferences) => {
+        queryClient.setQueryData<AccountPreferences>(
+          queryKeys.accountPreferences(userId),
+          preferences,
+        );
+        if (cancelled) return;
+        const enabled = autoPlayNextEpisodeFromPreferences(preferences);
+        setAutoPlayEnabledState(enabled);
+        writeAutoPlayNextEpisodePreference(enabled, userId);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [needsAccountPreference, queryClient, userId]);
 
   const setAutoPlayEnabled = useCallback((enabled: boolean) => {
     setAutoPlayEnabledState(enabled);

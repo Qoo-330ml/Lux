@@ -1,4 +1,4 @@
-import type { PlayerChapterSegment } from "./player-chapters";
+import type { PlayerChapterSegment, PlayerIntroRange } from "./player-chapters";
 
 /** Countdown shown before the player moves on to the next episode by itself. */
 export const AUTO_PLAY_NEXT_DELAY_SECONDS = 10;
@@ -95,6 +95,48 @@ export function creditsStartSeconds(
   const segment = segments.find((entry) => entry.markerType === "CREDITS_START");
   if (!segment || !Number.isFinite(segment.start) || segment.start < 0) return null;
   return segment.start;
+}
+
+export function introSkipVisible(input: {
+  currentTime: number;
+  introRange: PlayerIntroRange | null;
+}): boolean {
+  const { currentTime, introRange } = input;
+  if (!introRange || !Number.isFinite(currentTime)) return false;
+  return currentTime >= introRange.start && currentTime < introRange.end;
+}
+
+export type ChapterSkipActions = {
+  intro: boolean;
+  credits: boolean;
+};
+
+/**
+ * The two skip buttons share one slot, so only one of them may render. The intro
+ * marker wins when both conditions happen to be true at the same position.
+ */
+export function resolveChapterSkipActions(input: {
+  introRange: PlayerIntroRange | null;
+  creditsStart: number | null;
+  currentTime: number;
+  duration: number;
+  hasNextEpisode: boolean;
+}): ChapterSkipActions {
+  const intro = introSkipVisible({
+    currentTime: input.currentTime,
+    introRange: input.introRange,
+  });
+  if (intro) return { intro: true, credits: false };
+  const credits = shouldShowSkipCredits({
+    creditsStart: input.creditsStart,
+    currentTime: input.currentTime,
+    duration: input.duration,
+  }) && creditsSkipAction({
+    creditsStart: input.creditsStart,
+    duration: input.duration,
+    hasNextEpisode: input.hasNextEpisode,
+  }) !== null;
+  return { intro: false, credits };
 }
 
 export function shouldShowSkipCredits(input: {

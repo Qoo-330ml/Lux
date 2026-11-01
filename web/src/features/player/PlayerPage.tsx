@@ -284,6 +284,7 @@ export function PlayerPage() {
     handleEnded: handlePlaybackEnded,
     playNow: playNextEpisodeNow,
     cancel: cancelAutoPlayNext,
+    interrupt: interruptAutoPlayNext,
   } = useAutoPlayNext({
     playbackKey,
     nextEpisodeId,
@@ -440,6 +441,7 @@ export function PlayerPage() {
     stopActiveSession,
     markStarted,
     onPlaybackEnded: handlePlaybackEnded,
+    onPlaybackInterrupted: interruptAutoPlayNext,
     autoStartPlayback,
     requestServerFallback: requestServerFallback as (reason?: unknown) => Promise<void>,
     setCurrentTime,

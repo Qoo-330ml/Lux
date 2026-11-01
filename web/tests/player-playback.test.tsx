@@ -1588,4 +1588,58 @@ describe("PlayerPage playback synchronization", () => {
     await act(async () => manualPlay?.click());
     expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(2);
   });
+
+  it("cancels the countdown when the viewer resumes playback or seeks", async () => {
+    const episodes = {
+      "episode-resume-1": { id: "episode-resume-1", title: "重看第一集", itemType: "EPISODE" as const, seriesId: "series-resume", parentId: "season-resume", indexNumber: 1, mediaSources: [{ id: "resume-source-1", isDefault: true }] },
+      "episode-resume-2": { id: "episode-resume-2", title: "重看第二集", itemType: "EPISODE" as const, seriesId: "series-resume", parentId: "season-resume", indexNumber: 2, mediaSources: [{ id: "resume-source-2", isDefault: true }] },
+    };
+    vi.spyOn(api, "item").mockImplementation(async (itemId) => episodes[itemId as keyof typeof episodes]);
+    vi.spyOn(api, "playback").mockResolvedValue({ positionTicks: 0, isPlayed: false, state: null, isPaused: false });
+    vi.spyOn(api, "children").mockResolvedValue({ items: Object.values(episodes) });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/episode-resume-1"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<><PlayerPage /><CurrentPath /></>} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const video = container.querySelector<HTMLVideoElement>("video");
+    if (!video) throw new Error("video element was not rendered");
+    Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 0 });
+    await act(async () => video.dispatchEvent(new Event("loadedmetadata")));
+    await act(async () => video.dispatchEvent(new Event("play")));
+    await act(async () => video.dispatchEvent(new Event("ended")));
+    expect(container.querySelector("[aria-label='自动连播下一集']")).not.toBeNull();
+
+    // Pressing play on the ended media cancels the countdown instead of switching episodes.
+    await act(async () => video.dispatchEvent(new Event("play")));
+    expect(container.querySelector("[aria-label='自动连播下一集']")).toBeNull();
+    expect(container.querySelector('[data-testid="current-path"]')?.textContent).toBe("/watch/episode-resume-1");
+
+    // A seek inside the same episode also retracts the card.
+    await act(async () => video.dispatchEvent(new Event("ended")));
+    expect(container.querySelector("[aria-label='自动连播下一集']")).not.toBeNull();
+    await act(async () => {
+      video.dispatchEvent(new Event("seeking"));
+      video.dispatchEvent(new Event("seeked"));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(container.querySelector("[aria-label='自动连播下一集']")).toBeNull();
+    expect(container.querySelector('[data-testid="current-path"]')?.textContent).toBe("/watch/episode-resume-1");
+  });
 });

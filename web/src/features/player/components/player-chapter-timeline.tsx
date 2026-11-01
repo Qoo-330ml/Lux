@@ -1,5 +1,5 @@
 import type { PlayerChapterSegment, PlayerIntroRange } from "../player-chapters";
-import { creditsSkipAction, shouldShowSkipCredits } from "../player-autoplay";
+import { introSkipVisible, resolveChapterSkipActions } from "../player-autoplay";
 
 type PlayerChapterTimelineProps = {
   segments: readonly PlayerChapterSegment[];
@@ -39,12 +39,7 @@ type PlayerIntroSkipProps = {
 };
 
 export function PlayerIntroSkip({ currentTime, introSkip, onSkip }: PlayerIntroSkipProps) {
-  if (
-    !introSkip
-    || !Number.isFinite(currentTime)
-    || currentTime < introSkip.start
-    || currentTime >= introSkip.end
-  ) return null;
+  if (!introSkip || !introSkipVisible({ currentTime, introRange: introSkip })) return null;
 
   return (
     <button
@@ -62,6 +57,8 @@ type PlayerSkipCreditsProps = {
   currentTime: number;
   duration: number;
   creditsStart: number | null;
+  /** Needed for the shared skip slot: the intro button wins when both apply. */
+  introRange: PlayerIntroRange | null;
   hasNextEpisode: boolean;
   onSkip: () => void;
 };
@@ -75,11 +72,18 @@ export function PlayerSkipCredits({
   currentTime,
   duration,
   creditsStart,
+  introRange,
   hasNextEpisode,
   onSkip,
 }: PlayerSkipCreditsProps) {
-  if (!shouldShowSkipCredits({ creditsStart, currentTime, duration })) return null;
-  if (!creditsSkipAction({ creditsStart, duration, hasNextEpisode })) return null;
+  const skipActions = resolveChapterSkipActions({
+    introRange,
+    creditsStart,
+    currentTime,
+    duration,
+    hasNextEpisode,
+  });
+  if (!skipActions.credits) return null;
 
   return (
     <button

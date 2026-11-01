@@ -80,6 +80,7 @@ describe("LuxPlayer chapter controls", () => {
         currentTime={89}
         duration={120}
         creditsStart={90}
+        introRange={null}
         hasNextEpisode
         onSkip={onSkip}
       />,
@@ -91,6 +92,7 @@ describe("LuxPlayer chapter controls", () => {
         currentTime={91}
         duration={120}
         creditsStart={90}
+        introRange={null}
         hasNextEpisode
         onSkip={onSkip}
       />,
@@ -112,6 +114,7 @@ describe("LuxPlayer chapter controls", () => {
         currentTime={95}
         duration={120}
         creditsStart={null}
+        introRange={null}
         hasNextEpisode={false}
         onSkip={() => undefined}
       />,
@@ -123,10 +126,34 @@ describe("LuxPlayer chapter controls", () => {
         currentTime={120}
         duration={120}
         creditsStart={90}
+        introRange={null}
         hasNextEpisode={false}
         onSkip={() => undefined}
       />,
     ));
+    expect(container.querySelector("[aria-label='跳过片尾']")).toBeNull();
+  });
+
+  it("shows only the intro button when both skip actions apply", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => root?.render(
+      <>
+        <PlayerIntroSkip currentTime={4} introSkip={{ start: 2, end: 6 }} onSkip={() => undefined} />
+        <PlayerSkipCredits
+          currentTime={4}
+          duration={120}
+          creditsStart={2}
+          introRange={{ start: 2, end: 6 }}
+          hasNextEpisode
+          onSkip={() => undefined}
+        />
+      </>,
+    ));
+
+    expect(container.querySelector("[aria-label='跳过片头']")).not.toBeNull();
     expect(container.querySelector("[aria-label='跳过片尾']")).toBeNull();
   });
 });

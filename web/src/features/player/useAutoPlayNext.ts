@@ -22,6 +22,7 @@ type AutoPlayNext = {
   handleEnded: () => void;
   playNow: () => void;
   cancel: () => void;
+  interrupt: () => void;
 };
 
 /**
@@ -71,6 +72,9 @@ export function useAutoPlayNext({
   }, [apply, enabled, nextEpisodeId]);
   const playNow = useCallback(() => apply({ type: "play-now" }), [apply]);
   const cancel = useCallback(() => apply({ type: "cancel" }), [apply]);
+  // Resuming playback or seeking during the countdown means the viewer is still
+  // watching this episode; retract the card without dismissing the episode.
+  const interrupt = useCallback(() => apply({ type: "reset" }), [apply]);
 
-  return { countdown: autoPlayNextCountdown(state), handleEnded, playNow, cancel };
+  return { countdown: autoPlayNextCountdown(state), handleEnded, playNow, cancel, interrupt };
 }

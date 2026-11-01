@@ -6,7 +6,9 @@ import {
   createAutoPlayNextState,
   creditsSkipAction,
   creditsStartSeconds,
+  introSkipVisible,
   reduceAutoPlayNext,
+  resolveChapterSkipActions,
   shouldShowSkipCredits,
   type AutoPlayNextState,
 } from "../src/features/player/player-autoplay";
@@ -163,5 +165,52 @@ describe("LuxPlayer skip credits", () => {
       .toEqual({ kind: "seek", seconds: 119 });
     expect(creditsSkipAction({ creditsStart: null, duration: 120, hasNextEpisode: false })).toBeNull();
     expect(creditsSkipAction({ creditsStart: 90, duration: Number.NaN, hasNextEpisode: false })).toBeNull();
+  });
+});
+
+describe("LuxPlayer chapter skip exclusivity", () => {
+  it("keeps only the intro button when both skip actions would be visible", () => {
+    expect(resolveChapterSkipActions({
+      introRange: { start: 90, end: 100 },
+      creditsStart: 90,
+      currentTime: 95,
+      duration: 120,
+      hasNextEpisode: true,
+    })).toEqual({ intro: true, credits: false });
+  });
+
+  it("shows the credits button once the intro range has passed", () => {
+    expect(resolveChapterSkipActions({
+      introRange: { start: 90, end: 100 },
+      creditsStart: 90,
+      currentTime: 105,
+      duration: 120,
+      hasNextEpisode: true,
+    })).toEqual({ intro: false, credits: true });
+  });
+
+  it("hides both buttons outside the markers or without a usable skip target", () => {
+    expect(resolveChapterSkipActions({
+      introRange: null,
+      creditsStart: null,
+      currentTime: 10,
+      duration: 120,
+      hasNextEpisode: false,
+    })).toEqual({ intro: false, credits: false });
+    // Credits start without a finite duration cannot finish the media either.
+    expect(resolveChapterSkipActions({
+      introRange: null,
+      creditsStart: 90,
+      currentTime: 95,
+      duration: Number.NaN,
+      hasNextEpisode: false,
+    })).toEqual({ intro: false, credits: false });
+  });
+
+  it("uses the same intro predicate as the intro button", () => {
+    expect(introSkipVisible({ currentTime: 3, introRange: { start: 2, end: 6 } })).toBe(true);
+    expect(introSkipVisible({ currentTime: 6, introRange: { start: 2, end: 6 } })).toBe(false);
+    expect(introSkipVisible({ currentTime: 3, introRange: null })).toBe(false);
+    expect(introSkipVisible({ currentTime: Number.NaN, introRange: { start: 2, end: 6 } })).toBe(false);
   });
 });
