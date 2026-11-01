@@ -45,6 +45,7 @@ export function groupPlayerShortcuts(shortcuts: readonly PlayerShortcut[]): Shor
  * so the panel can never document a shortcut that does not work.
  */
 export function PlayerShortcutHelp({ onClose, shortcuts = PLAYER_SHORTCUTS }: PlayerShortcutHelpProps) {
+  const layerRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   // PlayerPage passes a fresh inline callback on every render; keeping it in a
   // ref lets the mount effect own focus for exactly one open/close cycle.
@@ -58,7 +59,9 @@ export function PlayerShortcutHelp({ onClose, shortcuts = PLAYER_SHORTCUTS }: Pl
     const handleClick = (event: MouseEvent) => {
       const target = event.target;
       if (!(target instanceof Element)) return;
-      if (panelRef.current?.contains(target)) return;
+      // The layer itself owns its own clicks; only clicks that bypass it (portals,
+      // dialogs stacked above) reach this listener.
+      if (layerRef.current?.contains(target)) return;
       // The control-bar entry point toggles the panel itself; without this the
       // open click would close and immediately reopen the dialog.
       if (target.closest("[data-player-shortcut-help-toggle]")) return;
@@ -99,54 +102,63 @@ export function PlayerShortcutHelp({ onClose, shortcuts = PLAYER_SHORTCUTS }: Pl
 
   return (
     <div
-      ref={panelRef}
-      className="lux-player-shortcut-help"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby={TITLE_ID}
-      tabIndex={-1}
-      data-player-shortcut-help
-      onClick={(event) => event.stopPropagation()}
-      onDoubleClick={(event) => event.stopPropagation()}
-      onKeyDown={handleKeyDown}
+      ref={layerRef}
+      className="lux-player-shortcut-help-layer"
+      onClick={(event) => {
+        // 点击浮层外部（视频、控制条等）只关闭浮层，不把点击继续交给播放器。
+        if (event.target === event.currentTarget) onCloseRef.current();
+      }}
     >
-      <header className="lux-player-shortcut-help-head">
-        <div>
-          <h2 id={TITLE_ID}>键盘快捷键</h2>
-          <p className="lux-player-shortcut-help-hint">播放器页面内生效；按 Esc 关闭。</p>
-        </div>
-        <button
-          type="button"
-          className="lux-player-shortcut-help-close"
-          aria-label="关闭键盘快捷键"
-          title="关闭 (Esc)"
-          onClick={() => onCloseRef.current()}
-        >
-          <X size={16} aria-hidden="true" />
-        </button>
-      </header>
-      <div className="lux-player-shortcut-help-body">
-        {groupPlayerShortcuts(shortcuts).map((group) => (
-          <section
-            key={group.title}
-            className="lux-player-shortcut-help-group"
-            aria-label={group.title}
+      <div
+        ref={panelRef}
+        className="lux-player-shortcut-help"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={TITLE_ID}
+        tabIndex={-1}
+        data-player-shortcut-help
+        onClick={(event) => event.stopPropagation()}
+        onDoubleClick={(event) => event.stopPropagation()}
+        onKeyDown={handleKeyDown}
+      >
+        <header className="lux-player-shortcut-help-head">
+          <div>
+            <h2 id={TITLE_ID}>键盘快捷键</h2>
+            <p className="lux-player-shortcut-help-hint">播放器页面内生效；按 Esc 关闭。</p>
+          </div>
+          <button
+            type="button"
+            className="lux-player-shortcut-help-close"
+            aria-label="关闭键盘快捷键"
+            title="关闭 (Esc)"
+            onClick={() => onCloseRef.current()}
           >
-            <h3>{group.title}</h3>
-            <dl>
-              {group.shortcuts.map((shortcut) => (
-                <div key={shortcut.action} className="lux-player-shortcut-help-row">
-                  <dt>
-                    {shortcut.keys.map((key) => (
-                      <kbd key={key}>{key}</kbd>
-                    ))}
-                  </dt>
-                  <dd>{shortcut.description}</dd>
-                </div>
-              ))}
-            </dl>
-          </section>
-        ))}
+            <X size={16} aria-hidden="true" />
+          </button>
+        </header>
+        <div className="lux-player-shortcut-help-body">
+          {groupPlayerShortcuts(shortcuts).map((group) => (
+            <section
+              key={group.title}
+              className="lux-player-shortcut-help-group"
+              aria-label={group.title}
+            >
+              <h3>{group.title}</h3>
+              <dl>
+                {group.shortcuts.map((shortcut) => (
+                  <div key={shortcut.action} className="lux-player-shortcut-help-row">
+                    <dt>
+                      {shortcut.keys.map((key) => (
+                        <kbd key={key}>{key}</kbd>
+                      ))}
+                    </dt>
+                    <dd>{shortcut.description}</dd>
+                  </div>
+                ))}
+              </dl>
+            </section>
+          ))}
+        </div>
       </div>
     </div>
   );

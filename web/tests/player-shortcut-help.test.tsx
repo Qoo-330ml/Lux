@@ -325,6 +325,23 @@ describe("PlayerShortcutHelp", () => {
     expect(insideClick).not.toHaveBeenCalled();
   });
 
+  it("closes on a click in the surrounding layer without leaking it to the player", () => {
+    const onClose = vi.fn();
+    const { element } = renderHelp(onClose);
+    const layer = element.querySelector<HTMLElement>(".lux-player-shortcut-help-layer");
+    expect(layer).not.toBeNull();
+
+    act(() => {
+      layer?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onClose).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      helpDialog(element)?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps Tab inside the dialog", () => {
     const { element } = renderHelp();
     const dialog = helpDialog(element);
