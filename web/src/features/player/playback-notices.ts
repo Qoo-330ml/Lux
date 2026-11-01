@@ -10,6 +10,9 @@
  * notice without rendering anything.
  */
 
+import type { ClientDecodeFallbackReason } from "./client-decode-fallback";
+import { CLIENT_DECODE_FALLBACK_NOTICE } from "./client-decode-fallback";
+
 export type PlaybackNoticeSeverity = "error" | "warning" | "info";
 
 export type PlaybackNotice = {
@@ -37,6 +40,11 @@ export type PlaybackNoticeInput = {
   errorCode?: string | null;
   /** True when the client already fell back from Direct Play to a server-side plan. */
   degraded?: boolean | null;
+  /**
+   * Set when the *client decode* path itself degraded, so the banner can name the reason instead of
+   * only reporting that the browser could not play the source.
+   */
+  clientDecodeFallback?: ClientDecodeFallbackReason | null;
 };
 
 type NoticeCopy = Omit<PlaybackNotice, "blocking">;
@@ -162,7 +170,9 @@ export function playbackNoticeFor(input: PlaybackNoticeInput): PlaybackNotice | 
   const failure = playbackFailureNotice(input);
   if (failure) return failure;
   if (input.planType === "UNSUPPORTED") return unsupportedNotice(input.reason);
-  if (input.planType === "SERVER_HLS") return transcodeNotice(input.tier, input.degraded === true);
+  if (input.planType === "SERVER_HLS") {
+    return transcodeNotice(input.tier, input.degraded === true, input.clientDecodeFallback ?? null);
+  }
   return null;
 }
 
@@ -203,7 +213,11 @@ function unsupportedNotice(reason: string | null | undefined): PlaybackNotice {
   });
 }
 
-function transcodeNotice(tier: number | null | undefined, degraded: boolean): PlaybackNotice | null {
+function transcodeNotice(
+  tier: number | null | undefined,
+  degraded: boolean,
+  clientDecodeFallback: ClientDecodeFallbackReason | null,
+): PlaybackNotice | null {
   if (typeof tier !== "number" || !Number.isFinite(tier)) return null;
   const copy = TRANSCODE_BY_TIER[tier];
   if (!copy) return null;
@@ -216,7 +230,7 @@ function transcodeNotice(tier: number | null | undefined, degraded: boolean): Pl
     blocking: false,
     title: copy.title,
     message: degraded
-      ? `浏览器无法直接播放原始码流，Lux 已自动改用服务端 HLS 输出。${copy.message}`
+      ? `${clientDecodeFallback ? CLIENT_DECODE_FALLBACK_NOTICE[clientDecodeFallback] : ""}浏览器无法直接播放原始码流，Lux 已自动改用服务端 HLS 输出。${copy.message}`
       : copy.message,
     ...(degraded
       ? { hint: copy.hint ?? "如果画面卡顿或等待过久，可以暂停后等待缓冲，或改用原生客户端。" }

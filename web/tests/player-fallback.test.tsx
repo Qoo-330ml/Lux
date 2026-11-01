@@ -21,12 +21,32 @@ const fallbackState = vi.hoisted(() => ({
   snapshotDuration: 8 as number | null,
 }));
 
+const selectionMocks = vi.hoisted(() => ({
+  shouldUseClientHevc: vi.fn(async () => true),
+  shouldUseClientMkv: vi.fn(async () => false),
+}));
+
 vi.mock("../src/features/player/playback-selection", () => ({
   isRemoteHttpStrmSource: (source: { sourceKind?: string; externalUrl?: string }) =>
     source.sourceKind === "STRM_URL" && /^https?:\/\//i.test(source.externalUrl ?? ""),
   canUseRemoteMkvCaptionSidecar: vi.fn().mockReturnValue(true),
-  shouldUseClientHevc: vi.fn().mockResolvedValue(true),
-  shouldUseClientMkv: vi.fn().mockResolvedValue(false),
+  shouldUseClientHevc: selectionMocks.shouldUseClientHevc,
+  shouldUseClientMkv: selectionMocks.shouldUseClientMkv,
+  // The runtime asks for one decision that also explains a rejection; these tests keep driving the
+  // two historical capability mocks instead of a real browser probe.
+  resolveClientDecode: async (source: unknown, video: unknown, options: unknown) => {
+    const container = String((source as { container?: string | null } | undefined)?.container ?? "").toLowerCase();
+    const matroska = container.split(",").some((part) => ["mkv", "matroska", "webm"].includes(part.trim()));
+    if (matroska && await selectionMocks.shouldUseClientMkv(source as never, video as never, options as never)) {
+      return { engine: "client-mkv", rejected: null };
+    }
+    if (await selectionMocks.shouldUseClientHevc(source as never, video as never)) {
+      return { engine: "client-hevc", rejected: null };
+    }
+    return { engine: null, rejected: "native-playback" };
+  },
+  clientDecodeRequiresServerFallback: (decision: { engine: string | null; rejected: string | null }) =>
+    decision.engine === null && decision.rejected !== "native-playback" && decision.rejected !== "no-candidate",
 }));
 
 vi.mock("../src/features/player/remote-mkv-caption-reader", () => ({

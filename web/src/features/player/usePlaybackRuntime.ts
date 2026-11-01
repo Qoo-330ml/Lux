@@ -11,7 +11,23 @@ import {
   rememberCandidate,
   type DirectCandidate,
 } from "./direct-candidates";
-import { shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
+import {
+  clientDecodeRequiresServerFallback,
+  resolveClientDecode,
+} from "./playback-selection";
+import {
+  CLIENT_FIRST_SEGMENT_TIMEOUT_MS,
+  DIRECT_FIRST_FRAME_TIMEOUT_MS,
+  evaluateClientDecodeWatchdog,
+  markClientDecodeFirstSegment,
+  recordClientDecodeSpeedSample,
+  startClientDecodeWatchdog,
+  type ClientDecodeWatchdog,
+} from "./client-decode-watchdog";
+import {
+  clientDecodeFallbackDiagnostic,
+  type ClientDecodeFallbackReason,
+} from "./client-decode-fallback";
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
 import { classifyPlayerEngineFailure } from "./components/player-diagnostics";
@@ -21,7 +37,7 @@ import {
   createAutoStartPlaybackGate,
   settleAutoStartPlaybackAfterFailure,
 } from "./player-autostart";
-import { TICKS_PER_SECOND, isMatroskaSource, useClientEngine } from "./player-page-helpers";
+import { TICKS_PER_SECOND, useClientEngine } from "./player-page-helpers";
 import type { PlaybackReporting } from "./usePlaybackReporting";
 
 export const TIMELINE_UI_UPDATE_INTERVAL_MS = 100;
@@ -73,7 +89,10 @@ type PlaybackRuntimeOptions = {
   /** The viewer resumed playback or moved the playhead inside this episode. */
   onPlaybackInterrupted?: () => void;
   /** True when this same episode reloads (server fallback or candidate retry). */
-  requestServerFallback: (reason?: unknown) => Promise<boolean>;
+  requestServerFallback: (
+    reason?: unknown,
+    clientDecodeFallback?: ClientDecodeFallbackReason,
+  ) => Promise<boolean>;
   setCurrentTime: (value: number) => void;
   setDuration: (value: number) => void;
   setBufferedEnd: (value: number) => void;
@@ -308,6 +327,14 @@ export function usePlaybackRuntime({
       if (cancelled) return;
       const performance = (event as CustomEvent<PlaybackPerformance | null>).detail;
       setFallbackSpeedX(performance && !performance.realtime ? performance.speedX : null);
+      if (clientWatchdog === null || !performance) return;
+      clientWatchdog = recordClientDecodeSpeedSample(clientWatchdog, performance.speedX);
+      const verdict = evaluateClientDecodeWatchdog(clientWatchdog, Date.now());
+      // `slow` keeps the existing “客户端解码速度低于实时” banner above; only a clearly-too-slow
+      // measurement (or a missing first segment) is worth an automatic server fallback.
+      if (verdict.action === "fallback") {
+        requestClientDecodeFallback(verdict.reason, `speedX ${performance.speedX.toFixed(2)}`);
+      }
     };
     const handleDurationChange = () => {
       if (!cancelled) syncSnapshot(activeEngine.snapshot(), true);
@@ -329,6 +356,52 @@ export function usePlaybackRuntime({
         }
       }, DIRECT_CANDIDATE_TIMEOUT_MS)
       : undefined;
+    // The client engines await browser-owned steps with no timeout of their own (module Worker
+    // readiness, the first remuxed segment, MSE `updateend`). Without a watchdog a Safari/Edge stall
+    // stays on “正在准备客户端解码…” forever instead of reaching server transcoding.
+    let clientWatchdog: ClientDecodeWatchdog | null = null;
+    let firstSegmentTimeout: number | undefined;
+    let fallbackRequested = false;
+    const requestClientDecodeFallback = (reason: ClientDecodeFallbackReason, detail?: string) => {
+      if (cancelled || fallbackRequested) return;
+      fallbackRequested = true;
+      window.clearTimeout(firstSegmentTimeout);
+      // Web Inspector has no other trace of this decision; the copy never carries media URLs.
+      console.warn(clientDecodeFallbackDiagnostic(reason, detail));
+      void requestServerFallback(new Error(`client decode fallback: ${reason}`), reason)
+        .then((reloadPending) => {
+          if (!cancelled) settleAutoStartPlaybackAfterFailure(autoStartGateRef.current, reloadPending);
+        })
+        .catch(() => undefined);
+    };
+    const startClientWatchdog = () => {
+      clientWatchdog = startClientDecodeWatchdog(Date.now());
+      firstSegmentTimeout = window.setTimeout(() => {
+        if (cancelled || clientWatchdog === null) return;
+        const verdict = evaluateClientDecodeWatchdog(clientWatchdog, Date.now());
+        if (verdict.action === "fallback") requestClientDecodeFallback(verdict.reason);
+      }, CLIENT_FIRST_SEGMENT_TIMEOUT_MS);
+    };
+    const markFirstPlayableSegment = () => {
+      if (clientWatchdog === null) return;
+      clientWatchdog = markClientDecodeFirstSegment(clientWatchdog, Date.now());
+      window.clearTimeout(firstSegmentTimeout);
+    };
+    // A native Direct Play element that never reaches HAVE_CURRENT_DATA is stuck too: Chromium opens
+    // Matroska whose video codec it cannot decode without firing `error` or `loadedmetadata`.
+    const nativeStallTimeout = playbackPlan?.type === "DIRECT" && !hasNextCandidate
+      ? window.setTimeout(() => {
+        if (cancelled || fallbackRequested || activeEngine.kind !== "native") return;
+        if (initialEngine.element.readyState >= 2) return;
+        fallbackRequested = true;
+        console.warn(clientDecodeFallbackDiagnostic("stalled", "direct play produced no frame"));
+        void requestServerFallback(new Error("direct play produced no frame"), "stalled")
+          .then((reloadPending) => {
+            if (!cancelled) settleAutoStartPlaybackAfterFailure(autoStartGateRef.current, reloadPending);
+          })
+          .catch(() => undefined);
+      }, DIRECT_FIRST_FRAME_TIMEOUT_MS)
+      : undefined;
     const load = async () => {
       try {
         setClientEngineActive(false);
@@ -339,18 +412,13 @@ export function usePlaybackRuntime({
           activeEngine = new HlsVideoEngine(initialEngine.element);
           engineRef.current = activeEngine;
         } else {
-          const useMkvFallback = isMatroskaSource(source)
-            ? await shouldUseClientMkv(source, initialEngine.element)
-            : false;
-          const useHevcFallback =
-            !useMkvFallback
-            && (await shouldUseClientHevc(source, initialEngine.element));
-          if (useMkvFallback || useHevcFallback) {
+          const decision = await resolveClientDecode(source, initialEngine.element);
+          if (cancelled) return;
+          if (decision.engine !== null) {
             setFallbackLoading(true);
             setClientEngineActive(true);
-            if (cancelled) return;
             initialEngine.destroy();
-            if (useMkvFallback) {
+            if (decision.engine === "client-mkv") {
               const { ClientMkvEngine } = await import("./mkv-playback-engine");
               if (cancelled) return;
               const inputCodec = source?.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO")?.codec ?? "";
@@ -363,6 +431,19 @@ export function usePlaybackRuntime({
             engineRef.current = activeEngine;
             performanceElement = activeEngine.element;
             performanceElement.addEventListener(PLAYBACK_PERFORMANCE_EVENT, handlePerformance);
+            startClientWatchdog();
+          } else if (clientDecodeRequiresServerFallback(decision) && playbackPlan?.type === "DIRECT") {
+            // The browser cannot decode what the server planned to send, so ask the server for a
+            // transcoding session instead of waiting for an element that will never play.
+            fallbackRequested = true;
+            window.clearTimeout(nativeStallTimeout);
+            console.warn(clientDecodeFallbackDiagnostic("unviable", decision.rejected));
+            const reloadPending = await requestServerFallback(
+              new Error(`client decode unavailable: ${decision.rejected}`),
+              "unviable",
+            );
+            if (!cancelled) settleAutoStartPlaybackAfterFailure(autoStartGateRef.current, reloadPending);
+            return;
           }
         }
         if (cancelled) return;
@@ -380,6 +461,7 @@ export function usePlaybackRuntime({
             poster,
           },
         );
+        if (!cancelled) markFirstPlayableSegment();
         if (!cancelled) await restoreEngineHandoff();
         if (!cancelled && autoStartGateRef.current.peek()) {
           // The viewer's one-shot request is finished once playback started or once
@@ -423,6 +505,8 @@ export function usePlaybackRuntime({
     return () => {
       cancelled = true;
       window.clearTimeout(candidateTimeout);
+      window.clearTimeout(firstSegmentTimeout);
+      window.clearTimeout(nativeStallTimeout);
       initialEngine.element.removeEventListener("loadedmetadata", handleLoadedMetadata);
       if ((remoteHttpSource || candidates.length > 1) && source?.id) {
         const video = activeEngine.element;

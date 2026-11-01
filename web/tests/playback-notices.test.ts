@@ -223,6 +223,25 @@ describe("playbackNoticeFor: server transcode banners", () => {
     expect(result.message).toContain("浏览器无法直接播放原始码流");
   });
 
+  it("names a client decode fallback reason in the degraded banner", () => {
+    const slow = notice({ planType: "SERVER_HLS", tier: 4, degraded: true, clientDecodeFallback: "slow" });
+    const stalled = notice({ planType: "SERVER_HLS", tier: 3, degraded: true, clientDecodeFallback: "stalled" });
+    const unviable = notice({ planType: "SERVER_HLS", tier: 3, degraded: true, clientDecodeFallback: "unviable" });
+
+    expect(slow.message).toContain("客户端解码过慢，已切换为服务器转码");
+    expect(stalled.message).toContain("长时间没有产出可播放画面");
+    expect(unviable.message).toContain("10-bit");
+    expect(slow.blocking).toBe(false);
+    // The old degradation copy is still there after the reason sentence.
+    expect(slow.message).toContain("Lux 已自动改用服务端 HLS 输出");
+  });
+
+  it("ignores a client decode reason when the plan is not a fallback", () => {
+    expect(playbackNoticeFor({ planType: "SERVER_HLS", tier: 2, clientDecodeFallback: "slow" }))
+      .toMatchObject({ message: expect.not.stringContaining("已切换为服务器转码") });
+    expect(playbackNoticeFor({ planType: "DIRECT", clientDecodeFallback: "slow" })).toBeNull();
+  });
+
   it("shows the remux banner when it is already a fallback", () => {
     const result = notice({ planType: "SERVER_HLS", tier: 1, degraded: true });
 

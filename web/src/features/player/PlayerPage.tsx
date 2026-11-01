@@ -59,6 +59,7 @@ import {
   type PlayerFailure,
 } from "./components/player-diagnostics";
 import { playbackNoticeFor, playbackNoticeSummary } from "./playback-notices";
+import type { ClientDecodeFallbackReason } from "./client-decode-fallback";
 import { usePlayerPlatform } from "./components/player-platform";
 import { usePlaybackReporting } from "./usePlaybackReporting";
 import { useCaptionSelection } from "./useCaptionSelection";
@@ -87,6 +88,7 @@ export function PlayerPage() {
   const [fallbackLoading, setFallbackLoading] = useState(false);
   const [fallbackSpeedX, setFallbackSpeedX] = useState<number | null>(null);
   const [clientEngineActive, setClientEngineActive] = useState(false);
+  const [clientDecodeFallback, setClientDecodeFallback] = useState<ClientDecodeFallbackReason | null>(null);
 
   // Playback control states
   const [currentTime, setCurrentTime] = useState(0);
@@ -415,7 +417,11 @@ export function PlayerPage() {
    * terminal path shows the failure instead and returns false, so callers can drop
    * state that must not leak into a later session.
    */
-  const requestServerFallback = useCallback(async (reason?: unknown): Promise<boolean> => {
+  const requestServerFallback = useCallback(async (
+    reason?: unknown,
+    clientDecodeFallbackReason?: ClientDecodeFallbackReason,
+  ): Promise<boolean> => {
+    if (clientDecodeFallbackReason) setClientDecodeFallback(clientDecodeFallbackReason);
     if (playbackPlan?.type === "DIRECT" && hasNextCandidate) {
       if (candidate && candidate.kind === rememberedCandidate()) clearRememberedCandidate();
       setCandidateOffset((offset) => offset + 1);
@@ -464,6 +470,7 @@ export function PlayerPage() {
     setFallbackLoading(false);
     setClientEngineActive(false);
     setFallbackSpeedX(null);
+    setClientDecodeFallback(null);
     currentTimeRef.current = 0;
     durationRef.current = 0;
     bufferedEndRef.current = 0;
@@ -626,6 +633,7 @@ export function PlayerPage() {
       status: sessionError instanceof ApiError ? sessionError.status : null,
       errorCode: sessionError instanceof ApiError ? sessionError.code : null,
       degraded: playbackAttempt !== 0,
+      clientDecodeFallback,
     });
   // A track switch intentionally clears the session plan while the replacement
   // session starts; keep the existing surface mounted without a failure layer.
