@@ -309,8 +309,8 @@ scripts/check-api-types.sh          # 只跑这一项
 | 响应 `resolution.sourceHeight` | `web_playback_session_json` | `WebPlaybackResolution.sourceHeight: number \| null` | 源视频高度（ffprobe `Height`），未探测为 `null` |
 | 响应 `resolution.maxHeight` | 同上 | `WebPlaybackResolution.maxHeight: number \| null` | 请求里的用户上限回显，未提供为 `null` |
 | 响应 `resolution.targetHeight` | 同上 | `WebPlaybackResolution.targetHeight: number \| null` | 实际输出高度；无法确定时为 `null` |
-| 响应 `resolution.limited` | 同上 | `WebPlaybackResolution.limited: boolean` | 仅当源高度 > `maxHeight`、服务端真的转码缩放时为 `true` |
-| 响应 `resolution` 键本身 | 同上 | `WebPlaybackSession.resolution?: WebPlaybackResolution` | **可选**：旧服务端不带该键，前端回落到中性文案「原画（自动）」 |
+| 响应 `resolution.limited` | 同上 | `WebPlaybackResolution.limited: boolean \| null` | 仅当源高度 > `maxHeight`、服务端真的转码缩放时为 `true`；无法确定时为 `null` |
+| 响应 `resolution` 键本身 | 同上 | `WebPlaybackSession.resolution?: WebPlaybackResolution \| null` | **可选**：旧服务端不带该键或显式给 `null`，前端回落到中性文案「原画（自动）」 |
 | 请求体 `max_bitrate: Option<i64>` | 同上 | `WebPlaybackRequestSelection.maxBitrate?: number` | **仅保留在 API 类型中**：UI 不再提供码率档位，播放页不再读取/写入 `maxBitrate` URL 参数 |
 | 响应 `bitrate.*` / `bitrate` 键 | 同上 | `WebPlaybackBitrate` / `WebPlaybackSession.bitrate?` | 继续保留（其它读路径仍可能使用），但播放页的画质文案已改用 `resolution` |
 
@@ -319,7 +319,7 @@ scripts/check-api-types.sh          # 只跑这一项
 - **`resolution` 与 `bitrate` 都保持可选**，与 `WebPlaybackPlan.candidates`、`MediaSource.bitrate` 的既有写法一致：
   这是读路径上的放宽，不会让旧响应的测试夹具全部失效；真正的必填化应等 G-Playback 改造成结构体时一次完成。
 - **语义**：源高度 > `maxHeight` 时服务端转码并缩放到 `maxHeight`；否则不变（`limited: false`）。
-  前端不自行断言服务端没有报告的结论：`resolution` 缺失或 `targetHeight/sourceHeight` 均为 `null` 时只显示「原画（自动）」。
+  前端不自行断言服务端没有报告的结论：`resolution`/`limited` 缺失或 `targetHeight/sourceHeight` 均为 `null` 时只显示「原画（自动）」。
 - **query key 槽位改为 `maxHeight`**（缓存按分辨率变体隔离，切换画质才能触发新会话）：
   `["playback-bootstrap" | "web-playback-session", itemId, sourceId, audioStreamIndex, subtitleStreamIndex, maxHeight, attempt]`。
   读取单个槽位的 helper 跟着各自的 feature 走：`audioParamFromQueryKey`（`audio-track-selection.ts`，下标 3）、

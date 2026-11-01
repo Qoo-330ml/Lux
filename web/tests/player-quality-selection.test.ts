@@ -207,6 +207,9 @@ describe("player quality status", () => {
     // `limited` without a target height must not be reported as "原画 <source>".
     expect(qualityStatusText(resolution({ sourceHeight: 2160, maxHeight: 720, limited: true })))
       .toBe("原画（自动）");
+    // A null `limited` is also "not reported": no conclusion about the output.
+    expect(qualityStatusText(resolution({ sourceHeight: 2160, targetHeight: 2160, limited: null })))
+      .toBe("原画（自动）");
   });
 });
 

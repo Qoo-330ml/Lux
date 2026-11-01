@@ -20,7 +20,7 @@ type QualitySwitchOptions = {
   /** Raw `maxHeight` URL value; the URL is the single source of truth. */
   requestedMaxHeight: string | null;
   /** `resolution` block of the current session; drives the effective-status line. */
-  playbackResolution: WebPlaybackResolution | undefined;
+  playbackResolution: WebPlaybackResolution | null | undefined;
   searchParams: URLSearchParams;
   setSearchParams: (next: URLSearchParams) => void;
   streamUrl: string;

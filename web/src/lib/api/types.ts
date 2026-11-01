@@ -504,8 +504,8 @@ export type WebPlaybackResolution = {
   sourceHeight: number | null;
   maxHeight: number | null;
   targetHeight: number | null;
-  /** `true` only when the server actually transcoded down to `maxHeight`. */
-  limited: boolean;
+  /** `true` only when the server actually transcoded down to `maxHeight`; `null` when unknown. */
+  limited: boolean | null;
 };
 
 export type WebPlaybackSession = {
@@ -517,8 +517,8 @@ export type WebPlaybackSession = {
   plan: WebPlaybackPlan;
   /** Absent on responses from servers that do not report the bitrate decision yet. */
   bitrate?: WebPlaybackBitrate;
-  /** Absent on responses from servers that do not report the resolution decision yet. */
-  resolution?: WebPlaybackResolution;
+  /** Absent (or `null`) on responses from servers that do not report the resolution decision yet. */
+  resolution?: WebPlaybackResolution | null;
 };
 
 /** Live `ffmpeg -progress` values for a running server-side HLS transcode. */

@@ -173,6 +173,10 @@ export function qualityStatusText(
   resolution: WebPlaybackResolution | null | undefined,
 ): string {
   if (!resolution) return "原画（自动）";
+  if (resolution.limited === null || resolution.limited === undefined) {
+    // `limited` missing means the server did not describe the output at all.
+    return "原画（自动）";
+  }
   if (resolution.limited) {
     // The server says it scaled, so the target height is the only honest claim;
     // without it the player must not fall back to the source height.
