@@ -80,6 +80,24 @@ describe("player resolution tiers", () => {
     expect(options.some((option) => (option.height ?? 0) >= 1080)).toBe(false);
   });
 
+  it("keeps a saved ceiling the current source cannot offer", () => {
+    // 4K 源选了 1440p 后切到 1080p 源：1440p 不再低于源高度，但仍是 URL 里的
+    // 真实选择，必须继续显示并标为当前，用户才能看到并切回「原画（自动）」。
+    const options = qualityOptions(source(1080), 1440);
+    expect(options.map((option) => option.value)).toEqual(["", "1440", "720", "480", "360"]);
+    expect(options[0]?.isCurrent).toBe(false);
+    expect(options.find((option) => option.value === "1440"))
+      .toMatchObject({ label: "1440p", height: 1440, isCurrent: true });
+  });
+
+  it("keeps a valid hand-written ceiling outside the named tiers", () => {
+    const options = qualityOptions(source(2160), 900);
+    expect(options.map((option) => option.value)).toContain("900");
+    expect(options.find((option) => option.value === "900"))
+      .toMatchObject({ label: "900p", height: 900, isCurrent: true });
+    expect(options[0]?.isCurrent).toBe(false);
+  });
+
   it("hides the selector when the source has no lower tier", () => {
     expect(qualityOptions(source(360), null).map((option) => option.label)).toEqual(["原画（自动）"]);
     expect(shouldShowQualitySelector(qualityOptions(source(360), null))).toBe(false);
@@ -191,6 +209,12 @@ describe("player quality status", () => {
   it("reports the original stream when nothing was scaled", () => {
     expect(qualityStatusText(resolution({ sourceHeight: 1080 }))).toBe("原画 1080p");
     expect(qualityStatusText(resolution({ sourceHeight: 2160, targetHeight: 2160 })))
+      .toBe("原画 2160p");
+    // `limited: false` reports what the server really emits: the target height
+    // wins over the source height, which may differ (e.g. anamorphic sources).
+    expect(qualityStatusText(resolution({ sourceHeight: 2160, targetHeight: 1920, limited: false })))
+      .toBe("原画 1920p");
+    expect(qualityStatusText(resolution({ sourceHeight: 2160, targetHeight: null, limited: false })))
       .toBe("原画 2160p");
   });
 

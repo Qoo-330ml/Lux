@@ -301,9 +301,13 @@ scripts/check-api-types.sh          # 只跑这一项
 ## 手工镜像补充：手动分辨率上限（`maxHeight`）
 
 手动画质上限没有走 ts-rs 试点（`bitrate` / `resolution` 仍由 `web_playback_session_json` 的 `json!` 拼装），
-前端按本文件约定继续手工镜像。播放页的「画质」已从码率上限改为分辨率上限，对应关系如下：
+前端按本文件约定继续手工镜像。播放页的「画质」已从码率上限改为分辨率上限，对应关系如下。
 
-| Rust（`src/api/playback.rs`） | 位置 | `types.ts` | 说明 |
+> **后端实现状态**：下表的 `max_height` 请求字段与 `resolution` 响应字段由并行后端任务
+> `playback-max-height-backend` 提供；该任务合并前，本文档按契约记录字段，Rust 侧尚未落地，
+> 不应把表中“Rust 位置/类型”当成已存在的代码。合并后如字段名或可空性有出入，以后端实际实现为准并同步本表。
+
+| Rust（契约，由 `playback-max-height-backend` 提供） | 位置 | `types.ts` | 说明 |
 | --- | --- | --- | --- |
 | 请求体 `max_height: Option<i64>` | `WebPlaybackSessionRequest` / `WebPlaybackBootstrapRequest` | `WebPlaybackRequestSelection.maxHeight?: number` | 可选，像素，144–4320；`client.ts` 把 `selection` 原样展开进请求体，不做字段重命名 |
 | 响应 `resolution.sourceHeight` | `web_playback_session_json` | `WebPlaybackResolution.sourceHeight: number \| null` | 源视频高度（ffprobe `Height`），未探测为 `null` |
@@ -320,6 +324,7 @@ scripts/check-api-types.sh          # 只跑这一项
   这是读路径上的放宽，不会让旧响应的测试夹具全部失效；真正的必填化应等 G-Playback 改造成结构体时一次完成。
 - **语义**：源高度 > `maxHeight` 时服务端转码并缩放到 `maxHeight`；否则不变（`limited: false`）。
   前端不自行断言服务端没有报告的结论：`resolution`/`limited` 缺失或 `targetHeight/sourceHeight` 均为 `null` 时只显示「原画（自动）」。
+  `limited: false` 的状态文案优先使用 `targetHeight`（服务端真实输出高度），缺失才回落到 `sourceHeight`。
 - **query key 槽位改为 `maxHeight`**（缓存按分辨率变体隔离，切换画质才能触发新会话）：
   `["playback-bootstrap" | "web-playback-session", itemId, sourceId, audioStreamIndex, subtitleStreamIndex, maxHeight, attempt]`。
   读取单个槽位的 helper 跟着各自的 feature 走：`audioParamFromQueryKey`（`audio-track-selection.ts`，下标 3）、

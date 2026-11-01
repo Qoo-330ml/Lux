@@ -97,10 +97,10 @@ function offeredTiers(sourceHeight: number | null): number[] {
  * output. An unknown (unprobed) source height shows every tier — the server does
  * not upgrade either, but the choice is preserved for when it is probed.
  *
- * A selection the current source cannot offer (a saved ceiling above a newly
- * switched, smaller source) is not rendered as a tier; `isCurrent` then falls
- * back to the automatic choice, while the URL keeps the saved parameter until
- * the user picks another option.
+ * A saved selection the current source cannot offer (a hand-written 900, or a
+ * ceiling above a newly switched, smaller source) is kept as an option and
+ * marked current. Dropping it would show 「原画（自动）」 while the requests keep
+ * sending the ceiling, and the user would have no way to clear it.
  */
 export function qualityOptions(
   source: MediaSource | undefined,
@@ -118,13 +118,16 @@ export function qualityOptions(
     }];
   }
   const tiers = offeredTiers(sourceVideoHeight(source));
-  const selectedIsOffered = selected !== null && tiers.includes(selected);
+  if (selected !== null && !tiers.includes(selected)) {
+    tiers.push(selected);
+    tiers.sort((left, right) => right - left);
+  }
   return [
     {
       value: "",
       label: "原画（自动）",
       height: null,
-      isCurrent: !selectedIsOffered,
+      isCurrent: selected === null,
     },
     ...tiers.map((height) => ({
       value: String(height),
@@ -165,9 +168,10 @@ export function qualitySwitchParams(
 /**
  * What the current session is actually doing, from the response `resolution`
  * summary: a limited session reports the height it was scaled to, an unlimited
- * one reports the source height. Without the block (or without a height) the
- * player knows nothing about the effective output, so it stays neutral instead
- * of claiming the ceiling was accepted.
+ * one reports the height the server really emits (`targetHeight`, which may
+ * differ from the probed source height). Without the block (or without a
+ * height) the player knows nothing about the effective output, so it stays
+ * neutral instead of claiming the ceiling was accepted.
  */
 export function qualityStatusText(
   resolution: WebPlaybackResolution | null | undefined,
@@ -184,7 +188,7 @@ export function qualityStatusText(
       ? `已缩放到 ${resolution.targetHeight}p`
       : "原画（自动）";
   }
-  const height = resolution.sourceHeight ?? resolution.targetHeight;
+  const height = resolution.targetHeight ?? resolution.sourceHeight;
   if (height === null) return "原画（自动）";
   return `原画 ${height}p`;
 }

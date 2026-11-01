@@ -347,6 +347,35 @@ describe("PlayerPage quality switching", () => {
     expect(optionsSnapshot.map((option) => option.value)).not.toContain("4000000");
   });
 
+  it("keeps a saved non-tier resolution visible and lets 原画 clear it", async () => {
+    await renderPlayer("/watch/movie-quality?maxHeight=900");
+    expect(bootstrapSelections).toEqual([
+      { audio: undefined, subtitle: undefined, maxHeight: 900 },
+    ]);
+
+    await openSettings();
+    expect(luxSelectValue(container!, "选择画质")).toBe("900");
+    const optionsSnapshot = await luxOptions(container!, "选择画质");
+    expect(optionsSnapshot.map((option) => option.value))
+      .toEqual(["", "1440", "1080", "900", "720", "480", "360"]);
+    expect(optionsSnapshot.find((option) => option.value === "900")?.label)
+      .toBe("900p（当前）");
+
+    await chooseLuxOptionByValue(container!, "选择画质", "");
+    await settleSwitch();
+
+    expect(container?.querySelector('[data-testid="current-location"]')?.textContent)
+      .toBe("/watch/movie-quality");
+    expect(bootstrapSelections.at(-1)).toEqual({
+      audio: undefined,
+      subtitle: undefined,
+      maxHeight: undefined,
+    });
+    await settleReplacement("web-default-auto");
+    expect(luxSelectValue(container!, "选择画质")).toBe("");
+    expect(container?.textContent).toContain("原画 2160p");
+  });
+
   it("rolls back to the previous resolution when the replacement session fails", async () => {
     vi.mocked(api.createWebPlaybackSession).mockImplementation(async (
       _itemId,
@@ -491,6 +520,31 @@ describe("PlayerPage quality switching", () => {
       audio: undefined,
       subtitle: undefined,
       maxHeight: 720,
+    });
+  });
+
+  it("keeps an inherited ceiling selectable after switching to a smaller source", async () => {
+    await renderPlayer("/watch/movie-quality?maxHeight=1440");
+    await openSettings();
+    await chooseLuxOptionByValue(container!, "选择播放版本", "source-quality-b");
+
+    expect(container?.querySelector('[data-testid="current-location"]')?.textContent)
+      .toBe("/watch/movie-quality?sourceId=source-quality-b&maxHeight=1440");
+    // 1080p 源已没有 1440p 档，但它是 URL 里真实保存的上限：仍显示并标为当前。
+    expect(luxSelectValue(container!, "选择画质")).toBe("1440");
+    const optionsSnapshot = await luxOptions(container!, "选择画质");
+    expect(optionsSnapshot.find((option) => option.value === "1440")?.label)
+      .toBe("1440p（当前）");
+
+    await chooseLuxOptionByValue(container!, "选择画质", "");
+    await settleSwitch();
+
+    expect(container?.querySelector('[data-testid="current-location"]')?.textContent)
+      .toBe("/watch/movie-quality?sourceId=source-quality-b");
+    expect(bootstrapSelections.at(-1)).toEqual({
+      audio: undefined,
+      subtitle: undefined,
+      maxHeight: undefined,
     });
   });
 
