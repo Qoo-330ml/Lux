@@ -397,6 +397,24 @@ describe("PlayerShortcutHelp", () => {
     expect(documentContextMenu).not.toHaveBeenCalled();
   });
 
+  it("stops a context menu opened on the dialog from toggling the info panel", () => {
+    const onClose = vi.fn();
+    const { element } = renderHelp(onClose);
+    const closeButton = element.querySelector<HTMLElement>('button[aria-label="关闭键盘快捷键"]');
+    if (!closeButton) throw new Error("close control was not rendered");
+    const documentContextMenu = vi.fn();
+    document.addEventListener("contextmenu", documentContextMenu);
+    try {
+      act(() => {
+        closeButton.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+      });
+    } finally {
+      document.removeEventListener("contextmenu", documentContextMenu);
+    }
+    expect(documentContextMenu).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
   it("marks the dialog with the attribute the key handler recognises", () => {
     const { element } = renderHelp();
     const dialog = helpDialog(element);

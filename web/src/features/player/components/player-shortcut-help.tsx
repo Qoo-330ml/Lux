@@ -124,6 +124,7 @@ export function PlayerShortcutHelp({ onClose, shortcuts = PLAYER_SHORTCUTS }: Pl
         data-player-shortcut-help
         onClick={(event) => event.stopPropagation()}
         onDoubleClick={(event) => event.stopPropagation()}
+        onContextMenu={(event) => event.stopPropagation()}
         onKeyDown={handleKeyDown}
       >
         <header className="lux-player-shortcut-help-head">
