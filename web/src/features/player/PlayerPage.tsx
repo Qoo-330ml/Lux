@@ -404,18 +404,24 @@ export function PlayerPage() {
     setNativeCaptionTracks,
   });
 
-  const requestServerFallback = useCallback(async (reason?: unknown) => {
+  /**
+   * Reacts to a failed Direct Play attempt. Returns true only when this same
+   * episode is reloaded (next candidate, or the server fallback session); every
+   * terminal path shows the failure instead and returns false, so callers can drop
+   * state that must not leak into a later session.
+   */
+  const requestServerFallback = useCallback(async (reason?: unknown): Promise<boolean> => {
     if (playbackPlan?.type === "DIRECT" && hasNextCandidate) {
       if (candidate && candidate.kind === rememberedCandidate()) clearRememberedCandidate();
       setCandidateOffset((offset) => offset + 1);
       setFailedStreamUrl(null);
       setPlaybackFailure(null);
-      return;
+      return true;
     }
     if (remoteHttpSource) {
       setFailedStreamUrl(streamUrl || null);
       setPlaybackFailure(classifyPlayerEngineFailure(reason));
-      return;
+      return false;
     }
     if (
       playbackAttempt !== 0 ||
@@ -424,13 +430,13 @@ export function PlayerPage() {
     ) {
       setFailedStreamUrl(streamUrl || null);
       setPlaybackFailure(classifyPlayerEngineFailure(reason));
-      return;
+      return false;
     }
     fallbackRequestedRef.current = true;
     const sessionId = playbackSessionIdRef.current;
     const fallbackGeneration = fallbackGenerationRef.current;
     if (sessionId) await stopActiveSession(sessionId);
-    if (fallbackGeneration !== fallbackGenerationRef.current) return;
+    if (fallbackGeneration !== fallbackGenerationRef.current) return false;
     if (playbackSessionIdRef.current === sessionId) {
       playbackSessionIdRef.current = null;
       resetSequence();
@@ -438,6 +444,7 @@ export function PlayerPage() {
     setPlaybackFailure(null);
     setFailedStreamUrl(null);
     setPlaybackAttempt(1);
+    return true;
   }, [candidate, hasNextCandidate, playbackAttempt, playbackPlan?.type, remoteHttpSource, resetSequence, stopActiveSession, streamUrl]);
 
   useEffect(() => {
@@ -498,7 +505,7 @@ export function PlayerPage() {
     onPlaybackEnded: handlePlaybackEnded,
     onPlaybackInterrupted: interruptAutoPlayNext,
     autoStartPlayback,
-    requestServerFallback: requestServerFallback as (reason?: unknown) => Promise<void>,
+    requestServerFallback,
     setCurrentTime,
     setDuration,
     setBufferedEnd,

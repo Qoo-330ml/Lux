@@ -1638,6 +1638,76 @@ describe("PlayerPage playback synchronization", () => {
     expect(container.querySelector('[role="alert"]')).toBeNull();
   });
 
+  it("drops the auto start request when the fallback session also fails", async () => {
+    const notSupported = () => new DOMException("no supported source", "NotSupportedError");
+    vi.mocked(HTMLMediaElement.prototype.play)
+      .mockRejectedValueOnce(notSupported())
+      .mockRejectedValueOnce(notSupported())
+      .mockResolvedValue(undefined);
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-retry-terminal",
+      title: "回退也失败",
+      itemType: "MOVIE",
+      mediaSources: [{
+        id: "terminal-source",
+        isDefault: true,
+        sourceKind: "LOCAL_FILE",
+        streams: [
+          { index: 0, type: "VIDEO", codec: "hevc" },
+          { index: 1, type: "AUDIO", codec: "aac", isDefault: true },
+          { index: 2, type: "AUDIO", codec: "eac3" },
+        ],
+      }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({ positionTicks: 0, isPlayed: false, state: null, isPaused: false });
+    vi.spyOn(api, "children").mockResolvedValue({ items: [] });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter
+            initialEntries={[{
+              pathname: "/watch/movie-retry-terminal",
+              state: { luxAutoStartPlayback: true },
+            }]}
+          >
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    // 直连起播失败 → 服务端回退重载 → 回退会话起播再失败，回退已用尽，属终态失败。
+    expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(2);
+    expect(container.querySelector('[role="alert"]')).not.toBeNull();
+
+    // 终态失败清掉一次性自动起播标记，之后手动切音轨的新会话不得自动起播。
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    if (!settings) throw new Error("settings control was not rendered");
+    await act(async () => settings.click());
+    await chooseLuxOptionByValue(container, "选择音轨", "2");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(2);
+  });
+
   it("cancels the countdown when the viewer resumes playback or seeks", async () => {
     const episodes = {
       "episode-resume-1": { id: "episode-resume-1", title: "重看第一集", itemType: "EPISODE" as const, seriesId: "series-resume", parentId: "season-resume", indexNumber: 1, mediaSources: [{ id: "resume-source-1", isDefault: true }] },

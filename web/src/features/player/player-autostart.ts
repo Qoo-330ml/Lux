@@ -20,6 +20,8 @@ export function requestsAutoStartPlayback(routeState: unknown): boolean {
 export type AutoStartPlaybackGate = {
   /** Remember a pending auto start (idempotent). */
   request: () => void;
+  /** True while a request is still waiting, without consuming it. */
+  peek: () => boolean;
   /** True exactly once per request, so a later source switch cannot replay it. */
   consume: () => boolean;
 };
@@ -29,6 +31,9 @@ export function createAutoStartPlaybackGate(pending: boolean): AutoStartPlayback
   return {
     request() {
       waiting = true;
+    },
+    peek() {
+      return waiting;
     },
     consume() {
       if (!waiting) return false;
@@ -67,28 +72,19 @@ export async function attemptAutoStartPlayback(
   }
 }
 
-export type AutoStartPlaybackRun = AutoStartPlaybackOutcome | "skipped";
-
 /**
- * Runs the pending one-shot request, if any, and treats it as consumed only when
- * the attempt really happened:
- * - a started playback consumes it, because the viewer now sees the new episode
- *   playing;
- * - a browser policy rejection consumes it too, because the player intentionally
- *   falls back to the manual play affordance instead of retrying;
- * - any other error re-arms the request before propagating, because that error
- *   sends the player into the server-fallback reload of the same episode, and the
- *   reloaded session is the one that must still auto start exactly once.
+ * Settles the pending one-shot request after a failed automatic start attempt.
+ *
+ * The request is kept only when the same episode really reloads — the server
+ * fallback plan or a Direct Play candidate retry — because that reloaded session
+ * is the one that must still auto start once. Every terminal failure (remote
+ * source, an already-used fallback attempt, an unsupported plan) clears it, so a
+ * later manual session such as the next episode, an audio track switch or a
+ * quality switch does not inherit the request and start playing on its own.
  */
-export async function consumeAutoStartPlayback(
+export function settleAutoStartPlaybackAfterFailure(
   gate: AutoStartPlaybackGate,
-  play: () => Promise<void>,
-): Promise<AutoStartPlaybackRun> {
-  if (!gate.consume()) return "skipped";
-  try {
-    return await attemptAutoStartPlayback(play);
-  } catch (error) {
-    gate.request();
-    throw error;
-  }
+  reloadPending: boolean,
+): void {
+  if (!reloadPending) gate.consume();
 }
