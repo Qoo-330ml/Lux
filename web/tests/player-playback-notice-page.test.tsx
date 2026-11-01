@@ -110,6 +110,18 @@ describe("PlayerPage unified playback notices", () => {
     expect(rendered.querySelector('[aria-label="重试"]')).not.toBeNull();
   });
 
+  it("asks the viewer to refresh when the CSRF check fails", async () => {
+    vi.spyOn(api, "createWebPlaybackSession").mockRejectedValue(
+      new ApiError("CSRF 校验失败", { status: 403, code: "CSRF_FAILED" }),
+    );
+
+    const rendered = await renderPlayer();
+
+    expect(rendered.querySelector('[role="alert"]')?.textContent).toContain("请求状态已失效");
+    expect(rendered.textContent).toContain("重新登录");
+    expect(rendered.textContent).not.toContain("播放策略");
+  });
+
   it("keeps the generic plan failure copy for unknown rejections", async () => {
     vi.spyOn(api, "createWebPlaybackSession").mockRejectedValue(new Error("network down"));
 

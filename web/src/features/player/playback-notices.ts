@@ -73,6 +73,14 @@ const PLAYBACK_UNAVAILABLE: NoticeCopy = {
   hint: "请稍后重试；如果持续失败，请联系管理员检查服务状态。",
 };
 
+const REQUEST_STALE: NoticeCopy = {
+  key: "playback-request-stale",
+  severity: "warning",
+  title: "请求状态已失效",
+  message: "这次播放请求没有通过服务端的会话校验（例如页面长时间未操作、跨标签页操作或登录状态已变化），服务端因此拒绝了它。",
+  hint: "刷新页面或重新登录后再试；如果仍然失败，请返回详情页重新开始播放。",
+};
+
 const REQUEST_INVALID: NoticeCopy = {
   key: "playback-request-invalid",
   severity: "error",
@@ -86,7 +94,7 @@ const STRM_REQUIRES_DIRECT_PLAY: NoticeCopy = {
   severity: "error",
   title: "STRM 源只能直连播放",
   message: ".strm 远程源在 Lux 中只支持直连播放，不代理媒体字节、也不交给服务端转码，而当前浏览器无法直接播放它的编码或容器格式。",
-  hint: "改用原生客户端（Infuse、VidHub 等）播放，或请管理员换一个浏览器可以直接播放的版本。",
+  hint: "尝试选择其他版本；改用原生客户端（Infuse、VidHub 等）播放，或请管理员换一个浏览器可以直接播放的版本。",
 };
 
 const BROWSER_CANNOT_CONSUME_HLS: NoticeCopy = {
@@ -94,7 +102,7 @@ const BROWSER_CANNOT_CONSUME_HLS: NoticeCopy = {
   severity: "error",
   title: "当前浏览器无法播放服务端 HLS",
   message: "浏览器没有声明支持 HLS/MSE，服务端因此无法用分片转码的方式输出这段媒体。",
-  hint: "换用支持 MSE 的现代浏览器（新版 Chrome、Edge、Firefox 或 Safari），或改用原生客户端。",
+  hint: "尝试选择其他版本，或换用支持 MSE 的现代浏览器（新版 Chrome、Edge、Firefox 或 Safari）、原生客户端。",
 };
 
 const NO_COMPATIBLE_SERVER_PLAN: NoticeCopy = {
@@ -113,12 +121,13 @@ const SERVER_TRANSCODING_DISABLED: NoticeCopy = {
   hint: "请联系管理员开启实时转码，或改用原生客户端播放。",
 };
 
-const UNSUPPORTED_BY_REASON: Record<string, NoticeCopy> = {
-  STRM_REQUIRES_DIRECT_PLAY,
-  BROWSER_CANNOT_CONSUME_HLS,
-  NO_COMPATIBLE_SERVER_PLAN,
-  SERVER_TRANSCODING_DISABLED,
-};
+/** A `Map` keeps prototype keys (`__proto__`, `constructor`) from resolving to copy objects. */
+const UNSUPPORTED_BY_REASON = new Map<string, NoticeCopy>([
+  ["STRM_REQUIRES_DIRECT_PLAY", STRM_REQUIRES_DIRECT_PLAY],
+  ["BROWSER_CANNOT_CONSUME_HLS", BROWSER_CANNOT_CONSUME_HLS],
+  ["NO_COMPATIBLE_SERVER_PLAN", NO_COMPATIBLE_SERVER_PLAN],
+  ["SERVER_TRANSCODING_DISABLED", SERVER_TRANSCODING_DISABLED],
+]);
 
 type TranscodeCopy = { title: string; message: string; hint?: string };
 
@@ -164,7 +173,10 @@ export function playbackNoticeSummary(notice: PlaybackNotice): string {
 
 function playbackFailureNotice({ status, errorCode }: PlaybackNoticeInput): PlaybackNotice | null {
   const code = (errorCode ?? "").toUpperCase();
-  if (code === "PERMISSION_DENIED" || status === 403) return blocking(POLICY_DENIED);
+  // A stale CSRF/session check is not a transcode policy denial: the plan may be perfectly legal.
+  if (code === "CSRF_FAILED") return blocking(REQUEST_STALE);
+  if (code === "PERMISSION_DENIED" || (status === 403 && !code)) return blocking(POLICY_DENIED);
+  if (status === 403) return blocking(REQUEST_STALE);
   if (status === 502) return blocking(TRANSCODE_CAPACITY);
   if (code === "DATABASE_UNAVAILABLE" || status === 503) return blocking(PLAYBACK_UNAVAILABLE);
   if (code === "INVALID_REQUEST" || status === 400) return blocking(REQUEST_INVALID);
@@ -176,7 +188,7 @@ function playbackFailureNotice({ status, errorCode }: PlaybackNoticeInput): Play
 
 function unsupportedNotice(reason: string | null | undefined): PlaybackNotice {
   const code = typeof reason === "string" ? reason.trim() : "";
-  const known = code ? UNSUPPORTED_BY_REASON[code] : undefined;
+  const known = code ? UNSUPPORTED_BY_REASON.get(code) : undefined;
   if (known) return blocking(known);
   return blocking({
     key: "unsupported-unknown",

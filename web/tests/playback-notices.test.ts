@@ -77,6 +77,24 @@ describe("playbackNoticeFor: UNSUPPORTED reasons", () => {
     expect(result.message).toContain("没有给出原因码");
     expect(result.message).not.toContain("null");
   });
+
+  it("ignores prototype keys supplied as an UNSUPPORTED reason", () => {
+    for (const reason of ["__proto__", "constructor", "toString", "hasOwnProperty"]) {
+      const result = notice({ planType: "UNSUPPORTED", reason });
+
+      expect(result.key).toBe("unsupported-unknown");
+      expect(result.title).toBe("这个媒体暂时无法在网页端播放");
+      expect(result.message).toContain(reason);
+      expect(result.hint).toBeTruthy();
+    }
+  });
+
+  it("suggests another version for the STRM and browser-capability reasons", () => {
+    expect(notice({ planType: "UNSUPPORTED", reason: "STRM_REQUIRES_DIRECT_PLAY" }).hint)
+      .toContain("其他版本");
+    expect(notice({ planType: "UNSUPPORTED", reason: "BROWSER_CANNOT_CONSUME_HLS" }).hint)
+      .toContain("其他版本");
+  });
 });
 
 describe("playbackNoticeFor: session failures", () => {
@@ -92,6 +110,22 @@ describe("playbackNoticeFor: session failures", () => {
     expect(byCode.key).toBe(byStatus.key);
     expect(byStatus.message).toContain("播放策略");
     expect(byStatus.hint).toContain("管理员");
+  });
+
+  it("reads a CSRF_FAILED 403 as a stale request state instead of a policy denial", () => {
+    const result = notice({ status: 403, errorCode: "CSRF_FAILED" });
+
+    expect(result).toMatchObject({
+      key: "playback-request-stale",
+      severity: "warning",
+      blocking: true,
+    });
+    expect(result.title).toContain("已失效");
+    expect(result.message).toContain("会话校验");
+    expect(result.hint).toContain("刷新页面");
+    expect(result.hint).toContain("重新登录");
+    expect(result.message).not.toContain("转码");
+    expect(result.hint).not.toContain("管理员");
   });
 
   it("explains a 502 as exhausted server transcode capacity", () => {
