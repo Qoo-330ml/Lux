@@ -96,6 +96,97 @@ export function evaluateDirectPlayWatchdog(watchdog: ClientDecodeWatchdog, nowMs
   return watchdog.firstSegmentAtMs === null && nowMs - watchdog.startedAtMs >= DIRECT_FIRST_FRAME_TIMEOUT_MS;
 }
 
+/**
+ * Playback time after which a native Direct Play element that still reports `videoWidth === 0` is
+ * treated as “the browser opened the container but decodes no video frame”.
+ *
+ * Confirmed on macOS Chrome and Win11 Edge with a Matroska whose video track is MPEG-4 Part 2: the
+ * element advanced `currentTime`, reached `readyState 4` and played the MP3 track while
+ * `videoWidth`/`videoHeight` stayed 0, with no `error` and no notice anywhere.
+ */
+export const NATIVE_SILENT_VIDEO_MS = 2_000;
+
+/** Playback time after which a native element that decoded no audio at all is treated as silent. */
+export const NATIVE_SILENT_AUDIO_MS = 3_000;
+
+/** How often the runtime samples the native element for the two silent-failure checks above. */
+export const NATIVE_SILENT_POLL_MS = 500;
+
+export type NativeSilentFailure =
+  /** The source has a video track but the element never produced a frame. */
+  | "silent-video"
+  /** The source has an audio track the element claims to support but never decodes. */
+  | "silent-audio";
+
+/**
+ * Accumulated *real* playback time for one native element.
+ *
+ * The watchdog must not fire while the element is buffering: a source that has not delivered bytes
+ * yet also reports `videoWidth === 0`. Only media time that advanced while the element was playing
+ * counts, and a single sample is capped so a background/suspended tab cannot fast-forward the clock.
+ */
+export type NativeSilentPlaybackClock = {
+  playedMs: number;
+  lastSampleMs: number | null;
+  lastCurrentTime: number | null;
+};
+
+export function startNativeSilentPlaybackClock(): NativeSilentPlaybackClock {
+  return { playedMs: 0, lastSampleMs: null, lastCurrentTime: null };
+}
+
+export function sampleNativeSilentPlayback(
+  clock: NativeSilentPlaybackClock,
+  sample: {
+    nowMs: number;
+    currentTime: number;
+    paused: boolean;
+    seeking: boolean;
+  },
+): NativeSilentPlaybackClock {
+  if (!Number.isFinite(sample.currentTime)) return clock;
+  const base = { lastSampleMs: sample.nowMs, lastCurrentTime: sample.currentTime };
+  if (clock.lastSampleMs === null || clock.lastCurrentTime === null) {
+    return { ...clock, ...base };
+  }
+  const elapsedMs = Math.min(sample.nowMs - clock.lastSampleMs, NATIVE_SILENT_POLL_MS * 2);
+  const advanced = sample.currentTime > clock.lastCurrentTime;
+  if (sample.paused || sample.seeking || !advanced) return { ...clock, ...base };
+  return { playedMs: clock.playedMs + Math.max(0, elapsedMs), ...base };
+}
+
+export type NativeSilentFailureInput = {
+  /** The source really carries a video track (cover art is already dropped by the probe). */
+  hasVideoStream: boolean;
+  hasAudioStream: boolean;
+  /** Accumulated playback time from `sampleNativeSilentPlayback`, after `loadedmetadata`. */
+  playedMs: number;
+  /** `HTMLVideoElement.videoWidth`; 0 means the element decoded no video frame. */
+  videoWidth: number | null | undefined;
+  /** Chromium's `webkitAudioDecodedByteCount`; undefined/null when the browser exposes none. */
+  audioDecodedBytes: number | null | undefined;
+  /** Safari's `video.audioTracks.length`; undefined/null when the browser exposes no track list. */
+  audioTrackCount: number | null | undefined;
+};
+
+/**
+ * Detects a native Direct Play element that is silently playing without a picture or without sound.
+ *
+ * Browsers cannot be trusted to report either: Chromium decodes only the audio track of a Matroska
+ * whose video codec it lacks, and an Edge without the Dolby extension answers `canPlayType("ac-3")`
+ * yet decodes no audio frame. Firefox exposes neither counter below, so it is never judged.
+ */
+export function evaluateNativeSilentFailure(input: NativeSilentFailureInput): NativeSilentFailure | null {
+  if (input.hasVideoStream && input.videoWidth === 0 && input.playedMs >= NATIVE_SILENT_VIDEO_MS) {
+    return "silent-video";
+  }
+  if (input.hasAudioStream && input.playedMs >= NATIVE_SILENT_AUDIO_MS) {
+    if (typeof input.audioDecodedBytes === "number" && input.audioDecodedBytes === 0) return "silent-audio";
+    if (typeof input.audioTrackCount === "number" && input.audioTrackCount === 0) return "silent-audio";
+  }
+  return null;
+}
+
 export function evaluateClientDecodeWatchdog(
   watchdog: ClientDecodeWatchdog,
   nowMs: number,
