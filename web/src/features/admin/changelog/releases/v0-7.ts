@@ -2,6 +2,35 @@ import type { ChangelogRelease } from "../types";
 
 export const changelogReleases07: ChangelogRelease[] = [
   {
+    version: "0.7.6",
+    date: "2026-11-02",
+    sections: [
+      { kind: "added", items: [
+        "自动连播下一集：一集播完后显示 10 秒倒计时卡（可立即播放或取消），结束后跳转下一集并自动起播；设置面板新增「自动连播下一集」开关，复用账户偏好 autoPlayNextEpisode；进入 CREDITS_START 章节后出现「跳过片尾」按钮。",
+        "播放页内切换音轨：设置面板新增「音轨」选择，按当前位置重建会话并保留暂停状态、倍速与字幕选择，直连播放也能显式选中第一条音轨；同时只允许一个切换在飞，失败回退并提示。",
+        "按分辨率选画质：档位改为 2160p/1440p/1080p/720p/480p/360p，只列严格低于源高度的档位，URL 参数改为 maxHeight；会话接口新增可选 maxHeight（144–4320，越界 400）与 resolution{sourceHeight,maxHeight,targetHeight,limited} 响应，统计补 videoWidth/videoHeight，重编码按目标高度推导码率并交给 FFmpeg 缩放；.strm 隐藏画质选择。",
+        "手动画质上限（码率）：播放会话新增可选 maxBitrate（100 kbps–200 Mbps），响应新增 bitrate（sourceBitrate/maxBitrate/targetBitrate/limited），targetBitrate 与 FFmpeg 实际 -b:v 一致（计入管理员码率上限）。",
+        "原生直放静默失败看门狗：DIRECT 计划下（远程 STRM 除外）每 500ms 采样原生元素，播放超过 2 秒但 videoWidth===0、或音频解码字节为 0，就自动回退服务端转码一次并给出提示。",
+        "播放不可用与降级提示：.strm、UNSUPPORTED、策略拒绝、转码并发占满、CSRF 失效等统一映射为中文提示并按错误码细分；降级时显示可关闭横幅；与换版本相关的失败统一指向「返回详情页选择其他版本」。",
+        "播放器快捷键帮助：按 ? 或点击控制条入口打开帮助浮层（触屏隐藏入口），快捷键收敛为单一数据源；浮层为模态遮罩，按键与点击不再漏给播放器。",
+        "转码管理页重做：改为「实时进度 / 转码历史 / 转码设置」标签页并去掉概览统计条，实时卡片带海报（剧集显示剧名与 SxxExx），设置按编码器、并发、画质、磁盘保护分组，未启用转码时硬件解码开关置灰，样式迁入 transcoding.css。",
+        "移除媒体库菜单里禁用的「复制」入口；播放设置面板去掉与详情页重复的「播放版本」下拉。",
+      ] },
+      { kind: "changed", items: [
+        "客户端解码门控收紧：浏览器端 WASM 软解 HEVC 只用于 ≤1080p，更高分辨率走服务端转码，原生 HEVC remux 不受限；取舍与实测见 docs/COMPATIBILITY.md 的「Web 播放：客户端解码回退与原生直放门控」。",
+        "奇数分辨率上限向下取偶：maxHeight 与管理员 max_output_height 在缩放、targetHeight 与码率查表处统一取偶（1081 → 1080），resolution.maxHeight 仍回显请求值；targetHeight 只在真正重编码时给确定值。",
+        "README 与 agent 规则对齐「分层 Web 播放 + 受限转码在范围内」；新增 docs/TODO-ROADMAP.md 记录产品完整度候选清单（只盘点，未拆任务）。",
+      ] },
+      { kind: "fixed", items: [
+        "4K HEVC 等 MKV 在浏览器端重新封装失败（MKV MSE SourceBuffer append failed）：解封装返回的 Buffer 视图被 MP4Box 按偏移 0 拷贝，导致 hvcC/avcC/vpcC/av1C 与样本错位；现在统一拷贝为独立数组并加回归测试。",
+        "客户端解码路径卡死不回退：DIRECT 计划下任何客户端引擎失败（MSE append 失败、编码串不支持、worker 错误、12 秒无首段、持续低于 0.5× 实时）都先回退一次服务端转码；原生直放 20 秒无 readyState≥2 同样回退。",
+        "原生 MKV 直放的静默失败：只有 h264/hevc/vp9/av1 允许原生直放，videoWidth===0 或音频解码字节为 0 时自动回退，且回退请求不再信任浏览器对 ac-3/ec-3/mpeg4 的可播放回答。",
+        "10-bit H.264/VP9/AV1 使用真实位深编码串探测；自动起播标记只在同集重载时保留一次、终态失败即清除；倒计时卡片不再逐秒播报；自动连播偏好首次读取不再覆盖用户切换。",
+        "播放页交互：音轨选择用 URL 结果判空，服务端会话重复点击不再重建；播放提示不再使用已被覆盖的会话错误；未知 403 错误码不再落入转码策略文案。",
+      ] },
+    ],
+  },
+  {
     version: "0.7.5",
     date: "2026-11-01",
     sections: [
