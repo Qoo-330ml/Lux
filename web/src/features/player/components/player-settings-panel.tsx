@@ -16,6 +16,10 @@ import {
   PlayerAudioTrackSelector,
   type PlayerAudioTrackSection,
 } from "./player-audio-track-selector";
+import {
+  PlayerQualitySelector,
+  type PlayerQualitySection,
+} from "./player-quality-selector";
 import { LuxSelectField } from "../../../components/ui";
 
 type PlayerPresentationSettings = PlayerVideoPresentation & {
@@ -44,6 +48,8 @@ type PlayerSettingsPanelProps = {
   onSourceChange?: (sourceId: string) => void;
   /** Independent audio-track slot; omitted when the player has no track data. */
   audioTracks?: PlayerAudioTrackSection;
+  /** Independent quality (bitrate ceiling) slot; omitted for Direct-only sources. */
+  quality?: PlayerQualitySection;
   captions?: readonly PlayerCaptionOption[];
   selectedCaptionId?: string | null;
   captionStatus?: string | null;
@@ -75,6 +81,7 @@ export function PlayerSettingsPanel({
   selectedSourceId = "",
   onSourceChange = () => undefined,
   audioTracks,
+  quality,
   captions = [],
   selectedCaptionId = null,
   captionStatus = null,
@@ -126,6 +133,7 @@ export function PlayerSettingsPanel({
         </div>
       ) : null}
       {audioTracks ? <PlayerAudioTrackSelector {...audioTracks} /> : null}
+      {quality ? <PlayerQualitySelector {...quality} /> : null}
       <div className="lux-player-settings-section">
         <span className="lux-player-settings-label" id="lux-player-speed-label">播放速度</span>
         <div className="lux-player-speed-grid" aria-labelledby="lux-player-speed-label">

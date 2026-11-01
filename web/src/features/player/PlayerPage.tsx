@@ -16,6 +16,7 @@ import { usePlayerScreenshot } from "./usePlayerScreenshot";
 import { usePlayerInfoPanel } from "./usePlayerInfoPanel";
 import { usePlayerPlaybackSession } from "./usePlayerPlaybackSession";
 import { useAudioTrackSwitch } from "./useAudioTrackSwitch";
+import { useQualitySwitch } from "./useQualitySwitch";
 import { usePlayerVideoElement } from "./usePlayerVideoElement";
 import { usePlayerNavigation } from "./usePlayerNavigation";
 import { usePlaybackSessionGate } from "./usePlaybackSessionGate";
@@ -113,6 +114,7 @@ export function PlayerPage() {
   const requestedSourceId = searchParams.get("sourceId");
   const requestedAudioStreamIndex = searchParams.get("audioStreamIndex");
   const requestedSubtitleStreamIndex = searchParams.get("subtitleStreamIndex");
+  const requestedMaxBitrate = searchParams.get("maxBitrate");
   const {
     playbackBootstrap,
     item,
@@ -135,9 +137,11 @@ export function PlayerPage() {
     requestedSourceId,
     requestedAudioStreamIndex,
     requestedSubtitleStreamIndex,
+    requestedMaxBitrate,
     playbackAttempt,
   });
 
+  const sessionFailed = Boolean(playbackBootstrap.error || webPlaybackSession.error);
   const nativeCaptionTracksSupported = typeof HTMLTrackElement !== "undefined";
   const {
     controlsVisible,
@@ -289,12 +293,37 @@ export function PlayerPage() {
     streamUrl,
     playing,
     playbackRate,
-    sessionFailed: Boolean(playbackBootstrap.error || webPlaybackSession.error)
-      || playbackPlan?.type === "UNSUPPORTED",
+    sessionFailed: sessionFailed || playbackPlan?.type === "UNSUPPORTED",
     videoRef,
     reportPlayback,
     resetControlsTimeout,
   });
+  const {
+    options: qualityOptions,
+    selectedValue: selectedQualityValue,
+    status: qualityStatus,
+    switching: switchingQuality,
+    notice: qualityNotice,
+    switchQuality,
+  } = useQualitySwitch({
+    itemId,
+    playbackKey,
+    source,
+    requestedMaxBitrate,
+    playbackBitrate: playbackSession?.bitrate,
+    searchParams,
+    setSearchParams,
+    streamUrl,
+    playing,
+    playbackRate,
+    sessionFailed: sessionFailed || playbackPlan?.type === "UNSUPPORTED",
+    videoRef,
+    reportPlayback,
+    resetControlsTimeout,
+  });
+  // Both selectors rebuild the session, so each is locked while either switch
+  // is in flight; otherwise the two URL rewrites could drop one another.
+  const switchingSession = switchingAudioTrack || switchingQuality;
 
   const nextEpisodeId = episodeNavigation?.nextEpisodeId ?? null;
   const { autoPlayEnabled, setAutoPlayEnabled } = useAutoPlayNextPreference();
@@ -427,7 +456,7 @@ export function PlayerPage() {
     setCurrentTime(0);
     setDuration(0);
     setBufferedEnd(0);
-  }, [itemId, requestedAudioStreamIndex, requestedSourceId]);
+  }, [itemId, requestedAudioStreamIndex, requestedMaxBitrate, requestedSourceId]);
 
   usePlaybackSessionGate({
     playbackKey,
@@ -568,7 +597,7 @@ export function PlayerPage() {
     : null;
   // A track switch intentionally clears the session plan while the replacement
   // session starts; keep the existing surface mounted without a failure layer.
-  const surfaceFailure = switchingAudioTrack
+  const surfaceFailure = switchingSession
     ? null
     : playbackFailure
       ?? planFailure
@@ -594,7 +623,7 @@ export function PlayerPage() {
     >
       <PlayerVideoSurface
         streamUrl={streamUrl}
-        keepVideoMounted={switchingAudioTrack}
+        keepVideoMounted={switchingSession}
         deferNativeSource={isMatroskaSource(source) && !remoteHttpSource}
         corsEnabled={source?.sourceKind !== "STRM_URL"}
         poster={poster}
@@ -636,7 +665,7 @@ export function PlayerPage() {
         onCaptionTrackError={() => setCaptionStatus("字幕加载失败")}
         errorMessage={null}
         failure={surfaceFailure}
-        showError={!switchingAudioTrack && (failedStreamUrl === streamUrl || !streamUrl)}
+        showError={!switchingSession && (failedStreamUrl === streamUrl || !streamUrl)}
         onRetry={() => window.location.reload()}
         onBack={handleBack}
       />
@@ -690,8 +719,18 @@ export function PlayerPage() {
             tracks: audioTracks,
             selectedIndex: selectedAudioStreamIndex,
             switching: switchingAudioTrack,
+            disabled: switchingQuality,
             notice: audioTrackNotice,
             onSelect: switchAudioTrack,
+          }}
+          quality={{
+            options: qualityOptions,
+            selectedValue: selectedQualityValue,
+            switching: switchingQuality,
+            disabled: switchingAudioTrack,
+            notice: qualityNotice,
+            status: qualityStatus,
+            onSelect: switchQuality,
           }}
           presentation={{
             loop: loopPlayback,

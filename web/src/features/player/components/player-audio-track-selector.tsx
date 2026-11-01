@@ -8,6 +8,8 @@ export type PlayerAudioTrackSection = {
   tracks: readonly AudioTrackOption[];
   selectedIndex: string | null;
   switching?: boolean;
+  /** Disabled while the other session-rebuilding selector is switching. */
+  disabled?: boolean;
   /** Failure/rollback message owned by the player's switch hook. */
   notice?: string | null;
   onSelect: (index: string) => void;
@@ -23,6 +25,7 @@ export function PlayerAudioTrackSelector({
   tracks,
   selectedIndex,
   switching = false,
+  disabled = false,
   notice = null,
   onSelect,
 }: PlayerAudioTrackSection) {
@@ -42,7 +45,7 @@ export function PlayerAudioTrackSelector({
         aria-label="选择音轨"
         title="选择音轨"
         value={current}
-        disabled={switching}
+        disabled={switching || disabled}
         onChange={(event) => onSelect(event.target.value)}
       >
         {tracks.map((track) => (

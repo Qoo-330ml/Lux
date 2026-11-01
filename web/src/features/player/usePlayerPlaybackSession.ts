@@ -6,9 +6,10 @@ import type {
   MediaItem,
   MediaSource,
   PlaybackState,
+  WebPlaybackRequestSelection,
   WebPlaybackSession,
-  WebPlaybackTrackSelection,
 } from "../../lib/api/types";
+import { parseMaxBitrateParam } from "./playback-quality";
 import { webPlaybackCapabilities } from "./playback-capabilities";
 import { episodeNavigationFor } from "./player-page-helpers";
 import type { PlayerEpisodeNavigation } from "./components/player-controls";
@@ -18,6 +19,7 @@ type PlayerPlaybackSessionOptions = {
   requestedSourceId: string | null;
   requestedAudioStreamIndex: string | null;
   requestedSubtitleStreamIndex: string | null;
+  requestedMaxBitrate: string | null;
   playbackAttempt: number;
 };
 
@@ -53,19 +55,24 @@ export function usePlayerPlaybackSession({
   requestedSourceId,
   requestedAudioStreamIndex,
   requestedSubtitleStreamIndex,
+  requestedMaxBitrate,
   playbackAttempt,
 }: PlayerPlaybackSessionOptions): PlayerPlaybackSession {
-  const trackSelection = useMemo<WebPlaybackTrackSelection | undefined>(() => {
+  // Out-of-contract URL values are dropped instead of being sent: the API
+  // rejects them with 400 and the player would have no recoverable UI state.
+  const maxBitrate = parseMaxBitrateParam(requestedMaxBitrate);
+  const trackSelection = useMemo<WebPlaybackRequestSelection | undefined>(() => {
     const audioStreamIndex = requestedAudioStreamIndex?.trim() ? Number(requestedAudioStreamIndex) : undefined;
     const subtitleStreamIndex = requestedSubtitleStreamIndex?.trim() ? Number(requestedSubtitleStreamIndex) : undefined;
-    return Number.isInteger(audioStreamIndex) || Number.isInteger(subtitleStreamIndex)
+    return Number.isInteger(audioStreamIndex) || Number.isInteger(subtitleStreamIndex) || maxBitrate !== null
       ? {
         ...(Number.isInteger(audioStreamIndex) ? { audioStreamIndex } : {}),
         ...(Number.isInteger(subtitleStreamIndex) ? { subtitleStreamIndex } : {}),
+        ...(maxBitrate !== null ? { maxBitrate } : {}),
       }
       : undefined;
-  }, [requestedAudioStreamIndex, requestedSubtitleStreamIndex]);
-  const bootstrapKey = `${itemId}:${requestedSourceId ?? ""}:${requestedAudioStreamIndex ?? ""}:${playbackAttempt}`;
+  }, [maxBitrate, requestedAudioStreamIndex, requestedSubtitleStreamIndex]);
+  const bootstrapKey = `${itemId}:${requestedSourceId ?? ""}:${requestedAudioStreamIndex ?? ""}:${maxBitrate ?? ""}:${playbackAttempt}`;
   const [sessionGateKey, setSessionGateKey] = useState(bootstrapKey);
 
   const playbackBootstrap = usePlaybackBootstrapQuery({
@@ -73,6 +80,7 @@ export function usePlayerPlaybackSession({
     requestedSourceId,
     requestedAudioStreamIndex,
     requestedSubtitleStreamIndex,
+    maxBitrate,
     playbackAttempt,
     trackSelection,
     bootstrapKey,
@@ -112,7 +120,7 @@ export function usePlayerPlaybackSession({
   const playbackKeySourceId = playbackAttempt === 0 && !requestedSourceId
     ? ""
     : source?.id ?? requestedSourceId ?? "";
-  const playbackKey = `${itemId}:${playbackKeySourceId}:${requestedAudioStreamIndex ?? ""}:${playbackAttempt}`;
+  const playbackKey = `${itemId}:${playbackKeySourceId}:${requestedAudioStreamIndex ?? ""}:${maxBitrate ?? ""}:${playbackAttempt}`;
   const sessionStartedRef = useRef(false);
   const playbackSessionIdRef = useRef<string | null>(null);
   const webPlaybackSession = useWebPlaybackSessionQuery({
@@ -121,6 +129,7 @@ export function usePlayerPlaybackSession({
     playbackAttempt,
     requestedAudioStreamIndex,
     requestedSubtitleStreamIndex,
+    maxBitrate,
     trackSelection,
     useLegacyPlaybackQueries,
     playbackKey,
@@ -156,8 +165,9 @@ export function usePlayerPlaybackSession({
   };
 }
 
-type BootstrapQueryOptions = PlayerPlaybackSessionOptions & {
-  trackSelection: WebPlaybackTrackSelection | undefined;
+type BootstrapQueryOptions = Omit<PlayerPlaybackSessionOptions, "requestedMaxBitrate"> & {
+  maxBitrate: number | null;
+  trackSelection: WebPlaybackRequestSelection | undefined;
   bootstrapKey: string;
   sessionGateKey: string;
 };
@@ -167,6 +177,7 @@ function usePlaybackBootstrapQuery({
   requestedSourceId,
   requestedAudioStreamIndex,
   requestedSubtitleStreamIndex,
+  maxBitrate,
   playbackAttempt,
   trackSelection,
   bootstrapKey,
@@ -174,7 +185,14 @@ function usePlaybackBootstrapQuery({
 }: BootstrapQueryOptions) {
   const bootstrapCapabilities = webPlaybackCapabilities(undefined, playbackAttempt);
   return useQuery({
-    queryKey: queryKeys.playbackBootstrap(itemId, requestedSourceId, playbackAttempt, requestedAudioStreamIndex, requestedSubtitleStreamIndex),
+    queryKey: queryKeys.playbackBootstrap(
+      itemId,
+      requestedSourceId,
+      playbackAttempt,
+      requestedAudioStreamIndex,
+      requestedSubtitleStreamIndex,
+      maxBitrate,
+    ),
     queryFn: ({ signal }) => api.createWebPlaybackBootstrap(
       itemId,
       requestedSourceId ?? undefined,
@@ -211,7 +229,8 @@ type WebPlaybackSessionQueryOptions = {
   playbackAttempt: number;
   requestedAudioStreamIndex: string | null;
   requestedSubtitleStreamIndex: string | null;
-  trackSelection: WebPlaybackTrackSelection | undefined;
+  maxBitrate: number | null;
+  trackSelection: WebPlaybackRequestSelection | undefined;
   useLegacyPlaybackQueries: boolean;
   playbackKey: string;
   sessionGateKey: string;
@@ -225,6 +244,7 @@ function useWebPlaybackSessionQuery({
   playbackAttempt,
   requestedAudioStreamIndex,
   requestedSubtitleStreamIndex,
+  maxBitrate,
   trackSelection,
   useLegacyPlaybackQueries,
   playbackKey,
@@ -234,7 +254,14 @@ function useWebPlaybackSessionQuery({
 }: WebPlaybackSessionQueryOptions) {
   const capabilities = webPlaybackCapabilities(source, playbackAttempt);
   return useQuery({
-    queryKey: queryKeys.webPlaybackSession(itemId, source?.id ?? "", playbackAttempt, requestedAudioStreamIndex, requestedSubtitleStreamIndex),
+    queryKey: queryKeys.webPlaybackSession(
+      itemId,
+      source?.id ?? "",
+      playbackAttempt,
+      requestedAudioStreamIndex,
+      requestedSubtitleStreamIndex,
+      maxBitrate,
+    ),
     queryFn: ({ signal }) => api.createWebPlaybackSession(
       itemId,
       source?.id ?? "",
