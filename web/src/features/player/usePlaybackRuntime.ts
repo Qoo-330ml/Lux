@@ -16,6 +16,10 @@ import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
 import { classifyPlayerEngineFailure } from "./components/player-diagnostics";
 import { createPlaybackTimelineScheduler } from "./player-timeline-scheduler";
+import {
+  attemptAutoStartPlayback,
+  createAutoStartPlaybackGate,
+} from "./player-autostart";
 import { TICKS_PER_SECOND, isMatroskaSource, useClientEngine } from "./player-page-helpers";
 import type { PlaybackReporting } from "./usePlaybackReporting";
 
@@ -61,6 +65,12 @@ type PlaybackRuntimeOptions = {
   reportPlayback: PlaybackReporting["reportPlayback"];
   stopActiveSession: PlaybackReporting["stopActiveSession"];
   markStarted: () => void;
+  /** Playback reached the media end without looping; the page decides what is next. */
+  onPlaybackEnded?: () => void;
+  /** One-shot request: start playing once this session finished loading. */
+  autoStartPlayback?: boolean;
+  /** The viewer resumed playback or moved the playhead inside this episode. */
+  onPlaybackInterrupted?: () => void;
   requestServerFallback: (reason?: unknown) => Promise<void>;
   setCurrentTime: (value: number) => void;
   setDuration: (value: number) => void;
@@ -105,6 +115,9 @@ export function usePlaybackRuntime({
   reportPlayback,
   stopActiveSession,
   markStarted,
+  onPlaybackEnded,
+  autoStartPlayback,
+  onPlaybackInterrupted,
   requestServerFallback,
   setCurrentTime,
   setDuration,
@@ -119,6 +132,25 @@ export function usePlaybackRuntime({
   setClientEngineActive,
 }: PlaybackRuntimeOptions) {
   const playbackEngineHandoffRef = useRef<PlaybackEngineHandoff | null>(null);
+  // The ended callback is read through a ref so a changing page callback never
+  // re-runs the engine loading effect below.
+  const onPlaybackEndedRef = useRef(onPlaybackEnded);
+  const onPlaybackInterruptedRef = useRef(onPlaybackInterrupted);
+  // The auto start request survives the page stripping the router marker right
+  // after mount, and is consumed once so a source switch does not replay it.
+  const autoStartGateRef = useRef(createAutoStartPlaybackGate(autoStartPlayback === true));
+
+  useEffect(() => {
+    onPlaybackEndedRef.current = onPlaybackEnded;
+  }, [onPlaybackEnded]);
+
+  useEffect(() => {
+    onPlaybackInterruptedRef.current = onPlaybackInterrupted;
+  }, [onPlaybackInterrupted]);
+
+  useEffect(() => {
+    if (autoStartPlayback) autoStartGateRef.current.request();
+  }, [autoStartPlayback]);
 
   const restorePlaybackPosition = useCallback(() => {
     if (hasRestoredPositionRef.current) return;
@@ -206,6 +238,7 @@ export function usePlaybackRuntime({
           void restoreEngineHandoff();
           break;
         case "PLAYING":
+          onPlaybackInterruptedRef.current?.();
           markStarted();
           setPlaying(true);
           setControlsVisible(true);
@@ -229,6 +262,7 @@ export function usePlaybackRuntime({
           break;
         case "SEEKED":
           syncSnapshot(event.snapshot, true);
+          onPlaybackInterruptedRef.current?.();
           break;
         case "TIME_UPDATE":
           syncSnapshot(event.snapshot);
@@ -252,6 +286,7 @@ export function usePlaybackRuntime({
           const sessionId = playbackSessionIdRef.current;
           void reportPlayback("STOPPED", true, false, initialEngine.element, sessionId);
           void stopActiveSession(sessionId);
+          onPlaybackEndedRef.current?.();
           break;
         }
         case "ERROR":
@@ -344,6 +379,12 @@ export function usePlaybackRuntime({
           },
         );
         if (!cancelled) await restoreEngineHandoff();
+        if (!cancelled && autoStartGateRef.current.consume()) {
+          // A browser autoplay policy rejection leaves the player paused on the
+          // normal play affordance; any other error is rethrown into the existing
+          // playback failure handling of this load() call.
+          await attemptAutoStartPlayback(() => runtime.play());
+        }
         if (!cancelled && activeEngine.performance)
           handlePerformance(
             new CustomEvent(PLAYBACK_PERFORMANCE_EVENT, {

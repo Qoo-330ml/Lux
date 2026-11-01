@@ -23,7 +23,11 @@ import type {
   PointerEvent as ReactPointerEvent,
   RefObject,
 } from "react";
-import { PlayerChapterTimeline, PlayerIntroSkip } from "./player-chapter-timeline";
+import {
+  PlayerChapterTimeline,
+  PlayerIntroSkip,
+  PlayerSkipCredits,
+} from "./player-chapter-timeline";
 import type { PlayerChapterSegment, PlayerIntroRange } from "../player-chapters";
 
 export type PlayerControlsProps = {
@@ -40,6 +44,8 @@ export type PlayerControlsProps = {
   airPlayAvailable?: boolean;
   chapters?: readonly PlayerChapterSegment[];
   introSkip?: PlayerIntroRange | null;
+  creditsStart?: number | null;
+  hasNextEpisode?: boolean;
   settingsOpen: boolean;
   infoOpen: boolean;
   remainingTime: boolean;
@@ -62,6 +68,7 @@ export type PlayerControlsProps = {
   onAirPlay?: () => void;
   onChapterSeek?: (seconds: number) => void;
   onSkipIntro?: (seconds: number) => void;
+  onSkipCredits?: () => void;
   onTakeScreenshot: () => void;
   onToggleSettings: () => void;
   onToggleInfo: () => void;
@@ -100,6 +107,8 @@ export function PlayerControls({
   airPlayAvailable = false,
   chapters = [],
   introSkip = null,
+  creditsStart = null,
+  hasNextEpisode = false,
   settingsOpen,
   infoOpen,
   remainingTime,
@@ -122,6 +131,7 @@ export function PlayerControls({
   onAirPlay = () => undefined,
   onChapterSeek = () => undefined,
   onSkipIntro = () => undefined,
+  onSkipCredits = () => undefined,
   onTakeScreenshot,
   onToggleSettings,
   onToggleInfo,
@@ -136,6 +146,14 @@ export function PlayerControls({
   return (
     <div className="lux-player-controls-wrap">
       <PlayerIntroSkip currentTime={currentTime} introSkip={introSkip} onSkip={onSkipIntro} />
+      <PlayerSkipCredits
+        currentTime={currentTime}
+        duration={duration}
+        creditsStart={creditsStart}
+        introRange={introSkip}
+        hasNextEpisode={hasNextEpisode}
+        onSkip={onSkipCredits}
+      />
       <div className="lux-player-timeline-row">
         <button
           type="button"

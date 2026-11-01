@@ -24,6 +24,11 @@ type PlayerPresentationSettings = PlayerVideoPresentation & {
   onChangeFlip: (flip: PlayerFlip) => void;
 };
 
+type PlayerAutoPlaySettings = {
+  enabled: boolean;
+  onToggle: () => void;
+};
+
 export type PlayerSettingsSourceOption = {
   id: string;
   label: string;
@@ -46,6 +51,7 @@ type PlayerSettingsPanelProps = {
   captionOffset?: number;
   onChangeCaptionOffset?: (offset: number) => void;
   presentation?: PlayerPresentationSettings;
+  autoPlay?: PlayerAutoPlaySettings;
   onClose: () => void;
 };
 
@@ -76,6 +82,7 @@ export function PlayerSettingsPanel({
   captionOffset = 0,
   onChangeCaptionOffset = () => undefined,
   presentation,
+  autoPlay,
   onClose,
 }: PlayerSettingsPanelProps) {
   const captionHelp = captionStatus
@@ -136,6 +143,24 @@ export function PlayerSettingsPanel({
           ))}
         </div>
       </div>
+      {autoPlay ? (
+        <div className="lux-player-settings-section">
+          <span className="lux-player-settings-label" id="lux-player-auto-play-label">
+            自动连播下一集
+          </span>
+          <button
+            type="button"
+            className={`lux-player-speed-pill ${autoPlay.enabled ? "is-active" : ""}`}
+            role="switch"
+            aria-label="自动连播下一集"
+            aria-checked={autoPlay.enabled}
+            onClick={autoPlay.onToggle}
+          >
+            {autoPlay.enabled ? "已开启" : "已关闭"}
+            {autoPlay.enabled ? <Check size={14} aria-hidden="true" /> : null}
+          </button>
+        </div>
+      ) : null}
       {presentation ? (
         <>
           <div className="lux-player-settings-section">
