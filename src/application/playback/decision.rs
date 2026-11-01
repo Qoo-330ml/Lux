@@ -124,6 +124,7 @@ impl PlaybackBitrateLimit {
     }
 }
 
+/// The plain decision for a request that selected no output ceiling.
 pub fn choose_plan(input: PlaybackDecisionInput) -> PlaybackPlan {
     choose_plan_with_bitrate(input, PlaybackBitrateLimit::NONE)
 }
