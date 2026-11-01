@@ -19,7 +19,7 @@ use tokio::{
     time::sleep,
 };
 
-use super::decision::ServerTier;
+use super::decision::{ServerTier, even_output_height};
 
 const MAX_REMUX_SESSIONS: usize = 4;
 const MAX_HARDWARE_SESSIONS: usize = 2;
@@ -348,13 +348,16 @@ pub(crate) fn effective_video_bitrate(requested: Option<i64>, admin_cap_bps: i64
 /// for less than the administrator allows but never for more. A cap of `0` produces no scale
 /// filter at all, which keeps the original picture untouched.
 pub(crate) fn effective_max_output_height(admin_cap: u32, requested: Option<u32>) -> u32 {
-    match requested {
+    let cap = match requested {
         Some(requested) if requested > 0 => match admin_cap {
             0 => requested,
             admin_cap => requested.min(admin_cap),
         },
         _ => admin_cap,
-    }
+    };
+    // H.264 and every hardware encoder Lux starts require even picture dimensions, so an odd
+    // ceiling (1081p) has to become an even one (1080p) before it reaches `scale=-2:min(ih,N)`.
+    u32::try_from(even_output_height(i64::from(cap))).unwrap_or(0)
 }
 
 /// Remembers which generation served a segment without letting the map grow without bound.
@@ -4107,6 +4110,21 @@ while :; do sleep 1; done
             2_160,
             "a zero request means no caller ceiling"
         );
+        assert_eq!(
+            effective_max_output_height(0, Some(1_081)),
+            1_080,
+            "H.264 cannot encode an odd height, so an odd ceiling is rounded down"
+        );
+        assert_eq!(
+            effective_max_output_height(2_160, Some(145)),
+            144,
+            "rounding down never leaves the accepted height band"
+        );
+        assert_eq!(
+            effective_max_output_height(481, None),
+            480,
+            "an odd administrator cap is rounded for the same reason"
+        );
     }
 
     #[test]
@@ -4135,6 +4153,16 @@ while :; do sleep 1; done
         assert_eq!(
             super::video_filter_chain(&encoding, ServerTier::SoftwareTranscode).as_deref(),
             Some("scale=-2:min(ih\\,720)")
+        );
+
+        // An odd ceiling becomes an even filter height instead of failing the encoder with
+        // "height not divisible by 2".
+        let mut encoding = super::FfmpegEncodingOptions::from_runtime(&runtime);
+        encoding.max_output_height =
+            super::effective_max_output_height(runtime.max_output_height, Some(1_081));
+        assert_eq!(
+            super::video_filter_chain(&encoding, ServerTier::SoftwareTranscode).as_deref(),
+            Some("scale=-2:min(ih\\,1080)")
         );
 
         // A session without either ceiling keeps the original picture.

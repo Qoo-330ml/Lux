@@ -2357,19 +2357,35 @@ impl MaxBitrateFixture {
         })
     }
 
-    /// Stores the administrator's transcoding policy; `maxVideoBitrateKbps` caps every encode.
-    async fn set_max_video_bitrate_kbps(
+    /// Replaces the administrator's transcoding policy.
+    async fn set_transcoding_settings(
         &self,
-        kbps: i64,
+        settings: Value,
     ) -> Result<(), Box<dyn std::error::Error>> {
         sqlx::query(
             "INSERT INTO server_settings (key, value) VALUES ('transcoding', ?)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         )
-        .bind(json!({ "maxVideoBitrateKbps": kbps }).to_string())
+        .bind(settings.to_string())
         .execute(self.database.pool())
         .await?;
         Ok(())
+    }
+
+    /// Stores the administrator's transcoding policy; `maxVideoBitrateKbps` caps every encode.
+    async fn set_max_video_bitrate_kbps(
+        &self,
+        kbps: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.set_transcoding_settings(json!({ "maxVideoBitrateKbps": kbps }))
+            .await
+    }
+
+    /// Stores the administrator's global output height cap, which every encode is scaled to at
+    /// most.
+    async fn set_max_output_height(&self, height: i64) -> Result<(), Box<dyn std::error::Error>> {
+        self.set_transcoding_settings(json!({ "maxOutputHeight": height }))
+            .await
     }
 
     /// The command line FFmpeg was started with, once the (asynchronous) child recorded it.
@@ -3155,6 +3171,118 @@ async fn web_playback_bootstrap_accepts_the_max_height() -> Result<(), Box<dyn s
         .as_str()
         .ok_or("missing bootstrap session id")?
         .to_owned();
+    fixture.stop_session(&session_id).await?;
+    fixture.server.abort();
+    Ok(())
+}
+
+/// An odd ceiling cannot reach the encoder as-is: H.264 would refuse it with "height not divisible
+/// by 2", so the height is rounded down before the scale filter and reported rounded as well.
+#[tokio::test]
+async fn web_playback_rounds_an_odd_max_height_down_to_even()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = MaxBitrateFixture::with_media(Some(20_000_000), Some(2_160)).await?;
+
+    let (status, created) = fixture
+        .create_session(json!({
+            "itemId": fixture.item_id,
+            "sourceId": fixture.source_id,
+            "maxHeight": 1081,
+            "capabilities": {
+                "directPlay": true,
+                "hls": true,
+                "softwareTranscode": true
+            }
+        }))
+        .await?;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "an odd ceiling must still produce a playable plan, not an encode failure: {created}"
+    );
+    assert_eq!(created["plan"]["type"], json!("SERVER_HLS"));
+    assert_eq!(created["tier"], json!(4));
+    assert_eq!(
+        created["resolution"]["maxHeight"],
+        json!(1081),
+        "the request is reported as the client sent it"
+    );
+    assert_eq!(
+        created["resolution"]["targetHeight"],
+        json!(1080),
+        "the output height is the rounded ceiling"
+    );
+    assert_eq!(created["resolution"]["limited"], json!(true));
+    assert_eq!(
+        created["bitrate"]["targetBitrate"],
+        json!(8_000_000),
+        "the bitrate ladder follows the rounded 1080p output"
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .ok_or("missing odd-height session id")?
+        .to_owned();
+
+    assert_eq!(
+        fixture.ffmpeg_argument("-vf").await?,
+        "scale=-2:min(ih\\,1080)",
+        "the encoder must never receive an odd height"
+    );
+    assert_eq!(fixture.ffmpeg_video_bitrate().await?, "8000000");
+
+    fixture.stop_session(&session_id).await?;
+    fixture.server.abort();
+    Ok(())
+}
+
+/// The administrator's global height cap is part of the real output height, so it decides which
+/// bitrate rung the derived `-b:v` comes from.
+#[tokio::test]
+async fn web_playback_derives_the_bitrate_from_the_administrator_capped_height()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = MaxBitrateFixture::with_media(Some(20_000_000), Some(2_160)).await?;
+    fixture.set_max_output_height(480).await?;
+
+    let (status, created) = fixture
+        .create_session(json!({
+            "itemId": fixture.item_id,
+            "sourceId": fixture.source_id,
+            "maxHeight": 1080,
+            "capabilities": {
+                "directPlay": true,
+                "hls": true,
+                "softwareTranscode": true
+            }
+        }))
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(created["plan"]["type"], json!("SERVER_HLS"));
+    assert_eq!(created["resolution"]["maxHeight"], json!(1080));
+    assert_eq!(
+        created["resolution"]["targetHeight"],
+        json!(480),
+        "the administrator cap is the smallest known ceiling: {created}"
+    );
+    assert_eq!(created["resolution"]["limited"], json!(true));
+    assert_eq!(
+        created["bitrate"]["targetBitrate"],
+        json!(2_000_000),
+        "480p derives 2 Mbit/s, not the 8 Mbit/s the requested 1080p would"
+    );
+    let session_id = created["sessionId"]
+        .as_str()
+        .ok_or("missing capped-height session id")?
+        .to_owned();
+
+    assert_eq!(
+        fixture.ffmpeg_argument("-vf").await?,
+        "scale=-2:min(ih\\,480)"
+    );
+    assert_eq!(fixture.ffmpeg_video_bitrate().await?, "2000000");
+    let stats = fixture.stats(&session_id).await?;
+    assert_eq!(stats["output"]["videoHeight"], json!(480));
+    assert_eq!(stats["output"]["videoBitrate"], json!(2_000_000));
+
     fixture.stop_session(&session_id).await?;
     fixture.server.abort();
     Ok(())

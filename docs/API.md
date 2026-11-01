@@ -395,7 +395,11 @@ Web 播放使用独立于 Emby 的播放会话 API。创建和状态写入接口
   或不高于上限时决策与原来完全一致，绝不因分辨率而升级。`maxBitrate` 保持兼容，可与 `maxHeight` 同时给出，
   两者取更严格者。只按分辨率限制时，服务端按目标高度推导 `-b:v`：≤360→1 Mbps、≤480→2 Mbps、≤720→4 Mbps、
   ≤1080→8 Mbps、≤1440→12 Mbps、其余→20 Mbps，再与源码率（不得高于源）、管理员码率上限和显式 `maxBitrate`
-  取最小。上限无法满足时按既有 `UNSUPPORTED` 原因返回，用户策略禁止所需档位时返回 403 `PERMISSION_DENIED`。
+  取最小。推导码率用的是**实际输出高度**（源高度、请求高度、管理员 `max_output_height` 三者取小），与
+  `resolution.targetHeight` 一致，因此管理员把输出压到 480p 时，即使请求 1080p 也按 480p 的 2 Mbps 档取。
+  编码器只接受偶数高度，奇数上限会在边界处向下规整为偶数（如 `1081`→`1080`），`scale` 滤镜、
+  `resolution.targetHeight` 与码率查表都用规整后的值；请求值本身仍按原样回显在 `resolution.maxHeight`。
+  上限无法满足时按既有 `UNSUPPORTED` 原因返回，用户策略禁止所需档位时返回 403 `PERMISSION_DENIED`。
   `.strm` 继续只允许 Direct Play，该字段被忽略。值越界返回 400 `INVALID_REQUEST`。
 - 响应中的 `bitrate` 描述实际生效的决策：`sourceBitrate`（源码率，未探测为 `null`）、`maxBitrate`（请求的上限，
   未提供为 `null`）、`targetBitrate`（服务端实际编码的视频码率，Direct/Remux/音频转码等拷贝视频的档位为
@@ -404,9 +408,10 @@ Web 播放使用独立于 Emby 的播放会话 API。创建和状态写入接口
   `targetBitrate` 仍有值），两者都没有时为空。前端据此显示「原画」或「已限制到 X」。同一值写入会话输出描述，
   `GET /api/v1/playback/sessions/{sessionId}/stats` 的 `output.videoBitrate` 与之一致。
 - `resolution` 描述分辨率上限实际生效的决策：`sourceHeight`（源视频高度，来自已落库的 `media_streams.details_json`
-  里第一条视频流的 `Height`，未探测为 `null`）、`maxHeight`（请求的上限，未提供为 `null`）、`targetHeight`（实际输出
-  高度：重编码档位取源高度、请求上限与管理员 `encoding.max_output_height` 三者已知值中的最小值；Direct/Remux/音频
-  转码保持源画面，因此就是源高度；`UNSUPPORTED` 不产生画面，为 `null`）、`limited`（是否因本字段真正发生了
+  里第一条视频流的 `Height`，未探测为 `null`）、`maxHeight`（请求的上限，按客户端原样回显，未提供为 `null`）、
+  `targetHeight`（实际输出高度：重编码档位取源高度、请求上限与管理员 `encoding.max_output_height` 三者已知值中的
+  最小值（上限按偶数向下规整）；Direct/Remux/音频转码保持源画面，因此就是源高度；`UNSUPPORTED` 不产生画面，
+  为 `null`）、`limited`（是否因本字段真正发生了
   缩放/升级；源高度未知、源不高于上限或最终为 `UNSUPPORTED` 时都是 `false`）。`stats.output` 的
   `videoWidth`/`videoHeight` 描述同一画面，按运行中会话捕获的缩放上限折算；`videoWidth` 由 `scale=-2` 的等比规则
   推导，可能与 FFmpeg 的实际取整差一步。

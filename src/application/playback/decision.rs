@@ -127,13 +127,26 @@ impl PlaybackBitrateLimit {
 /// Lowest accepted resolution ceiling, in output pixels of height (144p).
 pub const MIN_MAX_HEIGHT: i64 = 144;
 
-/// Highest accepted resolution ceiling, in output pixels of height (2160p is the largest Web
-/// ladder rung; anything above that is refused as malformed rather than treated as "no limit").
+/// Highest accepted resolution ceiling, in output pixels of height (4320p).
+///
+/// The Web ladder ends at 2160p, but a ceiling above it is still meaningful for an 8K source, so
+/// the whole 144p–4320p band is accepted; anything outside it is refused as malformed instead of
+/// being treated as "no limit".
 pub const MAX_MAX_HEIGHT: i64 = 4320;
 
 /// Whether `value` is an acceptable user-selected output height in pixels.
 pub const fn valid_max_height(value: i64) -> bool {
     MIN_MAX_HEIGHT <= value && value <= MAX_MAX_HEIGHT
+}
+
+/// Rounds a requested output height down to an even number of pixels.
+///
+/// H.264 (and every hardware encoder Lux starts) requires even picture dimensions, so an odd
+/// ceiling such as 1081p has to become 1080p before it reaches the scale filter, the response or
+/// the bitrate ladder. The accepted band starts at 144, which is already even, so rounding down
+/// never leaves it.
+pub const fn even_output_height(height: i64) -> i64 {
+    if height % 2 == 0 { height } else { height - 1 }
 }
 
 /// Video bitrate the server derives from an output height when the caller only picked a
@@ -191,24 +204,32 @@ impl PlaybackResolutionLimit {
     }
 
     /// The height the picture ends up at when only the caller's ceiling applies.
+    ///
+    /// The caller's ceiling is rounded down to an even number first, because the scale filter can
+    /// only produce even dimensions.
     pub const fn scaled_height(&self) -> Option<i64> {
         match (self.source_height, self.max_height) {
-            (Some(source), Some(max)) => Some(if source < max { source } else { max }),
+            (Some(source), Some(max)) => {
+                let max = even_output_height(max);
+                Some(if source < max { source } else { max })
+            }
             (source, None) => source,
-            (None, max) => max,
+            (None, Some(max)) => Some(even_output_height(max)),
         }
     }
 
     /// The height a re-encoded picture ends up at, once the administrator's global cap applies.
     ///
     /// Only a re-encode applies the cap: Direct Play, Remux and audio transcode keep the source
-    /// picture and report the source height instead. `admin_cap` of `0` or less means the
-    /// administrator configured no global height cap.
+    /// picture and report the source height instead. The cap is rounded down to an even number too,
+    /// since `encoding.max_output_height` feeds the same scale filter. `admin_cap` of `0` or less
+    /// means the administrator configured no global height cap.
     pub fn reencoded_height(&self, admin_cap: i64) -> Option<i64> {
         let scaled = self.scaled_height();
         if admin_cap <= 0 {
             return scaled;
         }
+        let admin_cap = even_output_height(admin_cap);
         match scaled {
             Some(scaled) => Some(scaled.min(admin_cap)),
             None => Some(admin_cap),
@@ -227,23 +248,28 @@ fn narrow(current: Option<i64>, candidate: Option<i64>) -> Option<i64> {
 
 /// The `-b:v` a re-encode is started with, or `None` when no limit asked for one.
 ///
-/// The candidates are the caller's explicit ceiling, the bitrate derived from the target height,
-/// and the source's own bitrate (an encode of a smaller picture never needs to spend more than
-/// the source already carries). The smallest wins; the administrator cap is applied later, when
-/// the encoder starts, because it applies even when the caller selected nothing.
+/// The candidates are the caller's explicit ceiling, the bitrate derived from the height the
+/// output really has (the smallest of the source, the caller's ceiling and the administrator's
+/// `max_output_height` cap), and the source's own bitrate (an encode of a smaller picture never
+/// needs to spend more than the source already carries). The smallest wins; the administrator's
+/// bitrate cap is applied later, when the encoder starts, because it applies even when the caller
+/// selected nothing.
 pub fn reencode_video_bitrate_bps(
     bitrate: PlaybackBitrateLimit,
     resolution: PlaybackResolutionLimit,
+    admin_max_height: i64,
 ) -> Option<i64> {
     let mut target = None;
     if bitrate.requires_video_transcode() {
         target = narrow(target, bitrate.max_bitrate_bps);
     }
     if resolution.requires_scale() {
+        // The ladder must follow the height the encoder really produces, otherwise a 480p-wide
+        // administrator cap would still be encoded at the 1080p rung.
         target = narrow(
             target,
             resolution
-                .scaled_height()
+                .reencoded_height(admin_max_height)
                 .map(height_band_video_bitrate_bps),
         );
         // A re-encode must not spend more than the source already carries; an unmeasured (or
@@ -358,8 +384,9 @@ mod tests {
         MAX_MAX_BITRATE_BPS, MAX_MAX_HEIGHT, MIN_MAX_BITRATE_BPS, MIN_MAX_HEIGHT,
         PlaybackBitrateLimit, PlaybackCapabilities, PlaybackDecisionInput, PlaybackPlan,
         PlaybackResolutionLimit, PlaybackSourceKind, ServerTier, UnsupportedReason, choose_plan,
-        choose_plan_with_bitrate, choose_plan_with_limits, height_band_video_bitrate_bps,
-        reencode_video_bitrate_bps, valid_max_bitrate_bps, valid_max_height,
+        choose_plan_with_bitrate, choose_plan_with_limits, even_output_height,
+        height_band_video_bitrate_bps, reencode_video_bitrate_bps, valid_max_bitrate_bps,
+        valid_max_height,
     };
 
     /// A local file the browser plays natively *and* the server could remux or transcode.
@@ -685,6 +712,39 @@ mod tests {
     }
 
     #[test]
+    fn odd_heights_are_rounded_down_to_an_even_picture() {
+        assert_eq!(even_output_height(1_081), 1_080);
+        assert_eq!(even_output_height(1_080), 1_080);
+        assert_eq!(even_output_height(145), 144);
+        assert_eq!(
+            even_output_height(MIN_MAX_HEIGHT),
+            MIN_MAX_HEIGHT,
+            "the lower bound is already even, so rounding never leaves the band"
+        );
+        assert_eq!(even_output_height(MAX_MAX_HEIGHT), MAX_MAX_HEIGHT);
+        assert_eq!(
+            height(2_160, 1_081).scaled_height(),
+            Some(1_080),
+            "the request is rounded before it reaches the scale filter"
+        );
+        assert_eq!(
+            height(1_081, 2_160).scaled_height(),
+            Some(1_081),
+            "a source height is whatever the probe measured; only ceilings are rounded"
+        );
+        assert_eq!(
+            height(2_160, 1_081).reencoded_height(0),
+            Some(1_080),
+            "the reported target height uses the rounded ceiling"
+        );
+        assert_eq!(
+            height(2_160, 1_080).reencoded_height(481),
+            Some(480),
+            "an odd administrator cap is rounded for the same reason"
+        );
+    }
+
+    #[test]
     fn the_height_bands_derive_one_bitrate_per_ladder_rung() {
         assert_eq!(height_band_video_bitrate_bps(144), 1_000_000);
         assert_eq!(height_band_video_bitrate_bps(360), 1_000_000);
@@ -778,7 +838,7 @@ mod tests {
             "a source inside its ceiling must still remux instead of transcoding"
         );
         assert_eq!(
-            reencode_video_bitrate_bps(PlaybackBitrateLimit::NONE, resolution),
+            reencode_video_bitrate_bps(PlaybackBitrateLimit::NONE, resolution, 0),
             None,
             "nothing is re-encoded, so there is no target bitrate"
         );
@@ -875,13 +935,13 @@ mod tests {
             }
         );
         assert_eq!(
-            reencode_video_bitrate_bps(bitrate, resolution),
+            reencode_video_bitrate_bps(bitrate, resolution, 0),
             Some(4_000_000),
             "the explicit ceiling is below the height ladder"
         );
         let high_bitrate_ceiling = ceiling(20_000_000, 50_000_000);
         assert_eq!(
-            reencode_video_bitrate_bps(high_bitrate_ceiling, resolution),
+            reencode_video_bitrate_bps(high_bitrate_ceiling, resolution, 0),
             Some(8_000_000),
             "a generous bitrate ceiling leaves the height ladder in charge"
         );
@@ -892,7 +952,7 @@ mod tests {
             max_bitrate_bps: Some(12_000_000),
         };
         assert_eq!(
-            reencode_video_bitrate_bps(generous_ceiling, resolution),
+            reencode_video_bitrate_bps(generous_ceiling, resolution, 0),
             Some(8_000_000),
             "the derived bitrate is the stricter ceiling"
         );
@@ -906,7 +966,7 @@ mod tests {
             max_bitrate_bps: None,
         };
         assert_eq!(
-            reencode_video_bitrate_bps(measured, resolution),
+            reencode_video_bitrate_bps(measured, resolution, 0),
             Some(3_000_000),
             "no re-encode needs more than the source already carries"
         );
@@ -915,7 +975,7 @@ mod tests {
             max_bitrate_bps: None,
         };
         assert_eq!(
-            reencode_video_bitrate_bps(unknown, resolution),
+            reencode_video_bitrate_bps(unknown, resolution, 0),
             Some(8_000_000),
             "without a measured source the height ladder decides"
         );
@@ -924,9 +984,42 @@ mod tests {
             max_bitrate_bps: None,
         };
         assert_eq!(
-            reencode_video_bitrate_bps(zero, resolution),
+            reencode_video_bitrate_bps(zero, resolution, 0),
             Some(8_000_000),
             "a zero measurement is unknown, not a ceiling"
+        );
+    }
+
+    #[test]
+    fn the_ladder_follows_the_height_the_encoder_really_produces() {
+        // A 2160p source asked for 1080p under an administrator 480p cap really outputs 480p, so
+        // the derived bitrate must be the 480p rung, not the 1080p one.
+        let resolution = height(2_160, 1_080);
+        assert_eq!(resolution.reencoded_height(480), Some(480));
+        assert_eq!(
+            reencode_video_bitrate_bps(PlaybackBitrateLimit::NONE, resolution, 480),
+            Some(2_000_000)
+        );
+        assert_eq!(
+            reencode_video_bitrate_bps(PlaybackBitrateLimit::NONE, resolution, 0),
+            Some(8_000_000),
+            "without an administrator cap the caller's 1080p rung applies"
+        );
+        // The source bitrate still caps the derived value, and the administrator bitrate cap is
+        // applied by the encoder on top.
+        let measured = PlaybackBitrateLimit {
+            source_bitrate_bps: Some(1_500_000),
+            max_bitrate_bps: None,
+        };
+        assert_eq!(
+            reencode_video_bitrate_bps(measured, resolution, 480),
+            Some(1_500_000)
+        );
+        // An odd ceiling and an odd cap both round before the ladder is consulted.
+        assert_eq!(
+            reencode_video_bitrate_bps(PlaybackBitrateLimit::NONE, height(2_160, 1_081), 481),
+            Some(2_000_000),
+            "the rounded 480p output lands on the 480p rung"
         );
     }
 
@@ -940,7 +1033,7 @@ mod tests {
         };
         assert!(!ceiling.requires_video_transcode());
         assert_eq!(
-            reencode_video_bitrate_bps(ceiling, resolution),
+            reencode_video_bitrate_bps(ceiling, resolution, 0),
             Some(6_000_000),
             "the height ladder (8 Mbit/s) is narrowed by the caller's ceiling"
         );

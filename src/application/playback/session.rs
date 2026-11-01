@@ -548,7 +548,7 @@ impl WebPlaybackSessionService {
             }
         );
         let target_video_bitrate_bps = if re_encodes_video {
-            reencode_video_bitrate_bps(input.bitrate, input.resolution)
+            reencode_video_bitrate_bps(input.bitrate, input.resolution, settings.max_output_height)
         } else {
             None
         };
