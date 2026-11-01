@@ -2206,3 +2206,420 @@ async fn broken_hardware_encoder_falls_back_to_software_transcoding()
     server.abort();
     Ok(())
 }
+
+/// A probed movie plus a fake FFmpeg that records its command line, so a ceiling test can assert
+/// both the plan the API returned and the `-b:v` FFmpeg was actually started with.
+struct MaxBitrateFixture {
+    _temp_dir: tempfile::TempDir,
+    database: Database,
+    library_id: luxd::domain::ids::LibraryId,
+    base_url: String,
+    client: reqwest::Client,
+    cookies: String,
+    csrf_cookie: String,
+    item_id: String,
+    source_id: String,
+    args_path: std::path::PathBuf,
+    server: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl MaxBitrateFixture {
+    async fn new(source_bitrate: Option<i64>) -> Result<Self, Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path().join("config");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.clone(),
+        };
+        let database = Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        setup.complete("Admin", "Admin", "correct password").await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let root = temp_dir.path().join("Movies");
+        tokio::fs::create_dir_all(&root).await?;
+        tokio::fs::write(root.join("Ceiling Movie 2026.mp4"), b"ceiling-bytes").await?;
+        libraries
+            .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let item_id: String =
+            sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE'")
+                .fetch_one(database.pool())
+                .await?;
+        let source_id: String =
+            sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
+                .bind(&item_id)
+                .fetch_one(database.pool())
+                .await?;
+        if let Some(bitrate) = source_bitrate {
+            // The scanner does not probe in tests, so the measured container bitrate is planted.
+            sqlx::query("UPDATE media_sources SET bitrate = ? WHERE id = ?")
+                .bind(bitrate)
+                .bind(&source_id)
+                .execute(database.pool())
+                .await?;
+        }
+
+        let args_path = temp_dir.path().join("ffmpeg-args.txt");
+        let fake_ffmpeg = temp_dir.path().join("fake-ffmpeg");
+        let fake_ffmpeg_source = [
+            "#!/bin/sh".to_owned(),
+            "set -eu".to_owned(),
+            format!("printf '%s\\n' \"$@\" > '{}'", args_path.display()),
+            "manifest=\"\"".to_owned(),
+            "segment=\"\"".to_owned(),
+            "init=\"init.mp4\"".to_owned(),
+            "while [ \"$#\" -gt 0 ]; do".to_owned(),
+            "  case \"$1\" in".to_owned(),
+            "    -hls_segment_filename) segment=\"$2\"; shift 2 ;;".to_owned(),
+            "    -hls_fmp4_init_filename) init=\"$2\"; shift 2 ;;".to_owned(),
+            "    *.m3u8) manifest=\"$1\"; shift ;;".to_owned(),
+            "    *) shift ;;".to_owned(),
+            "  esac".to_owned(),
+            "done".to_owned(),
+            "[ -n \"$manifest\" ] || exit 0".to_owned(),
+            "directory=$(dirname \"$manifest\")".to_owned(),
+            "mkdir -p \"$directory\"".to_owned(),
+            "printf '#EXTM3U\\n#EXT-X-MAP:URI=\"%s\"\\n#EXTINF:1,\\nsegment_000000.m4s\\n' \"$init\" > \"$manifest\"".to_owned(),
+            "printf init > \"$directory/$init\"".to_owned(),
+            "printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"".to_owned(),
+            "sleep 2".to_owned(),
+        ]
+        .join("\n");
+        tokio::fs::write(&fake_ffmpeg, fake_ffmpeg_source).await?;
+        let mut permissions = tokio::fs::metadata(&fake_ffmpeg).await?.permissions();
+        permissions.set_mode(0o700);
+        tokio::fs::set_permissions(&fake_ffmpeg, permissions).await?;
+
+        let auth = WebAuthService::new(database.clone())?;
+        let emby_auth = EmbyAuthService::new(database.clone())?;
+        let state = AppState::ready(config, database.clone(), setup, auth, emby_auth)
+            .with_hls_executable(fake_ffmpeg);
+        let app = app_with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let base_url = format!("http://{address}");
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client");
+        let login = client
+            .post(format!("{base_url}/api/v1/auth/login"))
+            .json(&json!({ "username": "admin", "password": "correct password" }))
+            .send()
+            .await?;
+        assert_eq!(login.status(), reqwest::StatusCode::OK);
+        let session_cookie =
+            cookie_value(login.headers(), "lux_session").ok_or("missing session")?;
+        let csrf_cookie = cookie_value(login.headers(), "lux_csrf").ok_or("missing csrf")?;
+        Ok(Self {
+            cookies: format!("lux_session={session_cookie}; lux_csrf={csrf_cookie}"),
+            csrf_cookie,
+            library_id: library.id,
+            _temp_dir: temp_dir,
+            database,
+            base_url,
+            client,
+            item_id,
+            source_id,
+            args_path,
+            server,
+        })
+    }
+
+    async fn create_session(
+        &self,
+        body: Value,
+    ) -> Result<(reqwest::StatusCode, Value), Box<dyn std::error::Error>> {
+        let response = self
+            .client
+            .post(format!("{}/api/v1/playback/sessions", self.base_url))
+            .header(COOKIE, &self.cookies)
+            .header("x-csrf-token", &self.csrf_cookie)
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        Ok((status, response.json::<Value>().await?))
+    }
+}
+
+/// The browser can play the original file natively: without a ceiling the plan stays Direct, and a
+/// ceiling the source already meets must not change it either.
+#[tokio::test]
+async fn web_playback_keeps_direct_play_when_the_source_already_meets_the_ceiling()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = MaxBitrateFixture::new(Some(2_000_000)).await?;
+
+    let (status, without_ceiling) = fixture
+        .create_session(json!({
+            "itemId": fixture.item_id,
+            "sourceId": fixture.source_id,
+            "capabilities": {
+                "directPlay": true,
+                "hls": true,
+                "softwareTranscode": true
+            }
+        }))
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(without_ceiling["plan"]["type"], json!("DIRECT"));
+    assert_eq!(
+        without_ceiling["bitrate"]["sourceBitrate"],
+        json!(2_000_000)
+    );
+    assert_eq!(without_ceiling["bitrate"]["maxBitrate"], Value::Null);
+    assert_eq!(without_ceiling["bitrate"]["targetBitrate"], Value::Null);
+    assert_eq!(without_ceiling["bitrate"]["limited"], json!(false));
+
+    let (status, within_ceiling) = fixture
+        .create_session(json!({
+            "itemId": fixture.item_id,
+            "sourceId": fixture.source_id,
+            "maxBitrate": 4_000_000,
+            "capabilities": {
+                "directPlay": true,
+                "hls": true,
+                "softwareTranscode": true
+            }
+        }))
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        within_ceiling["plan"]["type"],
+        json!("DIRECT"),
+        "a source inside its ceiling keeps Direct Play"
+    );
+    assert_eq!(within_ceiling["bitrate"]["maxBitrate"], json!(4_000_000));
+    assert_eq!(within_ceiling["bitrate"]["targetBitrate"], Value::Null);
+    assert_eq!(within_ceiling["bitrate"]["limited"], json!(false));
+    assert!(
+        !fixture.args_path.exists(),
+        "a direct plan must not start FFmpeg"
+    );
+
+    fixture.server.abort();
+    Ok(())
+}
+
+/// A source above the requested ceiling is re-encoded to it: the plan leaves Direct Play, FFmpeg is
+/// started with that bitrate, and the session reports the target back to the client.
+#[tokio::test]
+async fn web_playback_limits_a_source_above_the_requested_max_bitrate()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = MaxBitrateFixture::new(Some(20_000_000)).await?;
+
+    let (status, created) = fixture
+        .create_session(json!({
+            "itemId": fixture.item_id,
+            "sourceId": fixture.source_id,
+            "maxBitrate": 4_000_000,
+            "capabilities": {
+                "directPlay": true,
+                "hls": true,
+                "videoCopyToFmp4": true,
+                "audioCopyToFmp4": true,
+                "softwareTranscode": true
+            }
+        }))
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        created["plan"]["type"],
+        json!("SERVER_HLS"),
+        "Direct Play and Remux would keep the original bitrate: {created}"
+    );
+    assert_eq!(created["tier"], json!(4));
+    assert_eq!(created["bitrate"]["sourceBitrate"], json!(20_000_000));
+    assert_eq!(created["bitrate"]["maxBitrate"], json!(4_000_000));
+    assert_eq!(created["bitrate"]["targetBitrate"], json!(4_000_000));
+    assert_eq!(created["bitrate"]["limited"], json!(true));
+    let session_id = created["sessionId"]
+        .as_str()
+        .ok_or("missing limited session id")?
+        .to_owned();
+
+    // The session starts FFmpeg and answers immediately, so wait for the child to record its
+    // command line instead of racing the spawn.
+    let mut arguments = String::new();
+    for _ in 0..250 {
+        if let Ok(captured) = tokio::fs::read_to_string(&fixture.args_path).await
+            && captured.contains("-b:v")
+        {
+            arguments = captured;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        !arguments.is_empty(),
+        "FFmpeg arguments were not captured before the timeout"
+    );
+    let arguments: Vec<&str> = arguments.lines().collect();
+    let video_bitrate = arguments
+        .iter()
+        .position(|argument| *argument == "-b:v")
+        .and_then(|index| arguments.get(index + 1))
+        .ok_or("the transcode was not started with a video bitrate")?;
+    assert_eq!(
+        *video_bitrate, "4000000",
+        "the ceiling must bound the encoder: {arguments:?}"
+    );
+
+    let stats = fixture
+        .client
+        .get(format!(
+            "{}/api/v1/playback/sessions/{session_id}/stats",
+            fixture.base_url
+        ))
+        .header(COOKIE, &fixture.cookies)
+        .send()
+        .await?;
+    assert_eq!(stats.status(), reqwest::StatusCode::OK);
+    let stats = stats.json::<Value>().await?;
+    assert_eq!(stats["plan"], json!("SERVER_HLS"));
+    assert_eq!(stats["tier"], json!(4));
+    assert_eq!(
+        stats["output"]["videoBitrate"],
+        json!(4_000_000),
+        "the stored output description must match what the player was told"
+    );
+
+    // Only one software transcode may run at a time by default, so release the first session.
+    let stopped = fixture
+        .client
+        .delete(format!(
+            "{}/api/v1/playback/sessions/{session_id}",
+            fixture.base_url
+        ))
+        .header(COOKIE, &fixture.cookies)
+        .header("x-csrf-token", &fixture.csrf_cookie)
+        .send()
+        .await?;
+    assert_eq!(stopped.status(), reqwest::StatusCode::NO_CONTENT);
+
+    // A browser that could otherwise be served by Remux must be re-encoded instead: a copy would
+    // keep the original bitrate the caller asked to stay below.
+    let (status, remux_upgraded) = fixture
+        .create_session(json!({
+            "itemId": fixture.item_id,
+            "sourceId": fixture.source_id,
+            "maxBitrate": 4_000_000,
+            "capabilities": {
+                "directPlay": false,
+                "hls": true,
+                "videoCopyToFmp4": true,
+                "audioCopyToFmp4": true,
+                "softwareTranscode": true
+            }
+        }))
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(remux_upgraded["plan"]["type"], json!("SERVER_HLS"));
+    assert_eq!(
+        remux_upgraded["tier"],
+        json!(4),
+        "Remux is tier 1; a ceiling the source exceeds rules it out: {remux_upgraded}"
+    );
+    assert_eq!(remux_upgraded["bitrate"]["targetBitrate"], json!(4_000_000));
+
+    fixture.server.abort();
+    Ok(())
+}
+
+/// `.strm` keeps its Direct-only rule: the ceiling is ignored instead of moving it to HLS, and a
+/// value outside the accepted range is a plain malformed request.
+#[tokio::test]
+async fn web_playback_ignores_the_max_bitrate_for_strm_and_rejects_an_invalid_value()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = MaxBitrateFixture::new(Some(20_000_000)).await?;
+    let root = fixture._temp_dir.path().join("Movies");
+    tokio::fs::write(
+        root.join("Remote Ceiling Movie 2026.strm"),
+        "http://media.example.test/media.mp4\n",
+    )
+    .await?;
+    LibraryScanner::new(fixture.database.clone())
+        .scan_movie_library(fixture.library_id)
+        .await?;
+    let (strm_item_id, strm_source_id): (String, String) = sqlx::query_as(
+        "SELECT mi.id, ms.id
+         FROM media_items mi
+         JOIN media_sources ms ON ms.item_id = mi.id
+         WHERE ms.source_kind = 'STRM_URL'
+         LIMIT 1",
+    )
+    .fetch_one(fixture.database.pool())
+    .await?;
+
+    let (status, strm_direct) = fixture
+        .create_session(json!({
+            "itemId": strm_item_id,
+            "sourceId": strm_source_id,
+            "maxBitrate": 4_000_000,
+            "capabilities": {
+                "directPlay": true,
+                "hls": true,
+                "softwareTranscode": true
+            }
+        }))
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        strm_direct["plan"]["type"],
+        json!("DIRECT"),
+        "a .strm never leaves Direct Play for a ceiling"
+    );
+    assert_eq!(strm_direct["bitrate"]["targetBitrate"], Value::Null);
+    assert_eq!(strm_direct["bitrate"]["limited"], json!(false));
+
+    let (status, strm_unplayable) = fixture
+        .create_session(json!({
+            "itemId": strm_item_id,
+            "sourceId": strm_source_id,
+            "maxBitrate": 4_000_000,
+            "capabilities": {
+                "directPlay": false,
+                "hls": true,
+                "softwareTranscode": true
+            }
+        }))
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(strm_unplayable["plan"]["type"], json!("UNSUPPORTED"));
+    assert_eq!(
+        strm_unplayable["plan"]["reason"],
+        json!("STRM_REQUIRES_DIRECT_PLAY")
+    );
+    let hls_sessions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM web_playback_sessions WHERE plan = 'SERVER_HLS'")
+            .fetch_one(fixture.database.pool())
+            .await?;
+    assert_eq!(hls_sessions, 0, "no .strm HLS session may be created");
+
+    for invalid in [50_000, 200_000_001, 0] {
+        let (status, body) = fixture
+            .create_session(json!({
+                "itemId": fixture.item_id,
+                "sourceId": fixture.source_id,
+                "maxBitrate": invalid,
+                "capabilities": { "directPlay": true, "hls": true }
+            }))
+            .await?;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "{invalid} bps must be refused as a malformed request"
+        );
+        assert_eq!(body["error"]["code"], json!("INVALID_REQUEST"));
+    }
+
+    fixture.server.abort();
+    Ok(())
+}
