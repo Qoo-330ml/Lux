@@ -1,6 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Copy,
   Database,
   HardDrive,
   Folder,
@@ -744,7 +743,6 @@ function LibraryActionMenu({ library, onEdit, onRefresh, refreshing, onScan, onR
     { label: "扫描媒体库文件", icon: RefreshCw, onClick: onScan },
     { label: "移除", icon: MinusCircle, onClick: onRemove },
     { label: "重命名", icon: Pencil, onClick: onEdit },
-    { label: "复制", icon: Copy, disabled: true, title: "复制媒体库功能暂未启用" },
   ];
   return <div className="lux-library-action-menu" role="menu" aria-label={`${library.name} 操作`}><div className="lux-library-action-menu-heading">{library.coverImageUrl ? <img src={library.coverImageUrl} alt="" /> : <span><Database size={16} /></span>}<strong>{library.name}</strong></div>{actions.map(({ label, icon: Icon, onClick, disabled, title }, index) => <span key={label}>{index === 6 ? <i className="lux-library-action-divider" aria-hidden="true" /> : null}<button type="button" role="menuitem" onClick={onClick} disabled={disabled} title={title}><Icon size={18} /><span>{label}</span></button></span>)}</div>;
 }
