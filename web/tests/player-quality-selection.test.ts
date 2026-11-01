@@ -8,7 +8,6 @@ import {
   qualityStatusText,
   qualitySwitchParams,
   shouldShowQualitySelector,
-  sourceSwitchParams,
   sourceVideoHeight,
   supportsQualitySelection,
 } from "../src/features/player/playback-quality";
@@ -149,11 +148,6 @@ describe("player maxHeight parameter", () => {
     // The legacy parameter is ignored: it is neither rewritten nor removed here.
     expect(qualitySwitchParams(current, 720).get("maxBitrate")).toBe("4000000");
     expect(qualitySwitchParams(current, 720).get("maxHeight")).toBe("720");
-
-    const switched = sourceSwitchParams("source-2", current);
-    expect(switched.get("maxHeight")).toBeNull();
-    // A fresh source URL never carries the legacy ceiling.
-    expect(switched.get("maxBitrate")).toBeNull();
   });
 
   it("canonicalizes hand-written URL forms for cache variant matching", () => {
@@ -167,22 +161,6 @@ describe("player maxHeight parameter", () => {
     expect(canonicalMaxHeightParam(null)).toBeNull();
     expect(canonicalMaxHeightParam("1e9")).toBeNull();
     expect(canonicalMaxHeightParam("abc")).toBeNull();
-  });
-
-  it("keeps the resolution ceiling when switching the played version", () => {
-    const current = new URLSearchParams({
-      sourceId: "source-a",
-      audioStreamIndex: "2",
-      subtitleStreamIndex: "7",
-      maxHeight: "1.08e3",
-    });
-
-    const switched = sourceSwitchParams("source-b", current);
-    expect(switched.get("sourceId")).toBe("source-b");
-    // Stream indexes belong to the source being replaced; the ceiling does not.
-    expect(switched.get("audioStreamIndex")).toBeNull();
-    expect(switched.get("subtitleStreamIndex")).toBeNull();
-    expect(switched.get("maxHeight")).toBe("1080");
   });
 
   it("reads the ceiling from both playback query key layouts", () => {

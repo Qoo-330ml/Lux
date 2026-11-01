@@ -427,73 +427,6 @@ describe("PlayerPage playback synchronization", () => {
     expect(api.createWebPlaybackSession).toHaveBeenCalledTimes(1);
   });
 
-  it("stops the old session before creating a selected replacement source", async () => {
-    const lifecycle: string[] = [];
-    vi.mocked(api.createWebPlaybackSession).mockImplementation(async (_itemId, sourceId) => {
-      lifecycle.push(`create:${sourceId}`);
-      return {
-        sessionId: `web-${sourceId}`,
-        playSessionId: `lux-web:web-${sourceId}`,
-        sourceId,
-        tier: 0,
-        expiresAt: 1_900_000_000,
-        plan: {
-          type: "DIRECT",
-          url: `/api/v1/playback/sessions/web-${sourceId}/direct?expires=1900000000&signature=test`,
-        },
-      };
-    });
-    vi.mocked(api.stopWebPlaybackSession).mockImplementation(async (sessionId) => {
-      lifecycle.push(`stop:${sessionId}`);
-    });
-    vi.spyOn(api, "item").mockResolvedValue({
-      id: "movie-switch",
-      title: "版本切换测试",
-      itemType: "MOVIE",
-      mediaSources: [
-        { id: "source-1", isDefault: true, qualityLabel: "1080P" },
-        { id: "source-2", qualityLabel: "4K" },
-      ],
-    });
-    vi.spyOn(api, "playback").mockResolvedValue({
-      positionTicks: 0,
-      isPlayed: false,
-      state: null,
-      isPaused: false,
-    });
-
-    container = document.createElement("div");
-    document.body.append(container);
-    root = createRoot(container);
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-
-    await act(async () => {
-      root?.render(
-        <QueryClientProvider client={queryClient}>
-          <MemoryRouter initialEntries={["/watch/movie-switch"]}>
-            <Routes>
-              <Route path="watch/:itemId" element={<PlayerPage />} />
-            </Routes>
-          </MemoryRouter>
-        </QueryClientProvider>,
-      );
-    });
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-
-    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
-    if (!settings) throw new Error("settings control was not rendered");
-    await act(async () => settings.click());
-    expect(luxCombobox(container, "选择播放版本")).not.toBeNull();
-    await chooseLuxOptionByValue(container, "选择播放版本", "source-2");
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    });
-
-    expect(lifecycle).toEqual(["create:source-1", "stop:web-source-1", "create:source-2"]);
-  });
-
   it("toggles only the local danmu visibility control without playback requests", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-danmu-toggle",
@@ -598,14 +531,13 @@ describe("PlayerPage playback synchronization", () => {
     expect(entry.getAttribute("aria-expanded")).toBe("false");
   });
 
-  it("keeps presentation settings local and reapplies them across source changes", async () => {
+  it("keeps presentation settings local without rebuilding the playback session", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-presentation",
       title: "画面设置测试",
       itemType: "MOVIE",
       mediaSources: [
         { id: "source-presentation-1", isDefault: true, qualityLabel: "1080P" },
-        { id: "source-presentation-2", qualityLabel: "4K" },
       ],
     });
     vi.spyOn(api, "playback").mockResolvedValue({
@@ -659,22 +591,6 @@ describe("PlayerPage playback synchronization", () => {
     expect(vi.mocked(api.createWebPlaybackSession)).toHaveBeenCalledTimes(sessionCallsBeforeSettings);
     expect(vi.mocked(api.webPlaybackEvent)).toHaveBeenCalledTimes(eventCallsBeforeSettings);
 
-    await chooseLuxOptionByValue(container, "选择播放版本", "source-presentation-2");
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    });
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-
-    const replacementVideo = container.querySelector<HTMLVideoElement>("video");
-    if (!replacementVideo) {
-      throw new Error("replacement video was not rendered after the source change");
-    }
-    expect(replacementVideo?.loop).toBe(true);
-    expect(replacementVideo?.style.aspectRatio).toBe("4 / 3");
-    expect(replacementVideo?.style.transform).toBe("translate(-50%, -50%) scaleX(-1)");
-
     const defaultAspect = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
       .find((button) => button.textContent?.trim() === "默认");
     const normalFlip = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
@@ -683,8 +599,8 @@ describe("PlayerPage playback synchronization", () => {
     await act(async () => defaultAspect.click());
     await act(async () => normalFlip.click());
 
-    expect(replacementVideo?.style.aspectRatio).toBe("");
-    expect(replacementVideo?.style.transform).toBe("");
+    expect(video.style.aspectRatio).toBe("");
+    expect(video.style.transform).toBe("");
   });
 
   it("restarts locally at the end only while loop is enabled", async () => {
@@ -802,7 +718,6 @@ describe("PlayerPage playback synchronization", () => {
     const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
     if (!video || !settings) throw new Error("chapter player was not rendered");
     await act(async () => settings.click());
-    expect(luxCombobox(container, "选择播放版本")).not.toBeNull();
     Object.defineProperty(video, "duration", { configurable: true, value: 10 });
     Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 3 });
     await act(async () => video.dispatchEvent(new Event("durationchange")));
@@ -816,21 +731,8 @@ describe("PlayerPage playback synchronization", () => {
     await act(async () => skip.click());
     expect(video.currentTime).toBe(6);
     expect(vi.mocked(api.createWebPlaybackSession)).toHaveBeenCalledTimes(sessionCallsBeforeSeek);
-
-    await chooseLuxOptionByValue(container, "选择播放版本", "source-chapters-2");
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    });
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-    const replacementVideo = container.querySelector<HTMLVideoElement>("video");
-    if (!replacementVideo) throw new Error("replacement chapter video was not rendered");
-    Object.defineProperty(replacementVideo, "duration", { configurable: true, value: 10 });
-    await act(async () => replacementVideo.dispatchEvent(new Event("durationchange")));
-    expect(container.querySelector("[aria-label='章节：片头开始']")).toBeNull();
-    expect(container.querySelector("[aria-label='章节：另一版本']")).not.toBeNull();
-    expect(container.querySelector("[aria-label='跳过片头']")).toBeNull();
+    // Chapters belong to the played source only: the other version's marker never renders here.
+    expect(container.querySelector("[aria-label='章节：另一版本']")).toBeNull();
   });
 
   it("selects and clears a current-source WebVTT track without replacing the playback session", async () => {

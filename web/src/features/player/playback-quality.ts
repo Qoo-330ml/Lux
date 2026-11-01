@@ -192,20 +192,3 @@ export function qualityStatusText(
   if (height === null) return "原画（自动）";
   return `原画 ${height}p`;
 }
-
-/**
- * URL parameters for switching the played version: the manual ceiling is a
- * user-wide preference and survives the change, while per-source track choices
- * (`audioStreamIndex`, `subtitleStreamIndex`) do not, because stream indexes
- * belong to the media source that is being replaced. The legacy `maxBitrate`
- * parameter is dropped with them because the player no longer reads it.
- */
-export function sourceSwitchParams(
-  sourceId: string,
-  current: URLSearchParams,
-): URLSearchParams {
-  const next = new URLSearchParams({ sourceId });
-  const maxHeight = canonicalMaxHeightParam(current.get("maxHeight"));
-  if (maxHeight !== null) next.set("maxHeight", maxHeight);
-  return next;
-}

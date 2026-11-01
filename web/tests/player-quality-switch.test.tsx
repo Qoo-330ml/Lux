@@ -507,26 +507,11 @@ describe("PlayerPage quality switching", () => {
     expect(container?.textContent).toContain("画质切换失败，已恢复原画。");
   });
 
-  it("keeps the resolution when switching the played version", async () => {
-    await renderPlayer(
-      "/watch/movie-quality?audioStreamIndex=2&subtitleStreamIndex=7&maxHeight=720",
-    );
+  it("keeps an inherited ceiling selectable on a smaller source", async () => {
+    // The version is chosen on the detail page and arrives as `sourceId`; a ceiling that the
+    // smaller source cannot offer must still be shown, or the URL could never be cleared.
+    await renderPlayer("/watch/movie-quality?sourceId=source-quality-b&maxHeight=1440");
     await openSettings();
-    await chooseLuxOptionByValue(container!, "选择播放版本", "source-quality-b");
-
-    expect(container?.querySelector('[data-testid="current-location"]')?.textContent)
-      .toBe("/watch/movie-quality?sourceId=source-quality-b&maxHeight=720");
-    expect(bootstrapSelections.at(-1)).toEqual({
-      audio: undefined,
-      subtitle: undefined,
-      maxHeight: 720,
-    });
-  });
-
-  it("keeps an inherited ceiling selectable after switching to a smaller source", async () => {
-    await renderPlayer("/watch/movie-quality?maxHeight=1440");
-    await openSettings();
-    await chooseLuxOptionByValue(container!, "选择播放版本", "source-quality-b");
 
     expect(container?.querySelector('[data-testid="current-location"]')?.textContent)
       .toBe("/watch/movie-quality?sourceId=source-quality-b&maxHeight=1440");

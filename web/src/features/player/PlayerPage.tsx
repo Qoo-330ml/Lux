@@ -17,7 +17,6 @@ import { usePlayerInfoPanel } from "./usePlayerInfoPanel";
 import { usePlayerPlaybackSession } from "./usePlayerPlaybackSession";
 import { useAudioTrackSwitch } from "./useAudioTrackSwitch";
 import { useQualitySwitch } from "./useQualitySwitch";
-import { sourceSwitchParams } from "./playback-quality";
 import { usePlayerVideoElement } from "./usePlayerVideoElement";
 import { usePlayerNavigation } from "./usePlayerNavigation";
 import { usePlaybackSessionGate } from "./usePlaybackSessionGate";
@@ -36,7 +35,6 @@ import { PlayerSettingsPanel } from "./components/player-settings-panel";
 import { PlayerInfoPanel } from "./components/player-info-panel";
 import { PlayerShortcutHelp } from "./components/player-shortcut-help";
 import { playerInfoCopyText } from "./player-stats";
-import type { PlayerSettingsSourceOption } from "./components/player-settings-panel";
 import { PlayerErrorState, PlayerLoadingState } from "./components/player-state";
 import { LuxPlayer } from "./components/lux-player";
 import { PlayerTopBar } from "./components/player-top-bar";
@@ -649,12 +647,6 @@ export function PlayerPage() {
     ? null
     : playbackFailure
       ?? (!streamUrl && !playbackNotice?.blocking ? playerFailure("SERVER_PLAN_FAILED") : null);
-  const sourceOptions: PlayerSettingsSourceOption[] = (media.mediaSources ?? []).map((entry, index) => ({
-    id: entry.id,
-    label: entry.qualityLabel || `版本 ${index + 1}`,
-    detail: entry.sourceKind === "STRM_URL" ? "STRM" : entry.container || "直链",
-  }));
-
   return (
     <LuxPlayer
       containerRef={playerContainerRef}
@@ -761,9 +753,6 @@ export function PlayerPage() {
           playbackRates={PLAYBACK_SPEEDS}
           playbackRate={playbackRate}
           onChangeRate={changePlaybackRate}
-          sources={sourceOptions}
-          selectedSourceId={source?.id ?? ""}
-          onSourceChange={(sourceId) => setSearchParams(sourceSwitchParams(sourceId, searchParams))}
           audioTracks={{
             tracks: audioTracks,
             selectedIndex: selectedAudioStreamIndex,

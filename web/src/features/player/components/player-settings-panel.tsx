@@ -33,19 +33,10 @@ type PlayerAutoPlaySettings = {
   onToggle: () => void;
 };
 
-export type PlayerSettingsSourceOption = {
-  id: string;
-  label: string;
-  detail: string;
-};
-
 type PlayerSettingsPanelProps = {
   playbackRates: readonly number[];
   playbackRate: number;
   onChangeRate: (rate: number) => void;
-  sources?: readonly PlayerSettingsSourceOption[];
-  selectedSourceId?: string;
-  onSourceChange?: (sourceId: string) => void;
   /** Independent audio-track slot; omitted when the player has no track data. */
   audioTracks?: PlayerAudioTrackSection;
   /** Independent quality (resolution ceiling) slot; omitted for Direct-only sources. */
@@ -77,9 +68,6 @@ export function PlayerSettingsPanel({
   playbackRates,
   playbackRate,
   onChangeRate,
-  sources = [],
-  selectedSourceId = "",
-  onSourceChange = () => undefined,
   audioTracks,
   quality,
   captions = [],
@@ -113,25 +101,6 @@ export function PlayerSettingsPanel({
           <X size={16} aria-hidden="true" />
         </button>
       </div>
-      {sources.length > 0 ? (
-        <div className="lux-player-settings-section">
-          <label className="lux-player-settings-label" htmlFor="lux-player-source-select">播放版本</label>
-          <LuxSelectField
-            id="lux-player-source-select"
-            className="lux-player-caption-select"
-            aria-label="选择播放版本"
-            title="选择播放版本"
-            value={selectedSourceId}
-            onChange={(event) => onSourceChange(event.target.value)}
-          >
-            {sources.map((source) => (
-              <option key={source.id} value={source.id}>
-                {source.label} ({source.detail})
-              </option>
-            ))}
-          </LuxSelectField>
-        </div>
-      ) : null}
       {audioTracks ? <PlayerAudioTrackSelector {...audioTracks} /> : null}
       {quality ? <PlayerQualitySelector {...quality} /> : null}
       <div className="lux-player-settings-section">

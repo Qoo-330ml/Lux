@@ -157,6 +157,28 @@ describe("LuxPlayer state components", () => {
     expect(markup).not.toContain("https://example.test/private");
   });
 
+  it("points the generic surface fallback at the detail page version list", () => {
+    const markup = renderToStaticMarkup(
+      <PlayerVideoSurface
+        streamUrl="/signed/movie-1"
+        title="示例电影"
+        videoRef={() => undefined}
+        onClick={() => undefined}
+        onDoubleClick={() => undefined}
+        centerSplash={null}
+        fallbackLoading={false}
+        fallbackSpeedX={null}
+        errorMessage={null}
+        showError
+        onRetry={() => undefined}
+        onBack={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain("请返回详情页选择其他版本");
+    expect(markup).not.toContain("请尝试其他版本");
+  });
+
   it("renders top-level media context and source selection as presentation", () => {
     const markup = renderToStaticMarkup(
       <PlayerTopBar
@@ -184,9 +206,6 @@ describe("LuxPlayer state components", () => {
         playbackRates={[0.5, 1, 1.5]}
         playbackRate={1}
         onChangeRate={() => undefined}
-        sources={[{ id: "source-1", label: "1080P", detail: "MP4" }]}
-        selectedSourceId="source-1"
-        onSourceChange={() => undefined}
         captionOffset={-1.2}
         onChangeCaptionOffset={() => undefined}
         presentation={{
@@ -203,8 +222,9 @@ describe("LuxPlayer state components", () => {
 
     expect(markup).toContain('role="dialog"');
     expect(markup).toContain('aria-label="播放设置"');
-    expect(markup).toContain('aria-label="选择播放版本"');
-    expect(markup).toContain("1080P (MP4)");
+    // The played version is chosen on the detail page; the panel must not repeat it.
+    expect(markup).not.toContain("播放版本");
+    expect(markup).not.toContain('id="lux-player-source-select"');
     expect(markup).toContain("标准");
     expect(markup).toContain("循环播放");
     expect(markup).toContain('role="switch"');
