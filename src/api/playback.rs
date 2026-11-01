@@ -9,7 +9,7 @@ use crate::application::playback::{
         MAX_MAX_BITRATE_BPS, MIN_MAX_BITRATE_BPS, PlaybackBitrateLimit, ServerTier,
         valid_max_bitrate_bps,
     },
-    hls::{HlsSegmentContainer, HlsStartOptions, HlsWebStartOptions},
+    hls::{HlsSegmentContainer, HlsStartOptions, HlsWebStartOptions, effective_video_bitrate},
     session::{
         AuthorizedWebPlaybackResource, CreatedWebPlaybackSession, PlaybackAssetAdmission,
         WebPlaybackPlan,
@@ -3100,6 +3100,23 @@ fn emby_transcoding_audio_bitrate(
 /// Copied tracks (remux and audio-transcode) intentionally leave their codec empty: the Web
 /// session row does not duplicate the source streams, and the player reads those from the media
 /// source. Only codecs the server actually re-encodes are asserted here.
+/// The video bitrate a plan is started with, or `None` when its output copies the source track.
+///
+/// Only tiers 3 and 4 re-encode video, and only they are started with `-b:v`; everything else keeps
+/// the source bitrate and must not claim a target of its own.
+fn web_output_video_bitrate(
+    tier: ServerTier,
+    requested_bitrate_bps: Option<i64>,
+    admin_video_bitrate_cap: i64,
+) -> Option<i64> {
+    match tier {
+        ServerTier::HardwareTranscode | ServerTier::SoftwareTranscode => {
+            effective_video_bitrate(requested_bitrate_bps, admin_video_bitrate_cap)
+        }
+        ServerTier::Direct | ServerTier::Remux | ServerTier::AudioTranscode => None,
+    }
+}
+
 fn web_transcoding_output(
     tier: ServerTier,
     segment_container: HlsSegmentContainer,
@@ -3739,6 +3756,11 @@ async fn create_web_playback_session_json(
         max_bitrate_bps,
     };
     let transcoding_settings = service.transcoding_settings().await;
+    // The administrator cap is applied by the encoder itself; the response must report the same
+    // number, so both sides read it from the snapshot that is passed to the HLS start.
+    let admin_video_bitrate_cap = transcoding_settings
+        .max_video_bitrate_kbps
+        .saturating_mul(1_000);
     let mut created = service
         .create_with_settings(
             CreateWebPlaybackSession {
@@ -3867,7 +3889,11 @@ async fn create_web_playback_session_json(
         let output = web_transcoding_output(
             effective_tier,
             HlsSegmentContainer::FragmentedMp4,
-            created.target_video_bitrate_bps,
+            web_output_video_bitrate(
+                effective_tier,
+                created.target_video_bitrate_bps,
+                admin_video_bitrate_cap,
+            ),
         );
         if let Err(error) = service
             .set_transcoding_details(&created.id, &user_id, &output)
@@ -3945,8 +3971,13 @@ async fn create_web_playback_session_json(
         }),
     };
     // What the server actually decided about the caller's ceiling. Copy paths and Direct Play keep
-    // the source bitrate, so only a re-encode reports a target the player can show as "limited".
-    let target_video_bitrate_bps = created.target_video_bitrate_bps;
+    // the source bitrate, so only a re-encode reports a target the player can show as "limited",
+    // and that target is exactly the `-b:v` FFmpeg was started with.
+    let target_video_bitrate_bps = web_output_video_bitrate(
+        created.plan.tier(),
+        created.target_video_bitrate_bps,
+        admin_video_bitrate_cap,
+    );
     Ok(json!({
         "sessionId": (!created.id.is_empty()).then_some(created.id),
         "playSessionId": (!created.play_session_id.is_empty()).then_some(created.play_session_id),

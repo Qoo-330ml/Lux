@@ -2333,6 +2333,71 @@ impl MaxBitrateFixture {
         })
     }
 
+    /// Stores the administrator's transcoding policy; `maxVideoBitrateKbps` caps every encode.
+    async fn set_max_video_bitrate_kbps(
+        &self,
+        kbps: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        sqlx::query(
+            "INSERT INTO server_settings (key, value) VALUES ('transcoding', ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(json!({ "maxVideoBitrateKbps": kbps }).to_string())
+        .execute(self.database.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// The `-b:v` FFmpeg was started with, once the (asynchronous) child recorded its arguments.
+    async fn ffmpeg_video_bitrate(&self) -> Result<String, Box<dyn std::error::Error>> {
+        let mut arguments = String::new();
+        for _ in 0..250 {
+            if let Ok(captured) = tokio::fs::read_to_string(&self.args_path).await
+                && captured.contains("-b:v")
+            {
+                arguments = captured;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let arguments: Vec<&str> = arguments.lines().collect();
+        arguments
+            .iter()
+            .position(|argument| *argument == "-b:v")
+            .and_then(|index| arguments.get(index + 1))
+            .map(|value| (*value).to_owned())
+            .ok_or_else(|| "FFmpeg arguments were not captured before the timeout".into())
+    }
+
+    async fn stats(&self, session_id: &str) -> Result<Value, Box<dyn std::error::Error>> {
+        let response = self
+            .client
+            .get(format!(
+                "{}/api/v1/playback/sessions/{session_id}/stats",
+                self.base_url
+            ))
+            .header(COOKIE, &self.cookies)
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        Ok(response.json::<Value>().await?)
+    }
+
+    async fn stop_session(&self, session_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let response = self
+            .client
+            .delete(format!(
+                "{}/api/v1/playback/sessions/{session_id}",
+                self.base_url
+            ))
+            .header(COOKIE, &self.cookies)
+            .header("x-csrf-token", &self.csrf_cookie)
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        Ok(())
+    }
+
     async fn create_session(
         &self,
         body: Value,
@@ -2619,6 +2684,91 @@ async fn web_playback_ignores_the_max_bitrate_for_strm_and_rejects_an_invalid_va
         );
         assert_eq!(body["error"]["code"], json!("INVALID_REQUEST"));
     }
+
+    fixture.server.abort();
+    Ok(())
+}
+
+/// The reported target must be the bitrate FFmpeg is really started with: the administrator's cap
+/// applies on top of the user's ceiling, so a 4 Mbit/s request under a 2 Mbit/s policy becomes 2.
+#[tokio::test]
+async fn web_playback_reports_the_applied_video_bitrate_below_the_administrator_cap()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = MaxBitrateFixture::new(Some(20_000_000)).await?;
+    fixture.set_max_video_bitrate_kbps(2_000).await?;
+
+    let (status, created) = fixture
+        .create_session(json!({
+            "itemId": fixture.item_id,
+            "sourceId": fixture.source_id,
+            "maxBitrate": 4_000_000,
+            "capabilities": {
+                "directPlay": true,
+                "hls": true,
+                "videoCopyToFmp4": true,
+                "audioCopyToFmp4": true,
+                "softwareTranscode": true
+            }
+        }))
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(created["plan"]["type"], json!("SERVER_HLS"));
+    assert_eq!(created["tier"], json!(4));
+    assert_eq!(
+        created["bitrate"]["maxBitrate"],
+        json!(4_000_000),
+        "the request the client sent is still reported as-is"
+    );
+    assert_eq!(
+        created["bitrate"]["targetBitrate"],
+        json!(2_000_000),
+        "the target must be the administrator-capped bitrate: {created}"
+    );
+    assert_eq!(created["bitrate"]["limited"], json!(true));
+    let session_id = created["sessionId"]
+        .as_str()
+        .ok_or("missing capped session id")?
+        .to_owned();
+    assert_eq!(
+        fixture.ffmpeg_video_bitrate().await?,
+        "2000000",
+        "the reported target must equal the -b:v FFmpeg was started with"
+    );
+    let stats = fixture.stats(&session_id).await?;
+    assert_eq!(
+        stats["output"]["videoBitrate"],
+        json!(2_000_000),
+        "the session output must describe the same bitrate as the response"
+    );
+
+    // Only one software transcode runs by default, so release the session before the next case.
+    fixture.stop_session(&session_id).await?;
+
+    // A transcode forced by the browser (no user ceiling at all) still reports the cap FFmpeg
+    // applies, so the player never claims an uncapped output it is not getting.
+    let (status, capped_without_ceiling) = fixture
+        .create_session(json!({
+            "itemId": fixture.item_id,
+            "sourceId": fixture.source_id,
+            "capabilities": {
+                "directPlay": false,
+                "hls": true,
+                "videoCopyToFmp4": false,
+                "audioCopyToFmp4": false,
+                "softwareTranscode": true
+            }
+        }))
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(capped_without_ceiling["plan"]["type"], json!("SERVER_HLS"));
+    assert_eq!(capped_without_ceiling["bitrate"]["maxBitrate"], Value::Null);
+    assert_eq!(
+        capped_without_ceiling["bitrate"]["targetBitrate"],
+        json!(2_000_000),
+        "the administrator cap alone bounds the encoder"
+    );
+    assert_eq!(capped_without_ceiling["bitrate"]["limited"], json!(true));
+    assert_eq!(fixture.ffmpeg_video_bitrate().await?, "2000000");
 
     fixture.server.abort();
     Ok(())

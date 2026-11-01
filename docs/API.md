@@ -389,9 +389,11 @@ Web 播放使用独立于 Emby 的播放会话 API。创建和状态写入接口
   `NO_COMPATIBLE_SERVER_PLAN`；用户策略禁止所需档位时返回 403 `PERMISSION_DENIED`。`.strm` 继续只允许 Direct
   Play，该字段被忽略。值越界返回 400 `INVALID_REQUEST`。
 - 响应中的 `bitrate` 描述实际生效的决策：`sourceBitrate`（源码率，未探测为 `null`）、`maxBitrate`（请求的上限，
-  未提供为 `null`）、`targetBitrate`（服务端实际编码的视频码率，Direct/Remux 等拷贝路径为 `null`）、
-  `limited`（是否因上限而限制输出）。前端据此显示「原画」或「已限制到 X」。同一信息也写入会话输出描述，
-  `GET /api/v1/playback/sessions/{sessionId}/stats` 的 `output.videoBitrate` 返回相同值。
+  未提供为 `null`）、`targetBitrate`（服务端实际编码的视频码率，Direct/Remux/音频转码等拷贝视频的档位为
+  `null`）、`limited`（输出是否受码率上限约束）。`targetBitrate` 就是 FFmpeg 实际使用的 `-b:v`：用户上限与
+  管理员配置的码率上限取较小值，没有用户上限时只受管理员上限约束（此时 `maxBitrate` 为 `null` 但
+  `targetBitrate` 仍有值），两者都没有时为空。前端据此显示「原画」或「已限制到 X」。同一值写入会话输出描述，
+  `GET /api/v1/playback/sessions/{sessionId}/stats` 的 `output.videoBitrate` 与之一致。
 - `POST /api/v1/playback/bootstrap` 接受与创建会话相同的 `maxBitrate`，语义一致。
 - `DIRECT` 计划除 `url`、`proxyUrl`、`rangeUrl`（旧字段，保留一个版本）外还带有序的 `candidates`：
   `[{ "kind": "proxy|lux|origin", "url": "..." }]`。`proxy` 是标准 Emby `/Videos/{id}/stream?MediaSourceId=...` 入口，

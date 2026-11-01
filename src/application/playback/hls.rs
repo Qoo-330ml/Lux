@@ -318,15 +318,24 @@ impl FfmpegEncodingOptions {
         }
     }
 
-    /// Applies the administrator bitrate cap without raising a lower client-requested bitrate.
+    /// The bitrate this session's encoder is started with; see [`effective_video_bitrate`].
     fn effective_video_bitrate(&self, requested: Option<i64>) -> Option<i64> {
-        let cap = (self.max_video_bitrate > 0).then_some(self.max_video_bitrate);
-        match (requested.filter(|value| *value > 0), cap) {
-            (Some(requested), Some(cap)) => Some(requested.min(cap)),
-            (Some(requested), None) => Some(requested),
-            (None, Some(cap)) => Some(cap),
-            (None, None) => None,
-        }
+        effective_video_bitrate(requested, self.max_video_bitrate)
+    }
+}
+
+/// The video bitrate FFmpeg is actually started with.
+///
+/// The administrator cap applies without raising a lower client-requested bitrate, and it applies
+/// even when the client asked for none. A re-encoding session therefore has a concrete `-b:v` as
+/// soon as either side set a limit, which is what the API reports back to the player.
+pub(crate) fn effective_video_bitrate(requested: Option<i64>, admin_cap_bps: i64) -> Option<i64> {
+    let cap = (admin_cap_bps > 0).then_some(admin_cap_bps);
+    match (requested.filter(|value| *value > 0), cap) {
+        (Some(requested), Some(cap)) => Some(requested.min(cap)),
+        (Some(requested), None) => Some(requested),
+        (None, Some(cap)) => Some(cap),
+        (None, None) => None,
     }
 }
 
@@ -4034,6 +4043,28 @@ while :; do sleep 1; done
         assert!(!args.iter().any(|value| value == "-vf"));
         assert!(!args.iter().any(|value| value == "-b:v"));
         assert!(args.windows(2).any(|pair| pair == ["-preset", "veryfast"]));
+    }
+
+    #[test]
+    fn the_applied_video_bitrate_is_the_administrator_cap_or_the_lower_request() {
+        use super::effective_video_bitrate;
+        assert_eq!(effective_video_bitrate(None, 0), None);
+        assert_eq!(effective_video_bitrate(Some(4_000_000), 0), Some(4_000_000));
+        assert_eq!(
+            effective_video_bitrate(None, 2_000_000),
+            Some(2_000_000),
+            "the administrator cap applies even without a client request"
+        );
+        assert_eq!(
+            effective_video_bitrate(Some(4_000_000), 2_000_000),
+            Some(2_000_000),
+            "the tighter limit wins"
+        );
+        assert_eq!(
+            effective_video_bitrate(Some(2_000_000), 4_000_000),
+            Some(2_000_000),
+            "the administrator cap never raises a lower request"
+        );
     }
 
     #[test]
