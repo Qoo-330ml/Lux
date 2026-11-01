@@ -3946,9 +3946,7 @@ async fn create_web_playback_session_json(
     };
     // What the server actually decided about the caller's ceiling. Copy paths and Direct Play keep
     // the source bitrate, so only a re-encode reports a target the player can show as "limited".
-    let target_video_bitrate_bps = created
-        .target_video_bitrate_bps
-        .filter(|_| matches!(created.plan, WebPlaybackPlan::ServerHls { .. }));
+    let target_video_bitrate_bps = created.target_video_bitrate_bps;
     Ok(json!({
         "sessionId": (!created.id.is_empty()).then_some(created.id),
         "playSessionId": (!created.play_session_id.is_empty()).then_some(created.play_session_id),
@@ -4054,11 +4052,11 @@ async fn web_proxy_candidate_url(
 /// Validates the optional user-selected output ceiling at the protocol boundary.
 ///
 /// A ceiling outside the accepted range is a malformed request, not an unsupported playback, so it
-/// is refused before any ACL work with the standard Lux error body.
-async fn web_playback_max_bitrate(
+/// is refused with the standard Lux error body instead of reaching the decision.
+fn web_playback_max_bitrate(
     headers: &HeaderMap,
     requested: Option<i64>,
-) -> Result<Option<i64>, Response> {
+) -> Result<Option<i64>, (StatusCode, Json<Value>)> {
     let Some(value) = requested else {
         return Ok(None);
     };
@@ -4072,8 +4070,7 @@ async fn web_playback_max_bitrate(
                 MIN_MAX_BITRATE_BPS / 1_000,
                 MAX_MAX_BITRATE_BPS / 1_000
             ),
-        )
-        .into_response());
+        ));
     }
     Ok(Some(value))
 }
@@ -4142,9 +4139,9 @@ pub(super) async fn lux_create_web_playback_session(
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let max_bitrate_bps = match web_playback_max_bitrate(&headers, request.max_bitrate).await {
+    let max_bitrate_bps = match web_playback_max_bitrate(&headers, request.max_bitrate) {
         Ok(max_bitrate_bps) => max_bitrate_bps,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let audio_stream_index = match validate_web_audio_stream(
         &state,
@@ -4239,9 +4236,9 @@ pub(super) async fn lux_create_web_playback_bootstrap(
         Ok(session) => session,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let max_bitrate_bps = match web_playback_max_bitrate(&headers, request.max_bitrate).await {
+    let max_bitrate_bps = match web_playback_max_bitrate(&headers, request.max_bitrate) {
         Ok(max_bitrate_bps) => max_bitrate_bps,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let audio_stream_index = match validate_web_audio_stream(
         &state,
