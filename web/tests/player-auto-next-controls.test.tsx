@@ -14,17 +14,35 @@ describe("LuxPlayer auto play next card", () => {
 
   afterEach(() => {
     if (root) act(() => root?.unmount());
+    root = undefined;
     container?.remove();
+    container = undefined;
   });
 
+  // One container and one root per test: a second call is a real rerender of the
+  // same instance instead of a second root that would never be unmounted.
   function render(node: ReactNode) {
-    container = document.createElement("div");
-    document.body.append(container);
-    root = createRoot(container);
+    if (!container) {
+      container = document.createElement("div");
+      document.body.append(container);
+      root = createRoot(container);
+    }
     return act(async () => root?.render(node));
   }
 
-  it("announces the countdown and exposes labelled keyboard buttons", async () => {
+  function card() {
+    return container?.querySelector<HTMLElement>("[aria-label='自动连播下一集']") ?? null;
+  }
+
+  function liveRegion() {
+    return card()?.querySelector("[aria-live]") ?? null;
+  }
+
+  function countdownText() {
+    return card()?.querySelector("[aria-hidden='true']")?.textContent ?? "";
+  }
+
+  it("announces the offer once and exposes labelled keyboard buttons", async () => {
     const onPlayNow = vi.fn();
     const onCancel = vi.fn();
 
@@ -32,9 +50,14 @@ describe("LuxPlayer auto play next card", () => {
       <PlayerAutoNextCard secondsLeft={10} onPlayNow={onPlayNow} onCancel={onCancel} />,
     );
 
-    expect(container?.querySelector("[aria-label='自动连播下一集']")).not.toBeNull();
-    expect(container?.querySelector("[role='status']")?.textContent).toContain("10 秒");
-    expect(container?.querySelector("[role='status']")?.textContent).toContain("下一集");
+    expect(card()).not.toBeNull();
+    // 单个 live 区域，不再叠加 role="status" 与 aria-live。
+    expect(container?.querySelectorAll("[aria-live]")).toHaveLength(1);
+    expect(card()?.querySelector("[role='status']")).toBeNull();
+    expect(liveRegion()?.textContent).toContain("下一集");
+    // 秒数不属于播报内容。
+    expect(liveRegion()?.textContent).not.toContain("10 秒");
+    expect(countdownText()).toContain("下一集将在 10 秒后播放");
 
     const playNow = container?.querySelector<HTMLButtonElement>("[aria-label='立即播放下一集']");
     const cancel = container?.querySelector<HTMLButtonElement>("[aria-label='取消自动连播']");
@@ -47,14 +70,23 @@ describe("LuxPlayer auto play next card", () => {
     expect(onCancel).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps the countdown number in the status text while it ticks", async () => {
+  it("keeps the live region text stable while the countdown ticks on the same instance", async () => {
     const props = { onPlayNow: () => undefined, onCancel: () => undefined };
 
     await render(<PlayerAutoNextCard secondsLeft={10} {...props} />);
-    expect(container?.querySelector("[role='status']")?.textContent).toContain("10 秒");
+    const liveNode = liveRegion();
+    const announcement = liveNode?.textContent ?? "";
+    expect(announcement).toContain("下一集即将自动播放");
+    expect(countdownText()).toContain("10 秒");
 
     await render(<PlayerAutoNextCard secondsLeft={3} {...props} />);
-    expect(container?.querySelector("[role='status']")?.textContent).toContain("3 秒");
+
+    // 同一实例 rerender：live 区域节点与文字都不变，辅助技术不会逐秒播报。
+    expect(liveRegion()).toBe(liveNode);
+    expect(liveRegion()?.textContent).toBe(announcement);
+    expect(countdownText()).toContain("3 秒");
+    // 没有遗留未卸载的旧 root。
+    expect(document.body.querySelectorAll(".lux-player-auto-next")).toHaveLength(1);
   });
 });
 

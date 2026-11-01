@@ -20,6 +20,8 @@ export function requestsAutoStartPlayback(routeState: unknown): boolean {
 export type AutoStartPlaybackGate = {
   /** Remember a pending auto start (idempotent). */
   request: () => void;
+  /** True while a request is still waiting, without consuming it. */
+  peek: () => boolean;
   /** True exactly once per request, so a later source switch cannot replay it. */
   consume: () => boolean;
 };
@@ -29,6 +31,9 @@ export function createAutoStartPlaybackGate(pending: boolean): AutoStartPlayback
   return {
     request() {
       waiting = true;
+    },
+    peek() {
+      return waiting;
     },
     consume() {
       if (!waiting) return false;
@@ -65,4 +70,21 @@ export async function attemptAutoStartPlayback(
     if (isAutoPlayPolicyError(error)) return "blocked";
     throw error;
   }
+}
+
+/**
+ * Settles the pending one-shot request after a failed automatic start attempt.
+ *
+ * The request is kept only when the same episode really reloads — the server
+ * fallback plan or a Direct Play candidate retry — because that reloaded session
+ * is the one that must still auto start once. Every terminal failure (remote
+ * source, an already-used fallback attempt, an unsupported plan) clears it, so a
+ * later manual session such as the next episode, an audio track switch or a
+ * quality switch does not inherit the request and start playing on its own.
+ */
+export function settleAutoStartPlaybackAfterFailure(
+  gate: AutoStartPlaybackGate,
+  reloadPending: boolean,
+): void {
+  if (!reloadPending) gate.consume();
 }
