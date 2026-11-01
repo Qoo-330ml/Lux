@@ -81,7 +81,9 @@ if [[ ",$plugin_capabilities," != *",notification.send,"* ]]; then
   exit 1
 fi
 
-version=${LUX_PLUGIN_VERSION:-$manifest_version}
+# The package version always comes from the manifest: an environment override could ship a
+# version that contradicts the manifest the host validates after installation.
+version=$manifest_version
 
 if [[ -z "$target" ]]; then
   target=$(rustc -vV | sed -n 's/^host: //p')
