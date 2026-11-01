@@ -1,18 +1,66 @@
-import type { MediaSource } from "../../lib/api/types";
+import type { MediaSource, MediaStream } from "../../lib/api/types";
+import {
+  DEFAULT_VIDEO_HEIGHT,
+  DEFAULT_VIDEO_WIDTH,
+  hevcMseCodecCandidates,
+  mseVideoCodecString,
+  videoStreamFacts,
+  wasmSoftDecodeExpectsRealtime,
+  type VideoStreamFacts,
+} from "./client-decode-caps";
 import { isHevcCodec } from "./media-codec";
+
+export { h264CodecForDimensions } from "./client-decode-caps";
 
 const CLIENT_HEVC_CONTAINERS = new Set(["mp4", "m4v", "mov"]);
 const H264_CODECS = ["avc1.640028", "avc1.64002a", "avc1.640033"] as const;
-const HEVC_MSE_CODECS = [
-  // Main 10 level 4.0/5.1 and the 8-bit Main baseline are common in MKV
-  // releases. Keep the concrete strings aligned with the codec string
-  // emitted from Matroska's hvcC instead of probing only one profile.
-  "hvc1.2.4.L120.B0",
-  "hvc1.2.4.L153.B0",
-  "hvc1.1.6.L120.B0",
-] as const;
 const PASSTHROUGH_AUDIO_CODECS = new Set(["ac3", "ac-3", "eac3", "ec-3", "opus"]);
 const CLIENT_MKV_VIDEO_CODECS = new Set(["h264", "avc", "avc1", "hevc", "h265", "hvc1", "vp9", "vp09", "av1", "av01"]);
+
+/** Facts used when a caller only needs the historical "could this ever work" answer. */
+const DEFAULT_HEVC_FACTS: VideoStreamFacts = {
+  codec: "hevc",
+  family: "hevc",
+  width: DEFAULT_VIDEO_WIDTH,
+  height: DEFAULT_VIDEO_HEIGHT,
+  bitDepth: 8,
+  profile: null,
+  level: null,
+};
+
+/** Why the client decode path was not taken. */
+export type ClientDecodeRejection =
+  /** The source never had a client engine candidate; ordinary playback decides. */
+  | "no-candidate"
+  /** The element plays the original container/codec itself, so no client engine is needed. */
+  | "native-playback"
+  /** The browser cannot decode the source's real bit depth/level through MSE or WebCodecs. */
+  | "client-codec-unsupported"
+  /** Only the CPU-bound WASM soft decoder is left, and the source is above its realtime cap. */
+  | "client-resolution-too-high"
+  /** The required WASM/Worker/MSE/WebCodecs runtime is missing. */
+  | "client-runtime-missing";
+
+export type ClientDecodeDecision =
+  | { engine: "client-mkv" | "client-hevc"; rejected: null }
+  | { engine: null; rejected: ClientDecodeRejection };
+
+const REJECTED = (rejected: ClientDecodeRejection): ClientDecodeDecision => ({ engine: null, rejected });
+const CLIENT_MKV: ClientDecodeDecision = { engine: "client-mkv", rejected: null };
+const CLIENT_HEVC: ClientDecodeDecision = { engine: "client-hevc", rejected: null };
+
+/**
+ * True when the client path was required but cannot work in this browser, so the session must be
+ * re-requested as server-side transcoding instead of waiting for a media element that never plays.
+ */
+export function clientDecodeRequiresServerFallback(decision: ClientDecodeDecision) {
+  return decision.engine === null
+    && (
+      decision.rejected === "client-codec-unsupported"
+      || decision.rejected === "client-resolution-too-high"
+      || decision.rejected === "client-runtime-missing"
+    );
+}
 
 export function isRemoteHttpStrmSource(source: MediaSource | undefined) {
   if (source?.sourceKind !== "STRM_URL" || !source.externalUrl) return false;
@@ -22,13 +70,6 @@ export function isRemoteHttpStrmSource(source: MediaSource | undefined) {
   } catch {
     return false;
   }
-}
-
-export function h264CodecForDimensions(width: number, height: number) {
-  const pixels = Math.max(1, width) * Math.max(1, height);
-  if (pixels > 2_073_600) return "avc1.640033";
-  if (pixels > 921_600) return "avc1.64002a";
-  return "avc1.640028";
 }
 
 export function hasClientHevcCandidate(source: MediaSource | undefined) {
@@ -52,9 +93,8 @@ function isMatroskaContainer(container: string | null | undefined) {
     .some((part) => ["mkv", "matroska", "webm"].includes(part.trim()));
 }
 
-export async function shouldUseClientHevc(source: MediaSource | undefined, video: HTMLVideoElement) {
-  if (!source || !hasClientHevcCandidate(source) || !hasClientHevcRuntime()) return false;
-  return probeClientHevc(source, video, "video/mp4");
+function videoStreamOf(source: MediaSource | undefined): MediaStream | undefined {
+  return source?.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO");
 }
 
 export type ClientMkvSelectionOptions = {
@@ -67,53 +107,131 @@ export type ClientMkvSelectionOptions = {
   requireCaptionPipeline?: boolean;
 };
 
+export async function shouldUseClientHevc(source: MediaSource | undefined, video: HTMLVideoElement) {
+  return (await resolveClientDecode(source, video)).engine === "client-hevc";
+}
+
 export async function shouldUseClientMkv(
   source: MediaSource | undefined,
   video: HTMLVideoElement,
   options: ClientMkvSelectionOptions = {},
 ) {
-  if (!source || !hasClientMkvCandidate(source)) return false;
-  const requireCaptionPipeline = options.requireCaptionPipeline === true;
-  const videoCodec = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO")?.codec?.toLowerCase() ?? "";
-  if (!requireCaptionPipeline && video.canPlayType(`video/x-matroska; codecs="${matroskaCodecHint(videoCodec)}"`) !== "") {
-    return false;
-  }
-  if (!isHevcCodec(videoCodec) && typeof MediaSource !== "undefined" && typeof MediaSource.isTypeSupported === "function") {
-    const codec = videoCodec.includes("vp9") || videoCodec.includes("vp09")
-      ? "vp09.00.10.08"
-      : videoCodec.includes("av1") || videoCodec.includes("av01")
-        ? "av01.0.04M.08"
-        : "avc1.640028";
-    const audioCodec = mseAudioCodec(source);
-    if (source.streams?.some((stream) => (stream.type ?? "").toUpperCase() === "AUDIO") && !audioCodec) return false;
-    return MediaSource.isTypeSupported(`video/mp4; codecs="${[codec, audioCodec].filter(Boolean).join(",")}"`);
-  }
-  if (hasClientMkvHevcRuntime()) {
-    if (!hasClientMkvAudioRuntime(source)) return false;
-    return requireCaptionPipeline || video.canPlayType('video/x-matroska; codecs="hvc1"') === "";
-  }
-  if (!hasClientHevcRuntime()) return false;
-  if (!hasClientMkvH264Audio(source)) return false;
-  return probeClientHevc(source, video, "video/x-matroska", requireCaptionPipeline);
+  return (await resolveClientDecode(source, video, options)).engine === "client-mkv";
 }
 
-function matroskaCodecHint(videoCodec: string) {
-  if (videoCodec.includes("vp9") || videoCodec.includes("vp09")) return "vp09";
-  if (videoCodec.includes("av1") || videoCodec.includes("av01")) return "av01";
-  if (videoCodec.includes("hevc") || videoCodec.includes("h265") || videoCodec.includes("hvc1") || videoCodec.includes("hev1")) return "hvc1";
-  return "avc1";
+/**
+ * Decides whether the client decode path should be used and, when it should not, why.
+ *
+ * The runtime needs the reason: `native-playback` and `no-candidate` keep ordinary playback, while
+ * the `client-*` rejections mean the browser cannot decode what the server planned to send and the
+ * session has to be re-requested as server-side transcoding.
+ */
+export async function resolveClientDecode(
+  source: MediaSource | undefined,
+  video: HTMLVideoElement,
+  options: ClientMkvSelectionOptions = {},
+): Promise<ClientDecodeDecision> {
+  if (!source) return REJECTED("no-candidate");
+  const mkvCandidate = hasClientMkvCandidate(source);
+  const hevcCandidate = hasClientHevcCandidate(source);
+  if (!mkvCandidate && !hevcCandidate) return REJECTED("no-candidate");
+
+  const facts = videoStreamFacts(videoStreamOf(source));
+  const requireCaptionPipeline = options.requireCaptionPipeline === true;
+
+  if (mkvCandidate) {
+    return decideMatroska(source, facts, video, requireCaptionPipeline);
+  }
+  return decideMp4Hevc(source, facts, video);
+}
+
+async function decideMatroska(
+  source: MediaSource,
+  facts: VideoStreamFacts,
+  video: HTMLVideoElement,
+  requireCaptionPipeline: boolean,
+): Promise<ClientDecodeDecision> {
+  // A 10-bit source must be hinted with its real profile: `codecs="avc1"` describes the 8-bit
+  // sibling the browser may support, which is how a High 10 file used to reach the remux worker.
+  const nativeMatroska = video.canPlayType(`video/x-matroska; codecs="${matroskaCodecHint(facts)}"`) !== "";
+  if (!requireCaptionPipeline && nativeMatroska) return REJECTED("native-playback");
+
+  if (facts.family !== "hevc") {
+    // H.264/VP9/AV1 Matroska is remuxed without re-encoding, so MSE must accept the source's own
+    // profile and bit depth.
+    return decideMatroskaRemux(source, facts);
+  }
+
+  if (hasClientMkvHevcRuntime(facts)) {
+    // The browser decodes HEVC itself, so the worker only rewraps Matroska into fMP4. This is the
+    // Safari/Windows path and it is not bounded by the WASM soft-decode cap.
+    if (!hasClientMkvAudioRuntime(source, facts)) return REJECTED("client-codec-unsupported");
+    return requireCaptionPipeline || !nativeMatroska ? CLIENT_MKV : REJECTED("native-playback");
+  }
+
+  // No HEVC support in MSE: only the CPU-bound WASM decoder + H.264 encoder is left.
+  if (!wasmSoftDecodeExpectsRealtime(facts)) return REJECTED("client-resolution-too-high");
+  if (!hasClientHevcRuntime()) return REJECTED("client-runtime-missing");
+  if (!hasClientMkvH264Audio(source)) return REJECTED("client-codec-unsupported");
+  if (!requireCaptionPipeline && video.canPlayType('video/x-matroska; codecs="hvc1"') !== "") {
+    return REJECTED("native-playback");
+  }
+  if (!(await probeWasmSoftDecode(source, facts))) return REJECTED("client-codec-unsupported");
+  return CLIENT_MKV;
+}
+
+async function decideMp4Hevc(
+  source: MediaSource,
+  facts: VideoStreamFacts,
+  video: HTMLVideoElement,
+): Promise<ClientDecodeDecision> {
+  const codecHint = facts.codec && /^(hvc1|hev1)\./i.test(facts.codec) ? facts.codec : "hvc1.1.6.L120.B0";
+  if (video.canPlayType(`video/mp4; codecs="${codecHint}"`) !== "") return REJECTED("native-playback");
+  // MP4/MOV HEVC always needs the WASM decoder + H.264 re-encode.
+  if (!wasmSoftDecodeExpectsRealtime(facts)) return REJECTED("client-resolution-too-high");
+  if (!hasClientHevcRuntime()) return REJECTED("client-runtime-missing");
+  if (!(await probeWasmSoftDecode(source, facts))) return REJECTED("client-codec-unsupported");
+  return CLIENT_HEVC;
+}
+
+function decideMatroskaRemux(source: MediaSource, facts: VideoStreamFacts): ClientDecodeDecision {
+  if (typeof MediaSource === "undefined" || typeof MediaSource.isTypeSupported !== "function") {
+    return REJECTED("client-runtime-missing");
+  }
+  const videoCodec = mseVideoCodecString(facts);
+  if (!videoCodec) return REJECTED("client-codec-unsupported");
+  const audioCodec = mseAudioCodec(source);
+  const hasAudio = (source.streams ?? []).some((stream) => (stream.type ?? "").toUpperCase() === "AUDIO");
+  if (hasAudio && !audioCodec) return REJECTED("client-codec-unsupported");
+  return MediaSource.isTypeSupported(`video/mp4; codecs="${[videoCodec, audioCodec].filter(Boolean).join(",")}"`)
+    ? CLIENT_MKV
+    : REJECTED("client-codec-unsupported");
+}
+
+function matroskaCodecHint(facts: VideoStreamFacts) {
+  return mseVideoCodecString(facts) ?? (facts.family === "hevc" ? "hvc1" : "avc1");
 }
 
 function mseAudioCodec(source: MediaSource) {
   const codecs = source.streams?.filter((stream) => (stream.type ?? "").toUpperCase() === "AUDIO").map((stream) => (stream.codec ?? "").toLowerCase()) ?? [];
   if (codecs.some((codec) => /^aac$|^mp4a\./i.test(codec))) return "mp4a.40.2";
-  if (codecs.some((codec) => ["ac3", "ac-3"].includes(codec))) return "ac-3";
-  if (codecs.some((codec) => ["eac3", "ec-3"].includes(codec))) return "ec-3";
+  if (codecs.some((codec) => ["ac3", "ac-3"].includes(codec)) && mseAudioSupported("ac-3")) return "ac-3";
+  if (codecs.some((codec) => ["eac3", "ec-3"].includes(codec)) && mseAudioSupported("ec-3")) return "ec-3";
   if (codecs.some((codec) => codec === "opus")) return "opus";
   return null;
 }
 
-function hasClientMkvAudioRuntime(source: MediaSource) {
+/**
+ * AC-3/E-AC-3 decoding is a platform feature (Windows needs the Dolby extension), and a browser can
+ * accept the MSE pair while never decoding a frame of it. Requiring the audio-only answer keeps a
+ * silent client remux from being preferred over the server's audio transcode.
+ */
+function mseAudioSupported(codec: "ac-3" | "ec-3" | "opus") {
+  if (typeof MediaSource === "undefined" || typeof MediaSource.isTypeSupported !== "function") return false;
+  return MediaSource.isTypeSupported(`audio/mp4; codecs="${codec}"`);
+}
+
+function hasClientMkvAudioRuntime(source: MediaSource, facts: VideoStreamFacts = DEFAULT_HEVC_FACTS) {
   const audio = source.streams?.filter((stream) => (stream.type ?? "").toUpperCase() === "AUDIO") ?? [];
   const codec = audio.some((stream) => /^aac$|^mp4a\./i.test(stream.codec ?? ""))
     ? "aac"
@@ -124,8 +242,10 @@ function hasClientMkvAudioRuntime(source: MediaSource) {
           : audio.some((stream) => (stream.codec ?? "").toLowerCase() === "opus")
             ? "opus"
         : null;
-  if (!codec || codec === "aac") return true;
-  return HEVC_MSE_CODECS.some((videoCodec) => MediaSource.isTypeSupported(`video/mp4; codecs="${videoCodec},${codec}"`));
+  if (!codec) return true;
+  if (codec !== "aac" && !mseAudioSupported(codec)) return false;
+  if (codec === "aac") return true;
+  return hevcMseCodecCandidates(facts).some((videoCodec) => MediaSource.isTypeSupported(`video/mp4; codecs="${videoCodec},${codec}"`));
 }
 
 function hasClientMkvH264Audio(source: MediaSource) {
@@ -133,9 +253,10 @@ function hasClientMkvH264Audio(source: MediaSource) {
   return audio.length === 0 || audio.some((stream) => /^aac$|^mp4a\./i.test(stream.codec ?? ""));
 }
 
-export function hasClientMkvHevcRuntime() {
+/** True when the browser can decode HEVC through MSE, which makes the worker a plain remux. */
+export function hasClientMkvHevcRuntime(facts: VideoStreamFacts = DEFAULT_HEVC_FACTS) {
   if (typeof MediaSource === "undefined" || typeof MediaSource.isTypeSupported !== "function") return false;
-  return HEVC_MSE_CODECS.some((codec) => MediaSource.isTypeSupported(`video/mp4; codecs="${codec}"`));
+  return hevcMseCodecCandidates(facts).some((codec) => MediaSource.isTypeSupported(`video/mp4; codecs="${codec}"`));
 }
 
 /**
@@ -146,18 +267,10 @@ export function hasClientMkvHevcRuntime() {
  */
 export function canUseClientMkvCaptionPipeline(source: MediaSource | undefined) {
   if (!source || !hasClientMkvCandidate(source)) return false;
-  const videoCodec = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO")?.codec?.toLowerCase() ?? "";
-  if (!isHevcCodec(videoCodec) && typeof MediaSource !== "undefined" && typeof MediaSource.isTypeSupported === "function") {
-    const codec = videoCodec.includes("vp9") || videoCodec.includes("vp09")
-      ? "vp09.00.10.08"
-      : videoCodec.includes("av1") || videoCodec.includes("av01")
-        ? "av01.0.04M.08"
-        : "avc1.640028";
-    const audioCodec = mseAudioCodec(source);
-    return (!source.streams?.some((stream) => (stream.type ?? "").toUpperCase() === "AUDIO") || Boolean(audioCodec))
-      && MediaSource.isTypeSupported(`video/mp4; codecs="${[codec, audioCodec].filter(Boolean).join(",")}"`);
-  }
-  if (hasClientMkvHevcRuntime()) return hasClientMkvAudioRuntime(source);
+  const facts = videoStreamFacts(videoStreamOf(source));
+  if (facts.family !== "hevc") return decideMatroskaRemux(source, facts).engine === "client-mkv";
+  if (hasClientMkvHevcRuntime(facts)) return hasClientMkvAudioRuntime(source, facts);
+  if (!wasmSoftDecodeExpectsRealtime(facts)) return false;
   return hasClientMkvH264Audio(source);
 }
 
@@ -176,30 +289,23 @@ export function canUseRemoteMkvCaptionSidecar(source: MediaSource | undefined) {
   });
 }
 
-async function probeClientHevc(
-  source: MediaSource,
-  video: HTMLVideoElement,
-  mime: string,
-  ignoreNativePlayback = false,
-) {
-  const videoStream = source?.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO");
-  const codec = videoStream?.codec;
-  const codecHint = codec && /^(hvc1|hev1)\./i.test(codec) ? codec : "hvc1.1.6.L120.B0";
-  if (!ignoreNativePlayback && video.canPlayType(`${mime}; codecs="${codecHint}"`) !== "") return false;
+/**
+ * The WASM soft decoder re-encodes to H.264 through WebCodecs, so the probe asks the encoder for the
+ * source's real resolution, framerate, bitrate and H.264 level.
+ */
+async function probeWasmSoftDecode(source: MediaSource, facts: VideoStreamFacts) {
   const browserGlobals = globalThis as typeof globalThis & {
     VideoEncoder?: {
       isConfigSupported: (config: Record<string, unknown>) => Promise<{ supported?: boolean }>;
     };
   };
-  const details = videoStream?.details ?? {};
-  const width = typeof details.width === "number" && Number.isFinite(details.width) && details.width > 0 ? Math.round(details.width) : 1920;
-  const height = typeof details.height === "number" && Number.isFinite(details.height) && details.height > 0 ? Math.round(details.height) : 1080;
-  const framerate = typeof details.averageFrameRate === "number" && Number.isFinite(details.averageFrameRate) && details.averageFrameRate > 0 ? details.averageFrameRate : 30;
+  const videoStream = videoStreamOf(source);
+  const framerate = probeFramerate(videoStream);
   try {
     const support = await browserGlobals.VideoEncoder?.isConfigSupported({
-      codec: h264CodecForDimensions(width, height),
-      width,
-      height,
+      codec: h264ProbeCodecCode(facts),
+      width: facts.width,
+      height: facts.height,
       bitrate: Math.max(1_000_000, source?.bitrate ?? 8_000_000),
       framerate,
     });
@@ -207,6 +313,19 @@ async function probeClientHevc(
   } catch {
     return false;
   }
+}
+
+function h264ProbeCodecCode(facts: VideoStreamFacts) {
+  // The encoder always produces 8-bit H.264 (High@L4.0–5.1), never a 10-bit profile.
+  const codec = mseVideoCodecString({ ...facts, family: "h264", bitDepth: 8 });
+  return codec ?? "avc1.640028";
+}
+
+function probeFramerate(stream: MediaStream | undefined) {
+  const details = stream?.details ?? {};
+  const value = details.AverageFrameRate ?? details.averageFrameRate ?? details.RealFrameRate ?? details.realFrameRate;
+  const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 30;
 }
 
 export function hasClientHevcRuntime() {
