@@ -12,6 +12,10 @@ import type {
   PlayerFlip,
   PlayerVideoPresentation,
 } from "./player-presentation";
+import {
+  PlayerAudioTrackSelector,
+  type PlayerAudioTrackSection,
+} from "./player-audio-track-selector";
 import { LuxSelectField } from "../../../components/ui";
 
 type PlayerPresentationSettings = PlayerVideoPresentation & {
@@ -33,6 +37,8 @@ type PlayerSettingsPanelProps = {
   sources?: readonly PlayerSettingsSourceOption[];
   selectedSourceId?: string;
   onSourceChange?: (sourceId: string) => void;
+  /** Independent audio-track slot; omitted when the player has no track data. */
+  audioTracks?: PlayerAudioTrackSection;
   captions?: readonly PlayerCaptionOption[];
   selectedCaptionId?: string | null;
   captionStatus?: string | null;
@@ -62,6 +68,7 @@ export function PlayerSettingsPanel({
   sources = [],
   selectedSourceId = "",
   onSourceChange = () => undefined,
+  audioTracks,
   captions = [],
   selectedCaptionId = null,
   captionStatus = null,
@@ -111,6 +118,7 @@ export function PlayerSettingsPanel({
           </LuxSelectField>
         </div>
       ) : null}
+      {audioTracks ? <PlayerAudioTrackSelector {...audioTracks} /> : null}
       <div className="lux-player-settings-section">
         <span className="lux-player-settings-label" id="lux-player-speed-label">播放速度</span>
         <div className="lux-player-speed-grid" aria-labelledby="lux-player-speed-label">
