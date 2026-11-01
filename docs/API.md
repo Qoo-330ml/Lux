@@ -377,10 +377,22 @@ Web 播放使用独立于 Emby 的播放会话 API。创建和状态写入接口
 签名只绑定当前会话、资源名称和过期时间，不能被改用于其他会话、媒体源或路径。
 
 - `POST /api/v1/playback/sessions`：创建一次播放计划。请求体为
-  `{ "itemId": "...", "sourceId": "...", "capabilities": { "directPlay": true, "hls": true, "videoCopyToFmp4": true, "audioCopyToFmp4": true, "hardwareTranscode": false, "softwareTranscode": true } }`。
+  `{ "itemId": "...", "sourceId": "...", "maxBitrate": 4000000, "capabilities": { "directPlay": true, "hls": true, "videoCopyToFmp4": true, "audioCopyToFmp4": true, "hardwareTranscode": false, "softwareTranscode": true } }`。
   服务端先检查条目/媒体库 ACL，再按 0→4 选择最低成本计划。响应包含 `sessionId`、`playSessionId`、`tier`、
-  `expiresAt`、`sourceId` 和 `plan`。`plan.type` 为 `DIRECT`、`SERVER_HLS` 或 `UNSUPPORTED`；后者带稳定的
+  `expiresAt`、`sourceId`、`bitrate` 和 `plan`。`plan.type` 为 `DIRECT`、`SERVER_HLS` 或 `UNSUPPORTED`；后者带稳定的
   `reason`，且不会创建播放会话或 FFmpeg 进程。
+- `maxBitrate`（可选，单位 bps，允许 100000～200000000）：用户选择的单路输出码率上限。缺省表示不限制。
+  源码率（`media_sources.bitrate`，由 ffprobe 记录）不超过上限时决策与原来完全一致；超过上限时 Direct Play、
+  Remux 和音频转码都会升级为可重编码的最低成本档位（优先档位 3，其次档位 4），并把该上限作为 FFmpeg 的
+  `-b:v`（管理员配置的码率上限仍会再取一次较小值）。源码率未知（未探测）时不触发升级。上限无法满足时按现有
+  `UNSUPPORTED` 规则返回：不可用 HLS 为 `BROWSER_CANNOT_CONSUME_HLS`，没有可用的重编码档位为
+  `NO_COMPATIBLE_SERVER_PLAN`；用户策略禁止所需档位时返回 403 `PERMISSION_DENIED`。`.strm` 继续只允许 Direct
+  Play，该字段被忽略。值越界返回 400 `INVALID_REQUEST`。
+- 响应中的 `bitrate` 描述实际生效的决策：`sourceBitrate`（源码率，未探测为 `null`）、`maxBitrate`（请求的上限，
+  未提供为 `null`）、`targetBitrate`（服务端实际编码的视频码率，Direct/Remux 等拷贝路径为 `null`）、
+  `limited`（是否因上限而限制输出）。前端据此显示「原画」或「已限制到 X」。同一信息也写入会话输出描述，
+  `GET /api/v1/playback/sessions/{sessionId}/stats` 的 `output.videoBitrate` 返回相同值。
+- `POST /api/v1/playback/bootstrap` 接受与创建会话相同的 `maxBitrate`，语义一致。
 - `DIRECT` 计划除 `url`、`proxyUrl`、`rangeUrl`（旧字段，保留一个版本）外还带有序的 `candidates`：
   `[{ "kind": "proxy|lux|origin", "url": "..." }]`。`proxy` 是标准 Emby `/Videos/{id}/stream?MediaSourceId=...` 入口，
   带 `PlaySessionId`、`DeviceId`、`UserId`、`static=true`，以及一个播放专用短期 `api_key`（`luxpb_{条目}_{随机串}`），
