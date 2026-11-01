@@ -186,10 +186,10 @@ describe("light theme contrast", () => {
 
     expect(cssRule(".lux-admin-transcoding-state.is-ok")).toContain("color: var(--lux-status-success)");
     expect(cssRule(".lux-admin-transcoding-state.is-error")).toContain("color: var(--lux-status-danger)");
-    expect(cssRule(".lux-transcoding-session-state.is-finished")).toContain("color: var(--lux-status-warning)");
-    expect(cssRule(".lux-transcoding-history-reason")).toContain("color: var(--lux-status-danger)");
-    expect(cssRule(".lux-transcoding-outcome.is-ok")).toContain("color: var(--lux-status-success)");
-    expect(cssRule(".lux-transcoding-outcome.is-error")).toContain("color: var(--lux-status-danger)");
+    expect(cssRule(".lux-tc-session-state.is-finished")).toContain("color: var(--lux-status-warning)");
+    expect(cssRule(".lux-tc-history-main .lux-tc-history-reason")).toContain("color: var(--lux-status-danger)");
+    expect(cssRule(".lux-tc-outcome.is-ok")).toContain("color: var(--lux-status-success)");
+    expect(cssRule(".lux-tc-outcome.is-error")).toContain("color: var(--lux-status-danger)");
     expect(cssRule(".lux-now-playing-kv-value.is-direct")).toContain("color: var(--lux-status-success)");
     expect(cssRule(".lux-now-playing-kv-value.is-transcode")).toContain("color: var(--lux-status-warning)");
     expect(cssRule(".lux-now-playing-kv-value.is-source")).toContain("color: var(--lux-status-info)");
