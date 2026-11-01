@@ -389,6 +389,42 @@ fn rejects_secret_config_fields_that_are_not_sensitive_or_unique() {
 }
 
 #[test]
+fn rejects_other_sensitive_or_password_fields_on_a_notification_plugin() {
+    let sensitive_field =
+        PluginManifest::from_value(notification_manifest_with_config_fields(json!([
+            {"key": "secret", "label": "凭据", "type": "password", "sensitive": true},
+            {"key": "serverUrl", "label": "服务地址", "type": "text", "sensitive": true}
+        ])));
+    assert!(
+        sensitive_field.is_err(),
+        "a notification plugin may only mark the secret field as sensitive"
+    );
+
+    let password_field =
+        PluginManifest::from_value(notification_manifest_with_config_fields(json!([
+            {"key": "channelId", "label": "频道", "type": "password", "sensitive": false}
+        ])));
+    assert!(
+        password_field.is_err(),
+        "a notification plugin may only declare the secret field as a password field"
+    );
+
+    let plain_fields =
+        PluginManifest::from_value(notification_manifest_with_config_fields(json!([
+            {"key": "serverUrl", "label": "服务地址", "type": "text", "required": true},
+            {"key": "sound", "label": "铃声", "type": "select", "options": [
+                {"value": "default", "label": "默认"}
+            ]},
+            {"key": "secret", "label": "凭据", "type": "password", "sensitive": true}
+        ])));
+    assert!(
+        plain_fields.is_ok(),
+        "non-secret notification fields must stay non-sensitive: {:?}",
+        plain_fields.err()
+    );
+}
+
+#[test]
 fn rejects_a_secret_config_field_on_a_non_notification_plugin() {
     let manifest = PluginManifest::from_value(json!({
         "formatVersion": PLUGIN_FORMAT_VERSION,

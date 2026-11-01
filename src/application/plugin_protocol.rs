@@ -421,6 +421,23 @@ impl PluginManifest {
                     ));
                 }
             }
+            if self.plugin_type == PLUGIN_TYPE_NOTIFICATION && field.key != SECRET_CONFIG_FIELD_KEY
+            {
+                // A notification provider's config fields are per destination and travel in the
+                // non-secret provider config, so the only credential channel is `secret`.
+                if field.sensitive {
+                    return Err(PluginManifestError::Invalid(
+                        "notification plugins may only mark the secret config field as sensitive"
+                            .to_owned(),
+                    ));
+                }
+                if field.input_type == "password" {
+                    return Err(PluginManifestError::Invalid(
+                        "notification plugins may only declare the secret config field as a password field"
+                            .to_owned(),
+                    ));
+                }
+            }
             if field.input_type == "select" {
                 if field.options.is_empty() == field.options_source.is_none()
                     || field.options.len() > 256
