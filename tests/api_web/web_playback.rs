@@ -3060,6 +3060,11 @@ async fn web_playback_ignores_the_max_height_for_strm_and_rejects_an_invalid_val
         "a .strm never leaves Direct Play for a resolution ceiling"
     );
     assert_eq!(strm_direct["resolution"]["limited"], json!(false));
+    assert_eq!(
+        strm_direct["resolution"]["targetHeight"],
+        Value::Null,
+        "a .strm probe recorded no height, so no output height is claimed"
+    );
     assert_eq!(strm_direct["bitrate"]["targetBitrate"], Value::Null);
 
     // A browser that cannot consume HLS gets the existing unsupported reason instead of a plan

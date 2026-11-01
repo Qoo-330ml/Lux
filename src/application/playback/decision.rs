@@ -199,14 +199,14 @@ impl PlaybackResolutionLimit {
         }
     }
 
-    /// The height the output actually has, once the administrator's global cap applies.
+    /// The height a re-encoded picture ends up at, once the administrator's global cap applies.
     ///
-    /// The cap only narrows a re-encode: a copied track keeps the source picture, so it is
-    /// ignored for Direct Play, Remux and audio transcode. `admin_cap` of `0` or less means the
+    /// Only a re-encode applies the cap: Direct Play, Remux and audio transcode keep the source
+    /// picture and report the source height instead. `admin_cap` of `0` or less means the
     /// administrator configured no global height cap.
-    pub fn output_height(&self, admin_cap: i64, video_re_encoded: bool) -> Option<i64> {
+    pub fn reencoded_height(&self, admin_cap: i64) -> Option<i64> {
         let scaled = self.scaled_height();
-        if !video_re_encoded || admin_cap <= 0 {
+        if admin_cap <= 0 {
             return scaled;
         }
         match scaled {
@@ -724,36 +724,31 @@ mod tests {
 
     #[test]
     fn the_reported_output_height_is_the_smallest_known_ceiling() {
-        assert_eq!(height(2_160, 1_080).output_height(0, true), Some(1_080));
+        assert_eq!(height(2_160, 1_080).reencoded_height(0), Some(1_080));
         assert_eq!(
-            height(2_160, 1_080).output_height(720, true),
+            height(2_160, 1_080).reencoded_height(720),
             Some(720),
             "the administrator cap narrows the caller's ceiling"
         );
         assert_eq!(
-            height(2_160, 1_080).output_height(720, false),
-            Some(1_080),
-            "a copied track keeps the source picture, so the cap does not apply"
-        );
-        assert_eq!(
-            height(720, 1_080).output_height(0, false),
+            height(720, 1_080).reencoded_height(0),
             Some(720),
-            "nothing is scaled, so the source height is the output height"
+            "nothing needs scaling, so the source height is the output height"
         );
         assert_eq!(
             PlaybackResolutionLimit {
                 source_height: None,
                 max_height: Some(1_080),
             }
-            .output_height(0, true),
+            .reencoded_height(0),
             Some(1_080)
         );
         assert_eq!(
-            PlaybackResolutionLimit::NONE.output_height(1_080, true),
+            PlaybackResolutionLimit::NONE.reencoded_height(1_080),
             Some(1_080),
             "an administrator cap alone describes the output height"
         );
-        assert_eq!(PlaybackResolutionLimit::NONE.output_height(0, true), None);
+        assert_eq!(PlaybackResolutionLimit::NONE.reencoded_height(0), None);
     }
 
     #[test]

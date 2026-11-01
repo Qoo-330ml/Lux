@@ -547,9 +547,11 @@ impl WebPlaybackSessionService {
                 tier: ServerTier::HardwareTranscode | ServerTier::SoftwareTranscode,
             }
         );
-        let target_video_bitrate_bps = re_encodes_video
-            .then(|| reencode_video_bitrate_bps(input.bitrate, input.resolution))
-            .flatten();
+        let target_video_bitrate_bps = if re_encodes_video {
+            reencode_video_bitrate_bps(input.bitrate, input.resolution)
+        } else {
+            None
+        };
         // The scale filter is only added when this request actually narrowed the picture; the
         // administrator's global cap is applied by the encoder on top of it.
         let target_video_height = if re_encodes_video && input.resolution.requires_scale() {

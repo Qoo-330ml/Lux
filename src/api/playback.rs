@@ -3993,15 +3993,16 @@ async fn create_web_playback_session_json(
         created.target_video_bitrate_bps,
         admin_video_bitrate_cap,
     );
-    // What the server actually decided about the caller's resolution ceiling. A copied track keeps
-    // the source picture, so the administrator's global cap only narrows a re-encode.
-    let video_re_encoded = matches!(
-        created.plan,
+    // What the server actually decided about the caller's resolution ceiling. Direct Play and the
+    // copy tiers hand over the source picture, so only a re-encode can land on another height; an
+    // unsupported decision produces no picture at all.
+    let (scales_video, output_height) = match created.plan {
+        WebPlaybackPlan::Unsupported { .. } => (false, None),
         WebPlaybackPlan::ServerHls {
-            tier: ServerTier::HardwareTranscode | ServerTier::SoftwareTranscode
-        }
-    );
-    let output_height = resolution.output_height(admin_max_height, video_re_encoded);
+            tier: ServerTier::HardwareTranscode | ServerTier::SoftwareTranscode,
+        } => (true, resolution.reencoded_height(admin_max_height)),
+        WebPlaybackPlan::Direct | WebPlaybackPlan::ServerHls { .. } => (false, source.video_height),
+    };
     Ok(json!({
         "sessionId": (!created.id.is_empty()).then_some(created.id),
         "playSessionId": (!created.play_session_id.is_empty()).then_some(created.play_session_id),
@@ -4021,7 +4022,7 @@ async fn create_web_playback_session_json(
             "targetHeight": output_height,
             // Only a plan the server actually re-encoded can be scaled: an unsupported decision
             // scales nothing, so the ceiling changed nothing either.
-            "limited": video_re_encoded && resolution.requires_scale(),
+            "limited": scales_video && resolution.requires_scale(),
         },
     }))
 }
