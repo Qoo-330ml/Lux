@@ -529,30 +529,34 @@ impl WebhookService {
                 })
                 .transpose()?
         };
-        self.database
-            .notifications()
-            .update_notification_destination(
-                id,
-                UpdateNotificationDestination {
-                    name: validated_name,
-                    url: validated_url
-                        .as_ref()
-                        .and_then(Option::as_ref)
-                        .map(Url::as_str),
-                    enabled,
-                    allow_private_network,
-                    event_types_json: event_types_json.as_deref(),
-                    payload_format: normalized_payload_format.map(WebhookPayloadFormat::as_str),
-                    provider_plugin_id,
-                    provider_config_json: provider_config_json.as_deref(),
-                },
-            )
-            .await?;
-        match &secret_change {
-            Some(SecretChange::Set(secret)) => self.set_secret(id, Some(secret)).await?,
-            Some(SecretChange::Clear) => self.set_secret(id, None).await?,
-            None => {}
-        }
+        let previous_secret = self.secret_value(id).await?;
+        self.write_destination_with_secret(id, previous_secret, secret_change, async {
+            let updated = self
+                .database
+                .notifications()
+                .update_notification_destination(
+                    id,
+                    UpdateNotificationDestination {
+                        name: validated_name,
+                        url: validated_url
+                            .as_ref()
+                            .and_then(Option::as_ref)
+                            .map(Url::as_str),
+                        enabled,
+                        allow_private_network,
+                        event_types_json: event_types_json.as_deref(),
+                        payload_format: normalized_payload_format.map(WebhookPayloadFormat::as_str),
+                        provider_plugin_id,
+                        provider_config_json: provider_config_json.as_deref(),
+                    },
+                )
+                .await?;
+            if !updated {
+                return Err(WebhookError::NotFound);
+            }
+            Ok(())
+        })
+        .await?;
         self.view_by_id(id).await?.ok_or(WebhookError::NotFound)
     }
 
@@ -1080,6 +1084,41 @@ impl WebhookService {
             .notification_provider_declares_secret(provider_plugin_id)
             .await
             .map_err(|error| WebhookError::Plugin(error.to_string()))
+    }
+
+    async fn secret_value(&self, id: &str) -> Result<Option<String>, WebhookError> {
+        Ok(self.read_secrets().await?.get(id).cloned())
+    }
+
+    /// Applies a pending secret change and rolls it back when the database write fails.
+    ///
+    /// A destination is a database row plus a credential in the secret store. Writing the secret
+    /// first and restoring the previous value on failure keeps the two in step: no update can leave
+    /// a destination holding a credential for a provider it no longer points at.
+    async fn write_destination_with_secret<F>(
+        &self,
+        id: &str,
+        previous_secret: Option<String>,
+        change: Option<SecretChange>,
+        write: F,
+    ) -> Result<(), WebhookError>
+    where
+        F: std::future::Future<Output = Result<(), WebhookError>>,
+    {
+        let Some(change) = change else {
+            return write.await;
+        };
+        match &change {
+            SecretChange::Set(secret) => self.set_secret(id, Some(secret)).await?,
+            SecretChange::Clear => self.set_secret(id, None).await?,
+        }
+        match write.await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = self.set_secret(id, previous_secret.as_deref()).await;
+                Err(error)
+            }
+        }
     }
 
     async fn read_secrets(&self) -> Result<BTreeMap<String, String>, WebhookError> {
@@ -3226,6 +3265,56 @@ mod tests {
             stored_secret(&service, &destination.id).await.is_none(),
             "the previous provider's credential must not survive the switch"
         );
+        Ok(())
+    }
+
+    /// The destination row and its credential live in two stores: when the row write fails, the
+    /// credential change is rolled back so the destination stays consistent with its provider.
+    #[tokio::test]
+    async fn a_failed_destination_write_restores_the_previous_credential()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = "org.lux.test-notifier";
+        let temp_dir = tempfile::tempdir()?;
+        let service = notification_provider_service(&temp_dir, true).await?;
+        let (destination, _) = service
+            .create_destination_with_provider(
+                "bark",
+                "",
+                true,
+                false,
+                &[],
+                Some("device-key-1"),
+                "LUX",
+                PLUGIN_ID,
+                &json!({"serverUrl": "https://bark.example.invalid"}),
+            )
+            .await?;
+
+        for change in [
+            super::SecretChange::Set("device-key-2".to_owned()),
+            super::SecretChange::Clear,
+        ] {
+            let result = service
+                .write_destination_with_secret(
+                    &destination.id,
+                    Some("device-key-1".to_owned()),
+                    Some(change.clone()),
+                    async {
+                        Err(super::WebhookError::Storage(
+                            crate::storage::StorageError::Conflict(
+                                "forced destination write failure".to_owned(),
+                            ),
+                        ))
+                    },
+                )
+                .await;
+            assert!(result.is_err(), "the helper must surface the write failure");
+            assert_eq!(
+                stored_secret(&service, &destination.id).await.as_deref(),
+                Some("device-key-1"),
+                "{change:?} must be rolled back after a failed write"
+            );
+        }
         Ok(())
     }
 
