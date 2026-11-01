@@ -61,7 +61,7 @@ export function usePlayerPlaybackSession({
   // Out-of-contract URL values are dropped instead of being sent: the API
   // rejects them with 400 and the player would have no recoverable UI state.
   const maxBitrate = parseMaxBitrateParam(requestedMaxBitrate);
-  const trackSelection = useMemo<WebPlaybackRequestSelection | undefined>(() => {
+  const requestSelection = useMemo<WebPlaybackRequestSelection | undefined>(() => {
     const audioStreamIndex = requestedAudioStreamIndex?.trim() ? Number(requestedAudioStreamIndex) : undefined;
     const subtitleStreamIndex = requestedSubtitleStreamIndex?.trim() ? Number(requestedSubtitleStreamIndex) : undefined;
     return Number.isInteger(audioStreamIndex) || Number.isInteger(subtitleStreamIndex) || maxBitrate !== null
@@ -82,7 +82,7 @@ export function usePlayerPlaybackSession({
     requestedSubtitleStreamIndex,
     maxBitrate,
     playbackAttempt,
-    trackSelection,
+    requestSelection,
     bootstrapKey,
     sessionGateKey,
   });
@@ -130,7 +130,7 @@ export function usePlayerPlaybackSession({
     requestedAudioStreamIndex,
     requestedSubtitleStreamIndex,
     maxBitrate,
-    trackSelection,
+    requestSelection,
     useLegacyPlaybackQueries,
     playbackKey,
     sessionGateKey,
@@ -167,7 +167,7 @@ export function usePlayerPlaybackSession({
 
 type BootstrapQueryOptions = Omit<PlayerPlaybackSessionOptions, "requestedMaxBitrate"> & {
   maxBitrate: number | null;
-  trackSelection: WebPlaybackRequestSelection | undefined;
+  requestSelection: WebPlaybackRequestSelection | undefined;
   bootstrapKey: string;
   sessionGateKey: string;
 };
@@ -179,7 +179,7 @@ function usePlaybackBootstrapQuery({
   requestedSubtitleStreamIndex,
   maxBitrate,
   playbackAttempt,
-  trackSelection,
+  requestSelection,
   bootstrapKey,
   sessionGateKey,
 }: BootstrapQueryOptions) {
@@ -198,7 +198,7 @@ function usePlaybackBootstrapQuery({
       requestedSourceId ?? undefined,
       bootstrapCapabilities,
       signal,
-      trackSelection,
+      requestSelection,
     ),
     enabled: Boolean(itemId) && playbackAttempt === 0 && sessionGateKey === bootstrapKey,
     retry: false,
@@ -230,7 +230,7 @@ type WebPlaybackSessionQueryOptions = {
   requestedAudioStreamIndex: string | null;
   requestedSubtitleStreamIndex: string | null;
   maxBitrate: number | null;
-  trackSelection: WebPlaybackRequestSelection | undefined;
+  requestSelection: WebPlaybackRequestSelection | undefined;
   useLegacyPlaybackQueries: boolean;
   playbackKey: string;
   sessionGateKey: string;
@@ -245,7 +245,7 @@ function useWebPlaybackSessionQuery({
   requestedAudioStreamIndex,
   requestedSubtitleStreamIndex,
   maxBitrate,
-  trackSelection,
+  requestSelection,
   useLegacyPlaybackQueries,
   playbackKey,
   sessionGateKey,
@@ -267,7 +267,7 @@ function useWebPlaybackSessionQuery({
       source?.id ?? "",
       capabilities,
       signal,
-      trackSelection,
+      requestSelection,
     ),
     enabled: Boolean(itemId && source?.id) && useLegacyPlaybackQueries
       && (sessionGateKey === playbackKey
