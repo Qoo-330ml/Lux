@@ -66,3 +66,29 @@ export async function attemptAutoStartPlayback(
     throw error;
   }
 }
+
+export type AutoStartPlaybackRun = AutoStartPlaybackOutcome | "skipped";
+
+/**
+ * Runs the pending one-shot request, if any, and treats it as consumed only when
+ * the attempt really happened:
+ * - a started playback consumes it, because the viewer now sees the new episode
+ *   playing;
+ * - a browser policy rejection consumes it too, because the player intentionally
+ *   falls back to the manual play affordance instead of retrying;
+ * - any other error re-arms the request before propagating, because that error
+ *   sends the player into the server-fallback reload of the same episode, and the
+ *   reloaded session is the one that must still auto start exactly once.
+ */
+export async function consumeAutoStartPlayback(
+  gate: AutoStartPlaybackGate,
+  play: () => Promise<void>,
+): Promise<AutoStartPlaybackRun> {
+  if (!gate.consume()) return "skipped";
+  try {
+    return await attemptAutoStartPlayback(play);
+  } catch (error) {
+    gate.request();
+    throw error;
+  }
+}

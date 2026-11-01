@@ -3,6 +3,7 @@ import {
   AUTO_START_PLAYBACK_STATE_KEY,
   attemptAutoStartPlayback,
   autoStartPlaybackState,
+  consumeAutoStartPlayback,
   createAutoStartPlaybackGate,
   requestsAutoStartPlayback,
 } from "../src/features/player/player-autostart";
@@ -72,5 +73,46 @@ describe("LuxPlayer auto start attempt", () => {
       .rejects.toBe(unsupported);
     await expect(attemptAutoStartPlayback(vi.fn().mockRejectedValue(new Error("媒体源不可用"))))
       .rejects.toThrow("媒体源不可用");
+  });
+});
+
+describe("LuxPlayer one-shot auto start consumption", () => {
+  it("consumes the request once playback really started", async () => {
+    const gate = createAutoStartPlaybackGate(true);
+    const play = vi.fn().mockResolvedValue(undefined);
+
+    await expect(consumeAutoStartPlayback(gate, play)).resolves.toBe("played");
+    expect(play).toHaveBeenCalledTimes(1);
+    expect(gate.consume()).toBe(false);
+  });
+
+  it("consumes the request when the browser policy rejects playback", async () => {
+    const gate = createAutoStartPlaybackGate(true);
+    const play = vi.fn().mockRejectedValue(
+      new DOMException("play() failed because the user didn't interact", "NotAllowedError"),
+    );
+
+    await expect(consumeAutoStartPlayback(gate, play)).resolves.toBe("blocked");
+    expect(gate.consume()).toBe(false);
+  });
+
+  it("does nothing without a pending request", async () => {
+    const gate = createAutoStartPlaybackGate(false);
+    const play = vi.fn().mockResolvedValue(undefined);
+
+    await expect(consumeAutoStartPlayback(gate, play)).resolves.toBe("skipped");
+    expect(play).not.toHaveBeenCalled();
+    expect(gate.consume()).toBe(false);
+  });
+
+  it("keeps the request for the server fallback session after a real failure", async () => {
+    const gate = createAutoStartPlaybackGate(true);
+    const unsupported = new DOMException("no supported source", "NotSupportedError");
+
+    await expect(consumeAutoStartPlayback(gate, vi.fn().mockRejectedValue(unsupported)))
+      .rejects.toBe(unsupported);
+    // The reloaded session owns the same one-shot request.
+    expect(gate.consume()).toBe(true);
+    expect(gate.consume()).toBe(false);
   });
 });

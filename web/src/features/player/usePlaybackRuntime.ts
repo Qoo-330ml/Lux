@@ -17,7 +17,7 @@ import { LuxPlayerRuntime } from "./core/player-runtime";
 import { classifyPlayerEngineFailure } from "./components/player-diagnostics";
 import { createPlaybackTimelineScheduler } from "./player-timeline-scheduler";
 import {
-  attemptAutoStartPlayback,
+  consumeAutoStartPlayback,
   createAutoStartPlaybackGate,
 } from "./player-autostart";
 import { TICKS_PER_SECOND, isMatroskaSource, useClientEngine } from "./player-page-helpers";
@@ -379,11 +379,14 @@ export function usePlaybackRuntime({
           },
         );
         if (!cancelled) await restoreEngineHandoff();
-        if (!cancelled && autoStartGateRef.current.consume()) {
-          // A browser autoplay policy rejection leaves the player paused on the
-          // normal play affordance; any other error is rethrown into the existing
-          // playback failure handling of this load() call.
-          await attemptAutoStartPlayback(() => runtime.play());
+        if (!cancelled) {
+          // The one-shot marker is consumed inside this call, and only once the
+          // attempt really happened: a started playback or a browser autoplay
+          // policy rejection both finish here, while any other error re-arms the
+          // marker before it reaches the server-fallback handling below — the
+          // reloaded session is the one that must still auto start once. A policy
+          // rejection leaves the player paused on the normal play affordance.
+          await consumeAutoStartPlayback(autoStartGateRef.current, () => runtime.play());
         }
         if (!cancelled && activeEngine.performance)
           handlePerformance(

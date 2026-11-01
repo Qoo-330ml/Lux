@@ -1589,6 +1589,55 @@ describe("PlayerPage playback synchronization", () => {
     expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(2);
   });
 
+  it("auto starts once on the server fallback session after a real playback failure", async () => {
+    vi.mocked(HTMLMediaElement.prototype.play)
+      .mockRejectedValueOnce(new DOMException("no supported source", "NotSupportedError"))
+      .mockResolvedValue(undefined);
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "episode-retry-1",
+      title: "回退后自动起播",
+      itemType: "EPISODE",
+      seriesId: "series-retry",
+      parentId: "season-retry",
+      indexNumber: 1,
+      mediaSources: [{ id: "retry-source-1", isDefault: true }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({ positionTicks: 0, isPlayed: false, state: null, isPaused: false });
+    vi.spyOn(api, "children").mockResolvedValue({ items: [] });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter
+            initialEntries={[{
+              pathname: "/watch/episode-retry-1",
+              state: { luxAutoStartPlayback: true },
+            }]}
+          >
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    // 直连会话的起播失败后走服务端回退重载，新会话仍应自动起播一次。
+    expect(vi.mocked(api.createWebPlaybackBootstrap).mock.calls.length).toBeGreaterThanOrEqual(1);
+    expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(2);
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+  });
+
   it("cancels the countdown when the viewer resumes playback or seeks", async () => {
     const episodes = {
       "episode-resume-1": { id: "episode-resume-1", title: "重看第一集", itemType: "EPISODE" as const, seriesId: "series-resume", parentId: "season-resume", indexNumber: 1, mediaSources: [{ id: "resume-source-1", isDefault: true }] },
