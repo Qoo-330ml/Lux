@@ -9,7 +9,8 @@ use luxd::application::plugin_protocol::{
     PLUGIN_CATEGORY_NOTIFICATION, PLUGIN_FORMAT_VERSION, PLUGIN_TYPE_CHAPTER_DETECTOR,
     PLUGIN_TYPE_DANMAKU, PLUGIN_TYPE_IP_LOCATION, PLUGIN_TYPE_STRM_RESOLVER,
     PluginEmbyRouteRequest, PluginEmbyRouteResponse, PluginManifest, PluginRequest,
-    STRM_RESOLVE_CAPABILITY, StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
+    SECRET_CONFIG_FIELD_KEY, STRM_RESOLVE_CAPABILITY, StrmResolveRpcRequest, StrmResolveRpcResult,
+    StrmResolveStatus,
 };
 use serde_json::{Value, json};
 
@@ -303,6 +304,115 @@ fn accepts_a_multiline_notification_config_field() {
     .expect("textarea config field should validate");
 
     assert_eq!(manifest.config_fields[0].input_type, "textarea");
+}
+
+fn notification_manifest_with_config_fields(config_fields: Value) -> Value {
+    json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.example-notifier",
+        "name": "Example notifier",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "notification",
+        "category": PLUGIN_CATEGORY_NOTIFICATION,
+        "capabilities": ["notification.send"],
+        "configFields": config_fields,
+        "permissions": {"network": [], "filesystem": []},
+        "files": []
+    })
+}
+
+#[test]
+fn accepts_one_sensitive_secret_config_field_for_a_notifier() {
+    let manifest = PluginManifest::from_value(notification_manifest_with_config_fields(json!([
+        {
+            "key": "serverUrl",
+            "label": "服务地址",
+            "type": "text",
+            "required": true
+        },
+        {
+            "key": "secret",
+            "label": "凭据",
+            "type": "password",
+            "required": true,
+            "sensitive": true
+        }
+    ])))
+    .expect("a notification manifest may declare one sensitive secret field");
+
+    let secret_field = manifest
+        .secret_config_field()
+        .expect("the secret field must be discoverable by the host");
+    assert_eq!(secret_field.key, SECRET_CONFIG_FIELD_KEY);
+    assert!(secret_field.sensitive);
+}
+
+#[test]
+fn rejects_secret_config_fields_that_are_not_sensitive_or_unique() {
+    let not_sensitive =
+        PluginManifest::from_value(notification_manifest_with_config_fields(json!([
+            {"key": "secret", "label": "凭据", "type": "password", "required": true}
+        ])));
+    assert!(
+        not_sensitive.is_err(),
+        "a secret config field must be declared sensitive"
+    );
+
+    let wrong_type = PluginManifest::from_value(notification_manifest_with_config_fields(json!([
+        {"key": "secret", "label": "凭据", "type": "text", "sensitive": true}
+    ])));
+    assert!(
+        wrong_type.is_err(),
+        "a secret config field must use the password type"
+    );
+
+    let duplicated = PluginManifest::from_value(notification_manifest_with_config_fields(json!([
+        {"key": "secret", "label": "凭据", "type": "password", "sensitive": true},
+        {"key": "secret", "label": "第二个凭据", "type": "password", "sensitive": true}
+    ])));
+    assert!(
+        duplicated.is_err(),
+        "a notification manifest may declare exactly one secret config field"
+    );
+
+    let with_default = PluginManifest::from_value(notification_manifest_with_config_fields(
+        json!([
+            {"key": "secret", "label": "凭据", "type": "password", "sensitive": true, "defaultValue": "x"}
+        ]),
+    ));
+    assert!(
+        with_default.is_err(),
+        "a secret config field must not ship a default value"
+    );
+}
+
+#[test]
+fn rejects_a_secret_config_field_on_a_non_notification_plugin() {
+    let manifest = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.strm-media-info",
+        "name": "STRM media info",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "media_probe",
+        "category": PLUGIN_CATEGORY_MEDIA,
+        "capabilities": ["media.probe"],
+        "configFields": [{
+            "key": "secret",
+            "label": "凭据",
+            "type": "password",
+            "sensitive": true
+        }],
+        "permissions": {"network": [], "filesystem": []},
+        "files": []
+    }));
+    assert!(
+        manifest.is_err(),
+        "secret target credentials belong to notification plugins only"
+    );
 }
 
 #[test]

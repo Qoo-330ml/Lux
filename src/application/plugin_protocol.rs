@@ -61,6 +61,12 @@ pub const MIGRATION_AUTHENTICATE_USER_METHOD: &str = "migration.authenticate_use
 pub const CHAPTER_FINGERPRINT_SAMPLE_RATE: u32 = 11_025;
 pub const CHAPTER_FINGERPRINT_POINT_DURATION_TICKS: i64 = 1_238_095;
 pub const CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES: &str = "media-libraries";
+/// Manifest key of the notification target credential.
+///
+/// A notification plugin may declare exactly one `sensitive` password field with this key. The host
+/// never forwards the value in `config` or stores it in the non-secret provider configuration: it
+/// keeps the value as the target secret and passes it through the controlled RPC `secret` field.
+pub const SECRET_CONFIG_FIELD_KEY: &str = "secret";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -111,6 +117,13 @@ impl PluginManifest {
             .map_err(|error| PluginManifestError::Invalid(error.to_string()))?;
         manifest.validate()?;
         Ok(manifest)
+    }
+
+    /// The manifest field that declares the notification target credential.
+    pub fn secret_config_field(&self) -> Option<&PluginConfigField> {
+        self.config_fields
+            .iter()
+            .find(|field| field.key == SECRET_CONFIG_FIELD_KEY)
     }
 
     pub fn validate(&self) -> Result<(), PluginManifestError> {
@@ -391,6 +404,23 @@ impl PluginManifest {
                         .to_owned(),
                 ));
             }
+            if field.key == SECRET_CONFIG_FIELD_KEY {
+                if self.plugin_type != PLUGIN_TYPE_NOTIFICATION {
+                    return Err(PluginManifestError::Invalid(
+                        "only notification plugins may declare a secret config field".to_owned(),
+                    ));
+                }
+                if !field.sensitive || field.input_type != "password" {
+                    return Err(PluginManifestError::Invalid(
+                        "a secret config field must be a sensitive password field".to_owned(),
+                    ));
+                }
+                if field.default_value.is_some() {
+                    return Err(PluginManifestError::Invalid(
+                        "a secret config field must not declare a defaultValue".to_owned(),
+                    ));
+                }
+            }
             if field.input_type == "select" {
                 if field.options.is_empty() == field.options_source.is_none()
                     || field.options.len() > 256
@@ -451,6 +481,17 @@ impl PluginManifest {
         {
             return Err(PluginManifestError::Invalid(
                 "login background plugins may declare only one image config field".to_owned(),
+            ));
+        }
+        if self
+            .config_fields
+            .iter()
+            .filter(|field| field.key == SECRET_CONFIG_FIELD_KEY)
+            .count()
+            > 1
+        {
+            return Err(PluginManifestError::Invalid(
+                "notification plugins may declare only one secret config field".to_owned(),
             ));
         }
         if self.scheduled_tasks.len() > 32 {

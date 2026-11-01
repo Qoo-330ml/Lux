@@ -47,8 +47,9 @@ use crate::{
             PLUGIN_TYPE_DANMAKU, PLUGIN_TYPE_DATA_MIGRATION, PLUGIN_TYPE_IP_LOCATION,
             PLUGIN_TYPE_LOGIN_BACKGROUND, PLUGIN_TYPE_NOTIFICATION, PLUGIN_TYPE_STRM_RESOLVER,
             PluginConfigField, PluginConfigOption, PluginEmbyRouteRequest, PluginEmbyRouteResponse,
-            STRM_RESOLVE_CAPABILITY, STRM_RESOLVE_METHOD, StrmResolveRpcRequest,
-            StrmResolveRpcResult, StrmResolveStatus, is_valid_login_background_asset_id,
+            SECRET_CONFIG_FIELD_KEY, STRM_RESOLVE_CAPABILITY, STRM_RESOLVE_METHOD,
+            StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
+            is_valid_login_background_asset_id,
         },
         plugin_runtime::{DiscoveredPlugin, PluginCatalog, PluginRuntimeError, PluginSupervisor},
         plugin_store::{
@@ -2111,6 +2112,12 @@ impl PluginService {
         if is_chapter_detector_plugin(plugin) {
             fields.retain(|field| field.key != "libraryIds");
         }
+        if is_notification_plugin(plugin) {
+            // The notification target credential is not plugin-level configuration: the host keeps
+            // it per destination and hands it to the plugin through the controlled RPC `secret`
+            // field, so it must not appear in the plugin config form or its completion check.
+            fields.retain(|field| field.key != SECRET_CONFIG_FIELD_KEY);
+        }
         if fields.iter().any(|field| {
             field.options_source.as_deref() == Some(CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES)
         }) {
@@ -2680,7 +2687,11 @@ impl PluginService {
             merge_default_config_values(&config_fields, stored_values),
         );
         let public_config_values = public_config_values(&config_fields, &config_values);
-        let configured = config_fields.is_empty()
+        // Notification fields describe one destination, not the installed provider, so their
+        // requiredness is enforced when an administrator creates or updates a notification
+        // destination. A provider without a destination yet is still selectable.
+        let configured = is_notification_plugin(plugin)
+            || config_fields.is_empty()
             || (validate_config_values(&config_fields, &config_values).is_ok()
                 && validate_dynamic_plugin_config(&plugin.manifest.id, &config_values).is_ok());
         let enabled = installed && enabled && !disabled_by_other_ip_provider;
@@ -2726,6 +2737,11 @@ impl PluginService {
             },
             configurable: !config_fields.is_empty(),
             config_fields,
+            secret_field: plugin
+                .manifest
+                .secret_config_field()
+                .filter(|_| is_notification_plugin(plugin))
+                .cloned(),
             config_source,
             config_values: public_config_values,
             latest_version: None,
@@ -3065,6 +3081,7 @@ fn remote_plugin_view(entry: &PluginStoreEntry, installed: bool, enabled: bool) 
         },
         configurable: false,
         config_fields: Vec::new(),
+        secret_field: None,
         config_source: CONFIG_SOURCE_NONE.to_owned(),
         config_values: Map::new(),
         latest_version: Some(entry.version.clone()),
@@ -3306,6 +3323,10 @@ pub struct PluginView {
     pub unavailable_reason: Option<String>,
     pub configurable: bool,
     pub config_fields: Vec<PluginConfigField>,
+    /// Credential metadata for notification plugins: the target secret field declared by the
+    /// manifest. It is deliberately kept out of `config_fields`, because the value belongs to one
+    /// notification destination instead of the plugin's own configuration.
+    pub secret_field: Option<PluginConfigField>,
     pub config_source: String,
     pub config_values: serde_json::Map<String, Value>,
     pub latest_version: Option<String>,
@@ -4183,6 +4204,82 @@ mod plugin_discovery_tests {
                 .fetch_one(database.pool())
                 .await?;
         assert_eq!(assigned_source.as_deref(), Some("existing-source"));
+        Ok(())
+    }
+
+    /// The notification target credential is per destination, not plugin configuration. A notifier
+    /// that declares `secret` must still count as configured, and the credential field must be
+    /// exposed separately so the admin page can ask for it once per destination.
+    #[tokio::test]
+    async fn notification_providers_report_the_target_credential_separately()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = "org.lux.test-notifier-credential";
+
+        let root = tempdir()?;
+        let config_dir = root.path().join("config");
+        let plugin_dir = config_dir.join(format!("plugins/{PLUGIN_ID}/binaries"));
+        tokio::fs::create_dir_all(&plugin_dir).await?;
+        tokio::fs::write(plugin_dir.join("plugin"), b"placeholder").await?;
+        tokio::fs::write(
+            config_dir.join(format!("plugins/{PLUGIN_ID}/manifest.json")),
+            serde_json::to_vec_pretty(&json!({
+                "formatVersion": 1,
+                "id": PLUGIN_ID,
+                "name": "Test notifier",
+                "version": "1.0.0",
+                "apiVersion": 1,
+                "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+                "type": "notification",
+                "category": "NOTIFICATION",
+                "capabilities": ["notification.send"],
+                "configFields": [{
+                    "key": "serverUrl",
+                    "label": "服务地址",
+                    "type": "text",
+                    "required": true
+                }, {
+                    "key": "secret",
+                    "label": "设备密钥",
+                    "type": "password",
+                    "required": true,
+                    "sensitive": true
+                }],
+                "permissions": {"network": [], "filesystem": []},
+                "files": []
+            }))?,
+        )
+        .await?;
+
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.clone(),
+        };
+        let database = Database::connect(&config).await?;
+        let service = PluginService::new_without_login_background_worker_for_test(
+            database.clone(),
+            config_dir,
+        );
+        service.install(PLUGIN_ID).await?;
+
+        let page = service.list_notification_plugins(0, 20).await?;
+
+        assert_eq!(page.plugins.len(), 1);
+        let view = &page.plugins[0];
+        assert!(
+            view.config_fields.iter().all(|field| field.key != "secret"),
+            "the target credential must not be plugin-level configuration"
+        );
+        let secret_field = view
+            .secret_field
+            .as_ref()
+            .expect("the credential metadata must be exposed");
+        assert_eq!(secret_field.key, "secret");
+        assert_eq!(secret_field.label, "设备密钥");
+        assert!(secret_field.required);
+        assert!(
+            view.configured,
+            "a missing per-destination credential must not mark the notifier unconfigured"
+        );
         Ok(())
     }
 }

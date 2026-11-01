@@ -690,6 +690,14 @@ pub(crate) fn plugin_json(plugin: &crate::application::plugins::PluginView) -> V
         "available": plugin.available,
         "unavailableReason": plugin.unavailable_reason,
         "configurable": plugin.configurable,
+        "secretField": plugin.secret_field.as_ref().map(|field| json!({
+            "key": field.key,
+            "label": field.label,
+            "type": field.input_type,
+            "required": field.required,
+            "sensitive": field.sensitive,
+            "description": field.description,
+        })),
         "configFields": plugin.config_fields.iter().map(|field| json!({
             "key": field.key,
             "label": field.label,
