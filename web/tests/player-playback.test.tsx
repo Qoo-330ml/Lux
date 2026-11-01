@@ -542,6 +542,62 @@ describe("PlayerPage playback synchronization", () => {
     expect(container.textContent).not.toContain("热力图");
   });
 
+  it("opens the keyboard shortcut help from the control bar and closes it with Escape", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-shortcut-help",
+      title: "快捷键帮助测试",
+      itemType: "MOVIE",
+      mediaSources: [{ id: "source-shortcut-help", isDefault: true, durationTicks: 1_200_000_000 }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({
+      positionTicks: 0,
+      isPlayed: false,
+      state: null,
+      isPaused: false,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-shortcut-help"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector(".lux-player-shortcut-help")).toBeNull();
+    const entry = container.querySelector<HTMLButtonElement>('[aria-label="键盘快捷键"]');
+    if (!entry) throw new Error("keyboard shortcut help entry was not rendered");
+    expect(entry.getAttribute("aria-expanded")).toBe("false");
+
+    await act(async () => entry.click());
+
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    expect(dialog).not.toBeNull();
+    expect(dialog?.getAttribute("aria-modal")).toBe("true");
+    expect(container.querySelector("#lux-player-shortcut-help-title")?.textContent).toBe("键盘快捷键");
+    expect(dialog?.textContent).toContain("后退 10 秒");
+    expect(dialog?.textContent).toContain("Esc");
+    expect(entry.getAttribute("aria-expanded")).toBe("true");
+
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    });
+
+    expect(container.querySelector(".lux-player-shortcut-help")).toBeNull();
+    expect(entry.getAttribute("aria-expanded")).toBe("false");
+  });
+
   it("keeps presentation settings local and reapplies them across source changes", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-presentation",

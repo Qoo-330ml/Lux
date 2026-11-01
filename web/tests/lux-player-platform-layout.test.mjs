@@ -30,6 +30,13 @@ test("LuxPlayer chapter markers overlay the shared timeline instead of adding a 
   assert.match(styles, /\.lux-player-chapter-rail \{[^}]*pointer-events: none/);
 });
 
+test("LuxPlayer does not force the keyboard shortcut entry on touch devices", () => {
+  assert.match(
+    styles,
+    /@media \(pointer: coarse\) \{\s*\.lux-player-controls \.lux-player-shortcut-help-btn \{ display: none; \}/,
+  );
+});
+
 test("LuxPlayer loading and error states center their content across the full viewport", () => {
   const stateRule = styles.match(/\.lux-player-page-loading, \.lux-player-page-error \{([^}]*)\}/)?.[1] ?? "";
 

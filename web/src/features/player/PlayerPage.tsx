@@ -34,6 +34,7 @@ import { LuxPlayerRuntime } from "./core/player-runtime";
 import { PlayerControls } from "./components/player-controls";
 import { PlayerSettingsPanel } from "./components/player-settings-panel";
 import { PlayerInfoPanel } from "./components/player-info-panel";
+import { PlayerShortcutHelp } from "./components/player-shortcut-help";
 import { playerInfoCopyText } from "./player-stats";
 import type { PlayerSettingsSourceOption } from "./components/player-settings-panel";
 import { PlayerErrorState, PlayerLoadingState } from "./components/player-state";
@@ -95,6 +96,7 @@ export function PlayerPage() {
   const [flip, setFlip] = useState<PlayerFlip>("normal");
   const [showSettings, setShowSettings] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
+  const [showShortcutHelp, setShowShortcutHelp] = useState(false);
   const [isRemainingTime, setIsRemainingTime] = useState(false);
   const [isPointerInteracting, setIsPointerInteracting] = useState(false);
   const [danmuVisible, setDanmuVisible] = useState(true);
@@ -392,6 +394,8 @@ export function PlayerPage() {
     setShowInfo,
     setShowSettings,
     navigate: (to) => navigate(to as never),
+    shortcutHelpOpen: showShortcutHelp,
+    setShortcutHelpOpen: setShowShortcutHelp,
   });
 
   const setVideoRef = usePlayerVideoElement({
@@ -763,6 +767,10 @@ export function PlayerPage() {
         />
       ) : null}
 
+      {showShortcutHelp ? (
+        <PlayerShortcutHelp onClose={() => setShowShortcutHelp(false)} />
+      ) : null}
+
       {autoPlayNextCountdown ? (
         <PlayerAutoNextCard
           secondsLeft={autoPlayNextCountdown.secondsLeft}
@@ -795,6 +803,7 @@ export function PlayerPage() {
         hasNextEpisode={Boolean(nextEpisodeId)}
         settingsOpen={showSettings}
         infoOpen={showInfo}
+        shortcutHelpOpen={showShortcutHelp}
         remainingTime={isRemainingTime}
         hoverTime={hoverTime}
         hoverPercent={hoverPercent}
@@ -822,6 +831,7 @@ export function PlayerPage() {
         onTakeScreenshot={takeScreenshot}
         onToggleSettings={() => setShowSettings((visible) => !visible)}
         onToggleInfo={() => setShowInfo((visible) => !visible)}
+        onToggleShortcutHelp={() => setShowShortcutHelp((visible) => !visible)}
         onTogglePictureInPicture={togglePictureInPicture}
         onToggleFullscreen={toggleFullscreen}
       />

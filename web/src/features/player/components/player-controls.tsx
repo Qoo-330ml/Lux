@@ -2,6 +2,7 @@ import {
   Camera,
   Airplay,
   Info,
+  Keyboard,
   Maximize,
   MessageCircleMore,
   Minimize,
@@ -48,6 +49,8 @@ export type PlayerControlsProps = {
   hasNextEpisode?: boolean;
   settingsOpen: boolean;
   infoOpen: boolean;
+  /** 键盘快捷键帮助浮层是否打开；触屏设备默认不展示该入口。 */
+  shortcutHelpOpen?: boolean;
   remainingTime: boolean;
   hoverTime: number | null;
   hoverPercent: number | null;
@@ -72,6 +75,7 @@ export type PlayerControlsProps = {
   onTakeScreenshot: () => void;
   onToggleSettings: () => void;
   onToggleInfo: () => void;
+  onToggleShortcutHelp?: () => void;
   onTogglePictureInPicture: () => void;
   onToggleFullscreen: () => void;
 };
@@ -111,6 +115,7 @@ export function PlayerControls({
   hasNextEpisode = false,
   settingsOpen,
   infoOpen,
+  shortcutHelpOpen = false,
   remainingTime,
   hoverTime,
   hoverPercent,
@@ -135,6 +140,7 @@ export function PlayerControls({
   onTakeScreenshot,
   onToggleSettings,
   onToggleInfo,
+  onToggleShortcutHelp = () => undefined,
   onTogglePictureInPicture,
   onToggleFullscreen,
 }: PlayerControlsProps) {
@@ -305,6 +311,18 @@ export function PlayerControls({
             onClick={onToggleInfo}
           >
             <Info size={20} aria-hidden="true" />
+          </button>
+          <button
+            type="button"
+            className={`lux-player-action-btn lux-player-shortcut-help-btn ${shortcutHelpOpen ? "is-active" : ""}`}
+            aria-label="键盘快捷键"
+            aria-expanded={shortcutHelpOpen}
+            aria-pressed={shortcutHelpOpen}
+            title="键盘快捷键 (?)"
+            data-player-shortcut-help-toggle
+            onClick={onToggleShortcutHelp}
+          >
+            <Keyboard size={20} aria-hidden="true" />
           </button>
           <button
             type="button"
