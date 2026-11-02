@@ -11,15 +11,28 @@
 //! - [`classify_http_status`] maps an upstream status onto `DELIVERED`, `RETRYABLE` or `FAILED`.
 //! - [`render_event_text`] turns the already desensitized Lux event into the Chinese title and body
 //!   a channel needs, without ever reading secrets, local paths or complete URLs.
+//! - [`guard_destination`] and [`guard_host`] resolve a destination once, reject private, loopback,
+//!   link-local, metadata and reserved addresses according to the host's `allowPrivateNetwork`
+//!   approval, and pin the validated address so a DNS rebinding cannot redirect the request.
 //!
 //! The event, target and config values arrive through the RPC request; the optional `secret` is the
 //! per-destination credential the host stores outside `providerConfig`. A plugin must not try to
 //! read the Lux config directory: the host starts notification plugins without `LUX_CONFIG_DIR`.
 
-use std::{future::Future, io, time::Duration};
+use std::{
+    fmt,
+    future::Future,
+    io,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
+use reqwest::{ClientBuilder, Url};
 use serde_json::{Map, Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
+    net::lookup_host,
+};
 
 use crate::{
     application::{
@@ -28,6 +41,7 @@ use crate::{
             NOTIFICATION_SEND_METHOD, NotificationSendRpcRequest, NotificationSendRpcResult,
             NotificationSendStatus, PluginRequest, PluginResponse, PluginRpcError,
         },
+        remote_url_policy, webhooks,
     },
     network,
 };
@@ -266,25 +280,305 @@ async fn write_response<W: AsyncWrite + Unpin>(
     output.flush().await
 }
 
+/// Builds the outbound client builder used by notification plugins.
+///
+/// The builder already applies the Lux proxy policy ([`NOTIFIER_PROXY_URL_ENV`], or `proxy_url`
+/// when the host supplies one), never follows redirects and gives every request
+/// [`NOTIFIER_HTTP_TIMEOUT`]. Use it instead of [`outbound_http_client`] when a destination has to be
+/// pinned with [`GuardedDestination::pin`] before the client is built.
+///
+/// When no administrator proxy is configured the builder disables proxies entirely
+/// (`no_proxy`), so `HTTP_PROXY`/`HTTPS_PROXY` and the system proxy cannot silently redirect a
+/// delivery: a guarded destination must reach the address the guard validated. When
+/// [`NOTIFIER_PROXY_URL_ENV`] (or `proxy_url`) is set, the request goes through the administrator
+/// proxy instead, the proxy resolves the destination, and [`GuardedDestination::pin`] no longer
+/// decides which address is contacted.
+pub fn outbound_http_client_builder(
+    proxy_url: Option<&str>,
+) -> Result<ClientBuilder, NotifierSdkError> {
+    let proxy_url = match proxy_url {
+        Some(proxy_url) => Some(proxy_url.to_owned()),
+        None => network::proxy_url_from_env().map_err(|_| NotifierSdkError::InvalidProxy)?,
+    };
+    let builder = network::apply_proxy(reqwest::Client::builder(), proxy_url.as_deref())
+        .map_err(|_| NotifierSdkError::InvalidProxy)?;
+    let builder = if proxy_url.is_some() {
+        builder
+    } else {
+        builder.no_proxy()
+    };
+    Ok(builder
+        .timeout(NOTIFIER_HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("lux-notifier-sdk/", env!("CARGO_PKG_VERSION"))))
+}
+
+/// Builds the outbound client builder from the plugin process environment.
+pub fn outbound_http_client_builder_from_env() -> Result<ClientBuilder, NotifierSdkError> {
+    let proxy_url = network::proxy_url_from_env().map_err(|_| NotifierSdkError::InvalidProxy)?;
+    outbound_http_client_builder(proxy_url.as_deref())
+}
+
 /// Builds the outbound client used by notification plugins.
 ///
 /// The client honors the Lux proxy policy ([`NOTIFIER_PROXY_URL_ENV`], or `proxy_url` when the host
 /// supplies one), never follows redirects and gives every request [`NOTIFIER_HTTP_TIMEOUT`].
 pub fn outbound_http_client(proxy_url: Option<&str>) -> Result<reqwest::Client, NotifierSdkError> {
-    let builder = network::client_builder_from_env_or(proxy_url)
-        .map_err(|_| NotifierSdkError::InvalidProxy)?;
-    builder
-        .timeout(NOTIFIER_HTTP_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("lux-notifier-sdk/", env!("CARGO_PKG_VERSION")))
+    outbound_http_client_builder(proxy_url)?
         .build()
-        .map_err(|error| NotifierSdkError::Client(error.to_string()))
+        .map_err(client_error)
 }
 
 /// Builds the outbound client from the plugin process environment.
 pub fn outbound_http_client_from_env() -> Result<reqwest::Client, NotifierSdkError> {
-    let proxy_url = network::proxy_url_from_env().map_err(|_| NotifierSdkError::InvalidProxy)?;
-    outbound_http_client(proxy_url.as_deref())
+    outbound_http_client_builder_from_env()?
+        .build()
+        .map_err(client_error)
+}
+
+fn client_error(error: reqwest::Error) -> NotifierSdkError {
+    NotifierSdkError::Client(error.to_string())
+}
+
+/// Upper bound of resolved addresses the destination guard inspects for one host.
+const MAX_GUARDED_ADDRESSES: usize = 16;
+
+/// A destination the host policy rejected, resolved transiently or validated.
+///
+/// [`Self::code`] is the stable error code a plugin returns to the host; the plugin never echoes the
+/// destination itself, because a complete external URL must not reach a log or a delivery record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DestinationGuardError {
+    /// The destination is not a URL with a host and a port.
+    InvalidUrl,
+    /// The destination does not use `http` or `https`.
+    UnsupportedScheme,
+    /// The destination URL carries credentials in its authority.
+    Credentials,
+    /// The host did not resolve, or resolved to no address.
+    ResolutionFailed,
+    /// A loopback, private or link-local destination the administrator did not approve.
+    PrivateAddress,
+    /// An address that stays forbidden even with `allowPrivateNetwork`: unspecified (`0.0.0.0`,
+    /// `::`), link-local (including cloud metadata such as `169.254.169.254`) and multicast ranges.
+    DangerousAddress,
+    /// An address that is neither private nor dangerous but is still unroutable, so it stays
+    /// forbidden even with `allowPrivateNetwork`: documentation ranges (`192.0.2.0/24`,
+    /// `198.51.100.0/24`, `203.0.113.0/24`, `2001:db8::/32`), `240/4`, the limited broadcast
+    /// address and tunnelled forms such as 6to4, Teredo and NAT64. The core policy classifies
+    /// CGNAT (`100.64/10`), benchmarking (`198.18/19`) and `192.0.0.0/24` as private, so those are
+    /// reachable after a private-network approval.
+    ReservedAddress,
+}
+
+impl DestinationGuardError {
+    /// The stable plugin error code for this rejection.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::InvalidUrl | Self::UnsupportedScheme | Self::Credentials => {
+                "invalid_destination_url"
+            }
+            Self::ResolutionFailed => "destination_unresolved",
+            Self::PrivateAddress | Self::DangerousAddress | Self::ReservedAddress => {
+                "destination_not_allowed"
+            }
+        }
+    }
+
+    /// Whether the host may retry the same destination later.
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::ResolutionFailed)
+    }
+}
+
+impl fmt::Display for DestinationGuardError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidUrl => "the destination URL is invalid",
+            Self::UnsupportedScheme => "the destination URL must use http or https",
+            Self::Credentials => "the destination URL must not carry credentials",
+            Self::ResolutionFailed => "the destination host could not be resolved",
+            Self::PrivateAddress => "the destination resolves to a private address",
+            Self::DangerousAddress => "the destination resolves to a reserved address",
+            Self::ReservedAddress => "the destination resolves to an unroutable address",
+        })
+    }
+}
+
+impl std::error::Error for DestinationGuardError {}
+
+/// A validated HTTP destination with the address the request must connect to.
+#[derive(Clone, Debug)]
+pub struct GuardedDestination {
+    url: Url,
+    host: String,
+    address: SocketAddr,
+}
+
+impl GuardedDestination {
+    /// The destination URL exactly as the channel configured it.
+    pub fn url(&self) -> &Url {
+        &self.url
+    }
+
+    /// The destination host, without a port.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// The validated address the request must connect to.
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    /// Pins the validated address into a client builder, so a second DNS answer cannot redirect the
+    /// request (DNS rebinding) after the guard approved the destination.
+    pub fn pin(&self, builder: ClientBuilder) -> ClientBuilder {
+        builder.resolve(&self.host, self.address)
+    }
+}
+
+/// A validated host and port, for channels that do not speak HTTP (SMTP, custom TCP).
+#[derive(Clone, Debug)]
+pub struct GuardedHost {
+    host: String,
+    port: u16,
+    primary: SocketAddr,
+    addresses: Vec<SocketAddr>,
+}
+
+impl GuardedHost {
+    /// The validated host name.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// The validated port.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Every validated address for the host; the channel may try them in order.
+    pub fn addresses(&self) -> &[SocketAddr] {
+        &self.addresses
+    }
+
+    /// The first validated address, which a single-address client should use.
+    pub fn primary(&self) -> SocketAddr {
+        self.primary
+    }
+}
+
+/// Validates an `http`/`https` destination against the host's private-network policy.
+///
+/// The host passes `allowPrivateNetwork` in `notification.send`; a plugin must forward it and must
+/// never widen it. Every resolved address is checked: loopback, private and link-local destinations
+/// are rejected unless the administrator approved the private network, while unspecified,
+/// link-local (cloud metadata), multicast, documentation, `240/4` and broadcast addresses are always
+/// rejected. IPv4-mapped and IPv4-compatible (`::/96`) forms are classified by their embedded IPv4
+/// target. Use [`GuardedDestination::pin`] before building the request client.
+pub async fn guard_destination(
+    url: &Url,
+    allow_private_network: bool,
+) -> Result<GuardedDestination, DestinationGuardError> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(DestinationGuardError::UnsupportedScheme);
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(DestinationGuardError::Credentials);
+    }
+    let host = url.host_str().ok_or(DestinationGuardError::InvalidUrl)?;
+    // `host_str` keeps the brackets of an IPv6 literal; the resolver needs the bare address so a
+    // literal is classified instead of being sent to DNS as a hostname.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let port = url
+        .port_or_known_default()
+        .ok_or(DestinationGuardError::InvalidUrl)?;
+    let guarded = resolve_guarded_host(host, port, allow_private_network).await?;
+    Ok(GuardedDestination {
+        url: url.clone(),
+        host: guarded.host.clone(),
+        address: guarded.primary(),
+    })
+}
+
+/// Parses and validates an `http`/`https` destination string.
+///
+/// Convenience wrapper around [`guard_destination`] for channels that keep their target as text.
+pub async fn guard_destination_str(
+    value: &str,
+    allow_private_network: bool,
+) -> Result<GuardedDestination, DestinationGuardError> {
+    let url = Url::parse(value).map_err(|_| DestinationGuardError::InvalidUrl)?;
+    guard_destination(&url, allow_private_network).await
+}
+
+/// Validates a `host:port` destination for channels that do not speak HTTP (SMTP, custom TCP).
+pub async fn guard_host(
+    host: &str,
+    port: u16,
+    allow_private_network: bool,
+) -> Result<GuardedHost, DestinationGuardError> {
+    let host = host.trim();
+    if host.is_empty()
+        || host.chars().count() > 255
+        || host
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '/' | '@' | ' ' | '\\'))
+        || port == 0
+    {
+        return Err(DestinationGuardError::InvalidUrl);
+    }
+    resolve_guarded_host(host, port, allow_private_network).await
+}
+
+async fn resolve_guarded_host(
+    host: &str,
+    port: u16,
+    allow_private_network: bool,
+) -> Result<GuardedHost, DestinationGuardError> {
+    let resolved = lookup_host((host, port))
+        .await
+        .map_err(|_| DestinationGuardError::ResolutionFailed)?;
+    let mut addresses = Vec::new();
+    for address in resolved.take(MAX_GUARDED_ADDRESSES) {
+        check_destination_address(address.ip(), allow_private_network)?;
+        addresses.push(address);
+    }
+    let Some(primary) = addresses.first().copied() else {
+        return Err(DestinationGuardError::ResolutionFailed);
+    };
+    Ok(GuardedHost {
+        host: host.to_owned(),
+        port,
+        primary,
+        addresses,
+    })
+}
+
+/// Applies the shared Lux IP policy to one resolved destination address.
+///
+/// The classification reuses the core helpers ([`webhooks::is_dangerous_address`],
+/// [`webhooks::is_private_address`] and [`remote_url_policy::is_private_or_reserved`]) instead of
+/// keeping a second copy of the address ranges.
+pub(crate) fn check_destination_address(
+    address: IpAddr,
+    allow_private_network: bool,
+) -> Result<(), DestinationGuardError> {
+    if webhooks::is_dangerous_address(address) {
+        return Err(DestinationGuardError::DangerousAddress);
+    }
+    let private = webhooks::is_private_address(address);
+    if !private && remote_url_policy::is_private_or_reserved(address) {
+        return Err(DestinationGuardError::ReservedAddress);
+    }
+    if private && !allow_private_network {
+        return Err(DestinationGuardError::PrivateAddress);
+    }
+    Ok(())
 }
 
 /// Classifies an upstream HTTP status exactly like the Lux delivery host.
@@ -416,10 +710,11 @@ mod tests {
     };
 
     use super::{
-        MAX_NOTIFIER_BODY_CHARS, NOTIFIER_HTTP_TIMEOUT, NotificationSendRpcResult,
-        NotificationSendStatus, classify_http_status, outbound_http_client,
-        outbound_http_client_from_env, render_event_text, result_from_http_status,
-        run_notifier_session,
+        DestinationGuardError, MAX_NOTIFIER_BODY_CHARS, NOTIFIER_HTTP_TIMEOUT,
+        NotificationSendRpcResult, NotificationSendStatus, check_destination_address,
+        classify_http_status, guard_destination_str, guard_host, outbound_http_client,
+        outbound_http_client_builder, outbound_http_client_from_env, render_event_text,
+        result_from_http_status, run_notifier_session,
     };
     use serde_json::{Value, json};
     use tokio::io::AsyncWrite;
@@ -544,6 +839,300 @@ mod tests {
 
         assert_eq!(responses[0]["result"]["status"], "RETRYABLE");
         assert_eq!(responses[0]["result"]["errorCode"], "PROVIDER_RATE_LIMITED");
+    }
+
+    fn check_address(
+        value: &str,
+        allow_private_network: bool,
+    ) -> Result<(), DestinationGuardError> {
+        check_destination_address(
+            value.parse().expect("the fixture must be an IP address"),
+            allow_private_network,
+        )
+    }
+
+    #[test]
+    fn classifies_ipv4_destinations_for_the_private_network_policy() {
+        use DestinationGuardError::{DangerousAddress, PrivateAddress, ReservedAddress};
+
+        // Private also covers the ranges the core policy treats as private, such as the CGNAT and
+        // benchmarking blocks, so an approved private network may reach them.
+        for private in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.9",
+            "192.168.1.10",
+            "100.64.0.1",
+            "198.18.0.1",
+        ] {
+            assert_eq!(
+                check_address(private, false),
+                Err(PrivateAddress),
+                "{private} must be blocked without private-network approval"
+            );
+            assert_eq!(
+                check_address(private, true),
+                Ok(()),
+                "{private} must be allowed with private-network approval"
+            );
+        }
+
+        // Always rejected: cloud metadata, unspecified, multicast and broadcast addresses.
+        for dangerous in [
+            "169.254.169.254",
+            "169.254.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "239.1.2.3",
+        ] {
+            assert_eq!(
+                check_address(dangerous, false),
+                Err(DangerousAddress),
+                "{dangerous} must be rejected"
+            );
+            assert_eq!(
+                check_address(dangerous, true),
+                Err(DangerousAddress),
+                "{dangerous} must stay rejected even with private-network approval"
+            );
+        }
+
+        // Always rejected: documentation, benchmarking, reserved and broadcast ranges.
+        for reserved in [
+            "192.0.2.7",
+            "198.51.100.9",
+            "203.0.113.5",
+            "240.0.0.1",
+            "255.255.255.255",
+        ] {
+            assert_eq!(
+                check_address(reserved, false),
+                Err(ReservedAddress),
+                "{reserved} must be rejected"
+            );
+            assert_eq!(
+                check_address(reserved, true),
+                Err(ReservedAddress),
+                "{reserved} must stay rejected even with private-network approval"
+            );
+        }
+
+        for public in ["93.184.216.34", "1.1.1.1", "8.8.8.8"] {
+            assert_eq!(check_address(public, false), Ok(()), "{public}");
+            assert_eq!(check_address(public, true), Ok(()), "{public}");
+        }
+    }
+
+    #[test]
+    fn classifies_ipv6_and_ipv4_mapped_destinations() {
+        use DestinationGuardError::{DangerousAddress, PrivateAddress, ReservedAddress};
+
+        for private in ["::1", "fd00::1", "fc00::abcd"] {
+            assert_eq!(
+                check_address(private, false),
+                Err(PrivateAddress),
+                "{private}"
+            );
+            assert_eq!(check_address(private, true), Ok(()), "{private}");
+        }
+        for dangerous in ["fe80::1", "::", "ff02::1"] {
+            assert_eq!(
+                check_address(dangerous, false),
+                Err(DangerousAddress),
+                "{dangerous}"
+            );
+            assert_eq!(
+                check_address(dangerous, true),
+                Err(DangerousAddress),
+                "{dangerous}"
+            );
+        }
+        for reserved in ["2002:c000:0201::1", "64:ff9b::c000:0201"] {
+            assert_eq!(
+                check_address(reserved, false),
+                Err(ReservedAddress),
+                "{reserved}"
+            );
+            assert_eq!(
+                check_address(reserved, true),
+                Err(ReservedAddress),
+                "{reserved}"
+            );
+        }
+
+        // An IPv4-mapped address is classified by its embedded IPv4 target.
+        assert_eq!(
+            check_address("::ffff:127.0.0.1", false),
+            Err(PrivateAddress)
+        );
+        assert_eq!(check_address("::ffff:127.0.0.1", true), Ok(()));
+        assert_eq!(
+            check_address("::ffff:169.254.169.254", true),
+            Err(DangerousAddress)
+        );
+        assert_eq!(
+            check_address("::ffff:203.0.113.5", true),
+            Err(ReservedAddress)
+        );
+        assert_eq!(check_address("::ffff:93.184.216.34", false), Ok(()));
+
+        // The deprecated IPv4-compatible form (`::/96`) must not bypass the embedded IPv4 policy.
+        assert_eq!(check_address("::127.0.0.1", false), Err(PrivateAddress));
+        assert_eq!(check_address("::127.0.0.1", true), Ok(()));
+        assert_eq!(check_address("::192.168.1.1", false), Err(PrivateAddress));
+        assert_eq!(check_address("::192.168.1.1", true), Ok(()));
+        assert_eq!(
+            check_address("::169.254.169.254", true),
+            Err(DangerousAddress)
+        );
+        assert_eq!(check_address("::203.0.113.5", true), Err(ReservedAddress));
+        assert_eq!(check_address("::93.184.216.34", false), Ok(()));
+        assert_eq!(check_address("::", true), Err(DangerousAddress));
+
+        // The IPv6 documentation range is reserved and never reachable.
+        assert_eq!(check_address("2001:db8::1", false), Err(ReservedAddress));
+        assert_eq!(check_address("2001:db8::1", true), Err(ReservedAddress));
+
+        assert_eq!(check_address("2001:4860:4860::8888", false), Ok(()));
+    }
+
+    #[test]
+    fn exposes_stable_destination_guard_error_codes() {
+        assert_eq!(
+            DestinationGuardError::InvalidUrl.code(),
+            "invalid_destination_url"
+        );
+        assert_eq!(
+            DestinationGuardError::UnsupportedScheme.code(),
+            "invalid_destination_url"
+        );
+        assert_eq!(
+            DestinationGuardError::Credentials.code(),
+            "invalid_destination_url"
+        );
+        assert_eq!(
+            DestinationGuardError::ResolutionFailed.code(),
+            "destination_unresolved"
+        );
+        assert_eq!(
+            DestinationGuardError::PrivateAddress.code(),
+            "destination_not_allowed"
+        );
+        assert_eq!(
+            DestinationGuardError::DangerousAddress.code(),
+            "destination_not_allowed"
+        );
+        assert_eq!(
+            DestinationGuardError::ReservedAddress.code(),
+            "destination_not_allowed"
+        );
+        assert!(DestinationGuardError::ResolutionFailed.is_retryable());
+        assert!(!DestinationGuardError::DangerousAddress.is_retryable());
+        assert!(!DestinationGuardError::PrivateAddress.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn guards_http_destinations_and_blocks_loopback_by_default() {
+        let blocked = guard_destination_str("http://127.0.0.1:8080/push", false)
+            .await
+            .expect_err("loopback must be blocked without private-network approval");
+        assert_eq!(blocked, DestinationGuardError::PrivateAddress);
+
+        let guarded = guard_destination_str("http://127.0.0.1:8080/push", true)
+            .await
+            .expect("an approved private network must be allowed");
+        assert_eq!(guarded.url().as_str(), "http://127.0.0.1:8080/push");
+        assert_eq!(guarded.address().port(), 8080);
+        assert!(guarded.address().ip().is_loopback());
+
+        // Pinning the resolved address must yield a usable client without another DNS lookup.
+        let builder = outbound_http_client_builder(None).expect("outbound builder");
+        assert!(guarded.pin(builder).build().is_ok());
+
+        let blocked = guard_destination_str("http://localhost:1234/", false)
+            .await
+            .expect_err("localhost must be blocked without private-network approval");
+        assert_eq!(blocked, DestinationGuardError::PrivateAddress);
+        let guarded = guard_destination_str("http://localhost:1234/", true)
+            .await
+            .expect("localhost must be allowed with private-network approval");
+        assert_eq!(guarded.host(), "localhost");
+        assert!(guarded.address().ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn rejects_destinations_that_stay_dangerous_with_private_network_approval() {
+        for value in [
+            "http://169.254.169.254/latest/meta-data",
+            "http://0.0.0.0/",
+            "http://[fe80::1]/",
+        ] {
+            assert_eq!(
+                guard_destination_str(value, true)
+                    .await
+                    .expect_err("the destination must stay blocked"),
+                DestinationGuardError::DangerousAddress,
+                "{value}"
+            );
+        }
+        assert_eq!(
+            guard_destination_str("http://[::ffff:169.254.169.254]/", true)
+                .await
+                .expect_err("the mapped metadata address must stay blocked"),
+            DestinationGuardError::DangerousAddress
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_unsupported_destination_urls() {
+        assert_eq!(
+            guard_destination_str("ftp://127.0.0.1/", true)
+                .await
+                .expect_err("ftp must be rejected"),
+            DestinationGuardError::UnsupportedScheme
+        );
+        assert_eq!(
+            guard_destination_str("http://user:password@127.0.0.1/", true)
+                .await
+                .expect_err("credentials must be rejected"),
+            DestinationGuardError::Credentials
+        );
+        assert_eq!(
+            guard_destination_str("not a url", true)
+                .await
+                .expect_err("an unparsable URL must be rejected"),
+            DestinationGuardError::InvalidUrl
+        );
+    }
+
+    #[tokio::test]
+    async fn guards_a_host_and_port_for_smtp_destinations() {
+        let blocked = guard_host("127.0.0.1", 25, false)
+            .await
+            .expect_err("loopback SMTP must be blocked without private-network approval");
+        assert_eq!(blocked, DestinationGuardError::PrivateAddress);
+
+        let guarded = guard_host("localhost", 587, true)
+            .await
+            .expect("an approved private SMTP host must be allowed");
+        assert_eq!(guarded.host(), "localhost");
+        assert_eq!(guarded.port(), 587);
+        assert!(!guarded.addresses().is_empty());
+        assert!(guarded.primary().ip().is_loopback());
+        assert_eq!(guarded.primary().port(), 587);
+
+        assert_eq!(
+            guard_host("127.0.0.1", 0, true)
+                .await
+                .expect_err("port zero must be rejected"),
+            DestinationGuardError::InvalidUrl
+        );
+        assert_eq!(
+            guard_host("", 25, true)
+                .await
+                .expect_err("an empty host must be rejected"),
+            DestinationGuardError::InvalidUrl
+        );
     }
 
     #[test]
