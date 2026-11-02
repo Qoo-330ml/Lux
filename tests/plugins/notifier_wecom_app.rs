@@ -988,3 +988,72 @@ async fn bounds_a_stalled_message_send() -> Result<(), Box<dyn std::error::Error
     assert_log_has_no_credentials(&stderr);
     Ok(())
 }
+
+#[tokio::test]
+async fn rejects_a_loopback_destination_without_private_network_approval()
+-> Result<(), Box<dyn std::error::Error>> {
+    let requests = RequestCount::default();
+    let (base, server) = spawn_server(requests.server()).await?;
+    let mut plugin = Plugin::start().await?;
+
+    let mut without_flag = send_params(api_base_config(&base), json!(TEST_SECRET));
+    without_flag["target"] = json!({"url": ""});
+    let absent = plugin.send("absent-flag", without_flag).await?;
+    assert_eq!(absent.status, NotificationSendStatus::Failed);
+    assert_eq!(
+        absent.error_code.as_deref(),
+        Some("destination_not_allowed")
+    );
+    assert!(absent.provider_request_id.is_none());
+
+    let mut denied = send_params(api_base_config(&base), json!(TEST_SECRET));
+    denied["target"] = json!({"url": "", "allowPrivateNetwork": false});
+    let explicit = plugin.send("denied", denied).await?;
+    assert_eq!(explicit.status, NotificationSendStatus::Failed);
+    assert_eq!(
+        explicit.error_code.as_deref(),
+        Some("destination_not_allowed")
+    );
+
+    let stderr = plugin.finish().await?;
+    server.abort();
+    assert_eq!(
+        requests.get(),
+        0,
+        "a rejected destination must not be contacted"
+    );
+    assert!(
+        stderr.contains("destination_not_allowed"),
+        "the log must carry the stable code: {stderr}"
+    );
+    assert_log_has_no_credentials(&stderr);
+    assert_result_has_no_credentials(&absent);
+    assert_result_has_no_credentials(&explicit);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_the_cloud_metadata_address_even_with_private_network_approval()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut config = api_base_config("http://169.254.169.254:80");
+    config["toUser"] = json!("@all");
+    let mut plugin = Plugin::start().await?;
+    let result = plugin
+        .send("metadata", send_params(config, json!(TEST_SECRET)))
+        .await?;
+    let stderr = plugin.finish().await?;
+
+    assert_eq!(result.status, NotificationSendStatus::Failed);
+    assert_eq!(
+        result.error_code.as_deref(),
+        Some("destination_not_allowed"),
+        "a link-local metadata address stays forbidden after private-network approval"
+    );
+    assert_result_has_no_credentials(&result);
+    assert!(
+        !stderr.contains("169.254"),
+        "the log must not carry the rejected destination: {stderr}"
+    );
+    assert_log_has_no_credentials(&stderr);
+    Ok(())
+}

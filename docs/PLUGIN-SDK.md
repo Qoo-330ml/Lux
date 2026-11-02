@@ -744,8 +744,15 @@ payload 组装，进程外壳、出站 client、状态分类和通知正文来�
 `secret` 是自建应用的 corpsecret，只从 `notification.send` 请求的 `NotificationSendRpcRequest.secret`
 取得，不读取配置文件、不写入 `config`/`providerConfig`，也不出现在日志、RPC 结果或错误信息里。`apiBase`
 仅用于代理或测试，必须是 http/https 基地址，且不得包含凭据、query 或 fragment；基地址里已有的路径段
-（包括百分号转义）按原样保留，插件只在其后追加 `cgi-bin/*` 路径段。插件进程的出站请求仍受宿主代理策略
-（`LUX_PROXY_URL`）约束，沿用 SDK client 的 10 秒超时且不跟随重定向。
+（包括百分号转义）按原样保留，插件只在其后追加 `cgi-bin/*` 路径段。
+
+目的地守卫：插件在发起任何出站连接之前，把 `config.apiBase` 和宿主给出的 `target.allowPrivateNetwork`
+（缺失或 `false` 表示不批准）原样交给 SDK 的 `guard_destination`，自己不放宽策略。未批准的私网/回环地址和
+始终禁止的保留地址（含 `169.254.169.254` 等云元数据）返回 `Failed(destination_not_allowed)`，DNS 暂时失败
+返回 `Retryable(destination_unresolved)`；被拒的请求不会建立任何连接，也不会写入主机或完整 URL。通过后插件
+用 `GuardedDestination::pin` 把已校验地址钉进按宿主代理策略构建的 client：未配置 `LUX_PROXY_URL` 时 SDK
+禁用一切环境/系统代理，请求直连该地址；管理员显式配置代理时由代理解析目标，`pin()` 不再决定连接地址。
+重定向仍然禁用，上游 `3xx` 无法绕过守卫。
 
 投递流程：
 
@@ -773,14 +780,18 @@ payload 组装，进程外壳、出站 client、状态分类和通知正文来�
 
 - `DELIVERED`：企业微信返回 `errcode: 0`，`msgid` 作为 `providerRequestId` 返回。
 - `RETRYABLE`：网络错误/超时（`network_error`）、`408`/`425`/`429`/`5xx`（`PROVIDER_HTTP_<status>`）、
-  `rate_limited`、`system_busy`，或总截止时间内尚未发出任何消息（`delivery_timeout`）。
+  `rate_limited`、`system_busy`、目的地 DNS 暂时失败（`destination_unresolved`），或总截止时间内尚未发出任何
+  消息（`delivery_timeout`）。
 - `FAILED`：缺少或空白凭据（`missing_secret`）、目标配置非法（`invalid_config`，如 corpId 为空、agentId
-  非正数、toUser 含非法字符、apiBase 非 http/https 或带凭据/query）、全部收件人无效
-  （`no_valid_recipient`）、已发出消息后超出总截止时间（`timeout_after_send`）、响应超 64 KiB
-  （`response_too_large`）、响应不是预期 JSON（`invalid_response`）、其他永久 4xx 与业务错误。
+  非正数、toUser 含非法字符、apiBase 非 http/https 或带凭据/query）、目的地被守卫拒绝
+  （`destination_not_allowed`）、全部收件人无效（`no_valid_recipient`）、已发出消息后超出总截止时间
+  （`timeout_after_send`）、响应超 64 KiB（`response_too_large`）、响应不是预期 JSON
+  （`invalid_response`）、其他永久 4xx 与业务错误。
 
 插件日志只写稳定结果码和无效收件人数量，不写 access_token、token 请求的 query、完整外部 URL、userid 或凭据。
 
 打包：`scripts/package-notifier-plugin.sh org.lux.notifier.wecom-app`，产物为
 `dist/plugins/org.lux.notifier.wecom-app-0.1.0-<platform>-<arch>.zip`。相关测试在
-`tests/plugins/notifier_wecom_app.rs`，使用 127.0.0.1 随机端口的 mock 企业微信服务，不访问真实租户。
+`tests/plugins/notifier_wecom_app.rs`，使用 127.0.0.1 随机端口的 mock 企业微信服务（显式携带
+`allowPrivateNetwork: true`），不访问真实租户；其中一条断言默认未批准私网时回环目的地被拒且 mock 收不到任何
+请求，另一条断言批准私网后 `169.254.169.254` 仍被拒。

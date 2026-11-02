@@ -20,8 +20,9 @@ use std::{
 
 use luxd::application::{
     notifier_plugin_sdk::{
-        delivered, failed, outbound_http_client_from_env, render_event_text,
-        result_from_http_status, retryable, run_notifier,
+        DestinationGuardError, delivered, failed, guard_destination,
+        outbound_http_client_builder_from_env, render_event_text, result_from_http_status,
+        retryable, run_notifier,
     },
     plugin_protocol::{
         NotificationSendRpcRequest, NotificationSendRpcResult, NotificationSendStatus,
@@ -74,20 +75,15 @@ const ERROR_TIMEOUT_AFTER_SEND: &str = "timeout_after_send";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = outbound_http_client_from_env()?;
-    run_notifier(move |request| {
-        let client = client.clone();
-        async move { deliver(&client, request).await }
-    })
-    .await?;
+    // Refuse to serve deliveries with a client that ignores the host proxy policy. The delivery
+    // path rebuilds the client around each guarded destination, so only the policy is checked here.
+    let _ = outbound_http_client_builder_from_env()?;
+    run_notifier(deliver).await?;
     Ok(())
 }
 
 /// Delivers one `notification.send` request.
-async fn deliver(
-    client: &Client,
-    request: NotificationSendRpcRequest,
-) -> NotificationSendRpcResult {
+async fn deliver(request: NotificationSendRpcRequest) -> NotificationSendRpcResult {
     let Some(secret) = destination_secret(request.secret.as_deref()) else {
         log_failure(ERROR_MISSING_SECRET);
         return failed(ERROR_MISSING_SECRET);
@@ -96,6 +92,8 @@ async fn deliver(
         log_failure(ERROR_INVALID_CONFIG);
         return failed(ERROR_INVALID_CONFIG);
     };
+    // The host decides whether the destination may be private; the plugin never widens it.
+    let allow_private = allowed_private_network(&request.target);
     let (title, body) = render_event_text(&request.event);
     let content = compose_text(&title, &body);
     let cache_key = token_cache_key(&config, &secret);
@@ -105,7 +103,14 @@ async fn deliver(
 
     let delivery = match tokio::time::timeout(
         TOTAL_DELIVERY_BUDGET,
-        run_delivery(client, &config, &secret, cache_key, &content, &dispatched),
+        run_delivery(
+            &config,
+            &secret,
+            cache_key,
+            &content,
+            allow_private,
+            &dispatched,
+        ),
     )
     .await
     {
@@ -137,16 +142,31 @@ impl Delivery {
 }
 
 /// Runs the delivery attempts inside the total deadline set by [`deliver`].
+///
+/// The configured API base passes the shared destination guard before any connection is opened, and
+/// the accepted address is pinned into the request client against DNS rebinding.
 async fn run_delivery(
-    client: &Client,
     config: &WecomAppConfig,
     secret: &str,
     cache_key: u64,
     content: &str,
+    allow_private: bool,
     dispatched: &AtomicBool,
 ) -> Delivery {
+    let guarded = match guard_destination(&config.api_base, allow_private).await {
+        Ok(guarded) => guarded,
+        Err(error) => return Delivery::plain(guard_failure(error)),
+    };
+    let client = match outbound_http_client_builder_from_env() {
+        Ok(builder) => builder,
+        Err(_) => return Delivery::plain(retryable(ERROR_NETWORK)),
+    };
+    let client = match guarded.pin(client).build() {
+        Ok(client) => client,
+        Err(_) => return Delivery::plain(retryable(ERROR_NETWORK)),
+    };
     match send_message(
-        client, config, secret, cache_key, content, false, dispatched,
+        &client, config, secret, cache_key, content, false, dispatched,
     )
     .await
     {
@@ -154,11 +174,36 @@ async fn run_delivery(
         Attempt::TokenRejected => {
             // WeCom rejected the cached token: drop it, fetch a fresh one and retry exactly once.
             evict_token(cache_key);
-            match send_message(client, config, secret, cache_key, content, true, dispatched).await {
+            match send_message(
+                &client, config, secret, cache_key, content, true, dispatched,
+            )
+            .await
+            {
                 Attempt::Done(delivery) => delivery,
                 Attempt::TokenRejected => Delivery::plain(failed(ERROR_TOKEN_REJECTED)),
             }
         }
+    }
+}
+
+/// Reads the host `allowPrivateNetwork` approval; absent or non-boolean means "not allowed".
+fn allowed_private_network(target: &Value) -> bool {
+    target
+        .get("allowPrivateNetwork")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Maps a destination guard rejection onto the delivery classification.
+fn guard_failure(error: DestinationGuardError) -> NotificationSendRpcResult {
+    eprintln!(
+        "wecom-app notifier: destination rejected ({})",
+        error.code()
+    );
+    if error.is_retryable() {
+        retryable(error.code())
+    } else {
+        failed(error.code())
     }
 }
 
