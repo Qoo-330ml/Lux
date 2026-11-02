@@ -151,9 +151,6 @@ describe("PlayerSettingsPanel quality slot", () => {
   it("renders the independent quality selector next to the other settings", () => {
     const markup = renderToStaticMarkup(
       <PlayerSettingsPanel
-        playbackRates={[1]}
-        playbackRate={1}
-        onChangeRate={() => undefined}
         quality={{
           options,
           selectedValue: "720",
@@ -166,15 +163,12 @@ describe("PlayerSettingsPanel quality slot", () => {
 
     expect(markup).toContain('aria-label="播放设置"');
     expect(markup).toContain('aria-label="选择画质"');
-    expect(markup).toContain('aria-label="选择字幕"');
+    expect(markup).not.toContain('aria-label="选择字幕"');
   });
 
   it("omits the quality slot when the player does not supply one", () => {
     const markup = renderToStaticMarkup(
       <PlayerSettingsPanel
-        playbackRates={[1]}
-        playbackRate={1}
-        onChangeRate={() => undefined}
         onClose={() => undefined}
       />,
     );

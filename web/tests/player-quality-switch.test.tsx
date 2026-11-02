@@ -10,6 +10,7 @@ import { api } from "../src/lib/api/client";
 import { queryKeys } from "../src/lib/api/query-keys";
 import type { WebPlaybackRequestSelection } from "../src/lib/api/types";
 import { chooseLuxOptionByValue, luxOptions, luxSelectValue } from "./lux-select-helpers";
+import { speedButton, speedLabel, trackMenuButton } from "./player-test-helpers";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -247,10 +248,10 @@ describe("PlayerPage quality switching", () => {
     expect(luxSelectValue(container!, "选择画质")).toBe("");
     expect(container?.textContent).toContain("原画 2160p");
 
-    const speed = Array.from(container!.querySelectorAll<HTMLButtonElement>("button"))
-      .find((button) => button.textContent?.trim() === "1.5x");
-    if (!speed) throw new Error("1.5x speed control was not rendered");
-    await act(async () => speed.click());
+    for (let attempt = 0; attempt < 6 && speedButton(container!).textContent !== speedLabel(1.5); attempt += 1) {
+      await act(async () => speedButton(container!).click());
+    }
+    expect(speedButton(container!).textContent).toBe(speedLabel(1.5));
     expect(firstVideo.playbackRate).toBe(1.5);
 
     firstVideo.currentTime = 48;
@@ -291,6 +292,7 @@ describe("PlayerPage quality switching", () => {
   it("keeps the audio selection when the quality changes and vice versa", async () => {
     await renderPlayer("/watch/movie-quality?audioStreamIndex=2");
     await openSettings();
+    await act(async () => trackMenuButton(container!, "音轨").click());
     expect(luxSelectValue(container!, "选择音轨")).toBe("2");
 
     await chooseLuxOptionByValue(container!, "选择画质", "1080");

@@ -188,7 +188,6 @@ describe("LuxPlayer state components", () => {
         airPlayAvailable
         pictureInPictureEnabled
         onAirPlay={() => undefined}
-        onTogglePictureInPicture={() => undefined}
       />,
     );
 
@@ -203,9 +202,6 @@ describe("LuxPlayer state components", () => {
   it("keeps settings actions in a focused, keyboard-addressable panel", () => {
     const markup = renderToStaticMarkup(
       <PlayerSettingsPanel
-        playbackRates={[0.5, 1, 1.5]}
-        playbackRate={1}
-        onChangeRate={() => undefined}
         captionOffset={-1.2}
         onChangeCaptionOffset={() => undefined}
         presentation={{
@@ -225,21 +221,16 @@ describe("LuxPlayer state components", () => {
     // The played version is chosen on the detail page; the panel must not repeat it.
     expect(markup).not.toContain("播放版本");
     expect(markup).not.toContain('id="lux-player-source-select"');
-    expect(markup).toContain("标准");
+    expect(markup).not.toContain("播放速度");
     expect(markup).toContain("循环播放");
     expect(markup).toContain('role="switch"');
     expect(markup).toContain('aria-checked="true"');
-    expect(markup).toContain("画面比例");
+    expect(markup).toContain("长宽比");
     expect(markup).toContain("4:3");
+    expect(markup).toContain("填充");
     expect(markup).toContain("画面翻转");
     expect(markup).toContain("水平镜像");
-    expect(markup).toContain('id="lux-player-caption-offset"');
-    expect(markup).toContain('min="-10"');
-    expect(markup).toContain('max="10"');
-    expect(markup).toContain('step="0.1"');
-    expect(markup).toContain('value="-1.2"');
-    expect(markup).toContain('aria-valuetext="-1.2s"');
-    expect(markup).toContain("正值延后，负值提前");
+    expect(markup).not.toContain('id="lux-player-caption-offset"');
     expect(markup).not.toContain("快捷键提示");
     expect(markup).not.toContain("空格 / K");
     expect(markup).toContain('aria-label="关闭播放设置"');
@@ -259,7 +250,6 @@ describe("LuxPlayer state components", () => {
         volume={1}
         muted={false}
         fullscreen={false}
-        pictureInPictureEnabled
         danmuVisible
         chapters={chapters}
         introSkip={{ start: 0, end: 20 }}
@@ -284,7 +274,6 @@ describe("LuxPlayer state components", () => {
         onChapterSeek={() => undefined}
         onSkipIntro={() => undefined}
         onAirPlay={() => undefined}
-        onTakeScreenshot={() => undefined}
         onToggleSettings={() => undefined}
         onTogglePictureInPicture={() => undefined}
         onToggleFullscreen={() => undefined}
@@ -298,12 +287,12 @@ describe("LuxPlayer state components", () => {
     expect(markup).toContain('aria-valuemax="100"');
     const timelineRowStart = markup.indexOf('<div class="lux-player-timeline-row">');
     const controlsStart = markup.indexOf('<div class="lux-player-controls">');
-    const timeDisplayIndex = markup.indexOf('class="lux-player-time"');
+    const timeDisplayIndex = markup.indexOf('class="lux-player-timeline-times"');
     expect(timelineRowStart).toBeGreaterThanOrEqual(0);
     expect(timeDisplayIndex).toBeGreaterThan(timelineRowStart);
     expect(timeDisplayIndex).toBeLessThan(controlsStart);
-    expect(markup).toMatch(/<div class="lux-player-timeline-row"><button type="button" class="lux-player-time"/);
-    expect(markup).not.toMatch(/<div class="lux-player-controls-left">[\s\S]*lux-player-time/);
+    expect(markup).toMatch(/<div class="lux-player-timeline-row"><div class="lux-player-timeline-times"><span class="lux-player-time-current">/);
+    expect(markup).not.toMatch(/<div class="lux-player-controls-left">[\s\S]*lux-player-timeline-times/);
     const timelineRailIndex = markup.indexOf('class="lux-player-timeline-rail"');
     const chapterRailIndex = markup.indexOf('class="lux-player-chapter-rail"');
     expect(timelineRailIndex).toBeGreaterThanOrEqual(0);
@@ -321,7 +310,6 @@ describe("LuxPlayer state components", () => {
     expect(markup).toContain('data-marker-type="CREDITS_START"');
     expect(markup).toContain('aria-label="跳过片头"');
     expect(markup).not.toContain('aria-label="选择播放版本"');
-    expect(markup).toContain('aria-label="截图"');
     expect(markup).toContain('aria-label="播放器设置"');
     expect(markup).not.toContain("发送弹幕");
     expect(markup).not.toContain("热力图");

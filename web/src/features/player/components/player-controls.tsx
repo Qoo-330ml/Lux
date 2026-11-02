@@ -1,28 +1,32 @@
 import {
-  Camera,
   Airplay,
-  Info,
-  Keyboard,
+  AudioLines,
   Maximize,
   MessageCircleMore,
   Minimize,
   Pause,
-  PictureInPicture2,
   Play,
+  RotateCcw,
+  RotateCw,
   Settings2,
   SkipBack,
   SkipForward,
+  Subtitles,
   Volume1,
   Volume2,
   VolumeX,
 } from "lucide-react";
-import type {
-  ChangeEvent,
-  CSSProperties,
-  KeyboardEvent as ReactKeyboardEvent,
-  MouseEvent as ReactMouseEvent,
-  PointerEvent as ReactPointerEvent,
-  RefObject,
+import {
+  useEffect,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode,
+  type RefObject,
 } from "react";
 import {
   PlayerChapterTimeline,
@@ -39,7 +43,6 @@ export type PlayerControlsProps = {
   volume: number;
   muted: boolean;
   fullscreen: boolean;
-  pictureInPictureEnabled: boolean;
   danmuVisible: boolean;
   episodeNavigation?: PlayerEpisodeNavigation | null;
   airPlayAvailable?: boolean;
@@ -48,9 +51,22 @@ export type PlayerControlsProps = {
   creditsStart?: number | null;
   hasNextEpisode?: boolean;
   settingsOpen: boolean;
-  infoOpen: boolean;
-  /** 键盘快捷键帮助浮层是否打开；触屏设备默认不展示该入口。 */
-  shortcutHelpOpen?: boolean;
+  /**
+   * Which control-bar popover is open. The page owns this when it passes it, so the open popover
+   * survives a remount of the control bar (for example a blocking notice swapping the surface).
+   */
+  trackMenu?: TrackMenu | null;
+  onTrackMenuChange?: (menu: TrackMenu | null) => void;
+  /** 字幕弹窗内容（选择字幕与字幕偏移）；缺省时不显示字幕按钮。 */
+  subtitleMenu?: ReactNode;
+  subtitleActive?: boolean;
+  /** 音轨弹窗内容；缺省时不显示音轨按钮。 */
+  audioMenu?: ReactNode;
+  playbackRate?: number;
+  playbackRates?: readonly number[];
+  onChangeRate?: (rate: number) => void;
+  /** 相对当前位置快退/快进（秒）；缺省时不显示 10 秒按钮。 */
+  onSeekBy?: (seconds: number) => void;
   remainingTime: boolean;
   hoverTime: number | null;
   hoverPercent: number | null;
@@ -72,11 +88,7 @@ export type PlayerControlsProps = {
   onChapterSeek?: (seconds: number) => void;
   onSkipIntro?: (seconds: number) => void;
   onSkipCredits?: () => void;
-  onTakeScreenshot: () => void;
   onToggleSettings: () => void;
-  onToggleInfo: () => void;
-  onToggleShortcutHelp?: () => void;
-  onTogglePictureInPicture: () => void;
   onToggleFullscreen: () => void;
 };
 
@@ -84,6 +96,8 @@ export type PlayerEpisodeNavigation = {
   previousEpisodeId: string | null;
   nextEpisodeId: string | null;
 };
+
+export type TrackMenu = "subtitle" | "audio";
 
 export function formatTime(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "00:00";
@@ -97,6 +111,10 @@ export function formatTime(seconds: number): string {
   return `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
 }
 
+function rateLabel(rate: number): string {
+  return rate === 1 ? "标准" : `${rate}x`;
+}
+
 export function PlayerControls({
   playing,
   currentTime,
@@ -105,7 +123,6 @@ export function PlayerControls({
   volume,
   muted,
   fullscreen,
-  pictureInPictureEnabled,
   danmuVisible,
   episodeNavigation = null,
   airPlayAvailable = false,
@@ -114,8 +131,15 @@ export function PlayerControls({
   creditsStart = null,
   hasNextEpisode = false,
   settingsOpen,
-  infoOpen,
-  shortcutHelpOpen = false,
+  trackMenu,
+  onTrackMenuChange,
+  subtitleMenu = null,
+  subtitleActive = false,
+  audioMenu = null,
+  playbackRate = 1,
+  playbackRates = [1],
+  onChangeRate = () => undefined,
+  onSeekBy,
   remainingTime,
   hoverTime,
   hoverPercent,
@@ -137,11 +161,7 @@ export function PlayerControls({
   onChapterSeek = () => undefined,
   onSkipIntro = () => undefined,
   onSkipCredits = () => undefined,
-  onTakeScreenshot,
   onToggleSettings,
-  onToggleInfo,
-  onToggleShortcutHelp = () => undefined,
-  onTogglePictureInPicture,
   onToggleFullscreen,
 }: PlayerControlsProps) {
   const progressPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
@@ -149,8 +169,42 @@ export function PlayerControls({
   const normalizedVolume = Number.isFinite(volume) ? Math.max(0, Math.min(1, muted ? 0 : volume)) : 0;
   const volumePercent = `${normalizedVolume * 100}%`;
 
+  // Track popovers (subtitles, audio) open from the control bar. Only one is open at a time;
+  // a pointer press outside the control bar or Escape closes it.
+  const [localMenu, setLocalMenu] = useState<TrackMenu | null>(null);
+  const openMenu = trackMenu !== undefined ? trackMenu : localMenu;
+  const setOpenMenu = onTrackMenuChange ?? setLocalMenu;
+  const wrapRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (openMenu === null) return undefined;
+    const closeOnOutside = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Node && wrapRef.current?.contains(target)) return;
+      // LuxSelect renders its option list into document.body; picking an option is still inside the popover.
+      if (target instanceof Element && target.closest(".lux-select-menu")) return;
+      setOpenMenu(null);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpenMenu(null);
+    };
+    document.addEventListener("pointerdown", closeOnOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [openMenu, setOpenMenu]);
+  const toggleMenu = (menu: TrackMenu) => setOpenMenu(openMenu === menu ? null : menu);
+
+  const cycleRate = () => {
+    if (playbackRates.length === 0) return;
+    const index = playbackRates.indexOf(playbackRate);
+    const next = playbackRates[(index + 1) % playbackRates.length];
+    if (next !== undefined) onChangeRate(next);
+  };
+
   return (
-    <div className="lux-player-controls-wrap">
+    <div className="lux-player-controls-wrap" ref={wrapRef}>
       <PlayerIntroSkip currentTime={currentTime} introSkip={introSkip} onSkip={onSkipIntro} />
       <PlayerSkipCredits
         currentTime={currentTime}
@@ -161,23 +215,20 @@ export function PlayerControls({
         onSkip={onSkipCredits}
       />
       <div className="lux-player-timeline-row">
-        <button
-          type="button"
-          className="lux-player-time"
-          onClick={onToggleRemainingTime}
-          title="点击切换显示剩余时间"
-          aria-label="切换剩余时间显示"
-        >
+        <div className="lux-player-timeline-times">
           <span className="lux-player-time-current">{formatTime(currentTime)}</span>
-          <span className="lux-player-time-divider" aria-hidden="true">/</span>
-          <span className="lux-player-time-total">
+          <button
+            type="button"
+            className="lux-player-time-total"
+            onClick={onToggleRemainingTime}
+            title="点击切换显示剩余时间"
+            aria-label="切换剩余时间显示"
+          >
             {remainingTime ? `-${formatTime(Math.max(0, duration - currentTime))}` : formatTime(duration)}
-          </span>
-        </button>
+          </button>
+        </div>
 
-        <div
-          className="lux-player-timeline"
-        >
+        <div className="lux-player-timeline">
           {hoverTime !== null && hoverPercent !== null ? (
             <div className="lux-player-tooltip" style={{ left: `${hoverPercent}%` }} aria-hidden="true">
               {formatTime(hoverTime)}
@@ -253,6 +304,29 @@ export function PlayerControls({
             </>
           ) : null}
 
+          {onSeekBy ? (
+            <>
+              <button
+                type="button"
+                className="lux-player-action-btn lux-player-seek-btn"
+                aria-label="后退 10 秒"
+                title="后退 10 秒"
+                onClick={() => onSeekBy(-10)}
+              >
+                <RotateCcw size={20} aria-hidden="true" />
+              </button>
+              <button
+                type="button"
+                className="lux-player-action-btn lux-player-seek-btn"
+                aria-label="前进 10 秒"
+                title="前进 10 秒"
+                onClick={() => onSeekBy(10)}
+              >
+                <RotateCw size={20} aria-hidden="true" />
+              </button>
+            </>
+          ) : null}
+
           <div className="lux-player-volume-group">
             <button
               type="button"
@@ -278,11 +352,60 @@ export function PlayerControls({
             </div>
           </div>
 
+          {subtitleMenu ? (
+            <div className="lux-player-track-anchor">
+              <button
+                type="button"
+                className={`lux-player-action-btn lux-player-subtitle-btn ${subtitleActive ? "is-active" : ""} ${openMenu === "subtitle" ? "is-active" : ""}`}
+                aria-label="字幕"
+                aria-haspopup="dialog"
+                aria-expanded={openMenu === "subtitle"}
+                title="字幕"
+                onClick={() => toggleMenu("subtitle")}
+              >
+                <Subtitles size={20} aria-hidden="true" />
+              </button>
+              {openMenu === "subtitle" ? (
+                <div className="lux-player-track-popover" role="dialog" aria-label="字幕">
+                  {subtitleMenu}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
         </div>
 
         <div className="lux-player-controls-middle" />
 
         <div className="lux-player-controls-right">
+          {audioMenu ? (
+            <div className="lux-player-track-anchor">
+              <button
+                type="button"
+                className={`lux-player-action-btn lux-player-audio-btn ${openMenu === "audio" ? "is-active" : ""}`}
+                aria-label="音轨"
+                aria-haspopup="dialog"
+                aria-expanded={openMenu === "audio"}
+                title="音轨"
+                onClick={() => toggleMenu("audio")}
+              >
+                <AudioLines size={20} aria-hidden="true" />
+              </button>
+              {openMenu === "audio" ? (
+                <div className="lux-player-track-popover" role="dialog" aria-label="音轨">
+                  {audioMenu}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+          <button
+            type="button"
+            className="lux-player-speed-btn"
+            aria-label="倍速"
+            title={`倍速：${rateLabel(playbackRate)}`}
+            onClick={cycleRate}
+          >
+            {rateLabel(playbackRate)}
+          </button>
           <button
             type="button"
             className={`lux-player-action-btn lux-player-danmu-btn ${danmuVisible ? "is-active" : ""}`}
@@ -298,32 +421,6 @@ export function PlayerControls({
               <Airplay size={20} aria-hidden="true" />
             </button>
           ) : null}
-          <button type="button" className="lux-player-action-btn" aria-label="截图" title="截图" onClick={onTakeScreenshot}>
-            <Camera size={20} aria-hidden="true" />
-          </button>
-          <button
-            type="button"
-            className={`lux-player-action-btn lux-player-info-btn ${infoOpen ? "is-active" : ""}`}
-            aria-label="播放信息"
-            aria-expanded={infoOpen}
-            aria-pressed={infoOpen}
-            title="播放信息 (I / 右键)"
-            onClick={onToggleInfo}
-          >
-            <Info size={20} aria-hidden="true" />
-          </button>
-          <button
-            type="button"
-            className={`lux-player-action-btn lux-player-shortcut-help-btn ${shortcutHelpOpen ? "is-active" : ""}`}
-            aria-label="键盘快捷键"
-            aria-expanded={shortcutHelpOpen}
-            aria-pressed={shortcutHelpOpen}
-            title="键盘快捷键 (?)"
-            data-player-shortcut-help-toggle
-            onClick={onToggleShortcutHelp}
-          >
-            <Keyboard size={20} aria-hidden="true" />
-          </button>
           <button
             type="button"
             className={`lux-player-action-btn ${settingsOpen ? "is-active" : ""}`}
@@ -335,11 +432,6 @@ export function PlayerControls({
           >
             <Settings2 size={20} aria-hidden="true" />
           </button>
-          {pictureInPictureEnabled ? (
-            <button type="button" className="lux-player-action-btn lux-player-mobile-top-control" aria-label="画中画" title="画中画" onClick={onTogglePictureInPicture}>
-              <PictureInPicture2 size={19} aria-hidden="true" />
-            </button>
-          ) : null}
           <button type="button" className="lux-player-action-btn" aria-label={fullscreen ? "退出全屏" : "全屏"} title={fullscreen ? "退出全屏 (F)" : "全屏 (F)"} onClick={onToggleFullscreen}>
             {fullscreen ? <Minimize size={20} aria-hidden="true" /> : <Maximize size={20} aria-hidden="true" />}
           </button>

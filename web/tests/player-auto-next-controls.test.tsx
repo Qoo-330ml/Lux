@@ -105,9 +105,6 @@ describe("LuxPlayer auto play next switch", () => {
     root = createRoot(container);
     await act(async () => root?.render(
       <PlayerSettingsPanel
-        playbackRates={[1]}
-        playbackRate={1}
-        onChangeRate={() => undefined}
         autoPlay={{ enabled, onToggle }}
         onClose={() => undefined}
       />,

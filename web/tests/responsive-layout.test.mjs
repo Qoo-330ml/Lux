@@ -37,9 +37,9 @@ test("player overlays use viewport-relative safe-area insets", () => {
   assert.match(rule(".lux-player-frame"), /right:\s*env\(safe-area-inset-right\)/);
 });
 
-test("portrait phone players move AirPlay and picture-in-picture to the top bar", () => {
-  assert.match(stylesheet, /\.lux-player-topbar-actions\s*\{[^}]*display:\s*none/);
-  assert.match(stylesheet, /@media\s*\(max-width:\s*720px\)\s+and\s+\(orientation:\s*portrait\)[\s\S]*?\.lux-player-topbar-actions\s*\{[^}]*display:\s*flex/);
+test("the top bar shows picture-in-picture on every viewport; portrait phones hide the duplicate AirPlay in the control bar", () => {
+  // Picture-in-picture sits top-right on desktop too, so the top-bar actions are always shown.
+  assert.match(stylesheet, /\.lux-player-topbar-actions\s*\{[^}]*display:\s*flex/);
   assert.match(stylesheet, /@media\s*\(max-width:\s*720px\)\s+and\s+\(orientation:\s*portrait\)[\s\S]*?\.lux-player-controls \.lux-player-mobile-top-control\s*\{[^}]*display:\s*none/);
 });
 

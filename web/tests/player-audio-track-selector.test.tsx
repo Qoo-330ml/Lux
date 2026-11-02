@@ -105,28 +105,20 @@ describe("PlayerAudioTrackSelector", () => {
 });
 
 describe("PlayerSettingsPanel audio track slot", () => {
-  it("renders the independent audio track selector next to the other settings", () => {
+  it("keeps audio, subtitles and speed out of the settings panel (they live in the control bar)", () => {
     const markup = renderToStaticMarkup(
-      <PlayerSettingsPanel
-        playbackRates={[1]}
-        playbackRate={1}
-        onChangeRate={() => undefined}
-        audioTracks={{ tracks, selectedIndex: "1", onSelect: () => undefined }}
-        onClose={() => undefined}
-      />,
+      <PlayerSettingsPanel onClose={() => undefined} />,
     );
 
     expect(markup).toContain('aria-label="播放设置"');
-    expect(markup).toContain('aria-label="选择音轨"');
-    expect(markup).toContain('aria-label="选择字幕"');
+    expect(markup).not.toContain('aria-label="选择音轨"');
+    expect(markup).not.toContain('aria-label="选择字幕"');
+    expect(markup).not.toContain("播放速度");
   });
 
   it("omits the audio track slot when the player does not supply one", () => {
     const markup = renderToStaticMarkup(
       <PlayerSettingsPanel
-        playbackRates={[1]}
-        playbackRate={1}
-        onChangeRate={() => undefined}
         onClose={() => undefined}
       />,
     );

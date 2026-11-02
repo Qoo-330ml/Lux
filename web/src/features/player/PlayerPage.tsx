@@ -12,7 +12,6 @@ import { imageUrl, mediaTitle } from "../home/media";
 import { usePlayerPlaybackControls } from "./usePlayerPlaybackControls";
 import { usePlayerTimelineScrubber } from "./usePlayerTimelineScrubber";
 import { usePlayerKeyboardShortcuts } from "./usePlayerKeyboardShortcuts";
-import { usePlayerScreenshot } from "./usePlayerScreenshot";
 import { usePlayerInfoPanel } from "./usePlayerInfoPanel";
 import { usePlayerPlaybackSession } from "./usePlayerPlaybackSession";
 import { useAudioTrackSwitch } from "./useAudioTrackSwitch";
@@ -32,6 +31,10 @@ import { canUseRemoteMkvCaptionSidecar, isRemoteHttpStrmSource } from "./playbac
 import { LuxPlayerRuntime } from "./core/player-runtime";
 import { PlayerControls } from "./components/player-controls";
 import { PlayerSettingsPanel } from "./components/player-settings-panel";
+import { PlayerSubtitleMenu } from "./components/player-subtitle-menu";
+import type { TrackMenu } from "./components/player-controls";
+import { PlayerAudioTrackSelector } from "./components/player-audio-track-selector";
+import { shouldShowAudioTrackSelector } from "./audio-track-selection";
 import { PlayerInfoPanel } from "./components/player-info-panel";
 import { PlayerShortcutHelp } from "./components/player-shortcut-help";
 import { playerInfoCopyText } from "./player-stats";
@@ -99,6 +102,7 @@ export function PlayerPage() {
   const [flip, setFlip] = useState<PlayerFlip>("normal");
   const [showSettings, setShowSettings] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
+  const [trackMenu, setTrackMenu] = useState<TrackMenu | null>(null);
   const [showShortcutHelp, setShowShortcutHelp] = useState(false);
   const [isRemainingTime, setIsRemainingTime] = useState(false);
   const [isPointerInteracting, setIsPointerInteracting] = useState(false);
@@ -579,7 +583,6 @@ export function PlayerPage() {
     clearCues: clearRuntimeCaptionCues,
   });
 
-  const { screenshotStatus, takeScreenshot } = usePlayerScreenshot({ videoRef, media });
 
   if (playbackBootstrap.isPending || (useLegacyPlaybackQueries && item.isPending)) {
     return <PlayerLoadingState message="正在准备播放器…" />;
@@ -751,16 +754,9 @@ export function PlayerPage() {
 
       {showSettings ? (
         <PlayerSettingsPanel
-          playbackRates={PLAYBACK_SPEEDS}
-          playbackRate={playbackRate}
-          onChangeRate={changePlaybackRate}
-          audioTracks={{
-            tracks: audioTracks,
-            selectedIndex: selectedAudioStreamIndex,
-            switching: switchingAudioTrack,
-            disabled: switchingQuality,
-            notice: audioTrackNotice,
-            onSelect: switchAudioTrack,
+          onOpenInfo={() => {
+            setShowSettings(false);
+            setShowInfo(true);
           }}
           quality={{
             options: qualityOptions,
@@ -779,12 +775,6 @@ export function PlayerPage() {
             onChangeAspectRatio: setAspectRatio,
             onChangeFlip: setFlip,
           }}
-          captions={captionOptions}
-          selectedCaptionId={captionSourceId === source?.id ? selectedCaptionId : null}
-          captionStatus={captionStatus}
-          onSelectCaption={selectCaption}
-          captionOffset={captionOffset}
-          onChangeCaptionOffset={changeCaptionOffset}
           autoPlay={{
             enabled: autoPlayEnabled,
             onToggle: () => setAutoPlayEnabled(!autoPlayEnabled),
@@ -813,12 +803,6 @@ export function PlayerPage() {
         />
       ) : null}
 
-      {screenshotStatus ? (
-        <div className="lux-player-screenshot-status" role="status">
-          {screenshotStatus}
-        </div>
-      ) : null}
-
       <PlayerControls
         playing={playing}
         currentTime={currentTime}
@@ -827,7 +811,6 @@ export function PlayerPage() {
         volume={volume}
         muted={isMuted}
         fullscreen={isFullscreen}
-        pictureInPictureEnabled={Boolean(document.pictureInPictureEnabled)}
         danmuVisible={danmuVisible}
         episodeNavigation={episodeNavigation}
         airPlayAvailable={airPlay.available}
@@ -836,8 +819,33 @@ export function PlayerPage() {
         creditsStart={creditsStart}
         hasNextEpisode={Boolean(nextEpisodeId)}
         settingsOpen={showSettings}
-        infoOpen={showInfo}
-        shortcutHelpOpen={showShortcutHelp}
+        trackMenu={trackMenu}
+        onTrackMenuChange={setTrackMenu}
+        subtitleMenu={(
+          <PlayerSubtitleMenu
+            captions={captionOptions}
+            selectedCaptionId={captionSourceId === source?.id ? selectedCaptionId : null}
+            captionStatus={captionStatus}
+            onSelectCaption={selectCaption}
+            captionOffset={captionOffset}
+            onChangeCaptionOffset={changeCaptionOffset}
+          />
+        )}
+        subtitleActive={captionSourceId === source?.id && selectedCaptionId !== null}
+        audioMenu={shouldShowAudioTrackSelector(audioTracks) ? (
+          <PlayerAudioTrackSelector
+            tracks={audioTracks}
+            selectedIndex={selectedAudioStreamIndex}
+            switching={switchingAudioTrack}
+            disabled={switchingQuality}
+            notice={audioTrackNotice}
+            onSelect={switchAudioTrack}
+          />
+        ) : undefined}
+        playbackRate={playbackRate}
+        playbackRates={PLAYBACK_SPEEDS}
+        onChangeRate={changePlaybackRate}
+        onSeekBy={(delta) => seekTo(currentTime + delta)}
         remainingTime={isRemainingTime}
         hoverTime={hoverTime}
         hoverPercent={hoverPercent}
@@ -862,12 +870,9 @@ export function PlayerPage() {
         onChapterSeek={seekTo}
         onSkipIntro={seekTo}
         onSkipCredits={handleSkipCredits}
-        onTakeScreenshot={takeScreenshot}
         onToggleSettings={() => setShowSettings((visible) => !visible)}
-        onToggleInfo={() => setShowInfo((visible) => !visible)}
-        onToggleShortcutHelp={() => setShowShortcutHelp((visible) => !visible)}
-        onTogglePictureInPicture={togglePictureInPicture}
         onToggleFullscreen={toggleFullscreen}
+
       />
     </LuxPlayer>
   );

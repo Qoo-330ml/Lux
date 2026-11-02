@@ -11,6 +11,7 @@ import { api } from "../src/lib/api/client";
 import { chooseLuxOptionByValue, luxCombobox, luxSelectValue } from "./lux-select-helpers";
 import { queryKeys } from "../src/lib/api/query-keys";
 import { mockPlaybackBootstrap } from "./player-test-helpers";
+import { trackMenuButton } from "./player-test-helpers";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -475,7 +476,7 @@ describe("PlayerPage playback synchronization", () => {
     expect(container.textContent).not.toContain("热力图");
   });
 
-  it("opens the keyboard shortcut help from the control bar and closes it with Escape", async () => {
+  it("opens the keyboard shortcut help with ? (no control-bar button) and closes it with Escape", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-shortcut-help",
       title: "快捷键帮助测试",
@@ -509,11 +510,10 @@ describe("PlayerPage playback synchronization", () => {
     });
 
     expect(container.querySelector(".lux-player-shortcut-help")).toBeNull();
-    const entry = container.querySelector<HTMLButtonElement>('[aria-label="键盘快捷键"]');
-    if (!entry) throw new Error("keyboard shortcut help entry was not rendered");
-    expect(entry.getAttribute("aria-expanded")).toBe("false");
-
-    await act(async () => entry.click());
+    expect(container.querySelector('[aria-label="键盘快捷键"]')).toBeNull();
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "?", bubbles: true }));
+    });
 
     const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
     expect(dialog).not.toBeNull();
@@ -521,14 +521,11 @@ describe("PlayerPage playback synchronization", () => {
     expect(container.querySelector("#lux-player-shortcut-help-title")?.textContent).toBe("键盘快捷键");
     expect(dialog?.textContent).toContain("后退 10 秒");
     expect(dialog?.textContent).toContain("Esc");
-    expect(entry.getAttribute("aria-expanded")).toBe("true");
-
     await act(async () => {
       window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
     });
 
     expect(container.querySelector(".lux-player-shortcut-help")).toBeNull();
-    expect(entry.getAttribute("aria-expanded")).toBe("false");
   });
 
   it("keeps presentation settings local without rebuilding the playback session", async () => {
@@ -776,7 +773,7 @@ describe("PlayerPage playback synchronization", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="字幕"]');
     if (!settings) throw new Error("settings control was not rendered");
     await act(async () => settings.click());
 
@@ -853,6 +850,7 @@ describe("PlayerPage playback synchronization", () => {
     );
     expect(container.querySelector("script")).toBeNull();
 
+    await act(async () => trackMenuButton(container!, "字幕").click());
     const captionOffset = container.querySelector<HTMLInputElement>("#lux-player-caption-offset");
     const captionOffsetValue = container.querySelector<HTMLOutputElement>(".lux-player-caption-offset-value");
     if (!captionOffset || !captionOffsetValue) throw new Error("caption offset control was not rendered");
@@ -870,76 +868,6 @@ describe("PlayerPage playback synchronization", () => {
     expect(container.querySelector(".lux-player-caption-text")).toBeNull();
     expect(vi.mocked(api.createWebPlaybackSession)).toHaveBeenCalledTimes(sessionCallsBeforeOffset);
     expect(vi.mocked(api.webPlaybackEvent)).toHaveBeenCalledTimes(eventCallsBeforeOffset);
-  });
-
-  it("creates a local PNG from the current video frame without playback requests", async () => {
-    vi.spyOn(api, "item").mockResolvedValue({
-      id: "movie-screenshot",
-      title: "截图: 测试/媒体",
-      itemType: "MOVIE",
-      mediaSources: [{ id: "source-screenshot", isDefault: true, durationTicks: 1_200_000_000 }],
-    });
-    vi.spyOn(api, "playback").mockResolvedValue({
-      positionTicks: 0,
-      isPlayed: false,
-      state: null,
-      isPaused: false,
-    });
-
-    container = document.createElement("div");
-    document.body.append(container);
-    root = createRoot(container);
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    await act(async () => {
-      root?.render(
-        <QueryClientProvider client={queryClient}>
-          <MemoryRouter initialEntries={["/watch/movie-screenshot"]}>
-            <Routes>
-              <Route path="watch/:itemId" element={<PlayerPage />} />
-            </Routes>
-          </MemoryRouter>
-        </QueryClientProvider>,
-      );
-    });
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-
-    const video = container.querySelector<HTMLVideoElement>("video");
-    const screenshot = container.querySelector<HTMLButtonElement>('[aria-label="截图"]');
-    if (!video || !screenshot) throw new Error("screenshot controls were not rendered");
-    Object.defineProperties(video, {
-      videoWidth: { configurable: true, value: 1920 },
-      videoHeight: { configurable: true, value: 1080 },
-    });
-    const drawImage = vi.fn();
-    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
-      drawImage,
-    } as unknown as CanvasRenderingContext2D);
-    vi.spyOn(HTMLCanvasElement.prototype, "toBlob").mockImplementation((callback) => {
-      callback(new Blob(["fixture"], { type: "image/png" }));
-    });
-    const createObjectURL = vi.fn(() => "blob:lux-screenshot");
-    const revokeObjectURL = vi.fn();
-    vi.stubGlobal("URL", { createObjectURL, revokeObjectURL });
-    let downloadedFileName = "";
-    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function click() {
-      downloadedFileName = this.download;
-    });
-    const sessionCallsBeforeScreenshot = vi.mocked(api.createWebPlaybackSession).mock.calls.length;
-    const eventCallsBeforeScreenshot = vi.mocked(api.webPlaybackEvent).mock.calls.length;
-
-    await act(async () => screenshot.click());
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-
-    expect(drawImage).toHaveBeenCalledWith(video, 0, 0, 1920, 1080);
-    expect(createObjectURL).toHaveBeenCalledTimes(1);
-    expect(revokeObjectURL).toHaveBeenCalledWith("blob:lux-screenshot");
-    expect(downloadedFileName).toMatch(/^截图- 测试-媒体-.*\.png$/);
-    expect(vi.mocked(api.createWebPlaybackSession)).toHaveBeenCalledTimes(sessionCallsBeforeScreenshot);
-    expect(vi.mocked(api.webPlaybackEvent)).toHaveBeenCalledTimes(eventCallsBeforeScreenshot);
   });
 
   it("waits for the direct session to stop before creating a server fallback", async () => {
@@ -1652,7 +1580,7 @@ describe("PlayerPage playback synchronization", () => {
     expect(container.querySelector('[role="alert"]')).not.toBeNull();
 
     // 终态失败清掉一次性自动起播标记，之后手动切音轨的新会话不得自动起播。
-    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="音轨"]');
     if (!settings) throw new Error("settings control was not rendered");
     await act(async () => settings.click());
     await chooseLuxOptionByValue(container, "选择音轨", "2");

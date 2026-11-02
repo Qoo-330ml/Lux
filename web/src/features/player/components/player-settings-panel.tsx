@@ -1,26 +1,13 @@
-import { Check, X } from "lucide-react";
-import type { PlayerCaptionOption } from "./player-captions";
-import {
-  CAPTION_OFFSET_MAX,
-  CAPTION_OFFSET_MIN,
-  CAPTION_OFFSET_STEP,
-  formatCaptionOffset,
-  normalizeCaptionOffset,
-} from "../caption-offset";
+import { Check, Info, X } from "lucide-react";
 import type {
   PlayerAspectRatio,
   PlayerFlip,
   PlayerVideoPresentation,
 } from "./player-presentation";
 import {
-  PlayerAudioTrackSelector,
-  type PlayerAudioTrackSection,
-} from "./player-audio-track-selector";
-import {
   PlayerQualitySelector,
   type PlayerQualitySection,
 } from "./player-quality-selector";
-import { LuxSelectField } from "../../../components/ui";
 
 type PlayerPresentationSettings = PlayerVideoPresentation & {
   onToggleLoop: () => void;
@@ -34,28 +21,20 @@ type PlayerAutoPlaySettings = {
 };
 
 type PlayerSettingsPanelProps = {
-  playbackRates: readonly number[];
-  playbackRate: number;
-  onChangeRate: (rate: number) => void;
-  /** Independent audio-track slot; omitted when the player has no track data. */
-  audioTracks?: PlayerAudioTrackSection;
   /** Independent quality (resolution ceiling) slot; omitted for Direct-only sources. */
   quality?: PlayerQualitySection;
-  captions?: readonly PlayerCaptionOption[];
-  selectedCaptionId?: string | null;
-  captionStatus?: string | null;
-  onSelectCaption?: (id: string | null) => void;
-  captionOffset?: number;
-  onChangeCaptionOffset?: (offset: number) => void;
   presentation?: PlayerPresentationSettings;
   autoPlay?: PlayerAutoPlaySettings;
+  /** Opens the playback information panel (subtitles, audio and speed live in the control bar). */
+  onOpenInfo?: () => void;
   onClose: () => void;
 };
 
 const ASPECT_RATIO_OPTIONS: readonly { value: PlayerAspectRatio; label: string }[] = [
   { value: "default", label: "默认" },
-  { value: "4:3", label: "4:3" },
   { value: "16:9", label: "16:9" },
+  { value: "4:3", label: "4:3" },
+  { value: "fill", label: "填充" },
 ];
 
 const FLIP_OPTIONS: readonly { value: PlayerFlip; label: string }[] = [
@@ -65,28 +44,12 @@ const FLIP_OPTIONS: readonly { value: PlayerFlip; label: string }[] = [
 ];
 
 export function PlayerSettingsPanel({
-  playbackRates,
-  playbackRate,
-  onChangeRate,
-  audioTracks,
   quality,
-  captions = [],
-  selectedCaptionId = null,
-  captionStatus = null,
-  onSelectCaption = () => undefined,
-  captionOffset = 0,
-  onChangeCaptionOffset = () => undefined,
   presentation,
   autoPlay,
+  onOpenInfo,
   onClose,
 }: PlayerSettingsPanelProps) {
-  const captionHelp = captionStatus
-    ?? (captions.length === 0
-      ? "当前版本没有字幕轨。"
-      : captions.every((caption) => !caption.available)
-        ? "当前版本没有可用的 WebVTT 字幕。"
-        : null);
-
   return (
     <div className="lux-player-settings-popover" role="dialog" aria-label="播放设置">
       <div className="lux-player-settings-header">
@@ -101,25 +64,7 @@ export function PlayerSettingsPanel({
           <X size={16} aria-hidden="true" />
         </button>
       </div>
-      {audioTracks ? <PlayerAudioTrackSelector {...audioTracks} /> : null}
       {quality ? <PlayerQualitySelector {...quality} /> : null}
-      <div className="lux-player-settings-section">
-        <span className="lux-player-settings-label" id="lux-player-speed-label">播放速度</span>
-        <div className="lux-player-speed-grid" aria-labelledby="lux-player-speed-label">
-          {playbackRates.map((speed) => (
-            <button
-              key={speed}
-              type="button"
-              className={`lux-player-speed-pill ${playbackRate === speed ? "is-active" : ""}`}
-              aria-pressed={playbackRate === speed}
-              onClick={() => onChangeRate(speed)}
-            >
-              {speed === 1 ? "标准" : `${speed}x`}
-              {playbackRate === speed ? <Check size={14} aria-hidden="true" /> : null}
-            </button>
-          ))}
-        </div>
-      </div>
       {autoPlay ? (
         <div className="lux-player-settings-section">
           <span className="lux-player-settings-label" id="lux-player-auto-play-label">
@@ -155,7 +100,7 @@ export function PlayerSettingsPanel({
             </button>
           </div>
           <div className="lux-player-settings-section">
-            <span className="lux-player-settings-label" id="lux-player-aspect-ratio-label">画面比例</span>
+            <span className="lux-player-settings-label" id="lux-player-aspect-ratio-label">长宽比</span>
             <div className="lux-player-speed-grid" role="group" aria-labelledby="lux-player-aspect-ratio-label">
               {ASPECT_RATIO_OPTIONS.map((option) => (
                 <button
@@ -188,54 +133,14 @@ export function PlayerSettingsPanel({
           </div>
         </>
       ) : null}
-      <div className="lux-player-settings-section">
-        <label className="lux-player-settings-label" htmlFor="lux-player-caption-select">字幕</label>
-        <LuxSelectField
-          id="lux-player-caption-select"
-          className="lux-player-caption-select"
-          aria-label="选择字幕"
-          value={selectedCaptionId ?? ""}
-          onChange={(event) => {
-            const value = event.target.value;
-            onSelectCaption(value === "" ? null : value);
-          }}
-        >
-          <option value="">关闭字幕</option>
-          {captions.map((caption) => (
-            <option
-              key={caption.id}
-              value={caption.id}
-              disabled={!caption.available}
-            >
-              {caption.unavailableReason
-                ? `${caption.label}（${caption.unavailableReason}）`
-                : caption.label}
-            </option>
-          ))}
-        </LuxSelectField>
-        {captionHelp ? <p className="lux-player-caption-status" role="status">{captionHelp}</p> : null}
-      </div>
-      <div className="lux-player-settings-section">
-        <div className="lux-player-caption-offset-heading">
-          <label className="lux-player-settings-label" htmlFor="lux-player-caption-offset">字幕偏移</label>
-          <output htmlFor="lux-player-caption-offset" className="lux-player-caption-offset-value">
-            {formatCaptionOffset(captionOffset)}
-          </output>
+      {onOpenInfo ? (
+        <div className="lux-player-settings-section">
+          <button type="button" className="lux-player-settings-info-row" onClick={onOpenInfo}>
+            <Info size={16} aria-hidden="true" />
+            播放信息
+          </button>
         </div>
-        <input
-          id="lux-player-caption-offset"
-          className="lux-player-caption-offset"
-          type="range"
-          min={CAPTION_OFFSET_MIN}
-          max={CAPTION_OFFSET_MAX}
-          step={CAPTION_OFFSET_STEP}
-          value={normalizeCaptionOffset(captionOffset)}
-          aria-label="字幕偏移"
-          aria-valuetext={formatCaptionOffset(captionOffset)}
-          onChange={(event) => onChangeCaptionOffset(Number(event.target.value))}
-        />
-        <p className="lux-player-caption-status">正值延后，负值提前；仅影响当前选中的字幕。</p>
-      </div>
+      ) : null}
     </div>
   );
 }

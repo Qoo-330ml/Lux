@@ -322,7 +322,7 @@ describe("PlayerPage client fallback status", () => {
     expect(shouldUseClientMkv).toHaveBeenCalled();
     expect(container?.textContent).not.toContain("播放器引擎失败");
 
-    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="字幕"]');
     expect(settings).not.toBeNull();
     await act(async () => settings?.click());
     const captionOptions = await luxOptions(container!, "选择字幕");
@@ -394,7 +394,7 @@ describe("PlayerPage client fallback status", () => {
       await new Promise((resolve) => setTimeout(resolve, 25));
     });
 
-    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="字幕"]');
     await act(async () => settings?.click());
     const captionChoices = await luxOptions(container, "选择字幕");
     await chooseLuxOptionByValue(container, "选择字幕", captionChoices[1]?.value ?? "");
@@ -481,7 +481,7 @@ describe("PlayerPage client fallback status", () => {
     });
     play.mockClear();
 
-    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="字幕"]');
     await act(async () => settings?.click());
     const captionChoices = await luxOptions(container, "选择字幕");
     await chooseLuxOptionByValue(container, "选择字幕", captionChoices[1]?.value ?? "");
@@ -547,7 +547,7 @@ describe("PlayerPage client fallback status", () => {
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 25));
     });
-    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="字幕"]');
     await act(async () => settings?.click());
     if (luxCombobox(container, "选择字幕")) {
       const captionChoices = await luxOptions(container, "选择字幕");
@@ -716,7 +716,7 @@ describe("PlayerPage client fallback status", () => {
       );
       await new Promise((resolve) => setTimeout(resolve, 25));
     });
-    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="字幕"]');
     await act(async () => settings?.click());
     if (luxCombobox(container, "选择字幕")) {
       const captionChoices = await luxOptions(container, "选择字幕");

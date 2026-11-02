@@ -19,3 +19,24 @@ export function mockPlaybackBootstrap() {
     return { item, playback, session };
   });
 }
+
+/**
+ * Subtitles and audio tracks live in control-bar popovers now (not the settings
+ * panel). Returns the button that opens the named popover.
+ */
+export function trackMenuButton(container: HTMLElement, name: "字幕" | "音轨"): HTMLButtonElement {
+  const button = container.querySelector<HTMLButtonElement>(`button[aria-label="${name}"]`);
+  if (!button) throw new Error(`${name} control was not rendered in the control bar`);
+  return button;
+}
+
+/** Speed is a cycling control in the control bar; this clicks it until it reads the target rate. */
+export function speedButton(container: HTMLElement): HTMLButtonElement {
+  const button = container.querySelector<HTMLButtonElement>(".lux-player-speed-btn");
+  if (!button) throw new Error("speed control was not rendered in the control bar");
+  return button;
+}
+
+export function speedLabel(rate: number): string {
+  return rate === 1 ? "标准" : `${rate}x`;
+}

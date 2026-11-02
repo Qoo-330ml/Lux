@@ -8,6 +8,7 @@ import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { PlayerPage } from "../src/features/player/PlayerPage";
 import { api } from "../src/lib/api/client";
 import { chooseLuxOptionByValue, luxOptions, luxSelectValue } from "./lux-select-helpers";
+import { speedButton, speedLabel, trackMenuButton } from "./player-test-helpers";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -193,9 +194,7 @@ describe("PlayerPage audio track switching", () => {
     if (!firstVideo) throw new Error("video element was not rendered");
     primeVideo(firstVideo);
 
-    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
-    if (!settings) throw new Error("settings control was not rendered");
-    await act(async () => settings.click());
+    await act(async () => trackMenuButton(container!, "音轨").click());
 
     const audioOptions = await luxOptions(container!, "选择音轨");
     expect(audioOptions.map((option) => option.value)).toEqual(["1", "2"]);
@@ -203,13 +202,14 @@ describe("PlayerPage audio track switching", () => {
     expect(audioOptions[1]?.label).toContain("中文");
     expect(audioOptions[1]?.label).toContain("5.1");
     expect(luxSelectValue(container!, "选择音轨")).toBe("1");
+    await act(async () => trackMenuButton(container!, "字幕").click());
     expect(luxSelectValue(container!, "选择字幕")).toBe("7");
     expect(container?.textContent).not.toContain("（当前）");
 
-    const speed = Array.from(container!.querySelectorAll<HTMLButtonElement>("button"))
-      .find((button) => button.textContent?.trim() === "1.5x");
-    if (!speed) throw new Error("1.5x speed control was not rendered");
-    await act(async () => speed.click());
+    for (let attempt = 0; attempt < 6 && speedButton(container!).textContent !== speedLabel(1.5); attempt += 1) {
+      await act(async () => speedButton(container!).click());
+    }
+    expect(speedButton(container!).textContent).toBe(speedLabel(1.5));
     expect(firstVideo.playbackRate).toBe(1.5);
 
     firstVideo.currentTime = 48;
@@ -217,6 +217,7 @@ describe("PlayerPage audio track switching", () => {
     firstVideo.muted = true;
     await act(async () => firstVideo.dispatchEvent(new Event("play")));
 
+    await act(async () => trackMenuButton(container!, "音轨").click());
     await chooseLuxOptionByValue(container!, "选择音轨", "2");
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 20));
@@ -257,8 +258,9 @@ describe("PlayerPage audio track switching", () => {
     expect(replacementVideo.muted).toBe(true);
     expect(play).toHaveBeenCalled();
     expect(luxSelectValue(container!, "选择音轨")).toBe("2");
-    expect(luxSelectValue(container!, "选择字幕")).toBe("7");
     expect(container?.textContent).toContain("（当前）");
+    await act(async () => trackMenuButton(container!, "字幕").click());
+    expect(luxSelectValue(container!, "选择字幕")).toBe("7");
   });
 
   it("keeps paused playback paused after switching audio", async () => {
@@ -269,7 +271,7 @@ describe("PlayerPage audio track switching", () => {
     primeVideo(firstVideo);
     firstVideo.currentTime = 30;
 
-    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="音轨"]');
     if (!settings) throw new Error("settings control was not rendered");
     await act(async () => settings.click());
 
@@ -315,7 +317,7 @@ describe("PlayerPage audio track switching", () => {
     if (!firstVideo) throw new Error("video element was not rendered");
     primeVideo(firstVideo);
 
-    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="音轨"]');
     if (!settings) throw new Error("settings control was not rendered");
     await act(async () => settings.click());
 
@@ -344,10 +346,7 @@ describe("PlayerPage audio track switching", () => {
     });
     await renderPlayer("/watch/movie-audio");
 
-    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
-    if (!settings) throw new Error("settings control was not rendered");
-    await act(async () => settings.click());
-
+    expect(container?.querySelector('[aria-label="音轨"]')).toBeNull();
     expect(container?.querySelector('[aria-label="选择音轨"]')).toBeNull();
   });
 
@@ -379,7 +378,7 @@ describe("PlayerPage audio track switching", () => {
       };
     });
     await renderPlayer("/watch/movie-audio");
-    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="音轨"]');
     if (!settings) throw new Error("settings control was not rendered");
     await act(async () => settings.click());
 
@@ -461,7 +460,7 @@ describe("PlayerPage audio track switching", () => {
     firstVideo.muted = true;
     await act(async () => firstVideo.dispatchEvent(new Event("play")));
 
-    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="音轨"]');
     if (!settings) throw new Error("settings control was not rendered");
     await act(async () => settings.click());
     expect(luxSelectValue(container!, "选择音轨")).toBe("2");
@@ -491,7 +490,7 @@ describe("PlayerPage audio track switching", () => {
   it("returns to the canonical URL when a server session switches back to its first audio track", async () => {
     await renderPlayer("/watch/movie-audio?subtitleStreamIndex=7");
 
-    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="音轨"]');
     if (!settings) throw new Error("settings control was not rendered");
     await act(async () => settings.click());
 
@@ -537,7 +536,7 @@ describe("PlayerPage audio track switching", () => {
     if (!firstVideo) throw new Error("video element was not rendered");
     primeVideo(firstVideo);
 
-    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="音轨"]');
     if (!settings) throw new Error("settings control was not rendered");
     await act(async () => settings.click());
 
@@ -586,7 +585,7 @@ describe("PlayerPage audio track switching", () => {
     });
     await renderPlayer("/watch/movie-audio?subtitleStreamIndex=7");
 
-    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="音轨"]');
     if (!settings) throw new Error("settings control was not rendered");
     await act(async () => settings.click());
 
@@ -622,10 +621,7 @@ describe("PlayerPage audio track switching", () => {
     });
     await renderPlayer("/watch/movie-audio");
 
-    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
-    if (!settings) throw new Error("settings control was not rendered");
-    await act(async () => settings.click());
-
+    expect(container?.querySelector('[aria-label="音轨"]')).toBeNull();
     expect(container?.querySelector('[aria-label="选择音轨"]')).toBeNull();
   });
 
@@ -638,7 +634,7 @@ describe("PlayerPage audio track switching", () => {
     const timeoutSpy = vi.spyOn(window, "setTimeout");
     await renderPlayer("/watch/movie-audio");
 
-    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="音轨"]');
     if (!settings) throw new Error("settings control was not rendered");
     await act(async () => settings.click());
 
@@ -704,7 +700,7 @@ describe("PlayerPage audio track switching", () => {
     });
     await renderPlayer("/watch/movie-audio");
 
-    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="音轨"]');
     if (!settings) throw new Error("settings control was not rendered");
     await act(async () => settings.click());
 
