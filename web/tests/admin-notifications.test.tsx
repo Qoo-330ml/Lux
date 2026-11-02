@@ -176,6 +176,22 @@ describe("AdminNotificationsPage", () => {
     expect(container.querySelector(".lux-notification-destination")).toBeTruthy();
   });
 
+  it("removes the standalone create card and places the new notification action in the destinations panel heading", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root.render(createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(MemoryRouter, null, createElement(AdminNotificationsPage)),
+      ));
+    });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+
+    expect(container.querySelector(".lux-notifications-create")).toBeNull();
+    const destinationsPanel = container.querySelector('[aria-labelledby="notification-destinations-title"]');
+    expect(destinationsPanel?.querySelector('button[aria-label="新建通知"]')).toBeTruthy();
+  });
+
   it("keeps the create form collapsed until the new notification action is opened", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     await act(async () => {
