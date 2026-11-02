@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act } from "react";
+import { StrictMode, act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PlayerDanmakuSettings } from "../src/features/player/components/player-danmaku-settings";
@@ -83,6 +83,8 @@ describe("LuxPlayer danmaku settings panel", () => {
     expect(byAriaLabel(container, "弹幕显示区域", "div")?.getAttribute("role")).toBe("group");
     expect(byAriaLabel(container, "屏蔽滚动弹幕", "button")).not.toBeNull();
     expect(buttonByText(container, "恢复默认")).not.toBeNull();
+    // The panel copy must match the scheduler: the area band only affects scrolling/top danmaku.
+    expect(container.textContent).toContain("底部弹幕始终贴近画面底部");
     expect(container.textContent).toContain("弹幕");
   });
 
@@ -233,6 +235,46 @@ describe("LuxPlayer danmaku settings persistence", () => {
     act(() => root.unmount());
     container.remove();
     window.localStorage.clear();
+    vi.restoreAllMocks();
+  });
+
+  it("writes storage outside the state updater and composes consecutive updates", async () => {
+    // Storage is written once per update, before setState, so StrictMode's double-invoked updaters
+    // and concurrent render retries cannot duplicate or drop a persisted value.
+    const setItem = vi.spyOn(Storage.prototype, "setItem");
+    function Sequential() {
+      const { settings, updateSettings } = useDanmakuSettings();
+      return (
+        <>
+          <button
+            type="button"
+            onClick={() => {
+              updateSettings({ opacity: 0.5 });
+              updateSettings({ area: "half" });
+            }}
+          >
+            连续更新
+          </button>
+          <output data-lux-opacity>{settings.opacity}</output>
+          <output data-lux-area>{settings.area}</output>
+        </>
+      );
+    }
+
+    await act(async () => {
+      root.render(
+        <StrictMode>
+          <Sequential />
+        </StrictMode>,
+      );
+    });
+    await click(buttonByText(container, "连续更新")!);
+
+    expect(container.querySelector("[data-lux-opacity]")?.textContent).toBe("0.5");
+    expect(container.querySelector("[data-lux-area]")?.textContent).toBe("half");
+    expect(readDanmakuSettings()).toMatchObject({ opacity: 0.5, area: "half" });
+    // Two updates, two writes: StrictMode must not double them, and neither update is lost.
+    expect(setItem).toHaveBeenCalledTimes(2);
   });
 
   it("persists a change and restores it on the next mount", async () => {

@@ -5,12 +5,23 @@ import { createDanmakuScheduler, type DanmakuScheduler } from "../danmaku/schedu
 import {
   DEFAULT_DANMAKU_SETTINGS,
   danmakuLayoutFromSettings,
+  danmakuLayoutsEqual,
   type DanmakuLayoutOptions,
   type DanmakuSettings,
 } from "../danmaku/settings";
 import { useDanmakuTrack } from "../danmaku/useDanmakuTrack";
 
 const DEFAULT_VIEWPORT = { width: 1280, height: 720 };
+
+function requestLayoutFrame(callback: () => void): number {
+  if (typeof requestAnimationFrame === "function") return requestAnimationFrame(() => callback());
+  return setTimeout(callback, 0) as unknown as number;
+}
+
+function cancelLayoutFrame(handle: number) {
+  if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(handle);
+  else clearTimeout(handle);
+}
 
 type PlayerDanmakuOverlayProps = {
   itemId: string;
@@ -68,6 +79,10 @@ export function PlayerDanmakuOverlay({
   // Read by the scheduler-creation effect so a layout change never has to recreate it just to keep
   // the current options.
   const layoutRef = useRef<DanmakuLayoutOptions>(layout);
+  // Layout updates are coalesced into one animation frame: dragging a slider fires an input event per
+  // step, and each one must not walk a 50k-entry danmaku file.
+  const layoutFrameRef = useRef<number | null>(null);
+  const appliedLayoutRef = useRef<DanmakuLayoutOptions | null>(null);
   const track = useDanmakuTrack({ itemId, sourceId, visible, lifecycleKey, onStatusChange });
 
   const syncClock = useCallback(() => {
@@ -109,15 +124,32 @@ export function PlayerDanmakuOverlay({
       measure: measureRef.current,
       layout: layoutRef.current,
     });
+    appliedLayoutRef.current = layoutRef.current;
     syncClock();
   }, [measure, syncClock, track.entries, viewport]);
 
-  // Settings changes re-lane the current window and redraw immediately; existing nodes keep their
-  // identity, so a paused video updates without any reload.
+  // Settings changes are coalesced into one frame, then re-lane the current window and redraw;
+  // existing nodes keep their identity, so a paused video updates without any reload.
   useEffect(() => {
     layoutRef.current = layout;
-    schedulerRef.current?.updateLayout(layout);
-    syncClock();
+    const scheduler = schedulerRef.current;
+    if (!scheduler) return;
+    const applied = appliedLayoutRef.current;
+    if (applied && danmakuLayoutsEqual(applied, layout)) return;
+    if (layoutFrameRef.current !== null) return;
+    layoutFrameRef.current = requestLayoutFrame(() => {
+      layoutFrameRef.current = null;
+      const active = schedulerRef.current;
+      if (!active) return;
+      active.updateLayout(layoutRef.current);
+      appliedLayoutRef.current = layoutRef.current;
+      syncClock();
+    });
+    return () => {
+      if (layoutFrameRef.current === null) return;
+      cancelLayoutFrame(layoutFrameRef.current);
+      layoutFrameRef.current = null;
+    };
   }, [layout, syncClock]);
 
   // The engine binds to the host element; it is the only owner of the danmaku DOM nodes.

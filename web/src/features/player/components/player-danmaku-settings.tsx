@@ -176,6 +176,9 @@ export function PlayerDanmakuSettings({ settings, onChange, onReset }: PlayerDan
           </button>
         ))}
       </div>
+      <p className="lux-player-danmaku-hint">
+        仅限制滚动与顶部弹幕，底部弹幕始终贴近画面底部。
+      </p>
 
       <span className="lux-player-settings-label">屏蔽类型</span>
       <div className="lux-player-speed-grid" role="group" aria-label="屏蔽弹幕类型">

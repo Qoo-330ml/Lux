@@ -32,6 +32,14 @@ function settlement() {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+/** The overlay coalesces settings updates into one animation frame. */
+function nextFrame() {
+  return new Promise<void>((resolve) => {
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => resolve());
+    else setTimeout(resolve, 0);
+  });
+}
+
 describe("LuxPlayer danmaku overlay", () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -430,6 +438,9 @@ describe("LuxPlayer danmaku overlay", () => {
           />,
         );
         await settlement();
+      });
+      await act(async () => {
+        await nextFrame();
       });
     };
     const overlay = () => container.querySelector<HTMLElement>("[data-lux-danmaku-overlay]");
