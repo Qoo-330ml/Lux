@@ -201,10 +201,15 @@ export function danmakuStatusMessage(result: DanmakuParseResult): string | null 
 }
 
 /** Status line for a failed load. */
+const ACTIONABLE_FAILURES = new Set([
+  "弹幕文件过大",
+  "弹幕内容编码无效",
+  // Worker failures keep their own wording instead of degrading to the generic load message.
+  "弹幕解析失败",
+]);
+
 export function danmakuFailureMessage(error: unknown): string {
   if (error instanceof DanmakuParseError) return error.message;
-  if (error instanceof Error) {
-    if (error.message === "弹幕文件过大" || error.message === "弹幕内容编码无效") return error.message;
-  }
+  if (error instanceof Error && ACTIONABLE_FAILURES.has(error.message)) return error.message;
   return "弹幕加载失败";
 }

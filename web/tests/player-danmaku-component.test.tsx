@@ -368,6 +368,44 @@ describe("LuxPlayer danmaku overlay", () => {
     expect(onStatusChange).toHaveBeenCalledWith("弹幕内容编码无效");
   });
 
+  it("surfaces a broken Worker as a parse failure, not a generic load failure", async () => {
+    mockDanmakuInfo();
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response('<i><d p="0,1,25,16777215,0,0,0,0">x</d></i>'),
+    );
+    const onStatusChange = vi.fn();
+
+    class BrokenWorker {
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      postMessage() {
+        queueMicrotask(() => this.onerror?.());
+      }
+      terminate() {
+        // no-op
+      }
+    }
+    vi.stubGlobal("Worker", BrokenWorker);
+
+    await act(async () => {
+      root.render(
+        <PlayerDanmakuOverlay
+          itemId="item-broken-worker"
+          sourceId="source-1"
+          visible
+          currentTime={1}
+          playbackRate={1}
+          lifecycleKey="session-1"
+          onStatusChange={onStatusChange}
+        />,
+      );
+      await settlement();
+      await settlement();
+    });
+
+    expect(onStatusChange).toHaveBeenCalledWith("弹幕解析失败");
+  });
+
   it("keeps the existing props contract without the optional danmaku additions", async () => {
     mockDanmakuInfo();
     vi.spyOn(globalThis, "fetch").mockResolvedValue(

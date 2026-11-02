@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   DANMAKU_LIMITS,
   DANMAKU_SERVER_MAX_BYTES,
+  danmakuFailureMessage,
   DanmakuParseError,
   decodeDanmakuBytes,
   exceedsUtf8ByteLimit,
@@ -139,6 +140,16 @@ describe("LuxPlayer danmaku parser", () => {
     expect(DANMAKU_SERVER_MAX_BYTES).toBe(50 * 1024 * 1024);
     expect(DANMAKU_LIMITS.maxBytes).toBe(16 * 1024 * 1024);
     expect(DANMAKU_LIMITS.maxEntries).toBe(50_000);
+  });
+
+  it("keeps specific danmaku failure messages instead of degrading them", () => {
+    // A Worker that dies reports “弹幕解析失败”; the user must see that, not a generic load error.
+    expect(danmakuFailureMessage(new Error("弹幕解析失败"))).toBe("弹幕解析失败");
+    expect(danmakuFailureMessage(new Error("弹幕文件过大"))).toBe("弹幕文件过大");
+    expect(danmakuFailureMessage(new Error("弹幕内容编码无效"))).toBe("弹幕内容编码无效");
+    // Unknown transport failures still collapse to the generic message (no internal detail leaks).
+    expect(danmakuFailureMessage(new Error("danmaku-request-failed"))).toBe("弹幕加载失败");
+    expect(danmakuFailureMessage(new Error("danmaku URL is not same-origin"))).toBe("弹幕加载失败");
   });
 
   it("decodes UTF-8 bytes with a fatal decoder", () => {
