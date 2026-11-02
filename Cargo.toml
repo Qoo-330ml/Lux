@@ -77,22 +77,6 @@ path = "src/main.rs"
 name = "lux-plugin-danmaku"
 path = "src/bin/lux-plugin-danmaku.rs"
 
-[[bin]]
-name = "lux-plugin-notifier-bark"
-path = "src/bin/lux-plugin-notifier-bark.rs"
-
-[[bin]]
-name = "lux-plugin-notifier-email"
-path = "src/bin/lux-plugin-notifier-email.rs"
-
-[[bin]]
-name = "lux-plugin-notifier-feishu"
-path = "src/bin/lux-plugin-notifier-feishu.rs"
-
-[[bin]]
-name = "lux-plugin-notifier-wecom-app"
-path = "src/bin/lux-plugin-notifier-wecom-app.rs"
-
 [profile.dev]
 debug = "line-tables-only"
 
