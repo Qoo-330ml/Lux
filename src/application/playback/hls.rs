@@ -31,7 +31,15 @@ const DEFAULT_MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
 /// Four sessions of the per-session ceiling fit inside it, so the disk cannot be filled by
 /// playback even when every transcode slot is busy. Override with `LUX_HLS_GLOBAL_DISK_BUDGET_BYTES`.
 const DEFAULT_MAX_GLOBAL_SESSION_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-const MANIFEST_WAIT_ATTEMPTS: usize = 50;
+/// How long a session start waits for ffmpeg to write the first playlist (100 ms per attempt).
+///
+/// The manifest only appears once ffmpeg has opened the input, probed it and encoded the first
+/// segment. Large remote or spinning-disk sources and software decode of 4K 10-bit HEVC routinely
+/// need more than the former 5 seconds, which made the session start fail with a 502 although the
+/// transcode itself was healthy. Segment requests already wait up to
+/// [`HLS_ASSET_WAIT_ATTEMPTS`]; the manifest gets a matching 30 second budget. An ffmpeg that
+/// exits early still fails the start immediately.
+const MANIFEST_WAIT_ATTEMPTS: usize = 300;
 const HLS_ASSET_WAIT_ATTEMPTS: usize = 600;
 const HLS_SEGMENT_DURATION_TICKS: i64 = 4 * 10_000_000;
 const HLS_SEGMENT_RESTART_GAP: i64 = 6;
