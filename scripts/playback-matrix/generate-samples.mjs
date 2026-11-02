@@ -1131,16 +1131,19 @@ async function main() {
         note: spec.note ?? null,
         reused: Boolean(skippedEntry.reused),
       });
-      console.log(`生成 ${relativePath}（${(bytes / 1024 / 1024).toFixed(2)} MB）`);
+      if (!options.json) console.log(`生成 ${relativePath}（${(bytes / 1024 / 1024).toFixed(2)} MB）`);
     } catch (error) {
       await rm(outFile, { force: true });
       skippedEntry.reason = error instanceof SkipError ? error.message : `生成失败：${error.message}`;
       skipped.push(skippedEntry);
-      console.log(`跳过 ${spec.title}：${skippedEntry.reason}`);
+      if (!options.json) console.log(`跳过 ${spec.title}：${skippedEntry.reason}`);
     }
   }
 
   const totalBytes = generated.reduce((sum, sample) => sum + sample.bytes, 0);
+  if (totalBytes > 300 * 1024 * 1024) {
+    console.warn(`警告：样本总体积 ${(totalBytes / 1024 / 1024).toFixed(1)} MB 超过 300 MB 预算，考虑缩短时长或减少样本。`);
+  }
   const manifest = {
     generatedAt: new Date().toISOString(),
     generator: "scripts/playback-matrix/generate-samples.mjs",

@@ -303,20 +303,35 @@ async function launchBrowser(playwright, name, options) {
 // ---------------------------------------------------------------------------
 
 async function apiGet(page, urlPath) {
-  return page.evaluate(async (requestPath) => {
-    const response = await fetch(requestPath, {
-      credentials: "include",
-      headers: { accept: "application/json" },
-    });
-    const text = await response.text();
-    let body = null;
+  // The login form performs a full navigation right after POST /auth/login; a fetch started in that
+  // window dies with "Execution context was destroyed". Retry a couple of times instead of treating
+  // it as a fatal error.
+  let lastError = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
-      body = JSON.parse(text);
-    } catch {
-      body = null;
+      return await page.evaluate(async (requestPath) => {
+        const response = await fetch(requestPath, {
+          credentials: "include",
+          headers: { accept: "application/json" },
+        });
+        const text = await response.text();
+        let body = null;
+        try {
+          body = JSON.parse(text);
+        } catch {
+          body = null;
+        }
+        return { status: response.status, body };
+      }, urlPath);
+    } catch (error) {
+      lastError = error;
+      if (!/Execution context was destroyed|navigat|Target closed/i.test(String(error?.message ?? error))) {
+        throw error;
+      }
+      await sleep(300);
     }
-    return { status: response.status, body };
-  }, urlPath);
+  }
+  throw lastError;
 }
 
 async function readCsrfToken(page) {
@@ -387,10 +402,15 @@ async function login(page, options) {
   // Do not depend on a page-specific class name: the logged-in shell changed from `main.content`
   // to `main.lux-main` across releases. `/api/v1/auth/me` is the stable signal that the cookie is
   // valid, and direct `/watch/...` navigation works without rendering the home page first.
+  await page.waitForLoadState("domcontentloaded").catch(() => undefined);
   let me = null;
   for (let attempt = 0; attempt < 40; attempt += 1) {
-    me = await apiGet(page, "/api/v1/auth/me");
-    if (me.status === 200) break;
+    try {
+      me = await apiGet(page, "/api/v1/auth/me");
+    } catch {
+      me = null;
+    }
+    if (me?.status === 200) break;
     await sleep(250);
   }
   if (me?.status !== 200) {
@@ -622,6 +642,7 @@ function planLabel(plan) {
 }
 
 async function measureSample(page, context, sample, options) {
+  let pendingResponses = 0;
   const collectors = {
     console: [],
     consoleErrors: [],
@@ -697,7 +718,6 @@ async function measureSample(page, context, sample, options) {
   page.on("requestfailed", onRequestFailed);
   page.on("response", onResponse);
 
-  let pendingResponses = 0;
   const result = {
     status: "failed",
     plan: null,
@@ -1039,7 +1059,11 @@ function buildSuspiciousRules(results) {
 
   const audioCodecs = [...new Set(played.flatMap((result) => result.sample.audioCodecs))];
   for (const codec of audioCodecs) {
-    const chromiumSamples = chromium.filter((result) => result.sample.audioCodecs.includes(codec));
+    // Only count samples whose video actually played: a failed transcode also reports 0 decoded
+    // bytes and would otherwise be mislabelled as "the browser silently ignores this codec".
+    const chromiumSamples = chromium.filter((result) => (
+      result.sample.audioCodecs.includes(codec) && result.status !== "failed" && result.video.frames
+    ));
     const silent = chromiumSamples.filter((result) => result.audio.decoded === "silent");
     if (silent.length === 0) continue;
     const allSilent = silent.length === chromiumSamples.length;
