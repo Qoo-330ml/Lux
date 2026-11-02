@@ -1,11 +1,5 @@
 use std::{path::Path, time::Duration};
 
-use axum::{
-    Router,
-    extract::Json,
-    http::StatusCode,
-    routing::{get, post},
-};
 use luxd::application::danmaku::{
     DanmakuService, DanmakuServiceError, MAX_DANMAKU_XML_BYTES, atomic_write_danmaku_xml,
     danmaku_sidecar_path, validate_danmaku_xml, validate_provider_base_url,
@@ -123,9 +117,70 @@ async fn danmaku_service_rejects_unsafe_concurrency() -> Result<(), Box<dyn std:
     Ok(())
 }
 
+/// Bilibili XML the stub plugin returns for a matched item.
+#[cfg(unix)]
+const STUB_XML: &[u8] = b"<i><d p=\"1,1,25,16777215,0,0,0,0\">hello</d></i>";
+
+/// Minimal `org.lux.danmaku` stand-in for the host-side end-to-end test.
+///
+/// The real plugin process is built, packaged and protocol-tested in the
+/// `Lux-plugins` repository. This stub speaks the same JSON-lines protocol and
+/// answers only the methods the host uses, so the host keeps coverage of the
+/// RPC boundary, the job pipeline and the sidecar write without shipping the
+/// plugin binary. It matches the two file names the test indexes and reports
+/// `NO_MATCH` for anything else, which keeps the "the host sends the source
+/// file name" expectation the provider mock used to assert.
+#[cfg(unix)]
+const DANMAKU_STUB_SCRIPT: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"plugin.hello"'*)
+      printf '{"id":"%s","result":{"id":"org.lux.danmaku","name":"danmaku stub","apiVersion":1,"capabilities":["danmaku.match"],"supportedItemTypes":[]}}\n' "$id"
+      ;;
+    *'"danmaku.match"'*)
+      case "$line" in
+        *'"fileName":"Demo.Movie.2024.mkv"'*|*'"fileName":"Remote.Movie.2024.strm"'*)
+          printf '{"id":"%s","result":{"status":"MATCHED","provider":"stub","episodeId":"34","xmlBase64":"__XML_BASE64__"}}\n' "$id"
+          ;;
+        *)
+          printf '{"id":"%s","result":{"status":"NO_MATCH"}}\n' "$id"
+          ;;
+      esac
+      ;;
+    *'"plugin.shutdown"'*)
+      printf '{"id":"%s","result":{"accepted":true}}\n' "$id"
+      exit 0
+      ;;
+    *'"plugin.health"'*)
+      printf '{"id":"%s","result":{"available":true,"configured":true}}\n' "$id"
+      ;;
+    *)
+      printf '{"id":"%s","error":{"code":"PLUGIN_UNSUPPORTED_METHOD","message":"unsupported plugin method"}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
+#[cfg(unix)]
+fn write_danmaku_stub_plugin(plugin_root: &Path, xml_base64: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(plugin_root)?;
+    let entrypoint = plugin_root.join("plugin");
+    std::fs::write(
+        &entrypoint,
+        DANMAKU_STUB_SCRIPT.replace("__XML_BASE64__", xml_base64),
+    )?;
+    std::fs::set_permissions(entrypoint, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn danmaku_service_matches_local_and_strm_sources_and_writes_sidecars()
 -> Result<(), Box<dyn std::error::Error>> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+
     let directory = tempfile::tempdir()?;
     let config_dir = directory.path().join("config");
     let media_root = directory.path().join("Movies");
@@ -154,43 +209,10 @@ async fn danmaku_service_matches_local_and_strm_sources_and_writes_sidecars()
         .scan_movie_library(library.id)
         .await?;
 
-    let app = Router::new()
-        .route(
-            "/api/v2/match",
-            post(|Json(body): Json<serde_json::Value>| async move {
-                assert!(matches!(
-                    body["fileName"].as_str(),
-                    Some("Demo.Movie.2024.mkv") | Some("Remote.Movie.2024.strm")
-                ));
-                Json(serde_json::json!({
-                    "matches": [{"animeId": 12, "episodeId": 34}]
-                }))
-            }),
-        )
-        .route(
-            "/api/v2/comment/34",
-            get(|| async {
-                (
-                    StatusCode::OK,
-                    [("content-type", "application/xml")],
-                    "<i><d p=\"1,1,25,16777215,0,0,0,0\">hello</d></i>",
-                )
-            }),
-        );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let address = listener.local_addr()?;
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .map_err(Box::<dyn std::error::Error + Send + Sync>::from)
-    });
-    let plugin_root = config_dir.join("plugins/org.lux.danmaku/binaries");
-    tokio::fs::create_dir_all(&plugin_root).await?;
-    tokio::fs::copy(
-        env!("CARGO_BIN_EXE_lux-plugin-danmaku"),
-        plugin_root.join("plugin"),
-    )
-    .await?;
+    write_danmaku_stub_plugin(
+        &config_dir.join("plugins/org.lux.danmaku/binaries"),
+        &BASE64.encode(STUB_XML),
+    )?;
     tokio::fs::write(
         config_dir.join("plugins/org.lux.danmaku/manifest.json"),
         serde_json::to_vec(&serde_json::json!({
@@ -230,7 +252,7 @@ async fn danmaku_service_matches_local_and_strm_sources_and_writes_sidecars()
     tokio::fs::write(
         config_dir.join("plugin-config/org.lux.danmaku.json"),
         serde_json::to_vec(&serde_json::json!({
-            "providerBaseUrl": format!("http://127.0.0.1:{}", address.port()),
+            "providerBaseUrl": "https://danmu.example.test",
             "libraryIds": [library.id.to_string()],
             "schedule": "* * * * *"
         }))?,
@@ -271,15 +293,15 @@ async fn danmaku_service_matches_local_and_strm_sources_and_writes_sidecars()
     })
     .await
     .map_err(|_| std::io::Error::other("timed out waiting for scheduled danmaku job"))??;
-    assert_eq!(completed.status, "COMPLETED");
+    assert_eq!(completed.status, "COMPLETED", "{completed:?}");
     assert_eq!(completed.success_count, 2);
     assert_eq!(
         tokio::fs::read(media_root.join("Demo.Movie.2024.xml")).await?,
-        b"<i><d p=\"1,1,25,16777215,0,0,0,0\">hello</d></i>"
+        STUB_XML
     );
     assert_eq!(
         tokio::fs::read(media_root.join("Remote.Movie.2024.xml")).await?,
-        b"<i><d p=\"1,1,25,16777215,0,0,0,0\">hello</d></i>"
+        STUB_XML
     );
     let (strm_item_id, strm_source_id): (String, String) = sqlx::query_as(
         "SELECT mi.id, ms.id
@@ -366,6 +388,5 @@ async fn danmaku_service_matches_local_and_strm_sources_and_writes_sidecars()
     .map_err(|_| "danmaku job creation materialized every source")??;
     assert_eq!(large_job.total_count, 10002);
 
-    server.abort();
     Ok(())
 }

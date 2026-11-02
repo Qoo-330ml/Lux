@@ -55,7 +55,6 @@ pub(crate) mod metadata_writeback;
 pub mod network_diagnostics;
 pub mod nfo;
 pub(crate) mod notification_template;
-pub mod notifier_plugin_sdk;
 pub mod people;
 pub mod playback;
 pub(crate) mod playback_history_retention;

@@ -42,3 +42,7 @@
 /docs/*-PROPOSAL.md
 /docs/LUX-DATA-PATH-*.md
 /docs/STAGE-*-GATE-REVIEW-*.md
+
+# Web 播放兼容性矩阵本地产物（样本与报告从不提交）
+/scripts/playback-matrix/samples/
+/scripts/playback-matrix/reports/

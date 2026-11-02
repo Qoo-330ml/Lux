@@ -52,7 +52,7 @@
 
 ## 5. 通知与集成
 
-- [x] **P2 通知渠道补全**：已提供 Bark、企业微信应用、飞书/Lark、邮件（SMTP）四个通知器插件，以及通知插件的单目标凭据字段、共享 SDK 与私网目的地守卫（见 `docs/PLUGIN-SDK.md`）；Telegram 等其它渠道按同一协议另行增加
+- [x] **P2 通知渠道补全**：已提供 Bark、企业微信应用、飞书/Lark、邮件（SMTP）四个通知器插件，以及通知插件的单目标凭据字段、共享 SDK 与私网目的地守卫（插件与 SDK 在插件仓库 Lux-plugins；宿主契约见 `docs/PLUGIN-SDK.md`）；Telegram 等其它渠道按同一协议另行增加
 - [ ] **P3 Trakt/Bangumi/豆瓣双向同步**（**DEP**、**OWNER**；现状更像数据来源，不是已看同步）
 - [ ] **P3 `/metrics` 端点**（Prometheus）？
 
