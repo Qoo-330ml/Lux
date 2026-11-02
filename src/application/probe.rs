@@ -29,6 +29,9 @@ const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_XML_EVENTS: usize = 20_000;
 const LIBRARY_SOURCE_PAGE_SIZE: usize = 500;
 const PROBE_ADMISSION_TICK: Duration = Duration::from_secs(1);
+/// Upper bound on how long a PlaybackInfo request waits for a probe permit before it falls back
+/// to the stored media information. The probe itself keeps the runner timeout.
+const PLAYBACK_PROBE_ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const MAX_EFFECTIVE_PROBE_CONCURRENCY: usize = 512;
 
 mod runner;
@@ -741,6 +744,23 @@ pub struct MediaProbeService {
     nfo_writer: Option<NfoWriteService>,
     resources: ResourceMetrics,
     process_hard_cap: Result<Option<usize>, String>,
+    /// One gate per media source: two clients opening the same unprobed item at once must run a
+    /// single ffprobe, and the second one reads whatever the first stored.
+    playback_probe_gates: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+}
+
+/// Outcome of the probe PlaybackInfo runs for a local source that has no media information yet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaybackProbeOutcome {
+    /// The source already carries a probe result; the stored values are authoritative.
+    NotNeeded,
+    /// ffprobe ran and the source now carries duration, bitrate, container and media streams.
+    Probed,
+    /// ffprobe ran and failed; the failure is stored so later plays read the stored values.
+    Failed,
+    /// The source cannot be probed from a request (unknown row, STRM target, symlink escape,
+    /// admission timeout, closing runtime).
+    Skipped,
 }
 
 type ProbeTaskResult = (
@@ -811,6 +831,7 @@ impl MediaProbeService {
             nfo_writer: None,
             resources: ResourceMetrics::new(),
             process_hard_cap,
+            playback_probe_gates: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
 
@@ -822,6 +843,139 @@ impl MediaProbeService {
     pub fn with_nfo_writer(mut self, nfo_writer: NfoWriteService) -> Self {
         self.nfo_writer = Some(nfo_writer);
         self
+    }
+
+    /// Runs one ffprobe for a local media source whose media information is still `PENDING`, so
+    /// the first PlaybackInfo response can carry a runtime instead of `null`.
+    ///
+    /// The probe goes through the same global admission budget as scan probing and gives up after
+    /// [`PLAYBACK_PROBE_ADMISSION_TIMEOUT`] without a permit. Every outcome other than
+    /// [`PlaybackProbeOutcome::Probed`] means the caller reads the stored values.
+    pub async fn probe_source_for_playback(
+        &self,
+        item_id: &str,
+        source_id: &str,
+    ) -> Result<PlaybackProbeOutcome, ProbeServiceError> {
+        let gate = self.playback_probe_gate(source_id).await;
+        let outcome = {
+            let _guard = gate.lock().await;
+            self.probe_source_for_playback_locked(item_id, source_id)
+                .await
+        };
+        drop(gate);
+        self.prune_playback_probe_gate(source_id).await;
+        outcome
+    }
+
+    async fn probe_source_for_playback_locked(
+        &self,
+        item_id: &str,
+        source_id: &str,
+    ) -> Result<PlaybackProbeOutcome, ProbeServiceError> {
+        // The same row set the delete path uses: one local/STRM source addressed by item and
+        // source. A second request that waited on the gate re-reads the status here, so a probe
+        // that already finished is never repeated.
+        let Some(source) = self
+            .database
+            .find_deletable_media_source_path_by_id(item_id, source_id)
+            .await?
+        else {
+            return Ok(PlaybackProbeOutcome::Skipped);
+        };
+        if source.probe_status != "PENDING" {
+            return Ok(PlaybackProbeOutcome::NotNeeded);
+        }
+        let Some(library_id) = self.database.find_item_library_id(item_id).await? else {
+            return Ok(PlaybackProbeOutcome::Skipped);
+        };
+        let Ok(library_id) = library_id.parse::<LibraryId>() else {
+            return Ok(PlaybackProbeOutcome::Skipped);
+        };
+        let path = match safe_media_path(&source.root_path, &source.relative_path) {
+            Ok(path) => path,
+            Err(_) => return Ok(PlaybackProbeOutcome::Skipped),
+        };
+        let Some(path) = confine_to_root(&source.root_path, path).await else {
+            return Ok(PlaybackProbeOutcome::Skipped);
+        };
+        // STRM targets keep their plugin-driven, non-blocking probe path.
+        if is_strm_path(&path) {
+            return Ok(PlaybackProbeOutcome::Skipped);
+        }
+
+        let runtime = self.global_probe_runtime().await?;
+        let session = match runtime.register(library_id, 1, 1, Instant::now()) {
+            Ok(session) => session,
+            Err(error) => return Err(ProbeServiceError::Worker(error.to_string())),
+        };
+        let Some(permit) = self
+            .acquire_playback_probe_permit(&runtime, &session)
+            .await?
+        else {
+            return Ok(PlaybackProbeOutcome::Skipped);
+        };
+        let result = self.probe_source_with_permit(&path, permit).await;
+        let mut report = ProbeReport::default();
+        let subtitle_cache = SubtitleDirectoryCache::default();
+        let state = self
+            .persist_probe_attempt(&source, &path, result, &mut report, &subtitle_cache)
+            .await?;
+        Ok(match state {
+            ProbeTargetState::Done => PlaybackProbeOutcome::Probed,
+            ProbeTargetState::Failed => PlaybackProbeOutcome::Failed,
+            ProbeTargetState::Skipped => PlaybackProbeOutcome::NotNeeded,
+        })
+    }
+
+    /// Waits for a probe permit without letting a PlaybackInfo request hang behind library work.
+    async fn acquire_playback_probe_permit(
+        &self,
+        runtime: &concurrency::ProbeRuntime,
+        session: &concurrency::ProbeSession,
+    ) -> Result<Option<concurrency::ProbePermit>, ProbeServiceError> {
+        let deadline = Instant::now() + PLAYBACK_PROBE_ADMISSION_TIMEOUT;
+        loop {
+            match session.try_acquire(Instant::now()) {
+                Ok(Some(permit)) => return Ok(Some(permit)),
+                Ok(None) => {}
+                Err(error) => return Err(ProbeServiceError::Worker(error.to_string())),
+            }
+            if Instant::now() >= deadline
+                || runtime
+                    .is_closing()
+                    .map_err(|error| ProbeServiceError::Worker(error.to_string()))?
+            {
+                return Ok(None);
+            }
+            let version = runtime
+                .version()
+                .map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
+            tokio::select! {
+                changed = runtime.wait_for_change_since(version) => {
+                    changed.map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
+                }
+                _ = tokio::time::sleep(PROBE_ADMISSION_TICK) => {}
+            }
+        }
+    }
+
+    async fn playback_probe_gate(&self, source_id: &str) -> Arc<AsyncMutex<()>> {
+        let mut gates = self.playback_probe_gates.lock().await;
+        gates
+            .entry(source_id.to_owned())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
+    async fn prune_playback_probe_gate(&self, source_id: &str) {
+        let mut gates = self.playback_probe_gates.lock().await;
+        // Another request still holding the gate keeps the entry alive; the last one drops it.
+        if gates
+            .get(source_id)
+            .is_some_and(|gate| Arc::strong_count(gate) == 1)
+        {
+            gates.remove(source_id);
+        }
     }
 
     pub(crate) async fn import_media_info_for_absolute_path(
@@ -1901,6 +2055,131 @@ impl From<StorageError> for ProbeServiceError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn playback_probe_runs_once_for_a_pending_local_source() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        use super::{FfprobeRunner, MediaProbeService, PlaybackProbeOutcome};
+
+        let (_directory, database) = crate::storage::test_database().await.expect("database");
+        let root = tempfile::tempdir().expect("library root");
+        tokio::fs::write(root.path().join("Playback Probe (2024).mkv"), b"fake media")
+            .await
+            .expect("media file");
+        let libraries = crate::application::libraries::LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Playback Probe", crate::library::LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        libraries
+            .add_root(library.id, root.path().to_str().expect("root path"))
+            .await
+            .expect("library root");
+        crate::application::scanner::LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await
+            .expect("scan");
+        let library_id = library.id.to_string();
+        let sources = database
+            .list_media_sources_for_library_page(&library_id, 10, 0)
+            .await
+            .expect("sources");
+        assert_eq!(sources.len(), 1, "one local source is indexed");
+        let source = &sources[0];
+        assert_eq!(source.probe_status, "PENDING");
+
+        let invocations = root.path().join("ffprobe-invocations");
+        let binary = root.path().join("fake-ffprobe");
+        let payload = serde_json::json!({
+            "format": {
+                "format_name": "matroska",
+                "duration": "125.5",
+                "size": "10",
+                "bit_rate": "1000"
+            },
+            "streams": [{
+                "index": 0,
+                "codec_type": "video",
+                "codec_name": "h264",
+                "width": 1920,
+                "height": 1080
+            }]
+        });
+        let script = format!(
+            "#!/bin/sh\nset -eu\necho run >> '{invocations}'\nprintf '%s' '{payload}'\n",
+            invocations = invocations.display(),
+        );
+        tokio::fs::write(&binary, script)
+            .await
+            .expect("probe script");
+        let mut permissions = std::fs::metadata(&binary).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&binary, permissions).expect("permissions");
+
+        let service = MediaProbeService::new(
+            database.clone(),
+            FfprobeRunner::new(binary, Duration::from_secs(10)),
+        );
+        let (first, second) = tokio::join!(
+            service.probe_source_for_playback(&source.item_id, &source.source_id),
+            service.probe_source_for_playback(&source.item_id, &source.source_id),
+        );
+        let outcomes = [
+            first.expect("playback probe"),
+            second.expect("concurrent playback probe"),
+        ];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == PlaybackProbeOutcome::Probed)
+                .count(),
+            1,
+            "a concurrent first play must run a single ffprobe"
+        );
+        assert!(outcomes.contains(&PlaybackProbeOutcome::NotNeeded));
+        assert_eq!(
+            service
+                .probe_source_for_playback(&source.item_id, &source.source_id)
+                .await
+                .expect("third playback probe"),
+            PlaybackProbeOutcome::NotNeeded
+        );
+        let runs = tokio::fs::read_to_string(&invocations)
+            .await
+            .expect("invocation log");
+        assert_eq!(
+            runs.lines().count(),
+            1,
+            "stored media information is not probed again"
+        );
+
+        let duration = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT duration_ticks FROM media_sources WHERE id = ?",
+        )
+        .bind(&source.source_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("duration");
+        assert_eq!(duration, Some(1_255_000_000));
+        let status =
+            sqlx::query_scalar::<_, String>("SELECT probe_status FROM media_sources WHERE id = ?")
+                .bind(&source.source_id)
+                .fetch_one(database.pool())
+                .await
+                .expect("status");
+        assert_eq!(status, "READY");
+        let streams = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM media_streams WHERE media_source_id = ?",
+        )
+        .bind(&source.source_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("stream count");
+        assert_eq!(streams, 1);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn probe_targets_that_escape_the_root_through_symlinks_are_rejected() {

@@ -16,6 +16,7 @@ use crate::application::playback::{
         WebPlaybackPlan,
     },
 };
+use crate::application::probe::PlaybackProbeOutcome;
 use crate::storage::{
     MAX_PLAYBACK_SESSION_WINDOW_SECONDS, PlaybackAdmissionDecision, PlaybackAdmissionDenialReason,
     PlaybackAdmissionResult, StoredWebPlaybackSession, UserPlaybackPolicy,
@@ -101,53 +102,44 @@ pub(super) async fn emby_playback_info(
     } else {
         (vec![item.clone()], None, None)
     };
-    let mut sources = playback_items
-        .iter()
-        .flat_map(|source_item| {
-            source_item
-                .media_sources
-                .iter()
-                .map(move |source| (source_item, source))
-        })
-        .collect::<Vec<_>>();
-    if sources.is_empty() {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    let query_media_source_requested = query.media_source_id.is_some();
-    // Keep each version attached to its original item so the DTO, media URL,
-    // subtitle routes and HLS session all authorize against the real owner.
-    sources.sort_by_key(|(source_item, source)| {
-        let preferred_copy =
-            usize::from(preferred_source_item_id.as_deref() != Some(source_item.id.as_str()));
-        let preferred_source =
-            usize::from(preferred_media_source_id.as_deref() != Some(source.id.as_str()));
-        let default_version =
-            usize::from(!crate::application::catalog::belongs_to_default_version(
-                &source_item.media_sources,
-                source,
-            ));
-        (preferred_copy, preferred_source, default_version)
+    let mut playback_items = playback_items;
+    // The first play of a local file without media information pays one synchronous ffprobe so
+    // the response carries a runtime; sources that already have a probe result are untouched.
+    // Only the source this request would actually play is probed.
+    let probe_target = emby_ordered_playback_sources(
+        &playback_items,
+        preferred_source_item_id.as_deref(),
+        preferred_media_source_id.as_deref(),
+        query.media_source_id.as_deref(),
+        request.media_source_id.as_deref(),
+    )
+    .and_then(|sources| {
+        sources
+            .first()
+            .filter(|(_, source)| playback_source_missing_media_info(source))
+            .map(|(source_item, source)| (source_item.id.clone(), source.id.clone()))
     });
-    if let Some(source_id) = query.media_source_id {
-        let Some(index) = sources
-            .iter()
-            .position(|(_, source)| source.id == source_id)
-        else {
-            return StatusCode::NOT_FOUND.into_response();
-        };
-        let source = sources.remove(index);
-        sources.insert(0, source);
+    if let Some((item_id, source_id)) = probe_target {
+        probe_playback_source(
+            &state,
+            catalog,
+            principal,
+            &mut playback_items,
+            &item_id,
+            &source_id,
+        )
+        .await;
     }
-    if let Some(source_id) = request.media_source_id.as_deref() {
-        let Some(index) = sources
-            .iter()
-            .position(|(_, source)| source.id == source_id)
-        else {
-            return StatusCode::NOT_FOUND.into_response();
-        };
-        let source = sources.remove(index);
-        sources.insert(0, source);
-    }
+    let Some(sources) = emby_ordered_playback_sources(
+        &playback_items,
+        preferred_source_item_id.as_deref(),
+        preferred_media_source_id.as_deref(),
+        query.media_source_id.as_deref(),
+        request.media_source_id.as_deref(),
+    ) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let query_media_source_requested = query.media_source_id.is_some();
     let admission_service = state.web_playback();
     if let Err(response) =
         check_web_playback_admission(&headers, admission_service, &user.id.to_string()).await
@@ -1000,6 +992,109 @@ fn normalize_emby_codec(value: &str) -> String {
         "h265" => "hevc".to_owned(),
         "mp4a" => "aac".to_owned(),
         value => value.to_owned(),
+    }
+}
+
+/// A local source is missing media information while its probe status is still `PENDING`: the
+/// scan created the source but no probe result has been stored yet. STRM sources keep their
+/// plugin-driven background probe and are never probed from a request.
+fn playback_source_missing_media_info(source: &crate::application::catalog::CatalogSource) -> bool {
+    source.source_kind == "LOCAL_FILE" && source.probe_status == "PENDING"
+}
+
+/// Builds the request's media source list in the order the client will see it: the preferred
+/// copy and source first, then the default version. `None` means "not found" (empty list or an
+/// explicitly requested source id that is absent).
+fn emby_ordered_playback_sources<'a>(
+    playback_items: &'a [CatalogItem],
+    preferred_source_item_id: Option<&str>,
+    preferred_media_source_id: Option<&str>,
+    query_media_source_id: Option<&str>,
+    body_media_source_id: Option<&str>,
+) -> Option<Vec<(&'a CatalogItem, &'a CatalogSource)>> {
+    let mut sources = playback_items
+        .iter()
+        .flat_map(|source_item| {
+            source_item
+                .media_sources
+                .iter()
+                .map(move |source| (source_item, source))
+        })
+        .collect::<Vec<_>>();
+    if sources.is_empty() {
+        return None;
+    }
+    // Keep each version attached to its original item so the DTO, media URL, subtitle routes
+    // and HLS session all authorize against the real owner.
+    sources.sort_by_key(|(source_item, source)| {
+        let preferred_copy = usize::from(preferred_source_item_id != Some(source_item.id.as_str()));
+        let preferred_source = usize::from(preferred_media_source_id != Some(source.id.as_str()));
+        let default_version =
+            usize::from(!crate::application::catalog::belongs_to_default_version(
+                &source_item.media_sources,
+                source,
+            ));
+        (preferred_copy, preferred_source, default_version)
+    });
+    for requested in [query_media_source_id, body_media_source_id]
+        .into_iter()
+        .flatten()
+    {
+        let index = sources
+            .iter()
+            .position(|(_, source)| source.id == requested)?;
+        let source = sources.remove(index);
+        sources.insert(0, source);
+    }
+    Some(sources)
+}
+
+/// Probes the source this request would play when it still lacks media information, then reloads
+/// its item so the response carries the freshly stored runtime and streams.
+///
+/// A failed or skipped probe leaves the source as it was and never fails the request: the client
+/// still gets a playable source, just without a runtime.
+async fn probe_playback_source(
+    state: &ReadyAppState,
+    catalog: &crate::application::catalog::CatalogService,
+    principal: AccessPrincipal,
+    playback_items: &mut [CatalogItem],
+    item_id: &str,
+    source_id: &str,
+) {
+    match state
+        .probe()
+        .probe_source_for_playback(item_id, source_id)
+        .await
+    {
+        Ok(PlaybackProbeOutcome::Probed) => {}
+        Ok(PlaybackProbeOutcome::Failed) => {
+            tracing::warn!(
+                event = "emby_playback_probe_failed",
+                item_id_prefix = %playback_identifier_prefix(item_id),
+                source_id_prefix = %playback_identifier_prefix(source_id),
+                "first-play media probe failed; using stored media information"
+            );
+            return;
+        }
+        Ok(PlaybackProbeOutcome::NotNeeded | PlaybackProbeOutcome::Skipped) => return,
+        Err(error) => {
+            tracing::warn!(
+                event = "emby_playback_probe_error",
+                item_id_prefix = %playback_identifier_prefix(item_id),
+                source_id_prefix = %playback_identifier_prefix(source_id),
+                %error,
+                "first-play media probe could not run; using stored media information"
+            );
+            return;
+        }
+    }
+    // Re-read through the same access path that produced the item, so a concurrent deletion or
+    // permission change keeps the response consistent with the caller's principal.
+    if let Some(item) = playback_items.iter_mut().find(|item| item.id == item_id)
+        && let Ok(Some(fresh)) = catalog.find_item(principal, &item.id).await
+    {
+        *item = fresh;
     }
 }
 
@@ -6734,5 +6829,48 @@ mod playback_duration_tests {
         assert_eq!(resolve_cold(&database, None, None).await, None);
         database.close().await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod playback_probe_selection_tests {
+    use super::playback_source_missing_media_info;
+    use crate::application::catalog::CatalogSource;
+
+    fn source(source_kind: &str, probe_status: &str) -> CatalogSource {
+        CatalogSource {
+            id: "source".to_owned(),
+            source_kind: source_kind.to_owned(),
+            file_name: Some("Movie.mkv".to_owned()),
+            container: Some("mkv".to_owned()),
+            size: Some(10),
+            external_url: None,
+            edition_name: None,
+            quality_label: None,
+            bitrate: None,
+            duration_ticks: None,
+            is_default: true,
+            probe_status: probe_status.to_owned(),
+            streams: Vec::new(),
+            chapters: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn only_pending_local_sources_are_probed_before_playback() {
+        assert!(playback_source_missing_media_info(&source(
+            "LOCAL_FILE",
+            "PENDING"
+        )));
+        for status in ["READY", "FAILED", "NOT_CONFIGURED"] {
+            assert!(
+                !playback_source_missing_media_info(&source("LOCAL_FILE", status)),
+                "{status} sources read their stored media information"
+            );
+        }
+        assert!(
+            !playback_source_missing_media_info(&source("STRM_URL", "PENDING")),
+            "STRM sources keep their non-blocking plugin probe"
+        );
     }
 }
