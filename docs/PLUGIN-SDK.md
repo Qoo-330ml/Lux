@@ -608,3 +608,67 @@ PLUGIN_INTERNAL_ERROR
 ## TMDb 插件
 
 `org.lux.tmdb` 是对 Emby `MovieDb.dll` 行为的独立重写，不加载原始 DLL。功能范围包括电影、剧集、季、集、人物、合集、图片、外部 ID、预告片、语言、缓存、限流、重试和 TMDb v3 API Key。插件使用自己的缓存目录；Lux 负责最终元数据持久化、NFO/图片回写和 Emby DTO 映射。
+
+## SMTP 邮件通知器（`org.lux.notifier.email`）
+
+`org.lux.notifier.email` 是一个参考实现的通知器插件，二进制为 `lux-plugin-notifier-email`，只负责
+`notification.send`：把宿主生成的通知标题作为邮件主题、正文作为纯文本邮件正文，通过管理员配置的 SMTP
+服务器投递。进程外壳、10 秒投递窗口和状态分类来自 `luxd::application::notifier_plugin_sdk`，正文来自
+`render_event_text`，插件不重写通知文本。SMTP 没有 HTTP 跳，因此本渠道不使用 `outbound_http_client`；
+单次投递由 `NOTIFIER_HTTP_TIMEOUT`（10 秒）的 `tokio::time::timeout` 硬性截断，SMTP 应答由 `lettre`
+解析，插件不读取、不记录也不转发上游响应体。
+
+manifest 核心字段：
+
+```json
+{
+  "id": "org.lux.notifier.email",
+  "type": "notification",
+  "category": "NOTIFICATION",
+  "capabilities": ["notification.send"],
+  "runtime": {"kind": "process", "entrypoint": "binaries/${platform}-${arch}/lux-plugin-notifier-email"},
+  "configFields": [
+    {"key": "secret", "label": "SMTP 密码", "type": "password", "required": true, "sensitive": true},
+    {"key": "smtpHost", "label": "SMTP 服务器", "type": "text", "required": true},
+    {"key": "smtpPort", "label": "SMTP 端口", "type": "number", "required": false, "defaultValue": 587, "minimum": 1, "maximum": 65535},
+    {"key": "security", "label": "加密方式", "type": "select", "required": true, "defaultValue": "starttls", "options": [{"value": "starttls", "label": "STARTTLS"}, {"value": "ssl", "label": "SSL/TLS"}, {"value": "none", "label": "不加密"}]},
+    {"key": "username", "label": "SMTP 用户名", "type": "text", "required": false},
+    {"key": "from", "label": "发件人地址", "type": "text", "required": true},
+    {"key": "to", "label": "收件人地址", "type": "text", "required": true}
+  ]
+}
+```
+
+配置语义：`secret` 是每条通知目标的 SMTP 密码，只从受控的 `secret` 字段到达插件，不进 `config`、不进
+日志、不进返回值或错误消息。SMTP 认证只在 `username` 非空时发生；`username` 留空时宿主仍要求 `secret`
+非空，此时它是管理员填写的占位值（例如 `unused`），插件不会使用它。其余字段是普通目标配置：
+
+- `smtpHost` 必填，非空、不含空白字符或控制字符、不含路径分隔符，长度不超过 253。
+- `smtpPort` 可选，缺省 587，范围 1–65535。
+- `security` 只接受 `starttls`、`ssl`、`none`；`starttls` 要求服务器支持 STARTTLS，否则投递失败而不是降级为明文。
+- `username` 可选，首尾空白或控制字符会被判为非法。
+- `from` 必填，必须是纯地址（不含显示名）；`to` 是逗号分隔的 1–20 个纯地址，两级都会重新校验地址格式。
+
+结果映射使用稳定的 snake_case 错误码：
+
+| 情况 | 状态 | `error_code` |
+| --- | --- | --- |
+| 邮件被 SMTP 服务器接受 | `DELIVERED` | 无 |
+| `secret` 缺失或只含空白 | `FAILED` | `missing_secret` |
+| 目标配置非法（主机、端口、加密方式、地址、收件人数量） | `FAILED` | `invalid_config` |
+| SMTP `4xx` 或连接被拒绝 | `RETRYABLE` | `smtp_transient` / `smtp_unavailable` |
+| 超过投递窗口（连接、握手或应答） | `RETRYABLE` | `smtp_timeout` |
+| SMTP `5xx`（认证、发件人或收件人被拒） | `FAILED` | `smtp_rejected` |
+| STARTTLS 不被服务器支持或协议不兼容 | `FAILED` | `smtp_protocol_error` |
+| TLS 层错误 | `FAILED` | `smtp_tls_failed` |
+
+`lettre` 的 rustls 后端把 TLS 握手失败报告为连接错误，所以对不可达或不可信的服务器保持 `RETRYABLE`，与其它
+网络错误一致；插件绝不会在加密未建立时把密码或收件人发给对端。插件每次投递向 stderr 写一行
+`org.lux.notifier.email: event <eventId> finished with <状态> (<错误码>)`，不包含密码、收件人地址或任何完整
+外部 URL。`LUX_PLUGIN_SMTP_TIMEOUT_SECONDS` 仅供测试把投递窗口收紧到 1–10 秒，不能放宽 SDK 的上限。
+
+测试（`cargo test --locked --test plugins notifier_email::`）用 `127.0.0.1` 随机端口的假 SMTP 服务器覆盖成功、
+无认证、`4xx`、`5xx`、认证被拒、连接被拒、超时、STARTTLS 不支持、SSL 握手失败、坏配置和缺凭据，并断言凭据
+不出现在返回值和捕获的日志中；测试不使用任何真实凭据或真实邮件服务。
+
+打包：`scripts/package-notifier-plugin.sh org.lux.notifier.email`。

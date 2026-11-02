@@ -14,7 +14,8 @@ use std::{
 };
 
 use luxd::application::plugin_protocol::{
-    NotificationSendRpcResult, NotificationSendStatus, PluginRequest, PluginResponse,
+    NotificationSendRpcResult, NotificationSendStatus, PluginManifest, PluginRequest,
+    PluginResponse,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -731,5 +732,50 @@ async fn unknown_methods_are_reported_without_stopping_the_plugin()
 
     let log = session.shutdown().await?;
     assert_no_secret_leak(&result, &log);
+    Ok(())
+}
+
+#[test]
+fn the_packaged_manifest_is_a_single_secret_notification_provider()
+-> Result<(), Box<dyn std::error::Error>> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("plugins/org.lux.notifier.email/manifest.json");
+    let manifest = PluginManifest::from_value(serde_json::from_slice(&std::fs::read(path)?)?)?;
+
+    assert_eq!(manifest.id, "org.lux.notifier.email");
+    assert_eq!(manifest.version, "0.1.0");
+    assert_eq!(manifest.plugin_type, "notification");
+    assert_eq!(manifest.category, "NOTIFICATION");
+    assert_eq!(manifest.capabilities, vec!["notification.send".to_owned()]);
+    assert_eq!(
+        manifest.runtime.entrypoint,
+        "binaries/${platform}-${arch}/lux-plugin-notifier-email"
+    );
+
+    let secret = manifest
+        .secret_config_field()
+        .expect("the destination credential must be a declared secret field");
+    assert_eq!(secret.input_type, "password");
+    assert!(secret.sensitive && secret.required);
+    assert_eq!(
+        manifest
+            .config_fields
+            .iter()
+            .filter(|field| field.key == "secret")
+            .count(),
+        1,
+        "a notifier may declare exactly one secret field"
+    );
+    for field in manifest
+        .config_fields
+        .iter()
+        .filter(|field| field.key != "secret")
+    {
+        assert!(
+            !field.sensitive && field.input_type != "password",
+            "{} must stay a non-secret provider config field",
+            field.key
+        );
+    }
     Ok(())
 }
