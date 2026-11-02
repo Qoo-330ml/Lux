@@ -77,6 +77,10 @@ path = "src/main.rs"
 name = "lux-plugin-danmaku"
 path = "src/bin/lux-plugin-danmaku.rs"
 
+[[bin]]
+name = "lux-plugin-notifier-wecom-app"
+path = "src/bin/lux-plugin-notifier-wecom-app.rs"
+
 [profile.dev]
 debug = "line-tables-only"
 
