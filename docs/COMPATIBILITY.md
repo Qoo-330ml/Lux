@@ -985,7 +985,7 @@ Lux 原生 `PLAYBACK_*` 事件保留原始 `itemTitle`，并提供可空的 `ser
 `seriesSeasonCount`。剧集通知标题按剧名、（总季数大于一季时）季号、集名排列；第 0 季显示“特别篇”。
 电影和缺少剧集关联的事件继续使用 `itemTitle`。这些新增展示字段不会加入 Emby 风格 payload。
 
-当前只提供 Webhook 渠道；Telegram、企业微信和 Email 尚未实现。
+渠道以插件形式提供，见 docs/PLUGIN-SDK.md。
 
 - 媒体库实时监听默认开启，也可通过 `realtimeWatchEnabled` 关闭。关闭后不会为该库根路径创建实时 watcher，但手动扫描、调和和外部刷新仍可用；开启时复制到已配置根路径中的新视频会进入局部 `INCREMENTAL_SCAN`，只处理该事件路径，通常在几秒内进入索引。
 - 2026-09-19 Symedia 媒体库发现兼容：Emby 兼容层新增管理员 `GET /Library/SelectableMediaFolders`（支持 `/emby` 前缀），按真实 Emby 的顶层数组结构返回媒体库及其 `SubFolders` 根目录，避免 Symedia 将 404 错误对象当作目录数组解析。自动化覆盖共享 API Key、两种路由形式以及媒体库和根目录字段；尚未在真实 Symedia 部署中复测。
