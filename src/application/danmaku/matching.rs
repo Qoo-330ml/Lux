@@ -1,8 +1,11 @@
-//! Provider configuration and match-title candidate construction.
+//! Provider configuration, match-title candidate construction and the plugin
+//! error-code mapping.
 //!
-//! The host never sends paths or upstream URLs to a plugin; it only builds the
-//! title candidates the plugin is asked to match, and maps the plugin error
-//! taxonomy to the stable `danmaku_match_job_items.error_code` values.
+//! The host never sends paths or upstream URLs to a plugin: it validates the
+//! configured provider base URL, builds the title candidates the plugin is asked
+//! to match, and maps the plugin error taxonomy to the stable
+//! `danmaku_match_job_items.error_code` values. Calling the plugin and writing
+//! the sidecar belong to the per-item worker in the `job` module.
 
 use std::fmt;
 

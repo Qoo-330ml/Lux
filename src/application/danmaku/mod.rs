@@ -3,11 +3,13 @@
 //! The behaviour is split into focused modules; this module keeps the public
 //! paths (`crate::application::danmaku::*`) the rest of the crate already uses:
 //!
-//! - [`path`]: sidecar path derivation and media-root path safety.
-//! - [`xml`]: XML validation and its error type.
-//! - [`sidecar`]: atomic write, bounded read, fingerprint, playback reads.
-//! - [`matching`]: match-title candidates, plugin invocation, error-code mapping.
-//! - [`job`]: match job lifecycle, cancellation, retry and the worker pool.
+//! - `path`: sidecar path derivation and media-root path safety.
+//! - `xml`: XML validation and its error type.
+//! - `sidecar`: atomic write, bounded read, fingerprint, playback reads.
+//! - `matching`: match-title candidates, provider base URL validation and the
+//!   plugin error-code mapping.
+//! - `job`: match job lifecycle, cancellation, retry, the worker pool that calls
+//!   the plugin and writes the sidecar, and the per-item worker.
 
 mod job;
 mod matching;
