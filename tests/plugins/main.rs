@@ -6,6 +6,7 @@ mod danmaku_plugin;
 mod ip_location_plugins;
 mod media_info_config;
 mod media_info_config_api;
+mod notifier_bark;
 mod notifier_wecom_app;
 mod plugin_protocol;
 mod plugin_runtime;

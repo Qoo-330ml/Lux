@@ -78,6 +78,10 @@ name = "lux-plugin-danmaku"
 path = "src/bin/lux-plugin-danmaku.rs"
 
 [[bin]]
+name = "lux-plugin-notifier-bark"
+path = "src/bin/lux-plugin-notifier-bark.rs"
+
+[[bin]]
 name = "lux-plugin-notifier-wecom-app"
 path = "src/bin/lux-plugin-notifier-wecom-app.rs"
 
