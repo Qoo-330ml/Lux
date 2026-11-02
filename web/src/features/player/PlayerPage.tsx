@@ -107,6 +107,9 @@ export function PlayerPage() {
   const [isRemainingTime, setIsRemainingTime] = useState(false);
   const [isPointerInteracting, setIsPointerInteracting] = useState(false);
   const [danmuVisible, setDanmuVisible] = useState(true);
+  // Danmaku load outcome (“加载失败” / “已截断” / “内容为空”), shown next to the player like the
+  // caption status; the overlay clears it whenever it starts a new load or is hidden.
+  const [danmakuStatus, setDanmakuStatus] = useState<string | null>(null);
   const [airPlayVideo, setAirPlayVideo] = useState<HTMLVideoElement | null>(null);
   const currentTimeRef = useRef(0);
   const durationRef = useRef(0);
@@ -730,7 +733,12 @@ export function PlayerPage() {
         currentTime={currentTime}
         playbackRate={playbackRate}
         lifecycleKey={playbackKey}
+        playing={playing}
+        onStatusChange={setDanmakuStatus}
       />
+      {danmakuStatus ? (
+        <p className="lux-player-danmaku-status" role="status">{danmakuStatus}</p>
+      ) : null}
       <PlayerMiniProgressBar
         controlsVisible={controlsVisible}
         currentTime={currentTime}
