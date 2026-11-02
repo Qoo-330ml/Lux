@@ -551,7 +551,13 @@ Lux 在发送请求前执行协议、主机和地址策略校验，并在收到�
   处理器，写出 `PluginResponse`，并在 `plugin.shutdown` 后退出；无效请求行和未知方法返回错误响应但不会
   终止循环。需要自定义流时使用 `run_notifier_session(reader, writer, handler)`。
 - `outbound_http_client(proxy_url)` / `outbound_http_client_from_env()`：统一的出站 client，读取 Lux 代理配置
-  （`LUX_PROXY_URL`），10 秒超时且不跟随重定向。
+  （`LUX_PROXY_URL`），10 秒超时且不跟随重定向。需要先钉住目的地地址时使用
+  `outbound_http_client_builder(proxy_url)` / `outbound_http_client_builder_from_env()` 取到同一个配置好的
+  `reqwest::ClientBuilder`，再调用 `GuardedDestination::pin(builder)` 后 `build()`。
+- `guard_destination(&Url, allow_private_network)` / `guard_destination_str(&str, allow_private_network)`：解析并
+  校验一个 HTTP(S) 目的地，返回 `GuardedDestination`（`url()`、`host()`、`address()`、`pin(builder)`）。
+- `guard_host(host, port, allow_private_network)`：非 HTTP 渠道（SMTP、自定义 TCP）使用的 host:port 版本，返回
+  `GuardedHost`（`host()`、`port()`、`addresses()`、`primary()`）。
 - `classify_http_status(status)` 与 `result_from_http_status(status, retry_after_seconds)`：与宿主一致的
   `DELIVERED`/`RETRYABLE`/`FAILED` 分类（`2xx` 成功，`408`、`425`、`429` 和 `5xx` 可重试，其余永久失败）；
   `delivered()`、`retryable(code)`、`failed(code)` 用于非 HTTP 渠道。
@@ -568,6 +574,61 @@ luxd::application::notifier_plugin_sdk::run_notifier(|request| {
 })
 .await?;
 ```
+
+#### 目的地守卫
+
+通知器必须把宿主在 `notification.send` 里给出的 `target.allowPrivateNetwork` 原样传给守卫，不能自行放宽。守卫
+一次性解析目的地的全部地址并逐个校验，分类与核心策略一致：
+
+- **批准私网后可用**：回环、RFC1918 私网、IPv6 唯一本地地址、链路本地，以及核心归类为私网的 CGNAT
+  （`100.64.0.0/10`）、基准测试（`198.18.0.0/15`）和 `192.0.0.0/24`。未批准私网时这些地址一律拒绝。
+- **即使批准私网也始终拒绝**：未指定地址（`0.0.0.0`、`::`）、链路本地/云元数据（`169.254.169.254` 等）、
+  多播、`240.0.0.0/4` 与受限广播 `255.255.255.255`、文档网段（`192.0.2.0/24`、`198.51.100.0/24`、
+  `203.0.113.0/24`、`2001:db8::/32`），以及 6to4、Teredo、NAT64 等可封装任意 IPv4 的形式。
+- IPv4-mapped（`::ffff:a.b.c.d`）与已废弃的 IPv4-compatible（`::a.b.c.d`、`::/96`）都按内嵌 IPv4 地址分类；
+  `::` 与 `::1` 保留其 IPv6 语义（未指定/回环）。
+
+IP 分类复用核心的 `webhooks::is_dangerous_address`、`webhooks::is_private_address` 与
+`remote_url_policy::is_private_or_reserved`，插件不应再复制一份网段判断。
+
+守卫只返回稳定错误码（`DestinationGuardError::code()`），插件不得把完整 URL 或主机写进日志、返回值或投递记录：
+
+| 错误 | `code()` | `is_retryable()` |
+| --- | --- | --- |
+| `InvalidUrl` / `UnsupportedScheme` / `Credentials` | `invalid_destination_url` | 否 |
+| `ResolutionFailed` | `destination_unresolved` | 是 |
+| `PrivateAddress` / `DangerousAddress` / `ReservedAddress` | `destination_not_allowed` | 否 |
+
+```rust
+use luxd::application::notifier_plugin_sdk::{
+    DestinationGuardError, failed, guard_destination, outbound_http_client_builder_from_env,
+    retryable,
+};
+
+let allow_private = request
+    .target
+    .get("allowPrivateNetwork")
+    .and_then(serde_json::Value::as_bool)
+    .unwrap_or(false);
+let guarded = match guard_destination(&target.url, allow_private).await {
+    Ok(guarded) => guarded,
+    Err(error) if error.is_retryable() => return retryable(error.code()),
+    Err(error) => return failed(error.code()),
+};
+// 把已校验地址钉进 client，防止 DNS 重绑定；随后客户端不会再解析该主机。
+let client = guarded.pin(outbound_http_client_builder_from_env()?).build()?;
+let response = client.post(guarded.url().clone()).json(&payload).send().await;
+```
+
+`guarded.url()` 保持管理员配置的原值（含路径与 query），只有连接目标被替换为已校验地址；重定向仍然禁用，所以
+上游的 3xx 不会绕过守卫。
+
+代理与 `pin()` 的关系：
+
+- 未配置 `LUX_PROXY_URL` 时，SDK 的 `outbound_http_client_builder(_from_env)` 会调用 `no_proxy()`，忽略
+  `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` 与系统代理，保证请求直连守卫校验过的地址。
+- 管理员显式配置了 `LUX_PROXY_URL` 时，请求按管理员配置走代理（代理仍遵守 `NO_PROXY`）。此时由代理解析目标
+  主机，`pin()` 不再决定实际连接地址；守卫仍然按解析结果做拒绝判断。
 
 通知器插件包使用 `scripts/package-notifier-plugin.sh <插件目录名> [target]` 打包：脚本从
 `plugins/<目录名>/manifest.json` 读取 ID、版本、入口和声明文件，拒绝非 `notification` 或缺少
@@ -608,6 +669,52 @@ PLUGIN_INTERNAL_ERROR
 ## TMDb 插件
 
 `org.lux.tmdb` 是对 Emby `MovieDb.dll` 行为的独立重写，不加载原始 DLL。功能范围包括电影、剧集、季、集、人物、合集、图片、外部 ID、预告片、语言、缓存、限流、重试和 TMDb v3 API Key。插件使用自己的缓存目录；Lux 负责最终元数据持久化、NFO/图片回写和 Emby DTO 映射。
+
+### Bark 通知器插件（`org.lux.notifier.bark`）
+
+`org.lux.notifier.bark` 是参考实现，演示通知器插件如何只做渠道接线：使用
+`run_notifier`、`guard_destination`、`outbound_http_client_builder_from_env`、
+`result_from_http_status`、`retryable`、`failed` 与 `render_event_text`，不读取 `LUX_CONFIG_DIR`、
+不访问 Lux 数据库或媒体目录。
+
+manifest 声明 `type: "notification"`、`category: "NOTIFICATION"`、`capabilities: ["notification.send"]`，
+配置字段分为两类：
+
+- `secret`（`type: "password"`、`sensitive: true`、必填、无默认值）：Bark 设备密钥，只允许
+  `[A-Za-z0-9_-]`、长度不超过 128（与 Bark 密钥格式一致，manifest 描述里同步写明）；仅通过
+  `notification.send` 请求的 `secret` 字段到达插件，不写入日志、不出现在返回值或错误信息中，也不放进任何 URL。
+- 非敏感目标配置：`serverUrl`（默认 `https://api.day.app`，只允许 http/https，去尾斜杠，拒绝凭据、
+  query 和 fragment）、`group`、`level`（`active`/`timeSensitive`/`passive`，默认 `active`）、
+  `icon`（可选 http(s) URL）、`sound`。这些字段走按目标保存的 `providerConfig`。
+
+投递行为：
+
+- 正文来自核心生成的 `data.title`/`data.content`（`render_event_text` 原样转发，插件不重写文案）。
+- 请求为 `POST {serverUrl}/push`，JSON 体是
+  `{device_key,title,body,group,level,icon,sound}`，未设置的可选字段省略；设备密钥只在请求体里。
+- 目的地守卫：插件把宿主给出的 `target.allowPrivateNetwork` 原样传给 `guard_destination`，默认（字段缺失或
+  `false`）拒绝回环/私网目的地，`169.254.169.254` 等危险保留地址即使批准私网也始终拒绝；通过后把已解析地址
+  钉进出站 client（仅在未配置 `LUX_PROXY_URL` 时生效，见上文“代理与 `pin()` 的关系”），`serverUrl` 的路径与
+  query 保持原样，重定向仍禁用。
+- 出站 client 使用宿主代理策略、10 秒超时且不跟随重定向；`2xx` 响应体最多读取 64 KiB。若进程启动时无法按
+  宿主代理策略构建 client，插件直接以失败退出（不返回伪造的投递结果），因此没有额外的
+  `*_client_unavailable` 错误码。
+- 分类：Bark 返回 `code == 200` → `DELIVERED`（`timestamp` 作为 `providerRequestId`）；
+  `408`/`425`/`429`/`5xx`、连接失败、请求超时，以及读响应体阶段的传输错误/超时 → `RETRYABLE`
+  （`Retry-After` 整数形式写入 `retryAfterSeconds`，其余情况为空）；其它 `4xx`、非 200 的 Bark `code`、
+  无法解析的响应和超过 64 KiB 的响应体 → `FAILED`；`Retry-After` 的 HTTP-date 形式被忽略。
+- 稳定错误码：`missing_secret`、`invalid_secret`、`invalid_server_url`、`invalid_config`、
+  `destination_not_allowed`（私网未批准或危险保留地址）、`destination_unresolved`（DNS 暂时失败，可重试）、
+  `invalid_destination_url`、`provider_unavailable`、`provider_response_too_large`、`invalid_response`、
+  `bark_code_<code>`，HTTP 分类失败沿用 SDK 的 `PROVIDER_HTTP_<status>`。配置校验失败或被守卫拒绝的请求不会
+  发出任何上游请求，日志只记录稳定错误码，不含凭据、主机或完整 URL。
+
+打包：`scripts/package-notifier-plugin.sh org.lux.notifier.bark [target]` 读取该目录的 manifest 并输出
+`dist/plugins/org.lux.notifier.bark-0.1.0-<platform>-<arch>.zip`。测试位于
+`tests/plugins/notifier_bark.rs`（`cargo test --locked --test plugins notifier_bark::`），全部使用
+`127.0.0.1` 随机端口的本地 mock Bark 服务（测试显式携带 `allowPrivateNetwork: true`），覆盖成功、4xx、
+429/5xx、超时、网络失败、读响应体中断开/超时、重定向不跟随、超限响应、坏配置、缺失/非法凭据、默认未批准私网
+时拒绝回环目的地，以及批准私网仍拒绝云元数据地址；并断言凭据与完整外部 URL 不出现在返回值和捕获的日志里。
 
 ## SMTP 邮件通知器（`org.lux.notifier.email`）
 

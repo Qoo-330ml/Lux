@@ -58,6 +58,25 @@ fn webhook_url_requires_explicit_private_network_opt_in() {
         validate_webhook_url("http://[::ffff:192.168.1.2]:8080/hooks", false),
         Err(WebhookUrlError::PrivateNetwork)
     ));
+    // The deprecated IPv4-compatible form (`::/96`) keeps the embedded IPv4 policy.
+    assert!(matches!(
+        validate_webhook_url("http://[::127.0.0.1]:8080/hooks", false),
+        Err(WebhookUrlError::PrivateNetwork)
+    ));
+    assert!(validate_webhook_url("http://[::127.0.0.1]:8080/hooks", true).is_ok());
+    assert!(matches!(
+        validate_webhook_url("http://[::192.168.1.1]:8080/hooks", false),
+        Err(WebhookUrlError::PrivateNetwork)
+    ));
+    assert!(validate_webhook_url("http://[::192.168.1.1]:8080/hooks", true).is_ok());
+    assert!(matches!(
+        validate_webhook_url("http://[::169.254.169.254]/hooks", false),
+        Err(WebhookUrlError::DangerousAddress)
+    ));
+    assert!(matches!(
+        validate_webhook_url("http://[::169.254.169.254]/hooks", true),
+        Err(WebhookUrlError::DangerousAddress)
+    ));
 }
 
 #[test]
