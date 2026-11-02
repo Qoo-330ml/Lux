@@ -41,6 +41,8 @@ describe("library filter helpers", () => {
     expect(isLibraryFilterYear("2024")).toBe(true);
     expect(isLibraryFilterYear("24")).toBe(false);
     expect(isLibraryFilterYear("1200")).toBe(false);
+    expect(readLibraryFilters(new URLSearchParams("year=24")).year).toBeUndefined();
+    expect(readLibraryFilters(new URLSearchParams("year=2024")).year).toBe(2024);
   });
 
   it("only offers a type filter for libraries that mix movies and series", () => {

@@ -1,4 +1,4 @@
-import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { LuxSelect } from "../../components/LuxSelect";
@@ -161,8 +161,9 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
   const libraries = useQuery({ queryKey: queryKeys.libraries, queryFn: () => api.libraries() });
   const library = libraries.data?.libraries?.find((entry) => entry.id === libraryId);
   const isHomeVideos = library?.kind === "HOMEVIDEOS";
-  // 文件夹浏览（其他视频）不是电影/剧集目录，年份和观看状态对文件夹没有意义，
-  // 因此筛选行只出现在电影/剧集类媒体库；全局合集库同样不提供筛选。
+  // 有意决定：文件夹浏览（其他视频）不是电影/剧集目录，筛选 UNSET 的 FOLDER
+  // 与「已看/未看」语义也不明确，因此这里始终不显示筛选行，仅保留排序/元数据；
+  // 全局合集库（虚拟媒体库）同样不提供筛选。改动前请先确认产品口径。
   const showFilters = !isGlobalCollectionLibrary && library?.kind !== "HOMEVIDEOS";
   const filterTypes = libraryTypeFilterValues(library?.kind);
   const filters = showFilters ? readLibraryFilters(searchParams, library?.kind) : EMPTY_LIBRARY_FILTERS;
@@ -172,9 +173,8 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
   const folderPath = isHomeVideos ? homeVideoFolderPath(searchParams.get("folderPath")) : [];
   const parentId = isHomeVideos ? folderPath.at(-1)?.id ?? "root" : undefined;
   const showMetadataPending = libraries.data?.showMetadataPending ?? true;
-  // Until the library record arrives, fetch the top-level movie/series set. The
-  // same filter is safe for MOVIE/SERIES/MIXED libraries, so the key does not
-  // change again once the record loads; HOMEVIDEOS switches after the record.
+  // 库记录就绪后才决定 itemType：未校验的 `type` 不能用来发出首个请求，否则会
+  // 先发一次错误请求、再因为 kind 校验换键重发。库记录到来前保持默认集合。
   const itemTypes = isGlobalCollectionLibrary
     ? "BOX_SET"
     : library?.kind === "HOMEVIDEOS"
@@ -253,7 +253,10 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     }),
     initialPageParam: 1,
     maxPages: 5,
-    enabled: Boolean(libraryId),
+    // 库记录就绪后再请求，避免用未校验的 type 发出一次错误请求。
+    enabled: Boolean(libraryId) && Boolean(library),
+    // 切换筛选/排序时保留上一份结果，工具条和年份草稿不会被骨架屏卸载。
+    placeholderData: keepPreviousData,
     getNextPageParam: (lastPage) => {
       const page = lastPage.page ?? 1;
       if (typeof lastPage.hasNext === "boolean") return lastPage.hasNext ? page + 1 : undefined;
@@ -266,13 +269,14 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
 
   useEffect(() => {
     const sentinel = loadMoreRef.current;
-    if (!sentinel || !pages.hasNextPage || pages.isFetchingNextPage || typeof IntersectionObserver === "undefined") return;
+    // 占位数据属于上一组筛选，不能在它之上继续翻页。
+    if (!sentinel || !pages.hasNextPage || pages.isFetchingNextPage || pages.isPlaceholderData || typeof IntersectionObserver === "undefined") return;
     const observer = new IntersectionObserver((entries) => {
       if (entries.some((entry) => entry.isIntersecting)) void pages.fetchNextPage();
     }, { rootMargin: "600px 0px" });
     observer.observe(sentinel);
     return () => observer.disconnect();
-  }, [pages.fetchNextPage, pages.hasNextPage, pages.isFetchingNextPage]);
+  }, [pages.fetchNextPage, pages.hasNextPage, pages.isFetchingNextPage, pages.isPlaceholderData]);
 
   if (pages.error && !pages.data) return <section className="lux-page-state"><h1>媒体库加载失败</h1><p>{pages.error.message}</p></section>;
   if (!library && !libraries.isPending) return <section className="lux-page-state"><h1>媒体库不存在</h1><p>这个媒体库可能已被删除或你没有访问权限。</p></section>;
@@ -449,6 +453,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
         <div className="lux-library-sort-control"><span>收藏</span><LuxSelect value={favoriteValue} options={favoriteOptions} onChange={changeFavoriteFilter} aria-label="收藏筛选" /></div>
         {filtersActive ? <LuxButton tone="secondary" type="button" data-action="clear-library-filters" onClick={clearLibraryFilters}>清除筛选</LuxButton> : null}
       </div> : null}
+      {pages.isPlaceholderData && pages.isFetching ? <p className="lux-muted-copy" role="status">正在更新列表…</p> : null}
       <LibraryGrid
         key={JSON.stringify([libraryQueryKey, parentId])}
         items={loadedItems}

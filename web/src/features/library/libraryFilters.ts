@@ -31,7 +31,12 @@ export type LibraryFilterState = {
 
 export const EMPTY_LIBRARY_FILTERS: LibraryFilterState = { favoriteOnly: false };
 
-/** 媒体库可能有能力展示的类型；返回多项时页面才提供类型筛选。 */
+/**
+ * 媒体库可能有能力展示的类型；返回多项时页面才提供类型筛选。
+ *
+ * 有意为之：`HOMEVIDEOS`（其他视频）返回空数组，因为文件夹浏览的条目是 FOLDER，
+ * 与「已看/未看」和「类型」语义不明确；页面因此不对这类库显示任何筛选。
+ */
 export function libraryTypeFilterValues(kind?: LibraryKind): LibraryTypeFilter[] {
   if (kind === "MOVIE") return ["MOVIE"];
   if (kind === "SERIES") return ["SERIES"];

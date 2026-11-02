@@ -7,6 +7,7 @@ import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LibraryPage } from "../src/features/library/LibraryPage";
 import { api } from "../src/lib/api/client";
+import type { LibrariesResponse, MediaItem, PageResponse } from "../src/lib/api/types";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -122,6 +123,8 @@ describe("LibraryPage filters", () => {
       isPlayed: false,
       isFavorite: true,
     });
+    // 只有在库记录就绪后才发一次请求，不会先用未校验的 type 试探。
+    expect(libraryItems).toHaveBeenCalledTimes(1);
     expect(container?.querySelector<HTMLButtonElement>("[role='combobox'][aria-label='媒体类型']")?.textContent).toContain("电影");
   });
 
@@ -230,6 +233,205 @@ describe("LibraryPage filters", () => {
       }));
     });
     expect(locationSearch()).toContain("year=2024");
+  });
+
+  it("commits the typed year when the input loses focus", async () => {
+    vi.spyOn(api, "libraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "电影", kind: "MOVIE" }],
+    });
+    const libraryItems = vi.spyOn(api, "libraryItems").mockResolvedValue({
+      items: [{ id: "movie-1", title: "示例电影", itemType: "MOVIE" }],
+      page: 1,
+      pageSize: 24,
+      total: 1,
+    });
+
+    await renderLibraryPage("/libraries/library-1");
+    await waitForCards(1);
+
+    const yearInput = container?.querySelector<HTMLInputElement>("input[aria-label='年份']");
+    expect(yearInput).toBeTruthy();
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(yearInput, "1994");
+      yearInput?.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => {
+      yearInput?.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => expect(libraryItems).toHaveBeenLastCalledWith("library-1", 1, "MOVIE,SERIES", {
+        sortBy: "Name",
+        sortOrder: "Ascending",
+        fields: "card",
+        count: false,
+        year: 1994,
+      }));
+    });
+    expect(locationSearch()).toContain("year=1994");
+  });
+
+  it("rolls an invalid year back to the active filter instead of requesting it", async () => {
+    vi.spyOn(api, "libraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "电影", kind: "MOVIE" }],
+    });
+    const libraryItems = vi.spyOn(api, "libraryItems").mockResolvedValue({
+      items: [{ id: "movie-1", title: "示例电影", itemType: "MOVIE" }],
+      page: 1,
+      pageSize: 24,
+      total: 1,
+    });
+
+    await renderLibraryPage("/libraries/library-1?year=2024");
+    await waitForCards(1);
+    expect(libraryItems).toHaveBeenCalledTimes(1);
+
+    const yearInput = container?.querySelector<HTMLInputElement>("input[aria-label='年份']");
+    expect(yearInput?.value).toBe("2024");
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(yearInput, "202");
+      yearInput?.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => {
+      yearInput?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    });
+
+    expect(locationSearch()).toContain("year=2024");
+    expect(container?.querySelector<HTMLInputElement>("input[aria-label='年份']")?.value).toBe("2024");
+    expect(libraryItems).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores a two-digit year in the URL", async () => {
+    vi.spyOn(api, "libraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "电影", kind: "MOVIE" }],
+    });
+    const libraryItems = vi.spyOn(api, "libraryItems").mockResolvedValue({
+      items: [{ id: "movie-1", title: "示例电影", itemType: "MOVIE" }],
+      page: 1,
+      pageSize: 24,
+      total: 1,
+    });
+
+    await renderLibraryPage("/libraries/library-1?year=24");
+    await waitForCards(1);
+
+    expect(libraryItems).toHaveBeenLastCalledWith("library-1", 1, "MOVIE,SERIES", {
+      sortBy: "Name",
+      sortOrder: "Ascending",
+      fields: "card",
+      count: false,
+    });
+    expect(container?.querySelector<HTMLInputElement>("input[aria-label='年份']")?.value).toBe("");
+    expect(container?.querySelector("button[data-action='clear-library-filters']")).toBeNull();
+  });
+
+  it("keeps the filter toolbar and the year draft mounted while the filtered page loads", async () => {
+    let resolveFiltered: ((value: PageResponse<MediaItem>) => void) | undefined;
+    let calls = 0;
+    vi.spyOn(api, "libraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "影视合集", kind: "MIXED" }],
+    });
+    const libraryItems = vi.spyOn(api, "libraryItems").mockImplementation(() => {
+      calls += 1;
+      if (calls === 1) {
+        return Promise.resolve({
+          items: [{ id: "movie-1", title: "第一份结果", itemType: "MOVIE" }],
+          page: 1,
+          pageSize: 24,
+          total: 1,
+        });
+      }
+      return new Promise<PageResponse<MediaItem>>((resolve) => { resolveFiltered = resolve; });
+    });
+
+    await renderLibraryPage("/libraries/library-1");
+    await waitForCards(1);
+
+    const yearInput = container?.querySelector<HTMLInputElement>("input[aria-label='年份']");
+    expect(yearInput).toBeTruthy();
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(yearInput, "1999");
+      yearInput?.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(yearInput?.value).toBe("1999");
+
+    // 筛选切换会换掉查询键，但新结果还在路上：工具条和年份草稿不能被卸载。
+    await chooseSelectOption("观看状态", "UNPLAYED");
+
+    expect(calls).toBe(2);
+    expect(container?.querySelector(".lux-library-filter-toolbar")).not.toBeNull();
+    expect(container?.querySelector(".lux-library-page-loading")).toBeNull();
+    const mountedYearInput = container?.querySelector<HTMLInputElement>("input[aria-label='年份']");
+    expect(mountedYearInput).toBe(yearInput);
+    expect(mountedYearInput?.value).toBe("1999");
+    expect(container?.textContent).toContain("第一份结果");
+    expect(container?.textContent).toContain("正在更新列表");
+
+    await act(async () => {
+      resolveFiltered?.({
+        items: [{ id: "movie-2", title: "筛选后的结果", itemType: "MOVIE" }],
+        page: 1,
+        pageSize: 24,
+        total: 1,
+      });
+      await vi.waitFor(() => expect(container?.textContent).toContain("筛选后的结果"));
+    });
+  });
+
+  it("waits for the library record before applying the URL type filter", async () => {
+    let resolveLibraries: ((value: LibrariesResponse) => void) | undefined;
+    vi.spyOn(api, "libraries").mockImplementation(() => new Promise<LibrariesResponse>((resolve) => {
+      resolveLibraries = resolve;
+    }));
+    const libraryItems = vi.spyOn(api, "libraryItems").mockResolvedValue({
+      items: [{ id: "movie-1", title: "示例电影", itemType: "MOVIE" }],
+      page: 1,
+      pageSize: 24,
+      total: 1,
+    });
+
+    await renderLibraryPage("/libraries/library-1?type=SERIES");
+
+    // 库记录未到达：不发请求，也就不会先用未校验的 type=SERIES 请求一次。
+    expect(libraryItems).not.toHaveBeenCalled();
+    expect(container?.querySelector(".lux-library-page-loading")).not.toBeNull();
+
+    await act(async () => {
+      resolveLibraries?.({ libraries: [{ id: "library-1", name: "电影", kind: "MOVIE" }] });
+      await vi.waitFor(() => expect(libraryItems).toHaveBeenCalled());
+    });
+
+    expect(libraryItems).toHaveBeenCalledTimes(1);
+    expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "MOVIE,SERIES", {
+      sortBy: "Name",
+      sortOrder: "Ascending",
+      fields: "card",
+      count: false,
+    });
+  });
+
+  it("keeps folder-based HomeVideos libraries free of filters", async () => {
+    vi.spyOn(api, "libraries").mockResolvedValue({
+      libraries: [{ id: "home-videos", name: "其他视频", kind: "HOMEVIDEOS" }],
+    });
+    const libraryItems = vi.spyOn(api, "libraryItems").mockResolvedValue({
+      items: [{ id: "folder-trips", title: "Trips", itemType: "FOLDER" }],
+      page: 1,
+      pageSize: 24,
+      total: 1,
+    });
+
+    await renderLibraryPage("/libraries/home-videos?year=2024&status=played&favorite=1");
+    await waitForCards(1);
+
+    expect(container?.querySelector(".lux-library-filter-toolbar")).toBeNull();
+    expect(libraryItems).toHaveBeenCalledWith("home-videos", 1, undefined, {
+      sortBy: "Name",
+      sortOrder: "Ascending",
+      fields: "card",
+      count: false,
+      parentId: "root",
+    });
   });
 
   it("clears every filter back to the unfiltered list", async () => {
