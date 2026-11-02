@@ -1,0 +1,61 @@
+{
+  "formatVersion": 1,
+  "id": "org.lux.notifier.feishu",
+  "name": "飞书 / Lark 通知",
+  "description": "通过飞书或 Lark 自定义机器人 Webhook 发送 Lux 通知",
+  "version": "0.1.0",
+  "apiVersion": 1,
+  "runtime": {
+    "kind": "process",
+    "entrypoint": "binaries/${platform}-${arch}/lux-plugin-notifier-feishu"
+  },
+  "type": "notification",
+  "category": "NOTIFICATION",
+  "capabilities": ["notification.send"],
+  "configFields": [
+    {
+      "key": "secret",
+      "label": "Webhook 凭据",
+      "type": "password",
+      "required": true,
+      "sensitive": true,
+      "description": "自定义机器人 Webhook 地址最后一段的 hookId，格式为 hookId 或 hookId#signSecret；hookId 只允许 [A-Za-z0-9-]，带 signSecret 时会按飞书规范附加 timestamp 与 HMAC-SHA256 签名。该值只用于投递，不会出现在日志、返回结果或通知列表里。"
+    },
+    {
+      "key": "region",
+      "label": "集群",
+      "type": "select",
+      "required": false,
+      "defaultValue": "feishu",
+      "options": [
+        {"value": "feishu", "label": "飞书（open.feishu.cn）"},
+        {"value": "lark", "label": "Lark（open.larksuite.com）"}
+      ],
+      "description": "选择机器人所属集群，决定默认 API 基址。"
+    },
+    {
+      "key": "apiBase",
+      "label": "API 基址覆盖",
+      "type": "text",
+      "required": false,
+      "description": "仅供测试或企业代理使用，填 http(s) 基址；留空时按集群使用官方基址。不得包含凭据、查询参数或片段。因为该基址可由管理员指向任意主机，manifest 的 permissions.network 声明为 [\"*\"]，实际可达地址仍由宿主私网策略与插件目的地守卫限制。"
+    },
+    {
+      "key": "msgType",
+      "label": "消息格式",
+      "type": "select",
+      "required": false,
+      "defaultValue": "post",
+      "options": [
+        {"value": "post", "label": "富文本 post"},
+        {"value": "text", "label": "纯文本 text"}
+      ],
+      "description": "post 使用飞书富文本消息，text 使用纯文本消息；通知正文始终原样来自 Lux 核心。"
+    }
+  ],
+  "permissions": {
+    "network": ["*"],
+    "filesystem": []
+  },
+  "files": []
+}

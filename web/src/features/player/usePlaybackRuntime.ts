@@ -109,6 +109,15 @@ type PlaybackRuntimeOptions = {
   playbackDataRef: Ref<PlaybackState | undefined>;
   hasRestoredPositionRef: Ref<boolean>;
   videoRef: Ref<HTMLVideoElement | null>;
+  /**
+   * The mounted `<video>`, mirrored into React state (see `usePlayerVideoElement`).
+   *
+   * The page unmounts the surface while it renders a loading state — notably while the replacement
+   * session of a Direct Play fallback is still pending — and mounts a fresh element afterwards. The
+   * engine load must follow that element: without it the effect can run once with no element, bail,
+   * and never run again because the plan and URL are then identical to the render that bailed.
+   */
+  videoElement: HTMLVideoElement | null;
   engineRef: Ref<PlaybackEngine | null>;
   runtimeRef: Ref<LuxPlayerRuntime | null>;
   currentTimeRef: Ref<number>;
@@ -164,6 +173,7 @@ export function usePlaybackRuntime({
   playbackDataRef,
   hasRestoredPositionRef,
   videoRef,
+  videoElement,
   engineRef,
   runtimeRef,
   currentTimeRef,
@@ -231,9 +241,14 @@ export function usePlaybackRuntime({
   }, [restorePlaybackPosition]);
 
   useEffect(() => {
-    const initialEngine = engineRef.current
-      ?? (videoRef.current ? new NativeVideoEngine(videoRef.current) : null);
-    if (!initialEngine || !streamUrl) return;
+    // `videoElement` is the reactive copy of the mounted element. The fallback path unmounts the
+    // surface while the replacement session is pending, so this effect can run with no element at
+    // all; bailing is only safe because the same state value brings the effect back once the
+    // element is mounted again, even when the plan and the stream URL are already final. The guard
+    // must therefore test the element itself, not `engineRef` (which the ref callback fills in one
+    // render earlier) so one plan is loaded exactly once.
+    if (!videoElement || !streamUrl) return;
+    const initialEngine = engineRef.current ?? new NativeVideoEngine(videoElement);
     const runtime = runtimeRef.current ?? new LuxPlayerRuntime();
     runtimeRef.current = runtime;
     engineRef.current = initialEngine;
@@ -410,6 +425,15 @@ export function usePlaybackRuntime({
     let firstSegmentTimeout: number | undefined;
     let fallbackRequested = false;
     /**
+     * The watchdogs fire while the viewer is already watching, so the degraded session must start on
+     * its own instead of landing on a paused surface. The one-shot gate keeps the request only when
+     * the same episode really reloads (see `settleAutoStartPlaybackAfterFailure`).
+     */
+    const requestAutoStartForFallback = (element: HTMLVideoElement) => {
+      if (element.paused || element.ended) return;
+      autoStartGateRef.current.request();
+    };
+    /**
      * One server-side retry per load. Any engine failure on a `DIRECT` plan (native media error,
      * client MSE append rejection, remux worker error, first-segment timeout) asks the server for a
      * transcoding session; only a refused fallback ends in the engine-failure screen.
@@ -432,6 +456,7 @@ export function usePlaybackRuntime({
           ? clientDecodeFallbackDiagnostic(reason, message)
           : playbackFallbackDiagnostic(message));
       }
+      requestAutoStartForFallback(activeEngine.element);
       const reloadPending = await requestServerFallback(cause, reason, options);
       if (!cancelled) settleAutoStartPlaybackAfterFailure(autoStartGateRef.current, reloadPending);
       return reloadPending;
@@ -472,6 +497,7 @@ export function usePlaybackRuntime({
         if (!evaluateDirectPlayWatchdog(nativeWatchdog, Date.now())) return;
         fallbackRequested = true;
         console.warn(clientDecodeFallbackDiagnostic("stalled", "direct play produced no frame"));
+        requestAutoStartForFallback(initialEngine.element);
         void requestServerFallback(new Error("direct play produced no frame"), "stalled")
           .then((reloadPending) => {
             if (!cancelled) settleAutoStartPlaybackAfterFailure(autoStartGateRef.current, reloadPending);
@@ -646,5 +672,5 @@ export function usePlaybackRuntime({
       if (runtimeRef.current === runtime) runtimeRef.current = null;
       if (engineRef.current === activeEngine) engineRef.current = null;
     };
-  }, [candidate?.kind, candidates.length, hasNextCandidate, playbackKey, playbackPlan?.type, poster, remoteHttpSource, requestServerFallback, source, streamUrl]);
+  }, [candidate?.kind, candidates.length, hasNextCandidate, playbackKey, playbackPlan?.type, poster, remoteHttpSource, requestServerFallback, source, streamUrl, videoElement]);
 }

@@ -403,7 +403,7 @@ export function PlayerPage() {
     setShortcutHelpOpen: setShowShortcutHelp,
   });
 
-  const setVideoRef = usePlayerVideoElement({
+  const { setVideoRef, videoElement } = usePlayerVideoElement({
     videoRef,
     lastVideoRef,
     engineRef,
@@ -510,6 +510,7 @@ export function PlayerPage() {
     playbackDataRef,
     hasRestoredPositionRef,
     videoRef,
+    videoElement,
     engineRef,
     runtimeRef,
     currentTimeRef,

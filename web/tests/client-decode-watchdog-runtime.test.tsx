@@ -11,11 +11,11 @@
  * the runtime side of both watchdogs: the session is re-requested as server transcoding, with a
  * diagnostic and the degradation notice.
  */
-import { act, useRef } from "react";
+import { act, useCallback, useRef, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MediaSource, WebPlaybackPlan } from "../src/lib/api/types";
-import type { PlaybackEngine } from "../src/features/player/playback-engine";
+import { NativeVideoEngine, type PlaybackEngine } from "../src/features/player/playback-engine";
 import type { LuxPlayerRuntime } from "../src/features/player/core/player-runtime";
 import type { PlaybackReporting } from "../src/features/player/usePlaybackReporting";
 import {
@@ -76,6 +76,9 @@ function Harness({
 }) {
   const playbackDataRef = useRef(undefined) as never;
   const hasRestoredPositionRef = useRef(false);
+  // The runtime only loads a plan once the element is published, exactly like
+  // `usePlayerVideoElement` in the player page.
+  const [videoElement, setVideoElement] = useState<HTMLVideoElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const engineRef = useRef<PlaybackEngine | null>(null);
   const runtimeRef = useRef<LuxPlayerRuntime | null>(null);
@@ -98,6 +101,7 @@ function Harness({
     playbackDataRef,
     hasRestoredPositionRef,
     videoRef,
+    videoElement,
     engineRef,
     runtimeRef,
     currentTimeRef,
@@ -121,7 +125,12 @@ function Harness({
     setFallbackSpeedX: () => undefined,
     setClientEngineActive: () => undefined,
   });
-  return <video ref={videoRef} />;
+  const bindVideo = useCallback((video: HTMLVideoElement | null) => {
+    videoRef.current = video;
+    if (video) engineRef.current = new NativeVideoEngine(video);
+    setVideoElement(video);
+  }, [engineRef]);
+  return <video ref={bindVideo} />;
 }
 
 describe("client decode first-segment watchdog", () => {
