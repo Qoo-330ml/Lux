@@ -1,10 +1,7 @@
 //! Sidecar file IO: validation-first atomic writes, bounded reads and
 //! fingerprints.
 
-use std::{
-    fmt,
-    path::Path,
-};
+use std::{fmt, path::Path};
 
 use sha2::{Digest, Sha256};
 use tokio::{
