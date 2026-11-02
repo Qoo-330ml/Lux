@@ -608,3 +608,37 @@ PLUGIN_INTERNAL_ERROR
 ## TMDb 插件
 
 `org.lux.tmdb` 是对 Emby `MovieDb.dll` 行为的独立重写，不加载原始 DLL。功能范围包括电影、剧集、季、集、人物、合集、图片、外部 ID、预告片、语言、缓存、限流、重试和 TMDb v3 API Key。插件使用自己的缓存目录；Lux 负责最终元数据持久化、NFO/图片回写和 Emby DTO 映射。
+
+## 飞书 / Lark 通知插件（`org.lux.notifier.feishu`）
+
+`plugins/org.lux.notifier.feishu` 是把 Lux 通知投递到飞书或 Lark 自定义机器人 Webhook 的参考实现。它只
+新增 `src/bin/lux-plugin-notifier-feishu.rs`、manifest 和 `tests/plugins/notifier_feishu.rs`，不修改通知
+核心、SDK 或其他插件；进程外壳、出站 client、状态分类和正文渲染全部来自
+`luxd::application::notifier_plugin_sdk`。
+
+- manifest：`type: "notification"`、`category: "NOTIFICATION"`、`capabilities: ["notification.send"]`，
+  入口沿用 `binaries/${platform}-${arch}/lux-plugin-notifier-feishu`。
+- 凭据：唯一声明且仅声明一个 `secret` 字段（`type: "password"`、`sensitive: true`、`required: true`），
+  格式为 `hookId` 或 `hookId#signSecret`；`hookId` 只允许 `[A-Za-z0-9-]`。带 `signSecret` 时按飞书规范
+  在请求体附加 `timestamp`（Unix 秒）和 `sign = base64(HMAC-SHA256(key = timestamp + "\n" + signSecret,
+  data = ""))`。凭据只来自 RPC 的 `secret` 字段，不写文件、不进日志、不进返回值或错误信息。
+- 非敏感目标配置（属于每条通知目标，不落 `secret`）：`region`（`feishu`/`lark`，默认 `feishu`，决定
+  `https://open.feishu.cn` 或 `https://open.larksuite.com`）、`apiBase`（可选覆盖，仅测试或企业代理使用，
+  只接受不含凭据、查询参数和片段的 http(s) 基址）、`msgType`（`post`/`text`，默认 `post`）。通知正文由
+  `render_event_text` 原样转发核心生成的 `title`/`content`，插件不重写。
+- 请求：`POST {base}/open-apis/bot/v2/hook/{hookId}`，`post` 使用飞书富文本消息，`text` 使用纯文本消息。
+  出站 client 来自 `outbound_http_client_from_env`：10 秒超时、不跟随重定向、遵循 `LUX_PROXY_URL`。
+- 结果分类：HTTP `2xx` 且响应 `code == 0` 为 `DELIVERED`；HTTP `429`/`5xx`（以及 `408`、`425`）与飞书
+  频控业务码 `11232`、`19xxx` 为 `RETRYABLE`（HTTP `Retry-After` 会转成 `retry_after_seconds`）；其余
+  HTTP `4xx` 和其他非 0 业务码为 `FAILED`。网络错误与超时为 `RETRYABLE`，响应体超过 64 KiB 或无法解析为
+  飞书响应时为 `FAILED`。
+- 稳定错误码：`missing_secret`、`invalid_secret`、`invalid_config`、`provider_timeout`、
+  `provider_unreachable`、`provider_response_too_large`、`provider_invalid_response`、
+  `provider_rate_limited`、`provider_code_<业务码>`；HTTP 状态沿用 SDK 的 `PROVIDER_HTTP_<状态码>`。
+  这些代码和 stderr 诊断都不包含凭据、hook 路径或完整外部 URL 与 query。
+- 测试：`cargo test --locked --test plugins notifier_feishu::` 用 127.0.0.1 随机端口的本地 mock 覆盖成功、
+  签名、4xx、429/5xx、频控业务码、超时、过大响应、坏配置和缺失/畸形凭据，并断言凭据不出现在返回值和捕获
+  的 stderr 日志中；不访问真实飞书服务，仓库里只有合成测试值。
+- 打包：`scripts/package-notifier-plugin.sh org.lux.notifier.feishu` 生成
+  `dist/plugins/org.lux.notifier.feishu-0.1.0-<platform>-<arch>.zip`（`dist/` 已被忽略，不提交产物）。
+
