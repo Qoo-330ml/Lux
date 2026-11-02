@@ -15,6 +15,13 @@ import type { DanmakuPlacement, DanmakuScheduler } from "./schedule";
 /** A media-time jump bigger than this is a seek, not interpolation drift. */
 export const DANMAKU_SEEK_THRESHOLD_SECONDS = 0.5;
 
+/**
+ * Wall-clock seconds the renderer may extrapolate past the last sample. A buffering stall keeps
+ * `paused === false` while `currentTime` freezes; without a bound the danmaku clock would run away
+ * from the picture and every entry would leave the screen before playback resumes.
+ */
+export const DANMAKU_MAX_INTERPOLATION_DRIFT_SECONDS = 2;
+
 export type DanmakuClockAnchor = {
   mediaTime: number;
   wallTime: number;
@@ -49,7 +56,8 @@ export function interpolateMediaTime(anchor: DanmakuClockAnchor, wallTime: numbe
   const elapsed = wallTime - anchor.wallTime;
   if (!Number.isFinite(elapsed) || elapsed <= 0) return anchor.mediaTime;
   const rate = Number.isFinite(anchor.playbackRate) && anchor.playbackRate > 0 ? anchor.playbackRate : 1;
-  return anchor.mediaTime + (elapsed / 1000) * rate;
+  const bounded = Math.min(elapsed / 1000, DANMAKU_MAX_INTERPOLATION_DRIFT_SECONDS);
+  return anchor.mediaTime + bounded * rate;
 }
 
 function roundPosition(value: number) {

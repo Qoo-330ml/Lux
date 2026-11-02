@@ -2,6 +2,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  DANMAKU_MAX_INTERPOLATION_DRIFT_SECONDS,
   DANMAKU_SEEK_THRESHOLD_SECONDS,
   createDanmakuEngine,
   createDanmakuScheduler,
@@ -74,6 +75,15 @@ describe("LuxPlayer danmaku frame clock", () => {
     expect(interpolateMediaTime({ ...anchor, playbackRate: 2 }, 500)).toBe(10);
     expect(interpolateMediaTime({ ...anchor, mediaTime: Number.NaN }, 2_000)).toBe(0);
   });
+
+  it("does not run away from the video when it stops reporting time", () => {
+    // A buffering stall keeps `paused === false` while `currentTime` freezes, so unbounded
+    // interpolation would scroll danmaku off-screen long before the picture resumes.
+    const anchor = { mediaTime: 10, wallTime: 1_000, playing: true, playbackRate: 1 };
+    expect(interpolateMediaTime(anchor, 60_000)).toBe(10 + DANMAKU_MAX_INTERPOLATION_DRIFT_SECONDS);
+    expect(interpolateMediaTime({ ...anchor, playbackRate: 2 }, 60_000))
+      .toBe(10 + DANMAKU_MAX_INTERPOLATION_DRIFT_SECONDS * 2);
+  });
 });
 
 describe("LuxPlayer danmaku renderer", () => {
@@ -141,7 +151,12 @@ describe("LuxPlayer danmaku renderer", () => {
     engine.sync({ mediaTime: 0, playing: true, playbackRate: 1 });
     expect(nodes(container)).toHaveLength(1);
 
-    driver.step(8_000);
+    // Walk a realistic 4 Hz sample cadence through the 8s lifetime of the entry; the frames in
+    // between interpolate, and the node disappears once the danmaku has left the screen.
+    for (let sample = 1; sample <= 32; sample += 1) {
+      engine.sync({ mediaTime: sample * 0.25, playing: true, playbackRate: 1 });
+      driver.step(250);
+    }
     expect(nodes(container)).toHaveLength(0);
 
     engine.sync({ mediaTime: 0, playing: true, playbackRate: 1 });

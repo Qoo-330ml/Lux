@@ -43,6 +43,7 @@ export {
 } from "./schedule";
 
 export {
+  DANMAKU_MAX_INTERPOLATION_DRIFT_SECONDS,
   DANMAKU_SEEK_THRESHOLD_SECONDS,
   createDanmakuEngine,
   interpolateMediaTime,
