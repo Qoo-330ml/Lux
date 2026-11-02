@@ -1,8 +1,9 @@
 use std::{path::Path, time::Duration};
 
 use luxd::application::danmaku::{
-    DanmakuService, DanmakuServiceError, MAX_DANMAKU_XML_BYTES, atomic_write_danmaku_xml,
-    danmaku_sidecar_path, validate_danmaku_xml, validate_provider_base_url,
+    DanmakuService, DanmakuServiceError, DanmakuSidecarScope, MAX_DANMAKU_XML_BYTES,
+    atomic_write_danmaku_xml, danmaku_sidecar_path, validate_danmaku_xml,
+    validate_provider_base_url,
 };
 use luxd::application::{
     libraries::LibraryService,
@@ -313,7 +314,11 @@ async fn danmaku_service_matches_local_and_strm_sources_and_writes_sidecars()
     .fetch_one(database.pool())
     .await?;
     let strm_danmaku = service
-        .read_registered_sidecar_for_source(&strm_item_id, Some(&strm_source_id))
+        .read_for_playback(
+            &strm_item_id,
+            Some(&strm_source_id),
+            DanmakuSidecarScope::RegisteredTrack,
+        )
         .await?;
     assert!(strm_danmaku.is_some());
     let track_status: String = sqlx::query_scalar("SELECT status FROM danmaku_tracks LIMIT 1")

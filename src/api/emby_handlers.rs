@@ -331,7 +331,10 @@ pub(super) async fn emby_danmaku_info(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
     let service = state.danmaku();
-    match service.read_sidecar(&item_id).await {
+    match service
+        .read_for_playback(&item_id, None, DanmakuSidecarScope::AnySource)
+        .await
+    {
         Ok(Some(_)) => Json(json!({
             "hasDanmaku": true,
             "format": "xml",
@@ -368,7 +371,10 @@ pub(super) async fn emby_danmaku_raw(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
     let service = state.danmaku();
-    match service.read_sidecar(&item_id).await {
+    match service
+        .read_for_playback(&item_id, None, DanmakuSidecarScope::AnySource)
+        .await
+    {
         Ok(Some(bytes)) => Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "application/xml; charset=utf-8")
