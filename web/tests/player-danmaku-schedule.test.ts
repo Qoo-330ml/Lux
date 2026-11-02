@@ -1,10 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   DANMAKU_LANE_GAP,
   FIXED_DURATION_SECONDS,
   SCROLL_DURATION_SECONDS,
   createDanmakuScheduler,
   createTextMeasurer,
+  DANMAKU_AREA_FRACTIONS,
   laneGeometry,
   matchesDanmakuKeyword,
   type MeasureText,
@@ -352,5 +353,124 @@ describe("LuxPlayer danmaku layout settings", () => {
 
     scheduler.updateLayout({ offsetSeconds: 5 });
     expect(scheduler.place(0).map((placement) => placement.text)).toEqual(["稍后"]);
+  });
+});
+
+
+describe("LuxPlayer danmaku lane pitch and display area", () => {
+  function layout(overrides: Partial<DanmakuLayoutOptions> = {}): DanmakuLayoutOptions {
+    return {
+      ...DEFAULT_DANMAKU_LAYOUT,
+      blockedModes: [],
+      keywords: [],
+      ...overrides,
+    };
+  }
+
+  it("derives the lane pitch from the rendered font size so adjacent lanes never overlap", () => {
+    // Bilibili's default danmaku font is 25px and the CSS line-height is 1.2; a lane must reserve
+    // at least one full text line, otherwise a 2.0x scale paints one lane over the next.
+    const shared = Array.from({ length: 8 }, (_, index) => entry(index, 0, "字"));
+
+    for (const fontScale of [0.5, 1, 2]) {
+      const scheduler = createDanmakuScheduler(shared, {
+        viewport: { width: 800, height: 720 },
+        measure,
+        layout: layout({ fontScale }),
+      });
+      const placements = scheduler.place(0).sort((left, right) => left.y - right.y);
+
+      expect(placements.length).toBeGreaterThan(1);
+      const expectedPitch = Math.ceil(25 * fontScale * 1.2);
+      for (const placement of placements) {
+        expect(placement.lineHeight).toBe(expectedPitch);
+      }
+      for (let index = 1; index < placements.length; index += 1) {
+        const previous = placements[index - 1]!;
+        const current = placements[index]!;
+        expect(current.y).toBeGreaterThanOrEqual(previous.y + previous.lineHeight);
+      }
+    }
+  });
+
+  it("reserves the pitch of the largest rendered entry instead of clipping it", () => {
+    const entries: LuxDanmakuEntry[] = [
+      entry(0, 0, "小"),
+      { ...entry(1, 0, "大"), fontSize: 64 },
+    ];
+    const scheduler = createDanmakuScheduler(entries, {
+      viewport: { width: 800, height: 720 },
+      measure,
+    });
+    const placements = scheduler.place(0);
+
+    // 64 * 1.2 = 76.8 -> 77px, so even the small entry uses the same non-overlapping pitch.
+    for (const placement of placements) {
+      expect(placement.lineHeight).toBe(77);
+    }
+    const sorted = placements.sort((left, right) => left.y - right.y);
+    expect(sorted[1]!.y).toBeGreaterThanOrEqual(sorted[0]!.y + sorted[0]!.lineHeight);
+  });
+
+  it("keeps scrolling and top danmaku inside the selected band on small viewports", () => {
+    const heights = [210, 390, 720];
+    const areas = ["full", "half", "quarter"] as const;
+
+    for (const height of heights) {
+      for (const area of areas) {
+        const scheduler = createDanmakuScheduler(
+          [
+            entry(0, 0, "滚动"),
+            { ...entry(1, 0, "顶部"), mode: "top" },
+            { ...entry(2, 0, "底部"), mode: "bottom" },
+          ],
+          {
+            viewport: { width: 800, height },
+            measure,
+            layout: layout({ area }),
+          },
+        );
+        const placements = scheduler.place(0);
+        const band = height * DANMAKU_AREA_FRACTIONS[area];
+
+        for (const placement of placements) {
+          // Bottom danmaku are pinned to the video bottom and deliberately ignore the area band.
+          const limit = placement.mode === "bottom" ? height : band;
+          expect(placement.y + placement.lineHeight).toBeLessThanOrEqual(limit);
+        }
+        expect(placements.some((placement) => placement.mode === "top")).toBe(true);
+      }
+    }
+  });
+
+  it("scales the top and bottom dwell time with the speed multiplier", () => {
+    for (const mode of ["top", "bottom"] as const) {
+      const scheduler = createDanmakuScheduler([{ ...entry(0, 0), mode }], {
+        viewport,
+        measure,
+        layout: layout({ speed: 2 }),
+      });
+      expect(scheduler.place(0)[0]!.duration).toBe(FIXED_DURATION_SECONDS / 2);
+    }
+  });
+
+  it("does not rebuild the filtered table for slider-only settings changes", () => {
+    // A 50k-entry file must not be re-filtered on every input event while dragging a slider; only
+    // the discrete block/keyword edits may rebuild it.
+    const entries = Array.from({ length: 5_000 }, (_, index) => entry(index, index * 0.01));
+    const onPrepare = vi.fn();
+    const scheduler = createDanmakuScheduler(entries, { viewport, measure, onPrepare });
+    expect(onPrepare).toHaveBeenCalledTimes(1);
+
+    expect(scheduler.updateLayout({ fontScale: 1.5 })).toBe(true);
+    expect(scheduler.updateLayout({ speed: 1.5 })).toBe(true);
+    expect(scheduler.updateLayout({ area: "half" })).toBe(true);
+    expect(scheduler.updateLayout({ offsetSeconds: 5 })).toBe(true);
+    expect(onPrepare).toHaveBeenCalledTimes(1);
+
+    scheduler.updateLayout({ blockedModes: ["scroll"] });
+    expect(onPrepare).toHaveBeenCalledTimes(2);
+    scheduler.updateLayout({ keywords: ["弹幕"] });
+    expect(onPrepare).toHaveBeenCalledTimes(3);
   });
 });

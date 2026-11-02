@@ -7,6 +7,7 @@ import {
   createDanmakuEngine,
   createDanmakuScheduler,
   interpolateMediaTime,
+  laneGeometry,
   type DanmakuScheduler,
   type MeasureText,
 } from "../src/features/player/danmaku";
@@ -87,6 +88,9 @@ describe("LuxPlayer danmaku frame clock", () => {
 });
 
 describe("LuxPlayer danmaku renderer", () => {
+  // First scrolling lane: below the top fixed band, derived from the shared lane pitch.
+  const SCROLL_TOP = laneGeometry(viewport.height).fixedBandHeight + 8;
+
   it("drives positions with transform instead of re-rendering on every frame", () => {
     const { container, engine, driver } = createHarness();
     engine.sync({ mediaTime: 0, playing: true, playbackRate: 1 });
@@ -99,13 +103,13 @@ describe("LuxPlayer danmaku renderer", () => {
     expect(node!.style.left).toBe("");
     expect(node!.style.top).toBe("");
     // 5 characters at 20px plus the shared padding, capped by the overlay width.
-    expect(node!.style.transform).toBe("translate3d(800px, 84px, 0)");
+    expect(node!.style.transform).toBe(`translate3d(800px, ${SCROLL_TOP}px, 0)`);
 
     driver.step(1_000);
     const [moved] = nodes(container);
     // The DOM node is reused; only its transform changed one second later.
     expect(moved).toBe(node);
-    expect(moved!.style.transform).toBe("translate3d(686.5px, 84px, 0)");
+    expect(moved!.style.transform).toBe(`translate3d(686.5px, ${SCROLL_TOP}px, 0)`);
   });
 
   it("scrolls twice as fast at 2x playback by advancing the media-time clock", () => {
@@ -115,7 +119,7 @@ describe("LuxPlayer danmaku renderer", () => {
     driver.step(1_000);
     const [node] = nodes(container);
     // One wall-clock second at 2x equals two media seconds, matching the video rhythm.
-    expect(node!.style.transform).toBe("translate3d(573px, 84px, 0)");
+    expect(node!.style.transform).toBe(`translate3d(573px, ${SCROLL_TOP}px, 0)`);
   });
 
   it("stops rendering frames while paused and resumes from the new anchor", () => {
@@ -130,7 +134,7 @@ describe("LuxPlayer danmaku renderer", () => {
     expect(nodes(container)[0]!.style.transform).toBe(paused);
 
     engine.sync({ mediaTime: 5, playing: true, playbackRate: 1 });
-    expect(nodes(container)[0]!.style.transform).toBe("translate3d(232.5px, 84px, 0)");
+    expect(nodes(container)[0]!.style.transform).toBe(`translate3d(232.5px, ${SCROLL_TOP}px, 0)`);
   });
 
   it("re-anchors immediately after a seek instead of interpolating across the jump", () => {
