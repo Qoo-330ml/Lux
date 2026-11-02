@@ -5518,6 +5518,16 @@ pub(crate) struct ResumeItemsQuery<'a> {
     pub(crate) limit: i64,
 }
 
+/// One page of the current user's watch history (seen items, newest play first).
+pub(crate) struct WatchHistoryQuery<'a> {
+    pub(crate) user_id: &'a str,
+    pub(crate) library_ids: &'a [String],
+    pub(crate) item_types: &'a [&'a str],
+    pub(crate) content_restrictions: Option<&'a UserContentRestrictions>,
+    pub(crate) offset: i64,
+    pub(crate) limit: i64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CatalogSort {
     Name,

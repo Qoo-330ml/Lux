@@ -23,7 +23,7 @@ use crate::{
         CatalogFilterQuery, CatalogSearchQuery, CatalogSort as StorageCatalogSort, Database,
         GLOBAL_COLLECTION_LIBRARY_ID, RecentByLibraryReadModelQuery, RecentReadModelQuery,
         ResumeItemsQuery, ResumePointerQuery, StorageError, StoredCatalogDetail, StoredCatalogRow,
-        StoredMediaChapter, UserContentRestrictions,
+        StoredMediaChapter, UserContentRestrictions, WatchHistoryQuery,
     },
 };
 
@@ -148,6 +148,8 @@ const MAX_LIBRARY_PAGE_CACHE_ENTRIES: usize = 256;
 const MAX_LIBRARY_PAGE_REFRESH_ENTRIES: usize = 64;
 const MAX_SEARCH_FLIGHTS: usize = 256;
 const DEFAULT_SEARCH_ITEM_TYPES: [&str; 2] = ["MOVIE", "SERIES"];
+/// Item kinds that can carry playback progress, so the watch history only lists playable leaves.
+const WATCH_HISTORY_ITEM_TYPES: [&str; 3] = ["MOVIE", "EPISODE", "VIDEO"];
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct SearchFlightKey {
@@ -1740,6 +1742,32 @@ impl CatalogService {
             content_restrictions.as_ref(),
         )
         .await
+    }
+
+    /// One page of the current user's watch history: seen movies, episodes and videos, newest
+    /// play first.
+    ///
+    /// The page is scoped to the caller (`user_id`), filtered by the same library ACL and content
+    /// restrictions as the other catalog lists, and paginated in SQL.
+    pub async fn list_watch_history(
+        &self,
+        principal: AccessPrincipal,
+        user_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<CatalogPage, CatalogError> {
+        let library_ids = self.access.accessible_library_ids(principal).await?;
+        let content_restrictions = self.content_restrictions_for_principal(principal).await?;
+        let query = WatchHistoryQuery {
+            user_id,
+            library_ids: &library_ids,
+            item_types: &WATCH_HISTORY_ITEM_TYPES,
+            content_restrictions: content_restrictions.as_ref(),
+            offset,
+            limit,
+        };
+        let (rows, total) = self.database.list_watch_history_items(&query).await?;
+        Ok(CatalogPage::new(assemble_items(rows), total, offset, limit))
     }
 
     pub(crate) async fn list_continue_watching_for_library_ids(

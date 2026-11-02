@@ -8,6 +8,7 @@ pub(super) fn api_routes() -> Router<ReadyAppState> {
             get(lux_library_cover).head(lux_library_cover),
         )
         .route("/api/v1/favorites", get(lux_list_favorites))
+        .route("/api/v1/watch-history", get(lux_list_watch_history))
         .route("/api/v1/search", get(lux_search))
         .route("/api/v1/home", get(lux_home))
         .route("/api/v1/home/carousel", get(lux_home_carousel))
