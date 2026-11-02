@@ -11,7 +11,9 @@
   },
   "type": "notification",
   "category": "NOTIFICATION",
-  "capabilities": ["notification.send"],
+  "capabilities": [
+    "notification.send"
+  ],
   "configFields": [
     {
       "key": "secret",
@@ -36,7 +38,7 @@
       "defaultValue": 587,
       "minimum": 1,
       "maximum": 65535,
-      "description": "SMTP 服务器端口，常用的有 587（STARTTLS）和 465（SSL）。"
+      "description": "SMTP 服务器端口；留空时按加密方式取默认值（STARTTLS 587，SSL 465）。"
     },
     {
       "key": "security",
@@ -45,11 +47,16 @@
       "required": true,
       "defaultValue": "starttls",
       "options": [
-        {"value": "starttls", "label": "STARTTLS"},
-        {"value": "ssl", "label": "SSL/TLS"},
-        {"value": "none", "label": "不加密（仅内网测试）"}
+        {
+          "value": "starttls",
+          "label": "STARTTLS"
+        },
+        {
+          "value": "ssl",
+          "label": "SSL/TLS"
+        }
       ],
-      "description": "STARTTLS 会先建立明文连接再升级；SSL/TLS 直接使用加密连接；不加密只应在可信内网使用。"
+      "description": "STARTTLS 先建立连接再升级加密；SSL/TLS 直接使用加密连接。插件不提供明文 SMTP 模式。"
     },
     {
       "key": "username",
@@ -74,7 +81,9 @@
     }
   ],
   "permissions": {
-    "network": ["*"],
+    "network": [
+      "*"
+    ],
     "filesystem": []
   },
   "files": []

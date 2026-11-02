@@ -31,6 +31,12 @@ const REJECTED_SECRET: &str = "smtp-test-password-rejected";
 /// Test-only timeout knob, clamped by the plugin to at most the SDK's delivery window.
 const TIMEOUT_ENV: &str = "LUX_PLUGIN_SMTP_TIMEOUT_SECONDS";
 
+/// Test-only plaintext seam of the plugin. A destination never offers plaintext SMTP; the suite
+/// needs an unencrypted local relay to drive the happy path (a TLS server and a custom trust root
+/// would need a new crate, which this task must not add). The plugin accepts `security: "none"`
+/// only while this flag is `1` and the relay address is a loopback address.
+const PLAINTEXT_TEST_ENV: &str = "LUX_NOTIFIER_EMAIL_TEST_PLAINTEXT";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SmtpReply {
     /// Full happy path: accept the credential, both recipients and the message.
@@ -41,6 +47,8 @@ enum SmtpReply {
     PermanentRecipient,
     /// Permanent 5xx reply to `AUTH`.
     AuthRejected,
+    /// Accept the connection and close it immediately.
+    Hangup,
     /// Accept the connection but never answer, so the client must hit its own timeout.
     Silent,
 }
@@ -108,6 +116,10 @@ async fn serve(
     reply: SmtpReply,
     received: Arc<Mutex<Received>>,
 ) -> io::Result<()> {
+    if reply == SmtpReply::Hangup {
+        // Accept and close at once: the client sees a dropped connection instead of a greeting.
+        return Ok(());
+    }
     if reply == SmtpReply::Silent {
         // Read and discard whatever the client sends; never answer.
         let mut buffer = [0_u8; 1024];
@@ -201,16 +213,30 @@ struct Session {
 }
 
 impl Session {
+    /// Starts a plugin whose destination configuration may not use plaintext SMTP.
     async fn start(timeout_seconds: Option<u64>) -> io::Result<Self> {
+        Self::start_with(timeout_seconds, false).await
+    }
+
+    /// Starts a plugin with the test-only plaintext seam enabled.
+    async fn start_plaintext(timeout_seconds: Option<u64>) -> io::Result<Self> {
+        Self::start_with(timeout_seconds, true).await
+    }
+
+    async fn start_with(timeout_seconds: Option<u64>, plaintext: bool) -> io::Result<Self> {
         let mut command = Command::new(env!("CARGO_BIN_EXE_lux-plugin-notifier-email"));
         command
             .env_remove("LUX_PROXY_URL")
             .env_remove(TIMEOUT_ENV)
+            .env_remove(PLAINTEXT_TEST_ENV)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(seconds) = timeout_seconds {
             command.env(TIMEOUT_ENV, seconds.to_string());
+        }
+        if plaintext {
+            command.env(PLAINTEXT_TEST_ENV, "1");
         }
         let mut child = command.spawn()?;
         let stdin = child
@@ -383,7 +409,7 @@ fn assert_no_secret_leak(result: &NotificationSendRpcResult, log: &str) {
 #[tokio::test]
 async fn delivers_a_plain_text_message_over_smtp() -> Result<(), Box<dyn std::error::Error>> {
     let server = FakeSmtp::start(SmtpReply::Deliver).await?;
-    let mut session = Session::start(None).await?;
+    let mut session = Session::start_plaintext(None).await?;
 
     let result = session
         .notify(send_params(
@@ -441,7 +467,7 @@ async fn delivers_a_plain_text_message_over_smtp() -> Result<(), Box<dyn std::er
 async fn delivers_without_authentication_when_no_username_is_configured()
 -> Result<(), Box<dyn std::error::Error>> {
     let server = FakeSmtp::start(SmtpReply::Deliver).await?;
-    let mut session = Session::start(None).await?;
+    let mut session = Session::start_plaintext(None).await?;
 
     let result = session
         .notify(send_params(
@@ -467,7 +493,7 @@ async fn delivers_without_authentication_when_no_username_is_configured()
 async fn a_missing_or_empty_secret_is_a_permanent_failure() -> Result<(), Box<dyn std::error::Error>>
 {
     let server = FakeSmtp::start(SmtpReply::Deliver).await?;
-    let mut session = Session::start(None).await?;
+    let mut session = Session::start_plaintext(None).await?;
     let config = email_config(server.address, "none", Some("lux@example.invalid"));
 
     let missing = session.notify(send_params(config.clone(), None)).await?;
@@ -515,6 +541,10 @@ async fn an_invalid_configuration_is_a_permanent_failure_with_a_stable_code()
         (
             "unknown security",
             json!({"smtpHost": host, "smtpPort": port, "security": "tls1", "from": "lux@example.invalid", "to": "ops@example.invalid"}),
+        ),
+        (
+            "plaintext security is not a destination option",
+            json!({"smtpHost": host, "smtpPort": port, "security": "none", "from": "lux@example.invalid", "to": "ops@example.invalid"}),
         ),
         (
             "zero port",
@@ -572,9 +602,37 @@ async fn an_invalid_configuration_is_a_permanent_failure_with_a_stable_code()
 }
 
 #[tokio::test]
+async fn the_plaintext_seam_only_applies_to_a_loopback_relay()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut session = Session::start_plaintext(None).await?;
+    let config = json!({
+        "smtpHost": "smtp.example.invalid",
+        "smtpPort": 2525,
+        "security": "none",
+        "from": "lux@example.invalid",
+        "to": "ops@example.invalid",
+    });
+
+    let result = session
+        .notify(send_params(config, Some(TEST_SECRET)))
+        .await?;
+
+    assert_eq!(
+        result.status,
+        NotificationSendStatus::Failed,
+        "the test seam must not enable plaintext for a remote relay"
+    );
+    assert_eq!(error_code(&result), "invalid_config");
+
+    let log = session.shutdown().await?;
+    assert_no_secret_leak(&result, &log);
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_transient_smtp_reply_is_retryable() -> Result<(), Box<dyn std::error::Error>> {
     let server = FakeSmtp::start(SmtpReply::TransientRecipient).await?;
-    let mut session = Session::start(None).await?;
+    let mut session = Session::start_plaintext(None).await?;
 
     let result = session
         .notify(send_params(
@@ -595,7 +653,7 @@ async fn a_transient_smtp_reply_is_retryable() -> Result<(), Box<dyn std::error:
 async fn permanent_smtp_replies_are_failures() -> Result<(), Box<dyn std::error::Error>> {
     for reply in [SmtpReply::PermanentRecipient, SmtpReply::AuthRejected] {
         let server = FakeSmtp::start(reply).await?;
-        let mut session = Session::start(None).await?;
+        let mut session = Session::start_plaintext(None).await?;
 
         let result = session
             .notify(send_params(
@@ -618,16 +676,14 @@ async fn permanent_smtp_replies_are_failures() -> Result<(), Box<dyn std::error:
 }
 
 #[tokio::test]
-async fn an_unreachable_smtp_server_is_retryable() -> Result<(), Box<dyn std::error::Error>> {
-    // Reserve a port and release it so the connection is refused immediately.
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let address = listener.local_addr()?;
-    drop(listener);
-
-    let mut session = Session::start(None).await?;
+async fn a_dropped_smtp_connection_is_retryable() -> Result<(), Box<dyn std::error::Error>> {
+    // The relay accepts and closes at once, so the failure is deterministic: no port is released
+    // and reused, and the plugin sees a network error rather than a timeout or a delivery.
+    let server = FakeSmtp::start(SmtpReply::Hangup).await?;
+    let mut session = Session::start_plaintext(Some(2)).await?;
     let result = session
         .notify(send_params(
-            email_config(address, "none", None),
+            email_config(server.address, "none", None),
             Some(TEST_SECRET),
         ))
         .await?;
@@ -641,10 +697,41 @@ async fn an_unreachable_smtp_server_is_retryable() -> Result<(), Box<dyn std::er
 }
 
 #[tokio::test]
+async fn the_default_port_follows_the_security_mode() -> Result<(), Box<dyn std::error::Error>> {
+    // No smtpPort: STARTTLS falls back to 587 and implicit TLS to 465. Nothing listens on either
+    // loopback port, so the attempt fails immediately and the log line reports the endpoint the
+    // plugin actually dialled.
+    for (security, port) in [("starttls", 587_u16), ("ssl", 465)] {
+        let mut session = Session::start(None).await?;
+        let config = json!({
+            "smtpHost": "127.0.0.1",
+            "security": security,
+            "from": "lux@example.invalid",
+            "to": "ops@example.invalid",
+        });
+        let result = session
+            .notify(send_params(config, Some(TEST_SECRET)))
+            .await?;
+        assert_ne!(
+            result.status,
+            NotificationSendStatus::Delivered,
+            "{security} must not report a delivery without a relay"
+        );
+        let log = session.shutdown().await?;
+        assert!(
+            log.contains(&format!("endpoint=127.0.0.1:{port}")),
+            "{security} must default to port {port}, got: {log}"
+        );
+        assert_no_secret_leak(&result, &log);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_silent_smtp_server_ticks_the_delivery_timeout() -> Result<(), Box<dyn std::error::Error>>
 {
     let server = FakeSmtp::start(SmtpReply::Silent).await?;
-    let mut session = Session::start(Some(1)).await?;
+    let mut session = Session::start_plaintext(Some(1)).await?;
 
     let started = Instant::now();
     let result = session
@@ -687,9 +774,9 @@ async fn the_transport_security_modes_are_validated_before_relaying()
         "a STARTTLS requirement must fail before any credential or recipient is sent"
     );
 
-    // SMTPS: a plaintext greeting cannot answer a TLS handshake. `lettre` reports a rustls
-    // handshake failure as a connection error, so the plugin keeps it retryable instead of
-    // claiming a delivery, and it still never sends the credential to an unencrypted peer.
+    // SMTPS: a plaintext greeting cannot answer a TLS handshake. The plugin must recognise the
+    // handshake failure buried in the connection error and report a permanent TLS failure instead
+    // of a retryable network error, and it must never send the credential to an unencrypted peer.
     let server = FakeSmtp::start(SmtpReply::Deliver).await?;
     let smtps = session
         .notify(send_params(
@@ -697,8 +784,8 @@ async fn the_transport_security_modes_are_validated_before_relaying()
             Some(TEST_SECRET),
         ))
         .await?;
-    assert_eq!(smtps.status, NotificationSendStatus::Retryable);
-    assert_eq!(error_code(&smtps), "smtp_unavailable");
+    assert_eq!(smtps.status, NotificationSendStatus::Failed);
+    assert_eq!(error_code(&smtps), "smtp_tls_failed");
     assert!(
         server.auth_commands().is_empty() && server.recipients().is_empty(),
         "an SSL requirement must fail before any credential or recipient is sent"
@@ -713,7 +800,7 @@ async fn the_transport_security_modes_are_validated_before_relaying()
 #[tokio::test]
 async fn unknown_methods_are_reported_without_stopping_the_plugin()
 -> Result<(), Box<dyn std::error::Error>> {
-    let mut session = Session::start(None).await?;
+    let mut session = Session::start_plaintext(None).await?;
 
     let response = session.send("ping", "plugin.health", json!({})).await?;
     assert_eq!(
@@ -777,5 +864,21 @@ fn the_packaged_manifest_is_a_single_secret_notification_provider()
             field.key
         );
     }
+
+    let security = manifest
+        .config_fields
+        .iter()
+        .find(|field| field.key == "security")
+        .expect("the security mode must be declared");
+    let options = security
+        .options
+        .iter()
+        .map(|option| option.value.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        options,
+        vec!["starttls", "ssl"],
+        "an unencrypted SMTP mode must never be offered to an administrator"
+    );
     Ok(())
 }

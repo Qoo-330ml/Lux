@@ -32,7 +32,9 @@ use serde_json::Value;
 /// Stable plugin identity, also used as the log prefix so a captured log is attributable.
 const PLUGIN_ID: &str = "org.lux.notifier.email";
 /// Port used when the destination configuration omits `smtpPort`.
-const DEFAULT_SMTP_PORT: u16 = 587;
+const DEFAULT_STARTTLS_PORT: u16 = 587;
+/// Port used when the destination omits `smtpPort` and selects implicit TLS.
+const DEFAULT_SMTPS_PORT: u16 = 465;
 const MAX_SMTP_HOST_CHARS: usize = 253;
 const MAX_ADDRESS_CHARS: usize = 320;
 const MAX_SMTP_USERNAME_CHARS: usize = 320;
@@ -41,6 +43,14 @@ const MAX_SECRET_CHARS: usize = 4_096;
 const MAX_RECIPIENTS: usize = 20;
 /// Test-only tightening knob: it can only shorten the delivery window, never extend it.
 const TIMEOUT_SECONDS_ENV: &str = "LUX_PLUGIN_SMTP_TIMEOUT_SECONDS";
+/// Test-only plaintext seam.
+///
+/// A notification destination never offers an unencrypted SMTP mode: the manifest declares only
+/// STARTTLS and implicit TLS, and `security: "none"` is rejected unless this environment flag is
+/// `1` *and* the relay is a loopback address. The seam exists because the integration suite drives
+/// the real binary against a plaintext fake relay bound to `127.0.0.1`; it is deliberately absent
+/// from the manifest and from the documented user-facing contract.
+const PLAINTEXT_TEST_ENV: &str = "LUX_NOTIFIER_EMAIL_TEST_PLAINTEXT";
 
 /// The destination configuration is unusable; retrying cannot fix it.
 const INVALID_CONFIG: &str = "invalid_config";
@@ -67,8 +77,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 /// Classifies one `notification.send` request and reports the outcome on stderr.
 async fn deliver(request: NotificationSendRpcRequest) -> NotificationSendRpcResult {
-    let result = attempt(&request).await.unwrap_or_else(failed);
-    log_outcome(&request, &result);
+    let config = EmailConfig::parse(&request.config).ok();
+    let result = match attempt(&request, config.as_ref()).await {
+        Ok(result) => result,
+        Err(code) => failed(code),
+    };
+    log_outcome(&request, config.as_ref(), &result);
     result
 }
 
@@ -78,13 +92,14 @@ async fn deliver(request: NotificationSendRpcRequest) -> NotificationSendRpcResu
 /// relay; everything the relay answers is classified by [`classify_smtp_error`].
 async fn attempt(
     request: &NotificationSendRpcRequest,
+    config: Option<&EmailConfig>,
 ) -> Result<NotificationSendRpcResult, &'static str> {
     let secret = transport_secret(request.secret.as_deref())?;
-    let config = EmailConfig::parse(&request.config)?;
+    let config = config.ok_or(INVALID_CONFIG)?;
     let (title, body) = render_event_text(&request.event);
     let message = config.message(&title, &body)?;
     let timeout = delivery_timeout();
-    let transport = build_transport(&config, config.credentials(secret), timeout)?;
+    let transport = build_transport(config, config.credentials(secret), timeout)?;
     match tokio::time::timeout(timeout, transport.send(message)).await {
         Err(_) => Ok(retryable(SMTP_TIMEOUT)),
         Ok(Ok(_)) => Ok(delivered()),
@@ -154,20 +169,22 @@ impl EmailConfig {
         {
             return Err(INVALID_CONFIG);
         }
+        let security = match object.get("security").and_then(Value::as_str) {
+            None => SmtpSecurity::StartTls,
+            Some("starttls") => SmtpSecurity::StartTls,
+            Some("ssl") => SmtpSecurity::Ssl,
+            // Unencrypted SMTP is not a destination option; only the loopback test seam may ask
+            // for it, and the manifest does not declare the value.
+            Some("none") if plaintext_test_allowed(host) => SmtpSecurity::None,
+            Some(_) => return Err(INVALID_CONFIG),
+        };
         let port = match object.get("smtpPort") {
-            None | Some(Value::Null) => DEFAULT_SMTP_PORT,
+            None | Some(Value::Null) => default_port(security),
             Some(value) => value
                 .as_u64()
                 .and_then(|port| u16::try_from(port).ok())
                 .filter(|port| *port > 0)
                 .ok_or(INVALID_CONFIG)?,
-        };
-        let security = match object.get("security").and_then(Value::as_str) {
-            None => SmtpSecurity::StartTls,
-            Some("starttls") => SmtpSecurity::StartTls,
-            Some("ssl") => SmtpSecurity::Ssl,
-            Some("none") => SmtpSecurity::None,
-            Some(_) => return Err(INVALID_CONFIG),
         };
         let username = match object.get("username").and_then(Value::as_str) {
             None => None,
@@ -209,6 +226,15 @@ impl EmailConfig {
         self.username
             .as_ref()
             .map(|username| Credentials::new(username.clone(), secret.to_owned()))
+    }
+
+    /// The effective endpoint, used in the diagnostic log line only.
+    fn endpoint(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
     }
 
     /// Builds the plain-text message: the core title becomes the subject, the core body the body.
@@ -296,13 +322,34 @@ fn build_transport(
     Ok(builder.build())
 }
 
+/// The submission port a security mode falls back to when the destination omits `smtpPort`.
+fn default_port(security: SmtpSecurity) -> u16 {
+    match security {
+        SmtpSecurity::Ssl => DEFAULT_SMTPS_PORT,
+        SmtpSecurity::StartTls | SmtpSecurity::None => DEFAULT_STARTTLS_PORT,
+    }
+}
+
+/// Whether the test-only plaintext seam is active for this relay.
+fn plaintext_test_allowed(host: &str) -> bool {
+    let enabled = std::env::var(PLAINTEXT_TEST_ENV).is_ok_and(|value| value.trim() == "1");
+    enabled && is_loopback_host(host)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 /// Maps the SMTP client error onto the host's delivery classification.
 ///
-/// A timeout and a transient 4xx reply ask for a later attempt; a permanent 5xx reply, a broken
-/// STARTTLS negotiation or an incompatible server is a configuration or provider failure. The
-/// rustls backend reports a TLS handshake failure as a connection error, so an unreachable or
-/// untrustworthy relay stays retryable like any other network error instead of being misreported
-/// as a delivered message.
+/// A timeout, a transient 4xx reply and a relay that drops the connection ask for a later attempt;
+/// a permanent 5xx reply, a TLS failure or an incompatible server is a configuration or provider
+/// failure. `lettre`'s rustls backend reports a TLS handshake or certificate problem as a
+/// connection error and reports an early end of the dialogue as a response error, so the error
+/// source chain is inspected for both classes before the plain response/client mapping.
 fn classify_smtp_error(error: &lettre::transport::smtp::Error) -> NotificationSendRpcResult {
     if error.is_timeout() {
         return retryable(SMTP_TIMEOUT);
@@ -313,8 +360,11 @@ fn classify_smtp_error(error: &lettre::transport::smtp::Error) -> NotificationSe
     if error.is_permanent() {
         return failed(SMTP_REJECTED);
     }
-    if error.is_tls() {
+    if error.is_tls() || error_matches(error, &TLS_FAILURE_MARKERS) {
         return failed(SMTP_TLS_FAILED);
+    }
+    if error_matches(error, &INTERRUPTED_CONNECTION_MARKERS) {
+        return retryable(SMTP_UNAVAILABLE);
     }
     if error.is_client() || error.is_response() {
         return failed(SMTP_PROTOCOL_ERROR);
@@ -322,19 +372,67 @@ fn classify_smtp_error(error: &lettre::transport::smtp::Error) -> NotificationSe
     retryable(SMTP_UNAVAILABLE)
 }
 
+/// Lower-case fragments the rustls (and TLS in general) error messages use for a handshake or a
+/// certificate rejection.
+const TLS_FAILURE_MARKERS: [&str; 9] = [
+    "handshake",
+    "certificate",
+    "corrupt message",
+    "peer sent no certificates",
+    "peer is incompatible",
+    "received fatal alert",
+    "decrypt error",
+    "invalid content type",
+    "unknown issuer",
+];
+
+/// Lower-case fragments of an interrupted dialogue.
+///
+/// `lettre` reports an early end of the SMTP conversation as a response error even though the
+/// network peer dropped the connection, so it belongs with the retryable network failures.
+const INTERRUPTED_CONNECTION_MARKERS: [&str; 4] = [
+    "incomplete response",
+    "connection closed",
+    "connection reset",
+    "broken pipe",
+];
+
+/// Checks the error and its source chain for one of the given message fragments.
+///
+/// Without taking a TLS dependency, the plugin recognises wrapped backend failures by their stable
+/// message fragments instead of their crate-private types.
+fn error_matches(error: &lettre::transport::smtp::Error, markers: &[&str]) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(source) = current {
+        let message = source.to_string().to_ascii_lowercase();
+        if markers.iter().any(|marker| message.contains(marker)) {
+            return true;
+        }
+        current = source.source();
+    }
+    false
+}
+
 /// Writes one diagnostic line per attempt to stderr.
 ///
-/// The line deliberately carries only the event ID, the classification and the stable error code:
-/// no credential, no recipient address and no complete external address.
-fn log_outcome(request: &NotificationSendRpcRequest, result: &NotificationSendRpcResult) {
+/// The line carries the event ID, the effective endpoint, the classification and the stable error
+/// code: no credential, no recipient address and no complete external URL.
+fn log_outcome(
+    request: &NotificationSendRpcRequest,
+    config: Option<&EmailConfig>,
+    result: &NotificationSendRpcResult,
+) {
     let event_id = request
         .event
         .get("eventId")
         .and_then(Value::as_str)
         .map(log_label)
         .unwrap_or_else(|| "-".to_owned());
+    let endpoint = config
+        .map(|config| format!(" endpoint={}", config.endpoint()))
+        .unwrap_or_default();
     eprintln!(
-        "{PLUGIN_ID}: event {event_id} finished with {} ({})",
+        "{PLUGIN_ID}: event {event_id}{endpoint} finished with {} ({})",
         status_label(result.status),
         result.error_code.as_deref().unwrap_or("none")
     );

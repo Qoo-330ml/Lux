@@ -630,8 +630,8 @@ manifest 核心字段：
   "configFields": [
     {"key": "secret", "label": "SMTP 密码", "type": "password", "required": true, "sensitive": true},
     {"key": "smtpHost", "label": "SMTP 服务器", "type": "text", "required": true},
-    {"key": "smtpPort", "label": "SMTP 端口", "type": "number", "required": false, "defaultValue": 587, "minimum": 1, "maximum": 65535},
-    {"key": "security", "label": "加密方式", "type": "select", "required": true, "defaultValue": "starttls", "options": [{"value": "starttls", "label": "STARTTLS"}, {"value": "ssl", "label": "SSL/TLS"}, {"value": "none", "label": "不加密"}]},
+    {"key": "smtpPort", "label": "SMTP 端口", "type": "number", "required": false, "minimum": 1, "maximum": 65535},
+    {"key": "security", "label": "加密方式", "type": "select", "required": true, "defaultValue": "starttls", "options": [{"value": "starttls", "label": "STARTTLS"}, {"value": "ssl", "label": "SSL/TLS"}]},
     {"key": "username", "label": "SMTP 用户名", "type": "text", "required": false},
     {"key": "from", "label": "发件人地址", "type": "text", "required": true},
     {"key": "to", "label": "收件人地址", "type": "text", "required": true}
@@ -644,8 +644,8 @@ manifest 核心字段：
 非空，此时它是管理员填写的占位值（例如 `unused`），插件不会使用它。其余字段是普通目标配置：
 
 - `smtpHost` 必填，非空、不含空白字符或控制字符、不含路径分隔符，长度不超过 253。
-- `smtpPort` 可选，缺省 587，范围 1–65535。
-- `security` 只接受 `starttls`、`ssl`、`none`；`starttls` 要求服务器支持 STARTTLS，否则投递失败而不是降级为明文。
+- `smtpPort` 可选，范围 1–65535；缺省值随 `security` 决定：`starttls` 用 587，`ssl` 用 465。
+- `security` 只接受 `starttls` 和 `ssl`，插件不提供明文 SMTP 模式；`starttls` 要求服务器支持 STARTTLS，否则投递失败而不是降级为明文。
 - `username` 可选，首尾空白或控制字符会被判为非法。
 - `from` 必填，必须是纯地址（不含显示名）；`to` 是逗号分隔的 1–20 个纯地址，两级都会重新校验地址格式。
 
@@ -656,19 +656,22 @@ manifest 核心字段：
 | 邮件被 SMTP 服务器接受 | `DELIVERED` | 无 |
 | `secret` 缺失或只含空白 | `FAILED` | `missing_secret` |
 | 目标配置非法（主机、端口、加密方式、地址、收件人数量） | `FAILED` | `invalid_config` |
-| SMTP `4xx` 或连接被拒绝 | `RETRYABLE` | `smtp_transient` / `smtp_unavailable` |
+| SMTP `4xx` | `RETRYABLE` | `smtp_transient` |
+| 连接被拒、连接被断开或对话被提前终止 | `RETRYABLE` | `smtp_unavailable` |
 | 超过投递窗口（连接、握手或应答） | `RETRYABLE` | `smtp_timeout` |
 | SMTP `5xx`（认证、发件人或收件人被拒） | `FAILED` | `smtp_rejected` |
 | STARTTLS 不被服务器支持或协议不兼容 | `FAILED` | `smtp_protocol_error` |
-| TLS 层错误 | `FAILED` | `smtp_tls_failed` |
+| TLS 握手或证书校验失败 | `FAILED` | `smtp_tls_failed` |
 
-`lettre` 的 rustls 后端把 TLS 握手失败报告为连接错误，所以对不可达或不可信的服务器保持 `RETRYABLE`，与其它
-网络错误一致；插件绝不会在加密未建立时把密码或收件人发给对端。插件每次投递向 stderr 写一行
-`org.lux.notifier.email: event <eventId> finished with <状态> (<错误码>)`，不包含密码、收件人地址或任何完整
-外部 URL。`LUX_PLUGIN_SMTP_TIMEOUT_SECONDS` 仅供测试把投递窗口收紧到 1–10 秒，不能放宽 SDK 的上限。
+`lettre` 的 rustls 后端把握手和证书失败包装成连接错误，把对话被提前关闭包装成响应错误。插件沿错误源链检查
+稳定的错误文本片段，把前一类判为永久失败、后一类判为可重试网络错误；插件绝不会在加密未建立时把密码或收件人
+发给对端。插件每次投递向 stderr 写一行
+`org.lux.notifier.email: event <eventId> endpoint=<host>:<port> finished with <状态> (<错误码>)`，不包含
+密码、收件人地址或任何完整外部 URL。`LUX_PLUGIN_SMTP_TIMEOUT_SECONDS` 仅供测试把投递窗口收紧到 1–10 秒，
+不能放宽 SDK 的上限。
 
 测试（`cargo test --locked --test plugins notifier_email::`）用 `127.0.0.1` 随机端口的假 SMTP 服务器覆盖成功、
-无认证、`4xx`、`5xx`、认证被拒、连接被拒、超时、STARTTLS 不支持、SSL 握手失败、坏配置和缺凭据，并断言凭据
-不出现在返回值和捕获的日志中；测试不使用任何真实凭据或真实邮件服务。
+无认证、`4xx`、`5xx`、认证被拒、连接被断开、超时、默认端口、STARTTLS 不被支持、SSL 握手失败、坏配置和缺凭据，
+并断言凭据不出现在返回值和捕获的日志中；测试不使用任何真实凭据或真实邮件服务。
 
 打包：`scripts/package-notifier-plugin.sh org.lux.notifier.email`。
