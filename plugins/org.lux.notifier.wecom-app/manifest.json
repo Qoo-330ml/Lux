@@ -18,7 +18,7 @@
       "label": "企业 ID",
       "type": "text",
       "required": true,
-      "description": "企业微信「我的企业」页面中的 CorpID。"
+      "description": "企业微信「我的企业」页面中的 CorpID；插件接受 1–4096 个字母、数字、- 或 _。"
     },
     {
       "key": "agentId",
@@ -35,7 +35,7 @@
       "type": "text",
       "required": false,
       "defaultValue": "@all",
-      "description": "企业微信 userid，多个用 | 分隔；@all 表示应用可见范围内的全部成员。"
+      "description": "企业微信 userid，多个用 | 分隔；不填写该字段时使用 @all，显式留空视为配置错误。上限 4096 字符。"
     },
     {
       "key": "apiBase",
@@ -51,7 +51,7 @@
       "type": "password",
       "required": true,
       "sensitive": true,
-      "description": "企业微信自建应用的 Secret；只通过通知目标凭据下发，不会写入配置、返回值或日志。"
+      "description": "企业微信自建应用的 Secret；只通过通知目标凭据下发，不写入配置、返回值或日志。上限 4096 字符且不得包含控制字符。"
     }
   ],
   "permissions": {

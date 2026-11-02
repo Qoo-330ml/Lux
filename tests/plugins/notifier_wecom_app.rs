@@ -1057,3 +1057,180 @@ async fn rejects_the_cloud_metadata_address_even_with_private_network_approval()
     assert_log_has_no_credentials(&stderr);
     Ok(())
 }
+
+#[tokio::test]
+async fn rejects_an_explicitly_emptied_to_user() -> Result<(), Box<dyn std::error::Error>> {
+    let upstream = Upstream::default();
+    let app = Router::new()
+        .route("/cgi-bin/gettoken", upstream.token_handler(TOKEN_ONE))
+        .route(
+            "/cgi-bin/message/send",
+            upstream.send_handler(json!({"errcode": 0, "msgid": "msg-to-user"})),
+        );
+    let (base, server) = spawn_server(app).await?;
+    let mut plugin = Plugin::start().await?;
+
+    // Only an absent key falls back to the declared default.
+    let mut absent = api_base_config(&base);
+    absent
+        .as_object_mut()
+        .ok_or("config must be an object")?
+        .remove("toUser");
+    let defaulted = plugin
+        .send("defaulted", send_params(absent, json!(TEST_SECRET)))
+        .await?;
+    assert_eq!(defaulted.status, NotificationSendStatus::Delivered);
+
+    // An explicitly cleared value is a target configuration error, not a silent fallback.
+    for (id, to_user) in [
+        ("empty", json!("")),
+        ("blank", json!("   \t  ")),
+        ("null", Value::Null),
+    ] {
+        let mut config = api_base_config(&base);
+        config["toUser"] = to_user;
+        let result = plugin
+            .send(id, send_params(config, json!(TEST_SECRET)))
+            .await?;
+        assert_eq!(
+            result.status,
+            NotificationSendStatus::Failed,
+            "{id} must fail permanently"
+        );
+        assert_eq!(
+            result.error_code.as_deref(),
+            Some("invalid_config"),
+            "{id} must use the stable config error code"
+        );
+    }
+
+    // The plugin-side limit follows the host's 4096 character target value bound.
+    let mut long = api_base_config(&base);
+    long["toUser"] = json!("u".repeat(4_096));
+    let long_result = plugin
+        .send("long", send_params(long, json!(TEST_SECRET)))
+        .await?;
+    assert_eq!(
+        long_result.status,
+        NotificationSendStatus::Delivered,
+        "a 4096 character recipient list is still accepted"
+    );
+
+    let stderr = plugin.finish().await?;
+    server.abort();
+
+    assert_eq!(upstream.token_calls(), 1, "the token stays cached");
+    let requests = upstream.send_requests();
+    assert_eq!(requests[0]["body"]["touser"], "@all");
+    assert_eq!(
+        requests[1]["body"]["touser"],
+        json!("u".repeat(4_096)),
+        "the long recipient list reaches WeCom unchanged"
+    );
+    assert_log_has_no_credentials(&stderr);
+    Ok(())
+}
+
+#[tokio::test]
+async fn caches_tokens_per_api_base() -> Result<(), Box<dyn std::error::Error>> {
+    let first = Upstream::default();
+    let first_app = Router::new()
+        .route("/cgi-bin/gettoken", first.token_handler(TOKEN_ONE))
+        .route(
+            "/cgi-bin/message/send",
+            first.send_handler(json!({"errcode": 0, "msgid": "msg-first"})),
+        );
+    let (first_base, first_server) = spawn_server(first_app).await?;
+
+    let second = Upstream::default();
+    let second_app = Router::new()
+        .route("/cgi-bin/gettoken", second.token_handler(TOKEN_TWO))
+        .route(
+            "/cgi-bin/message/send",
+            second.send_handler(json!({"errcode": 0, "msgid": "msg-second"})),
+        );
+    let (second_base, second_server) = spawn_server(second_app).await?;
+
+    let mut plugin = Plugin::start().await?;
+    for (id, base, expected_id) in [
+        ("first", first_base.as_str(), "msg-first"),
+        ("second", second_base.as_str(), "msg-second"),
+    ] {
+        let result = plugin
+            .send(id, send_params(api_base_config(base), json!(TEST_SECRET)))
+            .await?;
+        assert_eq!(result.status, NotificationSendStatus::Delivered);
+        assert_eq!(result.provider_request_id.as_deref(), Some(expected_id));
+    }
+    let stderr = plugin.finish().await?;
+    first_server.abort();
+    second_server.abort();
+
+    assert_eq!(
+        first.token_calls(),
+        1,
+        "each API base caches its own access token"
+    );
+    assert_eq!(
+        second.token_calls(),
+        1,
+        "a token cached for another API base must not be reused"
+    );
+    assert_eq!(first.send_requests()[0]["query"]["access_token"], TOKEN_ONE);
+    assert_eq!(
+        second.send_requests()[0]["query"]["access_token"],
+        TOKEN_TWO
+    );
+    assert_log_has_no_credentials(&stderr);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_a_malformed_secret() -> Result<(), Box<dyn std::error::Error>> {
+    let upstream = Upstream::default();
+    let app = Router::new()
+        .route("/cgi-bin/gettoken", upstream.token_handler(TOKEN_ONE))
+        .route(
+            "/cgi-bin/message/send",
+            upstream.send_handler(json!({"errcode": 0, "msgid": "msg-long-secret"})),
+        );
+    let (base, server) = spawn_server(app).await?;
+    let mut plugin = Plugin::start().await?;
+
+    for (id, secret) in [
+        ("oversized", json!("s".repeat(4_097))),
+        ("control", json!("corp\nsecret")),
+    ] {
+        let result = plugin
+            .send(id, send_params(api_base_config(&base), secret))
+            .await?;
+        assert_eq!(result.status, NotificationSendStatus::Failed);
+        assert_eq!(
+            result.error_code.as_deref(),
+            Some("invalid_secret"),
+            "{id} is present but malformed"
+        );
+    }
+    assert_eq!(upstream.token_calls(), 0, "a malformed secret is not sent");
+
+    let accepted = plugin
+        .send(
+            "max-length",
+            send_params(api_base_config(&base), json!("s".repeat(4_096))),
+        )
+        .await?;
+    assert_eq!(
+        accepted.status,
+        NotificationSendStatus::Delivered,
+        "the host's 4096 character credential bound is accepted"
+    );
+
+    let stderr = plugin.finish().await?;
+    server.abort();
+    assert!(
+        !stderr.contains("corp\nsecret"),
+        "a rejected secret must never be logged: {stderr}"
+    );
+    assert_log_has_no_credentials(&stderr);
+    Ok(())
+}

@@ -49,10 +49,13 @@ const DEFAULT_TOKEN_LIFETIME_SECONDS: i64 = 7_200;
 const MAX_TOKEN_LIFETIME_SECONDS: i64 = 86_400;
 /// Upper bound of cached access tokens; entries are addressable per destination credential.
 const MAX_CACHE_ENTRIES: usize = 64;
-const MAX_CORP_ID_CHARS: usize = 64;
-const MAX_SECRET_CHARS: usize = 512;
-const MAX_TO_USER_CHARS: usize = 1_000;
+/// Target config and credential values the host accepts, mirrored so the plugin never rejects a
+/// value the host already validated.
+const MAX_CONFIG_TEXT_CHARS: usize = 4_096;
+const MAX_SECRET_CHARS: usize = 4_096;
 const MAX_ACCESS_TOKEN_CHARS: usize = 1_024;
+/// The recipient list used only when the target omits `toUser` entirely.
+const DEFAULT_TO_USER: &str = "@all";
 /// WeCom `agentid` is a positive 32-bit integer.
 const MAX_AGENT_ID: i64 = 2_147_483_647;
 const MAX_PROVIDER_REQUEST_ID_CHARS: usize = 128;
@@ -60,6 +63,7 @@ const MAX_PROVIDER_REQUEST_ID_CHARS: usize = 128;
 const MAX_RETRY_AFTER_SECONDS: i64 = 7_200;
 
 const ERROR_MISSING_SECRET: &str = "missing_secret";
+const ERROR_INVALID_SECRET: &str = "invalid_secret";
 const ERROR_INVALID_CONFIG: &str = "invalid_config";
 const ERROR_NETWORK: &str = "network_error";
 const ERROR_RESPONSE_TOO_LARGE: &str = "response_too_large";
@@ -84,9 +88,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Delivers one `notification.send` request.
 async fn deliver(request: NotificationSendRpcRequest) -> NotificationSendRpcResult {
-    let Some(secret) = destination_secret(request.secret.as_deref()) else {
-        log_failure(ERROR_MISSING_SECRET);
-        return failed(ERROR_MISSING_SECRET);
+    let secret = match destination_secret(request.secret.as_deref()) {
+        Ok(secret) => secret,
+        Err(code) => {
+            log_failure(code);
+            return failed(code);
+        }
     };
     let Ok(config) = WecomAppConfig::from_config_value(&request.config) else {
         log_failure(ERROR_INVALID_CONFIG);
@@ -538,7 +545,7 @@ impl WecomAppConfig {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or(())?;
-        if corp_id.chars().count() > MAX_CORP_ID_CHARS
+        if corp_id.chars().count() > MAX_CONFIG_TEXT_CHARS
             || !corp_id.chars().all(|character| {
                 character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
             })
@@ -567,21 +574,21 @@ fn parse_agent_id(value: Option<&Value>) -> Option<i64> {
 }
 
 fn parse_to_user(value: Option<&Value>) -> Result<String, ()> {
-    let to_user = match value {
-        None | Some(Value::Null) => String::new(),
-        Some(value) => value.as_str().ok_or(())?.trim().to_owned(),
+    // Only an absent key uses the declared default. An explicitly cleared value is a target
+    // configuration error, so a mis-edited target cannot silently notify everyone instead.
+    let Some(value) = value else {
+        return Ok(DEFAULT_TO_USER.to_owned());
     };
-    if to_user.is_empty() {
-        return Ok("@all".to_owned());
-    }
-    if to_user.chars().count() > MAX_TO_USER_CHARS
+    let to_user = value.as_str().ok_or(())?.trim();
+    if to_user.is_empty()
+        || to_user.chars().count() > MAX_CONFIG_TEXT_CHARS
         || !to_user
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || "@._-|".contains(character))
     {
         return Err(());
     }
-    Ok(to_user)
+    Ok(to_user.to_owned())
 }
 
 fn parse_api_base(value: Option<&Value>) -> Result<Url, ()> {
@@ -611,18 +618,23 @@ fn parse_api_base(value: Option<&Value>) -> Result<Url, ()> {
     Ok(url)
 }
 
-/// Returns the usable destination credential, or `None` when it is missing or malformed.
+/// Validates the destination credential.
 ///
-/// The value is only kept in memory for the outbound request; it is never logged or returned.
-fn destination_secret(secret: Option<&str>) -> Option<String> {
-    let secret = secret?.trim();
-    if secret.is_empty()
-        || secret.chars().count() > MAX_SECRET_CHARS
-        || secret.chars().any(char::is_control)
-    {
-        return None;
+/// A missing or blank credential is `missing_secret`; a present value the plugin cannot forward
+/// safely is `invalid_secret`. The value is only kept in memory for the outbound request; it is
+/// never logged or returned.
+fn destination_secret(secret: Option<&str>) -> Result<String, &'static str> {
+    let Some(secret) = secret else {
+        return Err(ERROR_MISSING_SECRET);
+    };
+    let secret = secret.trim();
+    if secret.is_empty() {
+        return Err(ERROR_MISSING_SECRET);
     }
-    Some(secret.to_owned())
+    if secret.chars().count() > MAX_SECRET_CHARS || secret.chars().any(char::is_control) {
+        return Err(ERROR_INVALID_SECRET);
+    }
+    Ok(secret.to_owned())
 }
 
 /// A cached WeCom access token and the instant after which it must be refreshed.
@@ -643,10 +655,17 @@ fn token_cache() -> &'static TokenCache {
 }
 
 /// Hashes the credential-bearing cache identity so the map key never holds the secret itself.
+///
+/// The API base (scheme, host, port and path) is part of the identity: a token issued for one
+/// endpoint or proxy prefix must never be replayed against another.
 fn token_cache_key(config: &WecomAppConfig, secret: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     config.corp_id.hash(&mut hasher);
     config.agent_id.hash(&mut hasher);
+    config.api_base.scheme().hash(&mut hasher);
+    config.api_base.host_str().hash(&mut hasher);
+    config.api_base.port_or_known_default().hash(&mut hasher);
+    config.api_base.path().hash(&mut hasher);
     secret.hash(&mut hasher);
     hasher.finish()
 }

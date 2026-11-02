@@ -794,6 +794,11 @@ payload 组装，进程外壳、出站 client、状态分类和通知正文来�
 仅用于代理或测试，必须是 http/https 基地址，且不得包含凭据、query 或 fragment；基地址里已有的路径段
 （包括百分号转义）按原样保留，插件只在其后追加 `cgi-bin/*` 路径段。
 
+配置边界与宿主一致：`corpId`、`toUser` 和 `secret` 都按宿主的 4096 字符目标值上限校验（`corpId` 另要求
+字母、数字、`-`、`_`；`toUser` 另要求字母、数字与 `@._-|`），因此插件不会拒绝宿主已经接受的配置值。
+`toUser` 只在**键缺失**时使用 manifest 默认值 `@all`；显式清空（`""`、纯空白或 `null`）属于配置错误，返回
+`Failed(invalid_config)`，避免管理员误清空后被静默改成全员通知。
+
 目的地守卫：插件在发起任何出站连接之前，把 `config.apiBase` 和宿主给出的 `target.allowPrivateNetwork`
 （缺失或 `false` 表示不批准）原样交给 SDK 的 `guard_destination`，自己不放宽策略。未批准的私网/回环地址和
 始终禁止的保留地址（含 `169.254.169.254` 等云元数据）返回 `Failed(destination_not_allowed)`，DNS 暂时失败
@@ -805,7 +810,8 @@ payload 组装，进程外壳、出站 client、状态分类和通知正文来�
 投递流程：
 
 1. `GET {apiBase}/cgi-bin/gettoken?corpid=&corpsecret=` 换取 `access_token`。token 缓存在插件进程内，key 为
-   `corpId + agentId + secret` 的哈希，到期前 5 分钟刷新；缓存用 `Mutex` 保护且不跨 `.await` 持锁。
+   `corpId + agentId + apiBase(scheme/host/port/path) + secret` 的哈希（同一凭据指向不同地址或代理前缀时不会
+   复用 token），到期前 5 分钟刷新；缓存用 `Mutex` 保护且不跨 `.await` 持锁。
 2. `POST {apiBase}/cgi-bin/message/send?access_token=` 发送 `msgtype: "text"` 消息，正文为 SDK
    `render_event_text` 返回的标题与正文（`标题\n\n正文`），超过企业微信 2048 字节限制时按 UTF-8 字符边界截断。
 3. 上游 `errcode` 为 `40001`/`40014`/`42001` 时清除缓存 token、重新获取后重试一次；再次失败返回
@@ -830,11 +836,11 @@ payload 组装，进程外壳、出站 client、状态分类和通知正文来�
 - `RETRYABLE`：网络错误/超时（`network_error`）、`408`/`425`/`429`/`5xx`（`PROVIDER_HTTP_<status>`）、
   `rate_limited`、`system_busy`、目的地 DNS 暂时失败（`destination_unresolved`），或总截止时间内尚未发出任何
   消息（`delivery_timeout`）。
-- `FAILED`：缺少或空白凭据（`missing_secret`）、目标配置非法（`invalid_config`，如 corpId 为空、agentId
-  非正数、toUser 含非法字符、apiBase 非 http/https 或带凭据/query）、目的地被守卫拒绝
-  （`destination_not_allowed`）、全部收件人无效（`no_valid_recipient`）、已发出消息后超出总截止时间
-  （`timeout_after_send`）、响应超 64 KiB（`response_too_large`）、响应不是预期 JSON
-  （`invalid_response`）、其他永久 4xx 与业务错误。
+- `FAILED`：凭据缺失或空白（`missing_secret`）、凭据存在但无法安全转发（`invalid_secret`，超过 4096 字符或
+  含控制字符）、目标配置非法（`invalid_config`，如 corpId 为空、agentId 非正数、toUser 显式清空或含非法
+  字符、apiBase 非 http/https 或带凭据/query）、目的地被守卫拒绝（`destination_not_allowed`）、全部收件人
+  无效（`no_valid_recipient`）、已发出消息后超出总截止时间（`timeout_after_send`）、响应超 64 KiB
+  （`response_too_large`）、响应不是预期 JSON（`invalid_response`）、其他永久 4xx 与业务错误。
 
 插件日志只写稳定结果码和无效收件人数量，不写 access_token、token 请求的 query、完整外部 URL、userid 或凭据。
 
