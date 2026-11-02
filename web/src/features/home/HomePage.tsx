@@ -16,6 +16,8 @@ import {
   writeHomeCarouselCache,
 } from "./carousel";
 import { useImageVariants } from "./image-variants";
+import { nextCarouselIndex, useDocumentHidden, useHeroCarouselAutoplay } from "./hero-carousel-autoplay";
+import { heroBackdropUrl, useHeroBackdropPreload } from "./hero-preload";
 import { ContinueWatchingRail, imageUrl, LibraryCard, MediaRail, mediaTitle, mediaTypeLabel, playbackPositionTicks, runtimeLabel } from "./media";
 import { useSseConnectionState, type SseConnectionState } from "../activity/useUserEvents";
 import { prefetchLibraryPage } from "../library/prefetchLibrary";
@@ -200,26 +202,34 @@ const HeroCarousel = memo(function HeroCarousel({ items, continueWatching, isLoa
 }) {
   const [activeIndex, setActiveIndex] = useState(0);
   const { enabled } = useImageVariants();
+  const [hovered, setHovered] = useState(false);
+  const [focusWithin, setFocusWithin] = useState(false);
+  const documentHidden = useDocumentHidden();
   const slideKey = useMemo(() => items.map((item) => item.id).join("|"), [items]);
+  const [slideKeyState, setSlideKeyState] = useState(slideKey);
+  // Adjust the index during render when the slide list changes: React re-renders before
+  // committing, so the commit that carries the new list already shows its first slide and no
+  // remount is needed (focus and entrance animations survive).
+  if (slideKeyState !== slideKey) {
+    setSlideKeyState(slideKey);
+    setActiveIndex(0);
+  }
+  // WCAG 2.2.2: moving content stops while the user points at it, reads it with the keyboard,
+  // or switches to another tab. Resuming keeps the remaining time instead of restarting.
+  const paused = hovered || focusWithin || documentHidden;
 
-  useEffect(() => setActiveIndex(0), [slideKey]);
-
-  useEffect(() => {
-    if (items.length < 2) return undefined;
-    const timeout = window.setTimeout(
-      () => setActiveIndex((index) => (index + 1) % items.length),
-      HERO_CAROUSEL_INTERVAL_MS,
-    );
-    return () => window.clearTimeout(timeout);
-  }, [activeIndex, items.length, slideKey]);
+  useHeroCarouselAutoplay({
+    slideCount: items.length,
+    paused,
+    restartToken: activeIndex,
+    onAdvance: () => setActiveIndex((index) => nextCarouselIndex(index, items.length)),
+  });
 
   const safeIndex = items.length ? activeIndex % items.length : 0;
   const item = items[safeIndex];
   const logo = item ? imageUrl(item, "logo") : undefined;
-  const image = item
-    ? imageUrl(item, "fanart", enabled ? 1280 : undefined)
-      ?? imageUrl(item, "poster", enabled ? 1280 : undefined)
-    : undefined;
+  const image = heroBackdropUrl(item, enabled);
+  useHeroBackdropPreload({ items, activeIndex: safeIndex, variantsEnabled: enabled });
   const title = item ? mediaTitle(item) : "你的私人影院";
   const titleClassName = logo
     ? "lux-hero-title has-logo"
@@ -234,7 +244,28 @@ const HeroCarousel = memo(function HeroCarousel({ items, continueWatching, isLoa
   const goTo = (index: number) => setActiveIndex((index + items.length) % items.length);
 
   return (
-    <section className="lux-hero" aria-label="精选媒体轮播" aria-roledescription="carousel" aria-busy={isLoading}>
+    <section
+      className="lux-hero"
+      aria-label="精选媒体轮播"
+      aria-roledescription="carousel"
+      aria-busy={isLoading}
+      onPointerEnter={(event) => {
+        if (event.pointerType === "mouse") setHovered(true);
+      }}
+      onPointerLeave={(event) => {
+        if (event.pointerType === "mouse") setHovered(false);
+      }}
+      onFocus={(event) => {
+        // A mouse click focuses the dot but leaves no way out of the hero, so only keyboard
+        // focus pauses; anything unrecognised stays conservative and pauses. The flag follows
+        // every focus change, otherwise a keyboard pause would survive a later mouse click.
+        setFocusWithin(isKeyboardFocus(event.target));
+      }}
+      onBlur={(event) => {
+        const nextFocus = event.relatedTarget;
+        if (!(nextFocus instanceof Node) || !event.currentTarget.contains(nextFocus)) setFocusWithin(false);
+      }}
+    >
       {image ? (
         <img
           key={`backdrop-${item?.id}`}
@@ -262,7 +293,7 @@ const HeroCarousel = memo(function HeroCarousel({ items, continueWatching, isLoa
                 <Link className={luxButtonClass({ tone: "primary", size: "large" })} to={playbackHref}><Play size={17} fill="currentColor" /> {item ? playbackLabel : "浏览媒体库"}</Link>
                 {item ? <Link className={luxButtonClass({ tone: "glass", size: "large" })} to={`/items/${item.id}`}><Info size={17} /> 详情</Link> : null}
               </div>
-              {items.length > 1 ? <div className="lux-hero-carousel-controls" aria-label="选择精选媒体"><div className="lux-hero-dots">{items.map((slide, index) => <button key={slide.id} className={index === safeIndex ? "lux-hero-dot is-active" : "lux-hero-dot"} type="button" aria-label={`显示第 ${index + 1} 条精选：${mediaTitle(slide)}`} aria-current={index === safeIndex ? "true" : undefined} onClick={() => goTo(index)}>{index === safeIndex ? <span className="lux-hero-dot-progress" aria-hidden="true" style={{ animationDuration: `${HERO_CAROUSEL_INTERVAL_MS}ms` }} /> : null}</button>)}</div></div> : null}
+              {items.length > 1 ? <div className="lux-hero-carousel-controls" aria-label="选择精选媒体"><div className="lux-hero-dots">{items.map((slide, index) => <button key={slide.id} className={index === safeIndex ? "lux-hero-dot is-active" : "lux-hero-dot"} type="button" aria-label={`显示第 ${index + 1} 条精选：${mediaTitle(slide)}`} aria-current={index === safeIndex ? "true" : undefined} onClick={() => goTo(index)}>{index === safeIndex ? <span className={paused ? "lux-hero-dot-progress is-paused" : "lux-hero-dot-progress"} aria-hidden="true" style={{ animationDuration: `${HERO_CAROUSEL_INTERVAL_MS}ms` }} /> : null}</button>)}</div></div> : null}
             </div>
           </div>
       ) : null}
@@ -275,6 +306,16 @@ function heroPlaybackItem(item: MediaItem, continueWatching: MediaItem[]) {
     return continueWatching.find((candidate) => candidate.itemType === "EPISODE" && candidate.seriesId === item.id);
   }
   return item.itemType === "MOVIE" || item.itemType === "EPISODE" ? item : undefined;
+}
+
+/** True for keyboard focus; mouse clicks on a dot must not pause the carousel forever. */
+function isKeyboardFocus(target: EventTarget | null) {
+  if (!(target instanceof Element)) return true;
+  try {
+    return target.matches(":focus-visible");
+  } catch {
+    return true;
+  }
 }
 
 function EmptyLibraries() {
