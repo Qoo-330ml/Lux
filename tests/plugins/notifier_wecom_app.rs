@@ -5,14 +5,21 @@
 //! file is a real credential.
 
 use std::{
+    collections::HashMap,
     process::Stdio,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
-use axum::Router;
+use axum::{
+    Json, Router,
+    extract::Query,
+    http::{StatusCode, header::RETRY_AFTER},
+    routing::{get, post},
+};
 use luxd::application::plugin_protocol::{
     NotificationSendRpcResult, NotificationSendStatus, PluginRequest, PluginResponse,
 };
@@ -125,7 +132,13 @@ impl Plugin {
 /// Asserts that the RPC result carries no credential, token or correlation with the upstream URL.
 fn assert_result_has_no_credentials(result: &NotificationSendRpcResult) {
     let encoded = serde_json::to_string(result).expect("result should serialize");
-    for needle in [TEST_SECRET, TOKEN_ONE, TOKEN_TWO, "corpsecret", "access_token"] {
+    for needle in [
+        TEST_SECRET,
+        TOKEN_ONE,
+        TOKEN_TWO,
+        "corpsecret",
+        "access_token",
+    ] {
         assert!(
             !encoded.contains(needle),
             "the notification result leaked {needle}: {encoded}"
@@ -329,5 +342,423 @@ async fn rejects_invalid_destination_config_without_touching_the_network()
         );
     }
     server.abort();
+    Ok(())
+}
+
+fn token_body(token: &str) -> Value {
+    json!({
+        "errcode": 0,
+        "errmsg": "ok",
+        "access_token": token,
+        "expires_in": 7200,
+    })
+}
+
+/// Counts upstream calls and records the query and body of every `message/send` request.
+#[derive(Clone, Default)]
+struct Upstream {
+    token_calls: Arc<AtomicUsize>,
+    send_calls: Arc<AtomicUsize>,
+    token_queries: Arc<Mutex<Vec<Value>>>,
+    send_requests: Arc<Mutex<Vec<Value>>>,
+}
+
+impl Upstream {
+    fn token_calls(&self) -> usize {
+        self.token_calls.load(Ordering::SeqCst)
+    }
+
+    fn send_calls(&self) -> usize {
+        self.send_calls.load(Ordering::SeqCst)
+    }
+
+    fn token_queries(&self) -> Vec<Value> {
+        self.token_queries
+            .lock()
+            .map(|queries| queries.clone())
+            .unwrap_or_default()
+    }
+
+    fn send_requests(&self) -> Vec<Value> {
+        self.send_requests
+            .lock()
+            .map(|requests| requests.clone())
+            .unwrap_or_default()
+    }
+
+    fn token_handler(&self, token: &str) -> axum::routing::MethodRouter {
+        let calls = self.token_calls.clone();
+        let queries = self.token_queries.clone();
+        let token = token.to_owned();
+        get(move |Query(query): Query<HashMap<String, String>>| {
+            let calls = calls.clone();
+            let queries = queries.clone();
+            let token = token.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if let Ok(mut captured) = queries.lock() {
+                    captured.push(json!(query));
+                }
+                Json(token_body(&token))
+            }
+        })
+    }
+
+    fn send_handler(&self, response: Value) -> axum::routing::MethodRouter {
+        let calls = self.send_calls.clone();
+        let requests = self.send_requests.clone();
+        post(
+            move |Query(query): Query<HashMap<String, String>>, Json(body): Json<Value>| {
+                let calls = calls.clone();
+                let requests = requests.clone();
+                let response = response.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if let Ok(mut captured) = requests.lock() {
+                        captured.push(json!({"query": query, "body": body}));
+                    }
+                    Json(response)
+                }
+            },
+        )
+    }
+}
+
+#[tokio::test]
+async fn delivers_a_text_message_without_leaking_the_credential()
+-> Result<(), Box<dyn std::error::Error>> {
+    let upstream = Upstream::default();
+    let app = Router::new()
+        .route("/cgi-bin/gettoken", upstream.token_handler(TOKEN_ONE))
+        .route(
+            "/cgi-bin/message/send",
+            upstream.send_handler(json!({"errcode": 0, "errmsg": "ok", "msgid": "msg-1"})),
+        );
+    let (base, server) = spawn_server(app).await?;
+    let mut plugin = Plugin::start().await?;
+    let result = plugin
+        .send(
+            "deliver",
+            send_params(api_base_config(&base), json!(TEST_SECRET)),
+        )
+        .await?;
+    let stderr = plugin.finish().await?;
+    server.abort();
+
+    assert_eq!(result.status, NotificationSendStatus::Delivered);
+    assert_eq!(result.provider_request_id.as_deref(), Some("msg-1"));
+    assert_eq!(result.error_code, None);
+    assert_eq!(result.retry_after_seconds, None);
+    assert_result_has_no_credentials(&result);
+    assert_log_has_no_credentials(&stderr);
+
+    assert_eq!(upstream.token_calls(), 1);
+    assert_eq!(upstream.send_calls(), 1);
+    let token_queries = upstream.token_queries();
+    assert_eq!(token_queries[0]["corpid"], "corp-demo");
+    assert_eq!(token_queries[0]["corpsecret"], TEST_SECRET);
+    let requests = upstream.send_requests();
+    assert_eq!(requests[0]["query"]["access_token"], TOKEN_ONE);
+    assert_eq!(
+        requests[0]["body"],
+        json!({
+            "touser": "@all",
+            "msgtype": "text",
+            "agentid": 1_000_002,
+            "text": {"content": "媒体新增\n\n新增媒体：2 个\n媒体库：电影"},
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn reuses_the_cached_access_token_for_later_messages()
+-> Result<(), Box<dyn std::error::Error>> {
+    let upstream = Upstream::default();
+    let app = Router::new()
+        .route("/cgi-bin/gettoken", upstream.token_handler(TOKEN_ONE))
+        .route(
+            "/cgi-bin/message/send",
+            upstream.send_handler(json!({"errcode": 0, "msgid": "msg-1"})),
+        );
+    let (base, server) = spawn_server(app).await?;
+    let mut plugin = Plugin::start().await?;
+    for id in ["first", "second"] {
+        let result = plugin
+            .send(id, send_params(api_base_config(&base), json!(TEST_SECRET)))
+            .await?;
+        assert_eq!(result.status, NotificationSendStatus::Delivered);
+    }
+    let stderr = plugin.finish().await?;
+    server.abort();
+
+    assert_eq!(upstream.token_calls(), 1, "the token must be cached");
+    assert_eq!(upstream.send_calls(), 2);
+    assert_log_has_no_credentials(&stderr);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fails_permanently_on_an_upstream_4xx() -> Result<(), Box<dyn std::error::Error>> {
+    let upstream = Upstream::default();
+    let app = Router::new()
+        .route("/cgi-bin/gettoken", upstream.token_handler(TOKEN_ONE))
+        .route(
+            "/cgi-bin/message/send",
+            post(|| async move { (StatusCode::FORBIDDEN, Json(json!({"errcode": 60020}))) }),
+        );
+    let (base, server) = spawn_server(app).await?;
+    let mut plugin = Plugin::start().await?;
+    let result = plugin
+        .send(
+            "denied",
+            send_params(api_base_config(&base), json!(TEST_SECRET)),
+        )
+        .await?;
+    let stderr = plugin.finish().await?;
+    server.abort();
+
+    assert_eq!(result.status, NotificationSendStatus::Failed);
+    assert_eq!(result.error_code.as_deref(), Some("PROVIDER_HTTP_403"));
+    assert_eq!(result.retry_after_seconds, None);
+    assert_result_has_no_credentials(&result);
+    assert_log_has_no_credentials(&stderr);
+    Ok(())
+}
+
+#[tokio::test]
+async fn retries_on_429_and_keeps_the_retry_after_hint() -> Result<(), Box<dyn std::error::Error>> {
+    let upstream = Upstream::default();
+    let app = Router::new()
+        .route("/cgi-bin/gettoken", upstream.token_handler(TOKEN_ONE))
+        .route(
+            "/cgi-bin/message/send",
+            post(|| async move {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(RETRY_AFTER, "30")],
+                    Json(json!({"errcode": 45009})),
+                )
+            }),
+        );
+    let (base, server) = spawn_server(app).await?;
+    let mut plugin = Plugin::start().await?;
+    let result = plugin
+        .send(
+            "limited",
+            send_params(api_base_config(&base), json!(TEST_SECRET)),
+        )
+        .await?;
+    let stderr = plugin.finish().await?;
+    server.abort();
+
+    assert_eq!(result.status, NotificationSendStatus::Retryable);
+    assert_eq!(result.error_code.as_deref(), Some("PROVIDER_HTTP_429"));
+    assert_eq!(result.retry_after_seconds, Some(30));
+    assert_log_has_no_credentials(&stderr);
+    Ok(())
+}
+
+#[tokio::test]
+async fn retries_on_an_upstream_5xx() -> Result<(), Box<dyn std::error::Error>> {
+    let upstream = Upstream::default();
+    let app = Router::new()
+        .route(
+            "/cgi-bin/gettoken",
+            get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        )
+        .route(
+            "/cgi-bin/message/send",
+            upstream.send_handler(json!({"errcode": 0})),
+        );
+    let (base, server) = spawn_server(app).await?;
+    let mut plugin = Plugin::start().await?;
+    let result = plugin
+        .send(
+            "unavailable",
+            send_params(api_base_config(&base), json!(TEST_SECRET)),
+        )
+        .await?;
+    let stderr = plugin.finish().await?;
+    server.abort();
+
+    assert_eq!(result.status, NotificationSendStatus::Retryable);
+    assert_eq!(result.error_code.as_deref(), Some("PROVIDER_HTTP_503"));
+    assert_eq!(upstream.send_calls(), 0, "no message may be sent");
+    assert_log_has_no_credentials(&stderr);
+    Ok(())
+}
+
+#[tokio::test]
+async fn classifies_wecom_business_error_codes() -> Result<(), Box<dyn std::error::Error>> {
+    let upstream = Upstream::default();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/cgi-bin/gettoken", upstream.token_handler(TOKEN_ONE))
+        .route(
+            "/cgi-bin/message/send",
+            post({
+                let attempts = attempts.clone();
+                move || {
+                    let attempts = attempts.clone();
+                    async move {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                        match attempt {
+                            0 => Json(json!({"errcode": 45009, "errmsg": "api freq out of limit"})),
+                            1 => Json(json!({"errcode": -1, "errmsg": "system busy"})),
+                            _ => Json(json!({"errcode": 0, "msgid": "msg-busy"})),
+                        }
+                    }
+                }
+            }),
+        );
+    let (base, server) = spawn_server(app).await?;
+    let mut plugin = Plugin::start().await?;
+
+    let limited = plugin
+        .send(
+            "rate-limited",
+            send_params(api_base_config(&base), json!(TEST_SECRET)),
+        )
+        .await?;
+    assert_eq!(limited.status, NotificationSendStatus::Retryable);
+    assert_eq!(limited.error_code.as_deref(), Some("rate_limited"));
+
+    let busy = plugin
+        .send(
+            "system-busy",
+            send_params(api_base_config(&base), json!(TEST_SECRET)),
+        )
+        .await?;
+    assert_eq!(busy.status, NotificationSendStatus::Retryable);
+    assert_eq!(busy.error_code.as_deref(), Some("system_busy"));
+
+    let delivered = plugin
+        .send(
+            "recovered",
+            send_params(api_base_config(&base), json!(TEST_SECRET)),
+        )
+        .await?;
+    assert_eq!(delivered.status, NotificationSendStatus::Delivered);
+    assert_eq!(delivered.provider_request_id.as_deref(), Some("msg-busy"));
+
+    let stderr = plugin.finish().await?;
+    server.abort();
+
+    assert_eq!(upstream.token_calls(), 1, "the token stays cached");
+    assert_result_has_no_credentials(&limited);
+    assert_result_has_no_credentials(&busy);
+    assert_result_has_no_credentials(&delivered);
+    assert_log_has_no_credentials(&stderr);
+    Ok(())
+}
+
+#[tokio::test]
+async fn refreshes_the_token_once_when_wecom_rejects_it() -> Result<(), Box<dyn std::error::Error>>
+{
+    let upstream = Upstream::default();
+    let app = Router::new()
+        .route(
+            "/cgi-bin/gettoken",
+            get({
+                let calls = upstream.token_calls.clone();
+                move || {
+                    let calls = calls.clone();
+                    async move {
+                        let index = calls.fetch_add(1, Ordering::SeqCst);
+                        Json(token_body(if index == 0 { TOKEN_ONE } else { TOKEN_TWO }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/cgi-bin/message/send",
+            post({
+                let calls = upstream.send_calls.clone();
+                move |Query(query): Query<HashMap<String, String>>| {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        if query.get("access_token").map(String::as_str) == Some(TOKEN_ONE) {
+                            Json(json!({"errcode": 40014, "errmsg": "invalid access_token"}))
+                        } else {
+                            Json(json!({"errcode": 0, "msgid": "msg-refreshed"}))
+                        }
+                    }
+                }
+            }),
+        );
+    let (base, server) = spawn_server(app).await?;
+    let mut plugin = Plugin::start().await?;
+    let result = plugin
+        .send(
+            "refresh",
+            send_params(api_base_config(&base), json!(TEST_SECRET)),
+        )
+        .await?;
+    let stderr = plugin.finish().await?;
+    server.abort();
+
+    assert_eq!(result.status, NotificationSendStatus::Delivered);
+    assert_eq!(result.provider_request_id.as_deref(), Some("msg-refreshed"));
+    assert_eq!(upstream.token_calls(), 2, "the rejected token is refreshed");
+    assert_eq!(upstream.send_calls(), 2, "the message is retried once");
+    assert_result_has_no_credentials(&result);
+    assert_log_has_no_credentials(&stderr);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_an_oversized_upstream_response() -> Result<(), Box<dyn std::error::Error>> {
+    let app = Router::new().route(
+        "/cgi-bin/gettoken",
+        get(|| async {
+            let mut body = token_body(TOKEN_ONE);
+            body["padding"] = json!("x".repeat(100 * 1024));
+            Json(body)
+        }),
+    );
+    let (base, server) = spawn_server(app).await?;
+    let mut plugin = Plugin::start().await?;
+    let result = plugin
+        .send(
+            "oversized",
+            send_params(api_base_config(&base), json!(TEST_SECRET)),
+        )
+        .await?;
+    let stderr = plugin.finish().await?;
+    server.abort();
+
+    assert_eq!(result.status, NotificationSendStatus::Failed);
+    assert_eq!(result.error_code.as_deref(), Some("response_too_large"));
+    assert_log_has_no_credentials(&stderr);
+    Ok(())
+}
+
+/// The plugin uses the SDK's 10 second outbound timeout, so this test intentionally waits for it.
+#[tokio::test]
+async fn reports_a_timeout_as_retryable() -> Result<(), Box<dyn std::error::Error>> {
+    let app = Router::new().route(
+        "/cgi-bin/gettoken",
+        get(|| async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Json(token_body(TOKEN_ONE))
+        }),
+    );
+    let (base, server) = spawn_server(app).await?;
+    let mut plugin = Plugin::start().await?;
+    let result = plugin
+        .send(
+            "timeout",
+            send_params(api_base_config(&base), json!(TEST_SECRET)),
+        )
+        .await?;
+    let stderr = plugin.finish().await?;
+    server.abort();
+
+    assert_eq!(result.status, NotificationSendStatus::Retryable);
+    assert_eq!(result.error_code.as_deref(), Some("network_error"));
+    assert_result_has_no_credentials(&result);
+    assert_log_has_no_credentials(&stderr);
     Ok(())
 }
