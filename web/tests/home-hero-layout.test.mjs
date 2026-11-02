@@ -6,9 +6,10 @@ import { stylesheet as allStyles } from "./style-source.mjs";
 const stylesheet = allStyles;
 const homePageSource = readFileSync(new URL("../src/features/home/HomePage.tsx", import.meta.url), "utf8");
 
-test("hero carousel remounts with the slide list instead of resetting its index afterwards", () => {
-  assert.match(homePageSource, /<HeroCarousel key=\{slideKey\}/);
-  assert.doesNotMatch(homePageSource, /setActiveIndex\(0\)/);
+test("hero carousel derives its slide index from the list instead of remounting", () => {
+  assert.doesNotMatch(homePageSource, /<HeroCarousel key=/);
+  assert.match(homePageSource, /const \[slideKeyState, setSlideKeyState\] = useState\(slideKey\)/);
+  assert.match(homePageSource, /if \(slideKeyState !== slideKey\) \{[\s\S]*?setActiveIndex\(0\);/);
 });
 
 test("hero carousel controls share a flexible row and stay at its right edge", () => {

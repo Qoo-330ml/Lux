@@ -13,7 +13,6 @@ import { queryKeys, queryRefreshIntervals } from "../src/lib/api/query-keys";
 import { accountSettingsStorageKey } from "../src/features/account/account-settings";
 
 const heroSlidesTracker = vi.hoisted(() => vi.fn());
-const heroTitleScaleTracker = vi.hoisted(() => vi.fn());
 
 vi.mock("../src/features/home/carousel", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/features/home/carousel")>();
@@ -22,10 +21,6 @@ vi.mock("../src/features/home/carousel", async (importOriginal) => {
     heroSlides: (...args: Parameters<typeof actual.heroSlides>) => {
       heroSlidesTracker(...args);
       return actual.heroSlides(...args);
-    },
-    heroTitleScale: (title: string) => {
-      heroTitleScaleTracker(title);
-      return actual.heroTitleScale(title);
     },
   };
 });
@@ -560,6 +555,38 @@ describe("HomePage shelves", () => {
     return element;
   }
 
+  /** Mount the hero for a test that swaps the carousel response and refetches it. */
+  async function mountCarouselQuerying(recommended: NonNullable<HomeResponse["recommended"]>) {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    mockHomeSections({ libraries: [], recommended, continueWatching: [], recentlyAdded: [] });
+    const element = document.createElement("div");
+    document.body.append(element);
+    container = element;
+    root = createRoot(element);
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <HomePage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await waitForHomeUpdate(() => expect(element.querySelector<HTMLButtonElement>(".lux-hero-dot.is-active")?.getAttribute("aria-label"))
+      .toContain("第 1 条精选"));
+    return { element, queryClient, homeCarousel: vi.mocked(api.homeCarousel) };
+  }
+
+  async function refetchCarousel(queryClient: QueryClient) {
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.homeCarousel });
+    });
+  }
+
   function activeSlideLabel(element: HTMLElement) {
     return element.querySelector<HTMLButtonElement>(".lux-hero-dot.is-active")?.getAttribute("aria-label");
   }
@@ -576,44 +603,13 @@ describe("HomePage shelves", () => {
   }
 
   /** jsdom implements neither pointer-type nor media-query based hover/focus capabilities. */
-  function stubPointerCapabilities({
-    hoverSelector = false,
-    hoverMedia = false,
-    focusVisible = false,
-  }: {
-    hoverSelector?: boolean;
-    hoverMedia?: boolean;
-    focusVisible?: boolean | (() => boolean);
-  } = {}) {
+  function stubFocusVisible(focusVisible: boolean | (() => boolean) = true) {
     const originalMatches = Element.prototype.matches;
-    const originalMatchMedia = window.matchMedia;
-    const focusVisibleMatches = () => (typeof focusVisible === "function" ? focusVisible() : focusVisible);
-    vi.spyOn(Element.prototype, "matches").mockImplementation(function (this: Element, selector: string) {
-      if (selector === ":hover") return hoverSelector;
-      if (selector === ":focus-visible") return focusVisibleMatches();
+    const matches = vi.spyOn(Element.prototype, "matches").mockImplementation(function (this: Element, selector: string) {
+      if (selector === ":focus-visible") return typeof focusVisible === "function" ? focusVisible() : focusVisible;
       return originalMatches.call(this, selector);
     });
-    Object.defineProperty(window, "matchMedia", {
-      configurable: true,
-      writable: true,
-      value: (query: string) => ({
-        matches: hoverMedia,
-        media: query,
-        onchange: null,
-        addListener: () => undefined,
-        removeListener: () => undefined,
-        addEventListener: () => undefined,
-        removeEventListener: () => undefined,
-        dispatchEvent: () => false,
-      }),
-    });
-    return () => {
-      Object.defineProperty(window, "matchMedia", {
-        configurable: true,
-        writable: true,
-        value: originalMatchMedia,
-      });
-    };
+    return () => matches.mockRestore();
   }
 
   function progressIsPaused(element: HTMLElement) {
@@ -621,77 +617,67 @@ describe("HomePage shelves", () => {
   }
 
   it("pauses the carousel while the mouse pointer rests on the hero and resumes afterwards", async () => {
-    const restoreCapabilities = stubPointerCapabilities({ hoverMedia: true });
+    const element = await mountCarousel();
+    const hero = element.querySelector(".lux-hero") as HTMLElement;
+
     try {
-      const element = await mountCarousel();
-      const hero = element.querySelector(".lux-hero") as HTMLElement;
+      vi.useFakeTimers({ now: Date.now() });
+      act(() => dispatchPointer(hero, "pointerover", "mouse", document.body));
+      expect(progressIsPaused(element)).toBe(true);
 
-      try {
-        vi.useFakeTimers({ now: Date.now() });
-        act(() => dispatchPointer(hero, "pointerover", "mouse", document.body));
-        expect(progressIsPaused(element)).toBe(true);
+      act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS * 3));
+      expect(activeSlideLabel(element)).toContain("第 1 条精选");
 
-        act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS * 3));
-        expect(activeSlideLabel(element)).toContain("第 1 条精选");
+      act(() => dispatchPointer(hero, "pointerout", "mouse", document.body));
+      expect(progressIsPaused(element)).toBe(false);
 
-        act(() => dispatchPointer(hero, "pointerout", "mouse", document.body));
-        expect(progressIsPaused(element)).toBe(false);
-
-        act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS));
-        expect(activeSlideLabel(element)).toContain("第 2 条精选");
-      } finally {
-        if (vi.isFakeTimers()) {
-          act(() => root?.unmount());
-          root = undefined;
-        }
-        vi.useRealTimers();
-      }
+      act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS));
+      expect(activeSlideLabel(element)).toContain("第 2 条精选");
     } finally {
-      restoreCapabilities();
+      if (vi.isFakeTimers()) {
+        act(() => root?.unmount());
+        root = undefined;
+      }
+      vi.useRealTimers();
     }
   });
 
   it("ignores touch pointer events so a tap cannot stick the carousel paused", async () => {
-    const restoreCapabilities = stubPointerCapabilities({ hoverMedia: false });
+    const element = await mountCarousel();
+    const hero = element.querySelector(".lux-hero") as HTMLElement;
+
     try {
-      const element = await mountCarousel();
-      const hero = element.querySelector(".lux-hero") as HTMLElement;
+      vi.useFakeTimers({ now: Date.now() });
+      act(() => element.querySelectorAll<HTMLButtonElement>(".lux-hero-dot")[1]?.click());
+      await act(async () => {});
+      expect(activeSlideLabel(element)).toContain("第 2 条精选");
 
-      try {
-        vi.useFakeTimers({ now: Date.now() });
-        act(() => element.querySelectorAll<HTMLButtonElement>(".lux-hero-dot")[1]?.click());
-        await act(async () => {});
-        expect(activeSlideLabel(element)).toContain("第 2 条精选");
+      act(() => {
+        // A real tap also synthesises mouse compatibility events that never fire a matching
+        // mouseleave, which used to leave `hovered` stuck at true.
+        hero.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, relatedTarget: document.body }));
+        dispatchPointer(hero, "pointerover", "touch", document.body);
+      });
+      expect(progressIsPaused(element)).toBe(false);
 
-        act(() => {
-          // A real tap also synthesises mouse compatibility events that never fire a matching
-          // mouseleave, which used to leave `hovered` stuck at true.
-          hero.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, relatedTarget: document.body }));
-          dispatchPointer(hero, "pointerover", "touch", document.body);
-        });
-        expect(progressIsPaused(element)).toBe(false);
+      act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS));
+      expect(activeSlideLabel(element)).toContain("第 1 条精选");
 
-        act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS));
-        expect(activeSlideLabel(element)).toContain("第 1 条精选");
-
-        act(() => dispatchPointer(hero, "pointerover", "mouse", document.body));
-        expect(progressIsPaused(element)).toBe(true);
-        act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS * 2));
-        expect(activeSlideLabel(element)).toContain("第 1 条精选");
-      } finally {
-        if (vi.isFakeTimers()) {
-          act(() => root?.unmount());
-          root = undefined;
-        }
-        vi.useRealTimers();
-      }
+      act(() => dispatchPointer(hero, "pointerover", "mouse", document.body));
+      expect(progressIsPaused(element)).toBe(true);
+      act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS * 2));
+      expect(activeSlideLabel(element)).toContain("第 1 条精选");
     } finally {
-      restoreCapabilities();
+      if (vi.isFakeTimers()) {
+        act(() => root?.unmount());
+        root = undefined;
+      }
+      vi.useRealTimers();
     }
   });
 
   it("pauses the carousel while keyboard focus is inside the hero", async () => {
-    const restoreCapabilities = stubPointerCapabilities({ focusVisible: true });
+    const restoreFocusVisible = stubFocusVisible(true);
     try {
       const element = await mountCarousel();
       const dot = element.querySelectorAll<HTMLButtonElement>(".lux-hero-dot")[0];
@@ -717,12 +703,13 @@ describe("HomePage shelves", () => {
         vi.useRealTimers();
       }
     } finally {
-      restoreCapabilities();
+      restoreFocusVisible();
     }
   });
 
   it("keeps rotating after a mouse click focuses a dot that is not focus-visible", async () => {
-    const restoreCapabilities = stubPointerCapabilities({ focusVisible: false, hoverMedia: true });
+    // jsdom reports :focus-visible for any focused element, so simulate a mouse-driven focus.
+    const restoreFocusVisible = stubFocusVisible(false);
     try {
       const element = await mountCarousel();
       const hero = element.querySelector(".lux-hero") as HTMLElement;
@@ -747,16 +734,13 @@ describe("HomePage shelves", () => {
         vi.useRealTimers();
       }
     } finally {
-      restoreCapabilities();
+      restoreFocusVisible();
     }
   });
 
   it("resumes rotating when a mouse click moves keyboard focus within the hero", async () => {
     let keyboardFocus = true;
-    const restoreCapabilities = stubPointerCapabilities({
-      hoverMedia: false,
-      focusVisible: () => keyboardFocus,
-    });
+    const restoreFocusVisible = stubFocusVisible(() => keyboardFocus);
     try {
       const element = await mountCarousel();
       const dots = () => element.querySelectorAll<HTMLButtonElement>(".lux-hero-dot");
@@ -782,27 +766,7 @@ describe("HomePage shelves", () => {
         vi.useRealTimers();
       }
     } finally {
-      restoreCapabilities();
-    }
-  });
-
-  it("starts paused when a remounted hover-capable carousel is already under the pointer", async () => {
-    const restoreCapabilities = stubPointerCapabilities({ hoverSelector: true, hoverMedia: true });
-    try {
-      const element = await mountCarousel();
-      expect(progressIsPaused(element)).toBe(true);
-    } finally {
-      restoreCapabilities();
-    }
-  });
-
-  it("does not adopt a sticky :hover state when the device cannot hover", async () => {
-    const restoreCapabilities = stubPointerCapabilities({ hoverSelector: true, hoverMedia: false });
-    try {
-      const element = await mountCarousel();
-      expect(progressIsPaused(element)).toBe(false);
-    } finally {
-      restoreCapabilities();
+      restoreFocusVisible();
     }
   });
 
@@ -872,57 +836,103 @@ describe("HomePage shelves", () => {
     }
   });
 
-  it("starts a changed slide list from its first slide instead of a stale index", async () => {
-    const firstSlides = [
+  it("starts a changed slide list from its first slide without a stale frame", async () => {
+    const { element, queryClient, homeCarousel } = await mountCarouselQuerying([
       { id: "featured-1", title: "精选电影", itemType: "MOVIE" },
       { id: "featured-2", title: "精选剧集", itemType: "SERIES" },
       { id: "featured-3", title: "精选纪录片", itemType: "MOVIE" },
-    ];
-    const nextSlides = [
+    ]);
+    act(() => element.querySelectorAll<HTMLButtonElement>(".lux-hero-dot")[2]?.click());
+    await waitForHomeUpdate(() => expect(activeSlideLabel(element)).toContain("第 3 条精选"));
+
+    // Record the titles of the slide copy that actually reaches the DOM, not the ones React merely
+    // computed: a reset from an effect would paint the third new slide before correcting itself.
+    const committedTitles: string[] = [];
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          if (!(node instanceof HTMLElement)) continue;
+          const copy = node.classList.contains("lux-hero-copy")
+            ? node
+            : node.querySelector(".lux-hero-copy");
+          if (!copy) continue;
+          committedTitles.push(copy.querySelector(".lux-hero-title-text")?.textContent ?? "");
+        }
+      }
+    });
+    observer.observe(element, { childList: true, subtree: true });
+
+    homeCarousel.mockResolvedValue({ recommended: [
       { id: "fresh-1", title: "新精选甲", itemType: "MOVIE" },
       { id: "fresh-2", title: "新精选乙", itemType: "SERIES" },
       { id: "fresh-3", title: "新精选丙", itemType: "MOVIE" },
       { id: "fresh-4", title: "新精选丁", itemType: "SERIES" },
-    ];
-    const homeCarousel = vi.spyOn(api, "homeCarousel").mockResolvedValue({ recommended: firstSlides });
-    vi.spyOn(api, "homeLibraries").mockResolvedValue({ libraries: [] });
-    vi.spyOn(api, "homeContinueWatching").mockResolvedValue({ items: [], total: 0 });
-    vi.spyOn(api, "homeLibrariesLatest").mockResolvedValue({ libraries: [] });
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-
-    const element = document.createElement("div");
-    document.body.append(element);
-    container = element;
-    root = createRoot(element);
-    await act(async () => {
-      root?.render(
-        <QueryClientProvider client={queryClient}>
-          <MemoryRouter>
-            <HomePage user={user} />
-          </MemoryRouter>
-        </QueryClientProvider>,
-      );
-    });
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-    await waitForHomeUpdate(() => expect(activeSlideLabel(element)).toContain("第 1 条精选"));
-
-    act(() => element.querySelectorAll<HTMLButtonElement>(".lux-hero-dot")[2]?.click());
-    await waitForHomeUpdate(() => expect(activeSlideLabel(element)).toContain("第 3 条精选"));
-
-    heroTitleScaleTracker.mockClear();
-    homeCarousel.mockResolvedValue({ recommended: nextSlides });
-    await act(async () => {
-      await queryClient.invalidateQueries({ queryKey: queryKeys.homeCarousel });
-    });
+    ] });
+    await refetchCarousel(queryClient);
     await waitForHomeUpdate(() => expect(element.querySelector(".lux-hero-title-text")?.textContent).toBe("新精选甲"));
+    await act(async () => {});
+    observer.disconnect();
 
-    const renderedTitles = heroTitleScaleTracker.mock.calls.map(([title]) => title);
-    expect(renderedTitles).toContain("新精选甲");
-    expect(renderedTitles).not.toContain("新精选丙");
+    expect(committedTitles).toEqual(["新精选甲"]);
     expect(activeSlideLabel(element)).toContain("第 1 条精选");
     expect(element.querySelectorAll(".lux-hero-dot")).toHaveLength(4);
+  });
+
+  it("keeps the hero artwork nodes when a refresh keeps the first slide", async () => {
+    const { element, queryClient, homeCarousel } = await mountCarouselQuerying([
+      { id: "featured-1", title: "精选电影", itemType: "MOVIE", imageTags: { fanart: "fa-1" } },
+      { id: "featured-2", title: "精选剧集", itemType: "SERIES", imageTags: { fanart: "fa-2" } },
+      { id: "featured-3", title: "精选纪录片", itemType: "MOVIE", imageTags: { fanart: "fa-3" } },
+    ]);
+    const backdrop = element.querySelector(".lux-hero-backdrop");
+    const copy = element.querySelector(".lux-hero-copy");
+    expect(backdrop?.classList.contains("lux-hero-backdrop-animated")).toBe(true);
+    expect(copy?.classList.contains("lux-hero-copy-animated")).toBe(true);
+
+    homeCarousel.mockResolvedValue({ recommended: [
+      { id: "featured-1", title: "精选电影", itemType: "MOVIE", imageTags: { fanart: "fa-1" } },
+      { id: "fresh-2", title: "新精选乙", itemType: "SERIES" },
+      { id: "fresh-3", title: "新精选丙", itemType: "MOVIE" },
+    ] });
+    await refetchCarousel(queryClient);
+    await waitForHomeUpdate(() => expect(element.querySelectorAll<HTMLButtonElement>(".lux-hero-dot")[1]?.getAttribute("aria-label"))
+      .toContain("新精选乙"));
+
+    // Same nodes means no unmount: entrance animations do not replay and the visible artwork stays.
+    expect(element.querySelector(".lux-hero-backdrop")).toBe(backdrop);
+    expect(element.querySelector(".lux-hero-copy")).toBe(copy);
+    expect(copy?.querySelector(".lux-hero-title-text")?.textContent).toBe("精选电影");
+    expect(activeSlideLabel(element)).toContain("第 1 条精选");
+  });
+
+  it("keeps focus on a dot when the slide list changes", async () => {
+    const restoreFocusVisible = stubFocusVisible(true);
+    try {
+      const { element, queryClient, homeCarousel } = await mountCarouselQuerying([
+        { id: "featured-1", title: "精选电影", itemType: "MOVIE" },
+        { id: "featured-2", title: "精选剧集", itemType: "SERIES" },
+        { id: "featured-3", title: "精选纪录片", itemType: "MOVIE" },
+      ]);
+      const dot = element.querySelectorAll<HTMLButtonElement>(".lux-hero-dot")[1];
+      act(() => dot.focus());
+      expect(document.activeElement).toBe(dot);
+      expect(progressIsPaused(element)).toBe(true);
+
+      homeCarousel.mockResolvedValue({ recommended: [
+        { id: "featured-1", title: "精选电影", itemType: "MOVIE" },
+        { id: "featured-2", title: "精选剧集", itemType: "SERIES" },
+        { id: "fresh-3", title: "新精选丙", itemType: "MOVIE" },
+      ] });
+      await refetchCarousel(queryClient);
+      await waitForHomeUpdate(() => expect(element.querySelectorAll<HTMLButtonElement>(".lux-hero-dot")[2]?.getAttribute("aria-label"))
+        .toContain("新精选丙"));
+
+      expect(document.activeElement).toBe(dot);
+      expect(progressIsPaused(element)).toBe(true);
+      expect(activeSlideLabel(element)).toContain("第 1 条精选");
+    } finally {
+      restoreFocusVisible();
+    }
   });
 
   it("starts an unfinished episode when the carousel highlights its series", async () => {

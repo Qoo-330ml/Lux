@@ -1,7 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Info, Play } from "lucide-react";
 import { Link } from "react-router-dom";
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
@@ -85,9 +85,6 @@ export function HomePage({ user }: { user: LuxUser }) {
     recommended: carousel.data?.recommended ?? EMPTY_MEDIA_ITEMS,
     continueWatching,
   }), [carousel.data?.recommended, continueWatching]);
-  // Remounting the carousel per slide list resets its index in the same commit as the new list,
-  // instead of rendering one frame with an index that belonged to the previous slides.
-  const slideKey = useMemo(() => slides.map((item) => item.id).join("|"), [slides]);
   const heroIsLoading = slides.length === 0 && (
     carousel.isPending || carousel.isFetching ||
     librariesQuery.isPending || librariesQuery.isFetching ||
@@ -97,7 +94,7 @@ export function HomePage({ user }: { user: LuxUser }) {
     carousel.isSuccess && librariesQuery.isSuccess && continueWatchingQuery.isSuccess;
   return (
     <div className="lux-home">
-      <HeroCarousel key={slideKey} items={slides} continueWatching={continueWatching} isLoading={heroIsLoading} showEmptyState={showEmptyHero} />
+      <HeroCarousel items={slides} continueWatching={continueWatching} isLoading={heroIsLoading} showEmptyState={showEmptyHero} />
       {carousel.error && !carousel.data ? (
         <div className="lux-editor-error" role="status">
           精选轮播加载失败。<LuxButton tone="secondary" type="button" onClick={() => void carousel.refetch()}>重试</LuxButton>
@@ -208,6 +205,15 @@ const HeroCarousel = memo(function HeroCarousel({ items, continueWatching, isLoa
   const [hovered, setHovered] = useState(false);
   const [focusWithin, setFocusWithin] = useState(false);
   const documentHidden = useDocumentHidden();
+  const slideKey = useMemo(() => items.map((item) => item.id).join("|"), [items]);
+  const [slideKeyState, setSlideKeyState] = useState(slideKey);
+  // Adjust the index during render when the slide list changes: React re-renders before
+  // committing, so the commit that carries the new list already shows its first slide and no
+  // remount is needed (focus and entrance animations survive).
+  if (slideKeyState !== slideKey) {
+    setSlideKeyState(slideKey);
+    setActiveIndex(0);
+  }
   // WCAG 2.2.2: moving content stops while the user points at it, reads it with the keyboard,
   // or switches to another tab. Resuming keeps the remaining time instead of restarting.
   const paused = hovered || focusWithin || documentHidden;
@@ -236,25 +242,9 @@ const HeroCarousel = memo(function HeroCarousel({ items, continueWatching, isLoa
       : "/libraries";
   const playbackLabel = playbackItem && playbackPositionTicks(playbackItem) > 0 ? "继续播放" : "播放";
   const goTo = (index: number) => setActiveIndex((index + items.length) % items.length);
-  const heroRef = useRef<HTMLElement | null>(null);
-
-  // A slide list change remounts the hero while the pointer may still rest on it; the browser
-  // does not repeat `pointerenter` for the fresh node, so adopt the current hover state on mount.
-  // Devices that cannot hover (touch) report no media match, which keeps a stale `:hover` from
-  // freezing the carousel.
-  useEffect(() => {
-    const node = heroRef.current;
-    if (!node || !supportsHoverPointer()) return;
-    try {
-      if (node.matches(":hover")) setHovered(true);
-    } catch {
-      // Some environments cannot match :hover; hover tracking falls back to pointer events.
-    }
-  }, []);
 
   return (
     <section
-      ref={heroRef}
       className="lux-hero"
       aria-label="精选媒体轮播"
       aria-roledescription="carousel"
@@ -325,15 +315,6 @@ function isKeyboardFocus(target: EventTarget | null) {
     return target.matches(":focus-visible");
   } catch {
     return true;
-  }
-}
-
-/** Hover pause needs a device that really hovers; touch reports a sticky, never-cleared hover. */
-function supportsHoverPointer() {
-  try {
-    return typeof window.matchMedia === "function" && window.matchMedia("(hover: hover)").matches;
-  } catch {
-    return false;
   }
 }
 
