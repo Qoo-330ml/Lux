@@ -625,7 +625,9 @@ impl WebhookService {
             .notifications()
             .list_enabled_notification_destinations()
             .await?;
-        let mut destination_groups = BTreeMap::<WebhookPayloadFormat, Vec<String>>::new();
+        // Keyed by payload format and whether the target is an external plugin: plugins receive
+        // the Lux envelope with the host-built Emby object, which native targets must not see.
+        let mut destination_groups = BTreeMap::<(WebhookPayloadFormat, bool), Vec<String>>::new();
         for destination in destinations {
             let selected = event_types_from_json(&destination.event_types_json)
                 .ok()
@@ -636,30 +638,41 @@ impl WebhookService {
             if !selected {
                 continue;
             }
-            let payload_format = if destination.provider_plugin_id == BUILTIN_WEBHOOK_PROVIDER_ID {
+            let external = destination.provider_plugin_id != BUILTIN_WEBHOOK_PROVIDER_ID;
+            let payload_format = if external {
+                // External providers receive the provider-neutral Lux event.
+                WebhookPayloadFormat::Lux
+            } else {
                 WebhookPayloadFormat::from_wire_name(&destination.payload_format).ok_or_else(
                     || WebhookError::Invalid("unknown webhook payload format".to_owned()),
                 )?
-            } else {
-                // External providers receive the provider-neutral Lux event.
-                WebhookPayloadFormat::Lux
             };
             destination_groups
-                .entry(payload_format)
+                .entry((payload_format, external))
                 .or_default()
                 .push(destination.id);
         }
         let mut first_event_id = None;
-        for (payload_format, destination_ids) in destination_groups {
+        for ((payload_format, external), destination_ids) in destination_groups {
             let event_id = uuid::Uuid::now_v7().to_string();
-            let payload = build_event_payload_for_format(
-                &self.server_id,
-                &event_id,
-                event_type,
-                occurred_at,
-                payload_format,
-                data.clone(),
-            )?;
+            let payload = if external {
+                external_event_payload(
+                    &self.server_id,
+                    &event_id,
+                    event_type,
+                    occurred_at,
+                    data.clone(),
+                )?
+            } else {
+                build_event_payload_for_format(
+                    &self.server_id,
+                    &event_id,
+                    event_type,
+                    occurred_at,
+                    payload_format,
+                    data.clone(),
+                )?
+            };
             let payload_json = serde_json::to_vec(&payload)
                 .map_err(|error| WebhookError::Serialization(error.to_string()))?;
             if payload_json.len() > MAX_EVENT_PAYLOAD_BYTES {
@@ -669,9 +682,10 @@ impl WebhookService {
             }
             let payload_json = String::from_utf8(payload_json)
                 .map_err(|error| WebhookError::Serialization(error.to_string()))?;
-            let event_dedupe_key = match payload_format {
-                WebhookPayloadFormat::Lux => dedupe_key.to_owned(),
-                WebhookPayloadFormat::Emby => format!("{dedupe_key}:EMBY"),
+            let event_dedupe_key = match (payload_format, external) {
+                (_, true) => format!("{dedupe_key}:PLUGIN"),
+                (WebhookPayloadFormat::Lux, false) => dedupe_key.to_owned(),
+                (WebhookPayloadFormat::Emby, false) => format!("{dedupe_key}:EMBY"),
             };
             let inserted = self
                 .database
@@ -1555,6 +1569,37 @@ fn build_event_payload(
     Ok(Value::Object(data))
 }
 
+/// External notifier plugins receive the Lux envelope plus the host-built Emby object under `emby`.
+/// Plugins forward `emby` as-is, so the host stays the only place that builds payload text.
+fn external_event_payload(
+    server_id: &str,
+    event_id: &str,
+    event_type: WebhookEventType,
+    occurred_at: i64,
+    data: Value,
+) -> Result<Value, WebhookError> {
+    let mut payload = build_event_payload_for_format(
+        server_id,
+        event_id,
+        event_type,
+        occurred_at,
+        WebhookPayloadFormat::Lux,
+        data.clone(),
+    )?;
+    let emby = build_event_payload_for_format(
+        server_id,
+        event_id,
+        event_type,
+        occurred_at,
+        WebhookPayloadFormat::Emby,
+        data,
+    )?;
+    if let Value::Object(object) = &mut payload {
+        object.insert("emby".to_owned(), emby);
+    }
+    Ok(payload)
+}
+
 fn build_event_payload_for_format(
     server_id: &str,
     event_id: &str,
@@ -2262,8 +2307,8 @@ fn public_error_message(error: &WebhookError) -> String {
 mod tests {
     use super::{
         WebhookEventType, WebhookPayloadFormat, build_event_payload,
-        build_event_payload_for_format, is_retryable_http_status, parse_retry_after,
-        plugin_event_from_payload, provider_config_json, retry_delay,
+        build_event_payload_for_format, external_event_payload, is_retryable_http_status,
+        parse_retry_after, plugin_event_from_payload, provider_config_json, retry_delay,
         validate_optional_provider_url,
     };
     use reqwest::StatusCode;
@@ -2925,6 +2970,47 @@ mod tests {
         assert_eq!(payload["Event"], "playback.pause");
         assert_eq!(payload["Title"], "Chrome 上 alice 已暂停播放 示例电影");
         assert!(payload["Description"].is_null());
+    }
+
+    #[test]
+    fn external_plugin_payload_carries_the_host_built_emby_object_only_for_plugins() {
+        let data = json!({
+            "itemId": "item-1",
+            "itemType": "MOVIE",
+            "itemTitle": "示例电影",
+            "userName": "alice",
+            "deviceName": "Chrome",
+            "playSessionId": "session-1",
+            "itemPath": "/media/movies/示例电影.mkv",
+            "fileName": "示例电影.mkv",
+            "remoteIp": "192.0.2.10"
+        });
+        let plugin = external_event_payload(
+            "server-1",
+            "event-plugin",
+            WebhookEventType::PlaybackStarted,
+            1_700_000_000,
+            data.clone(),
+        )
+        .expect("plugin payload should be accepted");
+        assert_eq!(plugin["emby"]["Event"], "playback.start");
+        assert_eq!(
+            plugin["emby"]["Title"],
+            "alice 在 Chrome 上开始播放 示例电影"
+        );
+        assert_eq!(plugin["emby"]["Item"]["Path"], "/media/movies/示例电影.mkv");
+        assert!(plugin.get("itemPath").is_none());
+
+        let native = build_event_payload_for_format(
+            "server-1",
+            "event-native",
+            WebhookEventType::PlaybackStarted,
+            1_700_000_000,
+            WebhookPayloadFormat::Lux,
+            data,
+        )
+        .expect("native payload should be accepted");
+        assert!(native.get("emby").is_none());
     }
 
     #[test]
