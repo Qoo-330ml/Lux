@@ -521,13 +521,13 @@ describe("HomePage shelves", () => {
     }
   });
 
-  async function mountTwoSlideCarousel() {
+  async function mountCarousel(recommended: NonNullable<HomeResponse["recommended"]> = [
+    { id: "featured-1", title: "精选电影", itemType: "MOVIE" },
+    { id: "featured-2", title: "精选剧集", itemType: "SERIES" },
+  ]) {
     mockHomeSections({
       libraries: [],
-      recommended: [
-        { id: "featured-1", title: "精选电影", itemType: "MOVIE" },
-        { id: "featured-2", title: "精选剧集", itemType: "SERIES" },
-      ],
+      recommended,
       continueWatching: [],
       recentlyAdded: [],
     });
@@ -560,7 +560,7 @@ describe("HomePage shelves", () => {
   }
 
   it("pauses the carousel while the pointer rests on the hero and resumes afterwards", async () => {
-    const element = await mountTwoSlideCarousel();
+    const element = await mountCarousel();
     const hero = element.querySelector(".lux-hero") as HTMLElement;
 
     try {
@@ -590,7 +590,7 @@ describe("HomePage shelves", () => {
   });
 
   it("pauses the carousel while keyboard focus is inside the hero", async () => {
-    const element = await mountTwoSlideCarousel();
+    const element = await mountCarousel();
     const dot = element.querySelectorAll<HTMLButtonElement>(".lux-hero-dot")[0];
 
     try {
@@ -616,7 +616,7 @@ describe("HomePage shelves", () => {
   });
 
   it("pauses the carousel while the page is hidden and resumes when it is visible again", async () => {
-    const element = await mountTwoSlideCarousel();
+    const element = await mountCarousel();
 
     try {
       vi.useFakeTimers({ now: Date.now() });
@@ -640,6 +640,44 @@ describe("HomePage shelves", () => {
         root = undefined;
       }
       vi.useRealTimers();
+    }
+  });
+
+  it("preloads only the next slide backdrop and keeps the visible image eager", async () => {
+    const created: { src: string }[] = [];
+
+    class TrackingImage {
+      src = "";
+      decoding = "";
+      onload: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      constructor() { created.push(this); }
+      decode() { return Promise.resolve(); }
+    }
+
+    vi.stubGlobal("Image", TrackingImage);
+    try {
+      const element = await mountCarousel([
+        { id: "featured-1", title: "精选电影", itemType: "MOVIE", imageTags: { fanart: "fa-1" } },
+        { id: "featured-2", title: "精选剧集", itemType: "SERIES", imageTags: { fanart: "fa-2" } },
+        { id: "featured-3", title: "精选纪录片", itemType: "MOVIE", imageTags: { fanart: "fa-3" } },
+      ]);
+
+      const backdrop = element.querySelector<HTMLImageElement>(".lux-hero-backdrop");
+      expect(backdrop?.getAttribute("src")).toBe("/api/v1/items/featured-1/images/fanart?tag=fa-1");
+      expect(backdrop?.getAttribute("fetchpriority")).toBe("high");
+      expect(created.map((image) => image.src))
+        .toEqual(["/api/v1/items/featured-2/images/fanart?tag=fa-2"]);
+
+      act(() => element.querySelectorAll<HTMLButtonElement>(".lux-hero-dot")[2]?.click());
+      await waitForHomeUpdate(() => expect(activeSlideLabel(element)).toContain("第 3 条精选"));
+
+      expect(created.map((image) => image.src)).toEqual([
+        "/api/v1/items/featured-2/images/fanart?tag=fa-2",
+        "/api/v1/items/featured-1/images/fanart?tag=fa-1",
+      ]);
+    } finally {
+      vi.unstubAllGlobals();
     }
   });
 

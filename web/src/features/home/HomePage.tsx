@@ -17,6 +17,7 @@ import {
 } from "./carousel";
 import { useImageVariants } from "./image-variants";
 import { nextCarouselIndex, useDocumentHidden, useHeroCarouselAutoplay } from "./hero-carousel-autoplay";
+import { heroBackdropUrl, useHeroBackdropPreload } from "./hero-preload";
 import { ContinueWatchingRail, imageUrl, LibraryCard, MediaRail, mediaTitle, mediaTypeLabel, playbackPositionTicks, runtimeLabel } from "./media";
 import { useSseConnectionState, type SseConnectionState } from "../activity/useUserEvents";
 import { prefetchLibraryPage } from "../library/prefetchLibrary";
@@ -221,10 +222,8 @@ const HeroCarousel = memo(function HeroCarousel({ items, continueWatching, isLoa
   const safeIndex = items.length ? activeIndex % items.length : 0;
   const item = items[safeIndex];
   const logo = item ? imageUrl(item, "logo") : undefined;
-  const image = item
-    ? imageUrl(item, "fanart", enabled ? 1280 : undefined)
-      ?? imageUrl(item, "poster", enabled ? 1280 : undefined)
-    : undefined;
+  const image = heroBackdropUrl(item, enabled);
+  useHeroBackdropPreload({ items, activeIndex: safeIndex, variantsEnabled: enabled });
   const title = item ? mediaTitle(item) : "你的私人影院";
   const titleClassName = logo
     ? "lux-hero-title has-logo"
