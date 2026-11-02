@@ -101,6 +101,24 @@ describe("LuxPlayer danmaku scheduler", () => {
     expect(scheduler.place(18)).toEqual([]);
   });
 
+  it("keeps lanes stable for millisecond rewinds instead of resetting on every step", () => {
+    // Two rAF frames can report 8.05 then 8.04 (a paused sample, a rounding artefact); that is not a
+    // seek. Resetting there would re-run lane assignment and make visible danmaku jump lanes.
+    const entries = Array.from({ length: 60 }, (_, index) => entry(index, index * 0.4, "长".repeat(8)));
+    const scheduler = createDanmakuScheduler(entries, { viewport, measure });
+
+    const atHigh = scheduler.place(8.05);
+    const atLow = scheduler.place(8.04);
+
+    expect(atHigh.length).toBeGreaterThan(0);
+    expect(atLow).toEqual(atHigh);
+    expect(atLow.map((placement) => placement.lane)).toEqual(atHigh.map((placement) => placement.lane));
+
+    // A rewind beyond the seek tolerance is a real seek and still recomputes lanes.
+    const fresh = createDanmakuScheduler(entries, { viewport, measure });
+    expect(scheduler.place(3)).toEqual(fresh.place(3));
+  });
+
   it("recomputes lanes after a seek so a rewound window matches a fresh schedule", () => {
     const entries = Array.from({ length: 60 }, (_, index) => entry(index, index * 0.5));
     const scheduler = createDanmakuScheduler(entries, { viewport, measure });

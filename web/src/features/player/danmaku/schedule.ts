@@ -14,6 +14,12 @@
 import { DANMAKU_LIMITS, type DanmakuMode, type LuxDanmakuEntry } from "./parse";
 import { createTextMeasurer, type MeasureText } from "./measure";
 
+/**
+ * Media-time tolerance shared with the renderer: a step beyond this is a seek (recompute lanes),
+ * a smaller one is sampling jitter (keep the current lanes).
+ */
+export const DANMAKU_SEEK_THRESHOLD_SECONDS = 0.5;
+
 export const SCROLL_DURATION_SECONDS = 8;
 export const FIXED_DURATION_SECONDS = 4;
 export const SCROLL_LINE_HEIGHT = 32;
@@ -176,11 +182,17 @@ export function createDanmakuScheduler(
     live.push(candidate);
   }
 
-  function place(mediaTime: number): DanmakuPlacement[] {
-    if (!Number.isFinite(mediaTime) || mediaTime < 0) return [];
-    // A backwards jump or a gap beyond the longest danmaku lifetime invalidates the lane state.
-    if (mediaTime < lastTime || mediaTime > lastTime + SCROLL_DURATION_SECONDS) {
+  function place(requestedTime: number): DanmakuPlacement[] {
+    if (!Number.isFinite(requestedTime) || requestedTime < 0) return [];
+    let mediaTime = requestedTime;
+    // A gap beyond the longest danmaku lifetime or a real rewind invalidates the lane state. A
+    // sub-threshold rewind is sampling jitter (two frames can report 8.05 then 8.04), so it keeps
+    // the current lanes and is clamped instead of re-assigning lanes under the viewer's eyes.
+    if (mediaTime > lastTime + SCROLL_DURATION_SECONDS
+      || mediaTime < lastTime - DANMAKU_SEEK_THRESHOLD_SECONDS) {
       reset(mediaTime);
+    } else if (mediaTime < lastTime) {
+      mediaTime = lastTime;
     }
     lastTime = mediaTime;
 

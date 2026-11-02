@@ -29,6 +29,7 @@ export {
 
 export {
   DANMAKU_LANE_GAP,
+  DANMAKU_SEEK_THRESHOLD_SECONDS,
   FIXED_DURATION_SECONDS,
   FIXED_LINE_HEIGHT,
   SCROLL_DURATION_SECONDS,
@@ -44,7 +45,6 @@ export {
 
 export {
   DANMAKU_MAX_INTERPOLATION_DRIFT_SECONDS,
-  DANMAKU_SEEK_THRESHOLD_SECONDS,
   createDanmakuEngine,
   interpolateMediaTime,
   type DanmakuClockAnchor,

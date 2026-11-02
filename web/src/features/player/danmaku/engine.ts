@@ -10,10 +10,11 @@
  * second, so scrolling speed stays in step with the video at any playback rate.
  */
 
-import type { DanmakuPlacement, DanmakuScheduler } from "./schedule";
-
-/** A media-time jump bigger than this is a seek, not interpolation drift. */
-export const DANMAKU_SEEK_THRESHOLD_SECONDS = 0.5;
+import {
+  DANMAKU_SEEK_THRESHOLD_SECONDS,
+  type DanmakuPlacement,
+  type DanmakuScheduler,
+} from "./schedule";
 
 /**
  * Wall-clock seconds the renderer may extrapolate past the last sample. A buffering stall keeps
