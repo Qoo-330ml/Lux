@@ -2379,13 +2379,23 @@ fn sanitize_probe_error(stderr: &str) -> String {
 /// append rejects the PCE form (`CHUNK_DEMUXER_ERROR_APPEND_FAILED`, the player's
 /// "播放器引擎失败"), so Web playback has to fold the decoded layout into this table first.
 ///
-/// The list is matched by channel count: FFmpeg keeps mono, stereo, 3.0, 4.0, 5.0 and 5.1
-/// sources as they are and downmixes everything wider into 5.1, which is the widest layout every
-/// browser AAC decoder supports. Sources wider than 5.1 are deliberately not kept as 6.1 or 7.1:
-/// recent FFmpeg versions signal those with the *extended* configurations 11/12 (verified with
-/// FFmpeg 9.0), and no Chromium build is known to accept them, while a 5.1 downmix always fits
-/// the classic table. The filter is also a no-op for a layout that is already in the list, so it
-/// is safe to apply even when the probe recorded no channel layout.
+/// FFmpeg keeps a listed input layout as it is and remixes everything else into whichever listed
+/// entry it judges closest, so mono, stereo, 3.0, 4.0, 5.0 and 5.1 sources pass through unchanged
+/// and every other mask still ends up inside the table. Measured on FFmpeg 9.0.2 with `mono`,
+/// `stereo`, `3.0`, `4.0`, `quad`, `2.1`, `4.1`, `5.0`, `5.0(side)`, `5.1`, `5.1(side)`, `6.0`,
+/// `6.0(front)`, `hexagonal`, `6.1`, `7.0`, `7.1`, `7.1(wide)`, `7.1(wide-side)`, `octagonal`,
+/// `7.1.4` and `22.2` sources: each one produced the five-byte `AudioSpecificConfig` with a single
+/// channel configuration, while the unnormalised encoder answered every layout outside this list
+/// with a PCE (or the extended configuration 12 for 7.1) and refused 7.1.4/22.2 outright. A rare
+/// mask can lose a channel on the way (`6.0`, `octagonal` -> 5.0, `2.1` -> stereo), which is
+/// acceptable for layouts the Web player could not describe at all; the result is always something
+/// a browser AAC decoder plays.
+///
+/// Wider than 5.1 is deliberately folded instead of kept: recent FFmpeg versions signal 6.1 and
+/// 7.1 with the *extended* channel configurations 11/12 (verified with FFmpeg 9.0), no Chromium
+/// build is known to accept those, and a 5.1 downmix always fits the classic table. Because the
+/// filter is a no-op for a listed layout it is also safe to apply when the probe recorded no
+/// channel layout at all.
 const AAC_STANDARD_CHANNEL_LAYOUTS: &str = "mono|stereo|3.0|4.0|5.0|5.1";
 
 /// Tiers that re-encode the audio track to AAC (`Remux` copies it, `Direct` never transcodes).
