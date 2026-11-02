@@ -3143,11 +3143,6 @@ impl RecommendationCandidate for CatalogItem {
     fn candidate_kind(&self) -> &str {
         &self.item_type
     }
-
-    fn candidate_series_key(&self) -> Option<&str> {
-        // Only episodes carry a `series_id`; a movie or a series entry is its own series.
-        self.series_id.as_deref()
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

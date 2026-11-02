@@ -1,14 +1,20 @@
+//! Daily recommendation selection.
+//!
+//! The scoring query only returns `MOVIE` and `SERIES` rows
+//! (`item_type IN ('MOVIE', 'SERIES')`), so candidate rows never carry a parent series: seasons
+//! and episodes are not recommended and this module needs no series grouping.
+
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 /// Candidate rows fetched from the scoring query for one daily batch.
 ///
 /// The batch only needs [`RECOMMENDATION_FEATURED_LIMIT`] curated slots, so the pool only has to
-/// be deep enough for the weighted draw and the diversity rules to have material to work with.
-/// 40 keeps the whole ranking tail reachable (0-based rank 39 still draws at ~5% of the top
-/// weight) while fetching a third fewer scored rows than the previous pool of 60.
+/// be deep enough for the weighted draw and the per-type cap to have material to work with. 40
+/// keeps the whole ranking tail reachable (0-based rank 39 still draws at ~5% of the top weight)
+/// while fetching a third fewer scored rows than the previous pool of 60.
 pub(crate) const RECOMMENDATION_CANDIDATE_POOL: i64 = 40;
 
 /// Leading home-carousel slots selected by [`daily_recommendation_items`].
@@ -18,8 +24,8 @@ pub(crate) const RECOMMENDATION_CANDIDATE_POOL: i64 = 40;
 pub(crate) const RECOMMENDATION_FEATURED_LIMIT: usize = 7;
 
 /// The two best-scored candidates are anchored at the front of every batch, so the most relevant
-/// items never lose the lottery against the rest of the pool. Anchors are exempt from the
-/// diversity rules (they are always included); the rules apply to the slots drawn after them.
+/// items never lose the lottery against the rest of the pool. Anchors are exempt from the type cap
+/// (they are always included); the cap applies to the slots drawn after them.
 const ANCHOR_COUNT: usize = 2;
 
 /// Exponent of the rank-derived sampling weight.
@@ -41,17 +47,16 @@ const MIN_RANK_WEIGHT: f64 = 1e-6;
 const MAX_FEATURED_PER_ITEM_TYPE: usize = 4;
 
 /// The catalog fields the daily selection needs. Catalog rows are ranked by the SQL query; this
-/// trait exposes only the stable identity and the diversity dimensions of a candidate.
+/// trait exposes only the stable identity and the type dimension of a candidate.
+///
+/// Candidates are only `MOVIE` or `SERIES` rows: seasons and episodes do not take part in
+/// recommendations, so a candidate is never a child of another candidate.
 pub(crate) trait RecommendationCandidate {
     /// Stable identity used to seed the deterministic draw. It must not change across restarts.
     fn candidate_key(&self) -> &str;
 
-    /// `item_type` (for example `MOVIE` or `SERIES`) used by the type diversity cap.
+    /// `item_type` (for example `MOVIE` or `SERIES`) used by the per-type cap.
     fn candidate_kind(&self) -> &str;
-
-    /// Series grouping key (the `series_id` of an episode). `None` means the candidate is its own
-    /// series, which is the case for movies and for a series entry itself.
-    fn candidate_series_key(&self) -> Option<&str>;
 }
 
 pub(crate) fn current_recommendation_batch_key() -> i64 {
@@ -123,9 +128,8 @@ pub(crate) fn daily_recommendation_items<T: RecommendationCandidate>(
 
 /// Picks the curated prefix: the anchored leaders first, then a weighted draw without replacement.
 ///
-/// Diversity is enforced while walking the draw: one item per series and at most
-/// [`MAX_FEATURED_PER_ITEM_TYPE`] items per type. Constraints relax in two passes (type cap first,
-/// then the series cap) so a thin pool still fills every slot instead of returning a short prefix.
+/// At most [`MAX_FEATURED_PER_ITEM_TYPE`] items per type are drawn. The cap relaxes in a second
+/// pass so a thin pool still fills every slot instead of returning a short prefix.
 fn curated_prefix_indices<T: RecommendationCandidate>(
     items: &[T],
     user_id: &str,
@@ -140,11 +144,9 @@ fn curated_prefix_indices<T: RecommendationCandidate>(
     }
 
     let mut type_counts: HashMap<&str, usize> = HashMap::new();
-    let mut series_used: HashSet<&str> = HashSet::new();
     for index in &selected {
         if let Some(item) = items.get(*index) {
             *type_counts.entry(item.candidate_kind()).or_default() += 1;
-            series_used.insert(series_group_key(item));
         }
     }
 
@@ -167,9 +169,9 @@ fn curated_prefix_indices<T: RecommendationCandidate>(
         }
     }
 
-    // Strict pass first, then relax the type cap, then the series cap. Each pass only revisits
-    // candidates the previous ones rejected, so a thin pool still fills every slot.
-    for relaxation in [Relaxation::None, Relaxation::TypeCap, Relaxation::AllRules] {
+    // Strict pass first, then the same draw without the type cap. The relaxed pass only revisits
+    // candidates the strict one rejected, so a thin pool still fills every slot.
+    for relaxation in [Relaxation::Strict, Relaxation::TypeCapRelaxed] {
         if selected.len() >= featured_limit {
             break;
         }
@@ -183,22 +185,19 @@ fn curated_prefix_indices<T: RecommendationCandidate>(
             let Some(item) = items.get(*index) else {
                 continue;
             };
-            let series_taken = series_used.contains(series_group_key(item));
             let type_count = type_counts
                 .get(item.candidate_kind())
                 .copied()
                 .unwrap_or_default();
-            let series_allowed = relaxation == Relaxation::AllRules || !series_taken;
             let type_allowed =
-                relaxation != Relaxation::None || type_count < MAX_FEATURED_PER_ITEM_TYPE;
-            if !series_allowed || !type_allowed {
+                relaxation == Relaxation::TypeCapRelaxed || type_count < MAX_FEATURED_PER_ITEM_TYPE;
+            if !type_allowed {
                 continue;
             }
             if let Some(slot) = chosen.get_mut(*index) {
                 *slot = true;
             }
             *type_counts.entry(item.candidate_kind()).or_default() += 1;
-            series_used.insert(series_group_key(item));
             selected.push(*index);
         }
     }
@@ -208,18 +207,10 @@ fn curated_prefix_indices<T: RecommendationCandidate>(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Relaxation {
-    /// Both diversity rules apply.
-    None,
-    /// The per-type cap is ignored; a series still appears at most once.
-    TypeCap,
-    /// Every rule is ignored so the prefix is filled rather than returned short.
-    AllRules,
-}
-
-fn series_group_key<T: RecommendationCandidate>(item: &T) -> &str {
-    item.candidate_series_key()
-        .filter(|series_id| !series_id.is_empty())
-        .unwrap_or_else(|| item.candidate_key())
+    /// The per-type cap applies.
+    Strict,
+    /// The per-type cap is ignored so the prefix is filled rather than returned short.
+    TypeCapRelaxed,
 }
 
 /// Rank-derived sampling weight: `1 / (rank + 1)^[`RANK_WEIGHT_EXPONENT`]`.
@@ -316,7 +307,6 @@ mod tests {
     struct TestItem {
         id: String,
         kind: &'static str,
-        series: Option<String>,
     }
 
     impl RecommendationCandidate for TestItem {
@@ -327,17 +317,12 @@ mod tests {
         fn candidate_kind(&self) -> &str {
             self.kind
         }
-
-        fn candidate_series_key(&self) -> Option<&str> {
-            self.series.as_deref()
-        }
     }
 
     fn movie(index: usize) -> TestItem {
         TestItem {
             id: format!("item-{index:02}"),
             kind: "MOVIE",
-            series: None,
         }
     }
 
@@ -345,12 +330,11 @@ mod tests {
         TestItem {
             id: format!("item-{index:02}"),
             kind: "SERIES",
-            series: Some(format!("series-{index:02}")),
         }
     }
 
-    /// Alternating kinds with one series per item keep the diversity rules satisfiable, so the
-    /// statistics below measure the ranking weights and not the relaxation passes.
+    /// Alternating kinds keep the per-type cap satisfiable, so the statistics below measure the
+    /// ranking weights and not the relaxation pass.
     fn mixed_items(count: usize) -> Vec<TestItem> {
         (0..count)
             .map(|index| {
@@ -458,36 +442,6 @@ mod tests {
     }
 
     #[test]
-    fn daily_recommendations_do_not_repeat_a_series_in_the_featured_slots() {
-        let mut items = mixed_items(40);
-        for item in items.iter_mut().take(21).skip(2) {
-            item.series = Some("series-dup".to_owned());
-        }
-
-        for batch_key in 0..20 {
-            let ordered = daily_recommendation_items(
-                items.clone(),
-                "user-1",
-                batch_key,
-                RECOMMENDATION_FEATURED_LIMIT,
-                40,
-            );
-            let featured = &ordered[..RECOMMENDATION_FEATURED_LIMIT];
-            assert_eq!(featured.len(), RECOMMENDATION_FEATURED_LIMIT);
-            assert!(
-                featured
-                    .iter()
-                    .filter(|item| item.series.as_deref() == Some("series-dup"))
-                    .count()
-                    <= 1,
-                "the same series appeared twice in one featured prefix"
-            );
-            let unique = ids(&ordered).into_iter().collect::<HashSet<_>>();
-            assert_eq!(unique.len(), 40, "a batch must not repeat a candidate");
-        }
-    }
-
-    #[test]
     fn daily_recommendations_limit_each_item_type_in_the_featured_slots() {
         let mut items = (0..30).map(movie).collect::<Vec<_>>();
         items.extend((30..40).map(series_item));
@@ -514,27 +468,10 @@ mod tests {
     }
 
     #[test]
-    fn daily_recommendations_relax_diversity_rules_when_candidates_run_out() {
+    fn daily_recommendations_relax_the_type_cap_when_candidates_run_out() {
         let single_kind = (0..10).map(movie).collect::<Vec<_>>();
         let ordered = daily_recommendation_items(
             single_kind,
-            "user-1",
-            20,
-            RECOMMENDATION_FEATURED_LIMIT,
-            10,
-        );
-        assert_eq!(ordered.len(), 10);
-        assert_eq!(ordered[..RECOMMENDATION_FEATURED_LIMIT].len(), 7);
-
-        let shared_series = (0..10)
-            .map(|index| TestItem {
-                id: format!("item-{index:02}"),
-                kind: "MOVIE",
-                series: Some("series-1".to_owned()),
-            })
-            .collect::<Vec<_>>();
-        let ordered = daily_recommendation_items(
-            shared_series,
             "user-1",
             20,
             RECOMMENDATION_FEATURED_LIMIT,
