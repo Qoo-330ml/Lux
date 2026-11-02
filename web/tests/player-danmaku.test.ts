@@ -62,6 +62,24 @@ describe("LuxPlayer danmaku parser", () => {
     }]);
   });
 
+  it("clamps out-of-range font sizes instead of dropping the entry", () => {
+    // The server normalizer clamps 12–64 and the shared validity rules only require a finite
+    // size, so the renderer must not hide entries the server would serve.
+    const entries = parseBilibiliDanmaku(
+      '<i><d p="1,1,10,16777215">small</d><d p="2,1,100,16777215">large</d><d p="3,1,64,0">edge</d></i>',
+    );
+    expect(entries.map((entry) => entry.fontSize)).toEqual([12, 64, 64]);
+  });
+
+  it("limits entry text by Unicode code points, not UTF-16 units", () => {
+    const astral = "😀".repeat(200);
+    const entries = parseBilibiliDanmaku(
+      `<i><d p="1,1,25,16777215">${astral}</d><d p="2,1,25,16777215">${astral}😀</d></i>`,
+    );
+    expect(entries).toHaveLength(1);
+    expect([...entries[0]!.text]).toHaveLength(200);
+  });
+
   it("tolerates eight-field Bilibili p attributes and skips advanced or dirty entries", () => {
     const result = parseDanmakuXml(
       '<i>'
