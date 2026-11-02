@@ -1963,7 +1963,11 @@ pub(super) async fn lux_danmaku_info(
     }
     let service = state.danmaku();
     match service
-        .read_registered_sidecar_for_source(&item_id, query.source_id.as_deref())
+        .read_for_playback(
+            &item_id,
+            query.source_id.as_deref(),
+            DanmakuSidecarScope::RegisteredTrack,
+        )
         .await
     {
         Ok(Some(_)) => Json(danmaku_info_json(
@@ -1991,7 +1995,11 @@ pub(super) async fn lux_danmaku_raw(
     }
     let service = state.danmaku();
     match service
-        .read_registered_sidecar_for_source(&item_id, query.source_id.as_deref())
+        .read_for_playback(
+            &item_id,
+            query.source_id.as_deref(),
+            DanmakuSidecarScope::RegisteredTrack,
+        )
         .await
     {
         Ok(Some(bytes)) => Response::builder()

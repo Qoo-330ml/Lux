@@ -33,7 +33,7 @@ use crate::api::lux;
 use crate::{
     COMMIT, VERSION,
     application::admin_health::{AdminHealthProbeCache, admin_health_report},
-    application::danmaku::{DanmakuService, DanmakuServiceError},
+    application::danmaku::{DanmakuService, DanmakuServiceError, DanmakuSidecarScope},
     application::database_setup::{DatabaseSetupError, DatabaseSetupService},
     application::deletion::{MediaDeleteError, MediaDeleteService},
     application::downloads::{DownloadArtifact, DownloadError, DownloadService},
