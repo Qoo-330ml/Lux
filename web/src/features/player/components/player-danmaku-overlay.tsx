@@ -10,6 +10,21 @@ import {
 } from "../danmaku";
 import { parseDanmakuWorkerRequest, type DanmakuWorkerResponse } from "../danmaku-worker";
 
+/**
+ * Item/source pairs the server already answered "no danmaku" for (HTTP 404, code `NOT_FOUND`).
+ *
+ * `GET /api/v1/items/{id}/danmaku` answers 404 when the media has no danmaku sidecar, which is a
+ * normal empty state rather than an error. The overlay reloads for every playback lifecycle key
+ * (session fallback, track/quality switch), so without this memo the same empty answer is requested
+ * again on each of them and every request leaves a 404 in the console. The memo lives for the page
+ * module, so a sidecar registered later still shows up after a reload.
+ */
+const sourcesWithoutDanmaku = new Set<string>();
+
+function danmakuSourceKey(itemId: string, sourceId: string) {
+  return `${itemId}\u0000${sourceId}`;
+}
+
 type PlayerDanmakuOverlayProps = {
   itemId: string;
   sourceId: string;
@@ -68,6 +83,10 @@ export function PlayerDanmakuOverlay({
     setEntries([]);
     onStatusChange?.(null);
     if (!visible || !itemId || !sourceId) return () => controller.abort();
+    // A known-empty source stays empty: no second request, no error state, no 404 in the console.
+    if (sourcesWithoutDanmaku.has(danmakuSourceKey(itemId, sourceId))) {
+      return () => controller.abort();
+    }
 
     const isCurrent = () => generationRef.current === generation && !controller.signal.aborted;
     const fail = (message: string) => {
@@ -107,10 +126,13 @@ export function PlayerDanmakuOverlay({
         worker.onerror = () => fail("弹幕解析失败");
         worker.postMessage(request);
       } catch (error) {
-        if (!controller.signal.aborted) {
-          if (error instanceof ApiError && error.status === 404) return;
-          fail(error instanceof Error && error.message === "弹幕文件过大" ? error.message : "弹幕加载失败");
+        if (controller.signal.aborted) return;
+        // 404 means “this source has no danmaku sidecar”: a normal empty result, not a failure.
+        if (error instanceof ApiError && error.status === 404) {
+          sourcesWithoutDanmaku.add(danmakuSourceKey(itemId, sourceId));
+          return;
         }
+        fail(error instanceof Error && error.message === "弹幕文件过大" ? error.message : "弹幕加载失败");
       }
     };
     void load();
