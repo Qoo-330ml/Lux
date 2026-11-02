@@ -87,6 +87,8 @@ pub(super) fn api_routes() -> (Router<ReadyAppState>, Vec<String>) {
         )
         .route("/ScheduledTasks", get(emby_scheduled_tasks))
         .route("/Persons", get(emby_persons))
+        .route("/Genres", get(emby_genres))
+        .route("/Studios", get(emby_studios))
         .route("/Persons/{person_id}", get(emby_person))
         .route(
             "/Users/{user_id}",

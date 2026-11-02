@@ -7,7 +7,7 @@ const EMBY_SHOW_EPISODE_DEFAULT_LIMIT: i64 = EMBY_MAX_PAGE_LIMIT;
 const EMBY_MAX_PAGE_LIMIT: i64 = 1_000;
 
 use crate::application::catalog::CatalogItemCounts;
-use crate::storage::GLOBAL_COLLECTION_LIBRARY_ID;
+use crate::storage::{GLOBAL_COLLECTION_LIBRARY_ID, MediaFacetKind};
 
 #[derive(Deserialize, Default)]
 pub(super) struct EmbyItemsQuery {
@@ -766,6 +766,131 @@ pub(super) async fn emby_persons(
         "TotalRecordCount": total,
     }))
     .into_response()
+}
+
+#[derive(Deserialize, Default)]
+pub(super) struct EmbyFacetsQuery {
+    #[serde(flatten)]
+    pub(super) auth: EmbyTokenQuery,
+    #[serde(rename = "UserId", alias = "userId", alias = "userid", default)]
+    pub(super) user_id: Option<String>,
+    #[serde(rename = "ParentId", alias = "parentId", default)]
+    pub(super) parent_id: Option<String>,
+    #[serde(rename = "IncludeItemTypes", alias = "includeItemTypes", default)]
+    pub(super) include_item_types: Option<String>,
+    #[serde(rename = "StartIndex", alias = "startIndex", default)]
+    pub(super) start_index: Option<i64>,
+    #[serde(rename = "Limit", alias = "limit", default)]
+    pub(super) limit: Option<i64>,
+}
+
+fn emby_facet_id(kind: MediaFacetKind, name_key: &str) -> String {
+    let prefix = match kind {
+        MediaFacetKind::Genre => "genre",
+        MediaFacetKind::Studio => "studio",
+    };
+    let hex = name_key
+        .bytes()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{prefix}-{hex}")
+}
+
+async fn emby_facets(
+    headers: HeaderMap,
+    query: EmbyFacetsQuery,
+    state: ReadyAppState,
+    kind: MediaFacetKind,
+) -> Response {
+    let auth_principal =
+        match require_emby_principal_with_query(&headers, &state, &query.auth).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, query.user_id.as_deref())
+            .await
+        {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let offset = query.start_index.unwrap_or(0);
+    let limit = match query.limit {
+        Some(value) if value > 0 => value,
+        _ => 50,
+    };
+    if offset < 0 || !(1..=EMBY_MAX_PAGE_LIMIT).contains(&limit) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let item_types = query
+        .include_item_types
+        .as_deref()
+        .map(|values| {
+            values
+                .split(',')
+                .filter_map(|value| normalize_emby_item_type(value.trim()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let parent_id = query.parent_id.as_deref().map(emby_internal_id);
+    let result = state
+        .catalog()
+        .list_facets(
+            principal,
+            parent_id.as_deref(),
+            kind,
+            &item_types,
+            offset,
+            limit,
+        )
+        .await;
+    let (facets, total) = match result {
+        Ok(result) => result,
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(CatalogError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let type_name = match kind {
+        MediaFacetKind::Genre => "Genre",
+        MediaFacetKind::Studio => "Studio",
+    };
+    Json(json!({
+        "Items": facets
+            .into_iter()
+            .map(|facet| {
+                json!({
+                    "Name": facet.name,
+                    "Id": emby_facet_id(kind, &facet.name_key),
+                    "ServerId": state.server_id,
+                    "Type": type_name,
+                    "IsFolder": true,
+                    "ChildCount": facet.item_count,
+                    "ImageTags": {},
+                    "BackdropImageTags": [],
+                })
+            })
+            .collect::<Vec<_>>(),
+        "TotalRecordCount": total,
+        "StartIndex": offset,
+    }))
+    .into_response()
+}
+
+pub(super) async fn emby_genres(
+    headers: HeaderMap,
+    Query(query): Query<EmbyFacetsQuery>,
+    State(state): State<ReadyAppState>,
+) -> Response {
+    emby_facets(headers, query, state, MediaFacetKind::Genre).await
+}
+
+pub(super) async fn emby_studios(
+    headers: HeaderMap,
+    Query(query): Query<EmbyFacetsQuery>,
+    State(state): State<ReadyAppState>,
+) -> Response {
+    emby_facets(headers, query, state, MediaFacetKind::Studio).await
 }
 
 pub(super) async fn emby_person(

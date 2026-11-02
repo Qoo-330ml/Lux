@@ -5,7 +5,8 @@ const NFO_METADATA_BATCH_SIZE: usize = 400;
 use crate::domain::content_restrictions::ContentRestrictionIndexProjection;
 use crate::storage::{
     CONTENT_RESTRICTION_INDEX_BATCH_LIMIT, ContentRestrictionIndexBatchOutcome,
-    ContentRestrictionIndexWrite, MediaContentRestrictionIndexCandidate,
+    ContentRestrictionIndexWrite, MediaContentRestrictionIndexCandidate, MediaFacetKind,
+    StoredMediaFacet,
 };
 use crate::storage::{
     CatalogSearchQuery, GlobalCollectionSourcePreference, GlobalMovieCollectionReference,
@@ -3699,6 +3700,71 @@ impl Database {
         let rows_future = self.fetch_catalog_rows(&query, &list_binds);
         let (total, rows) = tokio::try_join!(total_future, rows_future)?;
         Ok((rows, total))
+    }
+
+    /// Distinct genre or studio values of the items the filter can see, with how many visible
+    /// items carry each. Reads only the `media_item_facets` projection, so it never parses NFO
+    /// JSON; `limit` is clamped by the caller.
+    pub(crate) async fn list_catalog_facets(
+        &self,
+        filter: &CatalogFilterQuery<'_>,
+        kind: MediaFacetKind,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredMediaFacet>, i64), StorageError> {
+        if filter.library_ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let (where_clause, filter_binds) = catalog_filter_where_clause(filter);
+        let from = format!(
+            "FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             JOIN media_item_facets facet
+               ON facet.item_id = mi.id AND facet.kind = '{}'
+             {where_clause}",
+            kind.as_str()
+        );
+        let list_query = format!(
+            "SELECT facet.name_key, MIN(facet.name) AS name, COUNT(*) AS item_count
+             {from}
+             GROUP BY facet.name_key
+             ORDER BY facet.name_key
+             LIMIT ? OFFSET ?"
+        );
+        let mut list = self.query_as::<(String, String, i64)>(sqlx::AssertSqlSafe(list_query));
+        for bind in &filter_binds {
+            list = match bind {
+                CatalogBind::Text(value) => list.bind(*value),
+                CatalogBind::Integer(value) => list.bind(*value),
+                CatalogBind::Real(value) => list.bind(*value),
+            };
+        }
+        let rows = list
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        let count_query = format!("SELECT COUNT(DISTINCT facet.name_key) {from}");
+        let mut count = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_query));
+        for bind in &filter_binds {
+            count = match bind {
+                CatalogBind::Text(value) => count.bind(*value),
+                CatalogBind::Integer(value) => count.bind(*value),
+                CatalogBind::Real(value) => count.bind(*value),
+            };
+        }
+        let total = count.fetch_one(&self.pool).await.map_err(self.sqlx_err())?;
+        Ok((
+            rows.into_iter()
+                .map(|(name_key, name, item_count)| StoredMediaFacet {
+                    name_key,
+                    name,
+                    item_count,
+                })
+                .collect(),
+            total,
+        ))
     }
 
     #[cfg(test)]

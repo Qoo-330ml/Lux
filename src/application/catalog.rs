@@ -21,9 +21,10 @@ use crate::{
     },
     storage::{
         CatalogFilterQuery, CatalogSearchQuery, CatalogSort as StorageCatalogSort, Database,
-        GLOBAL_COLLECTION_LIBRARY_ID, RecentByLibraryReadModelQuery, RecentReadModelQuery,
-        ResumeItemsQuery, ResumePointerQuery, StorageError, StoredCatalogDetail, StoredCatalogRow,
-        StoredMediaChapter, UserContentRestrictions, WatchHistoryQuery,
+        GLOBAL_COLLECTION_LIBRARY_ID, MediaFacetKind, RecentByLibraryReadModelQuery,
+        RecentReadModelQuery, ResumeItemsQuery, ResumePointerQuery, StorageError,
+        StoredCatalogDetail, StoredCatalogRow, StoredMediaChapter, StoredMediaFacet,
+        UserContentRestrictions, WatchHistoryQuery,
     },
 };
 
@@ -1364,6 +1365,62 @@ impl CatalogService {
                 has_next,
             ))
         }
+    }
+
+    /// Distinct genres or studios visible to `principal`, optionally narrowed to one library and
+    /// to item types. Served from the `media_item_facets` projection.
+    pub(crate) async fn list_facets(
+        &self,
+        principal: AccessPrincipal,
+        library_id: Option<&str>,
+        kind: MediaFacetKind,
+        item_types: &[String],
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredMediaFacet>, i64), CatalogError> {
+        let accessible = self.access.accessible_library_ids(principal).await?;
+        let library_ids = match library_id {
+            Some(library_id) if accessible.iter().any(|id| id == library_id) => {
+                vec![library_id.to_owned()]
+            }
+            Some(_) => return Err(CatalogError::LibraryNotFound),
+            None => accessible,
+        };
+        let user_id = principal.user_id_string();
+        let content_restrictions = if principal.is_admin {
+            None
+        } else {
+            self.database.user_content_restrictions(&user_id).await?
+        };
+        let no_values: [String; 0] = [];
+        let query = CatalogFilterQuery {
+            library_ids: &library_ids,
+            user_id: &user_id,
+            item_types,
+            excluded_item_types: &no_values,
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            provider_id_equals: None,
+            years: &[],
+            genre_keys: &no_values,
+            studio_keys: &no_values,
+            is_played: None,
+            is_favorite: None,
+            min_date_last_saved: None,
+            metadata_pending: false,
+            parent_id_scope: None,
+            content_restrictions: content_restrictions.as_ref(),
+            sort_by: StorageCatalogSort::Name,
+            descending: false,
+            offset,
+            limit,
+            include_total: true,
+        };
+        Ok(self
+            .database
+            .list_catalog_facets(&query, kind, offset, limit)
+            .await?)
     }
 
     pub async fn list_all_items_filtered(

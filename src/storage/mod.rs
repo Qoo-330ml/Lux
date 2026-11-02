@@ -41,6 +41,14 @@ pub(crate) struct MediaItemFacetWrite {
     pub(crate) name: String,
 }
 
+/// One distinct genre/studio value together with its visible item count.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredMediaFacet {
+    pub(crate) name_key: String,
+    pub(crate) name: String,
+    pub(crate) item_count: i64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MediaFacetKind {
     Genre,
