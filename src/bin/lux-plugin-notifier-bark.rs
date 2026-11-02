@@ -6,20 +6,26 @@
 //! returned in a result and never placed in a URL (Bark pushes carry it in the JSON body).
 //!
 //! Classification follows the host contract: `2xx` with `code == 200` is `DELIVERED`, a network
-//! failure, a timeout, `429` and `5xx` are `RETRYABLE` (with `Retry-After` when Bark sends it), and
-//! every other `4xx`, an invalid configuration and an upstream business error are `FAILED`.
+//! failure, a timeout (including one while reading the response body), `429` and `5xx` are
+//! `RETRYABLE` (with `Retry-After` when Bark sends it), and every other `4xx`, an invalid
+//! configuration, a rejected destination and an upstream business error are `FAILED`.
+//!
+//! The destination passes the shared SDK guard first: the host's `target.allowPrivateNetwork`
+//! approval is forwarded unchanged, a private/loopback destination without that approval is
+//! rejected, and the validated address is pinned into the request client against DNS rebinding.
 
 use std::process::ExitCode;
 
 use luxd::application::{
     notifier_plugin_sdk::{
-        delivered, failed, outbound_http_client_from_env, render_event_text,
+        DestinationGuardError, delivered, failed, guard_destination,
+        outbound_http_client_builder_from_env, outbound_http_client_from_env, render_event_text,
         result_from_http_status, retryable, run_notifier,
     },
     plugin_protocol::{NotificationSendRpcRequest, NotificationSendRpcResult},
 };
 use reqwest::{
-    Client, Url,
+    Url,
     header::{HeaderMap, RETRY_AFTER},
 };
 use serde_json::{Map, Value, json};
@@ -43,22 +49,13 @@ const BARK_SUCCESS_CODE: i64 = 200;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let outcome = match outbound_http_client_from_env() {
-        Ok(client) => {
-            run_notifier(move |request| {
-                let client = client.clone();
-                async move { deliver(&client, request).await }
-            })
-            .await
-        }
-        Err(_) => {
-            // A broken proxy configuration is a plugin-level failure: fail closed, never fall back
-            // to a client without the host proxy policy.
-            eprintln!("bark notifier: outbound HTTP client is unavailable");
-            run_notifier(|_request| async { failed("client_unavailable") }).await
-        }
-    };
-    match outcome {
+    if outbound_http_client_from_env().is_err() {
+        // A broken proxy configuration is a process-level failure: refuse to serve deliveries with a
+        // client that ignores the host proxy policy, and let the host report the plugin unavailable.
+        eprintln!("bark notifier: outbound HTTP client is unavailable");
+        return ExitCode::FAILURE;
+    }
+    match run_notifier(deliver).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => {
             // The protocol loop failed on stdin/stdout. No request data is included on purpose.
@@ -69,10 +66,7 @@ async fn main() -> ExitCode {
 }
 
 /// Handles one `notification.send` request.
-async fn deliver(
-    client: &Client,
-    request: NotificationSendRpcRequest,
-) -> NotificationSendRpcResult {
+async fn deliver(request: NotificationSendRpcRequest) -> NotificationSendRpcResult {
     let device_key = match validate_device_key(request.secret.as_deref()) {
         Ok(device_key) => device_key,
         Err(code) => return rejected(code),
@@ -81,10 +75,31 @@ async fn deliver(
         Ok(target) => target,
         Err(error) => return rejected(error.code()),
     };
+    // The host decides whether the destination may be private; the plugin never widens it.
+    let guarded =
+        match guard_destination(&target.push_url, allowed_private_network(&request.target)).await {
+            Ok(guarded) => guarded,
+            Err(error) => return guard_failure(error),
+        };
+    let client = match outbound_http_client_builder_from_env() {
+        // Pin the validated address so a second DNS answer cannot redirect this delivery.
+        Ok(builder) => builder,
+        Err(_) => return retryable("provider_unavailable"),
+    };
+    let client = match guarded.pin(client).build() {
+        Ok(client) => client,
+        Err(_) => return retryable("provider_unavailable"),
+    };
+
     let (title, body) = render_event_text(&request.event);
     let payload = push_payload(device_key, &target, title, body);
 
-    let response = match client.post(&target.push_url).json(&payload).send().await {
+    let response = match client
+        .post(guarded.url().clone())
+        .json(&payload)
+        .send()
+        .await
+    {
         Ok(response) => response,
         // A connection error or the client timeout is always worth another host attempt.
         Err(_) => return retryable("provider_unavailable"),
@@ -97,14 +112,35 @@ async fn deliver(
     }
     match read_bounded_body(response).await {
         Ok(body) => classify_push_body(&body),
-        Err(error) => rejected(error.code()),
+        // A transport error or timeout while reading the body is transient, unlike an oversized or
+        // unparsable body produced by a reachable server.
+        Err(BarkResponseError::Unavailable) => retryable("provider_unavailable"),
+        Err(BarkResponseError::ResponseTooLarge) => rejected("provider_response_too_large"),
+    }
+}
+
+/// Reads the host `allowPrivateNetwork` approval; an absent or non-boolean value means "not allowed".
+fn allowed_private_network(target: &Value) -> bool {
+    target
+        .get("allowPrivateNetwork")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Maps a destination guard rejection onto the delivery classification.
+fn guard_failure(error: DestinationGuardError) -> NotificationSendRpcResult {
+    eprintln!("bark notifier: destination rejected ({})", error.code());
+    if error.is_retryable() {
+        retryable(error.code())
+    } else {
+        failed(error.code())
     }
 }
 
 /// A validated Bark destination.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct BarkTarget {
-    push_url: String,
+    push_url: Url,
     group: Option<String>,
     level: &'static str,
     icon: Option<String>,
@@ -132,15 +168,6 @@ impl BarkConfigError {
 enum BarkResponseError {
     Unavailable,
     ResponseTooLarge,
-}
-
-impl BarkResponseError {
-    fn code(self) -> &'static str {
-        match self {
-            Self::Unavailable => "provider_unavailable",
-            Self::ResponseTooLarge => "provider_response_too_large",
-        }
-    }
 }
 
 /// Validates the Bark device key without ever echoing it.
@@ -188,8 +215,10 @@ fn parse_target(config: &Value) -> Result<BarkTarget, BarkConfigError> {
         .map(|icon| validate_icon_url(&icon))
         .transpose()?;
     let sound = bounded_text(config, "sound", MAX_TEXT_CHARS)?;
+    let push_url =
+        Url::parse(&format!("{base_url}/push")).map_err(|_| BarkConfigError::InvalidServerUrl)?;
     Ok(BarkTarget {
-        push_url: format!("{base_url}/push"),
+        push_url,
         group,
         level,
         icon,
@@ -351,17 +380,23 @@ mod tests {
     #[test]
     fn normalizes_the_bark_base_url_and_defaults() {
         let target = parse_target(&json!({})).expect("the default target must be valid");
-        assert_eq!(target.push_url, format!("{DEFAULT_SERVER_URL}/push"));
+        assert_eq!(
+            target.push_url.as_str(),
+            format!("{DEFAULT_SERVER_URL}/push")
+        );
         assert_eq!(target.level, "active");
         assert_eq!(target.group, None);
 
         let target = parse_target(&json!({"serverUrl": " http://127.0.0.1:8080/bark/ "}))
             .expect("a trailing slash must be dropped");
-        assert_eq!(target.push_url, "http://127.0.0.1:8080/bark/push");
+        assert_eq!(target.push_url.as_str(), "http://127.0.0.1:8080/bark/push");
 
         let target = parse_target(&json!({"serverUrl": "", "level": "passive"}))
             .expect("an empty serverUrl must fall back to the public server");
-        assert_eq!(target.push_url, format!("{DEFAULT_SERVER_URL}/push"));
+        assert_eq!(
+            target.push_url.as_str(),
+            format!("{DEFAULT_SERVER_URL}/push")
+        );
         assert_eq!(target.level, "passive");
     }
 

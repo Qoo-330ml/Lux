@@ -658,15 +658,16 @@ PLUGIN_INTERNAL_ERROR
 ### Bark 通知器插件（`org.lux.notifier.bark`）
 
 `org.lux.notifier.bark` 是参考实现，演示通知器插件如何只做渠道接线：使用
-`run_notifier`、`outbound_http_client_from_env`、`result_from_http_status`、`retryable`、
-`failed` 与 `render_event_text`，不读取 `LUX_CONFIG_DIR`、不访问 Lux 数据库或媒体目录。
+`run_notifier`、`guard_destination`、`outbound_http_client_builder_from_env`、
+`result_from_http_status`、`retryable`、`failed` 与 `render_event_text`，不读取 `LUX_CONFIG_DIR`、
+不访问 Lux 数据库或媒体目录。
 
 manifest 声明 `type: "notification"`、`category: "NOTIFICATION"`、`capabilities: ["notification.send"]`，
 配置字段分为两类：
 
 - `secret`（`type: "password"`、`sensitive: true`、必填、无默认值）：Bark 设备密钥，只允许
-  `[A-Za-z0-9_-]`、长度不超过 128；仅通过 `notification.send` 请求的 `secret` 字段到达插件，
-  不写入日志、不出现在返回值或错误信息中，也不放进任何 URL。
+  `[A-Za-z0-9_-]`、长度不超过 128（与 Bark 密钥格式一致，manifest 描述里同步写明）；仅通过
+  `notification.send` 请求的 `secret` 字段到达插件，不写入日志、不出现在返回值或错误信息中，也不放进任何 URL。
 - 非敏感目标配置：`serverUrl`（默认 `https://api.day.app`，只允许 http/https，去尾斜杠，拒绝凭据、
   query 和 fragment）、`group`、`level`（`active`/`timeSensitive`/`passive`，默认 `active`）、
   `icon`（可选 http(s) URL）、`sound`。这些字段走按目标保存的 `providerConfig`。
@@ -676,17 +677,25 @@ manifest 声明 `type: "notification"`、`category: "NOTIFICATION"`、`capabilit
 - 正文来自核心生成的 `data.title`/`data.content`（`render_event_text` 原样转发，插件不重写文案）。
 - 请求为 `POST {serverUrl}/push`，JSON 体是
   `{device_key,title,body,group,level,icon,sound}`，未设置的可选字段省略；设备密钥只在请求体里。
-- 出站 client 使用宿主代理策略、10 秒超时且不跟随重定向；`2xx` 响应体最多读取 64 KiB。
+- 目的地守卫：插件把宿主给出的 `target.allowPrivateNetwork` 原样传给 `guard_destination`，默认（字段缺失或
+  `false`）拒绝回环/私网目的地，`169.254.169.254` 等危险保留地址即使批准私网也始终拒绝；通过后把已解析地址
+  钉进出站 client，`serverUrl` 的路径与 query 保持原样，重定向仍禁用。
+- 出站 client 使用宿主代理策略、10 秒超时且不跟随重定向；`2xx` 响应体最多读取 64 KiB。若进程启动时无法按
+  宿主代理策略构建 client，插件直接以失败退出（不返回伪造的投递结果），因此没有额外的
+  `*_client_unavailable` 错误码。
 - 分类：Bark 返回 `code == 200` → `DELIVERED`（`timestamp` 作为 `providerRequestId`）；
-  `408`/`425`/`429`/`5xx`、连接失败和超时 → `RETRYABLE`（`Retry-After` 整数形式写入
-  `retryAfterSeconds`，其余情况为空）；其它 `4xx`、非 200 的 Bark `code`、无法解析或超限的响应
-  → `FAILED`；`Retry-After` 的 HTTP-date 形式被忽略。
+  `408`/`425`/`429`/`5xx`、连接失败、请求超时，以及读响应体阶段的传输错误/超时 → `RETRYABLE`
+  （`Retry-After` 整数形式写入 `retryAfterSeconds`，其余情况为空）；其它 `4xx`、非 200 的 Bark `code`、
+  无法解析的响应和超过 64 KiB 的响应体 → `FAILED`；`Retry-After` 的 HTTP-date 形式被忽略。
 - 稳定错误码：`missing_secret`、`invalid_secret`、`invalid_server_url`、`invalid_config`、
-  `provider_unavailable`、`provider_response_too_large`、`invalid_response`、`bark_code_<code>`，
-  HTTP 分类失败沿用 SDK 的 `PROVIDER_HTTP_<status>`。配置校验失败的请求不会发出任何上游请求。
+  `destination_not_allowed`（私网未批准或危险保留地址）、`destination_unresolved`（DNS 暂时失败，可重试）、
+  `invalid_destination_url`、`provider_unavailable`、`provider_response_too_large`、`invalid_response`、
+  `bark_code_<code>`，HTTP 分类失败沿用 SDK 的 `PROVIDER_HTTP_<status>`。配置校验失败或被守卫拒绝的请求不会
+  发出任何上游请求，日志只记录稳定错误码，不含凭据、主机或完整 URL。
 
 打包：`scripts/package-notifier-plugin.sh org.lux.notifier.bark [target]` 读取该目录的 manifest 并输出
 `dist/plugins/org.lux.notifier.bark-0.1.0-<platform>-<arch>.zip`。测试位于
 `tests/plugins/notifier_bark.rs`（`cargo test --locked --test plugins notifier_bark::`），全部使用
-`127.0.0.1` 随机端口的本地 mock Bark 服务，覆盖成功、4xx、429/5xx、超时、网络失败、重定向不跟随、
-超限响应、坏配置与缺失/非法凭据，并断言凭据与完整外部 URL 不出现在返回值和捕获的日志里。
+`127.0.0.1` 随机端口的本地 mock Bark 服务（测试显式携带 `allowPrivateNetwork: true`），覆盖成功、4xx、
+429/5xx、超时、网络失败、读响应体中断开/超时、重定向不跟随、超限响应、坏配置、缺失/非法凭据、默认未批准私网
+时拒绝回环目的地，以及批准私网仍拒绝云元数据地址；并断言凭据与完整外部 URL 不出现在返回值和捕获的日志里。

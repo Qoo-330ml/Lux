@@ -124,7 +124,18 @@ impl Plugin {
 }
 
 /// The `notification.send` params the host builds, including the credential only when it exists.
+///
+/// The loopback mock server is a private destination, so the default fixtures carry the host's
+/// private-network approval; a test that exercises the default policy passes `false` explicitly.
 fn notification_params(config: Value, secret: Option<&str>) -> Value {
+    notification_params_with_approval(config, secret, true)
+}
+
+fn notification_params_with_approval(
+    config: Value,
+    secret: Option<&str>,
+    allow_private_network: bool,
+) -> Value {
     let mut params = json!({
         "event": {
             "schemaVersion": 1,
@@ -142,7 +153,7 @@ fn notification_params(config: Value, secret: Option<&str>) -> Value {
                 "timestamp": "2023-11-14T22:13:20Z"
             }
         },
-        "target": {"url": "", "allowPrivateNetwork": false},
+        "target": {"url": "", "allowPrivateNetwork": allow_private_network},
         "config": config,
     });
     if let Some(secret) = secret {
@@ -419,10 +430,46 @@ async fn run_send(
     config: Value,
     secret: Option<&str>,
 ) -> Result<(NotificationSendRpcResult, String), Box<dyn std::error::Error>> {
+    run_send_with_approval(config, secret, true).await
+}
+
+async fn run_send_with_approval(
+    config: Value,
+    secret: Option<&str>,
+    allow_private_network: bool,
+) -> Result<(NotificationSendRpcResult, String), Box<dyn std::error::Error>> {
     let mut plugin = Plugin::spawn()?;
-    let result = plugin.send(notification_params(config, secret)).await?;
+    let result = plugin
+        .send(notification_params_with_approval(
+            config,
+            secret,
+            allow_private_network,
+        ))
+        .await?;
     let stderr = plugin.finish().await?;
     Ok((result, stderr))
+}
+
+/// Serves one hand-written HTTP response head and body prefix, then optionally stalls the body.
+async fn spawn_raw_response(
+    prefix: &'static str,
+    hold_body_open: bool,
+) -> Result<(u16, JoinHandle<()>), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let server = tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buffer = [0_u8; 8 * 1024];
+        let _ = socket.read(&mut buffer).await;
+        let _ = socket.write_all(prefix.as_bytes()).await;
+        let _ = socket.flush().await;
+        if hold_body_open {
+            sleep(Duration::from_secs(30)).await;
+        }
+    });
+    Ok((port, server))
 }
 
 struct Delivery {
@@ -800,5 +847,126 @@ async fn rejects_an_invalid_destination_configuration_without_a_request()
     assert!(!stderr.contains(DEVICE_KEY));
     assert!(!stderr.contains("token=abc"));
     assert!(!stderr.contains(&format!("127.0.0.1:{port}")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_a_loopback_destination_without_private_network_approval()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (port, recorder, server) = spawn_push_server(bark_success()).await?;
+
+    let (result, stderr) = run_send_with_approval(
+        json!({"serverUrl": format!("http://127.0.0.1:{port}")}),
+        Some(DEVICE_KEY),
+        false,
+    )
+    .await?;
+    server.abort();
+
+    assert_eq!(result.status, NotificationSendStatus::Failed);
+    assert_eq!(
+        result.error_code.as_deref(),
+        Some("destination_not_allowed")
+    );
+    assert_eq!(result.retry_after_seconds, None);
+    assert_eq!(
+        recorder.len(),
+        0,
+        "a destination rejected by the guard must not be contacted"
+    );
+    assert!(!stderr.contains(DEVICE_KEY));
+    assert!(!stderr.contains(&format!("127.0.0.1:{port}")));
+
+    let result = missing_approval_is_default(&port).await?;
+    assert_eq!(result.status, NotificationSendStatus::Failed);
+    assert_eq!(
+        result.error_code.as_deref(),
+        Some("destination_not_allowed")
+    );
+    Ok(())
+}
+
+/// Sends with a `target` object that has no `allowPrivateNetwork` key at all.
+async fn missing_approval_is_default(
+    port: &u16,
+) -> Result<NotificationSendRpcResult, Box<dyn std::error::Error>> {
+    let mut plugin = Plugin::spawn()?;
+    let mut params = notification_params(
+        json!({"serverUrl": format!("http://127.0.0.1:{port}")}),
+        Some(DEVICE_KEY),
+    );
+    params["target"] = json!({"url": ""});
+    let result = plugin.send(params).await?;
+    let _ = plugin.finish().await?;
+    Ok(result)
+}
+
+#[tokio::test]
+async fn rejects_the_cloud_metadata_address_even_with_private_network_approval()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (result, stderr) = run_send_with_approval(
+        json!({"serverUrl": "http://169.254.169.254"}),
+        Some(DEVICE_KEY),
+        true,
+    )
+    .await?;
+
+    assert_eq!(result.status, NotificationSendStatus::Failed);
+    assert_eq!(
+        result.error_code.as_deref(),
+        Some("destination_not_allowed")
+    );
+    assert!(!stderr.contains(DEVICE_KEY));
+    assert!(!stderr.contains("169.254.169.254"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn retries_when_reading_the_response_body_times_out() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (port, server) = spawn_raw_response(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"code\":",
+        true,
+    )
+    .await?;
+
+    let started = Instant::now();
+    let (result, stderr) = run_send(
+        json!({"serverUrl": format!("http://127.0.0.1:{port}")}),
+        Some(DEVICE_KEY),
+    )
+    .await?;
+    server.abort();
+
+    assert_eq!(result.status, NotificationSendStatus::Retryable);
+    assert_eq!(result.error_code.as_deref(), Some("provider_unavailable"));
+    assert!(
+        started.elapsed() >= Duration::from_secs(9),
+        "the body read must use the client timeout, waited {:?}",
+        started.elapsed()
+    );
+    assert!(!stderr.contains(DEVICE_KEY));
+    Ok(())
+}
+
+#[tokio::test]
+async fn retries_when_the_response_body_connection_breaks() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (port, server) = spawn_raw_response(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"code\":",
+        false,
+    )
+    .await?;
+
+    let (result, stderr) = run_send(
+        json!({"serverUrl": format!("http://127.0.0.1:{port}")}),
+        Some(DEVICE_KEY),
+    )
+    .await?;
+    server.abort();
+
+    assert_eq!(result.status, NotificationSendStatus::Retryable);
+    assert_eq!(result.error_code.as_deref(), Some("provider_unavailable"));
+    assert!(!stderr.contains(DEVICE_KEY));
     Ok(())
 }

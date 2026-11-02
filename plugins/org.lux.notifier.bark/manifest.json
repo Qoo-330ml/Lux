@@ -19,7 +19,7 @@
       "type": "password",
       "required": true,
       "sensitive": true,
-      "description": "Bark App 首页显示的设备密钥，只允许字母、数字、下划线和连字符。"
+      "description": "Bark App 首页显示的设备密钥，只允许字母、数字、下划线和连字符，长度不超过 128 个字符。"
     },
     {
       "key": "serverUrl",
