@@ -1,5 +1,6 @@
 import {
   DanmakuParseError,
+  decodeDanmakuBytes,
   parseDanmakuXml,
   type LuxDanmakuEntry,
 } from "./danmaku/parse";
@@ -7,7 +8,11 @@ import {
 export type DanmakuWorkerRequest = {
   type: "PARSE";
   requestId: number;
-  xml: string;
+  /**
+   * The raw response bytes, posted as a transferable so the main thread neither decodes the XML nor
+   * copies a large string across the worker boundary.
+   */
+  bytes: ArrayBuffer;
 };
 
 export type DanmakuWorkerResponse =
@@ -26,7 +31,8 @@ export type DanmakuWorkerResponse =
 
 export function parseDanmakuWorkerRequest(request: DanmakuWorkerRequest): DanmakuWorkerResponse {
   try {
-    const result = parseDanmakuXml(request.xml);
+    const xml = decodeDanmakuBytes(request.bytes);
+    const result = parseDanmakuXml(xml);
     return {
       type: "PARSED",
       requestId: request.requestId,
@@ -38,9 +44,16 @@ export function parseDanmakuWorkerRequest(request: DanmakuWorkerRequest): Danmak
     return {
       type: "FAILED",
       requestId: request.requestId,
-      message: error instanceof DanmakuParseError ? error.message : "弹幕解析失败",
+      message: workerFailureMessage(error),
     };
   }
+}
+
+function workerFailureMessage(error: unknown) {
+  if (error instanceof DanmakuParseError) return error.message;
+  // A fatal UTF-8 decode failure is actionable for the user; anything else is a generic failure.
+  if (error instanceof Error && error.message === "弹幕内容编码无效") return error.message;
+  return "弹幕解析失败";
 }
 
 const workerScope = globalThis as typeof globalThis & {

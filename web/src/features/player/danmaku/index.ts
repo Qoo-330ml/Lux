@@ -8,7 +8,9 @@
 
 export {
   DANMAKU_LIMITS,
+  DANMAKU_SERVER_MAX_BYTES,
   DanmakuParseError,
+  decodeDanmakuBytes,
   exceedsUtf8ByteLimit,
   parseBilibiliDanmaku,
   parseDanmakuXml,

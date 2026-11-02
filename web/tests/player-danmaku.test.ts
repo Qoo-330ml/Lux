@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   DANMAKU_LIMITS,
+  DANMAKU_SERVER_MAX_BYTES,
   DanmakuParseError,
+  decodeDanmakuBytes,
   exceedsUtf8ByteLimit,
   parseBilibiliDanmaku,
   parseDanmakuXml,
+  parseDanmakuPayload,
+  readDanmakuResponse,
 } from "../src/features/player/danmaku";
 import { parseDanmakuWorkerRequest } from "../src/features/player/danmaku-worker";
 
@@ -85,10 +89,10 @@ describe("LuxPlayer danmaku parser", () => {
   });
 
   it("truncates oversized files by uniform sampling instead of keeping the first entries", () => {
-    const count = 30_271;
+    const count = 60_000;
     const rows = Array.from(
       { length: count },
-      (_, index) => `<d p="${index},1,25,16777215,0,0,0,0">entry-${index}</d>`,
+      (_, index) => `<d p="${index / 2},1,25,16777215,0,0,0,0">entry-${index}</d>`,
     ).join("");
     const xml = `<i>${rows}</i>`;
 
@@ -102,17 +106,19 @@ describe("LuxPlayer danmaku parser", () => {
     expect(starts).toEqual([...starts].sort((left, right) => left - right));
     expect(new Set(result.entries.map((entry) => entry.id)).size).toBe(result.entries.length);
     // A sampled spread reaches both ends of the file; keeping the first N entries could not.
-    expect(Math.min(...starts)).toBeLessThan(count * 0.05);
-    expect(Math.max(...starts)).toBeGreaterThan(count * 0.95);
+    expect(Math.min(...starts)).toBeLessThan((count / 2) * 0.1);
+    expect(Math.max(...starts)).toBeGreaterThan((count / 2) * 0.9);
   });
 
-  it("keeps a file that exceeds four megabytes but stays under the server limit", () => {
+  it("keeps a multi-megabyte file that exceeds the entry budget instead of rejecting it", () => {
     const rows = Array.from(
       { length: 120_000 },
       (_, index) => `<d p="${index % 86_400},1,25,16777215,0,0,0,0">filler-${index}</d>`,
     ).join("");
     const xml = `<i>${rows}</i>`;
     expect(exceedsUtf8ByteLimit(xml, 4 * 1024 * 1024)).toBe(true);
+    // …but still inside the client's buffer/decode budget.
+    expect(exceedsUtf8ByteLimit(xml, DANMAKU_LIMITS.maxBytes)).toBe(false);
 
     const result = parseDanmakuXml(xml, { random: deterministicRandom(3) });
 
@@ -127,8 +133,54 @@ describe("LuxPlayer danmaku parser", () => {
       .toThrowError(new DanmakuParseError("INPUT_TOO_LARGE", "弹幕文件过大"));
   });
 
-  it("documents the server-side byte limit instead of a smaller client-only one", () => {
-    expect(DANMAKU_LIMITS.maxBytes).toBe(50 * 1024 * 1024);
+  it("documents the client byte budget and the entry budget it samples against", () => {
+    // The server serves up to 50 MiB, but the browser must not buffer, decode, and structured-clone
+    // that on the main thread: the client stays at 16 MiB and samples beyond 50,000 entries.
+    expect(DANMAKU_SERVER_MAX_BYTES).toBe(50 * 1024 * 1024);
+    expect(DANMAKU_LIMITS.maxBytes).toBe(16 * 1024 * 1024);
+    expect(DANMAKU_LIMITS.maxEntries).toBe(50_000);
+  });
+
+  it("decodes UTF-8 bytes with a fatal decoder", () => {
+    expect(decodeDanmakuBytes(new TextEncoder().encode("弹幕").buffer)).toBe("弹幕");
+    expect(() => decodeDanmakuBytes(new Uint8Array([0xff, 0xfe, 0x00]).buffer))
+      .toThrowError(new Error("弹幕内容编码无效"));
+  });
+
+  it("reads a raw response as bytes and refuses one beyond the client budget", async () => {
+    const small = await readDanmakuResponse(
+      new Response("<i></i>"),
+      new AbortController().signal,
+    );
+    expect(small).toBeInstanceOf(ArrayBuffer);
+    expect(new TextDecoder().decode(small)).toBe("<i></i>");
+
+    const declared = new Response("<i></i>", {
+      headers: { "content-length": String(DANMAKU_LIMITS.maxBytes + 1) },
+    });
+    await expect(readDanmakuResponse(declared, new AbortController().signal))
+      .rejects.toThrowError(new Error("弹幕文件过大"));
+
+    // The streamed guard matters when a proxy omits content-length.
+    const streamed = new Response("x".repeat(DANMAKU_LIMITS.maxBytes + 1));
+    await expect(readDanmakuResponse(streamed, new AbortController().signal))
+      .rejects.toThrowError(new Error("弹幕文件过大"));
+  });
+
+  it("decodes and parses bytes off the Worker path and rejects invalid UTF-8", async () => {
+    const bytes = new TextEncoder().encode('<i><d p="1,1,25,16777215,0,0,0,0">字节</d></i>').buffer;
+    const result = await parseDanmakuPayload(bytes);
+    expect(result.entries).toEqual([{
+      id: "danmaku-0",
+      start: 1,
+      mode: "scroll",
+      text: "字节",
+      color: "#ffffff",
+      fontSize: 25,
+    }]);
+
+    await expect(parseDanmakuPayload(new Uint8Array([0xff, 0xfe, 0x00]).buffer))
+      .rejects.toThrowError(new Error("弹幕内容编码无效"));
   });
 
   it("rejects invalid XML, unsafe declarations, and keeps DOCTYPE/ENTITY denied", () => {
@@ -164,7 +216,7 @@ describe("LuxPlayer danmaku parser", () => {
     expect(parseDanmakuWorkerRequest({
       type: "PARSE",
       requestId: 12,
-      xml: '<i><d p="1,1,25,16777215,0,0,0,0">worker</d></i>',
+      bytes: new TextEncoder().encode('<i><d p="1,1,25,16777215,0,0,0,0">worker</d></i>').buffer,
     })).toEqual({
       type: "PARSED",
       requestId: 12,
@@ -182,30 +234,39 @@ describe("LuxPlayer danmaku parser", () => {
     expect(parseDanmakuWorkerRequest({
       type: "PARSE",
       requestId: 13,
-      xml: "<bad />",
+      bytes: new TextEncoder().encode("<bad />").buffer,
     })).toEqual({
       type: "FAILED",
       requestId: 13,
       message: "弹幕 XML 格式无效",
     });
+    expect(parseDanmakuWorkerRequest({
+      type: "PARSE",
+      requestId: 14,
+      bytes: new Uint8Array([0xff, 0xfe, 0x00]).buffer,
+    })).toEqual({
+      type: "FAILED",
+      requestId: 14,
+      message: "弹幕内容编码无效",
+    });
   });
 
   it("reports truncation from the worker so the page can tell the user", () => {
     const rows = Array.from(
-      { length: 25_000 },
-      (_, index) => `<d p="${index},1,25,16777215,0,0,0,0">row-${index}</d>`,
+      { length: 60_000 },
+      (_, index) => `<d p="${index / 2},1,25,16777215,0,0,0,0">row-${index}</d>`,
     ).join("");
     const response = parseDanmakuWorkerRequest({
       type: "PARSE",
       requestId: 21,
-      xml: `<i>${rows}</i>`,
+      bytes: new TextEncoder().encode(`<i>${rows}</i>`).buffer,
     });
 
     expect(response).toMatchObject({
       type: "PARSED",
       requestId: 21,
       truncated: true,
-      totalEntries: 25_000,
+      totalEntries: 60_000,
     });
     expect(response.type === "PARSED" ? response.entries : []).toHaveLength(DANMAKU_LIMITS.maxEntries);
   });

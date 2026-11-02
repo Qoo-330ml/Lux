@@ -17,18 +17,25 @@ export type LuxDanmakuEntry = {
   fontSize: number;
 };
 
+/**
+ * Server-side cap (`MAX_DANMAKU_XML_BYTES` in `application::danmaku`). The browser deliberately
+ * stays below it — see `DANMAKU_LIMITS.maxBytes` — but the number is recorded here because the
+ * client must never assume it can load everything the server can serve.
+ */
+export const DANMAKU_SERVER_MAX_BYTES = 50 * 1024 * 1024;
+
 export const DANMAKU_LIMITS = {
   /**
-   * Mirrors the server-side cap (`MAX_DANMAKU_XML_BYTES = 50 MiB` in `application::danmaku`).
-   * The Web client used to reject anything above 4 MiB, which made popular videos fail to load
-   * even though the server served them; a file the server can serve must stay loadable.
+   * Client buffer/decode budget. The server serves up to 50 MiB, but the browser would otherwise
+   * buffer, decode, and structured-clone that much text on a low-memory device; 16 MiB is the
+   * largest payload we accept, and anything above it reports “弹幕文件过大”.
    */
-  maxBytes: 50 * 1024 * 1024,
+  maxBytes: 16 * 1024 * 1024,
   /**
    * Parse/render budget. Larger files are kept but uniformly sampled down to this many entries
    * (reservoir sampling) instead of being rejected or cut to the first N rows.
    */
-  maxEntries: 20_000,
+  maxEntries: 50_000,
   maxTextLength: 200,
   maxTimeSeconds: 24 * 60 * 60,
   minFontSize: 12,
@@ -66,6 +73,20 @@ export type DanmakuParseOptions = {
 const XML_DECLARATION_PATTERN = /^<\?xml\s+version\s*=\s*(?:"1\.[01]"|'1\.[01]')(?:\s+encoding\s*=\s*(?:"[A-Za-z][A-Za-z0-9._-]*"|'[A-Za-z][A-Za-z0-9._-]*'))?(?:\s+standalone\s*=\s*(?:"(?:yes|no)"|'(?:yes|no)'))?\s*\?>$/i;
 const DENIED_DECLARATION_PATTERN = /<!(?:DOCTYPE|ENTITY)\b/i;
 const CONTROL_CHARACTER_PATTERN = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/u;
+
+/**
+ * Decodes raw danmaku bytes with a fatal UTF-8 decoder.
+ *
+ * Runs inside the Worker (the bytes are transferred there, so the main thread never decodes or
+ * copies the payload); the non-Worker fallback calls the same helper.
+ */
+export function decodeDanmakuBytes(bytes: ArrayBuffer | ArrayBufferView): string {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error("弹幕内容编码无效");
+  }
+}
 
 export function exceedsUtf8ByteLimit(input: string, limit: number): boolean {
   if (input.length > limit) return true;

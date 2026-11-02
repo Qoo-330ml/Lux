@@ -9,7 +9,7 @@ import { api } from "../../../lib/api/client";
 import {
   DanmakuParseError,
   DANMAKU_LIMITS,
-  exceedsUtf8ByteLimit,
+  decodeDanmakuBytes,
   parseDanmakuXml,
   type DanmakuParseResult,
 } from "./parse";
@@ -56,18 +56,28 @@ export function sameOriginRawUrl(rawUrl: string) {
   return `${url.pathname}${url.search}`;
 }
 
-export async function readDanmakuResponse(response: Response, signal: AbortSignal) {
+/**
+ * Reads a raw danmaku response as bytes, enforcing the client byte budget.
+ *
+ * Bytes (not a decoded string) are returned on purpose: the Worker decodes them, so the main thread
+ * never holds both a byte buffer and a large JS string for the same payload.
+ */
+export async function readDanmakuResponse(
+  response: Response,
+  signal: AbortSignal,
+): Promise<ArrayBuffer> {
   const declaredLength = response.headers.get("content-length");
-  // The server caps a danmaku XML at 50 MiB; anything larger is refused before buffering it.
+  // The server serves up to 50 MiB, but the browser budget is 16 MiB (low-memory devices OOM well
+  // before that); anything above it is refused before buffering it.
   if (declaredLength && Number(declaredLength) > DANMAKU_LIMITS.maxBytes) {
     throw new Error("弹幕文件过大");
   }
   if (!response.body) {
-    const text = await response.text();
-    if (exceedsUtf8ByteLimit(text, DANMAKU_LIMITS.maxBytes)) {
+    const buffer = await response.arrayBuffer();
+    if (buffer.byteLength > DANMAKU_LIMITS.maxBytes) {
       throw new Error("弹幕文件过大");
     }
-    return text;
+    return buffer;
   }
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -90,20 +100,25 @@ export async function readDanmakuResponse(response: Response, signal: AbortSigna
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-  } catch {
-    throw new Error("弹幕内容编码无效");
-  }
+  // The buffer is exactly sized, so it can be transferred to the Worker without copying.
+  return bytes.buffer;
 }
 
 let requestSequence = 0;
 
-/** Parses off the main thread when Workers exist, otherwise in place (tests, old browsers). */
-export function parseDanmakuPayload(xml: string, signal?: AbortSignal): Promise<DanmakuParseResult> {
+/**
+ * Parses off the main thread when Workers exist, otherwise in place (tests, old browsers).
+ *
+ * `bytes` is transferred to the Worker, which decodes it with a fatal UTF-8 decoder; the main
+ * thread only decodes on the fallback path.
+ */
+export function parseDanmakuPayload(
+  bytes: ArrayBuffer,
+  signal?: AbortSignal,
+): Promise<DanmakuParseResult> {
   if (typeof Worker === "undefined") {
     try {
-      return Promise.resolve(parseDanmakuXml(xml));
+      return Promise.resolve(parseDanmakuXml(decodeDanmakuBytes(bytes)));
     } catch (error) {
       return Promise.reject(error);
     }
@@ -143,7 +158,7 @@ export function parseDanmakuPayload(xml: string, signal?: AbortSignal): Promise<
       cleanup();
       reject(new Error("弹幕解析失败"));
     };
-    worker.postMessage({ type: "PARSE" as const, requestId, xml });
+    worker.postMessage({ type: "PARSE" as const, requestId, bytes }, [bytes]);
   });
 }
 
@@ -171,9 +186,9 @@ export async function loadDanmakuDocument({
     headers: { Accept: "application/xml, text/xml" },
   });
   if (!response.ok) throw new Error("danmaku-request-failed");
-  const xml = await readDanmakuResponse(response, signal);
+  const bytes = await readDanmakuResponse(response, signal);
   if (signal.aborted) throw new DOMException("Aborted", "AbortError");
-  return parseDanmakuPayload(xml, signal);
+  return parseDanmakuPayload(bytes, signal);
 }
 
 /** Status line for a successful load; `null` means "nothing the user needs to know". */
