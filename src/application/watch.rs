@@ -23,6 +23,7 @@ use tokio::{
 use crate::{
     application::{
         libraries::LibraryChangeNotifier,
+        probe::MediaProbeService,
         reidentify::MetadataReidentifyService,
         scanner::{IncrementalScanChange, ScanJobError, ScanJobService},
     },
@@ -190,6 +191,7 @@ pub struct LibraryWatchService {
     database: Database,
     scan_jobs: ScanJobService,
     metadata: Option<MetadataReidentifyService>,
+    probe: Option<MediaProbeService>,
     watcher_init_permits: Arc<Semaphore>,
     library_change_notifier: LibraryChangeNotifier,
     library_change_receiver: watch::Receiver<u64>,
@@ -218,11 +220,22 @@ impl LibraryWatchService {
             scan_jobs,
             database,
             metadata,
+            probe: None,
             watcher_init_permits: Arc::new(Semaphore::new(WATCHER_INIT_CONCURRENCY)),
             library_change_notifier,
             library_change_receiver,
             worker: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Attaches the `ffprobe` service used by realtime incremental scans.
+    ///
+    /// The watcher runs the same postprocessing stages as the administrator scan paths, so
+    /// without this service every source that a realtime scan newly indexes stays `PENDING` and
+    /// its probe target is silently skipped.
+    pub fn with_probe(mut self, probe: Option<MediaProbeService>) -> Self {
+        self.probe = probe;
+        self
     }
 
     pub fn with_library_change_notifications(mut self, notifier: LibraryChangeNotifier) -> Self {
@@ -419,15 +432,11 @@ impl LibraryWatchService {
                         continue;
                     }
                     drop(running);
-                    let scan_jobs = self.scan_jobs.clone();
-                    let metadata = self.metadata.clone();
+                    let service = self.clone();
                     let running_jobs = Arc::clone(&running_jobs);
                     let job_id = job.id.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = scan_jobs
-                            .run_to_completion_with_metadata(&job_id, 100, None, metadata)
-                            .await
-                        {
+                        if let Err(error) = service.run_incremental_scan(&job_id).await {
                             tracing::error!(job_id = %job_id, %error, "realtime incremental scan stopped");
                         }
                         running_jobs.lock().await.remove(&job_id);
@@ -440,6 +449,25 @@ impl LibraryWatchService {
                 }
             }
         }
+    }
+
+    /// Runs one realtime incremental scan job with the same worker services the administrator
+    /// scan paths pass to [`ScanJobService::run_to_completion_with_metadata_and_thumbnails`].
+    ///
+    /// Passing `None` for the probe service would make the incremental postprocessing stage mark
+    /// every newly indexed source's probe target as skipped while leaving
+    /// `media_sources.probe_status = 'PENDING'`; a later full scan classifies those files as
+    /// unchanged and never probes them again.
+    async fn run_incremental_scan(&self, job_id: &str) -> Result<(), ScanJobError> {
+        self.scan_jobs
+            .run_to_completion_with_metadata_and_thumbnails(
+                job_id,
+                100,
+                self.probe.clone(),
+                self.metadata.clone(),
+                None,
+            )
+            .await
     }
 }
 
@@ -878,5 +906,104 @@ mod tests {
                 kind: ChangeKind::Create,
             }]
         );
+    }
+
+    /// A realtime incremental scan must probe the local source it just indexed.
+    ///
+    /// Without the probe service the incremental postprocessing stage skips the source's probe
+    /// target and leaves `probe_status = 'PENDING'`; a later full scan sees the unchanged file and
+    /// materializes no probe target, so the source stays `PENDING` forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn realtime_incremental_scan_probes_the_source_it_indexes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        use crate::{
+            application::{
+                libraries::LibraryService,
+                probe::{FfprobeRunner, MediaProbeService},
+                scanner::IncrementalScanChange,
+            },
+            config::Config,
+            library::LibraryKind,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, true)
+            .await?;
+        let root = temp_dir.path().join("Movies");
+        tokio::fs::create_dir_all(root.join("Existing Movie (2023)")).await?;
+        tokio::fs::write(
+            root.join("Existing Movie (2023)/Existing.Movie.2023.mkv"),
+            b"fixture",
+        )
+        .await?;
+        let root_record = libraries
+            .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+            .await?
+            .root;
+
+        let fake_ffprobe = temp_dir.path().join("fake-ffprobe");
+        fs::write(
+            &fake_ffprobe,
+            r#"#!/bin/sh
+printf '%s' '{"format":{"format_name":"matroska","duration":"30","bit_rate":"128000"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264"}]}'
+"#,
+        )?;
+        let mut permissions = fs::metadata(&fake_ffprobe)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_ffprobe, permissions)?;
+        let probe = MediaProbeService::new(
+            database.clone(),
+            FfprobeRunner::new(fake_ffprobe, Duration::from_secs(5)),
+        );
+
+        let scan_jobs = ScanJobService::new(database.clone());
+        let initial_scan = scan_jobs.create_movie_scan_job(library.id).await?;
+        scan_jobs
+            .run_to_completion(&initial_scan.id, 100, Some(probe.clone()))
+            .await?;
+
+        let watch = LibraryWatchService::with_scan_jobs_and_metadata(
+            database.clone(),
+            scan_jobs.clone(),
+            None,
+        )
+        .with_probe(Some(probe));
+
+        let added_path = "Added Movie (2024)/Added.Movie.2024.mkv";
+        tokio::fs::create_dir_all(root.join("Added Movie (2024)")).await?;
+        tokio::fs::write(root.join(added_path), b"fixture").await?;
+        let job = scan_jobs
+            .enqueue_incremental_changes(
+                library.id,
+                vec![IncrementalScanChange {
+                    root_id: root_record.id.to_string(),
+                    relative_path: added_path.to_owned(),
+                    kind: ChangeKind::Create,
+                }],
+            )
+            .await?;
+        watch.run_incremental_scan(&job.id).await?;
+
+        let status: String = sqlx::query_scalar(
+            "SELECT ms.probe_status
+             FROM media_sources ms
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             WHERE fe.relative_path = ?",
+        )
+        .bind(added_path)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(status, "READY");
+        Ok(())
     }
 }
