@@ -163,6 +163,18 @@ describe("LuxPlayer danmaku settings", () => {
     });
   });
 
+  it("returns independent default arrays so callers cannot mutate shared defaults", () => {
+    const first = readDanmakuSettings(null);
+    first.blockedModes.push("scroll");
+    first.keywords.push("共享");
+
+    const second = readDanmakuSettings(null);
+    expect(second.blockedModes).toEqual([]);
+    expect(second.keywords).toEqual([]);
+    expect(DEFAULT_DANMAKU_SETTINGS.blockedModes).toEqual([]);
+    expect(DEFAULT_DANMAKU_SETTINGS.keywords).toEqual([]);
+  });
+
   it("derives the scheduler layout from user settings", () => {
     const layout = danmakuLayoutFromSettings({
       ...DEFAULT_DANMAKU_SETTINGS,

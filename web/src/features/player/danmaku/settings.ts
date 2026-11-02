@@ -157,14 +157,14 @@ export function normalizeDanmakuKeywords(value: unknown): string[] {
 
 export function readDanmakuSettings(storage?: Storage | null): DanmakuSettings {
   const target = storage === undefined ? defaultStorage() : storage;
-  if (!target) return { ...DEFAULT_DANMAKU_SETTINGS };
+  if (!target) return defaultSettings();
   try {
     const raw = target.getItem(DANMAKU_SETTINGS_STORAGE_KEY);
-    if (!raw) return { ...DEFAULT_DANMAKU_SETTINGS };
+    if (!raw) return defaultSettings();
     return normalizeDanmakuSettings(JSON.parse(raw));
   } catch {
     // Corrupted JSON, a disabled storage, or a throwing getter: defaults, never an exception.
-    return { ...DEFAULT_DANMAKU_SETTINGS };
+    return defaultSettings();
   }
 }
 
@@ -208,6 +208,18 @@ export function danmakuLayoutsEqual(
     && left.blockedModes.every((mode, index) => right.blockedModes[index] === mode)
     && left.keywords.length === right.keywords.length
     && left.keywords.every((keyword, index) => right.keywords[index] === keyword);
+}
+
+/**
+ * A default copy with its own arrays: callers receive a settings object they may mutate (the panel
+ * draft, tests) without corrupting `DEFAULT_DANMAKU_SETTINGS` or a later reader's value.
+ */
+function defaultSettings(): DanmakuSettings {
+  return {
+    ...DEFAULT_DANMAKU_SETTINGS,
+    blockedModes: [],
+    keywords: [],
+  };
 }
 
 function normalizeBlockedModes(value: unknown): DanmakuMode[] {

@@ -40,6 +40,16 @@ async function click(element: HTMLElement) {
   });
 }
 
+/** The settings store coalesces localStorage writes into one animation frame. */
+async function nextFrame() {
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => resolve());
+      else setTimeout(resolve, 0);
+    });
+  });
+}
+
 describe("LuxPlayer danmaku settings panel", () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -238,9 +248,9 @@ describe("LuxPlayer danmaku settings persistence", () => {
     vi.restoreAllMocks();
   });
 
-  it("writes storage outside the state updater and composes consecutive updates", async () => {
-    // Storage is written once per update, before setState, so StrictMode's double-invoked updaters
-    // and concurrent render retries cannot duplicate or drop a persisted value.
+  it("coalesces localStorage writes while the UI updates immediately", async () => {
+    // Dragging a slider fires many updates; only the last value is written, once per frame, and the
+    // UI reflects every value immediately.
     const setItem = vi.spyOn(Storage.prototype, "setItem");
     function Sequential() {
       const { settings, updateSettings } = useDanmakuSettings();
@@ -272,14 +282,21 @@ describe("LuxPlayer danmaku settings persistence", () => {
 
     expect(container.querySelector("[data-lux-opacity]")?.textContent).toBe("0.5");
     expect(container.querySelector("[data-lux-area]")?.textContent).toBe("half");
+    // Nothing is persisted synchronously...
+    expect(setItem).not.toHaveBeenCalled();
+
+    await nextFrame();
+    // ...and the frame writes exactly once, with the merged last value.
+    expect(setItem).toHaveBeenCalledTimes(1);
     expect(readDanmakuSettings()).toMatchObject({ opacity: 0.5, area: "half" });
-    // Two updates, two writes: StrictMode must not double them, and neither update is lost.
-    expect(setItem).toHaveBeenCalledTimes(2);
   });
 
   it("persists a change and restores it on the next mount", async () => {
     await mount();
     await click(byAriaLabel<HTMLButtonElement>(container, "上 1/4", "button")!);
+
+    expect(readDanmakuSettings().area).toBe("full");
+    await nextFrame();
 
     expect(readDanmakuSettings().area).toBe("quarter");
     expect(JSON.parse(window.localStorage.getItem(DANMAKU_SETTINGS_STORAGE_KEY)!)).toMatchObject({
@@ -293,6 +310,37 @@ describe("LuxPlayer danmaku settings persistence", () => {
       .toBe("true");
   });
 
+  it("flushes a pending write on a native change event before the frame", async () => {
+    await mount();
+    const opacity = byAriaLabel<HTMLInputElement>(container, "弹幕不透明度", "input")!;
+    await changeInput(opacity, "55");
+
+    // React's onChange is the input event; the native change fires when the drag ends.
+    expect(readDanmakuSettings().opacity).toBe(1);
+    await act(async () => {
+      window.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(readDanmakuSettings().opacity).toBeCloseTo(0.55, 5);
+
+    // A blurred control flushes as well (keyboard stepping never fires a native change).
+    await changeInput(opacity, "60");
+    expect(readDanmakuSettings().opacity).toBeCloseTo(0.55, 5);
+    await act(async () => {
+      window.dispatchEvent(new Event("blur"));
+    });
+    expect(readDanmakuSettings().opacity).toBeCloseTo(0.6, 5);
+  });
+
+  it("flushes a pending write when the panel unmounts", async () => {
+    await mount();
+    await click(byAriaLabel<HTMLButtonElement>(container, "上 1/4", "button")!);
+    expect(readDanmakuSettings().area).toBe("full");
+
+    act(() => root.unmount());
+    expect(readDanmakuSettings().area).toBe("quarter");
+    root = createRoot(container);
+  });
+
   it("writes the defaults back when the viewer resets", async () => {
     window.localStorage.setItem(
       DANMAKU_SETTINGS_STORAGE_KEY,
@@ -300,6 +348,7 @@ describe("LuxPlayer danmaku settings persistence", () => {
     );
     await mount();
     await click(byAriaLabel<HTMLButtonElement>(container, "恢复默认弹幕设置", "button")!);
+    await nextFrame();
 
     expect(readDanmakuSettings()).toEqual(DEFAULT_DANMAKU_SETTINGS);
   });
