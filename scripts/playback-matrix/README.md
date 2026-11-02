@@ -88,6 +88,11 @@ node scripts/playback-matrix/generate-samples.mjs --only audio --force
 旋转/HDR、音轨与声道、字幕）、`ffprobe` 摘要、字节数，以及 **skipped 列表**（编码器缺失或组合无法生成的原因）。
 样本总量约 54 个、30 MB 左右，远低于 300 MB。
 
+> 扫描器会把文件名里的编码词（`h264`、`hevc`、`vp9`…）当作可剥离的品质标记，并把清理后同名的文件合并成
+> **同一电影条目的多个 source**（例如“main stereo”同时有 H.264 与 HEVC 两个版本）。这是预期行为：
+> `run-matrix.mjs` 会枚举每个 source，并在报告标题里补上“版本 N（视频/音频编码）”，矩阵轴仍取自 ffprobe
+> 流信息，而不是文件名。
+
 ### 覆盖范围
 
 - 视频：H.264 baseline/main/high/High 10/High 4:2:2/High 4:4:4、HEVC Main/Main10/HDR10、VP8、VP9 8/10-bit、
@@ -149,7 +154,8 @@ node scripts/playback-matrix/run-matrix.mjs
 2. `GET /api/v1/libraries` 枚举媒体库（可过滤），再 `GET /api/v1/libraries/{id}/items` 以 `pageSize=100`
    分页（服务端上限）取条目；列表缺少 `mediaSources` 时再读 `GET /api/v1/items/{id}`。
 3. 对每个 source：先清掉服务端保存的播放进度，再打开 `/watch/<itemId>?sourceId=<sourceId>`；
-   等待最多 `MATRIX_TIMEOUT_MS`，期间按需触发一次 `<video>.play()`。
+   等待最多 `MATRIX_TIMEOUT_MS`，期间在拿到元数据后 seek 到 0 并按需触发一次 `<video>.play()`。
+   这样重复运行不会因为“继续观看”位置从片尾开始而误判。
 4. 记录：
    - 服务端最终计划：捕获 `/api/v1/playback/bootstrap` 与 `/api/v1/playback/sessions` 响应里的
      `plan.type` / `tier`（DIRECT、REMUX=tier 1、SERVER_HLS tier 2–4、UNSUPPORTED+原因）；
@@ -157,7 +163,9 @@ node scripts/playback-matrix/run-matrix.mjs
      `silent-audio` / 直连失败）；
    - `video.videoWidth/Height > 0`、`currentTime` 是否前进 ≥ 1.5 秒；
    - 音频是否真的解码：Chromium 用 `webkitAudioDecodedByteCount > 0`，其他引擎记 `unknown`；
-   - `role=alert` 错误横幅、媒体错误、首帧耗时、导航耗时。
+   - `role=alert` 错误横幅、媒体错误、首帧耗时、导航耗时；
+   - 客户端回退会重建播放器，测量计数会从新会话重新开始，因此回退样本的首帧时间是“自导航起的最终会话首帧”，
+     会明显大于直连样本。
 5. 每个样本后导航到 `about:blank` 并等待会话释放，**严格串行**，不并发。
 6. 捕获到 HTTP 429（同时播放数上限）时按 5s / 10s / 20s 退避重试（最多 3 次），仍失败则样本记 ⏭️ 并写明原因。
 
@@ -203,6 +211,9 @@ node scripts/playback-matrix/run-matrix.mjs
 - 不覆盖 `.strm`（工具只生成/测试 `.mkv`、`.mp4`）。
 - 不进入 CI；不要把它接进 `scripts/check-all.sh`。
 - 音频解码只在 Chromium 引擎可判定；Firefox/WebKit 的静默问题需要人工听音或另配指标。
+- 服务端 HLS 回退本身失败（例如 MSE `CHUNK_DEMUXER_ERROR_APPEND_FAILED`）会如实记为 ❌，并附带回退原因和
+  `media error`；这正是工具要暴露的现象，不是测量噪声。
+- 扫描器会剥离文件名里的编码词并合并同名文件为多版本条目；报告标题里的“版本 N（编码）”用于区分它们。
 - 字幕只验证“轨道存在且播放不崩”，不做像素级渲染校验。
 - HDR/4K 的显示效果不作像素比较，只验证能否起播与进度；无头 Chrome 的 HEVC/HDR 结论可能与真机不同。
 - PGS、HE-AAC、DTS-HD MA、VC-1 等本机无法生成的编码记在 `manifest.json` 的 `skipped`，需要时放入现成样本补齐。

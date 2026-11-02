@@ -370,18 +370,31 @@ async function login(page, options) {
   if (await usernameField.count()) {
     await usernameField.fill(options.user);
     await page.getByLabel("密码", { exact: true }).first().fill(process.env.LUX_PASS);
+    // The submit label changed across releases ("登录" → "进入影院 ›"), so target the form's submit
+    // button instead of one exact copy string.
+    const submitButton = page.locator("form button[type=submit]").first();
+    const submit = (await submitButton.count())
+      ? submitButton.click()
+      : page.locator("button").filter({ hasText: /登录|进入影院/ }).first().click();
     const [loginResponse] = await Promise.all([
       page.waitForResponse((response) => response.url().endsWith("/api/v1/auth/login"), { timeout: 20000 }),
-      page.getByRole("button", { name: "登录", exact: true }).click(),
+      submit,
     ]);
     if (!loginResponse.ok()) {
       throw new UsageError(`登录失败：HTTP ${loginResponse.status()}（检查 LUX_USER / LUX_PASS）。`);
     }
   }
-  await page.locator("main.content").first().waitFor({ state: "visible", timeout: 30000 });
-  const me = await apiGet(page, "/api/v1/auth/me");
-  if (me.status !== 200) {
-    throw new UsageError(`登录后 /api/v1/auth/me 返回 ${me.status}；账号、密码或实例状态异常。`);
+  // Do not depend on a page-specific class name: the logged-in shell changed from `main.content`
+  // to `main.lux-main` across releases. `/api/v1/auth/me` is the stable signal that the cookie is
+  // valid, and direct `/watch/...` navigation works without rendering the home page first.
+  let me = null;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    me = await apiGet(page, "/api/v1/auth/me");
+    if (me.status === 200) break;
+    await sleep(250);
+  }
+  if (me?.status !== 200) {
+    throw new UsageError(`登录后 /api/v1/auth/me 返回 ${me?.status ?? "无响应"}；账号、密码或实例状态异常。`);
   }
   options.csrfToken = await readCsrfToken(page);
 }
@@ -434,17 +447,25 @@ function codecsFromTitle(title) {
   return { video, audio };
 }
 
-function describeSource(item, source) {
+function describeSource(item, source, sourceIndex = 0, sourceCount = 1) {
   const streams = Array.isArray(source.streams) ? source.streams : [];
   const videoStreams = streams.filter((stream) => String(stream.type ?? "").toUpperCase() === "VIDEO");
   const audioStreams = streams.filter((stream) => String(stream.type ?? "").toUpperCase() === "AUDIO");
   const subtitleStreams = streams.filter((stream) => String(stream.type ?? "").toUpperCase() === "SUBTITLE");
-  const title = item.title || item.name || "(untitled)";
-  const fallback = codecsFromTitle(title);
+  const baseTitle = item.title || item.name || "(untitled)";
+  const fallback = codecsFromTitle(`${baseTitle} ${source.qualityLabel ?? ""}`);
   const videoCodec = videoStreams[0]?.codec || fallback.video;
   const audioCodecs = audioStreams.length
     ? audioStreams.map((stream) => stream.codec || "unknown")
     : (fallback.audio.length ? fallback.audio : []);
+  // The scanner strips codec tokens from titles and merges files that clean up to the same name, so
+  // several samples can share one item. Keep the version label (HDR/4K/…) or, for unlabeled
+  // versions, the ordinal plus the actual codecs so two rows never look identical.
+  const variant = source.qualityLabel || source.editionName
+    || (sourceCount > 1
+      ? `版本 ${sourceIndex + 1}（${videoCodec}/${audioCodecs.length ? audioCodecs.join("+") : "无音轨"}）`
+      : "");
+  const title = variant ? `${baseTitle} · ${variant}` : baseTitle;
   return {
     itemId: item.id,
     libraryId: item.libraryId ?? null,
@@ -483,9 +504,9 @@ async function collectSamples(page, options) {
         }
         continue;
       }
-      for (const source of sources) {
+      for (const [sourceIndex, source] of sources.entries()) {
         if (!source?.id) continue;
-        samples.push(describeSource(item, source));
+        samples.push(describeSource(item, source, sourceIndex, sources.length));
       }
     }
   }
@@ -607,12 +628,18 @@ async function measureSample(page, context, sample, options) {
     pageErrors: [],
     failedRequests: [],
     playbackResponses: [],
+    // Increments on every successful playback session response; the player swaps the element and
+    // restarts playback after a client fallback, so measurement must start over for the new attempt.
+    playbackEpoch: 0,
     rateLimited: false,
   };
   const onConsole = (message) => {
     const entry = { type: message.type(), text: sanitizeText(message.text()) };
     collectors.console.push(entry);
-    if (entry.type === "error") collectors.consoleErrors.push(entry.text);
+    // Browsers emit one generic message per missing static asset (favicon, poster) without the URL;
+    // playback API failures are captured with their HTTP status in `failedRequests` instead.
+    const genericResource = /^Failed to load resource: the server responded with a status of (?:401|404)/.test(entry.text);
+    if (entry.type === "error" && !genericResource) collectors.consoleErrors.push(entry.text);
   };
   const onPageError = (error) => {
     collectors.pageErrors.push(sanitizeText(error?.message ?? error));
@@ -621,6 +648,9 @@ async function measureSample(page, context, sample, options) {
     try {
       const url = new URL(request.url());
       if (!/\/api\/v1\/playback\/|\/stream|\/direct|\/hls\//.test(url.pathname)) return;
+      // The player aborts the previous session and in-flight HLS segments on fallback/teardown;
+      // that is expected and must not look like a playback failure.
+      if (/ERR_ABORTED/i.test(request.failure()?.errorText ?? "")) return;
       collectors.failedRequests.push({
         path: url.pathname,
         error: sanitizeText(request.failure()?.errorText ?? "unknown"),
@@ -634,8 +664,12 @@ async function measureSample(page, context, sample, options) {
       const url = new URL(response.url());
       if (!url.pathname.startsWith("/api/v1/playback/")) return;
       if (response.status() === 429) collectors.rateLimited = true;
+      if (response.status() >= 400 && /^\/api\/v1\/playback\//.test(url.pathname)) {
+        collectors.failedRequests.push({ path: url.pathname, error: `HTTP ${response.status()}` });
+      }
       if (response.request().method() !== "POST") return;
       if (!/\/api\/v1\/playback\/(sessions|bootstrap)$/.test(url.pathname)) return;
+      if (response.status() === 200) collectors.playbackEpoch += 1;
       const entry = {
         endpoint: url.pathname.endsWith("bootstrap") ? "bootstrap" : "sessions",
         status: response.status(),
@@ -698,15 +732,64 @@ async function measureSample(page, context, sample, options) {
     result.timing.navigationMs = Date.now() - navigationStarted;
 
     let nudged = false;
+    let seeded = false;
+    let reseeked = false;
     let initialCurrent = null;
     let maxCurrent = 0;
     let firstFrameMs = null;
     let blockingAlert = null;
+    let silentAudioGraceUntil = null;
     let lastState = null;
+    let seenEpoch = 0;
     const deadline = Date.now() + options.timeoutMs;
     while (Date.now() < deadline) {
       const state = await readPlaybackState(page);
+      if (collectors.playbackEpoch !== seenEpoch || (lastState?.exists && !state.exists)) {
+        // A new session (client fallback) or a remounted element means the measured advance belongs
+        // to the previous attempt; restart the counters and give the new playback the full budget.
+        seenEpoch = collectors.playbackEpoch;
+        seeded = false;
+        reseeked = false;
+        initialCurrent = null;
+        maxCurrent = 0;
+        firstFrameMs = null;
+        silentAudioGraceUntil = null;
+      }
       lastState = state;
+      // A previous run (or another version of the same item) leaves a resume position behind. Start
+      // from zero once the element has metadata, so the measured advance is real playback rather
+      // than a seek straight to the end of a 5s sample.
+      if (!seeded && state.exists && state.readyState >= 1) {
+        await page.evaluate(() => {
+          const video = document.querySelector("video");
+          if (!video) return;
+          try {
+            video.currentTime = 0;
+          } catch {
+            // The element may not be seekable yet; the next poll retries.
+          }
+        });
+        seeded = true;
+        initialCurrent = 0;
+        maxCurrent = 0;
+      }
+      if (seeded && !reseeked && state.currentTime > 2 && maxCurrent < 1) {
+        // The player restored the resume position after our seek; take it back once.
+        await page.evaluate(() => {
+          const video = document.querySelector("video");
+          if (!video) return;
+          try {
+            video.currentTime = 0;
+          } catch {
+            // Ignore; the deadline still bounds the sample.
+          }
+        });
+        reseeked = true;
+        initialCurrent = 0;
+        maxCurrent = 0;
+        await sleep(150);
+        continue;
+      }
       if (state.exists && initialCurrent === null) initialCurrent = state.currentTime;
       if (state.currentTime > maxCurrent) maxCurrent = state.currentTime;
       if (state.hasFrame && firstFrameMs === null) firstFrameMs = Date.now() - navigationStarted;
@@ -739,7 +822,18 @@ async function measureSample(page, context, sample, options) {
       }
       const advance = maxCurrent - (initialCurrent ?? 0);
       if (blockingAlert) break;
-      if (advance >= options.advanceSeconds) break;
+      if (advance >= options.advanceSeconds) {
+        // A slow-starting audio track can legitimately report 0 decoded bytes at 1.5s. Give
+        // Chromium up to two extra seconds before calling it silent (other engines do not expose
+        // the counter and break immediately).
+        const audioStillSilent = sample.hasAudio
+          && typeof state.audioDecodedBytes === "number"
+          && state.audioDecodedBytes === 0;
+        if (audioStillSilent && silentAudioGraceUntil === null) {
+          silentAudioGraceUntil = Date.now() + 2000;
+        }
+        if (!audioStillSilent || Date.now() >= silentAudioGraceUntil) break;
+      }
       if (state.ended && state.hasFrame) break;
       await sleep(250);
     }
@@ -925,7 +1019,7 @@ function resultDetail(result) {
   }
   lines.push(`  - 画面：${result.video.frames ? `${result.video.width}×${result.video.height}` : "无画面"}，currentTime 前进 ${result.video.currentTimeAdvance}s，readyState=${result.video.readyState}`);
   lines.push(`  - 音频：${result.audio.decoded === "decoded" ? `已解码（${result.audio.decodedBytes} 字节）` : result.audio.decoded === "silent" ? "**静默（0 字节）**" : result.audio.decoded === "n/a" ? "无音轨" : result.engine === "chromium" ? "未知（未读到解码计数器）" : "未知（非 Chromium 引擎）"}`);
-  lines.push(`  - 首帧：${result.timing.firstFrameMs === null ? "未出现" : `${(result.timing.firstFrameMs / 1000).toFixed(2)}s`}；导航 ${result.timing.navigationMs}ms；尝试 ${result.attempts} 次`);
+  lines.push(`  - 首帧：${result.timing.firstFrameMs === null ? "未出现" : `${(result.timing.firstFrameMs / 1000).toFixed(2)}s`}（最终会话）；导航 ${result.timing.navigationMs}ms；尝试 ${result.attempts} 次`);
   if (result.blockingAlert) lines.push(`  - 阻塞提示（role=alert）：${result.blockingAlert}`);
   if (result.mediaError) lines.push(`  - 媒体错误：code=${result.mediaError.code} ${result.mediaError.message ?? ""}`);
   if (result.playError?.blocked) lines.push(`  - 自动播放失败：${result.playError.blocked}`);
