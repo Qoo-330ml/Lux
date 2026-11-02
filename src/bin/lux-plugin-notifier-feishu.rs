@@ -13,8 +13,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use hmac::{Hmac, Mac};
 use luxd::application::{
     notifier_plugin_sdk::{
-        delivered, failed, outbound_http_client_from_env, render_event_text,
-        result_from_http_status, retryable, run_notifier,
+        delivered, failed, guard_destination, outbound_http_client_builder_from_env,
+        render_event_text, result_from_http_status, retryable, run_notifier,
     },
     plugin_protocol::{NotificationSendRpcRequest, NotificationSendRpcResult},
 };
@@ -29,6 +29,8 @@ const HOOK_PATH: &str = "/open-apis/bot/v2/hook";
 const MAX_HOOK_ID_CHARS: usize = 128;
 const MAX_SIGN_SECRET_CHARS: usize = 256;
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 64 * 1024;
+/// Returned when the host proxy policy cannot be turned into a usable outbound client.
+const CLIENT_UNAVAILABLE: &str = "client_unavailable";
 /// Feishu's documented "request frequency limited" business code.
 const FEISHU_RATE_LIMIT_CODE: i64 = 11_232;
 /// Feishu reserves the 19xxx range for frequency-control responses.
@@ -112,32 +114,11 @@ impl FeishuError {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let client = match outbound_http_client_from_env() {
-        Ok(client) => Some(client),
-        Err(error) => {
-            log_line(&format!("outbound client unavailable: {error}"));
-            None
-        }
-    };
-    run_notifier(move |request| {
-        let client = client.clone();
-        async move {
-            match client {
-                Some(client) => deliver(&client, request).await,
-                // A broken outbound-client configuration is an operator-side transient problem:
-                // retrying keeps the delivery queued instead of dropping it permanently.
-                None => retryable("client_unavailable"),
-            }
-        }
-    })
-    .await
+    run_notifier(deliver).await
 }
 
 /// Delivers one notification and classifies the outcome for the host.
-async fn deliver(
-    client: &Client,
-    request: NotificationSendRpcRequest,
-) -> NotificationSendRpcResult {
+async fn deliver(request: NotificationSendRpcRequest) -> NotificationSendRpcResult {
     let config = match parse_config(&request.config) {
         Ok(config) => config,
         Err(error) => return log_failure(error),
@@ -146,10 +127,49 @@ async fn deliver(
         Ok(credential) => credential,
         Err(error) => return log_failure(error),
     };
-    match send(client, &config, &credential, &request.event).await {
+    let url = hook_url(&config.base, &credential.hook_id);
+    // The host decides whether the destination may be private; the plugin never widens it. The
+    // guard runs before any client is built or connected, so a rejected destination cannot send.
+    let guarded = match guard_destination(&url, allowed_private_network(&request.target)).await {
+        Ok(guarded) => guarded,
+        Err(error) => {
+            log_line(&format!("destination rejected ({})", error.code()));
+            return if error.is_retryable() {
+                retryable(error.code())
+            } else {
+                failed(error.code())
+            };
+        }
+    };
+    let builder = match outbound_http_client_builder_from_env() {
+        Ok(builder) => builder,
+        Err(error) => {
+            // A broken proxy configuration is an operator-side transient problem: retrying keeps
+            // the delivery queued instead of dropping it permanently.
+            log_line(&format!("outbound client unavailable: {error}"));
+            return retryable(CLIENT_UNAVAILABLE);
+        }
+    };
+    // Pin the address the guard approved so a second DNS answer cannot redirect this delivery.
+    let client = match guarded.pin(builder).build() {
+        Ok(client) => client,
+        Err(error) => {
+            log_line(&format!("outbound client unavailable: {error}"));
+            return retryable(CLIENT_UNAVAILABLE);
+        }
+    };
+    match send(&client, guarded.url(), &config, &credential, &request.event).await {
         Ok(result) => result,
         Err(error) => log_failure(error),
     }
+}
+
+/// Reads the host `allowPrivateNetwork` approval; an absent or non-boolean value means "not allowed".
+fn allowed_private_network(target: &Value) -> bool {
+    target
+        .get("allowPrivateNetwork")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn log_failure(error: FeishuError) -> NotificationSendRpcResult {
@@ -163,15 +183,15 @@ fn log_line(message: &str) {
 
 async fn send(
     client: &Client,
+    url: &Url,
     config: &FeishuConfig,
     credential: &FeishuCredential,
     event: &Value,
 ) -> Result<NotificationSendRpcResult, FeishuError> {
-    let url = hook_url(&config.base, &credential.hook_id);
     let (title, body) = render_event_text(event);
     let payload = build_payload(config.msg_type, &title, &body, credential.signature()?);
     let response = client
-        .post(url)
+        .post(url.clone())
         .json(&payload)
         .send()
         .await

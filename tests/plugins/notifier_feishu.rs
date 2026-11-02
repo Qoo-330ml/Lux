@@ -34,7 +34,24 @@ const PLUGIN_BIN: &str = env!("CARGO_BIN_EXE_lux-plugin-notifier-feishu");
 const TEST_HOOK_ID: &str = "test-hook-1";
 const TEST_SIGN_SECRET: &str = "test-sign-secret";
 
+/// The host's private-network approval, forwarded unchanged into `target.allowPrivateNetwork`.
+#[derive(Clone, Copy, Debug)]
+enum PrivateNetwork {
+    Approved,
+    Denied,
+}
+
+/// The local mock server runs on `127.0.0.1`, so the ordinary delivery tests need the host's
+/// explicit private-network approval.
 fn backend(secret: Option<&str>, config: Value) -> PluginRequest {
+    backend_with(secret, config, PrivateNetwork::Approved)
+}
+
+fn backend_with(secret: Option<&str>, config: Value, approval: PrivateNetwork) -> PluginRequest {
+    let allow_private_network = match approval {
+        PrivateNetwork::Approved => true,
+        PrivateNetwork::Denied => false,
+    };
     let mut params = json!({
         "event": {
             "schemaVersion": 1,
@@ -49,7 +66,7 @@ fn backend(secret: Option<&str>, config: Value) -> PluginRequest {
                 "timestamp": "2023-11-14T22:13:20Z"
             }
         },
-        "target": {"url": "", "allowPrivateNetwork": false},
+        "target": {"url": "", "allowPrivateNetwork": allow_private_network},
         "config": config
     });
     if let Some(secret) = secret {
@@ -344,6 +361,61 @@ async fn sends_through_a_configured_api_base_path() -> Result<(), Box<dyn std::e
         NotificationSendStatus::Delivered
     );
     assert_eq!(server.state.requests()[0].0, TEST_HOOK_ID);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_a_loopback_destination_without_private_network_approval()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = MockServer::start(MockReply::ok(json!({"code": 0}))).await?;
+    let request = backend_with(
+        Some(TEST_HOOK_ID),
+        json!({"apiBase": server.api_base()}),
+        PrivateNetwork::Denied,
+    );
+
+    let run = run_plugin(vec![request]).await?;
+
+    let result = result_of(&run.responses[0]);
+    assert_eq!(result.status, NotificationSendStatus::Failed);
+    assert_eq!(
+        result.error_code.as_deref(),
+        Some("destination_not_allowed")
+    );
+    assert!(
+        server.state.requests().is_empty(),
+        "a rejected destination must never receive the notification"
+    );
+    assert!(
+        !run.logs.contains("127.0.0.1"),
+        "the rejection log must not carry the destination: {}",
+        run.logs
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn approving_the_private_network_still_rejects_cloud_metadata()
+-> Result<(), Box<dyn std::error::Error>> {
+    let request = backend_with(
+        Some(TEST_HOOK_ID),
+        json!({"apiBase": "http://169.254.169.254"}),
+        PrivateNetwork::Approved,
+    );
+
+    let run = run_plugin(vec![request]).await?;
+
+    let result = result_of(&run.responses[0]);
+    assert_eq!(result.status, NotificationSendStatus::Failed);
+    assert_eq!(
+        result.error_code.as_deref(),
+        Some("destination_not_allowed")
+    );
+    assert!(
+        !run.logs.contains("169.254.169.254"),
+        "the rejection log must not carry the destination: {}",
+        run.logs
+    );
     Ok(())
 }
 
