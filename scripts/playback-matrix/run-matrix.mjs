@@ -1185,7 +1185,7 @@ function reportMarkdown(report) {
   lines.push("");
   lines.push(`- 生成时间：${report.generatedAt}`);
   lines.push(`- 服务地址：${report.baseUrl}`);
-  lines.push(`- 浏览器：${report.browsers.map((browser) => `${browser.label}${browser.launched ? "" : `（跳过：${browser.skippedReason}）`}`).join("；")}`);
+  lines.push(`- 浏览器：${report.browsers.map((browser) => `${browser.label}${browser.skippedReason ? `（${browser.launched ? "运行中断" : "跳过"}：${browser.skippedReason}）` : ""}`).join("；")}`);
   lines.push(`- 样本：${report.totals.samples} 个 source，完成 ${report.totals.measured} 次测量（多浏览器会重复计），跳过 ${report.totals.skipped} 次`);
   lines.push(`- 结果：✅ ${report.totals.ok} · ⚠️ ${report.totals.warning} · ❌ ${report.totals.failed} · ⏭️ ${report.totals.skipped}`);
   lines.push(`- 机器可读结果：\`report.json\`（同目录）`);
@@ -1244,8 +1244,8 @@ function reportMarkdown(report) {
   if (skipped.length || skippedItems.length || report.browsers.some((browser) => !browser.launched)) {
     lines.push("## ⏭️ 跳过项");
     lines.push("");
-    for (const browser of report.browsers.filter((entry) => !entry.launched)) {
-      lines.push(`- 浏览器 ${browser.name}：${browser.skippedReason}`);
+    for (const browser of report.browsers.filter((entry) => entry.skippedReason)) {
+      lines.push(`- 浏览器 ${browser.name}（${browser.launched ? "运行中断" : "跳过"}）：${browser.skippedReason}`);
     }
     for (const result of skipped) {
       lines.push(`- ${result.sample.title}（${result.browserLabel}）：${result.skippedReason}`);
