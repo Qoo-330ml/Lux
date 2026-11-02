@@ -15,8 +15,9 @@ use crate::{
     application::access::{AccessError, AccessPrincipal, MediaAccessService},
     application::catalog_read_model::{catalog_items_consumer, user_series_next_consumer},
     application::recommendations::{
-        RECOMMENDATION_CANDIDATE_POOL, current_recommendation_batch_key,
-        daily_recommendation_items, recommendation_library_scope_key,
+        RECOMMENDATION_CANDIDATE_POOL, RECOMMENDATION_FEATURED_LIMIT, RecommendationCandidate,
+        current_recommendation_batch_key, daily_recommendation_items,
+        recommendation_library_scope_key,
     },
     storage::{
         CatalogFilterQuery, CatalogSearchQuery, CatalogSort as StorageCatalogSort, Database,
@@ -2361,6 +2362,7 @@ impl CatalogService {
                 assemble_items(rows),
                 &user_id,
                 batch_key,
+                RECOMMENDATION_FEATURED_LIMIT,
                 RECOMMENDATION_CANDIDATE_POOL as usize,
             );
             let item_ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
@@ -3133,6 +3135,21 @@ pub struct CatalogItem {
     pub media_sources: Vec<CatalogSource>,
 }
 
+impl RecommendationCandidate for CatalogItem {
+    fn candidate_key(&self) -> &str {
+        &self.id
+    }
+
+    fn candidate_kind(&self) -> &str {
+        &self.item_type
+    }
+
+    fn candidate_series_key(&self) -> Option<&str> {
+        // Only episodes carry a `series_id`; a movie or a series entry is its own series.
+        self.series_id.as_deref()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogSource {
     pub id: String,
@@ -3761,14 +3778,36 @@ mod tests {
 
     #[test]
     fn daily_recommendations_are_stable_for_one_day_and_change_next_day() {
-        let items = || (1..=6).collect::<Vec<_>>();
+        let items = || {
+            (0..6)
+                .map(|index| catalog_item(&format!("item-{index}")))
+                .collect::<Vec<_>>()
+        };
 
-        let day_one = daily_recommendation_items(items(), "user-1", 20, 3);
-        let same_day = daily_recommendation_items(items(), "user-1", 20, 3);
-        let next_day = daily_recommendation_items(items(), "user-1", 21, 3);
-
+        let day_one = daily_recommendation_items(items(), "user-1", 20, 3, 6);
+        let same_day = daily_recommendation_items(items(), "user-1", 20, 3, 6);
         assert_eq!(day_one, same_day);
-        assert_ne!(day_one, next_day);
+        // The anchored leaders lead every batch; the weighted draw behind them is what rotates.
+        assert_eq!(
+            day_one
+                .iter()
+                .take(2)
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["item-0", "item-1"]
+        );
+        let distinct = (20..30)
+            .map(|batch_key| {
+                daily_recommendation_items(items(), "user-1", batch_key, 3, 6)
+                    .iter()
+                    .map(|item| item.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            distinct.windows(2).any(|pair| pair[0] != pair[1]),
+            "a new batch must change the recommendation"
+        );
     }
 
     #[test]
