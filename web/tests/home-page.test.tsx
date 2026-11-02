@@ -580,12 +580,17 @@ describe("HomePage shelves", () => {
     hoverSelector = false,
     hoverMedia = false,
     focusVisible = false,
-  }: { hoverSelector?: boolean; hoverMedia?: boolean; focusVisible?: boolean } = {}) {
+  }: {
+    hoverSelector?: boolean;
+    hoverMedia?: boolean;
+    focusVisible?: boolean | (() => boolean);
+  } = {}) {
     const originalMatches = Element.prototype.matches;
     const originalMatchMedia = window.matchMedia;
+    const focusVisibleMatches = () => (typeof focusVisible === "function" ? focusVisible() : focusVisible);
     vi.spyOn(Element.prototype, "matches").mockImplementation(function (this: Element, selector: string) {
       if (selector === ":hover") return hoverSelector;
-      if (selector === ":focus-visible") return focusVisible;
+      if (selector === ":focus-visible") return focusVisibleMatches();
       return originalMatches.call(this, selector);
     });
     Object.defineProperty(window, "matchMedia", {
@@ -730,6 +735,41 @@ describe("HomePage shelves", () => {
         act(() => dispatchPointer(hero, "pointerout", "mouse", document.body));
 
         expect(dot.matches(":focus-visible")).toBe(false);
+        expect(progressIsPaused(element)).toBe(false);
+
+        act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS));
+        expect(activeSlideLabel(element)).toContain("第 2 条精选");
+      } finally {
+        if (vi.isFakeTimers()) {
+          act(() => root?.unmount());
+          root = undefined;
+        }
+        vi.useRealTimers();
+      }
+    } finally {
+      restoreCapabilities();
+    }
+  });
+
+  it("resumes rotating when a mouse click moves keyboard focus within the hero", async () => {
+    let keyboardFocus = true;
+    const restoreCapabilities = stubPointerCapabilities({
+      hoverMedia: false,
+      focusVisible: () => keyboardFocus,
+    });
+    try {
+      const element = await mountCarousel();
+      const dots = () => element.querySelectorAll<HTMLButtonElement>(".lux-hero-dot");
+
+      try {
+        vi.useFakeTimers({ now: Date.now() });
+        act(() => dots()[0].focus());
+        expect(progressIsPaused(element)).toBe(true);
+
+        // Tab focus (paused) is replaced by a mouse click on another dot: the pointer part of the
+        // hero owns the pause now, so leaving the dots must let autoplay continue.
+        keyboardFocus = false;
+        act(() => dots()[1].focus());
         expect(progressIsPaused(element)).toBe(false);
 
         act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS));

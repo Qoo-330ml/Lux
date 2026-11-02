@@ -267,8 +267,9 @@ const HeroCarousel = memo(function HeroCarousel({ items, continueWatching, isLoa
       }}
       onFocus={(event) => {
         // A mouse click focuses the dot but leaves no way out of the hero, so only keyboard
-        // focus pauses; anything unrecognised stays conservative and pauses.
-        if (isKeyboardFocus(event.target)) setFocusWithin(true);
+        // focus pauses; anything unrecognised stays conservative and pauses. The flag follows
+        // every focus change, otherwise a keyboard pause would survive a later mouse click.
+        setFocusWithin(isKeyboardFocus(event.target));
       }}
       onBlur={(event) => {
         const nextFocus = event.relatedTarget;
