@@ -13,6 +13,7 @@ import { queryKeys, queryRefreshIntervals } from "../src/lib/api/query-keys";
 import { accountSettingsStorageKey } from "../src/features/account/account-settings";
 
 const heroSlidesTracker = vi.hoisted(() => vi.fn());
+const heroTitleScaleTracker = vi.hoisted(() => vi.fn());
 
 vi.mock("../src/features/home/carousel", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/features/home/carousel")>();
@@ -21,6 +22,10 @@ vi.mock("../src/features/home/carousel", async (importOriginal) => {
     heroSlides: (...args: Parameters<typeof actual.heroSlides>) => {
       heroSlidesTracker(...args);
       return actual.heroSlides(...args);
+    },
+    heroTitleScale: (title: string) => {
+      heroTitleScaleTracker(title);
+      return actual.heroTitleScale(title);
     },
   };
 });
@@ -679,6 +684,59 @@ describe("HomePage shelves", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it("starts a changed slide list from its first slide instead of a stale index", async () => {
+    const firstSlides = [
+      { id: "featured-1", title: "精选电影", itemType: "MOVIE" },
+      { id: "featured-2", title: "精选剧集", itemType: "SERIES" },
+      { id: "featured-3", title: "精选纪录片", itemType: "MOVIE" },
+    ];
+    const nextSlides = [
+      { id: "fresh-1", title: "新精选甲", itemType: "MOVIE" },
+      { id: "fresh-2", title: "新精选乙", itemType: "SERIES" },
+      { id: "fresh-3", title: "新精选丙", itemType: "MOVIE" },
+      { id: "fresh-4", title: "新精选丁", itemType: "SERIES" },
+    ];
+    const homeCarousel = vi.spyOn(api, "homeCarousel").mockResolvedValue({ recommended: firstSlides });
+    vi.spyOn(api, "homeLibraries").mockResolvedValue({ libraries: [] });
+    vi.spyOn(api, "homeContinueWatching").mockResolvedValue({ items: [], total: 0 });
+    vi.spyOn(api, "homeLibrariesLatest").mockResolvedValue({ libraries: [] });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    const element = document.createElement("div");
+    document.body.append(element);
+    container = element;
+    root = createRoot(element);
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <HomePage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await waitForHomeUpdate(() => expect(activeSlideLabel(element)).toContain("第 1 条精选"));
+
+    act(() => element.querySelectorAll<HTMLButtonElement>(".lux-hero-dot")[2]?.click());
+    await waitForHomeUpdate(() => expect(activeSlideLabel(element)).toContain("第 3 条精选"));
+
+    heroTitleScaleTracker.mockClear();
+    homeCarousel.mockResolvedValue({ recommended: nextSlides });
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.homeCarousel });
+    });
+    await waitForHomeUpdate(() => expect(element.querySelector(".lux-hero-title-text")?.textContent).toBe("新精选甲"));
+
+    const renderedTitles = heroTitleScaleTracker.mock.calls.map(([title]) => title);
+    expect(renderedTitles).toContain("新精选甲");
+    expect(renderedTitles).not.toContain("新精选丙");
+    expect(activeSlideLabel(element)).toContain("第 1 条精选");
+    expect(element.querySelectorAll(".lux-hero-dot")).toHaveLength(4);
   });
 
   it("starts an unfinished episode when the carousel highlights its series", async () => {

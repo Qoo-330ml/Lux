@@ -85,6 +85,9 @@ export function HomePage({ user }: { user: LuxUser }) {
     recommended: carousel.data?.recommended ?? EMPTY_MEDIA_ITEMS,
     continueWatching,
   }), [carousel.data?.recommended, continueWatching]);
+  // Remounting the carousel per slide list resets its index in the same commit as the new list,
+  // instead of rendering one frame with an index that belonged to the previous slides.
+  const slideKey = useMemo(() => slides.map((item) => item.id).join("|"), [slides]);
   const heroIsLoading = slides.length === 0 && (
     carousel.isPending || carousel.isFetching ||
     librariesQuery.isPending || librariesQuery.isFetching ||
@@ -94,7 +97,7 @@ export function HomePage({ user }: { user: LuxUser }) {
     carousel.isSuccess && librariesQuery.isSuccess && continueWatchingQuery.isSuccess;
   return (
     <div className="lux-home">
-      <HeroCarousel items={slides} continueWatching={continueWatching} isLoading={heroIsLoading} showEmptyState={showEmptyHero} />
+      <HeroCarousel key={slideKey} items={slides} continueWatching={continueWatching} isLoading={heroIsLoading} showEmptyState={showEmptyHero} />
       {carousel.error && !carousel.data ? (
         <div className="lux-editor-error" role="status">
           精选轮播加载失败。<LuxButton tone="secondary" type="button" onClick={() => void carousel.refetch()}>重试</LuxButton>
@@ -202,15 +205,12 @@ const HeroCarousel = memo(function HeroCarousel({ items, continueWatching, isLoa
 }) {
   const [activeIndex, setActiveIndex] = useState(0);
   const { enabled } = useImageVariants();
-  const slideKey = useMemo(() => items.map((item) => item.id).join("|"), [items]);
   const [hovered, setHovered] = useState(false);
   const [focusWithin, setFocusWithin] = useState(false);
   const documentHidden = useDocumentHidden();
   // WCAG 2.2.2: moving content stops while the user points at it, reads it with the keyboard,
   // or switches to another tab. Resuming keeps the remaining time instead of restarting.
   const paused = hovered || focusWithin || documentHidden;
-
-  useEffect(() => setActiveIndex(0), [slideKey]);
 
   useHeroCarouselAutoplay({
     slideCount: items.length,

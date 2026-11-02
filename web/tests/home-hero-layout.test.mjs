@@ -4,6 +4,12 @@ import { readFileSync } from "node:fs";
 import { stylesheet as allStyles } from "./style-source.mjs";
 
 const stylesheet = allStyles;
+const homePageSource = readFileSync(new URL("../src/features/home/HomePage.tsx", import.meta.url), "utf8");
+
+test("hero carousel remounts with the slide list instead of resetting its index afterwards", () => {
+  assert.match(homePageSource, /<HeroCarousel key=\{slideKey\}/);
+  assert.doesNotMatch(homePageSource, /setActiveIndex\(0\)/);
+});
 
 test("hero carousel controls share a flexible row and stay at its right edge", () => {
   const actionRowRule = stylesheet.match(/\.lux-hero-action-row\s*\{([^}]*)\}/)?.[1] ?? "";
