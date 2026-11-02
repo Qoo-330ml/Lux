@@ -367,49 +367,88 @@ describe("LuxPlayer danmaku lane pitch and display area", () => {
     };
   }
 
-  it("derives the lane pitch from the rendered font size so adjacent lanes never overlap", () => {
-    // Bilibili's default danmaku font is 25px and the CSS line-height is 1.2; a lane must reserve
-    // at least one full text line, otherwise a 2.0x scale paints one lane over the next.
+  it("derives the lane pitch from the rounded rendered font size", () => {
+    // Bilibili's default danmaku font is 25px and the CSS line-height is 1.2. Literal expectations
+    // (not the implementation formula): ceil(round(25 * scale) * 1.2).
+    const cases = [
+      { fontScale: 0.5, pitch: 16 },
+      { fontScale: 0.7, pitch: 22 },
+      { fontScale: 1.3, pitch: 40 },
+      { fontScale: 2, pitch: 60 },
+    ];
     const shared = Array.from({ length: 8 }, (_, index) => entry(index, 0, "字"));
 
-    for (const fontScale of [0.5, 1, 2]) {
+    for (const { fontScale, pitch } of cases) {
       const scheduler = createDanmakuScheduler(shared, {
-        viewport: { width: 800, height: 720 },
+        viewport: { width: 800, height: 1080 },
         measure,
         layout: layout({ fontScale }),
       });
       const placements = scheduler.place(0).sort((left, right) => left.y - right.y);
 
       expect(placements.length).toBeGreaterThan(1);
-      const expectedPitch = Math.ceil(25 * fontScale * 1.2);
       for (const placement of placements) {
-        expect(placement.lineHeight).toBe(expectedPitch);
+        expect(placement.lineHeight).toBe(pitch);
       }
       for (let index = 1; index < placements.length; index += 1) {
-        const previous = placements[index - 1]!;
-        const current = placements[index]!;
-        expect(current.y).toBeGreaterThanOrEqual(previous.y + previous.lineHeight);
+        expect(placements[index]!.y - placements[index - 1]!.y).toBe(pitch);
       }
     }
   });
 
-  it("reserves the pitch of the largest rendered entry instead of clipping it", () => {
+  it("uses one full line per 25px entry instead of letting one 64px entry shrink every lane", () => {
     const entries: LuxDanmakuEntry[] = [
-      entry(0, 0, "小"),
-      { ...entry(1, 0, "大"), fontSize: 64 },
+      { ...entry(0, 0, "大字弹幕"), fontSize: 64 },
+      ...Array.from({ length: 5 }, (_, index) => entry(index + 1, 0, "小字")),
     ];
     const scheduler = createDanmakuScheduler(entries, {
       viewport: { width: 800, height: 720 },
       measure,
     });
     const placements = scheduler.place(0);
+    const big = placements.find((placement) => placement.fontSize === 64)!;
 
-    // 64 * 1.2 = 76.8 -> 77px, so even the small entry uses the same non-overlapping pitch.
-    for (const placement of placements) {
-      expect(placement.lineHeight).toBe(77);
+    // The 64px entry reserves its own 77px line (64 * 1.2 -> 77) across several 30px slots...
+    expect(big.lineHeight).toBe(77);
+    // ...while 25px entries keep the normal 30px pitch; one big entry must not shrink the file.
+    const small = placements
+      .filter((placement) => placement.fontSize === 25)
+      .sort((left, right) => left.y - right.y);
+    expect(small.length).toBeGreaterThan(1);
+    for (let index = 1; index < small.length; index += 1) {
+      expect(small[index]!.y - small[index - 1]!.y).toBe(30);
     }
-    const sorted = placements.sort((left, right) => left.y - right.y);
-    expect(sorted[1]!.y).toBeGreaterThanOrEqual(sorted[0]!.y + sorted[0]!.lineHeight);
+    // No two placed entries may overlap vertically.
+    const sorted = [...placements].sort((left, right) => left.y - right.y);
+    for (let index = 1; index < sorted.length; index += 1) {
+      expect(sorted[index]!.y).toBeGreaterThanOrEqual(sorted[index - 1]!.y + sorted[index - 1]!.lineHeight);
+    }
+  });
+
+  it("keeps at least one scrolling danmaku in extreme area and scale combinations", () => {
+    // quarter + 2.0x: the pitch is 60px, so a 502px overlay only has 125px of band and a 210px
+    // overlay only 52px. Scrolling danmaku must still be placed (clamped into the band and allowed
+    // to overlap) instead of silently disappearing.
+    for (const height of [502, 210]) {
+      const scheduler = createDanmakuScheduler(
+        [
+          { ...entry(0, 0, "大"), fontSize: 64 },
+          entry(1, 0, "小"),
+          { ...entry(2, 0, "顶部"), mode: "top" },
+        ],
+        {
+          viewport: { width: 800, height },
+          measure,
+          layout: layout({ area: "quarter", fontScale: 2 }),
+        },
+      );
+      const placements = scheduler.place(0);
+      const scroll = placements.filter((placement) => placement.mode === "scroll");
+
+      expect(scroll.length).toBeGreaterThanOrEqual(1);
+      expect(scroll[0]!.y).toBeGreaterThanOrEqual(0);
+      expect(scroll[0]!.y).toBeLessThan(height * 0.25);
+    }
   });
 
   it("keeps scrolling and top danmaku inside the selected band on small viewports", () => {

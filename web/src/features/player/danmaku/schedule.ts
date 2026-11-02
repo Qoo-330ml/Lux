@@ -38,14 +38,15 @@ export const FIXED_DURATION_SECONDS = 4;
 export const DANMAKU_LANE_GAP = 16;
 
 /**
- * Bilibili's default danmaku font size. The lane pitch is derived from it (scaled by the user's font
- * multiplier), so lanes always reserve at least one full line even for files that only carry 18px
- * entries.
+ * Reference font size for the lane pitch. It is the default Bilibili danmaku size and acts as a cap:
+ * the pitch is derived from `round(25 * fontScale)`, never from the largest entry in the file, so one
+ * 64px danmaku cannot shrink the density of every lane. Larger entries reserve several pitches
+ * through their own `lineHeight` (see `schedule()`), so they still never overlap their neighbours.
  */
 export const DANMAKU_BASE_FONT_SIZE = 25;
 /** Must match `line-height: 1.2` on `.lux-player-danmaku-text` in `player.css`. */
 export const DANMAKU_LINE_HEIGHT_RATIO = 1.2;
-/** Default pitch of one lane: 25px * 1.2 = 30px. */
+/** Default pitch of one lane: round(25 * 1) * 1.2 = 30px. */
 export const DANMAKU_LANE_HEIGHT = Math.ceil(DANMAKU_BASE_FONT_SIZE * DANMAKU_LINE_HEIGHT_RATIO);
 
 /** Fraction of the overlay height each display area may use for scrolling and top danmaku. */
@@ -66,7 +67,7 @@ export type ScheduledDanmaku = LuxDanmakuEntry & {
   lane: number;
   duration: number;
   width: number;
-  /** Vertical pitch reserved for this entry's lane; adjacent lanes start at least this far apart. */
+  /** Vertical space this entry reserves; adjacent reserved bands never overlap. */
   lineHeight: number;
   y: number;
 };
@@ -109,12 +110,11 @@ export type DanmakuSchedulerOptions = {
 /**
  * Lane geometry for a viewport height and a display area.
  *
- * `lineHeight` is the uniform pitch (already scaled by the user's font multiplier) shared by every
- * lane; the fixed band, scrolling lanes, and top lanes all derive from it so `laneY` can never
- * disagree with the lane count. The geometry is also clamped by the available band, so a small
- * overlay or a `half`/`quarter` area never places a lane outside the selected band. The band may be
- * too short for any lane (the count becomes 0), which is the honest answer instead of drawing over
- * the allowed area.
+ * `lineHeight` is the uniform pitch (scaled by the user's font multiplier) shared by every lane slot;
+ * the fixed band, scrolling lanes, and top lanes all derive from it so `laneY` can never disagree
+ * with the lane count. Fixed lanes are clamped by the band and may be 0 when even one line does not
+ * fit, but scrolling lanes always keep at least one slot: a scrolling track that silently vanishes
+ * would look like a broken player.
  */
 export function laneGeometry(
   height: number,
@@ -126,22 +126,21 @@ export function laneGeometry(
   const bandHeight = Math.max(1, safeHeight * DANMAKU_AREA_FRACTIONS[area]);
   // Fixed (top) lanes: two tops with a 16%-of-band target, but never more than the band can hold.
   const fixedCapacity = Math.floor((bandHeight - 8) / pitch);
-  const fixedLaneCount = Math.max(
-    0,
-    Math.min(4, fixedCapacity, Math.max(1, Math.floor((bandHeight * 0.16) / pitch))),
-  );
+  const fixedTarget = Math.max(1, Math.floor((bandHeight * 0.16) / pitch));
+  const fixedLaneCount = Math.min(4, fixedCapacity, fixedTarget);
   const fixedBandHeight = fixedLaneCount * pitch + 8;
-  // Scrolling lanes sit below the fixed band and must end before the band's bottom edge.
+  // Scrolling lanes sit below the fixed band and must end before the band's bottom edge; they keep
+  // at least one slot even when the capacity rounds down to zero.
   const scrollCapacity = Math.floor((bandHeight - fixedBandHeight - 8) / pitch);
   const desiredScrollHeight = Math.max(pitch * 4, bandHeight - fixedBandHeight * 2);
   const scrollLaneCount = Math.max(
-    0,
+    1,
     Math.min(
       scrollCapacity,
       Math.max(4, Math.min(18, Math.floor((desiredScrollHeight * 0.64) / pitch))),
     ),
   );
-  return { fixedLaneCount, fixedBandHeight, scrollLaneCount, lineHeight: pitch };
+  return { fixedLaneCount, fixedBandHeight, scrollLaneCount, lineHeight: pitch, bandHeight };
 }
 
 function durationFor(mode: DanmakuMode, speed: number) {
@@ -161,18 +160,32 @@ function laneCountFor(
   return mode === "top" ? areaGeometry.fixedLaneCount : fullGeometry.fixedLaneCount;
 }
 
+/**
+ * Keeps a lane inside its allowed band. When the band is shorter than one text line (an extreme
+ * quarter + 2.0x combination), the lane is pinned to the band's top and the text may overflow: seeing
+ * one slightly overflowing danmaku is better than the whole track disappearing.
+ */
+function clampIntoBand(y: number, bandHeight: number, lineHeight: number) {
+  return Math.max(0, Math.min(y, Math.max(0, bandHeight - lineHeight)));
+}
+
 function laneY(
   mode: DanmakuMode,
   lane: number,
   viewport: DanmakuViewport,
   areaGeometry: ReturnType<typeof laneGeometry>,
-  pitch: number,
+  fullGeometry: ReturnType<typeof laneGeometry>,
+  lineHeight: number,
 ) {
-  // `pitch` is the scheduled entry's own `lineHeight`, so the lane pitch used for `y` can never
-  // drift from the one reserved in `ScheduledDanmaku`.
-  if (mode === "top") return lane * pitch + 8;
-  if (mode === "bottom") return viewport.height - (lane + 1) * pitch - 8;
-  return areaGeometry.fixedBandHeight + lane * pitch + 8;
+  if (mode === "top") {
+    return clampIntoBand(lane * areaGeometry.lineHeight + 8, areaGeometry.bandHeight, lineHeight);
+  }
+  if (mode === "bottom") {
+    const y = viewport.height - (lane + 1) * fullGeometry.lineHeight - 8;
+    return Math.max(0, Math.min(y, Math.max(0, viewport.height - lineHeight)));
+  }
+  const y = areaGeometry.fixedBandHeight + lane * areaGeometry.lineHeight + 8;
+  return clampIntoBand(y, areaGeometry.bandHeight, lineHeight);
 }
 
 /** Case-insensitive plain substring match. Keywords are data, never a regular expression. */
@@ -270,12 +283,10 @@ export function createDanmakuScheduler(
   };
   let layout = resolveLayout(options.layout);
   let prepared: LuxDanmakuEntry[] = [];
-  let maxSourceFontSize = 0;
-  // One pitch for every lane: the largest rendered entry (at least the base 25px) times the CSS
-  // line-height. This is what makes `ScheduledDanmaku.lineHeight` the real vertical reservation.
-  let laneHeight = DANMAKU_LANE_HEIGHT;
-  let areaGeometry = laneGeometry(viewport.height, layout.area, laneHeight);
-  let fullGeometry = laneGeometry(viewport.height, "full", laneHeight);
+  // Pitch of one lane slot, derived from the fixed 25px reference font and the font multiplier.
+  let lanePitch = DANMAKU_LANE_HEIGHT;
+  let areaGeometry = laneGeometry(viewport.height, layout.area, lanePitch);
+  let fullGeometry = laneGeometry(viewport.height, "full", lanePitch);
   // Media clock of the last `place()`, already shifted by the user's time offset.
   let lastTime = Number.NEGATIVE_INFINITY;
   let nextIndex = 0;
@@ -286,24 +297,20 @@ export function createDanmakuScheduler(
     bottom: [],
   };
 
-  function computeLaneHeight() {
-    const baseFontSize = Math.max(DANMAKU_BASE_FONT_SIZE, maxSourceFontSize);
-    laneHeight = Math.max(1, Math.ceil(baseFontSize * layout.fontScale * DANMAKU_LINE_HEIGHT_RATIO));
+  function computePitch() {
+    // Rounded first, then line-height: round(25 * fontScale) * 1.2, rounded up to whole pixels.
+    const referenceFontSize = Math.round(DANMAKU_BASE_FONT_SIZE * layout.fontScale);
+    lanePitch = Math.max(1, Math.ceil(referenceFontSize * DANMAKU_LINE_HEIGHT_RATIO));
   }
 
   function prepare() {
     prepared = sourceEntries.filter((entry) => !isDanmakuEntryHidden(entry, layout));
-    maxSourceFontSize = 0;
-    for (const entry of prepared) {
-      if (entry.fontSize > maxSourceFontSize) maxSourceFontSize = entry.fontSize;
-    }
-    computeLaneHeight();
     onPrepare?.();
   }
 
   function applyViewport() {
-    areaGeometry = laneGeometry(viewport.height, layout.area, laneHeight);
-    fullGeometry = laneGeometry(viewport.height, "full", laneHeight);
+    areaGeometry = laneGeometry(viewport.height, layout.area, lanePitch);
+    fullGeometry = laneGeometry(viewport.height, "full", lanePitch);
     lanes.scroll = Array.from({ length: areaGeometry.scrollLaneCount });
     lanes.top = Array.from({ length: areaGeometry.fixedLaneCount });
     lanes.bottom = Array.from({ length: fullGeometry.fixedLaneCount });
@@ -343,6 +350,9 @@ export function createDanmakuScheduler(
   function schedule(source: LuxDanmakuEntry) {
     const duration = durationFor(source.mode, layout.speed);
     const fontSize = renderedFontSize(source);
+    // This entry's own reservation: bigger entries span several pitch slots instead of forcing the
+    // whole file onto their pitch.
+    const lineHeight = Math.ceil(fontSize * DANMAKU_LINE_HEIGHT_RATIO);
     const width = Math.min(
       viewport.width * 0.9,
       Math.max(24, measure(source.text, fontSize) + 8),
@@ -353,23 +363,46 @@ export function createDanmakuScheduler(
       lane: 0,
       duration,
       width,
-      lineHeight: laneHeight,
+      lineHeight,
       y: 0,
     };
     const modeLanes = lanes[source.mode];
     const count = laneCountFor(source.mode, areaGeometry, fullGeometry);
+    if (count === 0) return;
+    const span = Math.min(count, Math.max(1, Math.ceil(lineHeight / lanePitch)));
     let lane = -1;
-    for (let index = 0; index < count && index < modeLanes.length; index += 1) {
-      if (fits(modeLanes[index], candidate)) {
+    for (let index = 0; index + span <= count; index += 1) {
+      let free = true;
+      for (let slot = index; slot < index + span; slot += 1) {
+        if (!fits(modeLanes[slot], candidate)) {
+          free = false;
+          break;
+        }
+      }
+      if (free) {
         lane = index;
         break;
       }
     }
-    // No free lane: drop this danmaku rather than stacking it on top of another one.
-    if (lane < 0) return;
+    if (lane < 0) {
+      // A band shorter than one pitch was already clamped, but a multi-slot entry can also run out of
+      // contiguous slots. Keep the first danmaku of a mode visible (clamped into the band, allowed to
+      // overlap) instead of dropping it; later ones still wait for room.
+      if (!live.some((entry) => entry.mode === source.mode)) lane = 0;
+      else return;
+    }
     candidate.lane = lane;
-    candidate.y = laneY(source.mode, lane, viewport, areaGeometry, candidate.lineHeight);
-    modeLanes[lane] = candidate;
+    candidate.y = laneY(
+      source.mode,
+      lane,
+      viewport,
+      areaGeometry,
+      fullGeometry,
+      candidate.lineHeight,
+    );
+    for (let slot = lane; slot < Math.min(count, lane + span); slot += 1) {
+      modeLanes[slot] = candidate;
+    }
     live.push(candidate);
   }
 
@@ -408,6 +441,7 @@ export function createDanmakuScheduler(
     return visible.sort((left, right) => left.start - right.start);
   }
 
+  computePitch();
   prepare();
   reset(0);
 
@@ -422,12 +456,11 @@ export function createDanmakuScheduler(
       const filtersChanged = !sameList(merged.blockedModes, layout.blockedModes)
         || !sameList(merged.keywords, layout.keywords);
       layout = merged;
+      // The pitch follows the font multiplier (O(1)); it is never derived from the file contents.
+      computePitch();
       if (filtersChanged) {
         // Discrete edits (mode switches, keyword add/remove) rebuild the filtered table once.
         prepare();
-      } else {
-        // Slider edits reuse the filtered table; only the O(1) pitch needs recomputing.
-        computeLaneHeight();
       }
       // Filtering, the display area, text scale, speed, and offset all affect lane assignment, so
       // the whole current window is re-laned instead of keeping stale placements. The offset itself
