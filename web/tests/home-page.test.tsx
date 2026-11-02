@@ -47,6 +47,10 @@ function waitForHomeUpdate(assertion: () => unknown) {
   return vi.waitFor(assertion, { timeout: 3_000 });
 }
 
+function setDocumentVisibility(state: "visible" | "hidden") {
+  Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+}
+
 describe("HomePage shelves", () => {
   let container: HTMLDivElement | undefined;
   let root: Root | undefined;
@@ -509,6 +513,128 @@ describe("HomePage shelves", () => {
       expect(container.querySelector<HTMLButtonElement>(".lux-hero-dot.is-active")?.getAttribute("aria-label"))
         .toContain("第 1 条精选");
     } finally {
+      if (vi.isFakeTimers()) {
+        act(() => root?.unmount());
+        root = undefined;
+      }
+      vi.useRealTimers();
+    }
+  });
+
+  async function mountTwoSlideCarousel() {
+    mockHomeSections({
+      libraries: [],
+      recommended: [
+        { id: "featured-1", title: "精选电影", itemType: "MOVIE" },
+        { id: "featured-2", title: "精选剧集", itemType: "SERIES" },
+      ],
+      continueWatching: [],
+      recentlyAdded: [],
+    });
+
+    const element = document.createElement("div");
+    document.body.append(element);
+    container = element;
+    root = createRoot(element);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <HomePage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await waitForHomeUpdate(() => expect(element.querySelector<HTMLButtonElement>(".lux-hero-dot.is-active")?.getAttribute("aria-label"))
+      .toContain("第 1 条精选"));
+    return element;
+  }
+
+  function activeSlideLabel(element: HTMLElement) {
+    return element.querySelector<HTMLButtonElement>(".lux-hero-dot.is-active")?.getAttribute("aria-label");
+  }
+
+  it("pauses the carousel while the pointer rests on the hero and resumes afterwards", async () => {
+    const element = await mountTwoSlideCarousel();
+    const hero = element.querySelector(".lux-hero") as HTMLElement;
+
+    try {
+      vi.useFakeTimers({ now: Date.now() });
+      act(() => {
+        hero.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, relatedTarget: document.body }));
+      });
+      expect(element.querySelector(".lux-hero-dot-progress")?.classList.contains("is-paused")).toBe(true);
+
+      act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS * 3));
+      expect(activeSlideLabel(element)).toContain("第 1 条精选");
+
+      act(() => {
+        hero.dispatchEvent(new MouseEvent("mouseout", { bubbles: true, relatedTarget: document.body }));
+      });
+      expect(element.querySelector(".lux-hero-dot-progress")?.classList.contains("is-paused")).toBe(false);
+
+      act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS));
+      expect(activeSlideLabel(element)).toContain("第 2 条精选");
+    } finally {
+      if (vi.isFakeTimers()) {
+        act(() => root?.unmount());
+        root = undefined;
+      }
+      vi.useRealTimers();
+    }
+  });
+
+  it("pauses the carousel while keyboard focus is inside the hero", async () => {
+    const element = await mountTwoSlideCarousel();
+    const dot = element.querySelectorAll<HTMLButtonElement>(".lux-hero-dot")[0];
+
+    try {
+      vi.useFakeTimers({ now: Date.now() });
+      act(() => dot.focus());
+      expect(element.querySelector(".lux-hero-dot-progress")?.classList.contains("is-paused")).toBe(true);
+
+      act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS * 3));
+      expect(activeSlideLabel(element)).toContain("第 1 条精选");
+
+      act(() => dot.blur());
+      expect(element.querySelector(".lux-hero-dot-progress")?.classList.contains("is-paused")).toBe(false);
+
+      act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS));
+      expect(activeSlideLabel(element)).toContain("第 2 条精选");
+    } finally {
+      if (vi.isFakeTimers()) {
+        act(() => root?.unmount());
+        root = undefined;
+      }
+      vi.useRealTimers();
+    }
+  });
+
+  it("pauses the carousel while the page is hidden and resumes when it is visible again", async () => {
+    const element = await mountTwoSlideCarousel();
+
+    try {
+      vi.useFakeTimers({ now: Date.now() });
+      act(() => {
+        setDocumentVisibility("hidden");
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS * 3));
+      expect(activeSlideLabel(element)).toContain("第 1 条精选");
+
+      act(() => {
+        setDocumentVisibility("visible");
+        document.dispatchEvent(new Event("visibilitychange"));
+      });
+      act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS));
+      expect(activeSlideLabel(element)).toContain("第 2 条精选");
+    } finally {
+      setDocumentVisibility("visible");
       if (vi.isFakeTimers()) {
         act(() => root?.unmount());
         root = undefined;

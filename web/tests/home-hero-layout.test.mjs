@@ -24,6 +24,10 @@ test("hero carousel uses a bordered progress dot instead of arrow controls", () 
   assert.match(stylesheet, /@keyframes lux-hero-dot-progress\s*\{[\s\S]*?100%\s*\{[^}]*transform:\s*scaleX\(1\)/);
 });
 
+test("hero progress dot freezes whenever autoplay is paused", () => {
+  assert.match(stylesheet, /\.lux-hero-dot-progress\.is-paused\s*\{[^}]*animation-play-state:\s*paused/);
+});
+
 test("hero keeps a shorter vertical footprint across responsive breakpoints", () => {
   assert.match(stylesheet, /\.lux-hero\s*\{[^}]*min-height:\s*min\(82vh,\s*820px\)/);
   assert.match(stylesheet, /@media \(max-width: 900px\) \{[\s\S]*?\.lux-hero\s*\{\s*min-height:\s*680px/);
