@@ -2,6 +2,20 @@ import type { ChangelogRelease } from "../types";
 
 export const changelogReleases07: ChangelogRelease[] = [
   {
+    version: "0.7.8",
+    date: "2026-11-02",
+    sections: [
+      { kind: "added", items: [
+        "后台通知能翻页和筛选了：通知投递列表改成带总数的分页表，可以按投递状态和目标筛选，不再是无限往下滚的时间线；每页条数还是走原来的上限规则。",
+        "发给 Emby 的 webhook 和官方插件对齐了：Emby 格式的目标按 Emby Webhooks 1.0.39 的字段和措辞发送（标题走服务器中文文案，开始播放/暂停/停止），信封补上标题、描述、时间、级别、服务器名称与版本、用户、会话和播放信息；本地文件带上条目路径、文件名、媒体流和媒体源，.strm 只暴露本地 .strm 路径，不会发出外部地址或带签名的流地址；播放过程中每个事件都会报远端地址。Lux 自有格式的字段白名单没动。",
+      ] },
+      { kind: "changed", items: [
+        "Linux 上换成 jemalloc：glibc 的 malloc 在扫描、探测、图片高峰过后不还页给系统，容器空闲时常驻内存偏高；jemalloc 会把脏页还回去。本机 Linux 容器 A/B（模拟 amd64、3000 个合成文件，单次运行）：空闲 120 秒后 93 MiB 对 110 MiB，峰值差不多。只在 Linux glibc 构建启用。",
+        "第一次播放先把媒体信息补上：本地源还停在待探测状态时，第一次请求播放信息会先补一次 ffprobe 再回响应，客户端能直接拿到总时长和技术信息；只对本地文件有效，.strm 仍走插件侧非阻塞探测，并发请求只跑一次，探测失败就回退到已存的值照常播放。",
+      ] },
+    ],
+  },
+  {
     version: "0.7.7",
     date: "2026-11-02",
     sections: [
