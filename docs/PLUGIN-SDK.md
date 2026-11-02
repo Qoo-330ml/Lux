@@ -551,7 +551,13 @@ Lux 在发送请求前执行协议、主机和地址策略校验，并在收到�
   处理器，写出 `PluginResponse`，并在 `plugin.shutdown` 后退出；无效请求行和未知方法返回错误响应但不会
   终止循环。需要自定义流时使用 `run_notifier_session(reader, writer, handler)`。
 - `outbound_http_client(proxy_url)` / `outbound_http_client_from_env()`：统一的出站 client，读取 Lux 代理配置
-  （`LUX_PROXY_URL`），10 秒超时且不跟随重定向。
+  （`LUX_PROXY_URL`），10 秒超时且不跟随重定向。需要先钉住目的地地址时使用
+  `outbound_http_client_builder(proxy_url)` / `outbound_http_client_builder_from_env()` 取到同一个配置好的
+  `reqwest::ClientBuilder`，再调用 `GuardedDestination::pin(builder)` 后 `build()`。
+- `guard_destination(&Url, allow_private_network)` / `guard_destination_str(&str, allow_private_network)`：解析并
+  校验一个 HTTP(S) 目的地，返回 `GuardedDestination`（`url()`、`host()`、`address()`、`pin(builder)`）。
+- `guard_host(host, port, allow_private_network)`：非 HTTP 渠道（SMTP、自定义 TCP）使用的 host:port 版本，返回
+  `GuardedHost`（`host()`、`port()`、`addresses()`、`primary()`）。
 - `classify_http_status(status)` 与 `result_from_http_status(status, retry_after_seconds)`：与宿主一致的
   `DELIVERED`/`RETRYABLE`/`FAILED` 分类（`2xx` 成功，`408`、`425`、`429` 和 `5xx` 可重试，其余永久失败）；
   `delivered()`、`retryable(code)`、`failed(code)` 用于非 HTTP 渠道。
@@ -568,6 +574,46 @@ luxd::application::notifier_plugin_sdk::run_notifier(|request| {
 })
 .await?;
 ```
+
+#### 目的地守卫
+
+通知器必须把宿主在 `notification.send` 里给出的 `target.allowPrivateNetwork` 原样传给守卫，不能自行放宽。守卫
+一次性解析目的地的全部地址并逐个校验：回环、私网和链路本地地址只有在管理员批准私网时才允许；未指定地址
+（`0.0.0.0`、`::`）、链路本地（含云元数据 `169.254.169.254`）、多播、广播以及文档/基准测试等保留网段即使批准
+私网也始终拒绝。IP 分类复用核心的 `webhooks::is_dangerous_address`、`webhooks::is_private_address` 与
+`remote_url_policy::is_private_or_reserved`，插件不应再复制一份网段判断。
+
+守卫只返回稳定错误码（`DestinationGuardError::code()`），插件不得把完整 URL 或主机写进日志、返回值或投递记录：
+
+| 错误 | `code()` | `is_retryable()` |
+| --- | --- | --- |
+| `InvalidUrl` / `UnsupportedScheme` / `Credentials` | `invalid_destination_url` | 否 |
+| `ResolutionFailed` | `destination_unresolved` | 是 |
+| `PrivateAddress` / `DangerousAddress` / `ReservedAddress` | `destination_not_allowed` | 否 |
+
+```rust
+use luxd::application::notifier_plugin_sdk::{
+    DestinationGuardError, failed, guard_destination, outbound_http_client_builder_from_env,
+    retryable,
+};
+
+let allow_private = request
+    .target
+    .get("allowPrivateNetwork")
+    .and_then(serde_json::Value::as_bool)
+    .unwrap_or(false);
+let guarded = match guard_destination(&target.url, allow_private).await {
+    Ok(guarded) => guarded,
+    Err(error) if error.is_retryable() => return retryable(error.code()),
+    Err(error) => return failed(error.code()),
+};
+// 把已校验地址钉进 client，防止 DNS 重绑定；随后客户端不会再解析该主机。
+let client = guarded.pin(outbound_http_client_builder_from_env()?).build()?;
+let response = client.post(guarded.url().clone()).json(&payload).send().await;
+```
+
+`guarded.url()` 保持管理员配置的原值（含路径与 query），只有连接目标被替换为已校验地址；重定向仍然禁用，所以
+上游的 3xx 不会绕过守卫。
 
 通知器插件包使用 `scripts/package-notifier-plugin.sh <插件目录名> [target]` 打包：脚本从
 `plugins/<目录名>/manifest.json` 读取 ID、版本、入口和声明文件，拒绝非 `notification` 或缺少
