@@ -636,8 +636,9 @@ payload 组装，进程外壳、出站 client、状态分类和通知正文来�
 
 `secret` 是自建应用的 corpsecret，只从 `notification.send` 请求的 `NotificationSendRpcRequest.secret`
 取得，不读取配置文件、不写入 `config`/`providerConfig`，也不出现在日志、RPC 结果或错误信息里。`apiBase`
-仅用于代理或测试，必须是 http/https 基地址，且不得包含凭据、query 或 fragment；插件进程的出站请求仍受
-宿主代理策略（`LUX_PROXY_URL`）约束。
+仅用于代理或测试，必须是 http/https 基地址，且不得包含凭据、query 或 fragment；基地址里已有的路径段
+（包括百分号转义）按原样保留，插件只在其后追加 `cgi-bin/*` 路径段。插件进程的出站请求仍受宿主代理策略
+（`LUX_PROXY_URL`）约束，沿用 SDK client 的 10 秒超时且不跟随重定向。
 
 投递流程：
 
@@ -649,17 +650,29 @@ payload 组装，进程外壳、出站 client、状态分类和通知正文来�
    `Failed(token_rejected)`。`-1`（系统繁忙）与 `45009`（频率限制）返回 `Retryable`，有 `Retry-After` 时填充
    `retry_after_seconds`；其他非 0 返回 `Failed(upstream_errcode_<n>)`。
 
+重试预算：整次投递（含 token 刷新重试路径）有一个 25 秒的总截止时间，小于宿主的 30 秒通知 RPC 超时；单次
+上游请求另有 6 秒截止时间，因此最坏情况（两次尝试各一次 gettoken 加一次 message/send）为 24 秒，仍在总预算
+内。总截止时间耗尽时按“消息是否可能已经发出”分类：已经发出过 `message/send` 时返回
+`Failed(timeout_after_send)`，避免宿主重试造成重复通知；尚未发出任何消息时返回
+`Retryable(delivery_timeout)`，可以安全重试。单次 `message/send` 请求自身超时仍按 `Retryable(network_error)`
+返回，宿主按至少一次语义投递并负责去重。
+
+收件人判定：企业微信返回 `errcode: 0` 后，插件把 `invaliduser`、`invalidparty`、`invalidtag` 和
+`unlicenseduser` 与配置的 `toUser` 逐项比对。全部收件人都无效时返回 `Failed(no_valid_recipient)`；部分无效
+仍然 `DELIVERED`，只在 stderr 记录无效数量，不记录 userid。`toUser` 为 `@all` 时无法逐项枚举，按企业微信的
+`errcode: 0` 视为已投递。
+
 稳定结果：
 
 - `DELIVERED`：企业微信返回 `errcode: 0`，`msgid` 作为 `providerRequestId` 返回。
 - `RETRYABLE`：网络错误/超时（`network_error`）、`408`/`425`/`429`/`5xx`（`PROVIDER_HTTP_<status>`）、
-  `rate_limited` 或 `system_busy`。
+  `rate_limited`、`system_busy`，或总截止时间内尚未发出任何消息（`delivery_timeout`）。
 - `FAILED`：缺少或空白凭据（`missing_secret`）、目标配置非法（`invalid_config`，如 corpId 为空、agentId
-  非正数、toUser 含非法字符、apiBase 非 http/https 或带凭据/query）、响应超 64 KiB
+  非正数、toUser 含非法字符、apiBase 非 http/https 或带凭据/query）、全部收件人无效
+  （`no_valid_recipient`）、已发出消息后超出总截止时间（`timeout_after_send`）、响应超 64 KiB
   （`response_too_large`）、响应不是预期 JSON（`invalid_response`）、其他永久 4xx 与业务错误。
 
-出站请求沿用 SDK client 的 10 秒超时且不跟随重定向。插件日志只写稳定结果码，不写 access_token、token
-请求的 query、完整外部 URL 或凭据。
+插件日志只写稳定结果码和无效收件人数量，不写 access_token、token 请求的 query、完整外部 URL、userid 或凭据。
 
 打包：`scripts/package-notifier-plugin.sh org.lux.notifier.wecom-app`，产物为
 `dist/plugins/org.lux.notifier.wecom-app-0.1.0-<platform>-<arch>.zip`。相关测试在

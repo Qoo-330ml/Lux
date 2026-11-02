@@ -18,6 +18,7 @@ use axum::{
     Json, Router,
     extract::Query,
     http::{StatusCode, header::RETRY_AFTER},
+    response::IntoResponse,
     routing::{get, post},
 };
 use luxd::application::plugin_protocol::{
@@ -200,7 +201,9 @@ fn send_params(config: Value, secret: Value) -> Value {
                 "content": "新增媒体：2 个\n媒体库：电影",
             }
         },
-        "target": {"url": "", "allowPrivateNetwork": false},
+        // The shared destination guard will reject the loopback mock unless the host target opens
+        // private networks explicitly; the plugin reads this flag once the guard is available.
+        "target": {"url": "", "allowPrivateNetwork": true},
         "config": config,
         "secret": secret,
     })
@@ -735,7 +738,8 @@ async fn rejects_an_oversized_upstream_response() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// The plugin uses the SDK's 10 second outbound timeout, so this test intentionally waits for it.
+/// Each upstream request carries its own short timeout inside the delivery budget, so this test
+/// intentionally waits for the plugin's request timeout (6 seconds), not the SDK's 10 second cap.
 #[tokio::test]
 async fn reports_a_timeout_as_retryable() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new().route(
@@ -805,5 +809,182 @@ fn manifest_declares_one_sensitive_password_secret_field() -> Result<(), Box<dyn
         .ok_or("agentId must be declared")?;
     assert_eq!(agent_id.input_type, "number");
     assert!(agent_id.required);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fails_when_every_recipient_is_invalid() -> Result<(), Box<dyn std::error::Error>> {
+    let upstream = Upstream::default();
+    let responses = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/cgi-bin/gettoken", upstream.token_handler(TOKEN_ONE))
+        .route(
+            "/cgi-bin/message/send",
+            post({
+                let responses = responses.clone();
+                move || {
+                    let responses = responses.clone();
+                    async move {
+                        match responses.fetch_add(1, Ordering::SeqCst) {
+                            0 => Json(json!({
+                                "errcode": 0,
+                                "msgid": "msg-unused-1",
+                                "invaliduser": "user-a|user-b",
+                            })),
+                            1 => Json(json!({
+                                "errcode": 0,
+                                "msgid": "msg-unused-2",
+                                "unlicenseduser": "user-c",
+                            })),
+                            _ => Json(json!({
+                                "errcode": 0,
+                                "msgid": "msg-partial",
+                                "invaliduser": "user-b",
+                            })),
+                        }
+                    }
+                }
+            }),
+        );
+    let (base, server) = spawn_server(app).await?;
+    let mut plugin = Plugin::start().await?;
+
+    let mut no_user = api_base_config(&base);
+    no_user["toUser"] = json!("user-a|user-b");
+    let all_invalid_users = plugin
+        .send("invalid-users", send_params(no_user, json!(TEST_SECRET)))
+        .await?;
+    assert_eq!(all_invalid_users.status, NotificationSendStatus::Failed);
+    assert_eq!(
+        all_invalid_users.error_code.as_deref(),
+        Some("no_valid_recipient")
+    );
+    assert!(all_invalid_users.provider_request_id.is_none());
+
+    let mut unlicensed = api_base_config(&base);
+    unlicensed["toUser"] = json!("user-c");
+    let all_unlicensed = plugin
+        .send("unlicensed", send_params(unlicensed, json!(TEST_SECRET)))
+        .await?;
+    assert_eq!(all_unlicensed.status, NotificationSendStatus::Failed);
+    assert_eq!(
+        all_unlicensed.error_code.as_deref(),
+        Some("no_valid_recipient")
+    );
+
+    let mut partial = api_base_config(&base);
+    partial["toUser"] = json!("user-a|user-b");
+    let partially_invalid = plugin
+        .send("partial", send_params(partial, json!(TEST_SECRET)))
+        .await?;
+    assert_eq!(
+        partially_invalid.status,
+        NotificationSendStatus::Delivered,
+        "a partially invalid recipient list still delivers"
+    );
+    assert_eq!(
+        partially_invalid.provider_request_id.as_deref(),
+        Some("msg-partial")
+    );
+
+    let stderr = plugin.finish().await?;
+    server.abort();
+
+    assert_eq!(upstream.token_calls(), 1, "the token stays cached");
+    assert!(
+        stderr.contains("1 invalid recipient"),
+        "the log must count invalid recipients: {stderr}"
+    );
+    for user_id in ["user-a", "user-b", "user-c"] {
+        assert!(
+            !stderr.contains(user_id),
+            "the log must not carry a recipient id ({user_id}): {stderr}"
+        );
+    }
+    for result in [&all_invalid_users, &all_unlicensed, &partially_invalid] {
+        assert_result_has_no_credentials(result);
+    }
+    assert_log_has_no_credentials(&stderr);
+    Ok(())
+}
+
+#[tokio::test]
+async fn keeps_percent_encoded_base_paths_intact() -> Result<(), Box<dyn std::error::Error>> {
+    let paths = Arc::new(Mutex::new(Vec::<String>::new()));
+    let app = Router::new().fallback({
+        let paths = paths.clone();
+        move |uri: axum::http::Uri| {
+            let paths = paths.clone();
+            async move {
+                let path = uri.path().to_owned();
+                if let Ok(mut captured) = paths.lock() {
+                    captured.push(path.clone());
+                }
+                if path.ends_with("/cgi-bin/gettoken") {
+                    return Json(token_body(TOKEN_ONE)).into_response();
+                }
+                if path.ends_with("/cgi-bin/message/send") {
+                    return Json(json!({"errcode": 0, "msgid": "msg-encoded"})).into_response();
+                }
+                StatusCode::NOT_FOUND.into_response()
+            }
+        }
+    });
+    let (base, server) = spawn_server(app).await?;
+    let mut proxy_config = api_base_config(&format!("{base}/proxy%2Fprefix"));
+    proxy_config["toUser"] = json!("@all");
+    let mut plugin = Plugin::start().await?;
+    let result = plugin
+        .send("encoded", send_params(proxy_config, json!(TEST_SECRET)))
+        .await?;
+    let stderr = plugin.finish().await?;
+    server.abort();
+
+    assert_eq!(result.status, NotificationSendStatus::Delivered);
+    let paths = paths.lock().map(|paths| paths.clone()).unwrap_or_default();
+    assert_eq!(
+        paths,
+        vec![
+            "/proxy%2Fprefix/cgi-bin/gettoken".to_owned(),
+            "/proxy%2Fprefix/cgi-bin/message/send".to_owned(),
+        ],
+        "an existing percent escape must reach the upstream unchanged"
+    );
+    assert_log_has_no_credentials(&stderr);
+    Ok(())
+}
+
+#[tokio::test]
+async fn bounds_a_stalled_message_send() -> Result<(), Box<dyn std::error::Error>> {
+    let upstream = Upstream::default();
+    let app = Router::new()
+        .route("/cgi-bin/gettoken", upstream.token_handler(TOKEN_ONE))
+        .route(
+            "/cgi-bin/message/send",
+            post(|| async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Json(json!({"errcode": 0, "msgid": "never"}))
+            }),
+        );
+    let (base, server) = spawn_server(app).await?;
+    let mut plugin = Plugin::start().await?;
+    let started = std::time::Instant::now();
+    let result = plugin
+        .send(
+            "stalled-send",
+            send_params(api_base_config(&base), json!(TEST_SECRET)),
+        )
+        .await?;
+    let elapsed = started.elapsed();
+    let stderr = plugin.finish().await?;
+    server.abort();
+
+    assert_eq!(result.status, NotificationSendStatus::Retryable);
+    assert_eq!(result.error_code.as_deref(), Some("network_error"));
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "one request must stay inside its own timeout, took {elapsed:?}"
+    );
+    assert_log_has_no_credentials(&stderr);
     Ok(())
 }

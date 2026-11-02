@@ -9,10 +9,13 @@
 //! token nor any request URL (including its query) is written to stderr or to the RPC result.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
-    sync::{Mutex, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use luxd::application::{
@@ -29,6 +32,11 @@ use serde_json::{Value, json};
 
 /// WeCom app API base used when the destination config does not override it.
 const DEFAULT_API_BASE: &str = "https://qyapi.weixin.qq.com";
+/// Hard deadline for one whole delivery, kept below the host's 30 second notification RPC timeout.
+const TOTAL_DELIVERY_BUDGET: Duration = Duration::from_secs(25);
+/// Deadline for one upstream request; the worst case (two attempts of a token plus a message) stays
+/// inside [`TOTAL_DELIVERY_BUDGET`] and well below the SDK client's 10 second cap.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 /// Upper bound of any upstream response body read by this plugin.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 /// WeCom text messages are truncated by the upstream API at 2048 bytes.
@@ -58,6 +66,11 @@ const ERROR_INVALID_RESPONSE: &str = "invalid_response";
 const ERROR_RATE_LIMITED: &str = "rate_limited";
 const ERROR_SYSTEM_BUSY: &str = "system_busy";
 const ERROR_TOKEN_REJECTED: &str = "token_rejected";
+const ERROR_NO_VALID_RECIPIENT: &str = "no_valid_recipient";
+/// Nothing had been sent yet when the delivery budget expired, so a retry cannot duplicate.
+const ERROR_DELIVERY_TIMEOUT: &str = "delivery_timeout";
+/// A message may already have reached WeCom, so retrying could send a duplicate notification.
+const ERROR_TIMEOUT_AFTER_SEND: &str = "timeout_after_send";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -86,25 +99,72 @@ async fn deliver(
     let (title, body) = render_event_text(&request.event);
     let content = compose_text(&title, &body);
     let cache_key = token_cache_key(&config, &secret);
+    // Set once a `message/send` request may have reached WeCom, which decides whether a budget
+    // expiry may be retried.
+    let dispatched = AtomicBool::new(false);
 
-    let result = match send_message(client, &config, &secret, cache_key, &content, false).await {
-        Attempt::Done(result) => result,
+    let delivery = match tokio::time::timeout(
+        TOTAL_DELIVERY_BUDGET,
+        run_delivery(client, &config, &secret, cache_key, &content, &dispatched),
+    )
+    .await
+    {
+        Ok(delivery) => {
+            if delivery.invalid_recipients > 0 {
+                log_partial_recipients(delivery.invalid_recipients);
+            }
+            delivery.result
+        }
+        Err(_) => budget_expiry_result(dispatched.load(Ordering::SeqCst)),
+    };
+    log_outcome(&delivery);
+    delivery
+}
+
+/// The outcome of one delivery attempt together with the recipient detail worth logging.
+struct Delivery {
+    result: NotificationSendRpcResult,
+    invalid_recipients: usize,
+}
+
+impl Delivery {
+    fn plain(result: NotificationSendRpcResult) -> Self {
+        Self {
+            result,
+            invalid_recipients: 0,
+        }
+    }
+}
+
+/// Runs the delivery attempts inside the total deadline set by [`deliver`].
+async fn run_delivery(
+    client: &Client,
+    config: &WecomAppConfig,
+    secret: &str,
+    cache_key: u64,
+    content: &str,
+    dispatched: &AtomicBool,
+) -> Delivery {
+    match send_message(
+        client, config, secret, cache_key, content, false, dispatched,
+    )
+    .await
+    {
+        Attempt::Done(delivery) => delivery,
         Attempt::TokenRejected => {
             // WeCom rejected the cached token: drop it, fetch a fresh one and retry exactly once.
             evict_token(cache_key);
-            match send_message(client, &config, &secret, cache_key, &content, true).await {
-                Attempt::Done(result) => result,
-                Attempt::TokenRejected => failed(ERROR_TOKEN_REJECTED),
+            match send_message(client, config, secret, cache_key, content, true, dispatched).await {
+                Attempt::Done(delivery) => delivery,
+                Attempt::TokenRejected => Delivery::plain(failed(ERROR_TOKEN_REJECTED)),
             }
         }
-    };
-    log_outcome(&result);
-    result
+    }
 }
 
 /// One WeCom delivery attempt.
 enum Attempt {
-    Done(NotificationSendRpcResult),
+    Done(Delivery),
     /// WeCom answered with a token error, so the caller must refresh the token and retry once.
     TokenRejected,
 }
@@ -116,12 +176,15 @@ async fn send_message(
     cache_key: u64,
     content: &str,
     force_refresh: bool,
+    dispatched: &AtomicBool,
 ) -> Attempt {
     let access_token = match access_token(client, config, secret, cache_key, force_refresh).await {
         Ok(access_token) => access_token,
-        Err(result) => return Attempt::Done(result),
+        Err(result) => return Attempt::Done(Delivery::plain(result)),
     };
-    let mut url = api_url(&config.api_base, "/cgi-bin/message/send");
+    let Some(mut url) = api_url(&config.api_base, &["cgi-bin", "message", "send"]) else {
+        return Attempt::Done(Delivery::plain(failed(ERROR_INVALID_CONFIG)));
+    };
     url.query_pairs_mut()
         .append_pair("access_token", &access_token);
     let payload = json!({
@@ -130,26 +193,25 @@ async fn send_message(
         "agentid": config.agent_id,
         "text": {"content": content},
     });
-    let response = match client.post(url).json(&payload).send().await {
-        Ok(response) => response,
-        Err(_) => return Attempt::Done(retryable(ERROR_NETWORK)),
+    // From this point on WeCom may deliver the message even if this attempt never completes.
+    dispatched.store(true, Ordering::SeqCst);
+    let exchange =
+        tokio::time::timeout(REQUEST_TIMEOUT, exchange(client.post(url).json(&payload))).await;
+    let (body, retry_after) = match exchange {
+        Ok(Ok(value)) => value,
+        Ok(Err(result)) => return Attempt::Done(Delivery::plain(result)),
+        Err(_) => return Attempt::Done(Delivery::plain(retryable(ERROR_NETWORK))),
     };
-    let status = response.status();
-    let retry_after = retry_after_seconds(response.headers());
-    if !status.is_success() {
-        return Attempt::Done(result_from_http_status(status.as_u16(), retry_after));
-    }
-    let body = match read_bounded(response).await {
-        Ok(body) => body,
-        Err(result) => return Attempt::Done(result),
+    let Some(value) = parse_body(&body) else {
+        return Attempt::Done(Delivery::plain(failed(ERROR_INVALID_RESPONSE)));
     };
-    let Some(errcode) = parse_errcode(&body) else {
-        return Attempt::Done(failed(ERROR_INVALID_RESPONSE));
+    let Some(errcode) = value.get("errcode").and_then(Value::as_i64) else {
+        return Attempt::Done(Delivery::plain(failed(ERROR_INVALID_RESPONSE)));
     };
     match errcode {
-        0 => Attempt::Done(delivered_message(&body)),
+        0 => Attempt::Done(delivered_message(&value, &config.to_user)),
         40001 | 40014 | 42001 => Attempt::TokenRejected,
-        other => Attempt::Done(errcode_result(other, retry_after)),
+        other => Attempt::Done(Delivery::plain(errcode_result(other, retry_after))),
     }
 }
 
@@ -167,30 +229,28 @@ async fn access_token(
     if !force_refresh && let Some(access_token) = cached_token(cache_key, now) {
         return Ok(access_token);
     }
-    let mut url = api_url(&config.api_base, "/cgi-bin/gettoken");
+    let Some(mut url) = api_url(&config.api_base, &["cgi-bin", "gettoken"]) else {
+        return Err(failed(ERROR_INVALID_CONFIG));
+    };
     {
         let mut query = url.query_pairs_mut();
         query.append_pair("corpid", &config.corp_id);
         query.append_pair("corpsecret", secret);
     }
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|_| retryable(ERROR_NETWORK))?;
-    let status = response.status();
-    let retry_after = retry_after_seconds(response.headers());
-    if !status.is_success() {
-        return Err(result_from_http_status(status.as_u16(), retry_after));
-    }
-    let body = read_bounded(response).await?;
-    let Some(errcode) = parse_errcode(&body) else {
+    let exchange = tokio::time::timeout(REQUEST_TIMEOUT, exchange(client.get(url))).await;
+    let (body, retry_after) = match exchange {
+        Ok(result) => result?,
+        Err(_) => return Err(retryable(ERROR_NETWORK)),
+    };
+    let Some(value) = parse_body(&body) else {
+        return Err(failed(ERROR_INVALID_RESPONSE));
+    };
+    let Some(errcode) = value.get("errcode").and_then(Value::as_i64) else {
         return Err(failed(ERROR_INVALID_RESPONSE));
     };
     if errcode != 0 {
         return Err(errcode_result(errcode, retry_after));
     }
-    let value: Value = serde_json::from_slice(&body).map_err(|_| failed(ERROR_INVALID_RESPONSE))?;
     let access_token = value
         .get("access_token")
         .and_then(Value::as_str)
@@ -208,6 +268,20 @@ async fn access_token(
         .unwrap_or(DEFAULT_TOKEN_LIFETIME_SECONDS);
     store_token(cache_key, access_token.clone(), expires_in, now);
     Ok(access_token)
+}
+
+/// Sends one request and returns its bounded body together with its `Retry-After` hint.
+async fn exchange(
+    request: reqwest::RequestBuilder,
+) -> Result<(Vec<u8>, Option<i64>), NotificationSendRpcResult> {
+    let response = request.send().await.map_err(|_| retryable(ERROR_NETWORK))?;
+    let status = response.status();
+    let retry_after = retry_after_seconds(response.headers());
+    if !status.is_success() {
+        return Err(result_from_http_status(status.as_u16(), retry_after));
+    }
+    let body = read_bounded(response).await?;
+    Ok((body, retry_after))
 }
 
 /// Reads a bounded response body.
@@ -235,11 +309,18 @@ async fn read_bounded(
     }
 }
 
-fn parse_errcode(body: &[u8]) -> Option<i64> {
-    serde_json::from_slice::<Value>(body)
-        .ok()?
-        .get("errcode")?
-        .as_i64()
+fn parse_body(body: &[u8]) -> Option<Value> {
+    serde_json::from_slice(body).ok()
+}
+
+/// Classifies an expired total delivery budget.
+fn budget_expiry_result(message_dispatched: bool) -> NotificationSendRpcResult {
+    if message_dispatched {
+        // A message may already be delivered upstream, so a retry could duplicate the notification.
+        failed(ERROR_TIMEOUT_AFTER_SEND)
+    } else {
+        retryable(ERROR_DELIVERY_TIMEOUT)
+    }
 }
 
 /// Maps a WeCom `errcode` onto the host delivery classification.
@@ -259,22 +340,87 @@ fn retryable_with(code: &str, retry_after: Option<i64>) -> NotificationSendRpcRe
     result
 }
 
-fn delivered_message(body: &[u8]) -> NotificationSendRpcResult {
+/// Builds the `DELIVERED` result of an `errcode: 0` response.
+fn delivered_message(value: &Value, to_user: &str) -> Delivery {
+    match recipient_outcome(value, to_user) {
+        RecipientOutcome::AllInvalid => Delivery::plain(failed(ERROR_NO_VALID_RECIPIENT)),
+        RecipientOutcome::PartialInvalid(count) => Delivery {
+            result: delivered_with_provider_id(value),
+            invalid_recipients: count,
+        },
+        RecipientOutcome::AllValid => Delivery::plain(delivered_with_provider_id(value)),
+    }
+}
+
+/// Describes whether WeCom rejected every requested recipient while still answering `errcode: 0`.
+enum RecipientOutcome {
+    AllValid,
+    PartialInvalid(usize),
+    AllInvalid,
+}
+
+fn recipient_outcome(value: &Value, to_user: &str) -> RecipientOutcome {
+    // `@all` cannot be enumerated, so WeCom's `errcode: 0` already states the whole scope received
+    // the message.
+    if to_user.eq_ignore_ascii_case("@all") {
+        return RecipientOutcome::AllValid;
+    }
+    let requested: Vec<&str> = to_user
+        .split('|')
+        .map(str::trim)
+        .filter(|user_id| !user_id.is_empty())
+        .collect();
+    if requested.is_empty() {
+        return RecipientOutcome::AllValid;
+    }
+    let invalid = invalid_recipient_ids(value);
+    let invalid_count = requested
+        .iter()
+        .filter(|user_id| invalid.contains(&user_id.to_ascii_lowercase()))
+        .count();
+    if invalid_count == 0 {
+        RecipientOutcome::AllValid
+    } else if invalid_count == requested.len() {
+        RecipientOutcome::AllInvalid
+    } else {
+        RecipientOutcome::PartialInvalid(invalid_count)
+    }
+}
+
+/// Collects the invalid recipient identifiers WeCom reports, lowercased and split into ids.
+fn invalid_recipient_ids(value: &Value) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for key in [
+        "invaliduser",
+        "invalidparty",
+        "invalidtag",
+        "unlicenseduser",
+    ] {
+        let Some(text) = value.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        for user_id in text.split(['|', ',', ';']) {
+            let user_id = user_id.trim();
+            if !user_id.is_empty() {
+                ids.insert(user_id.to_ascii_lowercase());
+            }
+        }
+    }
+    ids
+}
+
+fn delivered_with_provider_id(value: &Value) -> NotificationSendRpcResult {
     let mut result = delivered();
-    result.provider_request_id = serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("msgid")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|msg_id| {
-                    !msg_id.is_empty()
-                        && msg_id.chars().count() <= MAX_PROVIDER_REQUEST_ID_CHARS
-                        && !msg_id.chars().any(char::is_control)
-                })
-                .map(str::to_owned)
-        });
+    result.provider_request_id = value
+        .get("msgid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|msg_id| {
+            !msg_id.is_empty()
+                && msg_id.chars().count() <= MAX_PROVIDER_REQUEST_ID_CHARS
+                && !msg_id.chars().any(char::is_control)
+        })
+        .map(str::to_owned);
     result
 }
 
@@ -289,14 +435,19 @@ fn retry_after_seconds(headers: &HeaderMap) -> Option<i64> {
         .map(|seconds| seconds.clamp(0, MAX_RETRY_AFTER_SECONDS))
 }
 
-fn api_url(base: &Url, path: &str) -> Url {
+/// Appends API path segments to the configured base without re-encoding existing path escapes.
+fn api_url(base: &Url, segments: &[&str]) -> Option<Url> {
     let mut url = base.clone();
-    let mut joined = url.path().trim_end_matches('/').to_owned();
-    joined.push_str(path);
-    url.set_path(&joined);
     url.set_query(None);
     url.set_fragment(None);
-    url
+    {
+        let mut path = url.path_segments_mut().ok()?;
+        path.pop_if_empty();
+        for segment in segments {
+            path.push(segment);
+        }
+    }
+    Some(url)
 }
 
 /// Joins the already rendered notification title and body into one WeCom text message.
@@ -500,6 +651,10 @@ fn log_failure(code: &str) {
     eprintln!("wecom-app notifier: notification failed ({code})");
 }
 
+fn log_partial_recipients(count: usize) {
+    eprintln!("wecom-app notifier: notification delivered with {count} invalid recipient(s)");
+}
+
 fn log_outcome(result: &NotificationSendRpcResult) {
     match result.status {
         NotificationSendStatus::Delivered => {
@@ -512,5 +667,36 @@ fn log_outcome(result: &NotificationSendRpcResult) {
         NotificationSendStatus::Failed => {
             log_failure(result.error_code.as_deref().unwrap_or("unknown"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ERROR_DELIVERY_TIMEOUT, ERROR_TIMEOUT_AFTER_SEND, NotificationSendStatus, REQUEST_TIMEOUT,
+        TOTAL_DELIVERY_BUDGET, budget_expiry_result,
+    };
+
+    // The total budget can only be reached after the per-request deadlines are exhausted, which is
+    // impractical to reproduce end to end, so its classification is asserted directly here.
+    #[test]
+    fn budget_expiry_after_a_send_is_permanent_to_avoid_duplicates() {
+        let result = budget_expiry_result(true);
+        assert_eq!(result.status, NotificationSendStatus::Failed);
+        assert_eq!(result.error_code.as_deref(), Some(ERROR_TIMEOUT_AFTER_SEND));
+    }
+
+    #[test]
+    fn budget_expiry_before_any_send_is_retryable() {
+        let result = budget_expiry_result(false);
+        assert_eq!(result.status, NotificationSendStatus::Retryable);
+        assert_eq!(result.error_code.as_deref(), Some(ERROR_DELIVERY_TIMEOUT));
+    }
+
+    #[test]
+    fn wire_deadlines_stay_inside_the_delivery_budget() {
+        assert!(TOTAL_DELIVERY_BUDGET < std::time::Duration::from_secs(30));
+        // Two attempts, each a token request plus a message request, must fit the budget.
+        assert!(REQUEST_TIMEOUT * 4 < TOTAL_DELIVERY_BUDGET);
     }
 }
