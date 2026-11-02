@@ -167,22 +167,6 @@ pub enum DanmakuSidecarScope {
 }
 
 impl DanmakuService {
-    pub async fn read_sidecar(
-        &self,
-        item_id: &str,
-    ) -> Result<Option<Vec<u8>>, DanmakuServiceError> {
-        self.read_sidecar_for_source(item_id, None).await
-    }
-
-    pub async fn read_sidecar_for_source(
-        &self,
-        item_id: &str,
-        source_id: Option<&str>,
-    ) -> Result<Option<Vec<u8>>, DanmakuServiceError> {
-        self.read_for_playback(item_id, source_id, DanmakuSidecarScope::AnySource)
-            .await
-    }
-
     pub async fn read_registered_sidecar_for_source(
         &self,
         item_id: &str,
