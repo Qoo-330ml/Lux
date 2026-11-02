@@ -1,4 +1,4 @@
-import { useCallback, type Dispatch, type SetStateAction } from "react";
+import { useCallback, useState, type Dispatch, type SetStateAction } from "react";
 import { NativeVideoEngine, type PlaybackEngine } from "./playback-engine";
 import type { LuxPlayerRuntime } from "./core/player-runtime";
 import type { PlayerRuntimeCaptionTrack } from "./components/player-captions";
@@ -12,6 +12,20 @@ type PlayerVideoElementOptions = {
   setNativeCaptionTracks: Dispatch<SetStateAction<PlayerRuntimeCaptionTrack[]>>;
 };
 
+export type BoundPlayerVideoElement = {
+  /** Callback ref for the rendered `<video>`; also binds the engine refs below. */
+  setVideoRef: (video: HTMLVideoElement | null) => void;
+  /**
+   * The element currently in the DOM, as React state.
+   *
+   * The playback runtime can only load a plan once a `<video>` exists, and the page replaces that
+   * element whenever it renders a loading state (a replacement session, a bootstrap retry). A ref
+   * alone cannot re-trigger an effect when the element comes back, so the mounted element is
+   * mirrored into state: the runtime effect depends on it and reloads as soon as it is attached.
+   */
+  videoElement: HTMLVideoElement | null;
+};
+
 /**
  * Binds the rendered video element to the engine refs. A null element tears the
  * runtime down and clears the per-element caption/airplay state.
@@ -23,8 +37,12 @@ export function usePlayerVideoElement({
   runtimeRef,
   setAirPlayVideo,
   setNativeCaptionTracks,
-}: PlayerVideoElementOptions) {
-  return useCallback((video: HTMLVideoElement | null) => {
+}: PlayerVideoElementOptions): BoundPlayerVideoElement {
+  const [videoElement, setVideoElement] = useState<HTMLVideoElement | null>(null);
+  const setVideoRef = useCallback((video: HTMLVideoElement | null) => {
+    // The state update is what re-runs the playback runtime effect once these refs are bound;
+    // re-attaching the same element is a no-op because `Object.is` equal state bails out.
+    setVideoElement(video);
     if (!video) {
       const runtime = runtimeRef.current;
       runtimeRef.current = null;
@@ -44,4 +62,5 @@ export function usePlayerVideoElement({
     setAirPlayVideo(video);
     engineRef.current = new NativeVideoEngine(video);
   }, [engineRef, lastVideoRef, runtimeRef, setAirPlayVideo, setNativeCaptionTracks, videoRef]);
+  return { setVideoRef, videoElement };
 }
