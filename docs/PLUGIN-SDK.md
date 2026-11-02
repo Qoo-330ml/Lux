@@ -608,3 +608,59 @@ PLUGIN_INTERNAL_ERROR
 ## TMDb 插件
 
 `org.lux.tmdb` 是对 Emby `MovieDb.dll` 行为的独立重写，不加载原始 DLL。功能范围包括电影、剧集、季、集、人物、合集、图片、外部 ID、预告片、语言、缓存、限流、重试和 TMDb v3 API Key。插件使用自己的缓存目录；Lux 负责最终元数据持久化、NFO/图片回写和 Emby DTO 映射。
+
+## 企业微信应用通知插件
+
+`org.lux.notifier.wecom-app` 通过企业微信自建应用发送文本通知，二进制为
+`lux-plugin-notifier-wecom-app`，源码在 `src/bin/lux-plugin-notifier-wecom-app.rs`。插件只做渠道认证和
+payload 组装，进程外壳、出站 client、状态分类和通知正文来自
+[通知器 SDK](#通知器-sdk)。
+
+`configFields` 都是**每条通知目标**的非敏感设置，凭据只通过唯一的 `secret` 字段下发：
+
+```json
+{
+  "id": "org.lux.notifier.wecom-app",
+  "type": "notification",
+  "category": "NOTIFICATION",
+  "capabilities": ["notification.send"],
+  "configFields": [
+    {"key": "corpId", "label": "企业 ID", "type": "text", "required": true},
+    {"key": "agentId", "label": "应用 AgentId", "type": "number", "required": true, "minimum": 1, "maximum": 2147483647},
+    {"key": "toUser", "label": "接收成员", "type": "text", "required": false, "defaultValue": "@all"},
+    {"key": "apiBase", "label": "API 基地址", "type": "text", "required": false, "defaultValue": "https://qyapi.weixin.qq.com"},
+    {"key": "secret", "label": "应用 Secret", "type": "password", "required": true, "sensitive": true}
+  ]
+}
+```
+
+`secret` 是自建应用的 corpsecret，只从 `notification.send` 请求的 `NotificationSendRpcRequest.secret`
+取得，不读取配置文件、不写入 `config`/`providerConfig`，也不出现在日志、RPC 结果或错误信息里。`apiBase`
+仅用于代理或测试，必须是 http/https 基地址，且不得包含凭据、query 或 fragment；插件进程的出站请求仍受
+宿主代理策略（`LUX_PROXY_URL`）约束。
+
+投递流程：
+
+1. `GET {apiBase}/cgi-bin/gettoken?corpid=&corpsecret=` 换取 `access_token`。token 缓存在插件进程内，key 为
+   `corpId + agentId + secret` 的哈希，到期前 5 分钟刷新；缓存用 `Mutex` 保护且不跨 `.await` 持锁。
+2. `POST {apiBase}/cgi-bin/message/send?access_token=` 发送 `msgtype: "text"` 消息，正文为 SDK
+   `render_event_text` 返回的标题与正文（`标题\n\n正文`），超过企业微信 2048 字节限制时按 UTF-8 字符边界截断。
+3. 上游 `errcode` 为 `40001`/`40014`/`42001` 时清除缓存 token、重新获取后重试一次；再次失败返回
+   `Failed(token_rejected)`。`-1`（系统繁忙）与 `45009`（频率限制）返回 `Retryable`，有 `Retry-After` 时填充
+   `retry_after_seconds`；其他非 0 返回 `Failed(upstream_errcode_<n>)`。
+
+稳定结果：
+
+- `DELIVERED`：企业微信返回 `errcode: 0`，`msgid` 作为 `providerRequestId` 返回。
+- `RETRYABLE`：网络错误/超时（`network_error`）、`408`/`425`/`429`/`5xx`（`PROVIDER_HTTP_<status>`）、
+  `rate_limited` 或 `system_busy`。
+- `FAILED`：缺少或空白凭据（`missing_secret`）、目标配置非法（`invalid_config`，如 corpId 为空、agentId
+  非正数、toUser 含非法字符、apiBase 非 http/https 或带凭据/query）、响应超 64 KiB
+  （`response_too_large`）、响应不是预期 JSON（`invalid_response`）、其他永久 4xx 与业务错误。
+
+出站请求沿用 SDK client 的 10 秒超时且不跟随重定向。插件日志只写稳定结果码，不写 access_token、token
+请求的 query、完整外部 URL 或凭据。
+
+打包：`scripts/package-notifier-plugin.sh org.lux.notifier.wecom-app`，产物为
+`dist/plugins/org.lux.notifier.wecom-app-0.1.0-<platform>-<arch>.zip`。相关测试在
+`tests/plugins/notifier_wecom_app.rs`，使用 127.0.0.1 随机端口的 mock 企业微信服务，不访问真实租户。

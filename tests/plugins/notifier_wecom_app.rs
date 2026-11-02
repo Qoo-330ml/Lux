@@ -762,3 +762,48 @@ async fn reports_a_timeout_as_retryable() -> Result<(), Box<dyn std::error::Erro
     assert_log_has_no_credentials(&stderr);
     Ok(())
 }
+
+#[test]
+fn manifest_declares_one_sensitive_password_secret_field() -> Result<(), Box<dyn std::error::Error>>
+{
+    let manifest: luxd::application::plugin_protocol::PluginManifest = serde_json::from_slice(
+        &std::fs::read("plugins/org.lux.notifier.wecom-app/manifest.json")?,
+    )?;
+    manifest
+        .validate()
+        .map_err(|error| format!("manifest is not installable: {error}"))?;
+
+    assert_eq!(manifest.id, "org.lux.notifier.wecom-app");
+    assert_eq!(manifest.version, "0.1.0");
+    assert_eq!(manifest.plugin_type, "notification");
+    assert_eq!(manifest.category, "NOTIFICATION");
+    assert_eq!(manifest.capabilities, vec!["notification.send".to_owned()]);
+
+    let secrets: Vec<_> = manifest
+        .config_fields
+        .iter()
+        .filter(|field| field.key == "secret")
+        .collect();
+    assert_eq!(secrets.len(), 1, "exactly one secret field is allowed");
+    let secret = secrets[0];
+    assert!(secret.sensitive);
+    assert!(secret.required);
+    assert_eq!(secret.input_type, "password");
+    assert!(secret.default_value.is_none());
+
+    for field in &manifest.config_fields {
+        if field.key == "secret" {
+            continue;
+        }
+        assert!(!field.sensitive, "{} must not be sensitive", field.key);
+        assert_ne!(field.input_type, "password", "{}", field.key);
+    }
+    let agent_id = manifest
+        .config_fields
+        .iter()
+        .find(|field| field.key == "agentId")
+        .ok_or("agentId must be declared")?;
+    assert_eq!(agent_id.input_type, "number");
+    assert!(agent_id.required);
+    Ok(())
+}
