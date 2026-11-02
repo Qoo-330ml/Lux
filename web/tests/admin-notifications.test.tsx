@@ -101,7 +101,8 @@ describe("AdminNotificationsPage", () => {
         updatedAt: 1_700_000_200,
       }],
       page: 1,
-      pageSize: 50,
+      pageSize: 20,
+      total: 45,
     });
     vi.spyOn(api, "createAdminWebhookDestination").mockResolvedValue({
       destination: {
@@ -144,6 +145,11 @@ describe("AdminNotificationsPage", () => {
     document.body.append(container);
     root = createRoot(container);
   });
+
+  async function openDeliveriesTab() {
+    await act(async () => { (container.querySelector('[role="tab"][data-tab="deliveries"]') as HTMLButtonElement).click(); });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+  }
 
   afterEach(() => {
     act(() => root.unmount());
@@ -214,9 +220,8 @@ describe("AdminNotificationsPage", () => {
 
     expect(container.textContent).toContain("通知");
     expect(container.textContent).toContain("本地接收器");
-    expect(container.textContent).toContain("发送失败");
-    expect(container.textContent).toContain("扫描已完成");
-    expect(container.textContent).toContain("媒体库：library-1");
+    expect(container.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("通知目标");
+    expect(container.textContent).not.toContain("upstream failed");
     expect(container.querySelector('input[name="event-MEDIA_ADDED"]')).toBeTruthy();
     expect(container.querySelector('[data-name="notification-provider"]')).toBeTruthy();
     expect(container.querySelector('input[name="notification-config-url"]')).toBeTruthy();
@@ -225,7 +230,35 @@ describe("AdminNotificationsPage", () => {
     expect(container.querySelector('input[name="notification-url"]')).toBeNull();
     expect(container.textContent).toContain("通知内容");
     expect(container.textContent).toContain("通知器配置");
+    await openDeliveriesTab();
+    expect(container.textContent).toContain("发送失败");
+    expect(container.textContent).toContain("扫描完成");
+    expect(container.querySelector("table")).toBeTruthy();
     expect(container.querySelector('button[aria-label="重试投递 delivery-1"]')).toBeTruthy();
+    expect(container.textContent).toContain("共 45 条");
+  });
+
+  it("filters deliveries by status and pages through them on the server", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root.render(createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(MemoryRouter, null, createElement(AdminNotificationsPage)),
+      ));
+    });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    await openDeliveriesTab();
+    expect(api.adminWebhookDeliveries).toHaveBeenLastCalledWith({ page: 1, pageSize: 20 });
+
+    await act(async () => { (container.querySelector('button[aria-label="下一页"]') as HTMLButtonElement).click(); });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(api.adminWebhookDeliveries).toHaveBeenLastCalledWith({ page: 2, pageSize: 20 });
+    expect(container.textContent).toContain("第 2 / 3 页");
+
+    await act(async () => { (container.querySelector('button[data-status="FAILED"]') as HTMLButtonElement).click(); });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(api.adminWebhookDeliveries).toHaveBeenLastCalledWith({ page: 1, pageSize: 20, status: "FAILED" });
   });
 
   it("requires the credential again when the edit form switches notification providers", async () => {

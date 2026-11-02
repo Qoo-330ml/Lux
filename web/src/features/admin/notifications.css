@@ -56,17 +56,18 @@
 html[data-lux-theme="light"] .lux-notification-form input:not([type="checkbox"]):not([type="radio"]), html[data-lux-theme="light"] .lux-notification-edit-form input:not([type="checkbox"]):not([type="radio"]) { color: var(--lux-text); background: rgba(28,28,34,.04); }
 html[data-lux-theme="light"] .lux-notification-form select, html[data-lux-theme="light"] .lux-notification-form textarea, html[data-lux-theme="light"] .lux-notification-edit-form select, html[data-lux-theme="light"] .lux-notification-edit-form textarea { color: var(--lux-text); background: rgba(28,28,34,.04); }
 
-/* Redesign: two-column workspace — destinations as cards on the left, delivery feed on the right. */
-.lux-notifications-page { grid-template-columns: minmax(0, 1.5fr) minmax(300px, 1fr); align-items: start; gap: 16px 20px; }
+/* Redesign: tabbed workspace — destinations as cards, deliveries as a paged table. */
+.lux-notifications-page { grid-template-columns: minmax(0, 1fr); align-items: start; gap: 16px; }
 .lux-notifications-page > * { min-width: 0; }
-.lux-notifications-page > .lux-notifications-heading, .lux-notifications-page > .lux-notifications-create, .lux-notifications-page > p, .lux-notifications-page > .lux-notification-dialog-backdrop, .lux-notifications-page > .lux-notification-secret-backdrop { grid-column: 1 / -1; }
-.lux-notifications-page > section.lux-admin-panel:not(.lux-notifications-create) { padding: 18px; border: 1px solid var(--lux-line-soft); border-radius: 14px; background: rgba(255,255,255,.025); }
-.lux-notifications-page > .lux-admin-panel + .lux-admin-panel { border-left: 1px solid var(--lux-line-soft); }
 .lux-notifications-page .lux-admin-panel-heading { margin-bottom: 14px; }
 .lux-notifications-page .lux-admin-panel-heading h2 { font-size: 1.02rem; }
-
-.lux-notifications-create { padding: 14px 18px; border: 1px dashed color-mix(in srgb, var(--lux-accent) 45%, var(--lux-line)); border-radius: 14px; background: color-mix(in srgb, var(--lux-accent) 6%, transparent); }
+.lux-notifications-page .lux-notifications-create { padding: 14px 18px; border: 1px dashed color-mix(in srgb, var(--lux-accent) 45%, var(--lux-line)); border-radius: 14px; background: color-mix(in srgb, var(--lux-accent) 6%, transparent); }
 .lux-notifications-create-summary h2 { margin-top: 4px; }
+
+.lux-notification-tabs { display: flex; gap: 22px; border-bottom: 1px solid var(--lux-line-soft); }
+.lux-notification-tabs button { display: inline-flex; align-items: center; gap: 8px; margin-bottom: -1px; padding: 8px 0; border: 0; border-bottom: 2px solid transparent; color: var(--lux-muted); background: none; font: inherit; font-size: .86rem; cursor: pointer; }
+.lux-notification-tabs button.is-active { border-bottom-color: var(--lux-text); color: var(--lux-text); }
+.lux-notification-tabpanel { display: grid; gap: 16px; }
 
 .lux-notification-destination-list { grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
 .lux-notification-destination { position: relative; gap: 12px; padding: 14px 14px 14px 17px; overflow: hidden; border: 1px solid var(--lux-line-soft); border-radius: 12px; background: rgba(255,255,255,.03); transition: border-color .2s ease, background .2s ease; }
@@ -78,15 +79,22 @@ html[data-lux-theme="light"] .lux-notification-form select, html[data-lux-theme=
 .lux-notification-destination-summary > .lux-user-badge { grid-column: 2; justify-self: start; }
 .lux-notification-destination-actions { padding-top: 10px; border-top: 1px solid var(--lux-line-soft); }
 
-/* Delivery feed: timeline with a status dot per entry. */
-.lux-notification-delivery-list { gap: 0; }
-.lux-notification-delivery { position: relative; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; padding: 12px 0 12px 20px; border-top: 0; border-left: 1px solid var(--lux-line-soft); }
-.lux-notification-delivery::before { position: absolute; top: 17px; left: -4px; width: 7px; height: 7px; border-radius: 50%; background: var(--lux-subtle); content: ""; }
-.lux-notification-delivery:has(.status-completed, .status-delivered)::before { background: var(--lux-status-success); }
-.lux-notification-delivery:has(.status-failed)::before { background: var(--lux-status-danger); }
-.lux-notification-delivery:has(.status-pending)::before { background: var(--lux-status-warning); }
-.lux-notification-delivery-content { padding: 8px 10px; border-radius: 8px; background: rgba(255,255,255,.04); }
+/* Delivery table: fixed page size, single-line rows, filters above, pager below. */
+.lux-notification-delivery-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; margin-bottom: 12px; }
+.lux-notification-status-filter { display: flex; gap: 4px; }
+.lux-notification-status-filter button { padding: 5px 12px; border: 0; border-radius: 99px; color: var(--lux-muted); background: none; font: inherit; font-size: .76rem; cursor: pointer; }
+.lux-notification-status-filter button.is-active { color: var(--lux-bg); background: var(--lux-text); }
+.lux-notification-table-wrap { overflow-x: auto; }
+.lux-notification-delivery-table { width: 100%; border-collapse: collapse; font-size: .8rem; }
+.lux-notification-delivery-table th { padding: 8px 10px; border-bottom: 1px solid var(--lux-line); color: var(--lux-subtle); font-size: .68rem; font-weight: 500; text-align: left; white-space: nowrap; }
+.lux-notification-delivery-table td { max-width: 360px; padding: 8px 10px; overflow: hidden; border-bottom: 1px solid var(--lux-line-soft); color: var(--lux-text); text-overflow: ellipsis; white-space: nowrap; }
+.lux-notification-delivery-table tbody tr:hover td { background: rgba(255,255,255,.04); }
+.lux-notification-delivery-time { color: var(--lux-subtle); font-variant-numeric: tabular-nums; }
+.lux-notification-delivery-cell strong { margin-right: 8px; font-weight: 600; }
+.lux-notification-delivery-cell span { color: var(--lux-muted); }
+.lux-notification-delivery-cell small { display: block; margin-top: 2px; overflow: hidden; color: var(--lux-subtle); font-size: .72rem; text-overflow: ellipsis; }
+.lux-notification-pagination { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; color: var(--lux-subtle); font-size: .74rem; }
+.lux-notification-pagination div { display: flex; gap: 6px; }
 
-@media (max-width: 1100px) { .lux-notifications-page { grid-template-columns: minmax(0, 1fr); } }
-html[data-lux-theme="light"] .lux-notifications-page > section.lux-admin-panel:not(.lux-notifications-create), html[data-lux-theme="light"] .lux-notification-destination { background: rgba(255,255,255,.7); }
-html[data-lux-theme="light"] .lux-notification-delivery-content { background: rgba(28,28,34,.045); }
+html[data-lux-theme="light"] .lux-notification-destination { background: rgba(255,255,255,.7); }
+html[data-lux-theme="light"] .lux-notification-delivery-table tbody tr:hover td { background: rgba(28,28,34,.045); }

@@ -269,6 +269,54 @@ async fn webhook_destination_api_publishes_signed_events_and_hides_secret()
     assert_eq!(deliveries.status(), reqwest::StatusCode::OK);
     let deliveries_body: Value = deliveries.json().await?;
     assert_eq!(deliveries_body["deliveries"][0]["status"], "DELIVERED");
+    let total = deliveries_body["total"]
+        .as_i64()
+        .ok_or("missing delivery total")?;
+    assert!(total >= 2);
+
+    let delivered: Value = client
+        .get(format!(
+            "http://{lux_address}/api/v1/admin/notification-deliveries?status=DELIVERED&pageSize=1"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(delivered["deliveries"].as_array().map(Vec::len), Some(1));
+    assert_eq!(delivered["deliveries"][0]["status"], "DELIVERED");
+    assert_eq!(delivered["total"], total);
+
+    let failed: Value = client
+        .get(format!(
+            "http://{lux_address}/api/v1/admin/notification-deliveries?status=FAILED"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(failed["total"], 0);
+
+    let other_destination: Value = client
+        .get(format!(
+            "http://{lux_address}/api/v1/admin/notification-deliveries?destinationId=missing"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(other_destination["total"], 0);
+
+    let bogus = client
+        .get(format!(
+            "http://{lux_address}/api/v1/admin/notification-deliveries?status=BOGUS"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(bogus.status(), reqwest::StatusCode::BAD_REQUEST);
     assert_eq!(
         deliveries_body["deliveries"]
             .as_array()

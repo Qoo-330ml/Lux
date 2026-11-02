@@ -369,15 +369,20 @@ impl WebhookService {
         &self,
         offset: i64,
         limit: i64,
-    ) -> Result<Vec<WebhookDeliveryView>, WebhookError> {
-        Ok(self
-            .database
-            .notifications()
-            .list_notification_deliveries(offset, limit)
+        status: Option<&str>,
+        destination_id: Option<&str>,
+    ) -> Result<(Vec<WebhookDeliveryView>, i64), WebhookError> {
+        let notifications = self.database.notifications();
+        let total = notifications
+            .count_notification_deliveries(status, destination_id)
+            .await?;
+        let deliveries = notifications
+            .list_notification_deliveries(offset, limit, status, destination_id)
             .await?
             .into_iter()
             .map(delivery_view)
-            .collect())
+            .collect();
+        Ok((deliveries, total))
     }
 
     pub async fn retry_delivery(&self, id: &str) -> Result<(), WebhookError> {
@@ -2203,8 +2208,9 @@ mod tests {
         let started = std::time::Instant::now();
         loop {
             let attempted = service
-                .list_deliveries(0, 10)
+                .list_deliveries(0, 10, None, None)
                 .await?
+                .0
                 .iter()
                 .any(|delivery| delivery.attempt_count >= 1);
             if attempted {
@@ -2244,8 +2250,9 @@ mod tests {
         let started = std::time::Instant::now();
         loop {
             let attempts = service
-                .list_deliveries(0, 10)
+                .list_deliveries(0, 10, None, None)
                 .await?
+                .0
                 .iter()
                 .map(|delivery| delivery.attempt_count)
                 .max()

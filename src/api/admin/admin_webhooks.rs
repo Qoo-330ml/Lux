@@ -305,15 +305,27 @@ pub(crate) async fn admin_rotate_webhook_secret(
     }
 }
 
+#[derive(Deserialize, Default)]
+pub(crate) struct DeliveryListQuery {
+    #[serde(default)]
+    page: Option<i64>,
+    #[serde(rename = "pageSize", default)]
+    page_size: Option<i64>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(rename = "destinationId", default)]
+    destination_id: Option<String>,
+}
+
 pub(crate) async fn admin_list_webhook_deliveries(
     headers: HeaderMap,
-    Query(query): Query<LuxPageQuery>,
+    Query(query): Query<DeliveryListQuery>,
     State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let (offset, limit) = match lux_page_params(&query) {
+    let (offset, limit) = match page_params(query.page, query.page_size) {
         Ok(value) => value,
         Err(message) => {
             return api_error(
@@ -325,6 +337,21 @@ pub(crate) async fn admin_list_webhook_deliveries(
             .into_response();
         }
     };
+    let status = query.status.as_deref().filter(|value| !value.is_empty());
+    if status.is_some_and(|value| !matches!(value, "PENDING" | "RUNNING" | "DELIVERED" | "FAILED"))
+    {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "投递状态无效",
+        )
+        .into_response();
+    }
+    let destination_id = query
+        .destination_id
+        .as_deref()
+        .filter(|value| !value.is_empty());
     let Some(service) = state.webhooks() else {
         return api_error(
             &headers,
@@ -334,11 +361,15 @@ pub(crate) async fn admin_list_webhook_deliveries(
         )
         .into_response();
     };
-    match service.list_deliveries(offset, limit).await {
-        Ok(deliveries) => Json(json!({
+    match service
+        .list_deliveries(offset, limit, status, destination_id)
+        .await
+    {
+        Ok((deliveries, total)) => Json(json!({
             "deliveries": deliveries,
             "page": offset / limit + 1,
             "pageSize": limit,
+            "total": total,
         }))
         .into_response(),
         Err(error) => webhook_error_response(&headers, error),

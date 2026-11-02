@@ -305,6 +305,8 @@ impl NotificationsRepo<'_> {
         &self,
         offset: i64,
         limit: i64,
+        status: Option<&str>,
+        destination_id: Option<&str>,
     ) -> Result<Vec<StoredNotificationDelivery>, StorageError> {
         self.db
             .query(
@@ -317,9 +319,14 @@ impl NotificationsRepo<'_> {
              FROM notification_deliveries d
              JOIN notification_events e ON e.id = d.event_id
              JOIN notification_destinations n ON n.id = d.destination_id
+             WHERE (? IS NULL OR d.status = ?) AND (? IS NULL OR d.destination_id = ?)
              ORDER BY d.created_at DESC, d.id DESC
              LIMIT ? OFFSET ?",
             )
+            .bind(status)
+            .bind(status)
+            .bind(destination_id)
+            .bind(destination_id)
             .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
             .bind(offset.max(0))
             .fetch_all(&self.db.pool)
@@ -329,6 +336,24 @@ impl NotificationsRepo<'_> {
             .map(stored_notification_delivery)
             .collect::<Result<Vec<_>, _>>()
             .map_err(self.db.sqlx_err())
+    }
+
+    pub(crate) async fn count_notification_deliveries(
+        &self,
+        status: Option<&str>,
+        destination_id: Option<&str>,
+    ) -> Result<i64, StorageError> {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM notification_deliveries d
+             WHERE (? IS NULL OR d.status = ?) AND (? IS NULL OR d.destination_id = ?)",
+        )
+        .bind(status)
+        .bind(status)
+        .bind(destination_id)
+        .bind(destination_id)
+        .fetch_one(&self.db.pool)
+        .await
+        .map_err(self.db.sqlx_err())
     }
 
     pub(crate) async fn claim_notification_delivery(

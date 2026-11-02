@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { BellRing, Check, Copy, Link2, Plus, RefreshCw, RotateCcw, Send, Trash2, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../lib/api/client";
@@ -14,6 +14,9 @@ const EVENT_OPTIONS = [
   ["PLAYBACK_STOPPED", "停止播放"],
 ] as const;
 
+const DELIVERY_PAGE_SIZE = 20;
+const DELIVERY_STATUS_FILTERS = [["", "全部"], ["FAILED", "失败"], ["PENDING", "等待"], ["DELIVERED", "已送达"]] as const;
+
 type NotificationForm = {
   name: string; url: string; enabled: boolean; allowPrivateNetwork: boolean; eventTypes: string[];
   providerPluginId: string; providerConfig: Record<string, unknown>; secret: string;
@@ -28,7 +31,12 @@ export function AdminNotificationsPage() {
   const queryClient = useQueryClient();
   const providers = useQuery({ queryKey: queryKeys.adminNotificationProviders, queryFn: () => api.adminNotificationProviders() });
   const destinations = useQuery({ queryKey: queryKeys.adminWebhookDestinations, queryFn: () => api.adminWebhookDestinations() });
-  const deliveries = useQuery({ queryKey: queryKeys.adminWebhookDeliveries, queryFn: () => api.adminWebhookDeliveries() });
+  const [tab, setTab] = useState<"destinations" | "deliveries">("destinations");
+  const [deliveryPage, setDeliveryPage] = useState(1);
+  const [deliveryStatus, setDeliveryStatus] = useState("");
+  const [deliveryDestination, setDeliveryDestination] = useState("");
+  const deliveryParams = { page: deliveryPage, pageSize: DELIVERY_PAGE_SIZE, ...(deliveryStatus ? { status: deliveryStatus } : {}), ...(deliveryDestination ? { destinationId: deliveryDestination } : {}) };
+  const deliveries = useQuery({ queryKey: [...queryKeys.adminWebhookDeliveries, deliveryParams], queryFn: () => api.adminWebhookDeliveries(deliveryParams), placeholderData: keepPreviousData, enabled: tab === "deliveries" });
   const [form, setForm] = useState<NotificationForm>(EMPTY_FORM);
   const [createOpen, setCreateOpen] = useState(false);
   const createDialogCloseRef = useRef<HTMLButtonElement>(null);
@@ -97,8 +105,15 @@ export function AdminNotificationsPage() {
         {create.error ? <p className="lux-error-copy" role="alert">{create.error.message}</p> : null}
       </section>
     </div> : null}
+    <div className="lux-notification-tabs" role="tablist" aria-label="通知视图">
+      <button type="button" role="tab" id="notification-tab-destinations" data-tab="destinations" aria-selected={tab === "destinations"} aria-controls="notification-tabpanel" className={tab === "destinations" ? "is-active" : ""} onClick={() => setTab("destinations")}>通知目标<span className="lux-status-pill">{destinationItems.length}</span></button>
+      <button type="button" role="tab" id="notification-tab-deliveries" data-tab="deliveries" aria-selected={tab === "deliveries"} aria-controls="notification-tabpanel" className={tab === "deliveries" ? "is-active" : ""} onClick={() => setTab("deliveries")}>投递记录</button>
+    </div>
+    <div id="notification-tabpanel" role="tabpanel" aria-labelledby={`notification-tab-${tab}`} className="lux-notification-tabpanel">
+    {tab === "destinations" ? <>
     <section className="lux-admin-panel" aria-labelledby="notification-destinations-title"><div className="lux-admin-panel-heading"><div><span className="lux-eyebrow">已配置</span><h2 id="notification-destinations-title">通知</h2><p>每条通知可以选择不同的通知器和通知内容。</p></div><span className="lux-status-pill">{destinationItems.length} 条</span></div>{destinationItems.length === 0 ? <div className="lux-admin-empty"><Link2 size={24} /><h2>还没有通知</h2><p>配置一个通知后，媒体和后台任务变化才会发送出去。</p></div> : <div className="lux-notification-destination-list">{destinationItems.map((destination) => <DestinationRow key={destination.id} destination={destination} providers={providerItems} onSecret={setSecretNotice} onChanged={() => void invalidateNotificationQueries(queryClient)} />)}</div>}</section>
-    <DeliveryList deliveries={deliveryItems} loading={deliveries.isPending} error={deliveries.error?.message} onRetry={() => void invalidateNotificationQueries(queryClient)} />
+    </> : <DeliveryList deliveries={deliveryItems} total={deliveries.data?.total ?? deliveryItems.length} page={deliveryPage} pageSize={DELIVERY_PAGE_SIZE} status={deliveryStatus} destinationId={deliveryDestination} destinations={destinationItems} loading={deliveries.isPending} error={deliveries.error?.message} onPage={setDeliveryPage} onStatus={(value) => { setDeliveryStatus(value); setDeliveryPage(1); }} onDestination={(value) => { setDeliveryDestination(value); setDeliveryPage(1); }} onRetry={() => void invalidateNotificationQueries(queryClient)} />}
+    </div>
     {secretNotice ? <SecretNotice secret={secretNotice} onClose={() => setSecretNotice(null)} /> : null}
   </main>;
 }
@@ -131,9 +146,35 @@ function DestinationRow({ destination, providers, onSecret, onChanged }: { desti
   return <article className={`lux-notification-destination ${destination.enabled ? "is-enabled" : "is-disabled"}`}><div className="lux-notification-destination-summary"><span className="lux-notification-destination-icon"><Link2 size={17} /></span><div><h3>{destination.name}</h3><p>{displayUrl || "由通知器配置目标"}</p><small>通知器：{provider?.name ?? destination.providerPluginId} · {destination.eventTypes.length === 0 ? "全部事件" : destination.eventTypes.map(eventLabel).join(" · ")}</small></div><span className={destination.enabled ? "lux-user-badge is-ok" : "lux-user-badge is-warn"}>{destination.enabled ? "已启用" : "已停用"}</span></div><div className="lux-notification-destination-actions"><LuxButton tone="secondary" type="button" onClick={() => setEditing((value) => !value)} disabled={busy}>{editing ? <X size={15} /> : <RefreshCw size={15} />}{editing ? "取消" : "编辑"}</LuxButton><LuxButton tone="secondary" type="button" onClick={() => toggle.mutate(!destination.enabled)} disabled={busy}>{destination.enabled ? "停用" : "启用"}</LuxButton><LuxButton tone="secondary" type="button" onClick={() => test.mutate()} disabled={busy}><Send size={15} />{test.isPending ? "发送中…" : "测试"}</LuxButton><LuxIconButton className="lux-icon-button-small" type="button" aria-label={`轮换 ${destination.name} Secret`} title={secretField ? "用编辑中填写的新凭据覆盖 Secret" : "轮换 Secret"} onClick={() => rotate.mutate()} disabled={busy || providerChanged || Boolean(secretField && secretDraft.trim() === "")}><RotateCcw size={15} /></LuxIconButton><LuxIconButton danger className="lux-icon-button-small" type="button" aria-label={`删除 ${destination.name}`} title="删除通知" onClick={async () => { if (await confirm(`确定删除通知“${destination.name}”？`)) remove.mutate(); }} disabled={busy}><Trash2 size={15} /></LuxIconButton></div>{editing ? <form className="lux-notification-edit-form" onSubmit={(event) => { event.preventDefault(); update.mutate(); }}><label>名称<LuxTextField value={name} onChange={(event) => setName(event.target.value)} maxLength={128} required /></label>{providerPluginId === "builtin.webhook" ? <label>接收地址<LuxTextField type="url" value={url} onChange={(event) => setUrl(event.target.value)} maxLength={2048} required={Boolean(url)} /></label> : null}{editingSecretField ? <label>{providerChanged ? "新凭据（必填）" : "新凭据"}<LuxTextField type="password" value={secretDraft} onChange={(event) => setSecretDraft(event.target.value)} autoComplete="new-password" required={providerChanged} placeholder={providerChanged ? "更换通知器后必须重新填写" : destination.secretConfigured ? "留空表示不修改" : "尚未配置凭据"} /><small>{providerChanged ? "更换通知器后旧凭据不会被沿用。" : "只保存为这条通知的 Secret，不写入通知器配置。"}</small></label> : null}{editingProvider ? <NotificationConfigFields plugin={editingProvider} values={providerConfig} onChange={setProviderConfig} /> : null}<label htmlFor="notification-edit-provider">通知器<LuxSelectField id="notification-edit-provider" name="notification-edit-provider" aria-label="编辑通知器" value={providerPluginId} onChange={(event) => { const next = providers.find((item) => item.id === event.target.value); setProviderPluginId(event.target.value); setProviderConfig(next ? defaultProviderConfig(next) : {}); setSecretDraft(""); }}>{providers.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</LuxSelectField></label><fieldset className="lux-notification-events"><legend>通知内容</legend><div className="lux-notification-event-grid">{EVENT_OPTIONS.map(([value, label]) => <LuxCheckbox key={value} checked={eventTypes.includes(value)} onChange={() => setEventTypes(toggleEvent(eventTypes, value))} label=<>{label}</> />)}</div></fieldset><LuxSwitch className="lux-admin-toggle" checked={allowPrivateNetwork} onChange={(event) => setAllowPrivateNetwork(event.target.checked)} label="允许私有网络地址" /><LuxSwitch className="lux-admin-toggle" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} label="启用通知" /><LuxButton tone="primary" type="submit" disabled={update.isPending || Boolean(providerChanged && editingSecretField && secretDraft.trim() === "")}>保存修改</LuxButton></form> : null}{test.data ? <p className="lux-notification-result" role="status">测试发送成功，HTTP {test.data.status}</p> : null}{error ? <p className="lux-error-copy" role="alert">{error.message}</p> : null}</article>;
 }
 
-function DeliveryList({ deliveries, loading, error, onRetry }: { deliveries: AdminWebhookDelivery[]; loading: boolean; error?: string; onRetry: () => void }) {
+type DeliveryListProps = {
+  deliveries: AdminWebhookDelivery[]; total: number; page: number; pageSize: number; status: string; destinationId: string;
+  destinations: AdminWebhookDestination[]; loading: boolean; error?: string;
+  onPage: (page: number) => void; onStatus: (status: string) => void; onDestination: (id: string) => void; onRetry: () => void;
+};
+
+function DeliveryList({ deliveries, total, page, pageSize, status, destinationId, destinations, loading, error, onPage, onStatus, onDestination, onRetry }: DeliveryListProps) {
   const retry = useMutation({ mutationFn: (deliveryId: string) => api.retryAdminWebhookDelivery(deliveryId), onSuccess: onRetry });
-  return <section className="lux-admin-panel" aria-labelledby="notification-deliveries-title"><div className="lux-admin-panel-heading"><div><span className="lux-eyebrow">投递记录</span><h2 id="notification-deliveries-title">最近发送</h2><p>失败发送会按退避策略自动重试；确认通知器恢复后可手动重试。</p></div><span className="lux-status-pill">{deliveries.length} 条记录</span></div>{loading ? <p className="lux-admin-muted" role="status">正在读取最近发送…</p> : error ? <p className="lux-error-copy" role="alert">最近发送加载失败：{error}</p> : deliveries.length === 0 ? <p className="lux-admin-muted">暂无投递记录。</p> : <div className="lux-notification-delivery-list">{deliveries.map((delivery) => <article className="lux-notification-delivery" key={delivery.id}><div className="lux-notification-delivery-copy"><strong>{delivery.title || eventLabel(delivery.eventType)}</strong>{delivery.content ? <p className="lux-notification-delivery-content">{delivery.content}</p> : null}<span>{delivery.destinationName}</span><small>{delivery.lastError || `尝试 ${delivery.attemptCount} 次`}</small></div><span className={delivery.status === "DELIVERED" ? "lux-user-badge is-ok" : delivery.status === "FAILED" ? "lux-user-badge is-warn" : "lux-user-badge"}>{deliveryStatusLabel(delivery.status)}</span>{delivery.status === "FAILED" ? <LuxIconButton className="lux-icon-button-small" type="button" aria-label={`重试投递 ${delivery.id}`} title="重试发送" onClick={() => retry.mutate(delivery.id)} disabled={retry.isPending}><RotateCcw size={15} /></LuxIconButton> : null}</article>)}</div>}{retry.error ? <p className="lux-error-copy" role="alert">{retry.error.message}</p> : null}</section>;
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  return <section className="lux-admin-panel lux-notification-deliveries" aria-labelledby="notification-deliveries-title">
+    <div className="lux-admin-panel-heading"><div><span className="lux-eyebrow">投递记录</span><h2 id="notification-deliveries-title">最近发送</h2><p>失败发送会按退避策略自动重试；确认通知器恢复后可手动重试。</p></div><span className="lux-status-pill">共 {total} 条</span></div>
+    <div className="lux-notification-delivery-toolbar">
+      <div className="lux-notification-status-filter" role="group" aria-label="按状态筛选">{DELIVERY_STATUS_FILTERS.map(([value, label]) => <button key={value || "all"} type="button" data-status={value} aria-pressed={status === value} className={status === value ? "is-active" : ""} onClick={() => onStatus(value)}>{label}</button>)}</div>
+      <LuxSelectField id="notification-delivery-destination" name="notification-delivery-destination" aria-label="按通知目标筛选" value={destinationId} onChange={(event) => onDestination(event.target.value)}><option value="">全部目标</option>{destinations.map((destination) => <option key={destination.id} value={destination.id}>{destination.name}</option>)}</LuxSelectField>
+    </div>
+    {loading ? <p className="lux-admin-muted" role="status">正在读取最近发送…</p> : error ? <p className="lux-error-copy" role="alert">最近发送加载失败：{error}</p> : deliveries.length === 0 ? <p className="lux-admin-muted">暂无投递记录。</p> : <div className="lux-notification-table-wrap"><table className="lux-notification-delivery-table">
+      <thead><tr><th scope="col">状态</th><th scope="col">时间</th><th scope="col">事件</th><th scope="col">内容</th><th scope="col">目标</th><th scope="col"><span className="lux-visually-hidden">操作</span></th></tr></thead>
+      <tbody>{deliveries.map((delivery) => <tr key={delivery.id} className={`is-${delivery.status.toLowerCase()}`}>
+        <td><span className={delivery.status === "DELIVERED" ? "lux-user-badge is-ok" : delivery.status === "FAILED" ? "lux-user-badge is-warn" : "lux-user-badge"}>{deliveryStatusLabel(delivery.status)}</span></td>
+        <td className="lux-notification-delivery-time"><time dateTime={new Date(delivery.createdAt * 1000).toISOString()}>{formatDeliveryTime(delivery.createdAt)}</time></td>
+        <td>{eventLabel(delivery.eventType)}</td>
+        <td className="lux-notification-delivery-cell" title={delivery.content || undefined}><strong>{delivery.title || eventLabel(delivery.eventType)}</strong>{delivery.content ? <span>{delivery.content.replace(/\s+/g, " ")}</span> : null}{delivery.status !== "DELIVERED" ? <small>{delivery.lastError || `尝试 ${delivery.attemptCount} 次`}</small> : null}</td>
+        <td>{delivery.destinationName}</td>
+        <td>{delivery.status === "FAILED" ? <LuxIconButton className="lux-icon-button-small" type="button" aria-label={`重试投递 ${delivery.id}`} title="重试发送" onClick={() => retry.mutate(delivery.id)} disabled={retry.isPending}><RotateCcw size={15} /></LuxIconButton> : null}</td>
+      </tr>)}</tbody>
+    </table></div>}
+    {retry.error ? <p className="lux-error-copy" role="alert">{retry.error.message}</p> : null}
+    <nav className="lux-notification-pagination" aria-label="投递记录分页"><span>第 {page} / {pageCount} 页 · 共 {total} 条</span><div><LuxButton type="button" aria-label="上一页" disabled={page <= 1} onClick={() => onPage(page - 1)}>上一页</LuxButton><LuxButton type="button" aria-label="下一页" disabled={page >= pageCount} onClick={() => onPage(page + 1)}>下一页</LuxButton></div></nav>
+  </section>;
 }
 
 function SecretNotice({ secret, onClose }: { secret: string; onClose: () => void }) {
@@ -154,5 +195,6 @@ function initialProviderConfig(destination: AdminWebhookDestination, providers: 
 function fieldValue(field: AdminPluginConfigField, values: Record<string, unknown>) { if (values[field.key] !== undefined) return values[field.key]; if (field.defaultValue !== undefined) return field.defaultValue; return field.multiple ? [] : field.type === "toggle" ? false : ""; }
 function toggleEvent(values: string[], value: string) { return values.includes(value) ? values.filter((item) => item !== value) : [...values, value]; }
 function eventLabel(value: string) { return EVENT_OPTIONS.find(([eventType]) => eventType === value)?.[1] ?? value; }
+function formatDeliveryTime(seconds: number) { return new Date(seconds * 1000).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }); }
 function deliveryStatusLabel(value: string) { return value === "DELIVERED" ? "已送达" : value === "FAILED" ? "发送失败" : value === "PENDING" ? "等待重试" : value; }
 async function invalidateNotificationQueries(queryClient: ReturnType<typeof useQueryClient>) { await Promise.all([queryClient.invalidateQueries({ queryKey: queryKeys.adminNotificationProviders }), queryClient.invalidateQueries({ queryKey: queryKeys.adminWebhookDestinations }), queryClient.invalidateQueries({ queryKey: queryKeys.adminWebhookDeliveries })]); }

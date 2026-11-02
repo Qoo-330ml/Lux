@@ -1213,9 +1213,12 @@ export class LuxApiClient {
     );
   }
 
-  adminWebhookDeliveries() {
-    return this.request<{ deliveries?: AdminWebhookDelivery[]; page?: number; pageSize?: number }>(
-      "/api/v1/admin/notification-deliveries?page=1&pageSize=50",
+  adminWebhookDeliveries(params: { page: number; pageSize: number; status?: string; destinationId?: string }) {
+    const query = new URLSearchParams({ page: String(params.page), pageSize: String(params.pageSize) });
+    if (params.status) query.set("status", params.status);
+    if (params.destinationId) query.set("destinationId", params.destinationId);
+    return this.request<{ deliveries?: AdminWebhookDelivery[]; page?: number; pageSize?: number; total?: number }>(
+      `/api/v1/admin/notification-deliveries?${query.toString()}`,
     );
   }
 
