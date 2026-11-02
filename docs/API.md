@@ -433,7 +433,10 @@ Web 播放使用独立于 Emby 的播放会话 API。创建和状态写入接口
   Lux 自己的签名入口；`origin` 是 HTTP(S) `.strm` 的目标地址，仅作最后手段。令牌无法签发（黑名单命中等）时省略 `proxy`。
 - 档位 0 是原始文件 Range 直放（客户端 HEVC/MKV fallback 仍属于此档）；档位 1 是视频/音频 copy 的
   fMP4/CMAF HLS；档位 2 是视频 copy、音频转码；档位 3 是管理员配置且运行时确认可用的硬件转码；档位 4 是
-  Jellyfin FFmpeg 软件转码。服务端 HLS 只为当前会话生成临时 `index.m3u8`、`init.mp4` 和 `.m4s`，不生成永久副本。
+  Jellyfin FFmpeg 软件转码。档位 2/3/4 的 AAC 输出统一规范到 `mono`/`stereo`/`3.0`/`4.0`/`5.0`/`5.1`
+  这些标准 `channelConfiguration` 布局（更宽的源降到 5.1），避免 `5.1(side)` 等布局退化成 Chromium MSE
+  会拒绝的 PCE 形式；Emby 转码路径不受影响。服务端 HLS 只为当前会话生成临时 `index.m3u8`、`init.mp4`
+  和 `.m4s`，不生成永久副本。
 - `GET|HEAD /api/v1/playback/sessions/{sessionId}/direct?expires=...&signature=...`：读取档位 0 的本地文件，
   支持单段 Range；HTTP `.strm` 只由此入口有限重定向到浏览器目标，不代理媒体字节。
 - `GET|HEAD /api/v1/playback/sessions/{sessionId}/hls/{asset}?expires=...&signature=...`：读取签名的 HLS

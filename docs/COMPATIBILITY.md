@@ -1,5 +1,33 @@
 # Lux 客户端兼容性矩阵
 
+## Web HLS 音频转码输出 AAC 声道布局规范化（2026-11-02）
+
+- 根因：AC-3 / E-AC-3 / DTS / TrueHD 的 5.1 音轨解码后是 `5.1(side)` 声道掩码，FFmpeg 的 AAC
+  编码器只对 `mono/stereo/3.0/4.0/5.0/5.1` 等「MPEG-4 `channelConfiguration` 表内」的布局写 5 字节
+  `AudioSpecificConfig`；表外布局（`5.1(side)`、`5.0(side)`、`quad`、`6.1`、`7.1(wide)`、`7.1.4`）
+  退化为 25 字节 `channelConfig=0` + Program Config Element，Chromium 的 MSE 在 append
+  init 段时直接失败（`CHUNK_DEMUXER_ERROR_APPEND_FAILED`，播放器显示“播放器引擎失败”）。
+  实测 FFmpeg 9.0.2 对 `5.1(side)` 输出
+  `11 80 04 c8 05 00 01 08 80 0c 4c61766336332e312e313032 56 e5 00`（25 字节，含 `Lavc` 注释）；
+  标准 `5.1` 布局的 ASC 只有 5 字节 `11 b0 56 e5 00`。
+- 修复：Web HLS 的三条重编码音频的档位（音频转码、硬件视频转码、软件视频转码）在 `-c:a aac` 之外
+  追加 `-af aformat=channel_layouts=mono|stereo|3.0|4.0|5.0|5.1`。FFmpeg 按声道数保留已有标准布局
+  （mono/stereo/3.0/4.0/5.0/5.1 原样通过），其余布局一律并成 5.1；源布局未知时同样安全，因为
+  该过滤器对表内布局是 no-op。
+- 声道数 > 5.1 的音轨统一降到 5.1，而不是保留 6.1 / 7.1：FFmpeg 9.0 对 6.1 / 7.1 会写**扩展**
+  `channelConfiguration` 11 / 12（实测 `11 e0 56 e5 00`），Chromium 是否接受这些扩展值未经验证，
+  而 5.1（config 6）在所有浏览器 AAC 解码器上都可用。音频转码档位默认 192 kbps，7.1 也放不下。
+- 复制音频的档位（Remux，`-c:a copy`）不能加音频过滤器，保持现状。Emby 路径（`start_emby_vod`）
+  的 FFmpeg 参数**完全不变**：Emby 客户端接受 PCE 形式，本修复只影响 Lux Web。
+- 回归：`web_audio_transcoding_normalises_the_aac_channel_layout`、
+  `emby_audio_transcoding_keeps_the_ffmpeg_default_audio_layout`、`a_copied_audio_track_is_never_filtered`
+  断言参数构造；`five_point_one_side_audio_encodes_a_standard_aac_channel_configuration`
+  （`#[ignore]`，需要本机 FFmpeg）真转码 `5.1(side)` AC-3 并解析 `init.mp4` 的 esds
+  `DecoderSpecificInfo`，断言 5 字节 / `channelConfiguration=6`，同时用 Emby 形态的参数做反向对照
+  （仍是 `channelConfiguration=0`）。
+- 待真机复测：Chromium 156 上的 8 个 ❌ 样本（AC-3/E-AC-3/DTS/TrueHD 6 声道 `5.1(side)`，
+  档位 2 与 4）应能正常起播；7.1 / 7.1.4 源现在按 5.1 输出，需要确认听感与音轨切换。
+
 ## gzip 压缩与搜索总数快路径（2026-10-29）
 
 - JSON 响应可能带 `Content-Encoding: gzip`：只压缩“成功、`application/json`、已知长度 ≤4 MiB”的响应；
