@@ -5,14 +5,31 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError, api } from "../src/lib/api/client";
 import { PlayerDanmakuOverlay } from "../src/features/player/components/player-danmaku-overlay";
+import { forgetKnownEmptyDanmakuSources } from "../src/features/player/danmaku";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+const RAW_URL = "/api/v1/items/item-1/danmaku/raw?sourceId=source-1";
+
+function mockDanmakuInfo(rawUrl = RAW_URL) {
+  return vi.spyOn(api, "webDanmaku").mockResolvedValue({
+    available: true,
+    format: "BILIBILI_XML",
+    sourceId: "source-1",
+    rawUrl,
+  });
+}
+
+function settlement() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
 
 describe("LuxPlayer danmaku overlay", () => {
   let container: HTMLDivElement;
   let root: Root;
 
   beforeEach(() => {
+    forgetKnownEmptyDanmakuSources();
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -25,12 +42,7 @@ describe("LuxPlayer danmaku overlay", () => {
   });
 
   it("loads only while visible and renders parsed danmaku as text nodes", async () => {
-    const metadata = vi.spyOn(api, "webDanmaku").mockResolvedValue({
-      available: true,
-      format: "BILIBILI_XML",
-      sourceId: "source-1",
-      rawUrl: "/api/v1/items/item-1/danmaku/raw?sourceId=source-1",
-    });
+    const metadata = mockDanmakuInfo();
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response('<?xml version="1.0" encoding="UTF-8"?>\n<i><d p="0,1,25,16711680,0,0,0,0">&lt;strong&gt;safe&lt;/strong&gt;</d></i>'),
     );
@@ -46,7 +58,7 @@ describe("LuxPlayer danmaku overlay", () => {
           lifecycleKey="session-1"
         />,
       );
-      await Promise.resolve();
+      await settlement();
     });
     expect(metadata).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
@@ -62,12 +74,12 @@ describe("LuxPlayer danmaku overlay", () => {
           lifecycleKey="session-1"
         />,
       );
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      await settlement();
     });
 
     expect(metadata).toHaveBeenCalledWith("item-1", "source-1");
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/v1/items/item-1/danmaku/raw?sourceId=source-1",
+      RAW_URL,
       expect.objectContaining({ credentials: "same-origin" }),
     );
     const text = container.querySelector<HTMLElement>(".lux-player-danmaku-text");
@@ -85,7 +97,7 @@ describe("LuxPlayer danmaku overlay", () => {
           lifecycleKey="session-1"
         />,
       );
-      await Promise.resolve();
+      await settlement();
     });
     expect(container.querySelector("[data-lux-danmaku-overlay]")).toBeNull();
   });
@@ -113,7 +125,7 @@ describe("LuxPlayer danmaku overlay", () => {
             onStatusChange={onStatusChange}
           />,
         );
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        await settlement();
       });
     };
 
@@ -132,5 +144,164 @@ describe("LuxPlayer danmaku overlay", () => {
 
     expect(metadata).toHaveBeenCalledTimes(1);
     expect(onStatusChange).not.toHaveBeenCalledWith("弹幕加载失败");
+  });
+
+  it("reports a truncation status for a file with more entries than the render budget", async () => {
+    mockDanmakuInfo();
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(`<i>${'<d p="1,1,25,16777215,0,0,0,0">弹幕</d>'.repeat(25_000)}</i>`),
+    );
+    const onStatusChange = vi.fn();
+
+    await act(async () => {
+      root.render(
+        <PlayerDanmakuOverlay
+          itemId="item-truncated"
+          sourceId="source-1"
+          visible
+          currentTime={1}
+          playbackRate={1}
+          lifecycleKey="session-1"
+          onStatusChange={onStatusChange}
+        />,
+      );
+      await settlement();
+      await settlement();
+    });
+
+    const statuses = onStatusChange.mock.calls.map(([status]) => status);
+    expect(statuses).toContain(null);
+    const truncation = statuses.find((status) => typeof status === "string" && status.includes("已截断"));
+    expect(truncation).toBeTruthy();
+    expect(truncation).toContain("抽样");
+    // The file is still rendered (sampled) instead of being rejected as a whole.
+    expect(container.querySelectorAll(".lux-player-danmaku-text").length).toBeGreaterThan(0);
+    expect(container.querySelectorAll(".lux-player-danmaku-text").length).toBeLessThanOrEqual(80);
+  });
+
+  it("reports an empty-content status when the file carries no usable danmaku", async () => {
+    mockDanmakuInfo();
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("<i></i>"));
+    const onStatusChange = vi.fn();
+
+    await act(async () => {
+      root.render(
+        <PlayerDanmakuOverlay
+          itemId="item-empty"
+          sourceId="source-1"
+          visible
+          currentTime={1}
+          playbackRate={1}
+          lifecycleKey="session-1"
+          onStatusChange={onStatusChange}
+        />,
+      );
+      await settlement();
+    });
+
+    expect(onStatusChange).toHaveBeenCalledWith("弹幕内容为空");
+    expect(container.querySelector("[data-lux-danmaku-overlay]")).not.toBeNull();
+    expect(container.querySelector(".lux-player-danmaku-text")).toBeNull();
+  });
+
+  it("surfaces a load failure instead of silently rendering nothing", async () => {
+    vi.spyOn(api, "webDanmaku").mockRejectedValue(new Error("boom"));
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    const onStatusChange = vi.fn();
+
+    await act(async () => {
+      root.render(
+        <PlayerDanmakuOverlay
+          itemId="item-failure"
+          sourceId="source-1"
+          visible
+          currentTime={1}
+          playbackRate={1}
+          lifecycleKey="session-1"
+          onStatusChange={onStatusChange}
+        />,
+      );
+      await settlement();
+    });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(onStatusChange).toHaveBeenCalledWith("弹幕加载失败");
+  });
+
+  it("refuses a non-same-origin raw URL without fetching it", async () => {
+    mockDanmakuInfo("https://evil.example/api/v1/items/item-1/danmaku/raw");
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    const onStatusChange = vi.fn();
+
+    await act(async () => {
+      root.render(
+        <PlayerDanmakuOverlay
+          itemId="item-cross-origin"
+          sourceId="source-1"
+          visible
+          currentTime={1}
+          playbackRate={1}
+          lifecycleKey="session-1"
+          onStatusChange={onStatusChange}
+        />,
+      );
+      await settlement();
+    });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(onStatusChange).toHaveBeenCalledWith("弹幕加载失败");
+  });
+
+  it("keeps the server-side 50MB limit and reports an oversized file", async () => {
+    mockDanmakuInfo();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response('<?xml version="1.0"?><i></i>', {
+        headers: { "content-length": String(51 * 1024 * 1024) },
+      }),
+    );
+    const onStatusChange = vi.fn();
+
+    await act(async () => {
+      root.render(
+        <PlayerDanmakuOverlay
+          itemId="item-huge"
+          sourceId="source-1"
+          visible
+          currentTime={1}
+          playbackRate={1}
+          lifecycleKey="session-1"
+          onStatusChange={onStatusChange}
+        />,
+      );
+      await settlement();
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(onStatusChange).toHaveBeenCalledWith("弹幕文件过大");
+  });
+
+  it("keeps the existing props contract without the optional danmaku additions", async () => {
+    mockDanmakuInfo();
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response('<i><d p="0,5,25,16777215,0,0,0,0">顶部</d></i>'),
+    );
+
+    await act(async () => {
+      root.render(
+        <PlayerDanmakuOverlay
+          itemId="item-legacy"
+          sourceId="source-1"
+          visible
+          currentTime={0.5}
+          playbackRate={1.5}
+          lifecycleKey="session-1"
+        />,
+      );
+      await settlement();
+    });
+
+    const node = container.querySelector<HTMLElement>(".lux-player-danmaku-top");
+    expect(node?.textContent).toBe("顶部");
+    expect(node?.style.transform).toContain("translate3d");
   });
 });

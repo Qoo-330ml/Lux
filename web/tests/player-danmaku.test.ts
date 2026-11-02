@@ -1,12 +1,26 @@
 import { describe, expect, it } from "vitest";
 import {
+  DANMAKU_LIMITS,
   DanmakuParseError,
-  activeDanmaku,
-  assignDanmakuLanes,
   exceedsUtf8ByteLimit,
   parseBilibiliDanmaku,
+  parseDanmakuXml,
 } from "../src/features/player/danmaku";
 import { parseDanmakuWorkerRequest } from "../src/features/player/danmaku-worker";
+
+const NO_DANMAKU = '<d p="1,1,25,0,0,0,0,0">entry</d>';
+
+function deterministicRandom(seed = 1) {
+  let state = seed >>> 0;
+  return () => {
+    // mulberry32: a tiny deterministic generator so sampling assertions stay reproducible.
+    state = (state + 0x6d2b79f5) >>> 0;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  };
+}
 
 describe("LuxPlayer danmaku parser", () => {
   it("checks UTF-8 byte limits without changing Unicode byte semantics", () => {
@@ -43,42 +57,105 @@ describe("LuxPlayer danmaku parser", () => {
     }]);
   });
 
-  it("accepts real-world-sized XML within the byte limit", () => {
-    const entry = '<d p="1,1,25,16777215,0,0,0,0">entry</d>';
-    const xml = `<i>${entry.repeat(30_271)}</i>`;
+  it("tolerates eight-field Bilibili p attributes and skips advanced or dirty entries", () => {
+    const result = parseDanmakuXml(
+      '<i>'
+      // Real Bilibili rows carry eight fields; only the first four are meaningful here.
+      + '<d p="12.5,1,25,16777215,1700000000,0,deadbeef,65264337">八字段</d>'
+      // Mode 7 is an advanced/positioned danmaku the Web renderer does not draw yet.
+      + '<d p="13,7,25,0,0,0,0,0">[0,0,"1-1",4,"高级",0,0,0,0,500,0,1,"#fff"]</d>'
+      // Mode 8 (code danmaku) and unknown modes are skipped as well.
+      + '<d p="14,8,25,0,0,0,0,0">code</d><d p="15,9,25,0,0,0,0,0">unknown</d>'
+      // Dirty rows are dropped one by one instead of failing the whole file.
+      + '<d p="-1,1,25,0,0,0,0,0">负时间</d><d p="1,1,25,0,0,0,0,0">bad\u0000text</d>'
+      + '<d p="1,1,25">too few fields</d><d p="1,1,25,0,0,0,0,0"></d>'
+      + '</i>',
+    );
 
-    expect(parseBilibiliDanmaku(xml)).toHaveLength(30_271);
+    expect(result.truncated).toBe(false);
+    expect(result.totalEntries).toBe(1);
+    expect(result.entries).toEqual([{
+      id: "danmaku-0",
+      start: 12.5,
+      mode: "scroll",
+      text: "八字段",
+      color: "#ffffff",
+      fontSize: 25,
+    }]);
   });
 
-  it("rejects invalid XML and discards unsafe or unsupported entries", () => {
-    expect(() => parseBilibiliDanmaku("<html>not danmaku</html>"))
+  it("truncates oversized files by uniform sampling instead of keeping the first entries", () => {
+    const count = 30_271;
+    const rows = Array.from(
+      { length: count },
+      (_, index) => `<d p="${index},1,25,16777215,0,0,0,0">entry-${index}</d>`,
+    ).join("");
+    const xml = `<i>${rows}</i>`;
+
+    const result = parseDanmakuXml(xml, { random: deterministicRandom(7) });
+
+    expect(result.truncated).toBe(true);
+    expect(result.totalEntries).toBe(count);
+    expect(result.entries).toHaveLength(DANMAKU_LIMITS.maxEntries);
+    // Sampling must stay sorted by playback time and keep ids unique.
+    const starts = result.entries.map((entry) => entry.start);
+    expect(starts).toEqual([...starts].sort((left, right) => left - right));
+    expect(new Set(result.entries.map((entry) => entry.id)).size).toBe(result.entries.length);
+    // A sampled spread reaches both ends of the file; keeping the first N entries could not.
+    expect(Math.min(...starts)).toBeLessThan(count * 0.05);
+    expect(Math.max(...starts)).toBeGreaterThan(count * 0.95);
+  });
+
+  it("keeps a file that exceeds four megabytes but stays under the server limit", () => {
+    const rows = Array.from(
+      { length: 120_000 },
+      (_, index) => `<d p="${index % 86_400},1,25,16777215,0,0,0,0">filler-${index}</d>`,
+    ).join("");
+    const xml = `<i>${rows}</i>`;
+    expect(exceedsUtf8ByteLimit(xml, 4 * 1024 * 1024)).toBe(true);
+
+    const result = parseDanmakuXml(xml, { random: deterministicRandom(3) });
+
+    expect(result.truncated).toBe(true);
+    expect(result.totalEntries).toBe(120_000);
+    expect(result.entries).toHaveLength(DANMAKU_LIMITS.maxEntries);
+  });
+
+  it("still rejects a file beyond the server-side size limit", () => {
+    const oversized = `<i>${" ".repeat(DANMAKU_LIMITS.maxBytes)}${NO_DANMAKU}</i>`;
+    expect(() => parseDanmakuXml(oversized))
+      .toThrowError(new DanmakuParseError("INPUT_TOO_LARGE", "弹幕文件过大"));
+  });
+
+  it("documents the server-side byte limit instead of a smaller client-only one", () => {
+    expect(DANMAKU_LIMITS.maxBytes).toBe(50 * 1024 * 1024);
+  });
+
+  it("rejects invalid XML, unsafe declarations, and keeps DOCTYPE/ENTITY denied", () => {
+    expect(() => parseDanmakuXml("<html>not danmaku</html>"))
       .toThrowError(new DanmakuParseError("INVALID_XML", "弹幕 XML 格式无效"));
-    expect(() => parseBilibiliDanmaku(
+    expect(() => parseDanmakuXml(
       '<i><i><d p="1,1,25,0,0,0,0,0">nested</d></i></i>',
     )).toThrowError(new DanmakuParseError("INVALID_XML", "弹幕 XML 格式无效"));
-    expect(() => parseBilibiliDanmaku(
+    expect(() => parseDanmakuXml(
       '<?xml?><i><d p="1,1,25,0,0,0,0,0">bad declaration</d></i>',
     )).toThrowError(new DanmakuParseError("INVALID_XML", "弹幕 XML 格式无效"));
-    expect(parseBilibiliDanmaku(
-      '<i><d p="1,7,25,0,0,0,0,0">高级模式</d><d p="-1,1,25,0,0,0,0,0">负时间</d><d p="1,1,25,0,0,0,0,0">safe\u0000text</d><d p="1,1,25,0,0,0,0,0"></d></i>',
-    )).toEqual([]);
-    expect(() => parseBilibiliDanmaku(
+    expect(() => parseDanmakuXml(
+      '<!DOCTYPE i [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><i><d p="1,1,25,0,0,0,0,0">&xxe;</d></i>',
+    )).toThrowError(new DanmakuParseError("INVALID_XML", "弹幕 XML 格式无效"));
+    expect(() => parseDanmakuXml(
+      '<!ENTITY xxe "boom"><i><d p="1,1,25,0,0,0,0,0">x</d></i>',
+    )).toThrowError(new DanmakuParseError("INVALID_XML", "弹幕 XML 格式无效"));
+    expect(() => parseDanmakuXml(
       '<i><d p="1,1,25,0,0,0,0,0">unclosed</i>',
     )).toThrowError(new DanmakuParseError("INVALID_XML", "弹幕 XML 格式无效"));
-    expect(() => parseBilibiliDanmaku(
+    expect(() => parseDanmakuXml(
       '<i><d p="1,1,25,0,0,0,0,0">outer<d p="1,1,25,0,0,0,0,0">inner</d></d></i>',
     )).toThrowError(new DanmakuParseError("INVALID_XML", "弹幕 XML 格式无效"));
   });
 
-  it("rejects more raw entries than the parser limit", () => {
-    const entry = '<d p="1,1,25,0,0,0,0,0">entry</d>';
-    expect(() => parseBilibiliDanmaku(
-      `<i>${entry.repeat(50_001)}</i>`,
-    )).toThrowError(new DanmakuParseError("TOO_MANY_ENTRIES", "弹幕条目过多"));
-  });
-
-  it("reports malformed XML before the entry limit", () => {
-    expect(() => parseBilibiliDanmaku(
+  it("reports malformed XML even when the entry count is enormous", () => {
+    expect(() => parseDanmakuXml(
       `<i>${"<d".repeat(5_001)}</i>`,
     )).toThrowError(new DanmakuParseError("INVALID_XML", "弹幕 XML 格式无效"));
   });
@@ -99,6 +176,8 @@ describe("LuxPlayer danmaku parser", () => {
         color: "#ffffff",
         fontSize: 25,
       }],
+      truncated: false,
+      totalEntries: 1,
     });
     expect(parseDanmakuWorkerRequest({
       type: "PARSE",
@@ -110,43 +189,24 @@ describe("LuxPlayer danmaku parser", () => {
       message: "弹幕 XML 格式无效",
     });
   });
-});
 
-describe("LuxPlayer danmaku lane scheduler", () => {
-  it("assigns scrolling, top, and bottom danmaku to independent non-overlapping lanes", () => {
-    const entries = parseBilibiliDanmaku(
-      '<i><d p="0,1,25,0,0,0,0,0">first</d><d p="0.1,1,25,0,0,0,0,0">second</d><d p="1,5,25,0,0,0,0,0">top</d><d p="2,4,25,0,0,0,0,0">bottom</d></i>',
-    );
-    expect(assignDanmakuLanes(entries, { width: 900, height: 450 })).toEqual([
-      expect.objectContaining({ id: "danmaku-0", lane: 0, duration: 8 }),
-      expect.objectContaining({ id: "danmaku-1", lane: 1, duration: 8 }),
-      expect.objectContaining({ id: "danmaku-2", lane: 0, duration: 4 }),
-      expect.objectContaining({ id: "danmaku-3", lane: 0, duration: 4 }),
-    ]);
-    const safeZoneEntries = [entries[0]!, entries[2]!, entries[3]!];
-    const placements = activeDanmaku(
-      assignDanmakuLanes(safeZoneEntries, { width: 390, height: 590 }),
-      2.5,
-      { width: 390, height: 590 },
-    );
-    expect(new Set(placements.map((placement) => placement.y)).size).toBe(3);
-  });
+  it("reports truncation from the worker so the page can tell the user", () => {
+    const rows = Array.from(
+      { length: 25_000 },
+      (_, index) => `<d p="${index},1,25,16777215,0,0,0,0">row-${index}</d>`,
+    ).join("");
+    const response = parseDanmakuWorkerRequest({
+      type: "PARSE",
+      requestId: 21,
+      xml: `<i>${rows}</i>`,
+    });
 
-  it("keeps scheduling bounded and activates only entries at the playback time", () => {
-    const entries = Array.from({ length: 1_000 }, (_, index) => ({
-      id: `danmaku-${index}`,
-      start: index / 10,
-      mode: "scroll" as const,
-      text: "弹幕",
-      color: "#ffffff",
-      fontSize: 25,
-    }));
-    const scheduled = assignDanmakuLanes(entries, { width: 320, height: 180 });
-    expect(scheduled).toHaveLength(1_000);
-    expect(scheduled.every((entry) => entry.lane >= 0 && entry.lane < 4)).toBe(true);
-    expect(activeDanmaku(scheduled, 10)).toEqual(
-      expect.arrayContaining([expect.objectContaining({ id: "danmaku-100" })]),
-    );
-    expect(activeDanmaku(scheduled, 10).length).toBeLessThanOrEqual(80);
+    expect(response).toMatchObject({
+      type: "PARSED",
+      requestId: 21,
+      truncated: true,
+      totalEntries: 25_000,
+    });
+    expect(response.type === "PARSED" ? response.entries : []).toHaveLength(DANMAKU_LIMITS.maxEntries);
   });
 });

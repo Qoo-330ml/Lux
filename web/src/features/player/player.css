@@ -191,9 +191,15 @@
 
 .lux-player-danmaku-overlay { position: absolute; inset: clamp(88px, 12vh, 120px) 0 clamp(92px, 18vh, 156px) 0; z-index: 7; overflow: hidden; pointer-events: none; }
 
-.lux-player-danmaku-text { position: absolute; display: block; max-width: 90%; overflow: hidden; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-weight: 600; line-height: 1.2; text-shadow: 0 1px 2px rgba(0,0,0,.95), 1px 0 2px rgba(0,0,0,.7), -1px 0 2px rgba(0,0,0,.7); white-space: pre-line; }
+/* Positions come from the renderer as `transform: translate3d(...)`, so no layout is recalculated
+   per frame and the safe-area inset above keeps danmaku out of the title and control zones. */
+.lux-player-danmaku-text { position: absolute; top: 0; left: 0; display: block; max-width: 90%; overflow: hidden; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-weight: 600; line-height: 1.2; text-shadow: 0 1px 2px rgba(0,0,0,.95), 1px 0 2px rgba(0,0,0,.7), -1px 0 2px rgba(0,0,0,.7); white-space: pre-line; will-change: transform; }
 
-.lux-player-danmaku-top, .lux-player-danmaku-bottom { left: 50% !important; max-width: min(90%, 72rem); transform: translateX(-50%); text-align: center; }
+.lux-player-danmaku-top, .lux-player-danmaku-bottom { max-width: min(90%, 72rem); text-align: center; }
+
+/* Load outcome for the danmaku track, mirroring the caption status: it must stay outside the
+   aria-hidden overlay so the reason (“加载失败” / “已截断” / “内容为空”) is announced once. */
+.lux-player-danmaku-status { position: absolute; top: calc(80px + env(safe-area-inset-top)); left: 50%; max-width: min(86vw, 460px); padding: 6px 11px; border: 1px solid rgba(255,255,255,.16); border-radius: 999px; transform: translateX(-50%); color: #fff; background: rgba(16,16,18,.72); box-shadow: 0 6px 18px rgba(0,0,0,.28); font-size: .76rem; line-height: 1.3; text-align: center; pointer-events: none; z-index: 8; }
 
 .lux-player-settings-popover { position: absolute; right: calc(2% + env(safe-area-inset-right)); bottom: calc(70px + env(safe-area-inset-bottom)); width: 270px; max-height: calc(100vh - 32px); max-height: calc(100dvh - 32px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding: 16px; border: 1px solid rgba(255,255,255,.15); border-radius: 16px; background: rgba(18,18,26,.88); backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); box-shadow: 0 20px 50px rgba(0,0,0,.6); z-index: 20; color: #fff; animation: lux-popover-in .2s var(--lux-ease); }
 

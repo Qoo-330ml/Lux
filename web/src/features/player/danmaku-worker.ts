@@ -1,8 +1,8 @@
 import {
   DanmakuParseError,
-  parseBilibiliDanmaku,
+  parseDanmakuXml,
   type LuxDanmakuEntry,
-} from "./danmaku";
+} from "./danmaku/parse";
 
 export type DanmakuWorkerRequest = {
   type: "PARSE";
@@ -11,15 +11,28 @@ export type DanmakuWorkerRequest = {
 };
 
 export type DanmakuWorkerResponse =
-  | { type: "PARSED"; requestId: number; entries: LuxDanmakuEntry[] }
+  | {
+    type: "PARSED";
+    requestId: number;
+    entries: LuxDanmakuEntry[];
+    /**
+     * A file with more entries than the parse budget is sampled instead of rejected; the page uses
+     * this flag to tell the user that what they see is truncated.
+     */
+    truncated: boolean;
+    totalEntries: number;
+  }
   | { type: "FAILED"; requestId: number; message: string };
 
 export function parseDanmakuWorkerRequest(request: DanmakuWorkerRequest): DanmakuWorkerResponse {
   try {
+    const result = parseDanmakuXml(request.xml);
     return {
       type: "PARSED",
       requestId: request.requestId,
-      entries: parseBilibiliDanmaku(request.xml),
+      entries: result.entries,
+      truncated: result.truncated,
+      totalEntries: result.totalEntries,
     };
   } catch (error) {
     return {
