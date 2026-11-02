@@ -578,9 +578,17 @@ luxd::application::notifier_plugin_sdk::run_notifier(|request| {
 #### 目的地守卫
 
 通知器必须把宿主在 `notification.send` 里给出的 `target.allowPrivateNetwork` 原样传给守卫，不能自行放宽。守卫
-一次性解析目的地的全部地址并逐个校验：回环、私网和链路本地地址只有在管理员批准私网时才允许；未指定地址
-（`0.0.0.0`、`::`）、链路本地（含云元数据 `169.254.169.254`）、多播、广播以及文档/基准测试等保留网段即使批准
-私网也始终拒绝。IP 分类复用核心的 `webhooks::is_dangerous_address`、`webhooks::is_private_address` 与
+一次性解析目的地的全部地址并逐个校验，分类与核心策略一致：
+
+- **批准私网后可用**：回环、RFC1918 私网、IPv6 唯一本地地址、链路本地，以及核心归类为私网的 CGNAT
+  （`100.64.0.0/10`）、基准测试（`198.18.0.0/15`）和 `192.0.0.0/24`。未批准私网时这些地址一律拒绝。
+- **即使批准私网也始终拒绝**：未指定地址（`0.0.0.0`、`::`）、链路本地/云元数据（`169.254.169.254` 等）、
+  多播、`240.0.0.0/4` 与受限广播 `255.255.255.255`、文档网段（`192.0.2.0/24`、`198.51.100.0/24`、
+  `203.0.113.0/24`、`2001:db8::/32`），以及 6to4、Teredo、NAT64 等可封装任意 IPv4 的形式。
+- IPv4-mapped（`::ffff:a.b.c.d`）与已废弃的 IPv4-compatible（`::a.b.c.d`、`::/96`）都按内嵌 IPv4 地址分类；
+  `::` 与 `::1` 保留其 IPv6 语义（未指定/回环）。
+
+IP 分类复用核心的 `webhooks::is_dangerous_address`、`webhooks::is_private_address` 与
 `remote_url_policy::is_private_or_reserved`，插件不应再复制一份网段判断。
 
 守卫只返回稳定错误码（`DestinationGuardError::code()`），插件不得把完整 URL 或主机写进日志、返回值或投递记录：
@@ -614,6 +622,13 @@ let response = client.post(guarded.url().clone()).json(&payload).send().await;
 
 `guarded.url()` 保持管理员配置的原值（含路径与 query），只有连接目标被替换为已校验地址；重定向仍然禁用，所以
 上游的 3xx 不会绕过守卫。
+
+代理与 `pin()` 的关系：
+
+- 未配置 `LUX_PROXY_URL` 时，SDK 的 `outbound_http_client_builder(_from_env)` 会调用 `no_proxy()`，忽略
+  `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` 与系统代理，保证请求直连守卫校验过的地址。
+- 管理员显式配置了 `LUX_PROXY_URL` 时，请求按管理员配置走代理（代理仍遵守 `NO_PROXY`）。此时由代理解析目标
+  主机，`pin()` 不再决定实际连接地址；守卫仍然按解析结果做拒绝判断。
 
 通知器插件包使用 `scripts/package-notifier-plugin.sh <插件目录名> [target]` 打包：脚本从
 `plugins/<目录名>/manifest.json` 读取 ID、版本、入口和声明文件，拒绝非 `notification` 或缺少
@@ -679,7 +694,8 @@ manifest 声明 `type: "notification"`、`category: "NOTIFICATION"`、`capabilit
   `{device_key,title,body,group,level,icon,sound}`，未设置的可选字段省略；设备密钥只在请求体里。
 - 目的地守卫：插件把宿主给出的 `target.allowPrivateNetwork` 原样传给 `guard_destination`，默认（字段缺失或
   `false`）拒绝回环/私网目的地，`169.254.169.254` 等危险保留地址即使批准私网也始终拒绝；通过后把已解析地址
-  钉进出站 client，`serverUrl` 的路径与 query 保持原样，重定向仍禁用。
+  钉进出站 client（仅在未配置 `LUX_PROXY_URL` 时生效，见上文“代理与 `pin()` 的关系”），`serverUrl` 的路径与
+  query 保持原样，重定向仍禁用。
 - 出站 client 使用宿主代理策略、10 秒超时且不跟随重定向；`2xx` 响应体最多读取 64 KiB。若进程启动时无法按
   宿主代理策略构建 client，插件直接以失败退出（不返回伪造的投递结果），因此没有额外的
   `*_client_unavailable` 错误码。

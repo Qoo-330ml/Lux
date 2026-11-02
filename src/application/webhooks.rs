@@ -21,6 +21,7 @@ use crate::application::{
     notification_template,
     plugin_protocol::{NotificationSendRpcRequest, NotificationSendStatus, PluginConfigField},
     plugins::PluginService,
+    remote_url_policy::ipv4_compatible_target,
 };
 use crate::storage::{
     Database, NewNotificationDestination, NewNotificationEvent, StorageError,
@@ -1382,10 +1383,13 @@ pub(crate) fn is_dangerous_address(address: IpAddr) -> bool {
                 || value.octets()[0] == 0
         }
         IpAddr::V6(value) => {
-            // Only IPv4-mapped addresses carry an IPv4 target; IPv4-compatible addresses are
-            // deprecated and must not be unwrapped into a different policy decision.
             if let Some(mapped) = value.to_ipv4_mapped() {
                 return is_dangerous_address(IpAddr::V4(mapped));
+            }
+            // A deprecated IPv4-compatible address (`::/96`) still carries an IPv4 target, so it
+            // must not bypass the IPv4 policy; `::` and `::1` keep their IPv6 meaning.
+            if let Some(compatible) = ipv4_compatible_target(value) {
+                return is_dangerous_address(IpAddr::V4(compatible));
             }
             value.is_unspecified() || value.is_multicast() || value.is_unicast_link_local()
         }
@@ -1409,6 +1413,9 @@ pub(crate) fn is_private_address(address: IpAddr) -> bool {
         IpAddr::V6(value) => {
             if let Some(mapped) = value.to_ipv4_mapped() {
                 return is_private_address(IpAddr::V4(mapped));
+            }
+            if let Some(compatible) = ipv4_compatible_target(value) {
+                return is_private_address(IpAddr::V4(compatible));
             }
             let octets = value.octets();
             value.is_loopback() || value.is_unicast_link_local() || (octets[0] & 0xfe) == 0xfc

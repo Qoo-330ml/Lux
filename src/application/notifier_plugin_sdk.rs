@@ -286,11 +286,27 @@ async fn write_response<W: AsyncWrite + Unpin>(
 /// when the host supplies one), never follows redirects and gives every request
 /// [`NOTIFIER_HTTP_TIMEOUT`]. Use it instead of [`outbound_http_client`] when a destination has to be
 /// pinned with [`GuardedDestination::pin`] before the client is built.
+///
+/// When no administrator proxy is configured the builder disables proxies entirely
+/// (`no_proxy`), so `HTTP_PROXY`/`HTTPS_PROXY` and the system proxy cannot silently redirect a
+/// delivery: a guarded destination must reach the address the guard validated. When
+/// [`NOTIFIER_PROXY_URL_ENV`] (or `proxy_url`) is set, the request goes through the administrator
+/// proxy instead, the proxy resolves the destination, and [`GuardedDestination::pin`] no longer
+/// decides which address is contacted.
 pub fn outbound_http_client_builder(
     proxy_url: Option<&str>,
 ) -> Result<ClientBuilder, NotifierSdkError> {
-    let builder = network::client_builder_from_env_or(proxy_url)
+    let proxy_url = match proxy_url {
+        Some(proxy_url) => Some(proxy_url.to_owned()),
+        None => network::proxy_url_from_env().map_err(|_| NotifierSdkError::InvalidProxy)?,
+    };
+    let builder = network::apply_proxy(reqwest::Client::builder(), proxy_url.as_deref())
         .map_err(|_| NotifierSdkError::InvalidProxy)?;
+    let builder = if proxy_url.is_some() {
+        builder
+    } else {
+        builder.no_proxy()
+    };
     Ok(builder
         .timeout(NOTIFIER_HTTP_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
@@ -343,10 +359,15 @@ pub enum DestinationGuardError {
     ResolutionFailed,
     /// A loopback, private or link-local destination the administrator did not approve.
     PrivateAddress,
-    /// An address that stays forbidden even with `allowPrivateNetwork`: unspecified, link-local
-    /// (cloud metadata), multicast and broadcast ranges.
+    /// An address that stays forbidden even with `allowPrivateNetwork`: unspecified (`0.0.0.0`,
+    /// `::`), link-local (including cloud metadata such as `169.254.169.254`) and multicast ranges.
     DangerousAddress,
-    /// Documentation, benchmarking, reserved and otherwise unroutable ranges.
+    /// An address that is neither private nor dangerous but is still unroutable, so it stays
+    /// forbidden even with `allowPrivateNetwork`: documentation ranges (`192.0.2.0/24`,
+    /// `198.51.100.0/24`, `203.0.113.0/24`, `2001:db8::/32`), `240/4`, the limited broadcast
+    /// address and tunnelled forms such as 6to4, Teredo and NAT64. The core policy classifies
+    /// CGNAT (`100.64/10`), benchmarking (`198.18/19`) and `192.0.0.0/24` as private, so those are
+    /// reachable after a private-network approval.
     ReservedAddress,
 }
 
@@ -453,8 +474,9 @@ impl GuardedHost {
 /// The host passes `allowPrivateNetwork` in `notification.send`; a plugin must forward it and must
 /// never widen it. Every resolved address is checked: loopback, private and link-local destinations
 /// are rejected unless the administrator approved the private network, while unspecified,
-/// link-local (cloud metadata), multicast, broadcast, documentation and reserved ranges are always
-/// rejected. Use [`GuardedDestination::pin`] before building the request client.
+/// link-local (cloud metadata), multicast, documentation, `240/4` and broadcast addresses are always
+/// rejected. IPv4-mapped and IPv4-compatible (`::/96`) forms are classified by their embedded IPv4
+/// target. Use [`GuardedDestination::pin`] before building the request client.
 pub async fn guard_destination(
     url: &Url,
     allow_private_network: bool,
@@ -953,6 +975,23 @@ mod tests {
             Err(ReservedAddress)
         );
         assert_eq!(check_address("::ffff:93.184.216.34", false), Ok(()));
+
+        // The deprecated IPv4-compatible form (`::/96`) must not bypass the embedded IPv4 policy.
+        assert_eq!(check_address("::127.0.0.1", false), Err(PrivateAddress));
+        assert_eq!(check_address("::127.0.0.1", true), Ok(()));
+        assert_eq!(check_address("::192.168.1.1", false), Err(PrivateAddress));
+        assert_eq!(check_address("::192.168.1.1", true), Ok(()));
+        assert_eq!(
+            check_address("::169.254.169.254", true),
+            Err(DangerousAddress)
+        );
+        assert_eq!(check_address("::203.0.113.5", true), Err(ReservedAddress));
+        assert_eq!(check_address("::93.184.216.34", false), Ok(()));
+        assert_eq!(check_address("::", true), Err(DangerousAddress));
+
+        // The IPv6 documentation range is reserved and never reachable.
+        assert_eq!(check_address("2001:db8::1", false), Err(ReservedAddress));
+        assert_eq!(check_address("2001:db8::1", true), Err(ReservedAddress));
 
         assert_eq!(check_address("2001:4860:4860::8888", false), Ok(()));
     }

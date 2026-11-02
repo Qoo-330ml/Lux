@@ -45,19 +45,37 @@ struct Plugin {
 
 impl Plugin {
     fn spawn() -> Result<Self, Box<dyn std::error::Error>> {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_lux-plugin-notifier-bark"))
-            // A notification plugin never receives LUX_CONFIG_DIR, so the plugin must not depend on
-            // it. Proxy variables are cleared so the loopback mock server is always reached directly.
+        Self::spawn_with_environment(&[])
+    }
+
+    /// Spawns the plugin with a clean proxy environment plus explicit overrides.
+    ///
+    /// A notification plugin never receives `LUX_CONFIG_DIR`, so the plugin must not depend on it.
+    /// Proxy variables are cleared (and `NO_PROXY` is left unset, so a test that sets a proxy really
+    /// exercises it) because the loopback mock server must always be reached directly.
+    fn spawn_with_environment(
+        overrides: &[(&str, &str)],
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_lux-plugin-notifier-bark"));
+        command
             .env_remove("LUX_CONFIG_DIR")
             .env_remove("LUX_PROXY_URL")
-            .env_remove("HTTP_PROXY")
-            .env_remove("HTTPS_PROXY")
-            .env_remove("ALL_PROXY")
-            .env_remove("http_proxy")
-            .env_remove("https_proxy")
-            .env_remove("all_proxy")
-            .env("NO_PROXY", "127.0.0.1,localhost")
-            .env("no_proxy", "127.0.0.1,localhost")
+            .env_remove("NO_PROXY")
+            .env_remove("no_proxy");
+        for variable in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            command.env_remove(variable);
+        }
+        for (key, value) in overrides {
+            command.env(key, value);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -967,6 +985,41 @@ async fn retries_when_the_response_body_connection_breaks() -> Result<(), Box<dy
 
     assert_eq!(result.status, NotificationSendStatus::Retryable);
     assert_eq!(result.error_code.as_deref(), Some("provider_unavailable"));
+    assert!(!stderr.contains(DEVICE_KEY));
+    Ok(())
+}
+
+#[tokio::test]
+async fn ignores_an_environment_proxy_for_a_guarded_destination()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (port, recorder, server) = spawn_push_server(bark_success()).await?;
+    // Every ambient proxy variable points at a dead endpoint: an honoured proxy would fail the
+    // delivery, while the guarded path must connect straight to the validated address.
+    let dead_proxy = "http://127.0.0.1:1";
+    let mut plugin = Plugin::spawn_with_environment(&[
+        ("HTTP_PROXY", dead_proxy),
+        ("HTTPS_PROXY", dead_proxy),
+        ("ALL_PROXY", dead_proxy),
+        ("http_proxy", dead_proxy),
+        ("https_proxy", dead_proxy),
+        ("all_proxy", dead_proxy),
+    ])?;
+
+    let result = plugin
+        .send(notification_params(
+            json!({"serverUrl": format!("http://127.0.0.1:{port}")}),
+            Some(DEVICE_KEY),
+        ))
+        .await?;
+    let stderr = plugin.finish().await?;
+    server.abort();
+
+    assert_eq!(result.status, NotificationSendStatus::Delivered);
+    assert_eq!(
+        recorder.len(),
+        1,
+        "the request must reach the mock directly"
+    );
     assert!(!stderr.contains(DEVICE_KEY));
     Ok(())
 }
