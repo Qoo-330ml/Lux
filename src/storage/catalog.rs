@@ -3516,7 +3516,7 @@ impl Database {
                  JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
                  {candidate_where}
              ),
-             page AS (
+             paged AS (
                  SELECT id, sort_title, last_played_at
                  FROM history
                  ORDER BY last_played_at DESC, sort_title, id
@@ -3547,8 +3547,8 @@ impl Database {
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
-             FROM page
-             JOIN media_items mi ON mi.id = page.id
+             FROM paged
+             JOIN media_items mi ON mi.id = paged.id
              LEFT JOIN media_items series ON series.id = mi.series_id
              LEFT JOIN media_sources ms
                ON ms.item_id = mi.id
@@ -3557,7 +3557,7 @@ impl Database {
                   WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
               )
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
-             ORDER BY page.last_played_at DESC, page.sort_title, page.id,
+             ORDER BY paged.last_played_at DESC, paged.sort_title, paged.id,
                       ms.id, mt.stream_index"
         );
         let mut binds = candidate_binds;
@@ -10729,7 +10729,7 @@ fn watch_history_candidate_clause<'a>(
         query
             .item_types
             .iter()
-            .map(|item_type| CatalogBind::Text(*item_type)),
+            .map(|item_type| CatalogBind::Text(item_type)),
     );
     binds.extend(
         query

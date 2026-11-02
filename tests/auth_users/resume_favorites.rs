@@ -1424,6 +1424,18 @@ async fn watch_history_lists_the_users_played_items_newest_first()
         .send()
         .await?;
     assert_eq!(invalid_page.status(), reqwest::StatusCode::BAD_REQUEST);
+    let empty_page = client
+        .get(format!(
+            "{base_url}/api/v1/watch-history?page=9&pageSize=10"
+        ))
+        .header(COOKIE, &admin_cookies)
+        .send()
+        .await?;
+    assert_eq!(empty_page.status(), reqwest::StatusCode::OK);
+    let empty_page_body = empty_page.json::<Value>().await?;
+    assert_eq!(empty_page_body["items"].as_array().map(Vec::len), Some(0));
+    assert_eq!(empty_page_body["total"], 2);
+    assert_eq!(empty_page_body["hasNext"], false);
 
     let viewer_login = client
         .post(format!("{base_url}/api/v1/auth/login"))
