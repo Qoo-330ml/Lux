@@ -778,14 +778,14 @@ LUX-271 的扫描配置优先级和目录替换安全检查已保留；并行目
 
 ## Web Bilibili 弹幕解析
 
-基准脚本为 `scripts/run-danmaku-performance.mjs`，从指定 Git revision 加载优化前解析器，并与当前工作树在相同 Node 进程中交替执行。输入包含 5,000 条合法弹幕和一个超过 4 MiB 的 ASCII XML；每组 5 批、每批 30 个样本，报告各批 p50/p95 的中位数。
+基准脚本为 `scripts/run-danmaku-performance.mjs`，从指定 Git revision 加载优化前解析器，并与当前工作树在相同 Node 进程中交替执行。解析器路径分别配置：baseline 默认取该 revision 的 `web/src/features/player/danmaku.ts`（该 revision 没有旧文件时回退到 `web/src/features/player/danmaku/parse.ts`），current 取工作树的 `web/src/features/player/danmaku/parse.ts`；`node scripts/run-danmaku-performance.mjs --check` 只校验路径解析与加载，不跑基准。输入包含 5,000 条合法弹幕和一个超过 16 MiB 客户端预算的 ASCII XML（默认 17 MiB，可用 `LUX_DANMAKU_OVERSIZED_BYTES` 覆盖）；每组 5 批、每批 30 个样本，报告各批 p50/p95 的中位数。
 
 | 日期 | 提交 | 硬件/运行时 | 命令 | 场景 | 优化前 p50/p95 | 优化后 p50/p95 | 结果 |
 |---|---|---|---|---|---:|---:|---|
 | 2026-08-28 | `85db4549` | macOS ARM64 (`uname -m=arm64`), Node 24.14.1 | `LUX_DANMAKU_BASELINE_REF=85db4549^ node --expose-gc scripts/run-danmaku-performance.mjs` | 5,000 条、2,540,007 bytes 合法 XML | 13.423 / 13.735 ms | 13.197 / 13.565 ms | 解析结果均为 5,000 条 |
 | 2026-08-28 | `85db4549` | macOS ARM64 (`uname -m=arm64`), Node 24.14.1 | 同上 | 4,194,311 bytes 超大 ASCII XML 大小检查 | 2.094 / 2.879 ms | 0.002 / 0.002 ms | 均返回 `INPUT_TOO_LARGE` |
 
-该结果只代表本机 ARM64 Node 基准，不外推 NAS/x86_64 或所有浏览器；Chrome 151 本地浏览器实测同一合法夹具 p50/p95 为 8.1/8.6 ms。
+下表两行对应重构前的解析器（`web/src/features/player/danmaku.ts`，4 MiB 上限）：现行解析器已把实现移到 `web/src/features/player/danmaku/parse.ts`，改为 16 MiB 客户端预算、超过 50,000 条时均匀抽样，并由 Worker 解码字节，因此这组数字不再代表当前代码，抽样开销与 17 MiB 大小检查的性能**待重测**。该结果只代表本机 ARM64 Node 基准，不外推 NAS/x86_64 或所有浏览器；Chrome 151 本地浏览器实测同一合法夹具 p50/p95 为 8.1/8.6 ms（重构前解析器）。
 
 ## 规则
 
