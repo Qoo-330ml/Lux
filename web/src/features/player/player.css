@@ -231,6 +231,24 @@
 
 .lux-player-caption-offset:focus-visible { outline: 2px solid rgba(255,255,255,.82); outline-offset: 2px; }
 
+/* Danmaku settings reuse the subtitle offset/speed styles; only the keyword list and the two-column
+   label rows need their own rules. */
+.lux-player-danmaku-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.lux-player-danmaku-value { color: #fff; font-size: .78rem; font-variant-numeric: tabular-nums; }
+.lux-player-danmaku-row .lux-player-settings-label { margin-bottom: 0; }
+.lux-player-danmaku-settings > .lux-player-settings-label { margin-top: 4px; }
+.lux-player-danmaku-hint { margin: 2px 0 4px; color: var(--lux-muted); font-size: .68rem; line-height: 1.4; }
+.lux-player-danmaku-keyword-form { display: flex; gap: 6px; }
+.lux-player-danmaku-keyword-input { flex: 1; min-width: 0; height: 28px; padding: 0 8px; border: 1px solid var(--lux-line-soft); border-radius: 8px; background: rgba(255,255,255,.04); color: #fff; font: inherit; font-size: .78rem; }
+.lux-player-danmaku-keyword-input:focus-visible { outline: 2px solid rgba(255,255,255,.82); outline-offset: 2px; }
+.lux-player-danmaku-keyword-add { height: 28px; padding: 0 10px; border: 1px solid var(--lux-line-soft); border-radius: 8px; background: rgba(255,255,255,.06); color: #fff; font: inherit; font-size: .78rem; cursor: pointer; }
+.lux-player-danmaku-keyword-add:hover:not(:disabled) { background: rgba(255,255,255,.12); }
+.lux-player-danmaku-keyword-add:disabled { opacity: .45; cursor: not-allowed; }
+.lux-player-danmaku-keywords { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 0; padding: 0; list-style: none; }
+.lux-player-danmaku-keyword { display: flex; align-items: center; gap: 4px; padding: 2px 4px 2px 8px; border-radius: 999px; background: rgba(255,255,255,.08); font-size: .74rem; }
+.lux-player-danmaku-keyword-remove { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--lux-muted); cursor: pointer; }
+.lux-player-danmaku-keyword-remove:hover, .lux-player-danmaku-keyword-remove:focus-visible { color: #fff; background: rgba(255,255,255,.14); }
+
 .lux-player-speed-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
 
 .lux-player-speed-pill { display: flex; align-items: center; justify-content: center; gap: 4px; padding: 6px 8px; border: 1px solid var(--lux-line-soft); border-radius: 8px; font-size: .78rem; color: var(--lux-text); background: rgba(255,255,255,.04); cursor: pointer; transition: all .15s ease; }

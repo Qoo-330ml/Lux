@@ -24,4 +24,22 @@ describe("LuxPlayer danmaku page wiring", () => {
     expect(source).toContain('className="lux-player-danmaku-status"');
     expect(source).toMatch(/\{danmakuStatus \?/);
   });
+
+  it("feeds the local danmaku settings to both the overlay and the settings panel", () => {
+    const source = readFileSync(
+      new URL("../src/features/player/PlayerPage.tsx", import.meta.url),
+      "utf8",
+    );
+    const overlay = /<PlayerDanmakuOverlay[\s\S]*?\/>/.exec(source)?.[0] ?? "";
+    const panel = /<PlayerSettingsPanel[\s\S]*?\/>/.exec(source)?.[0] ?? "";
+
+    // One hook owns the browser-local settings; the overlay applies them live and the panel edits
+    // the same object, so there is no second copy to drift.
+    expect(source).toContain("useDanmakuSettings");
+    expect(overlay).toContain("settings={danmakuSettings}");
+    expect(panel).toContain("danmaku={{");
+    expect(panel).toContain("settings: danmakuSettings");
+    expect(panel).toContain("onChange: updateDanmakuSettings");
+    expect(panel).toContain("onReset: resetDanmakuSettings");
+  });
 });

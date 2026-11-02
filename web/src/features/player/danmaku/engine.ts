@@ -119,6 +119,10 @@ export function createDanmakuEngine({
         nodes.set(placement.id, node);
         container.append(node);
       }
+      // The user can change the text scale at runtime; update the existing node instead of
+      // recreating it (which would restart the entry's on-screen identity).
+      const fontSize = `${placement.fontSize}px`;
+      if (node.style.fontSize !== fontSize) node.style.fontSize = fontSize;
       node.style.transform = `translate3d(${roundPosition(placement.x)}px, ${roundPosition(placement.y)}px, 0)`;
     }
     for (const [id, node] of nodes) {

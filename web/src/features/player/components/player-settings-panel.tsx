@@ -8,6 +8,7 @@ import {
   PlayerQualitySelector,
   type PlayerQualitySection,
 } from "./player-quality-selector";
+import { PlayerDanmakuSettings, type PlayerDanmakuSettingsProps } from "./player-danmaku-settings";
 
 type PlayerPresentationSettings = PlayerVideoPresentation & {
   onToggleLoop: () => void;
@@ -25,6 +26,8 @@ type PlayerSettingsPanelProps = {
   quality?: PlayerQualitySection;
   presentation?: PlayerPresentationSettings;
   autoPlay?: PlayerAutoPlaySettings;
+  /** Browser-local danmaku settings; omitted when the page does not render a danmaku track. */
+  danmaku?: PlayerDanmakuSettingsProps;
   /** Opens the playback information panel (subtitles, audio and speed live in the control bar). */
   onOpenInfo?: () => void;
   onClose: () => void;
@@ -47,6 +50,7 @@ export function PlayerSettingsPanel({
   quality,
   presentation,
   autoPlay,
+  danmaku,
   onOpenInfo,
   onClose,
 }: PlayerSettingsPanelProps) {
@@ -83,6 +87,7 @@ export function PlayerSettingsPanel({
           </button>
         </div>
       ) : null}
+      {danmaku ? <PlayerDanmakuSettings {...danmaku} /> : null}
       {presentation ? (
         <>
           <div className="lux-player-settings-section">

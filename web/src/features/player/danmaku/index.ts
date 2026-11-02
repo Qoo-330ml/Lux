@@ -2,8 +2,9 @@
  * Public surface of the danmaku feature.
  *
  * `parse` is pure XML handling, `schedule` assigns lanes from the current playback window,
- * `engine` owns the requestAnimationFrame rendering, and `load`/`useDanmakuTrack` handle fetching and
- * Worker parsing. `components/player-danmaku-overlay.tsx` wires them to the player.
+ * `engine` owns the requestAnimationFrame rendering, `settings`/`useDanmakuSettings` hold the
+ * browser-local user preferences, and `load`/`useDanmakuTrack` handle fetching and Worker parsing.
+ * `components/player-danmaku-overlay.tsx` wires them to the player.
  */
 
 export {

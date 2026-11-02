@@ -10,6 +10,10 @@ import {
   parseDanmakuWorkerRequest,
   type DanmakuWorkerRequest,
 } from "../src/features/player/danmaku-worker";
+import {
+  DEFAULT_DANMAKU_SETTINGS,
+  type DanmakuSettings,
+} from "../src/features/player/danmaku/settings";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -404,6 +408,58 @@ describe("LuxPlayer danmaku overlay", () => {
     });
 
     expect(onStatusChange).toHaveBeenCalledWith("弹幕解析失败");
+  });
+
+  it("applies opacity and layout settings in place without reloading the danmaku file", async () => {
+    mockDanmakuInfo();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response('<i><d p="0,1,25,16777215,0,0,0,0">设置</d></i>'),
+    );
+
+    const render = async (settings: DanmakuSettings) => {
+      await act(async () => {
+        root.render(
+          <PlayerDanmakuOverlay
+            itemId="item-settings"
+            sourceId="source-1"
+            visible
+            currentTime={1}
+            playbackRate={1}
+            lifecycleKey="session-1"
+            settings={settings}
+          />,
+        );
+        await settlement();
+      });
+    };
+    const overlay = () => container.querySelector<HTMLElement>("[data-lux-danmaku-overlay]");
+    const text = () => container.querySelector<HTMLElement>(".lux-player-danmaku-text");
+
+    await render({ ...DEFAULT_DANMAKU_SETTINGS, opacity: 0.4, fontScale: 2 });
+
+    expect(overlay()?.style.opacity).toBe("0.4");
+    expect(text()?.textContent).toBe("设置");
+    expect(text()?.style.fontSize).toBe("50px");
+
+    // A settings change must reach the on-screen nodes and the scheduler without refetching.
+    await render({ ...DEFAULT_DANMAKU_SETTINGS, opacity: 0.4, fontScale: 1 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(text()?.style.fontSize).toBe("25px");
+
+    // Blocking a mode re-lanes the current window and removes the now-hidden nodes.
+    await render({ ...DEFAULT_DANMAKU_SETTINGS, blockedModes: ["scroll"] });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(text()).toBeNull();
+
+    // Restoring the mode and switching the display area keeps rendering the same loaded entries.
+    await render({ ...DEFAULT_DANMAKU_SETTINGS, area: "quarter" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(text()?.textContent).toBe("设置");
+    // jsdom reports no layout, so the overlay keeps its 1280x720 fallback viewport; the quarter
+    // band is 180px tall and the first scrolling lane starts below the top fixed band.
+    const quarterY = Number(/translate3d\([-\d.]+px, ([\d.]+)px/.exec(text()?.style.transform ?? "")?.[1]);
+    expect(quarterY).toBeGreaterThan(0);
+    expect(quarterY).toBeLessThan(720 * 0.25);
   });
 
   it("keeps the existing props contract without the optional danmaku additions", async () => {

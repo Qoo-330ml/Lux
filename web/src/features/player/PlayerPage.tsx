@@ -48,6 +48,7 @@ import type {
 } from "./components/player-presentation";
 import { PlayerCaptionOverlay } from "./components/player-caption-overlay";
 import { PlayerDanmakuOverlay } from "./components/player-danmaku-overlay";
+import { useDanmakuSettings } from "./danmaku/useDanmakuSettings";
 import { usePlayerAirPlay } from "./components/player-airplay";
 import { PlayerMiniProgressBar } from "./components/player-mini-progress";
 import { PlayerAutoNextCard } from "./components/player-auto-next-card";
@@ -107,6 +108,13 @@ export function PlayerPage() {
   const [isRemainingTime, setIsRemainingTime] = useState(false);
   const [isPointerInteracting, setIsPointerInteracting] = useState(false);
   const [danmuVisible, setDanmuVisible] = useState(true);
+  // Browser-local danmaku preferences (opacity, scale, area, blocks, keywords, offset). The overlay
+  // applies them live and the settings panel edits the same store; nothing is uploaded.
+  const {
+    settings: danmakuSettings,
+    updateSettings: updateDanmakuSettings,
+    resetSettings: resetDanmakuSettings,
+  } = useDanmakuSettings();
   // Danmaku load outcome (“加载失败” / “已截断” / “内容为空”), shown next to the player like the
   // caption status; the overlay clears it whenever it starts a new load or is hidden.
   const [danmakuStatus, setDanmakuStatus] = useState<string | null>(null);
@@ -734,6 +742,7 @@ export function PlayerPage() {
         playbackRate={playbackRate}
         lifecycleKey={playbackKey}
         playing={playing}
+        settings={danmakuSettings}
         onStatusChange={setDanmakuStatus}
       />
       {danmakuStatus ? (
@@ -786,6 +795,11 @@ export function PlayerPage() {
           autoPlay={{
             enabled: autoPlayEnabled,
             onToggle: () => setAutoPlayEnabled(!autoPlayEnabled),
+          }}
+          danmaku={{
+            settings: danmakuSettings,
+            onChange: updateDanmakuSettings,
+            onReset: resetDanmakuSettings,
           }}
           onClose={() => setShowSettings(false)}
         />
