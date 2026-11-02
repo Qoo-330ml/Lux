@@ -124,7 +124,9 @@ async fn main() -> std::io::Result<()> {
         async move {
             match client {
                 Some(client) => deliver(&client, request).await,
-                None => failed("client_unavailable"),
+                // A broken outbound-client configuration is an operator-side transient problem:
+                // retrying keeps the delivery queued instead of dropping it permanently.
+                None => retryable("client_unavailable"),
             }
         }
     })
@@ -317,23 +319,22 @@ fn build_payload(
     body: &str,
     signature: Option<(String, String)>,
 ) -> Value {
-    let content = if body.trim().is_empty() {
-        title.to_owned()
-    } else {
-        format!("{title}\n{body}")
-    };
+    let body = if body.trim().is_empty() { title } else { body };
     let mut payload = match msg_type {
+        // Feishu has no separate text title, so the title is the first line.
         MsgType::Text => json!({
             "msg_type": "text",
-            "content": {"text": content},
+            "content": {"text": format!("{title}\n{body}")},
         }),
+        // A `post` message carries the title in its own field: repeating it in the body would
+        // render the same text twice.
         MsgType::Post => json!({
             "msg_type": "post",
             "content": {
                 "post": {
                     "zh_cn": {
                         "title": title,
-                        "content": [[{"tag": "text", "text": content}]],
+                        "content": [[{"tag": "text", "text": body}]],
                     },
                 },
             },

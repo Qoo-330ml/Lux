@@ -179,9 +179,21 @@ struct PluginRun {
 }
 
 async fn run_plugin(requests: Vec<PluginRequest>) -> Result<PluginRun, Box<dyn std::error::Error>> {
-    let mut child = Command::new(PLUGIN_BIN)
+    run_plugin_with_proxy(requests, None).await
+}
+
+async fn run_plugin_with_proxy(
+    requests: Vec<PluginRequest>,
+    proxy_url: Option<&str>,
+) -> Result<PluginRun, Box<dyn std::error::Error>> {
+    let mut command = Command::new(PLUGIN_BIN);
+    command
         .env_remove("LUX_CONFIG_DIR")
-        .env_remove("LUX_PROXY_URL")
+        .env_remove("LUX_PROXY_URL");
+    if let Some(proxy_url) = proxy_url {
+        command.env("LUX_PROXY_URL", proxy_url);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -270,7 +282,8 @@ async fn sends_a_post_message_and_reports_delivery() -> Result<(), Box<dyn std::
     );
     assert_eq!(
         requests[0].1["content"]["post"]["zh_cn"]["content"][0][0]["text"],
-        "媒体新增\n新增媒体：2 个\n媒体库：电影"
+        "新增媒体：2 个\n媒体库：电影",
+        "a post body must not repeat the title it already carries"
     );
     assert!(
         requests[0].1.get("sign").is_none(),
@@ -440,6 +453,24 @@ async fn times_out_into_a_retryable_failure() -> Result<(), Box<dyn std::error::
     assert!(
         elapsed >= Duration::from_secs(9) && elapsed < Duration::from_secs(25),
         "the plugin must enforce the SDK's 10 second timeout, took {elapsed:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn reports_a_broken_outbound_client_as_retryable() -> Result<(), Box<dyn std::error::Error>> {
+    let server = MockServer::start(MockReply::ok(json!({"code": 0}))).await?;
+    let request = backend(Some(TEST_HOOK_ID), json!({"apiBase": server.api_base()}));
+
+    let run = run_plugin_with_proxy(vec![request], Some("ftp://127.0.0.1:3128")).await?;
+
+    let result = result_of(&run.responses[0]);
+    assert_eq!(result.status, NotificationSendStatus::Retryable);
+    assert_eq!(result.error_code.as_deref(), Some("client_unavailable"));
+    assert!(result.retry_after_seconds.is_none());
+    assert!(
+        server.state.requests().is_empty(),
+        "an unusable outbound client must not send a request"
     );
     Ok(())
 }
