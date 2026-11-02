@@ -126,6 +126,7 @@ pub(crate) const MEDIA_ITEM_CHILD_DELETES: &[(&str, &str, DeletionParent)] = &[
         "item_id",
         DeletionParent::MediaItems,
     ),
+    ("media_item_facets", "item_id", DeletionParent::MediaItems),
     (
         "media_content_restriction_index_queue",
         "item_id",

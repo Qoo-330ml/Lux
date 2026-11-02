@@ -6,7 +6,8 @@ use crate::{
     application::nfo::{LocalNfoDetails, local_nfo_details_from_cache_json},
     domain::content_restrictions::project_content_restriction_index,
     storage::{
-        CONTENT_RESTRICTION_INDEX_BATCH_LIMIT, ContentRestrictionIndexWrite, Database, StorageError,
+        CONTENT_RESTRICTION_INDEX_BATCH_LIMIT, ContentRestrictionIndexWrite, Database,
+        MediaFacetKind, MediaItemFacetWrite, StorageError,
     },
 };
 
@@ -77,6 +78,7 @@ impl ContentRestrictionIndexService {
                 expected_nfo_json: candidate.nfo_metadata_json,
                 certification_code: projection.certification_code,
                 tags: projection.tags,
+                facets: facets_from_details(&details.genres, &details.studios),
             });
         }
 
@@ -88,6 +90,38 @@ impl ContentRestrictionIndexService {
         report.stale_snapshots = outcome.stale;
         Ok(report)
     }
+}
+
+const MAX_FACET_NAME_CHARS: usize = 256;
+
+/// Genre and studio values worth indexing: trimmed, bounded, de-duplicated case-insensitively
+/// (the first spelling wins as the display name).
+fn facets_from_details(genres: &[String], studios: &[String]) -> Vec<MediaItemFacetWrite> {
+    let mut facets: Vec<MediaItemFacetWrite> = Vec::new();
+    for (kind, values) in [
+        (MediaFacetKind::Genre, genres),
+        (MediaFacetKind::Studio, studios),
+    ] {
+        for value in values {
+            let name = value.trim();
+            if name.is_empty() || name.chars().count() > MAX_FACET_NAME_CHARS {
+                continue;
+            }
+            let name_key = name.to_lowercase();
+            if facets
+                .iter()
+                .any(|facet| facet.kind == kind && facet.name_key == name_key)
+            {
+                continue;
+            }
+            facets.push(MediaItemFacetWrite {
+                kind,
+                name_key,
+                name: name.to_owned(),
+            });
+        }
+    }
+    facets
 }
 
 const CONTENT_RESTRICTION_INDEX_IDLE_RETRY: Duration = Duration::from_secs(10);
@@ -399,6 +433,58 @@ mod tests {
         .await;
         worker.shutdown().await;
         assert_eq!(result??, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn index_batches_project_genres_and_studios_into_facets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Facet Index", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        let nfo_json = r#"{"genres":[" Sci-Fi ","sci-fi","Drama"],"studios":["A24"]}"#;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('facet-a', ?, 'MOVIE', 'facet-a', 'facet-a', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_item_nfo_cache (item_id, json, bytes)
+             VALUES ('facet-a', ?, length(CAST(? AS BLOB)))",
+        )
+        .bind(nfo_json)
+        .bind(nfo_json)
+        .execute(database.pool())
+        .await?;
+
+        let report = ContentRestrictionIndexService::new(database.clone())
+            .index_batch(None, 10)
+            .await?;
+        assert_eq!(report.indexed, 1);
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT kind, name_key, name FROM media_item_facets
+             WHERE item_id = 'facet-a' ORDER BY kind, name_key",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(
+            rows,
+            [
+                ("GENRE".to_owned(), "drama".to_owned(), "Drama".to_owned()),
+                ("GENRE".to_owned(), "sci-fi".to_owned(), "Sci-Fi".to_owned()),
+                ("STUDIO".to_owned(), "a24".to_owned(), "A24".to_owned()),
+            ]
+        );
         Ok(())
     }
 }

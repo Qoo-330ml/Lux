@@ -8935,6 +8935,11 @@ impl Database {
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
         for item_id in invalid_item_ids {
+            self.query("DELETE FROM media_item_facets WHERE item_id = ?")
+                .bind(item_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(self.sqlx_err())?;
             self.query("DELETE FROM media_content_restriction_index_queue WHERE item_id = ?")
                 .bind(item_id)
                 .execute(&mut *transaction)
@@ -9021,6 +9026,25 @@ impl Database {
                 )
                 .bind(&write.item_id)
                 .bind(tag)
+                .execute(&mut *transaction)
+                .await
+                .map_err(self.sqlx_err())?;
+            }
+            self.query("DELETE FROM media_item_facets WHERE item_id = ?")
+                .bind(&write.item_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(self.sqlx_err())?;
+            for facet in &write.facets {
+                self.query(
+                    "INSERT INTO media_item_facets (item_id, kind, name_key, name)
+                     VALUES (?, ?, ?, ?)
+                     ON CONFLICT (item_id, kind, name_key) DO NOTHING",
+                )
+                .bind(&write.item_id)
+                .bind(facet.kind.as_str())
+                .bind(&facet.name_key)
+                .bind(&facet.name)
                 .execute(&mut *transaction)
                 .await
                 .map_err(self.sqlx_err())?;

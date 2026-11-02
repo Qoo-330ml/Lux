@@ -30,6 +30,30 @@ pub(crate) struct ContentRestrictionIndexWrite {
     pub(crate) expected_nfo_json: Option<String>,
     pub(crate) certification_code: Option<String>,
     pub(crate) tags: Vec<String>,
+    pub(crate) facets: Vec<MediaItemFacetWrite>,
+}
+
+/// One genre or studio value of an item, as stored in `media_item_facets`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MediaItemFacetWrite {
+    pub(crate) kind: MediaFacetKind,
+    pub(crate) name_key: String,
+    pub(crate) name: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MediaFacetKind {
+    Genre,
+    Studio,
+}
+
+impl MediaFacetKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Genre => "GENRE",
+            Self::Studio => "STUDIO",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
