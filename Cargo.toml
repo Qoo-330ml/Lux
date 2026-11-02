@@ -77,6 +77,10 @@ path = "src/main.rs"
 name = "lux-plugin-danmaku"
 path = "src/bin/lux-plugin-danmaku.rs"
 
+[[bin]]
+name = "lux-plugin-notifier-email"
+path = "src/bin/lux-plugin-notifier-email.rs"
+
 [profile.dev]
 debug = "line-tables-only"
 
