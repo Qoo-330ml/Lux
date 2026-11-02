@@ -82,6 +82,10 @@ name = "lux-plugin-notifier-bark"
 path = "src/bin/lux-plugin-notifier-bark.rs"
 
 [[bin]]
+name = "lux-plugin-notifier-email"
+path = "src/bin/lux-plugin-notifier-email.rs"
+
+[[bin]]
 name = "lux-plugin-notifier-feishu"
 path = "src/bin/lux-plugin-notifier-feishu.rs"
 
