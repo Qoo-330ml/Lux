@@ -166,11 +166,13 @@ function laneY(
   lane: number,
   viewport: DanmakuViewport,
   areaGeometry: ReturnType<typeof laneGeometry>,
-  fullGeometry: ReturnType<typeof laneGeometry>,
+  pitch: number,
 ) {
-  if (mode === "top") return lane * areaGeometry.lineHeight + 8;
-  if (mode === "bottom") return viewport.height - (lane + 1) * fullGeometry.lineHeight - 8;
-  return areaGeometry.fixedBandHeight + lane * areaGeometry.lineHeight + 8;
+  // `pitch` is the scheduled entry's own `lineHeight`, so the lane pitch used for `y` can never
+  // drift from the one reserved in `ScheduledDanmaku`.
+  if (mode === "top") return lane * pitch + 8;
+  if (mode === "bottom") return viewport.height - (lane + 1) * pitch - 8;
+  return areaGeometry.fixedBandHeight + lane * pitch + 8;
 }
 
 /** Case-insensitive plain substring match. Keywords are data, never a regular expression. */
@@ -366,7 +368,7 @@ export function createDanmakuScheduler(
     // No free lane: drop this danmaku rather than stacking it on top of another one.
     if (lane < 0) return;
     candidate.lane = lane;
-    candidate.y = laneY(source.mode, lane, viewport, areaGeometry, fullGeometry);
+    candidate.y = laneY(source.mode, lane, viewport, areaGeometry, candidate.lineHeight);
     modeLanes[lane] = candidate;
     live.push(candidate);
   }
