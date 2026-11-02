@@ -10,7 +10,12 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use super::xml::{DanmakuXmlError, MAX_DANMAKU_XML_BYTES, validate_danmaku_xml};
+use super::{
+    DanmakuService, DanmakuServiceError,
+    path::safe_danmaku_source_paths,
+    xml::{DanmakuXmlError, MAX_DANMAKU_XML_BYTES, validate_danmaku_xml},
+};
+use crate::storage::StoredDanmakuSource;
 
 pub async fn atomic_write_danmaku_xml(
     target: &Path,
@@ -147,4 +152,90 @@ pub(super) async fn read_danmaku_file(path: &Path) -> Result<Vec<u8>, ()> {
 
 pub(crate) fn fingerprint(bytes: &[u8]) -> Vec<u8> {
     Sha256::digest(bytes).to_vec()
+}
+
+/// Which media source a playback read is allowed to use.
+///
+/// The two playback protocols differ only in this requirement; resolving the
+/// source, the media-root checks and the XML validation are shared.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DanmakuSidecarScope {
+    /// Any existing sidecar of the item's media source (Emby `/api/danmu/*`).
+    AnySource,
+    /// Only a source whose `danmaku_tracks` row is `READY` (Lux Web API).
+    RegisteredTrack,
+}
+
+impl DanmakuService {
+    pub async fn read_sidecar(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<Vec<u8>>, DanmakuServiceError> {
+        self.read_sidecar_for_source(item_id, None).await
+    }
+
+    pub async fn read_sidecar_for_source(
+        &self,
+        item_id: &str,
+        source_id: Option<&str>,
+    ) -> Result<Option<Vec<u8>>, DanmakuServiceError> {
+        self.read_for_playback(item_id, source_id, DanmakuSidecarScope::AnySource)
+            .await
+    }
+
+    pub async fn read_registered_sidecar_for_source(
+        &self,
+        item_id: &str,
+        source_id: Option<&str>,
+    ) -> Result<Option<Vec<u8>>, DanmakuServiceError> {
+        self.read_for_playback(item_id, source_id, DanmakuSidecarScope::RegisteredTrack)
+            .await
+    }
+
+    /// Reads the sidecar a playback protocol may serve for an item.
+    ///
+    /// Both protocol handlers call this; only the [`DanmakuSidecarScope`] and
+    /// their own authentication differ.
+    pub async fn read_for_playback(
+        &self,
+        item_id: &str,
+        source_id: Option<&str>,
+        scope: DanmakuSidecarScope,
+    ) -> Result<Option<Vec<u8>>, DanmakuServiceError> {
+        let source = match scope {
+            DanmakuSidecarScope::AnySource => {
+                self.database
+                    .find_danmaku_source_for_item(item_id, source_id)
+                    .await?
+            }
+            DanmakuSidecarScope::RegisteredTrack => {
+                self.database
+                    .find_registered_danmaku_source_for_item(item_id, source_id)
+                    .await?
+            }
+        };
+        let Some(source) = source else {
+            return Ok(None);
+        };
+        Ok(read_validated_sidecar(&source).await)
+    }
+}
+
+async fn read_validated_sidecar(source: &StoredDanmakuSource) -> Option<Vec<u8>> {
+    let Ok((_, target)) = safe_danmaku_source_paths(source).await else {
+        return None;
+    };
+    let Ok(metadata) = fs::symlink_metadata(&target).await else {
+        return None;
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return None;
+    }
+    let Ok(bytes) = read_danmaku_file(&target).await else {
+        return None;
+    };
+    if validate_danmaku_xml(&bytes).is_err() {
+        return None;
+    }
+    Some(bytes)
 }
