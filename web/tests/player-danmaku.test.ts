@@ -128,10 +128,12 @@ describe("LuxPlayer danmaku parser", () => {
     expect(result.entries).toHaveLength(DANMAKU_LIMITS.maxEntries);
   });
 
-  it("still rejects a file beyond the server-side size limit", () => {
-    const oversized = `<i>${" ".repeat(DANMAKU_LIMITS.maxBytes)}${NO_DANMAKU}</i>`;
-    expect(() => parseDanmakuXml(oversized))
+  it("still rejects a file beyond the byte budget", () => {
+    // The budget is a parameter so the reject path is exercised without allocating 16 MiB here.
+    const oversized = `<i>${" ".repeat(64)}${NO_DANMAKU}</i>`;
+    expect(() => parseDanmakuXml(oversized, { maxBytes: 32 }))
       .toThrowError(new DanmakuParseError("INPUT_TOO_LARGE", "弹幕文件过大"));
+    expect(parseDanmakuXml(oversized, { maxBytes: 512 }).entries).toHaveLength(1);
   });
 
   it("documents the client byte budget and the entry budget it samples against", () => {
@@ -166,16 +168,23 @@ describe("LuxPlayer danmaku parser", () => {
     expect(small).toBeInstanceOf(ArrayBuffer);
     expect(new TextDecoder().decode(small)).toBe("<i></i>");
 
+    // The byte budget is a parameter so the guard can be exercised without allocating 16 MiB here.
+    const budget = 64;
     const declared = new Response("<i></i>", {
-      headers: { "content-length": String(DANMAKU_LIMITS.maxBytes + 1) },
+      headers: { "content-length": String(budget + 1) },
     });
-    await expect(readDanmakuResponse(declared, new AbortController().signal))
+    await expect(readDanmakuResponse(declared, new AbortController().signal, budget))
       .rejects.toThrowError(new Error("弹幕文件过大"));
 
     // The streamed guard matters when a proxy omits content-length.
-    const streamed = new Response("x".repeat(DANMAKU_LIMITS.maxBytes + 1));
-    await expect(readDanmakuResponse(streamed, new AbortController().signal))
+    const streamed = new Response("x".repeat(budget + 1));
+    await expect(readDanmakuResponse(streamed, new AbortController().signal, budget))
       .rejects.toThrowError(new Error("弹幕文件过大"));
+    await expect(readDanmakuResponse(
+      new Response("x".repeat(budget)),
+      new AbortController().signal,
+      budget,
+    )).resolves.toBeInstanceOf(ArrayBuffer);
   });
 
   it("decodes and parses bytes off the Worker path and rejects invalid UTF-8", async () => {

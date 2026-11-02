@@ -64,6 +64,8 @@ export type DanmakuParseResult = {
 };
 
 export type DanmakuParseOptions = {
+  /** Overrides `DANMAKU_LIMITS.maxBytes` (tests, or a tighter mobile budget). */
+  maxBytes?: number;
   /** Overrides `DANMAKU_LIMITS.maxEntries` (tests, or a tighter mobile budget). */
   maxEntries?: number;
   /** Injectable source of randomness so sampling stays reproducible in tests. */
@@ -124,7 +126,8 @@ export function parseDanmakuXml(
   if (typeof input !== "string") {
     throw invalidXml();
   }
-  if (exceedsUtf8ByteLimit(input, DANMAKU_LIMITS.maxBytes)) {
+  const maxBytes = options.maxBytes ?? DANMAKU_LIMITS.maxBytes;
+  if (exceedsUtf8ByteLimit(input, maxBytes)) {
     throw new DanmakuParseError("INPUT_TOO_LARGE", "弹幕文件过大");
   }
   if (DENIED_DECLARATION_PATTERN.test(input)) {

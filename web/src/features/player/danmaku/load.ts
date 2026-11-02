@@ -65,16 +65,17 @@ export function sameOriginRawUrl(rawUrl: string) {
 export async function readDanmakuResponse(
   response: Response,
   signal: AbortSignal,
+  maxBytes: number = DANMAKU_LIMITS.maxBytes,
 ): Promise<ArrayBuffer> {
   const declaredLength = response.headers.get("content-length");
   // The server serves up to 50 MiB, but the browser budget is 16 MiB (low-memory devices OOM well
   // before that); anything above it is refused before buffering it.
-  if (declaredLength && Number(declaredLength) > DANMAKU_LIMITS.maxBytes) {
+  if (declaredLength && Number(declaredLength) > maxBytes) {
     throw new Error("弹幕文件过大");
   }
   if (!response.body) {
     const buffer = await response.arrayBuffer();
-    if (buffer.byteLength > DANMAKU_LIMITS.maxBytes) {
+    if (buffer.byteLength > maxBytes) {
       throw new Error("弹幕文件过大");
     }
     return buffer;
@@ -88,7 +89,7 @@ export async function readDanmakuResponse(
       const result = await reader.read();
       if (result.done) break;
       total += result.value.byteLength;
-      if (total > DANMAKU_LIMITS.maxBytes) throw new Error("弹幕文件过大");
+      if (total > maxBytes) throw new Error("弹幕文件过大");
       chunks.push(result.value);
     }
   } finally {
