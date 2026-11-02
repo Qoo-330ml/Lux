@@ -764,7 +764,6 @@ manifest 声明 `type: "notification"`、`category: "NOTIFICATION"`、`capabilit
 429/5xx、超时、网络失败、读响应体中断开/超时、重定向不跟随、超限响应、坏配置、缺失/非法凭据、默认未批准私网
 时拒绝回环目的地，以及批准私网仍拒绝云元数据地址；并断言凭据与完整外部 URL 不出现在返回值和捕获的日志里。
 
-<<<<<<< HEAD
 ## 企业微信应用通知插件
 
 `org.lux.notifier.wecom-app` 通过企业微信自建应用发送文本通知，二进制为
@@ -786,7 +785,7 @@ payload 组装，进程外壳、出站 client、状态分类和通知正文来�
     {"key": "toUser", "label": "接收成员", "type": "text", "required": false, "defaultValue": "@all"},
     {"key": "apiBase", "label": "API 基地址", "type": "text", "required": false, "defaultValue": "https://qyapi.weixin.qq.com"},
     {"key": "secret", "label": "应用 Secret", "type": "password", "required": true, "sensitive": true}
-=======
+
 ## SMTP 邮件通知器（`org.lux.notifier.email`）
 
 `org.lux.notifier.email` 是一个参考实现的通知器插件，二进制为 `lux-plugin-notifier-email`，只负责
@@ -813,12 +812,10 @@ manifest 核心字段：
     {"key": "username", "label": "SMTP 用户名", "type": "text", "required": false},
     {"key": "from", "label": "发件人地址", "type": "text", "required": true},
     {"key": "to", "label": "收件人地址", "type": "text", "required": true}
->>>>>>> test
   ]
 }
 ```
 
-<<<<<<< HEAD
 `secret` 是自建应用的 corpsecret，只从 `notification.send` 请求的 `NotificationSendRpcRequest.secret`
 取得，不读取配置文件、不写入 `config`/`providerConfig`，也不出现在日志、RPC 结果或错误信息里。`apiBase`
 仅用于代理或测试，必须是 http/https 基地址，且不得包含凭据、query 或 fragment；基地址里已有的路径段
@@ -879,7 +876,7 @@ manifest 核心字段：
 `tests/plugins/notifier_wecom_app.rs`，使用 127.0.0.1 随机端口的 mock 企业微信服务（显式携带
 `allowPrivateNetwork: true`），不访问真实租户；其中一条断言默认未批准私网时回环目的地被拒且 mock 收不到任何
 请求，另一条断言批准私网后 `169.254.169.254` 仍被拒。
-=======
+
 配置语义：`secret` 是每条通知目标的 SMTP 密码，只从受控的 `secret` 字段到达插件，不进 `config`、不进
 日志、不进返回值或错误消息。SMTP 认证只在 `username` 非空时发生；`username` 留空时宿主仍要求 `secret`
 非空，此时它是管理员填写的占位值（例如 `unused`），插件不会使用它。其余字段是普通目标配置：
@@ -934,4 +931,3 @@ HTTP 代理，`LUX_PROXY_URL` 对它不生效；守卫校验过的地址始终�
 使用任何真实凭据或真实邮件服务。
 
 打包：`scripts/package-notifier-plugin.sh org.lux.notifier.email`。
->>>>>>> test
