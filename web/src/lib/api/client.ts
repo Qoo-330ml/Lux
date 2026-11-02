@@ -208,6 +208,12 @@ export type LibraryItemsOptions = {
   sortBy?: LibrarySortBy;
   sortOrder?: LibrarySortOrder;
   metadataStatus?: "PENDING";
+  /** 按发行年份筛选；参数名与 `LuxPageQuery::year` 一致。 */
+  year?: number;
+  /** 按已看/未看筛选；以 `is_played` 下发。 */
+  isPlayed?: boolean;
+  /** 只看收藏；以 `is_favorite` 下发。 */
+  isFavorite?: boolean;
   pageSize?: number;
   parentId?: string;
   fields?: "card";
@@ -690,6 +696,9 @@ export class LuxApiClient {
     if (options.sortBy) params.set("sortBy", options.sortBy);
     if (options.sortOrder) params.set("sortOrder", options.sortOrder);
     if (options.metadataStatus) params.set("metadataStatus", options.metadataStatus);
+    if (options.year != null) params.set("year", String(options.year));
+    if (options.isPlayed != null) params.set("is_played", String(options.isPlayed));
+    if (options.isFavorite != null) params.set("is_favorite", String(options.isFavorite));
     if (options.parentId) params.set("parentId", options.parentId);
     if (options.fields) params.set("fields", options.fields);
     if (options.count === false) params.set("count", "false");
