@@ -11440,6 +11440,49 @@ async fn emby_collection_member_mutations_use_bounded_batches() {
     database.close().await;
 }
 
+#[test]
+fn catalog_filter_where_clause_matches_genres_and_studios_through_facets() {
+    let library_ids = vec!["library".to_owned()];
+    let none: Vec<String> = Vec::new();
+    let years: Vec<i64> = Vec::new();
+    let genre_keys = vec!["drama".to_owned(), "sci-fi".to_owned()];
+    let studio_keys = vec!["a24".to_owned()];
+    let filter = CatalogFilterQuery {
+        library_ids: &library_ids,
+        user_id: "user",
+        item_types: &none,
+        excluded_item_types: &none,
+        item_ids: None,
+        person_id: None,
+        media_source_ids: None,
+        provider_id_equals: None,
+        years: &years,
+        genre_keys: &genre_keys,
+        studio_keys: &studio_keys,
+        is_played: None,
+        is_favorite: None,
+        min_date_last_saved: None,
+        metadata_pending: false,
+        parent_id_scope: None,
+        content_restrictions: None,
+        sort_by: CatalogSort::DateCreated,
+        descending: true,
+        offset: 0,
+        limit: 24,
+        include_total: true,
+    };
+    let (where_clause, binds) = catalog_filter_where_clause(&filter);
+    assert_eq!(where_clause.matches("media_item_facets").count(), 2);
+    let texts = binds
+        .iter()
+        .filter_map(|bind| match bind {
+            CatalogBind::Text(value) => Some(*value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(texts, ["library", "drama", "sci-fi", "a24"]);
+}
+
 #[tokio::test]
 async fn favorite_catalog_filter_uses_favorite_state_index() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
@@ -11462,6 +11505,8 @@ async fn favorite_catalog_filter_uses_favorite_state_index() {
         media_source_ids: None,
         provider_id_equals: None,
         years: &empty_years,
+        genre_keys: &[],
+        studio_keys: &[],
         is_played: None,
         is_favorite: Some(true),
         min_date_last_saved: None,
@@ -11633,6 +11678,8 @@ async fn content_restrictions_filter_catalog_rows_before_pagination()
         media_source_ids: None,
         provider_id_equals: None,
         years: &empty_years,
+        genre_keys: &[],
+        studio_keys: &[],
         is_played: None,
         is_favorite: None,
         min_date_last_saved: None,
@@ -11789,6 +11836,8 @@ async fn catalog_sort_expression_indexes_cover_default_sorting()
             media_source_ids: None,
             provider_id_equals: None,
             years: &empty_years,
+            genre_keys: &[],
+            studio_keys: &[],
             is_played: None,
             is_favorite: None,
             min_date_last_saved: None,
@@ -13667,6 +13716,8 @@ async fn catalog_tie_breakers_use_displayed_title_when_sort_key_is_stale() {
             media_source_ids: None,
             provider_id_equals: None,
             years: &empty_years,
+            genre_keys: &[],
+            studio_keys: &[],
             is_played: None,
             is_favorite: None,
             min_date_last_saved: None,
@@ -13738,6 +13789,8 @@ async fn catalog_filter_parent_scope_applies_before_pagination() {
         media_source_ids: None,
         provider_id_equals: None,
         years: &empty_years,
+        genre_keys: &[],
+        studio_keys: &[],
         is_played: None,
         is_favorite: None,
         min_date_last_saved: None,
@@ -13905,6 +13958,8 @@ async fn catalog_premiere_date_sort_falls_back_to_production_year() {
             media_source_ids: None,
             provider_id_equals: None,
             years: &empty_years,
+            genre_keys: &[],
+            studio_keys: &[],
             is_played: None,
             is_favorite: None,
             min_date_last_saved: None,
@@ -23466,6 +23521,8 @@ async fn catalog_read_model_shadow_matches_the_legacy_default_list()
         media_source_ids: None,
         provider_id_equals: None,
         years: &empty_years,
+        genre_keys: &[],
+        studio_keys: &[],
         is_played: None,
         is_favorite: None,
         min_date_last_saved: None,

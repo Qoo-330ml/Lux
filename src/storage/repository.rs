@@ -4937,6 +4937,8 @@ fn catalog_filter_where_clause<'a>(
     let provider_id_equals = filter.provider_id_equals;
     let excluded_item_types = filter.excluded_item_types;
     let years = filter.years;
+    let genre_keys = filter.genre_keys;
+    let studio_keys = filter.studio_keys;
     let is_played = filter.is_played;
     let is_favorite = filter.is_favorite;
     let min_date_last_saved = filter.min_date_last_saved;
@@ -5135,6 +5137,23 @@ fn catalog_filter_where_clause<'a>(
                 .join(", ")
         ));
         binds.extend(years.iter().copied().map(CatalogBind::Integer));
+    }
+    for (kind, keys) in [("GENRE", genre_keys), ("STUDIO", studio_keys)] {
+        if keys.is_empty() {
+            continue;
+        }
+        where_clause.push_str(&format!(
+            " AND EXISTS (
+                SELECT 1 FROM media_item_facets facet_filter
+                WHERE facet_filter.item_id = mi.id
+                  AND facet_filter.kind = '{kind}'
+                  AND facet_filter.name_key IN ({})
+            )",
+            std::iter::repeat_n("?", keys.len())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        binds.extend(keys.iter().map(|key| CatalogBind::Text(key.as_str())));
     }
     if let Some(is_played) = is_played {
         where_clause.push_str(
@@ -5494,6 +5513,9 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) media_source_ids: Option<&'a [String]>,
     pub(crate) provider_id_equals: Option<&'a [(String, String)]>,
     pub(crate) years: &'a [i64],
+    /// Lower-cased genre keys; an item matches when it has any of them (`Genres=A|B`).
+    pub(crate) genre_keys: &'a [String],
+    pub(crate) studio_keys: &'a [String],
     pub(crate) is_played: Option<bool>,
     pub(crate) is_favorite: Option<bool>,
     pub(crate) min_date_last_saved: Option<i64>,

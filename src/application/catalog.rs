@@ -36,6 +36,9 @@ pub struct CatalogFilter {
     pub media_source_ids: Option<Vec<String>>,
     pub provider_id_equals: Option<Vec<(String, String)>>,
     pub years: Vec<i64>,
+    /// Lower-cased genre keys (any-of), matched against `media_item_facets`.
+    pub genre_keys: Vec<String>,
+    pub studio_keys: Vec<String>,
     pub is_played: Option<bool>,
     pub is_favorite: Option<bool>,
     pub min_date_last_saved: Option<i64>,
@@ -55,6 +58,8 @@ impl Default for CatalogFilter {
             media_source_ids: None,
             provider_id_equals: None,
             years: Vec::new(),
+            genre_keys: Vec::new(),
+            studio_keys: Vec::new(),
             is_played: None,
             is_favorite: None,
             min_date_last_saved: None,
@@ -1167,6 +1172,8 @@ impl CatalogService {
             || query.media_source_ids.is_some()
             || query.provider_id_equals.is_some()
             || !query.years.is_empty()
+            || !query.genre_keys.is_empty()
+            || !query.studio_keys.is_empty()
             || query.is_played.is_some()
             || query.is_favorite.is_some()
             || query.min_date_last_saved.is_some()
@@ -1268,6 +1275,8 @@ impl CatalogService {
             media_source_ids: filter.media_source_ids.as_deref(),
             provider_id_equals: filter.provider_id_equals.as_deref(),
             years: &filter.years,
+            genre_keys: &filter.genre_keys,
+            studio_keys: &filter.studio_keys,
             is_played: filter.is_played,
             is_favorite: filter.is_favorite,
             min_date_last_saved: filter.min_date_last_saved,
@@ -1381,6 +1390,8 @@ impl CatalogService {
             media_source_ids: filter.media_source_ids.as_deref(),
             provider_id_equals: filter.provider_id_equals.as_deref(),
             years: &filter.years,
+            genre_keys: &filter.genre_keys,
+            studio_keys: &filter.studio_keys,
             is_played: filter.is_played,
             is_favorite: filter.is_favorite,
             min_date_last_saved: filter.min_date_last_saved,

@@ -67,6 +67,11 @@ pub(super) struct EmbyItemsQuery {
     pub(super) min_date_last_saved: Option<i64>,
     #[serde(rename = "Years", default)]
     pub(super) years: Option<String>,
+    /// Emby separates several values with `|`; an item matches when it has any of them.
+    #[serde(rename = "Genres", default)]
+    pub(super) genres: Option<String>,
+    #[serde(rename = "Studios", default)]
+    pub(super) studios: Option<String>,
     #[serde(rename = "SortBy", alias = "sortBy", default)]
     pub(super) sort_by: Option<String>,
     #[serde(rename = "SortOrder", alias = "sortOrder", default)]
@@ -274,6 +279,8 @@ pub(super) fn catalog_filter_from_values(
         media_source_ids: None,
         provider_id_equals: None,
         years,
+        genre_keys: Vec::new(),
+        studio_keys: Vec::new(),
         is_played,
         is_favorite,
         min_date_last_saved: None,
@@ -301,6 +308,23 @@ fn catalog_sort_from_value(value: Option<&str>) -> CatalogSort {
     }
 }
 
+/// Splits a `|`-separated Emby facet filter into lower-cased lookup keys (bounded, no blanks).
+fn emby_facet_keys(value: Option<&str>) -> Vec<String> {
+    let mut keys = Vec::new();
+    for key in value
+        .unwrap_or_default()
+        .split('|')
+        .map(|part| part.trim().to_lowercase())
+        .filter(|part| !part.is_empty())
+        .take(32)
+    {
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
 pub(super) fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter {
     let mut filter = catalog_filter_from_values(
         query.include_item_types.as_deref(),
@@ -312,6 +336,8 @@ pub(super) fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter 
         false,
     );
     filter.min_date_last_saved = query.min_date_last_saved;
+    filter.genre_keys = emby_facet_keys(query.genres.as_deref());
+    filter.studio_keys = emby_facet_keys(query.studios.as_deref());
     let requested_filters = query.filters.as_deref().unwrap_or_default();
     if requested_filters
         .split(',')
@@ -1267,6 +1293,8 @@ pub(super) async fn emby_group_latest_page(
             media_source_ids: None,
             provider_id_equals: None,
             years: Vec::new(),
+            genre_keys: Vec::new(),
+            studio_keys: Vec::new(),
             is_played: None,
             is_favorite: None,
             min_date_last_saved: None,
@@ -2127,6 +2155,8 @@ pub(super) fn emby_single_id_lookup(query: &EmbyItemsQuery) -> Option<&str> {
         || query.is_played.is_some()
         || query.is_favorite.is_some()
         || query.years.is_some()
+        || query.genres.is_some()
+        || query.studios.is_some()
         || query.sort_by.is_some()
         || query.sort_order.is_some()
         || query.group_items.is_some()

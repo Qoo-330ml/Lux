@@ -10677,6 +10677,8 @@ fn catalog_list_union_selected_sql<'a>(
         || filter.provider_id_equals.is_some()
         || !filter.excluded_item_types.is_empty()
         || !filter.years.is_empty()
+        || !filter.genre_keys.is_empty()
+        || !filter.studio_keys.is_empty()
         || filter.is_played.is_some()
         || filter.is_favorite.is_some()
         || filter.min_date_last_saved.is_some()
@@ -10961,6 +10963,8 @@ mod tests {
             media_source_ids: None,
             provider_id_equals: None,
             years: &[],
+            genre_keys: &[],
+            studio_keys: &[],
             is_played: None,
             is_favorite: None,
             min_date_last_saved: None,
@@ -11068,6 +11072,8 @@ mod tests {
             media_source_ids: None,
             provider_id_equals: None,
             years: &[],
+            genre_keys: &[],
+            studio_keys: &[],
             is_played: None,
             is_favorite: None,
             min_date_last_saved: None,
@@ -11234,6 +11240,8 @@ mod tests {
             media_source_ids: None,
             provider_id_equals: None,
             years: &[],
+            genre_keys: &[],
+            studio_keys: &[],
             is_played: None,
             is_favorite: None,
             min_date_last_saved: None,
@@ -11268,6 +11276,8 @@ mod tests {
             media_source_ids: None,
             provider_id_equals: None,
             years: &[],
+            genre_keys: &[],
+            studio_keys: &[],
             is_played: None,
             is_favorite: None,
             min_date_last_saved: None,
