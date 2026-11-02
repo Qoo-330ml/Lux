@@ -35,10 +35,9 @@
       "label": "SMTP 端口",
       "type": "number",
       "required": false,
-      "defaultValue": 587,
       "minimum": 1,
       "maximum": 65535,
-      "description": "SMTP 服务器端口；留空时按加密方式取默认值（STARTTLS 587，SSL 465）。"
+      "description": "SMTP 服务器端口；留空时由加密方式决定：STARTTLS 用 587，SSL/TLS 用 465。"
     },
     {
       "key": "security",

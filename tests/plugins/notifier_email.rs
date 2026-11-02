@@ -564,6 +564,26 @@ async fn an_invalid_configuration_is_a_permanent_failure_with_a_stable_code()
             json!({"smtpHost": host, "smtpPort": port, "security": "none", "from": "lux@example.invalid", "to": "ops@example.invalid"}),
         ),
         (
+            "host with a user part",
+            json!({"smtpHost": "user@example.invalid", "smtpPort": port, "from": "lux@example.invalid", "to": "ops@example.invalid"}),
+        ),
+        (
+            "host with a backslash",
+            json!({"smtpHost": format!("example\\invalid"), "smtpPort": port, "from": "lux@example.invalid", "to": "ops@example.invalid"}),
+        ),
+        (
+            "bracketed ipv6 host",
+            json!({"smtpHost": "[::1]", "smtpPort": port, "from": "lux@example.invalid", "to": "ops@example.invalid"}),
+        ),
+        (
+            "host with an embedded port",
+            json!({"smtpHost": "smtp.example.invalid:587", "smtpPort": port, "from": "lux@example.invalid", "to": "ops@example.invalid"}),
+        ),
+        (
+            "host that cannot be a tls server name",
+            json!({"smtpHost": format!("{}.invalid", "a".repeat(64)), "smtpPort": port, "security": "starttls", "from": "lux@example.invalid", "to": "ops@example.invalid"}),
+        ),
+        (
             "zero port",
             json!({"smtpHost": host, "smtpPort": 0, "from": "lux@example.invalid", "to": "ops@example.invalid"}),
         ),
@@ -619,11 +639,14 @@ async fn an_invalid_configuration_is_a_permanent_failure_with_a_stable_code()
 }
 
 #[tokio::test]
-async fn the_plaintext_seam_only_applies_to_a_loopback_relay()
+async fn the_plaintext_seam_only_applies_to_a_loopback_connection_address()
 -> Result<(), Box<dyn std::error::Error>> {
+    // The environment flag alone is not enough. This relay is approved by the host and resolves to
+    // a private (but not loopback) address, so plaintext stays unavailable and no connection is
+    // attempted.
     let mut session = Session::start_plaintext(None).await?;
     let config = json!({
-        "smtpHost": "smtp.example.invalid",
+        "smtpHost": "192.168.255.254",
         "smtpPort": 2525,
         "security": "none",
         "from": "lux@example.invalid",
@@ -637,7 +660,7 @@ async fn the_plaintext_seam_only_applies_to_a_loopback_relay()
     assert_eq!(
         result.status,
         NotificationSendStatus::Failed,
-        "the test seam must not enable plaintext for a remote relay"
+        "the test seam must not enable plaintext for a non-loopback connection address"
     );
     assert_eq!(error_code(&result), "invalid_config");
 
@@ -938,6 +961,16 @@ fn the_packaged_manifest_is_a_single_secret_notification_provider()
             field.key
         );
     }
+
+    let port = manifest
+        .config_fields
+        .iter()
+        .find(|field| field.key == "smtpPort")
+        .expect("the relay port must be declared");
+    assert!(
+        port.default_value.is_none(),
+        "a prefilled port would force every destination to one security mode's port"
+    );
 
     let security = manifest
         .config_fields

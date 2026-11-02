@@ -750,9 +750,14 @@ manifest 核心字段：
 日志、不进返回值或错误消息。SMTP 认证只在 `username` 非空时发生；`username` 留空时宿主仍要求 `secret`
 非空，此时它是管理员填写的占位值（例如 `unused`），插件不会使用它。其余字段是普通目标配置：
 
-- `smtpHost` 必填，非空、不含空白字符或控制字符、不含路径分隔符，长度不超过 253。
-- `smtpPort` 可选，范围 1–65535；缺省值随 `security` 决定：`starttls` 用 587，`ssl` 用 465。
-- `security` 只接受 `starttls` 和 `ssl`，插件不提供明文 SMTP 模式；`starttls` 要求服务器支持 STARTTLS，否则投递失败而不是降级为明文。
+- `smtpHost` 必填，只接受 ASCII 字母、数字、`.`、`-`、`_`，或裸 IPv6 字面量；`@`、`\`、`[`、`]`、
+  非 IPv6 的 `:`、路径、空白和控制字符一律判为 `invalid_config`。TLS 模式下还要求它是合法的 DNS 名或 IP
+  字面量（标签 1–63 字节、不以 `-` 开头或结尾、末级标签不是纯数字），否则在解析阶段就返回 `invalid_config`。
+- `smtpPort` 可选，范围 1–65535；manifest 不声明 `defaultValue`（界面不会预填），留空时由 `security` 决定：
+  `starttls` 用 587，`ssl` 用 465。
+- `security` 只接受 `starttls` 和 `ssl`；生产构建默认不提供明文 SMTP 目标，`starttls` 要求服务器支持
+  STARTTLS，否则投递失败而不是降级为明文。明文通道只作为集成测试的进程内测试缝存在：需要显式设置测试用环境
+  变量，**并且**守卫解析出的实际连接地址是回环地址，两者缺一不可；它不是产品功能，也不在 manifest 中声明。
 - `username` 可选，首尾空白或控制字符会被判为非法。
 - `from` 必填，必须是纯地址（不含显示名）；`to` 是逗号分隔的 1–20 个纯地址，两级都会重新校验地址格式。
 
@@ -769,9 +774,10 @@ HTTP 代理，`LUX_PROXY_URL` 对它不生效；守卫校验过的地址始终�
 | --- | --- | --- |
 | 邮件被 SMTP 服务器接受 | `DELIVERED` | 无 |
 | `secret` 缺失或只含空白 | `FAILED` | `missing_secret` |
-| 目标配置非法（主机、端口、加密方式、地址、收件人数量） | `FAILED` | `invalid_config` |
-| 守卫拒绝：主机未批准私网、危险保留地址或无法解析的主机名 | `FAILED` | `destination_not_allowed` |
+| 目标配置非法（主机、端口、加密方式、TLS 主机名、地址、收件人数量） | `FAILED` | `invalid_config` |
+| 守卫拒绝：主机未批准私网、危险保留地址或不可路由的保留地址 | `FAILED` | `destination_not_allowed` |
 | 守卫无法解析主机（临时 DNS 失败） | `RETRYABLE` | `destination_unresolved` |
+| 守卫判定目的地不是合法的 URL/host:port（空主机、非法端口等） | `FAILED` | `invalid_destination_url` |
 | SMTP `4xx` | `RETRYABLE` | `smtp_transient` |
 | 连接被拒、连接被断开或对话被提前终止 | `RETRYABLE` | `smtp_unavailable` |
 | 超过投递窗口（连接、握手或应答） | `RETRYABLE` | `smtp_timeout` |
@@ -780,16 +786,17 @@ HTTP 代理，`LUX_PROXY_URL` 对它不生效；守卫校验过的地址始终�
 | TLS 握手或证书校验失败 | `FAILED` | `smtp_tls_failed` |
 
 `lettre` 的 rustls 后端把握手和证书失败包装成连接错误，把对话被提前关闭包装成响应错误。插件沿错误源链检查
-稳定的错误文本片段，把前一类判为永久失败、后一类判为可重试网络错误；插件绝不会在加密未建立时把密码或收件人
-发给对端。插件每次投递向 stderr 写一行
+稳定的错误文本片段，把前一类判为永久失败、后一类判为可重试网络错误；除上述测试缝外，插件不会在加密未建立时把
+密码或收件人发给对端。插件每次投递向 stderr 写一行
 `org.lux.notifier.email: event <eventId> transport=<starttls|ssl> port=<端口> finished with <状态> (<错误码>)`，
 不包含密码、收件人地址、SMTP 主机或任何完整外部 URL。`LUX_PLUGIN_SMTP_TIMEOUT_SECONDS` 仅供测试把投递窗口
 收紧到 1–10 秒，不能放宽 SDK 的上限。
 
 测试（`cargo test --locked --test plugins notifier_email::`）用 `127.0.0.1` 随机端口的假 SMTP 服务器覆盖成功、
-无认证、`4xx`、`5xx`、认证被拒、连接被断开、超时、默认端口、STARTTLS 不被支持、SSL 握手失败、坏配置和缺凭据；
-守卫用例覆盖默认未批准私网时拒绝回环中继，以及批准私网后仍拒绝云元数据地址 `169.254.169.254`。所有 mock 用例
-显式携带 `allowPrivateNetwork: true`，并断言凭据和目的主机不出现在返回值与捕获的日志中；测试不使用任何真实凭据
-或真实邮件服务。
+无认证、`4xx`、`5xx`、认证被拒、连接被断开、超时、默认端口、STARTTLS 不被支持、SSL 握手失败、坏配置（含带
+`@`/`\`/方括号/内嵌端口的主机与不可作为 TLS 主机名的名字）和缺凭据；守卫用例覆盖默认未批准私网时拒绝回环中继、
+批准私网后仍拒绝云元数据地址 `169.254.169.254`，以及"仅设置测试环境变量但实际地址不是回环"时明文测试缝仍不可用。
+所有 mock 用例显式携带 `allowPrivateNetwork: true`，并断言凭据和目的主机不出现在返回值与捕获的日志中；测试不
+使用任何真实凭据或真实邮件服务。
 
 打包：`scripts/package-notifier-plugin.sh org.lux.notifier.email`。

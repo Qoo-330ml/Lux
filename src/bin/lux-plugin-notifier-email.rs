@@ -118,6 +118,11 @@ async fn attempt(
         Ok(guarded) => guarded,
         Err(error) => return Ok(guard_failure(error)),
     };
+    // The plaintext seam is decided by the address the guard validated, never by the configured
+    // name: an approved private relay that is not loopback still must not receive plaintext SMTP.
+    if config.security == SmtpSecurity::None && !guarded.primary().ip().is_loopback() {
+        return Err(INVALID_CONFIG);
+    }
     let (title, body) = render_event_text(&request.event);
     let message = config.message(&title, &body)?;
     let timeout = delivery_timeout();
@@ -211,23 +216,25 @@ impl EmailConfig {
             .get("smtpHost")
             .and_then(Value::as_str)
             .ok_or(INVALID_CONFIG)?;
-        if host.is_empty()
-            || host.chars().count() > MAX_SMTP_HOST_CHARS
-            || host.chars().any(char::is_whitespace)
-            || host.chars().any(char::is_control)
-            || host.contains('/')
-        {
+        if !valid_smtp_host(host) {
             return Err(INVALID_CONFIG);
         }
         let security = match object.get("security").and_then(Value::as_str) {
             None => SmtpSecurity::StartTls,
             Some("starttls") => SmtpSecurity::StartTls,
             Some("ssl") => SmtpSecurity::Ssl,
-            // Unencrypted SMTP is not a destination option; only the loopback test seam may ask
-            // for it, and the manifest does not declare the value.
-            Some("none") if plaintext_test_allowed(host) => SmtpSecurity::None,
+            // Unencrypted SMTP is not a destination option: the value is only reachable while the
+            // test seam is enabled, and even then the guarded connection address must be loopback.
+            Some("none") if plaintext_test_enabled() => SmtpSecurity::None,
             Some(_) => return Err(INVALID_CONFIG),
         };
+        // An unusable TLS server name is a configuration error, not a retryable upstream failure.
+        // Validate it before the guard resolves anything: `lettre` only parses the TLS server name
+        // during the handshake, so a bad name would otherwise surface as `destination_unresolved`
+        // (retryable) or as a noisy handshake failure.
+        if security != SmtpSecurity::None && !valid_tls_server_name(host) {
+            return Err(INVALID_CONFIG);
+        }
         let port = match object.get("smtpPort") {
             None | Some(Value::Null) => default_port(security),
             Some(value) => value
@@ -379,17 +386,66 @@ fn default_port(security: SmtpSecurity) -> u16 {
     }
 }
 
-/// Whether the test-only plaintext seam is active for this relay.
-fn plaintext_test_allowed(host: &str) -> bool {
-    let enabled = std::env::var(PLAINTEXT_TEST_ENV).is_ok_and(|value| value.trim() == "1");
-    enabled && is_loopback_host(host)
+/// A host the plugin accepts as an SMTP relay.
+///
+/// Only an ASCII DNS name (letters, digits, `.`, `-`, `_`) or a bare IPv6 literal is accepted, which
+/// keeps `user@host`, `[::1]`, `host:port`, absolute paths and backslashes out of the destination
+/// before the guard or the TLS layer ever sees them.
+fn valid_smtp_host(host: &str) -> bool {
+    if host.is_empty()
+        || host.chars().count() > MAX_SMTP_HOST_CHARS
+        || host.chars().any(char::is_control)
+    {
+        return false;
+    }
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        return true;
+    }
+    host.chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_'))
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
+/// A host the TLS layer can validate a certificate against.
+///
+/// An IP literal is accepted as-is. Otherwise the name must follow the DNS name rules the TLS
+/// backend enforces: at most 253 bytes, labels of 1-63 bytes made of letters, digits, `-` and `_`,
+/// no label that starts or ends with `-`, and a final label that is not all digits. This mirrors
+/// the backend so a bad name fails as `invalid_config` before the guard or a connection.
+fn valid_tls_server_name(host: &str) -> bool {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    let name = host.strip_suffix('.').unwrap_or(host);
+    if name.is_empty() || name.len() > MAX_SMTP_HOST_CHARS {
+        return false;
+    }
+    let mut labels = name.split('.').peekable();
+    while let Some(label) = labels.next() {
+        if !valid_dns_label(label) {
+            return false;
+        }
+        if labels.peek().is_none() {
+            return !label.chars().all(|character| character.is_ascii_digit());
+        }
+    }
+    false
+}
+
+fn valid_dns_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+/// Whether the test-only plaintext seam is enabled by the environment.
+///
+/// It is not enough on its own: the address the guard actually resolved must also be loopback.
+fn plaintext_test_enabled() -> bool {
+    std::env::var(PLAINTEXT_TEST_ENV).is_ok_and(|value| value.trim() == "1")
 }
 
 /// Maps the SMTP client error onto the host's delivery classification.
