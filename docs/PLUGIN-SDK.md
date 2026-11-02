@@ -626,16 +626,20 @@ PLUGIN_INTERNAL_ERROR
   `https://open.feishu.cn` 或 `https://open.larksuite.com`）、`apiBase`（可选覆盖，仅测试或企业代理使用，
   只接受不含凭据、查询参数和片段的 http(s) 基址）、`msgType`（`post`/`text`，默认 `post`）。通知正文由
   `render_event_text` 原样转发核心生成的 `title`/`content`，插件不重写。
-- 请求：`POST {base}/open-apis/bot/v2/hook/{hookId}`，`post` 使用飞书富文本消息，`text` 使用纯文本消息。
-  出站 client 来自 `outbound_http_client_from_env`：10 秒超时、不跟随重定向、遵循 `LUX_PROXY_URL`。
+- 请求：`POST {base}/open-apis/bot/v2/hook/{hookId}`，`post` 使用飞书富文本消息（标题放 `title` 字段、
+  `content` 只放正文，避免标题重复），`text` 使用纯文本消息（标题作为首行）。出站 client 来自
+  `outbound_http_client_from_env`：10 秒超时、不跟随重定向、遵循 `LUX_PROXY_URL`；client 因代理配置无效
+  无法构建时返回可重试的 `client_unavailable`，不会静默丢弃投递。
 - 结果分类：HTTP `2xx` 且响应 `code == 0` 为 `DELIVERED`；HTTP `429`/`5xx`（以及 `408`、`425`）与飞书
   频控业务码 `11232`、`19xxx` 为 `RETRYABLE`（HTTP `Retry-After` 会转成 `retry_after_seconds`）；其余
   HTTP `4xx` 和其他非 0 业务码为 `FAILED`。网络错误与超时为 `RETRYABLE`，响应体超过 64 KiB 或无法解析为
   飞书响应时为 `FAILED`。
 - 稳定错误码：`missing_secret`、`invalid_secret`、`invalid_config`、`provider_timeout`、
   `provider_unreachable`、`provider_response_too_large`、`provider_invalid_response`、
-  `provider_rate_limited`、`provider_code_<业务码>`；HTTP 状态沿用 SDK 的 `PROVIDER_HTTP_<状态码>`。
-  这些代码和 stderr 诊断都不包含凭据、hook 路径或完整外部 URL 与 query。
+  `provider_rate_limited`、`provider_code_<业务码>`、`client_unavailable`；HTTP 状态沿用 SDK 的
+  `PROVIDER_HTTP_<状态码>`。其中 `provider_timeout`、`provider_unreachable`、`provider_rate_limited` 和
+  `client_unavailable` 归类为 `RETRYABLE`，其余为 `FAILED`。这些代码和 stderr 诊断都不包含凭据、hook 路径
+  或完整外部 URL 与 query。
 - 测试：`cargo test --locked --test plugins notifier_feishu::` 用 127.0.0.1 随机端口的本地 mock 覆盖成功、
   签名、4xx、429/5xx、频控业务码、超时、过大响应、坏配置和缺失/畸形凭据，并断言凭据不出现在返回值和捕获
   的 stderr 日志中；不访问真实飞书服务，仓库里只有合成测试值。
