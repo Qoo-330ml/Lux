@@ -564,71 +564,205 @@ describe("HomePage shelves", () => {
     return element.querySelector<HTMLButtonElement>(".lux-hero-dot.is-active")?.getAttribute("aria-label");
   }
 
-  it("pauses the carousel while the pointer rests on the hero and resumes afterwards", async () => {
-    const element = await mountCarousel();
-    const hero = element.querySelector(".lux-hero") as HTMLElement;
+  function dispatchPointer(
+    target: Element,
+    type: "pointerover" | "pointerout",
+    pointerType: string,
+    relatedTarget: EventTarget | null = null,
+  ) {
+    const event = new MouseEvent(type, { bubbles: true, relatedTarget: relatedTarget as Node | null });
+    Object.defineProperty(event, "pointerType", { configurable: true, value: pointerType });
+    target.dispatchEvent(event);
+  }
 
+  /** jsdom implements neither pointer-type nor media-query based hover/focus capabilities. */
+  function stubPointerCapabilities({
+    hoverSelector = false,
+    hoverMedia = false,
+    focusVisible = false,
+  }: { hoverSelector?: boolean; hoverMedia?: boolean; focusVisible?: boolean } = {}) {
+    const originalMatches = Element.prototype.matches;
+    const originalMatchMedia = window.matchMedia;
+    vi.spyOn(Element.prototype, "matches").mockImplementation(function (this: Element, selector: string) {
+      if (selector === ":hover") return hoverSelector;
+      if (selector === ":focus-visible") return focusVisible;
+      return originalMatches.call(this, selector);
+    });
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      writable: true,
+      value: (query: string) => ({
+        matches: hoverMedia,
+        media: query,
+        onchange: null,
+        addListener: () => undefined,
+        removeListener: () => undefined,
+        addEventListener: () => undefined,
+        removeEventListener: () => undefined,
+        dispatchEvent: () => false,
+      }),
+    });
+    return () => {
+      Object.defineProperty(window, "matchMedia", {
+        configurable: true,
+        writable: true,
+        value: originalMatchMedia,
+      });
+    };
+  }
+
+  function progressIsPaused(element: HTMLElement) {
+    return element.querySelector(".lux-hero-dot-progress")?.classList.contains("is-paused");
+  }
+
+  it("pauses the carousel while the mouse pointer rests on the hero and resumes afterwards", async () => {
+    const restoreCapabilities = stubPointerCapabilities({ hoverMedia: true });
     try {
-      vi.useFakeTimers({ now: Date.now() });
-      act(() => {
-        hero.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, relatedTarget: document.body }));
-      });
-      expect(element.querySelector(".lux-hero-dot-progress")?.classList.contains("is-paused")).toBe(true);
+      const element = await mountCarousel();
+      const hero = element.querySelector(".lux-hero") as HTMLElement;
 
-      act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS * 3));
-      expect(activeSlideLabel(element)).toContain("第 1 条精选");
+      try {
+        vi.useFakeTimers({ now: Date.now() });
+        act(() => dispatchPointer(hero, "pointerover", "mouse", document.body));
+        expect(progressIsPaused(element)).toBe(true);
 
-      act(() => {
-        hero.dispatchEvent(new MouseEvent("mouseout", { bubbles: true, relatedTarget: document.body }));
-      });
-      expect(element.querySelector(".lux-hero-dot-progress")?.classList.contains("is-paused")).toBe(false);
+        act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS * 3));
+        expect(activeSlideLabel(element)).toContain("第 1 条精选");
 
-      act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS));
-      expect(activeSlideLabel(element)).toContain("第 2 条精选");
-    } finally {
-      if (vi.isFakeTimers()) {
-        act(() => root?.unmount());
-        root = undefined;
+        act(() => dispatchPointer(hero, "pointerout", "mouse", document.body));
+        expect(progressIsPaused(element)).toBe(false);
+
+        act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS));
+        expect(activeSlideLabel(element)).toContain("第 2 条精选");
+      } finally {
+        if (vi.isFakeTimers()) {
+          act(() => root?.unmount());
+          root = undefined;
+        }
+        vi.useRealTimers();
       }
-      vi.useRealTimers();
+    } finally {
+      restoreCapabilities();
+    }
+  });
+
+  it("ignores touch pointer events so a tap cannot stick the carousel paused", async () => {
+    const restoreCapabilities = stubPointerCapabilities({ hoverMedia: false });
+    try {
+      const element = await mountCarousel();
+      const hero = element.querySelector(".lux-hero") as HTMLElement;
+
+      try {
+        vi.useFakeTimers({ now: Date.now() });
+        act(() => element.querySelectorAll<HTMLButtonElement>(".lux-hero-dot")[1]?.click());
+        await act(async () => {});
+        expect(activeSlideLabel(element)).toContain("第 2 条精选");
+
+        act(() => {
+          // A real tap also synthesises mouse compatibility events that never fire a matching
+          // mouseleave, which used to leave `hovered` stuck at true.
+          hero.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, relatedTarget: document.body }));
+          dispatchPointer(hero, "pointerover", "touch", document.body);
+        });
+        expect(progressIsPaused(element)).toBe(false);
+
+        act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS));
+        expect(activeSlideLabel(element)).toContain("第 1 条精选");
+
+        act(() => dispatchPointer(hero, "pointerover", "mouse", document.body));
+        expect(progressIsPaused(element)).toBe(true);
+        act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS * 2));
+        expect(activeSlideLabel(element)).toContain("第 1 条精选");
+      } finally {
+        if (vi.isFakeTimers()) {
+          act(() => root?.unmount());
+          root = undefined;
+        }
+        vi.useRealTimers();
+      }
+    } finally {
+      restoreCapabilities();
     }
   });
 
   it("pauses the carousel while keyboard focus is inside the hero", async () => {
-    const element = await mountCarousel();
-    const dot = element.querySelectorAll<HTMLButtonElement>(".lux-hero-dot")[0];
-
+    const restoreCapabilities = stubPointerCapabilities({ focusVisible: true });
     try {
-      vi.useFakeTimers({ now: Date.now() });
-      act(() => dot.focus());
-      expect(element.querySelector(".lux-hero-dot-progress")?.classList.contains("is-paused")).toBe(true);
+      const element = await mountCarousel();
+      const dot = element.querySelectorAll<HTMLButtonElement>(".lux-hero-dot")[0];
 
-      act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS * 3));
-      expect(activeSlideLabel(element)).toContain("第 1 条精选");
+      try {
+        vi.useFakeTimers({ now: Date.now() });
+        act(() => dot.focus());
+        expect(progressIsPaused(element)).toBe(true);
 
-      act(() => dot.blur());
-      expect(element.querySelector(".lux-hero-dot-progress")?.classList.contains("is-paused")).toBe(false);
+        act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS * 3));
+        expect(activeSlideLabel(element)).toContain("第 1 条精选");
 
-      act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS));
-      expect(activeSlideLabel(element)).toContain("第 2 条精选");
-    } finally {
-      if (vi.isFakeTimers()) {
-        act(() => root?.unmount());
-        root = undefined;
+        act(() => dot.blur());
+        expect(progressIsPaused(element)).toBe(false);
+
+        act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS));
+        expect(activeSlideLabel(element)).toContain("第 2 条精选");
+      } finally {
+        if (vi.isFakeTimers()) {
+          act(() => root?.unmount());
+          root = undefined;
+        }
+        vi.useRealTimers();
       }
-      vi.useRealTimers();
+    } finally {
+      restoreCapabilities();
     }
   });
 
-  it("starts paused when a remounted carousel is already under the pointer", async () => {
-    const matches = vi.spyOn(Element.prototype, "matches").mockImplementation(function (this: Element, selector: string) {
-      return selector === ":hover";
-    });
+  it("keeps rotating after a mouse click focuses a dot that is not focus-visible", async () => {
+    const restoreCapabilities = stubPointerCapabilities({ focusVisible: false, hoverMedia: true });
     try {
       const element = await mountCarousel();
-      expect(element.querySelector(".lux-hero-dot-progress")?.classList.contains("is-paused")).toBe(true);
+      const hero = element.querySelector(".lux-hero") as HTMLElement;
+      const dot = element.querySelectorAll<HTMLButtonElement>(".lux-hero-dot")[0];
+
+      try {
+        vi.useFakeTimers({ now: Date.now() });
+        act(() => dispatchPointer(hero, "pointerover", "mouse", document.body));
+        act(() => dot.focus());
+        act(() => dispatchPointer(hero, "pointerout", "mouse", document.body));
+
+        expect(dot.matches(":focus-visible")).toBe(false);
+        expect(progressIsPaused(element)).toBe(false);
+
+        act(() => vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS));
+        expect(activeSlideLabel(element)).toContain("第 2 条精选");
+      } finally {
+        if (vi.isFakeTimers()) {
+          act(() => root?.unmount());
+          root = undefined;
+        }
+        vi.useRealTimers();
+      }
     } finally {
-      matches.mockRestore();
+      restoreCapabilities();
+    }
+  });
+
+  it("starts paused when a remounted hover-capable carousel is already under the pointer", async () => {
+    const restoreCapabilities = stubPointerCapabilities({ hoverSelector: true, hoverMedia: true });
+    try {
+      const element = await mountCarousel();
+      expect(progressIsPaused(element)).toBe(true);
+    } finally {
+      restoreCapabilities();
+    }
+  });
+
+  it("does not adopt a sticky :hover state when the device cannot hover", async () => {
+    const restoreCapabilities = stubPointerCapabilities({ hoverSelector: true, hoverMedia: false });
+    try {
+      const element = await mountCarousel();
+      expect(progressIsPaused(element)).toBe(false);
+    } finally {
+      restoreCapabilities();
     }
   });
 

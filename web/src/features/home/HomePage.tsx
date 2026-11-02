@@ -239,14 +239,16 @@ const HeroCarousel = memo(function HeroCarousel({ items, continueWatching, isLoa
   const heroRef = useRef<HTMLElement | null>(null);
 
   // A slide list change remounts the hero while the pointer may still rest on it; the browser
-  // does not repeat `mouseenter` for the fresh node, so adopt the current hover state on mount.
+  // does not repeat `pointerenter` for the fresh node, so adopt the current hover state on mount.
+  // Devices that cannot hover (touch) report no media match, which keeps a stale `:hover` from
+  // freezing the carousel.
   useEffect(() => {
     const node = heroRef.current;
-    if (!node) return;
+    if (!node || !supportsHoverPointer()) return;
     try {
       if (node.matches(":hover")) setHovered(true);
     } catch {
-      // Some environments cannot match :hover; hover tracking falls back to mouse events.
+      // Some environments cannot match :hover; hover tracking falls back to pointer events.
     }
   }, []);
 
@@ -257,9 +259,17 @@ const HeroCarousel = memo(function HeroCarousel({ items, continueWatching, isLoa
       aria-label="精选媒体轮播"
       aria-roledescription="carousel"
       aria-busy={isLoading}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      onFocus={() => setFocusWithin(true)}
+      onPointerEnter={(event) => {
+        if (event.pointerType === "mouse") setHovered(true);
+      }}
+      onPointerLeave={(event) => {
+        if (event.pointerType === "mouse") setHovered(false);
+      }}
+      onFocus={(event) => {
+        // A mouse click focuses the dot but leaves no way out of the hero, so only keyboard
+        // focus pauses; anything unrecognised stays conservative and pauses.
+        if (isKeyboardFocus(event.target)) setFocusWithin(true);
+      }}
       onBlur={(event) => {
         const nextFocus = event.relatedTarget;
         if (!(nextFocus instanceof Node) || !event.currentTarget.contains(nextFocus)) setFocusWithin(false);
@@ -305,6 +315,25 @@ function heroPlaybackItem(item: MediaItem, continueWatching: MediaItem[]) {
     return continueWatching.find((candidate) => candidate.itemType === "EPISODE" && candidate.seriesId === item.id);
   }
   return item.itemType === "MOVIE" || item.itemType === "EPISODE" ? item : undefined;
+}
+
+/** True for keyboard focus; mouse clicks on a dot must not pause the carousel forever. */
+function isKeyboardFocus(target: EventTarget | null) {
+  if (!(target instanceof Element)) return true;
+  try {
+    return target.matches(":focus-visible");
+  } catch {
+    return true;
+  }
+}
+
+/** Hover pause needs a device that really hovers; touch reports a sticky, never-cleared hover. */
+function supportsHoverPointer() {
+  try {
+    return typeof window.matchMedia === "function" && window.matchMedia("(hover: hover)").matches;
+  } catch {
+    return false;
+  }
 }
 
 function EmptyLibraries() {
