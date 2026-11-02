@@ -1,0 +1,45 @@
+.lux-history-list { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+
+.lux-history-row { display: grid; grid-template-columns: 96px minmax(0, 1fr) auto; align-items: center; gap: 16px; padding: 12px 16px; border: 1px solid var(--lux-line-soft); border-radius: 14px; background: rgba(255,255,255,.022); transition: border-color .2s ease, background .2s ease; }
+
+.lux-history-row:hover { border-color: var(--lux-line); background: rgba(255,255,255,.05); }
+
+.lux-history-art { display: block; width: 96px; aspect-ratio: 2 / 3; overflow: hidden; border-radius: 9px; background: #17171b; }
+
+.lux-history-art img { display: block; width: 100%; height: 100%; object-fit: cover; }
+
+.lux-history-copy { display: grid; gap: 6px; min-width: 0; }
+
+.lux-history-title { overflow: hidden; color: #fff; font-size: .98rem; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+
+.lux-history-title:hover { color: var(--lux-accent); }
+
+.lux-history-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; color: var(--lux-muted); font-size: .78rem; }
+
+.lux-history-meta > span + span::before { margin-right: 12px; color: var(--lux-subtle); content: "·"; }
+
+.lux-history-progress { width: 100%; max-width: 260px; height: 3px; border-radius: 999px; background: rgba(255,255,255,.14); }
+
+.lux-history-progress span { display: block; height: 100%; border-radius: inherit; background: var(--lux-accent); }
+
+.lux-history-resume { justify-self: end; white-space: nowrap; }
+
+.lux-history-pagination { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 18px; color: var(--lux-subtle); font-size: .78rem; }
+
+.lux-history-pagination > div { display: flex; gap: 8px; }
+
+@media (max-width: 640px) {
+  .lux-history-row { grid-template-columns: 68px minmax(0, 1fr); gap: 12px; padding: 10px 12px; }
+  .lux-history-art { width: 68px; }
+  .lux-history-resume { grid-column: 1 / -1; justify-self: stretch; }
+  .lux-history-pagination { align-items: stretch; flex-direction: column; }
+  .lux-history-pagination > div { display: grid; grid-template-columns: 1fr 1fr; }
+}
+
+html[data-lux-theme="light"] .lux-history-row { border-color: var(--lux-line-soft); background: rgba(20,20,26,.03); }
+
+html[data-lux-theme="light"] .lux-history-row:hover { background: rgba(20,20,26,.06); }
+
+html[data-lux-theme="light"] .lux-history-title { color: var(--lux-text); }
+
+html[data-lux-theme="light"] .lux-history-progress { background: rgba(20,20,26,.12); }

@@ -30,6 +30,7 @@ const LibrariesPage = lazy(() => import("../features/library/LibrariesPage").the
 const LibraryPage = lazy(() => import("../features/library/LibraryPage").then(({ LibraryPage }) => ({ default: LibraryPage })));
 const SearchPage = lazy(() => import("../features/search/SearchPage").then(({ SearchPage }) => ({ default: SearchPage })));
 const FavoritesPage = lazy(() => import("../features/favorites/FavoritesPage").then(({ FavoritesPage }) => ({ default: FavoritesPage })));
+const WatchHistoryPage = lazy(() => import("../features/history/WatchHistoryPage").then(({ WatchHistoryPage }) => ({ default: WatchHistoryPage })));
 const MediaDetailPage = lazy(() => import("../features/detail/MediaDetailPage").then(({ MediaDetailPage }) => ({ default: MediaDetailPage })));
 const CollectionDetailPage = lazy(() => import("../features/detail/CollectionDetailPage").then(({ CollectionDetailPage }) => ({ default: CollectionDetailPage })));
 const PersonDetailPage = lazy(() => import("../features/detail/PersonDetailPage").then(({ PersonDetailPage }) => ({ default: PersonDetailPage })));
@@ -130,6 +131,7 @@ function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?:
             <Route path="libraries" element={<SuspensePage><LibrariesPage /></SuspensePage>} />
             <Route path="libraries/:libraryId" element={<SuspensePage><LibraryPage serverName={serverName} /></SuspensePage>} />
             <Route path="favorites" element={<SuspensePage><FavoritesPage /></SuspensePage>} />
+            <Route path="history" element={<SuspensePage><WatchHistoryPage /></SuspensePage>} />
             <Route path="items/:itemId" element={<SuspensePage><MediaDetailPage /></SuspensePage>} />
             <Route path="collections/:collectionId" element={<SuspensePage><CollectionDetailPage /></SuspensePage>} />
             <Route path="people/:personId" element={<SuspensePage><PersonDetailPage user={user} /></SuspensePage>} />

@@ -3472,6 +3472,101 @@ impl Database {
             .map_err(self.sqlx_err())
     }
 
+    /// One page of the current user's watch history, newest play first, with the match total.
+    ///
+    /// An item enters the history once its user state carries a `last_played_at`, so finished and
+    /// in-progress items both show up; `hide_from_resume` only hides continue watching. The row
+    /// projection and the visibility/ACL predicates match the other catalog pages, so the caller
+    /// renders the page with the shared catalog DTO without a second lookup.
+    pub(crate) async fn list_watch_history_items(
+        &self,
+        query: &WatchHistoryQuery<'_>,
+    ) -> Result<(Vec<StoredCatalogRow>, i64), StorageError> {
+        if query.library_ids.is_empty() || query.item_types.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let (candidate_where, candidate_binds) = watch_history_candidate_clause(query);
+        let count_sql = format!(
+            "SELECT COUNT(*)
+             FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
+             {candidate_where}"
+        );
+        let mut count_statement = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_sql));
+        for bind in &candidate_binds {
+            count_statement = match bind {
+                CatalogBind::Text(value) => count_statement.bind(*value),
+                CatalogBind::Integer(value) => count_statement.bind(*value),
+                CatalogBind::Real(value) => count_statement.bind(*value),
+            };
+        }
+        let total = count_statement
+            .fetch_one(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        if total == 0 || query.offset >= total {
+            return Ok((Vec::new(), total));
+        }
+        let list_sql = format!(
+            "WITH history AS (
+                 SELECT mi.id, mi.sort_title, us.last_played_at
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
+                 {candidate_where}
+             ),
+             paged AS (
+                 SELECT id, sort_title, last_played_at
+                 FROM history
+                 ORDER BY last_played_at DESC, sort_title, id
+                 LIMIT ? OFFSET ?
+             )
+             SELECT mi.id AS item_id, mi.library_id, mi.item_type,
+                    mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
+                    series.title AS series_name,
+                    mi.title, mi.sort_title, mi.original_title, mi.overview,
+                    mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
+                    mi.added_at, mi.updated_at,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
+                     ORDER BY image_index LIMIT 1) AS poster_image_tag,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
+                     ORDER BY image_index LIMIT 1) AS fanart_image_tag,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'THUMB'
+                     ORDER BY image_index LIMIT 1) AS thumb_image_tag,
+                    (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
+                     ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                    (SELECT fe.relative_path FROM filesystem_entries fe
+                     WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
+                    ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
+                    ms.edition_name, ms.quality_label,
+                    ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
+                    mt.id AS stream_id, mt.stream_index, mt.stream_type,
+                    mt.codec, mt.language, mt.title AS stream_title,
+                    mt.details_json AS stream_details_json,
+                    mt.is_external AS stream_is_external,
+                    mt.is_default AS stream_is_default,
+                    mt.is_forced AS stream_is_forced
+             FROM paged
+             JOIN media_items mi ON mi.id = paged.id
+             LEFT JOIN media_items series ON series.id = mi.series_id
+             LEFT JOIN media_sources ms
+               ON ms.item_id = mi.id
+              AND EXISTS (
+                  SELECT 1 FROM filesystem_entries fe
+                  WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
+              )
+             LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
+             ORDER BY paged.last_played_at DESC, paged.sort_title, paged.id,
+                      ms.id, mt.stream_index"
+        );
+        let mut binds = candidate_binds;
+        binds.push(CatalogBind::Integer(query.limit));
+        binds.push(CatalogBind::Integer(query.offset));
+        let rows = self.fetch_catalog_rows(&list_sql, &binds).await?;
+        Ok((rows, total))
+    }
+
     pub(crate) async fn list_progress_items(
         &self,
         user_id: &str,
@@ -10612,6 +10707,43 @@ fn catalog_list_union_selected_sql<'a>(
     union_binds.push(CatalogBind::Integer(fetch_limit));
     union_binds.push(CatalogBind::Integer(filter.offset));
     Some((paged_sql, union_binds))
+}
+
+/// `WHERE` clause, plus its binds, selecting the watch-history candidates of one user.
+///
+/// The clause is shared by the count and the page statement so both always match the same rows.
+/// Binds are emitted in textual placeholder order: user id, item types, library ids, then the
+/// content-restriction values.
+fn watch_history_candidate_clause<'a>(
+    query: &WatchHistoryQuery<'a>,
+) -> (String, Vec<CatalogBind<'a>>) {
+    let item_type_placeholders = std::iter::repeat_n("?", query.item_types.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let library_placeholders = std::iter::repeat_n("?", query.library_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut binds = Vec::with_capacity(query.item_types.len() + query.library_ids.len() + 4);
+    binds.push(CatalogBind::Text(query.user_id));
+    binds.extend(
+        query
+            .item_types
+            .iter()
+            .map(|item_type| CatalogBind::Text(item_type)),
+    );
+    binds.extend(
+        query
+            .library_ids
+            .iter()
+            .map(|library_id| CatalogBind::Text(library_id.as_str())),
+    );
+    let mut clause = format!(
+        "WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
+           AND us.last_played_at IS NOT NULL
+           AND mi.library_id IN ({library_placeholders})"
+    );
+    append_content_restriction_predicate(&mut clause, &mut binds, query.content_restrictions);
+    (clause, binds)
 }
 
 fn global_generated_identity_key(kind: &str, provider: &str, provider_id: &str) -> String {

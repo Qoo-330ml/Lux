@@ -935,9 +935,9 @@ pub(crate) use repository::{
     UserAccessBlacklistRuleScope, UserAccessSnapshot, UserAccountPreferences,
     UserAccountPreferencesCasResult, UserActivityEventQuery, UserContentRestrictions,
     UserContentRestrictionsCasResult, UserDevicePageQuery, UserInvitationCreateResult,
-    UserInvitationPage, UserInvitationResendResult, UserInvitationStatus, WebPlaybackEventClaim,
-    WebPlaybackTranscodingDetails, is_lite_manifest_discovery, movie_parent_folder_identity,
-    playback_reached_played_threshold, recommendation_batch_key_at,
+    UserInvitationPage, UserInvitationResendResult, UserInvitationStatus, WatchHistoryQuery,
+    WebPlaybackEventClaim, WebPlaybackTranscodingDetails, is_lite_manifest_discovery,
+    movie_parent_folder_identity, playback_reached_played_threshold, recommendation_batch_key_at,
 };
 
 /// Opens a throwaway SQLite database for unit tests.

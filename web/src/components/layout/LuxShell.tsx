@@ -1,5 +1,6 @@
 import {
   Heart,
+  History,
   Home,
   Library,
   Menu,
@@ -22,6 +23,7 @@ const DEFAULT_BROWSER_TITLE = "Lux Server - Lux";
 const shellRouteLoaders: Record<string, () => Promise<unknown>> = {
   "/libraries": () => import("../../features/library/LibrariesPage"),
   "/favorites": () => import("../../features/favorites/FavoritesPage"),
+  "/history": () => import("../../features/history/WatchHistoryPage"),
   "/search": () => import("../../features/search/SearchPage"),
   "/account": () => import("../../features/account/AccountPage"),
   "/admin": () => import("../../features/admin/AdminLayout"),
@@ -99,6 +101,9 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
               <NavLink className={navClass} to="/favorites" onPointerEnter={() => preloadShellRoute("/favorites")} onFocus={() => preloadShellRoute("/favorites")}>
                 收藏
               </NavLink>
+              <NavLink className={navClass} to="/history" onPointerEnter={() => preloadShellRoute("/history")} onFocus={() => preloadShellRoute("/history")}>
+                历史
+              </NavLink>
               <NavLink className={navClass} to="/search" onPointerEnter={() => preloadShellRoute("/search")} onFocus={() => preloadShellRoute("/search")}>
                 搜索
               </NavLink>
@@ -157,6 +162,10 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
           <NavLink className={mobileNavClass} to="/favorites" onPointerEnter={() => preloadShellRoute("/favorites")} onFocus={() => preloadShellRoute("/favorites")} onClick={() => setMobileOpen(false)}>
             <span className="lux-mobile-nav-icon" aria-hidden="true"><Heart size={18} /></span>
             <span className="lux-mobile-nav-label">收藏</span>
+          </NavLink>
+          <NavLink className={mobileNavClass} to="/history" onPointerEnter={() => preloadShellRoute("/history")} onFocus={() => preloadShellRoute("/history")} onClick={() => setMobileOpen(false)}>
+            <span className="lux-mobile-nav-icon" aria-hidden="true"><History size={18} /></span>
+            <span className="lux-mobile-nav-label">历史</span>
           </NavLink>
           <NavLink className={mobileNavClass} to="/search" onPointerEnter={() => preloadShellRoute("/search")} onFocus={() => preloadShellRoute("/search")} onClick={() => setMobileOpen(false)}>
             <span className="lux-mobile-nav-icon" aria-hidden="true"><Search size={18} /></span>

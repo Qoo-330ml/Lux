@@ -681,6 +681,11 @@ export class LuxApiClient {
     return this.request<PageResponse<MediaItem>>(`/api/v1/favorites?${params}`);
   }
 
+  watchHistory(page = 1) {
+    const params = new URLSearchParams({ page: String(page), pageSize: "24" });
+    return this.request<PageResponse<MediaItem>>(`/api/v1/watch-history?${params}`);
+  }
+
   libraries() {
     return this.request<LibrariesResponse>("/api/v1/libraries");
   }

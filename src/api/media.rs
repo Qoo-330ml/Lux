@@ -444,6 +444,54 @@ pub(super) async fn lux_list_continue_watching(
     }
 }
 
+pub(super) async fn lux_list_watch_history(
+    headers: HeaderMap,
+    Query(query): Query<LuxPageQuery>,
+    State(state): State<ReadyAppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let (offset, limit) = match page_params(
+        Some(query.page.unwrap_or(1)),
+        Some(query.page_size.unwrap_or(24)),
+    ) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let catalog = state.catalog();
+    let database = state.database();
+    match catalog
+        .list_watch_history(
+            AccessPrincipal::new(user.id, user.is_admin),
+            &user.id.to_string(),
+            offset,
+            limit,
+        )
+        .await
+    {
+        Ok(page) => {
+            match lux_catalog_page_json_for_user(database, &user.id.to_string(), &page).await {
+                Ok(body) => Json(body).into_response(),
+                Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
+        }
+        Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+            StatusCode::FORBIDDEN.into_response()
+        }
+    }
+}
+
 pub(super) async fn lux_list_library_latest(
     headers: HeaderMap,
     Path(library_id): Path<String>,

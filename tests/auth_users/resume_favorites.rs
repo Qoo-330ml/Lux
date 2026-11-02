@@ -1236,6 +1236,238 @@ async fn emby_resume_keeps_only_latest_eligible_episode_per_series()
     Ok(())
 }
 
+#[tokio::test]
+async fn watch_history_lists_the_users_played_items_newest_first()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    let viewer = UserStore::new(database.clone())?
+        .create_user("viewer", "Viewer", "viewer password", false)
+        .await?;
+    let libraries = LibraryService::new(database.clone());
+    let movies = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let private = libraries
+        .create_library("Private", LibraryKind::Movie, false)
+        .await?;
+    // The viewer is granted the public library only, so a state row in `Private` must not leak.
+    sqlx::query(
+        "INSERT INTO user_library_access (user_id, library_id, can_view)
+         VALUES (?, ?, 1)",
+    )
+    .bind(viewer.id.to_string())
+    .bind(movies.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query("UPDATE users SET library_access_mode = 'SELECTED' WHERE id = ?")
+        .bind(viewer.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+    let movies_root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&movies_root).await?;
+    tokio::fs::write(movies_root.join("Alpha.Movie.2024.mkv"), b"alpha").await?;
+    tokio::fs::write(movies_root.join("Beta.Movie.2025.mkv"), b"beta").await?;
+    libraries
+        .add_root(movies.id, movies_root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(movies.id)
+        .await?;
+    let private_root = temp_dir.path().join("Private");
+    tokio::fs::create_dir_all(&private_root).await?;
+    tokio::fs::write(private_root.join("Gamma.Movie.2023.mkv"), b"gamma").await?;
+    libraries
+        .add_root(private.id, private_root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(private.id)
+        .await?;
+
+    let alpha_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE title = 'Alpha Movie'")
+            .fetch_one(database.pool())
+            .await?;
+    let beta_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE title = 'Beta Movie'")
+            .fetch_one(database.pool())
+            .await?;
+    let gamma_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE title = 'Gamma Movie'")
+            .fetch_one(database.pool())
+            .await?;
+    sqlx::query(
+        "UPDATE media_sources SET duration_ticks = 7200000000
+         WHERE item_id IN (?, ?, ?)",
+    )
+    .bind(&alpha_id)
+    .bind(&beta_id)
+    .bind(&gamma_id)
+    .execute(database.pool())
+    .await?;
+    let admin_id = admin.id.to_string();
+    sqlx::query(
+        "INSERT INTO user_item_state (
+             user_id, item_id, position_ticks, is_played, last_played_at
+         ) VALUES (?, ?, ?, 0, ?), (?, ?, ?, 1, ?)",
+    )
+    .bind(&admin_id)
+    .bind(&alpha_id)
+    .bind(1_800_000_000_i64)
+    .bind(1_700_000_100_i64)
+    .bind(&admin_id)
+    .bind(&beta_id)
+    .bind(0_i64)
+    .bind(1_800_000_000_i64)
+    .execute(database.pool())
+    .await?;
+    let viewer_id = viewer.id.to_string();
+    sqlx::query(
+        "INSERT INTO user_item_state (user_id, item_id, position_ticks, is_played, last_played_at)
+         VALUES (?, ?, 0, 0, ?), (?, ?, 0, 1, ?)",
+    )
+    .bind(&viewer_id)
+    .bind(&beta_id)
+    .bind(1_750_000_000_i64)
+    .bind(&viewer_id)
+    .bind(&gamma_id)
+    .bind(1_900_000_000_i64)
+    .execute(database.pool())
+    .await?;
+
+    let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+
+    let anonymous = client
+        .get(format!(
+            "{base_url}/api/v1/watch-history?page=1&pageSize=10"
+        ))
+        .send()
+        .await?;
+    assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let admin_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    let admin_cookies = format!(
+        "lux_session={}; lux_csrf={}",
+        cookie_value(&admin_login, "lux_session")?,
+        cookie_value(&admin_login, "lux_csrf")?
+    );
+    let first_page = client
+        .get(format!("{base_url}/api/v1/watch-history?page=1&pageSize=1"))
+        .header(COOKIE, &admin_cookies)
+        .send()
+        .await?;
+    assert_eq!(first_page.status(), reqwest::StatusCode::OK);
+    let first_page_body = first_page.json::<Value>().await?;
+    assert_eq!(first_page_body["total"], 2);
+    assert_eq!(first_page_body["page"], 1);
+    assert_eq!(first_page_body["pageSize"], 1);
+    assert_eq!(first_page_body["hasNext"], true);
+    assert_eq!(first_page_body["items"][0]["title"], "Beta Movie");
+    assert_eq!(first_page_body["items"][0]["userData"]["isPlayed"], true);
+    assert_eq!(
+        first_page_body["items"][0]["userData"]["lastPlayedAt"],
+        1_800_000_000_i64
+    );
+    let second_page = client
+        .get(format!("{base_url}/api/v1/watch-history?page=2&pageSize=1"))
+        .header(COOKIE, &admin_cookies)
+        .send()
+        .await?;
+    assert_eq!(second_page.status(), reqwest::StatusCode::OK);
+    let second_page_body = second_page.json::<Value>().await?;
+    assert_eq!(second_page_body["hasNext"], false);
+    assert_eq!(second_page_body["items"][0]["title"], "Alpha Movie");
+    assert_eq!(
+        second_page_body["items"][0]["userData"]["positionTicks"],
+        1_800_000_000_i64
+    );
+    let oversized = client
+        .get(format!(
+            "{base_url}/api/v1/watch-history?page=1&pageSize=101"
+        ))
+        .header(COOKIE, &admin_cookies)
+        .send()
+        .await?;
+    assert_eq!(oversized.status(), reqwest::StatusCode::BAD_REQUEST);
+    let invalid_page = client
+        .get(format!(
+            "{base_url}/api/v1/watch-history?page=0&pageSize=10"
+        ))
+        .header(COOKIE, &admin_cookies)
+        .send()
+        .await?;
+    assert_eq!(invalid_page.status(), reqwest::StatusCode::BAD_REQUEST);
+    let empty_page = client
+        .get(format!(
+            "{base_url}/api/v1/watch-history?page=9&pageSize=10"
+        ))
+        .header(COOKIE, &admin_cookies)
+        .send()
+        .await?;
+    assert_eq!(empty_page.status(), reqwest::StatusCode::OK);
+    let empty_page_body = empty_page.json::<Value>().await?;
+    assert_eq!(empty_page_body["items"].as_array().map(Vec::len), Some(0));
+    assert_eq!(empty_page_body["total"], 2);
+    assert_eq!(empty_page_body["hasNext"], false);
+
+    let viewer_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "viewer", "password": "viewer password" }))
+        .send()
+        .await?;
+    let viewer_cookies = format!(
+        "lux_session={}; lux_csrf={}",
+        cookie_value(&viewer_login, "lux_session")?,
+        cookie_value(&viewer_login, "lux_csrf")?
+    );
+    let viewer_history = client
+        .get(format!(
+            "{base_url}/api/v1/watch-history?page=1&pageSize=10"
+        ))
+        .header(COOKIE, &viewer_cookies)
+        .send()
+        .await?;
+    assert_eq!(viewer_history.status(), reqwest::StatusCode::OK);
+    let viewer_history_body = viewer_history.json::<Value>().await?;
+    assert_eq!(viewer_history_body["total"], 1);
+    assert_eq!(viewer_history_body["items"][0]["title"], "Beta Movie");
+    assert_eq!(
+        viewer_history_body["items"][0]["userData"]["lastPlayedAt"],
+        1_750_000_000_i64
+    );
+
+    server.abort();
+    database.close().await;
+    Ok(())
+}
+
 fn cookie_value(
     response: &reqwest::Response,
     name: &str,

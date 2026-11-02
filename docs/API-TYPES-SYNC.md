@@ -23,7 +23,7 @@
 | (c) | 非 JSON：图片字节流、媒体流、字幕文本、XML |
 | 204 | 成功但无响应体 |
 
-统计口径：`src/api/lux_api.rs` 共 **45 条 route 条目、47 个 handler**（`/items/{item_id}/metadata` 与 `/people/{person_id}` 各有两个方法）。
+统计口径：`src/api/lux_api.rs` 共 **46 条 route 条目、48 个 handler**（`/items/{item_id}/metadata` 与 `/people/{person_id}` 各有两个方法）。
 
 ## 全量路由清点
 
@@ -74,6 +74,7 @@
 | 43 | `/api/v1/playback-history` | GET | `lux_list_playback_history` | (b) | `{events:Vec<PlaybackHistoryEventView>,page,pageSize}` | **无前端消费** |
 | 44 | `/api/v1/items/{item_id}/metadata` | GET, PATCH | `lux_get_metadata` / `lux_update_metadata` | (b) | `metadata_json`（`media.rs:1274`） | `ItemMetadata` / `MetadataFieldName` |
 | 45 | `/api/v1/items/{item_id}/download` | GET, HEAD | `lux_download` | (c) | 文件下载流 | — |
+| 46 | `/api/v1/watch-history` | GET | `lux_list_watch_history` | (b) | `lux_catalog_page_json_for_user` | `PageResponse<MediaItem>` |
 
 ### 统计
 
@@ -81,12 +82,12 @@
 | --- | --- | --- |
 | (a) 全新具名结构体 | 1 | 2% |
 | (a)+(b) 混合（元素具名、信封手拼） | 1 | 2% |
-| (b) `json!` 手拼 / `Value` | 25 | 56% |
+| (b) `json!` 手拼 / `Value` | 26 | 57% |
 | (c) 非 JSON | 12 | 27% |
 | 204 无响应体 | 6 | 13% |
-| **合计** | **45** | 100% |
+| **合计** | **46** | 100% |
 
-结论：Lux API 的 JSON 响应里 **只有 1 条路由（`/people/{id}`）已经是纯具名结构体**，(b) 占 56%。
+结论：Lux API 的 JSON 响应里 **只有 1 条路由（`/people/{id}`）已经是纯具名结构体**，(b) 占 57%。
 `types.ts` 中 221 个导出类型的绝大部分（含整个 `Admin*` 家族）对应的是 `src/api/admin/**` 与 `src/api/users.rs` 的路由，
 不在本次清点范围内，但同样属于 (b)。
 
