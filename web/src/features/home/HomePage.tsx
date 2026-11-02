@@ -1,7 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Info, Play } from "lucide-react";
 import { Link } from "react-router-dom";
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
@@ -236,9 +236,23 @@ const HeroCarousel = memo(function HeroCarousel({ items, continueWatching, isLoa
       : "/libraries";
   const playbackLabel = playbackItem && playbackPositionTicks(playbackItem) > 0 ? "继续播放" : "播放";
   const goTo = (index: number) => setActiveIndex((index + items.length) % items.length);
+  const heroRef = useRef<HTMLElement | null>(null);
+
+  // A slide list change remounts the hero while the pointer may still rest on it; the browser
+  // does not repeat `mouseenter` for the fresh node, so adopt the current hover state on mount.
+  useEffect(() => {
+    const node = heroRef.current;
+    if (!node) return;
+    try {
+      if (node.matches(":hover")) setHovered(true);
+    } catch {
+      // Some environments cannot match :hover; hover tracking falls back to mouse events.
+    }
+  }, []);
 
   return (
     <section
+      ref={heroRef}
       className="lux-hero"
       aria-label="精选媒体轮播"
       aria-roledescription="carousel"

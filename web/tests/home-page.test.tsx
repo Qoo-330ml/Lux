@@ -620,6 +620,18 @@ describe("HomePage shelves", () => {
     }
   });
 
+  it("starts paused when a remounted carousel is already under the pointer", async () => {
+    const matches = vi.spyOn(Element.prototype, "matches").mockImplementation(function (this: Element, selector: string) {
+      return selector === ":hover";
+    });
+    try {
+      const element = await mountCarousel();
+      expect(element.querySelector(".lux-hero-dot-progress")?.classList.contains("is-paused")).toBe(true);
+    } finally {
+      matches.mockRestore();
+    }
+  });
+
   it("pauses the carousel while the page is hidden and resumes when it is visible again", async () => {
     const element = await mountCarousel();
 
