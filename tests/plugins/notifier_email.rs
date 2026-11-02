@@ -309,7 +309,20 @@ fn email_config(address: SocketAddr, security: &str, username: Option<&str>) -> 
     config
 }
 
+/// Builds a `notification.send` request for the loopback mock relay.
+///
+/// Every mock lives on `127.0.0.1`, so the request explicitly carries the administrator's
+/// `allowPrivateNetwork: true` approval; the guard must see exactly that value.
 fn send_params(config: Value, secret: Option<&str>) -> Value {
+    send_params_with_private_approval(config, secret, true)
+}
+
+/// Builds a `notification.send` request with an explicit private-network decision.
+fn send_params_with_private_approval(
+    config: Value,
+    secret: Option<&str>,
+    allow_private_network: bool,
+) -> Value {
     let mut params = json!({
         "event": {
             "schemaVersion": 1,
@@ -324,7 +337,7 @@ fn send_params(config: Value, secret: Option<&str>) -> Value {
                 "timestamp": "2023-11-14T22:13:20Z"
             }
         },
-        "target": {"url": "", "allowPrivateNetwork": false},
+        "target": {"url": "", "allowPrivateNetwork": allow_private_network},
         "config": config,
     });
     if let Some(secret) = secret {
@@ -399,6 +412,10 @@ fn assert_no_secret_leak(result: &NotificationSendRpcResult, log: &str) {
     assert!(
         !log.contains("smtp://") && !log.contains("smtps://"),
         "the plugin log must not contain a complete external URL: {log}"
+    );
+    assert!(
+        !log.contains("127.0.0.1") && !log.contains("169.254.169.254"),
+        "the plugin log must not contain the destination host: {log}"
     );
     assert!(
         log.contains("org.lux.notifier.email"),
@@ -630,6 +647,63 @@ async fn the_plaintext_seam_only_applies_to_a_loopback_relay()
 }
 
 #[tokio::test]
+async fn the_destination_guard_blocks_an_unapproved_loopback_relay()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The host has not approved a private destination: the loopback mock must be refused before
+    // the plugin opens a connection or sends the credential.
+    let server = FakeSmtp::start(SmtpReply::Deliver).await?;
+    let mut session = Session::start_plaintext(None).await?;
+
+    let result = session
+        .notify(send_params_with_private_approval(
+            email_config(server.address, "none", Some("lux@example.invalid")),
+            Some(TEST_SECRET),
+            false,
+        ))
+        .await?;
+
+    assert_eq!(result.status, NotificationSendStatus::Failed);
+    assert_eq!(error_code(&result), "destination_not_allowed");
+    assert!(
+        server.auth_commands().is_empty() && server.recipients().is_empty(),
+        "a rejected destination must never reach the network"
+    );
+
+    let log = session.shutdown().await?;
+    assert_no_secret_leak(&result, &log);
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_destination_guard_still_blocks_cloud_metadata_with_private_approval()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The link-local metadata address stays forbidden even with the administrator's approval.
+    let mut session = Session::start(None).await?;
+    let config = json!({
+        "smtpHost": "169.254.169.254",
+        "smtpPort": 25,
+        "security": "starttls",
+        "from": "lux@example.invalid",
+        "to": "ops@example.invalid",
+    });
+
+    let result = session
+        .notify(send_params_with_private_approval(
+            config,
+            Some(TEST_SECRET),
+            true,
+        ))
+        .await?;
+
+    assert_eq!(result.status, NotificationSendStatus::Failed);
+    assert_eq!(error_code(&result), "destination_not_allowed");
+
+    let log = session.shutdown().await?;
+    assert_no_secret_leak(&result, &log);
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_transient_smtp_reply_is_retryable() -> Result<(), Box<dyn std::error::Error>> {
     let server = FakeSmtp::start(SmtpReply::TransientRecipient).await?;
     let mut session = Session::start_plaintext(None).await?;
@@ -719,7 +793,7 @@ async fn the_default_port_follows_the_security_mode() -> Result<(), Box<dyn std:
         );
         let log = session.shutdown().await?;
         assert!(
-            log.contains(&format!("endpoint=127.0.0.1:{port}")),
+            log.contains(&format!("transport={security} port={port}")),
             "{security} must default to port {port}, got: {log}"
         );
         assert_no_secret_leak(&result, &log);

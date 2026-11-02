@@ -720,10 +720,10 @@ manifest 声明 `type: "notification"`、`category: "NOTIFICATION"`、`capabilit
 
 `org.lux.notifier.email` 是一个参考实现的通知器插件，二进制为 `lux-plugin-notifier-email`，只负责
 `notification.send`：把宿主生成的通知标题作为邮件主题、正文作为纯文本邮件正文，通过管理员配置的 SMTP
-服务器投递。进程外壳、10 秒投递窗口和状态分类来自 `luxd::application::notifier_plugin_sdk`，正文来自
-`render_event_text`，插件不重写通知文本。SMTP 没有 HTTP 跳，因此本渠道不使用 `outbound_http_client`；
-单次投递由 `NOTIFIER_HTTP_TIMEOUT`（10 秒）的 `tokio::time::timeout` 硬性截断，SMTP 应答由 `lettre`
-解析，插件不读取、不记录也不转发上游响应体。
+服务器投递。进程外壳、10 秒投递窗口、目的地守卫和状态分类来自
+`luxd::application::notifier_plugin_sdk`，正文来自 `render_event_text`，插件不重写通知文本。SMTP 没有 HTTP
+跳，因此本渠道不使用 `outbound_http_client`；单次投递由 `NOTIFIER_HTTP_TIMEOUT`（10 秒）的
+`tokio::time::timeout` 硬性截断，SMTP 应答由 `lettre` 解析，插件不读取、不记录也不转发上游响应体。
 
 manifest 核心字段：
 
@@ -756,6 +756,13 @@ manifest 核心字段：
 - `username` 可选，首尾空白或控制字符会被判为非法。
 - `from` 必填，必须是纯地址（不含显示名）；`to` 是逗号分隔的 1–20 个纯地址，两级都会重新校验地址格式。
 
+目的地守卫：插件在发起任何出站连接前调用 `guard_host(smtpHost, port, allow_private_network)`，把宿主给出的
+`target.allowPrivateNetwork` 原样传入（字段缺失或非布尔值视为 `false`，插件不得放宽）。守卫一次性解析
+`smtpHost:port` 的全部地址并逐个校验；通过后 SMTP 传输只连接守卫返回的 `primary()` 地址，连接的端口、TLS
+握手与证书校验仍使用管理员配置的主机名和端口，因此第二次 DNS 应答无法把投递改道（DNS 重绑定）。SMTP 渠道不走
+HTTP 代理，`LUX_PROXY_URL` 对它不生效；守卫校验过的地址始终是实际连接目标。被守卫拒绝时插件不打开任何连接，也
+不会把主机或地址写进日志。
+
 结果映射使用稳定的 snake_case 错误码：
 
 | 情况 | 状态 | `error_code` |
@@ -763,6 +770,8 @@ manifest 核心字段：
 | 邮件被 SMTP 服务器接受 | `DELIVERED` | 无 |
 | `secret` 缺失或只含空白 | `FAILED` | `missing_secret` |
 | 目标配置非法（主机、端口、加密方式、地址、收件人数量） | `FAILED` | `invalid_config` |
+| 守卫拒绝：主机未批准私网、危险保留地址或无法解析的主机名 | `FAILED` | `destination_not_allowed` |
+| 守卫无法解析主机（临时 DNS 失败） | `RETRYABLE` | `destination_unresolved` |
 | SMTP `4xx` | `RETRYABLE` | `smtp_transient` |
 | 连接被拒、连接被断开或对话被提前终止 | `RETRYABLE` | `smtp_unavailable` |
 | 超过投递窗口（连接、握手或应答） | `RETRYABLE` | `smtp_timeout` |
@@ -773,12 +782,14 @@ manifest 核心字段：
 `lettre` 的 rustls 后端把握手和证书失败包装成连接错误，把对话被提前关闭包装成响应错误。插件沿错误源链检查
 稳定的错误文本片段，把前一类判为永久失败、后一类判为可重试网络错误；插件绝不会在加密未建立时把密码或收件人
 发给对端。插件每次投递向 stderr 写一行
-`org.lux.notifier.email: event <eventId> endpoint=<host>:<port> finished with <状态> (<错误码>)`，不包含
-密码、收件人地址或任何完整外部 URL。`LUX_PLUGIN_SMTP_TIMEOUT_SECONDS` 仅供测试把投递窗口收紧到 1–10 秒，
-不能放宽 SDK 的上限。
+`org.lux.notifier.email: event <eventId> transport=<starttls|ssl> port=<端口> finished with <状态> (<错误码>)`，
+不包含密码、收件人地址、SMTP 主机或任何完整外部 URL。`LUX_PLUGIN_SMTP_TIMEOUT_SECONDS` 仅供测试把投递窗口
+收紧到 1–10 秒，不能放宽 SDK 的上限。
 
 测试（`cargo test --locked --test plugins notifier_email::`）用 `127.0.0.1` 随机端口的假 SMTP 服务器覆盖成功、
-无认证、`4xx`、`5xx`、认证被拒、连接被断开、超时、默认端口、STARTTLS 不被支持、SSL 握手失败、坏配置和缺凭据，
-并断言凭据不出现在返回值和捕获的日志中；测试不使用任何真实凭据或真实邮件服务。
+无认证、`4xx`、`5xx`、认证被拒、连接被断开、超时、默认端口、STARTTLS 不被支持、SSL 握手失败、坏配置和缺凭据；
+守卫用例覆盖默认未批准私网时拒绝回环中继，以及批准私网后仍拒绝云元数据地址 `169.254.169.254`。所有 mock 用例
+显式携带 `allowPrivateNetwork: true`，并断言凭据和目的主机不出现在返回值与捕获的日志中；测试不使用任何真实凭据
+或真实邮件服务。
 
 打包：`scripts/package-notifier-plugin.sh org.lux.notifier.email`。

@@ -10,18 +10,28 @@
 //! The SMTP password arrives exactly once, through the controlled
 //! `NotificationSendRpcRequest.secret` field. It is never read from a config file or the process
 //! environment, never written to the log, and never copied into a result or an error message. The
-//! log line only carries the event ID, the classification and the stable error code.
+//! log line only carries the event ID, the transport, the port, the classification and the stable
+//! error code.
+//!
+//! Before any outbound connection the relay goes through the shared SDK destination guard with the
+//! host's `target.allowPrivateNetwork` approval. The guard resolves the relay once; the transport
+//! then connects to that validated address while the configured host name still drives the TLS
+//! handshake, so a second DNS answer cannot redirect the delivery.
 
 use std::{str::FromStr, time::Duration};
 
 use lettre::{
     Address, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
     message::{Mailbox, header::ContentType},
-    transport::smtp::authentication::Credentials,
+    transport::smtp::{
+        authentication::Credentials,
+        client::{Tls, TlsParameters},
+    },
 };
 use luxd::application::{
     notifier_plugin_sdk::{
-        NOTIFIER_HTTP_TIMEOUT, delivered, failed, render_event_text, retryable, run_notifier,
+        DestinationGuardError, GuardedHost, NOTIFIER_HTTP_TIMEOUT, delivered, failed, guard_host,
+        render_event_text, retryable, run_notifier,
     },
     plugin_protocol::{
         NotificationSendRpcRequest, NotificationSendRpcResult, NotificationSendStatus,
@@ -96,14 +106,43 @@ async fn attempt(
 ) -> Result<NotificationSendRpcResult, &'static str> {
     let secret = transport_secret(request.secret.as_deref())?;
     let config = config.ok_or(INVALID_CONFIG)?;
+    // The host decides whether the relay may be private; the plugin never widens that approval.
+    // A rejected destination never reaches the network.
+    let guarded = match guard_host(
+        &config.host,
+        config.port,
+        allowed_private_network(&request.target),
+    )
+    .await
+    {
+        Ok(guarded) => guarded,
+        Err(error) => return Ok(guard_failure(error)),
+    };
     let (title, body) = render_event_text(&request.event);
     let message = config.message(&title, &body)?;
     let timeout = delivery_timeout();
-    let transport = build_transport(config, config.credentials(secret), timeout)?;
+    let transport = build_transport(config, &guarded, config.credentials(secret), timeout)?;
     match tokio::time::timeout(timeout, transport.send(message)).await {
         Err(_) => Ok(retryable(SMTP_TIMEOUT)),
         Ok(Ok(_)) => Ok(delivered()),
         Ok(Err(error)) => Ok(classify_smtp_error(&error)),
+    }
+}
+
+/// Reads the host `allowPrivateNetwork` approval; an absent or non-boolean value means "not allowed".
+fn allowed_private_network(target: &Value) -> bool {
+    target
+        .get("allowPrivateNetwork")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Maps a destination guard rejection onto the delivery classification.
+fn guard_failure(error: DestinationGuardError) -> NotificationSendRpcResult {
+    if error.is_retryable() {
+        retryable(error.code())
+    } else {
+        failed(error.code())
     }
 }
 
@@ -138,6 +177,17 @@ enum SmtpSecurity {
     StartTls,
     Ssl,
     None,
+}
+
+impl SmtpSecurity {
+    /// The configuration value this mode was parsed from, for the diagnostic log line.
+    fn label(self) -> &'static str {
+        match self {
+            Self::StartTls => "starttls",
+            Self::Ssl => "ssl",
+            Self::None => "plaintext",
+        }
+    }
 }
 
 /// One destination's validated non-secret configuration.
@@ -228,15 +278,6 @@ impl EmailConfig {
             .map(|username| Credentials::new(username.clone(), secret.to_owned()))
     }
 
-    /// The effective endpoint, used in the diagnostic log line only.
-    fn endpoint(&self) -> String {
-        if self.host.contains(':') {
-            format!("[{}]:{}", self.host, self.port)
-        } else {
-            format!("{}:{}", self.host, self.port)
-        }
-    }
-
     /// Builds the plain-text message: the core title becomes the subject, the core body the body.
     fn message(&self, title: &str, body: &str) -> Result<Message, &'static str> {
         let mut builder = Message::builder()
@@ -297,29 +338,37 @@ fn parse_recipients(value: &str) -> Result<Vec<Address>, &'static str> {
 
 /// Builds the async SMTP transport for the configured security mode.
 ///
-/// A relay that cannot even be described (for example an unusable TLS server name) is a
-/// configuration failure rather than a retryable upstream condition.
+/// The transport connects to the address the destination guard validated instead of resolving the
+/// configured host again, so a second DNS answer cannot redirect the delivery. The configured host
+/// name still drives the TLS handshake, so the certificate must match the administrator's target
+/// rather than the resolved address. A relay that cannot even be described (for example an
+/// unusable TLS server name) is a configuration failure rather than a retryable upstream condition.
 fn build_transport(
     config: &EmailConfig,
+    guarded: &GuardedHost,
     credentials: Option<Credentials>,
     timeout: Duration,
 ) -> Result<AsyncSmtpTransport<Tokio1Executor>, &'static str> {
+    let address = guarded.primary();
+    let server = address.ip().to_string();
     let builder = match config.security {
-        SmtpSecurity::Ssl => {
-            AsyncSmtpTransport::<Tokio1Executor>::relay(&config.host).map_err(|_| INVALID_CONFIG)?
-        }
-        SmtpSecurity::StartTls => {
-            AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.host)
-                .map_err(|_| INVALID_CONFIG)?
-        }
-        SmtpSecurity::None => AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&config.host),
+        SmtpSecurity::Ssl => AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&server)
+            .tls(Tls::Wrapper(tls_parameters(&config.host)?)),
+        SmtpSecurity::StartTls => AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&server)
+            .tls(Tls::Required(tls_parameters(&config.host)?)),
+        SmtpSecurity::None => AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&server),
     };
-    let builder = builder.port(config.port).timeout(Some(timeout));
+    let builder = builder.port(address.port()).timeout(Some(timeout));
     let builder = match credentials {
         Some(credentials) => builder.credentials(credentials),
         None => builder,
     };
     Ok(builder.build())
+}
+
+/// Builds the TLS parameters for the configured host name.
+fn tls_parameters(host: &str) -> Result<TlsParameters, &'static str> {
+    TlsParameters::new(host.to_owned()).map_err(|_| INVALID_CONFIG)
 }
 
 /// The submission port a security mode falls back to when the destination omits `smtpPort`.
@@ -415,8 +464,9 @@ fn error_matches(error: &lettre::transport::smtp::Error, markers: &[&str]) -> bo
 
 /// Writes one diagnostic line per attempt to stderr.
 ///
-/// The line carries the event ID, the effective endpoint, the classification and the stable error
-/// code: no credential, no recipient address and no complete external URL.
+/// The line carries the event ID, the transport and port, the classification and the stable error
+/// code. It never carries the credential, a recipient address, the relay host or any complete
+/// external URL: the destination guard contract forbids logging the destination itself.
 fn log_outcome(
     request: &NotificationSendRpcRequest,
     config: Option<&EmailConfig>,
@@ -428,11 +478,17 @@ fn log_outcome(
         .and_then(Value::as_str)
         .map(log_label)
         .unwrap_or_else(|| "-".to_owned());
-    let endpoint = config
-        .map(|config| format!(" endpoint={}", config.endpoint()))
+    let transport = config
+        .map(|config| {
+            format!(
+                " transport={} port={}",
+                config.security.label(),
+                config.port
+            )
+        })
         .unwrap_or_default();
     eprintln!(
-        "{PLUGIN_ID}: event {event_id}{endpoint} finished with {} ({})",
+        "{PLUGIN_ID}: event {event_id}{transport} finished with {} ({})",
         status_label(result.status),
         result.error_code.as_deref().unwrap_or("none")
     );
