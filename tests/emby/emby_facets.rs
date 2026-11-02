@@ -129,6 +129,7 @@ async fn emby_genres_and_studios_list_and_filter_items_within_user_scope()
         .execute(database.pool())
         .await?;
 
+    let server_database = database.clone();
     let web_auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let app = app_with_state(AppState::ready(
@@ -219,6 +220,37 @@ async fn emby_genres_and_studios_list_and_filter_items_within_user_scope()
         .await?;
     assert_eq!(a24["TotalRecordCount"], 1);
 
+    sqlx_set_year(&server_database, "facet-movie-1", 2019).await?;
+    sqlx_set_year(&server_database, "facet-movie-2", 2021).await?;
+    sqlx_set_year(&server_database, "facet-series-1", 2019).await?;
+    let years: Value = client
+        .get(format!("{base_url}/emby/Years"))
+        .header("X-Emby-Token", &admin)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(names(&years), ["2021", "2019"]);
+    assert_eq!(years["TotalRecordCount"], 2);
+    assert_eq!(years["Items"][0]["Type"], "Year");
+    let viewer_years: Value = client
+        .get(format!("{base_url}/emby/Years?IncludeItemTypes=Series"))
+        .header("X-Emby-Token", &viewer_token)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(viewer_years["TotalRecordCount"], 0);
+
     server.abort();
     Ok(())
+}
+
+async fn sqlx_set_year(database: &Database, id: &str, year: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE media_items SET production_year = ? WHERE id = ?")
+        .bind(year)
+        .bind(id)
+        .execute(database.pool())
+        .await
+        .map(|_| ())
 }

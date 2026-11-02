@@ -784,10 +784,11 @@ pub(super) struct EmbyFacetsQuery {
     pub(super) limit: Option<i64>,
 }
 
-fn emby_facet_id(kind: MediaFacetKind, name_key: &str) -> String {
+fn emby_facet_id(kind: Option<MediaFacetKind>, name_key: &str) -> String {
     let prefix = match kind {
-        MediaFacetKind::Genre => "genre",
-        MediaFacetKind::Studio => "studio",
+        Some(MediaFacetKind::Genre) => "genre",
+        Some(MediaFacetKind::Studio) => "studio",
+        None => "year",
     };
     let hex = name_key
         .bytes()
@@ -800,7 +801,7 @@ async fn emby_facets(
     headers: HeaderMap,
     query: EmbyFacetsQuery,
     state: ReadyAppState,
-    kind: MediaFacetKind,
+    kind: Option<MediaFacetKind>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal_with_query(&headers, &state, &query.auth).await {
@@ -852,8 +853,9 @@ async fn emby_facets(
         Err(CatalogError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let type_name = match kind {
-        MediaFacetKind::Genre => "Genre",
-        MediaFacetKind::Studio => "Studio",
+        Some(MediaFacetKind::Genre) => "Genre",
+        Some(MediaFacetKind::Studio) => "Studio",
+        None => "Year",
     };
     Json(json!({
         "Items": facets
@@ -882,7 +884,7 @@ pub(super) async fn emby_genres(
     Query(query): Query<EmbyFacetsQuery>,
     State(state): State<ReadyAppState>,
 ) -> Response {
-    emby_facets(headers, query, state, MediaFacetKind::Genre).await
+    emby_facets(headers, query, state, Some(MediaFacetKind::Genre)).await
 }
 
 pub(super) async fn emby_studios(
@@ -890,7 +892,15 @@ pub(super) async fn emby_studios(
     Query(query): Query<EmbyFacetsQuery>,
     State(state): State<ReadyAppState>,
 ) -> Response {
-    emby_facets(headers, query, state, MediaFacetKind::Studio).await
+    emby_facets(headers, query, state, Some(MediaFacetKind::Studio)).await
+}
+
+pub(super) async fn emby_years(
+    headers: HeaderMap,
+    Query(query): Query<EmbyFacetsQuery>,
+    State(state): State<ReadyAppState>,
+) -> Response {
+    emby_facets(headers, query, state, None).await
 }
 
 pub(super) async fn emby_person(

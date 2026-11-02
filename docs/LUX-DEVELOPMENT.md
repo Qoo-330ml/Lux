@@ -1539,7 +1539,7 @@ COMPATIBILITY.md 是唯一兼容性事实来源。不能因为实现了官方 Sw
 #### P2：体验完善
 
 - DisplayPreferences 相关端点。
-- Years、Genres、Tags 等筛选辅助端点。
+- Years、Genres、Tags 等筛选辅助端点。（Years、Genres、Studios 已实现，见 `docs/COMPATIBILITY.md`；Tags 因 NFO 缓存无该数据而未实现。）
 - Collections 与合集成员。
 - 多版本选择所需的 AlternateSources 等端点。
 - Sessions WebSocket 或实时消息，仅在目标客户端确有依赖时实现。

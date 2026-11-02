@@ -1367,13 +1367,13 @@ impl CatalogService {
         }
     }
 
-    /// Distinct genres or studios visible to `principal`, optionally narrowed to one library and
+    /// Distinct genres or studios (`kind`) or production years (`None`) visible to `principal`, optionally narrowed to one library and
     /// to item types. Served from the `media_item_facets` projection.
     pub(crate) async fn list_facets(
         &self,
         principal: AccessPrincipal,
         library_id: Option<&str>,
-        kind: MediaFacetKind,
+        kind: Option<MediaFacetKind>,
         item_types: &[String],
         offset: i64,
         limit: i64,
@@ -1417,10 +1417,18 @@ impl CatalogService {
             limit,
             include_total: true,
         };
-        Ok(self
-            .database
-            .list_catalog_facets(&query, kind, offset, limit)
-            .await?)
+        Ok(match kind {
+            Some(kind) => {
+                self.database
+                    .list_catalog_facets(&query, kind, offset, limit)
+                    .await?
+            }
+            None => {
+                self.database
+                    .list_catalog_years(&query, offset, limit)
+                    .await?
+            }
+        })
     }
 
     pub async fn list_all_items_filtered(

@@ -3767,6 +3767,66 @@ impl Database {
         ))
     }
 
+    /// Distinct production years of the items the filter can see (newest first) with item
+    /// counts, in the same shape as [`Self::list_catalog_facets`].
+    pub(crate) async fn list_catalog_years(
+        &self,
+        filter: &CatalogFilterQuery<'_>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredMediaFacet>, i64), StorageError> {
+        if filter.library_ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let (where_clause, filter_binds) = catalog_filter_where_clause(filter);
+        let from = format!(
+            "FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             {where_clause} AND mi.production_year IS NOT NULL"
+        );
+        let list_query = format!(
+            "SELECT mi.production_year, COUNT(*) AS item_count
+             {from}
+             GROUP BY mi.production_year
+             ORDER BY mi.production_year DESC
+             LIMIT ? OFFSET ?"
+        );
+        let mut list = self.query_as::<(i64, i64)>(sqlx::AssertSqlSafe(list_query));
+        for bind in &filter_binds {
+            list = match bind {
+                CatalogBind::Text(value) => list.bind(*value),
+                CatalogBind::Integer(value) => list.bind(*value),
+                CatalogBind::Real(value) => list.bind(*value),
+            };
+        }
+        let rows = list
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        let count_query = format!("SELECT COUNT(DISTINCT mi.production_year) {from}");
+        let mut count = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_query));
+        for bind in &filter_binds {
+            count = match bind {
+                CatalogBind::Text(value) => count.bind(*value),
+                CatalogBind::Integer(value) => count.bind(*value),
+                CatalogBind::Real(value) => count.bind(*value),
+            };
+        }
+        let total = count.fetch_one(&self.pool).await.map_err(self.sqlx_err())?;
+        Ok((
+            rows.into_iter()
+                .map(|(year, item_count)| StoredMediaFacet {
+                    name_key: year.to_string(),
+                    name: year.to_string(),
+                    item_count,
+                })
+                .collect(),
+            total,
+        ))
+    }
+
     #[cfg(test)]
     pub(crate) async fn explain_filtered_catalog_rows(
         &self,

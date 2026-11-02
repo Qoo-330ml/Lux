@@ -1,5 +1,13 @@
 # Lux 客户端兼容性矩阵
 
+## Emby 筛选辅助端点：Genres、Studios、Years（2026-11-02）
+
+- 新增 `GET /Genres`、`/Studios`、`/Years`（同样挂在 `/emby` 前缀下，路径大小写不敏感）。需要 Emby token，按用户的媒体库权限和内容限制收窄；支持 `UserId`、`ParentId`（仅媒体库 ID，未授权或未知返回 404）、`IncludeItemTypes`、`StartIndex`、`Limit`（上限与 `/Persons` 相同，超限 400）。返回 `{ Items, TotalRecordCount, StartIndex }`，每项含 `Name`、不透明的 `Id`、`Type`（`Genre`/`Studio`/`Year`）和 `ChildCount`（可见条目数）；`Genres`、`Studios` 按名称排序，`Years` 由新到旧。
+- `GET /Items`、`/Users/{id}/Items` 新增 `Genres`、`Studios` 筛选，值用 `|` 分隔、任一命中即匹配，大小写不敏感，最多 32 个值。`Years` 参数原本就支持。
+- **未实现**：`/Tags`（NFO 缓存里没有 tags 数据，未新增解析）；`GenreIds`、`StudioIds` 按 ID 筛选（`Id` 仅是稳定的不透明值，客户端请用 `Genres`/`Studios` 名称筛选）；Genres/Studios 的图片。
+- 数据来源：迁移 `0245`/`0247` 新增 `media_item_facets(item_id, kind, name_key, name)`，由内容限制索引 worker 从同一份 NFO 快照写入，NFO 变化后经既有队列重建。请求路径只读该表，不解析 NFO、不扫库。升级时迁移会把所有存量条目重新入队，回填在后台分批完成；回填完成前 `/Genres`、`/Studios` 与 `Genres`/`Studios` 筛选只覆盖已索引的条目。回填会重写内容限制索引行，并触发一次 catalog outbox 更新。
+- 验证：`cargo test --locked --test emby emby_facets::`；`cargo test --locked --lib content_restriction_index`。
+
 ## Web HLS 音频转码输出 AAC 声道布局规范化（2026-11-02）
 
 - 根因：AC-3 / E-AC-3 / DTS / TrueHD 的 5.1 音轨解码后是 `5.1(side)` 声道掩码，FFmpeg 的 AAC
