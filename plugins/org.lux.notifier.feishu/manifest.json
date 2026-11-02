@@ -38,7 +38,7 @@
       "label": "API 基址覆盖",
       "type": "text",
       "required": false,
-      "description": "仅供测试或企业代理使用，填 http(s) 基址；留空时按集群使用官方基址。不得包含凭据、查询参数或片段。"
+      "description": "仅供测试或企业代理使用，填 http(s) 基址；留空时按集群使用官方基址。不得包含凭据、查询参数或片段。因为该基址可由管理员指向任意主机，manifest 的 permissions.network 声明为 [\"*\"]，实际可达地址仍由宿主私网策略与插件目的地守卫限制。"
     },
     {
       "key": "msgType",
@@ -54,7 +54,7 @@
     }
   ],
   "permissions": {
-    "network": ["open.feishu.cn", "open.larksuite.com"],
+    "network": ["*"],
     "filesystem": []
   },
   "files": []

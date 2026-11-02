@@ -678,7 +678,9 @@ PLUGIN_INTERNAL_ERROR
 `luxd::application::notifier_plugin_sdk`。
 
 - manifest：`type: "notification"`、`category: "NOTIFICATION"`、`capabilities: ["notification.send"]`，
-  入口沿用 `binaries/${platform}-${arch}/lux-plugin-notifier-feishu`。
+  入口沿用 `binaries/${platform}-${arch}/lux-plugin-notifier-feishu`。`permissions.network` 声明为 `["*"]`
+  （与 Bark 一致），因为 `apiBase` 允许管理员指向任意 http(s) 主机；实际可达地址仍由宿主私网策略和插件目的地
+  守卫约束。
 - 凭据：唯一声明且仅声明一个 `secret` 字段（`type: "password"`、`sensitive: true`、`required: true`），
   格式为 `hookId` 或 `hookId#signSecret`；`hookId` 只允许 `[A-Za-z0-9-]`。带 `signSecret` 时按飞书规范
   在请求体附加 `timestamp`（Unix 秒）和 `sign = base64(HMAC-SHA256(key = timestamp + "\n" + signSecret,
@@ -697,9 +699,10 @@ PLUGIN_INTERNAL_ERROR
   时由代理解析，`pin` 不再决定实际连接地址，与 SDK 守卫小节一致）。被拒目的地返回失败状态与
   `destination_not_allowed`，DNS 暂时失败返回可重试的 `destination_unresolved`，两者都不会发出上游请求。
 - 结果分类：HTTP `2xx` 且响应 `code == 0` 为 `DELIVERED`；HTTP `429`/`5xx`（以及 `408`、`425`）与飞书
-  频控业务码 `11232`、`19xxx` 为 `RETRYABLE`（HTTP `Retry-After` 会转成 `retry_after_seconds`）；其余
-  HTTP `4xx` 和其他非 0 业务码为 `FAILED`。网络错误与超时为 `RETRYABLE`，响应体超过 64 KiB 或无法解析为
-  飞书响应时为 `FAILED`。
+  唯一具有频控语义的业务码 `11232` 为 `RETRYABLE`（HTTP `Retry-After` 会转成 `retry_after_seconds`）；其余
+  HTTP `4xx` 和其他非 0 业务码（包括 `19xxx` 中除 `11232` 外的码）为 `FAILED`，错误码为
+  `provider_code_<业务码>`。网络错误与超时为 `RETRYABLE`，响应体超过 64 KiB 或无法解析为飞书响应时为
+  `FAILED`。
 - 稳定错误码：`missing_secret`、`invalid_secret`、`invalid_config`、`provider_timeout`、
   `provider_unreachable`、`provider_response_too_large`、`provider_invalid_response`、
   `provider_rate_limited`、`provider_code_<业务码>`、`client_unavailable`、`destination_not_allowed`、
@@ -708,7 +711,8 @@ PLUGIN_INTERNAL_ERROR
   `destination_unresolved` 归类为 `RETRYABLE`，其余为 `FAILED`。这些代码和 stderr 诊断都不包含凭据、hook
   路径或完整外部 URL 与 query。
 - 测试：`cargo test --locked --test plugins notifier_feishu::` 用 127.0.0.1 随机端口的本地 mock 覆盖成功、
-  签名、4xx、429/5xx、频控业务码、超时、过大响应、坏配置、缺失/畸形凭据、默认未批准私网时拒绝回环目的地，
+  签名、4xx、429/5xx、频控业务码 `11232` 可重试、其他 `19xxx` 业务码永久失败、超时、过大响应、坏配置、
+  缺失/畸形凭据、默认未批准私网时拒绝回环目的地，
   以及批准私网仍拒绝云元数据地址 `169.254.169.254`；mock 用例都显式携带 `allowPrivateNetwork: true`，并断言
   凭据不出现在返回值和捕获的 stderr 日志中。不访问真实飞书服务，仓库里只有合成测试值。
 - 打包：`scripts/package-notifier-plugin.sh org.lux.notifier.feishu` 生成

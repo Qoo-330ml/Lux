@@ -32,9 +32,10 @@ const MAX_PROVIDER_RESPONSE_BYTES: usize = 64 * 1024;
 /// Returned when the host proxy policy cannot be turned into a usable outbound client.
 const CLIENT_UNAVAILABLE: &str = "client_unavailable";
 /// Feishu's documented "request frequency limited" business code.
+///
+/// Only this code has frequency-control semantics. Other business codes, including the rest of the
+/// 19xxx range, are ordinary upstream rejections and must stay permanent failures.
 const FEISHU_RATE_LIMIT_CODE: i64 = 11_232;
-/// Feishu reserves the 19xxx range for frequency-control responses.
-const FEISHU_RATE_LIMIT_CODE_RANGE: std::ops::RangeInclusive<i64> = 19_000..=19_999;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Region {
@@ -386,7 +387,7 @@ fn unix_timestamp() -> i64 {
 }
 
 fn is_rate_limited(code: i64) -> bool {
-    code == FEISHU_RATE_LIMIT_CODE || FEISHU_RATE_LIMIT_CODE_RANGE.contains(&code)
+    code == FEISHU_RATE_LIMIT_CODE
 }
 
 fn parse_retry_after(value: Option<&str>) -> Option<i64> {

@@ -457,13 +457,14 @@ async fn retries_rate_limited_and_server_errors() -> Result<(), Box<dyn std::err
 }
 
 #[tokio::test]
-async fn retries_feishu_frequency_control_codes() -> Result<(), Box<dyn std::error::Error>> {
+async fn retries_only_the_documented_frequency_control_code()
+-> Result<(), Box<dyn std::error::Error>> {
     let documented = MockServer::start(MockReply::ok(
         json!({"code": 11232, "msg": "frequency limited"}),
     ))
     .await?;
-    let reserved_range = MockServer::start(MockReply::ok(
-        json!({"code": 19001, "msg": "too many requests"}),
+    let other = MockServer::start(MockReply::ok(
+        json!({"code": 19001, "msg": "invalid request"}),
     ))
     .await?;
 
@@ -472,18 +473,23 @@ async fn retries_feishu_frequency_control_codes() -> Result<(), Box<dyn std::err
             Some(TEST_HOOK_ID),
             json!({"apiBase": documented.api_base()}),
         ),
-        backend(
-            Some(TEST_HOOK_ID),
-            json!({"apiBase": reserved_range.api_base()}),
-        ),
+        backend(Some(TEST_HOOK_ID), json!({"apiBase": other.api_base()})),
     ])
     .await?;
 
-    for response in &run.responses {
-        let result = result_of(response);
-        assert_eq!(result.status, NotificationSendStatus::Retryable);
-        assert_eq!(result.error_code.as_deref(), Some("provider_rate_limited"));
-    }
+    let rate_limited = result_of(&run.responses[0]);
+    assert_eq!(rate_limited.status, NotificationSendStatus::Retryable);
+    assert_eq!(
+        rate_limited.error_code.as_deref(),
+        Some("provider_rate_limited")
+    );
+    let rejected = result_of(&run.responses[1]);
+    assert_eq!(
+        rejected.status,
+        NotificationSendStatus::Failed,
+        "a 19xxx code other than 11232 is not a frequency-control retry"
+    );
+    assert_eq!(rejected.error_code.as_deref(), Some("provider_code_19001"));
     Ok(())
 }
 
