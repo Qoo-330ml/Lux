@@ -1,6 +1,6 @@
 import type { CSSProperties } from "react";
 
-export type PlayerAspectRatio = "default" | "4:3" | "16:9";
+export type PlayerAspectRatio = "default" | "4:3" | "16:9" | "fill";
 export type PlayerFlip = "normal" | "horizontal" | "vertical";
 
 export type PlayerVideoPresentation = {
@@ -27,6 +27,7 @@ export function playerVideoPresentationSize(
 ): PlayerVideoBoxSize | null {
   if (
     aspectRatio === "default"
+    || aspectRatio === "fill"
     || !Number.isFinite(containerWidth)
     || !Number.isFinite(containerHeight)
     || containerWidth <= 0
@@ -52,6 +53,10 @@ export function playerVideoPresentationStyle(
       : "";
   if (aspectRatio === "default") {
     return flipTransform ? { transform: flipTransform } : undefined;
+  }
+  if (aspectRatio === "fill") {
+    // Fill the stage: crop the picture to cover the whole box instead of letterboxing.
+    return { objectFit: "cover", ...(flipTransform ? { transform: flipTransform } : {}) };
   }
 
   return {
