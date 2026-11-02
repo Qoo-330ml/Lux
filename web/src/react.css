@@ -667,11 +667,16 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 
 .lux-library-sort-toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 12px; margin: -14px 0 28px; }
 
+/* 筛选行紧接排序行，靠负的 margin-top 与上一行的 28px 反向外边距合并成 14px 间距。 */
+.lux-library-filter-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; margin: -14px 0 28px; }
+
 .lux-library-selection-toolbar { display: flex; align-items: center; gap: 12px; margin: -24px 0 20px; color: var(--lux-muted); font-size: .78rem; }
 
 .lux-library-sort-control { display: flex; align-items: center; gap: 8px; color: var(--lux-muted); font-size: .76rem; }
 
 .lux-library-sort-control .lux-select { min-width: 142px; }
+
+.lux-library-sort-control .lux-library-filter-year { width: 118px; min-height: 41px; text-align: right; }
 
 .lux-poster-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(165px, 1fr)); gap: 34px 16px; }
 
@@ -1301,8 +1306,11 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .lux-page-heading { margin-bottom: 28px; }
   .lux-page-heading h1 { font-size: 2.1rem; }
   .lux-library-sort-toolbar { align-items: stretch; flex-direction: column; margin-top: -12px; }
+  .lux-library-filter-toolbar { align-items: stretch; flex-direction: column; gap: 8px; margin-top: -20px; }
+  .lux-library-filter-toolbar > .lux-button { min-height: var(--lux-button-height-touch); }
   .lux-library-sort-control { justify-content: space-between; }
   .lux-library-sort-control .lux-select { min-width: min(220px, 62vw); }
+  .lux-library-sort-control .lux-library-filter-year { width: min(220px, 62vw); min-height: var(--lux-button-height-touch); }
   .lux-library-selection-toolbar { align-items: stretch; flex-wrap: wrap; gap: 8px; }
   .lux-library-selection-toolbar > .lux-button { flex: 1 1 120px; min-width: 0; min-height: var(--lux-button-height-touch); }
   .lux-library-selection-toolbar > span { flex: 1 1 100%; min-width: 0; overflow-wrap: anywhere; }

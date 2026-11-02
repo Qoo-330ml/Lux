@@ -168,6 +168,19 @@ test("mobile library batch actions wrap instead of overflowing", () => {
   assert.match(selectionRule, /flex-wrap:\s*wrap/);
 });
 
+test("library filter controls wrap on desktop and stack on narrow phones", () => {
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
+  const filterRule = mobileStyles.match(/\.lux-library-filter-toolbar\s*\{([^}]*)\}/)?.[1] ?? "";
+  const yearRule = mobileStyles.match(/\.lux-library-sort-control \.lux-library-filter-year\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(rule(".lux-library-filter-toolbar"), /flex-wrap:\s*wrap/);
+  assert.match(filterRule, /flex-direction:\s*column/);
+  assert.match(filterRule, /align-items:\s*stretch/);
+  assert.match(mobileStyles, /\.lux-library-filter-toolbar\s*>\s*\.lux-button\s*\{[^}]*min-height:\s*var\(--lux-button-height-touch\)/);
+  assert.match(yearRule, /width:\s*min\(220px,\s*62vw\)/);
+  assert.match(yearRule, /min-height:\s*var\(--lux-button-height-touch\)/);
+});
+
 test("mobile image editing controls stay usable in a narrow dialog", () => {
   const mobileStyles = mediaStyles("@media (max-width: 560px)");
   const tabsRule = mobileStyles.match(/\.lux-image-type-tabs\s*\{([^}]*)\}/)?.[1] ?? "";
