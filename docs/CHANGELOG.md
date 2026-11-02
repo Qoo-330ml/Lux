@@ -10,6 +10,31 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 
 （暂无记录；下一个版本从这里开始累积）
 
+## [0.7.7] - 2026-11-02
+
+通知渠道与播放兼容版本：通知渠道改为插件化并给出凭据契约，Web HLS 的 AAC 声道布局统一，播放矩阵工具落地。
+
+### Added
+
+- **通知渠道插件化与凭据契约**：通知目标支持 `type: "notification"` 插件，provider 可在 manifest 里声明一个 `secret` 字段。该字段不进 `configFields`/`configValues`，而是以 `secretField` 单独返回；值只写入目标 secret，不进 `providerConfig`、事件、普通列表或日志。`providerConfig` 按 manifest 的 `configFields` 校验（未知键、缺少 required、类型/选项/范围不合法都返回 400）。更换 provider 不沿用旧凭据：新 provider 声明了 `secret` 就必须同一次 PATCH 重新提交（否则 400），切回 `builtin.webhook` 会重新生成 HMAC secret，新增 `rotate-secret` 用于轮换。管理页会渲染声明出的凭据字段，接收地址输入只在内置 webhook 下显示。
+- **播放兼容性矩阵工具**（`scripts/playback-matrix/`）：用 ffmpeg 生成固定样本，再用真实浏览器逐源播放每个 `sourceId` 并输出 `report.md` / `report.json`——按视频编码 × 音频编码给出 ✅/⚠️/❌/⏭️ 矩阵，附每条失败的服务端计划、客户端回退原因、`videoWidth`/`videoHeight`、`currentTime` 增量、Chromium 音频解码字节、首帧耗时，以及「可疑规则」建议（例如某音频编码在全部 Chromium 样本静默时建议加入强制音频转码名单）。
+- **Web HLS 的 AAC 声道布局规范化**：三条重编码音频的档位（音频转码、硬件转码、软件转码）在 `-c:a aac` 之外追加 `-af aformat=channel_layouts=mono|stereo|3.0|4.0|5.0|5.1`。AC-3 / E-AC-3 / DTS / TrueHD 的 5.1 音轨解码后是 `5.1(side)` 掩码，AAC 编码器对它只能写 25 字节 PCE，Chromium MSE 在 append init 段时直接失败（`CHUNK_DEMUXER_ERROR_APPEND_FAILED`，界面显示「播放器引擎失败」）。规范化后输出始终是浏览器可放的标准 `channelConfiguration`；更宽的源降到 5.1，个别罕见布局会掉声道（`6.0`/`octagonal` → 5.0、`2.1` → stereo），源布局未知时也可安全通过。
+
+### Changed
+
+- **插件仓库拆分**：弹幕插件与四个通知插件（Bark、飞书/Lark、企业微信应用、SMTP 邮件）的实现、manifest 与打包脚本移到 `Lux-plugins` 仓库；主仓库只保留宿主侧契约（敏感字段、`providerConfig` 校验、插件 IP 分类、运行时与服务端测试 stub）。渠道仍以插件形式安装，见 `docs/PLUGIN-SDK.md`。
+- **HLS 清单起播预算放宽到 30 秒**：4K 10-bit HEVC 软解、大型远程或机械盘片源常在 5 秒内写不出首个播放列表，被当成 502；现在首包预算 30 秒。
+- **实时增量扫描也会探测新本地源**：realtime 增量扫描发现的本地文件现在进入 probe 队列，不再等整库扫描才探测。
+- 文档：`docs/PLUGIN-SDK.md` 补通知插件的凭据与打包契约；`docs/API.md` 补通知目标、凭据字段与轮换接口；`docs/COMPATIBILITY.md` 记录 AAC 声道布局的实验数据与待真机复测项。
+
+### Fixed
+
+- **播放器看门狗回退丢掉「正在播放」意图**：回退到服务端计划后仍保持起播状态，不再把播放中的会话标记成已停止。
+- **回退后不重载播放引擎**：切换到服务端计划时会重新加载引擎，不再沿用已经失败的原生解码状态。
+- **弹幕接口 404 被当成错误**：现在视为「没有弹幕」的空结果，并且只请求一次。
+- 非内置 webhook 的通知 provider 不再显示接收地址输入框。
+
+## [0.7.6] - 2026-11-02
 ## [0.7.6] - 2026-11-02
 
 Web 播放版本：播放页内可以切音轨、按分辨率选画质，客户端解码失败自动回退服务端转码；管理端转码页重做。

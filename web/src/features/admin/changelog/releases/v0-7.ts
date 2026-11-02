@@ -2,6 +2,27 @@ import type { ChangelogRelease } from "../types";
 
 export const changelogReleases07: ChangelogRelease[] = [
   {
+    version: "0.7.7",
+    date: "2026-11-02",
+    sections: [
+      { kind: "added", items: [
+        "通知渠道插件化与凭据契约：通知目标支持 type:「notification」插件，provider 可在 manifest 里声明一个 secret 字段；该字段不进 configFields/configValues，而是以 secretField 单独返回，值只写入目标 secret，不进 providerConfig、事件、列表或日志。providerConfig 按 manifest 校验（未知键、缺 required、类型/选项/范围不合法都 400）；更换 provider 不沿用旧凭据，切回内置 webhook 会重新生成 HMAC secret，并新增 rotate-secret 轮换；管理页渲染凭据字段，接收地址只在内置 webhook 下显示。",
+        "播放兼容性矩阵工具（scripts/playback-matrix/）：用 ffmpeg 生成固定样本，再用真实浏览器逐源播放并输出 report.md / report.json——按视频×音频编码给出 ✅/⚠️/❌/⏭️ 矩阵，附每条失败的服务端计划、客户端回退原因、videoWidth/Height、currentTime 增量、Chromium 音频解码字节、首帧耗时与「可疑规则」建议。",
+        "Web HLS 的 AAC 声道布局规范化：三条重编码音频档位在 -c:a aac 之外追加 -af aformat=channel_layouts=mono|stereo|3.0|4.0|5.0|5.1；5.1(side) 等表外布局此前只能写成 25 字节 PCE，Chromium MSE 在 append init 段时直接失败，现在输出始终是浏览器可放的标准 channelConfiguration，更宽的源降到 5.1。",
+      ] },
+      { kind: "changed", items: [
+        "插件仓库拆分：弹幕插件与四个通知插件（Bark、飞书/Lark、企业微信应用、SMTP 邮件）的实现、manifest 与打包脚本移到 Lux-plugins 仓库；主仓库只保留宿主侧契约（敏感字段、providerConfig 校验、插件 IP 分类、测试 stub），渠道仍以插件形式安装。",
+        "HLS 清单起播预算放宽到 30 秒：4K 10-bit HEVC 软解、大型远程或机械盘片源常在 5 秒内写不出首个播放列表而被当成 502。",
+        "实时增量扫描也会探测新本地源，不再等整库扫描；文档补充通知插件契约、通知目标接口与 AAC 声道布局实验记录。",
+      ] },
+      { kind: "fixed", items: [
+        "播放器看门狗回退后仍保持「正在播放」意图，不再把播放中的会话标记成已停止；回退到服务端计划时会重新加载播放引擎。",
+        "弹幕接口的 404 视为「没有弹幕」的空结果，并且只请求一次。",
+        "非内置 webhook 的通知 provider 不再显示接收地址输入框。",
+      ] },
+    ],
+  },
+  {
     version: "0.7.6",
     date: "2026-11-02",
     sections: [
