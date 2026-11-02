@@ -989,6 +989,7 @@ impl AppState {
             scan_jobs.clone(),
             Some(metadata_reidentify.clone()),
         )
+        .with_probe(Some(probe.clone()))
         .with_library_change_notifications(libraries.change_notifier());
         let ready = ReadyServices {
             database_setup,

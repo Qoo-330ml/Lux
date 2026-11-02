@@ -8501,6 +8501,93 @@ printf '%s' '{"format":{"format_name":"mp4","duration":"30","bit_rate":"128000"}
 
 #[cfg(unix)]
 #[tokio::test]
+async fn full_rescan_probes_sources_added_after_the_first_scan()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    for relative_path in [
+        "First Movie (2020)/First.Movie.2020.mkv",
+        "Second Movie (2021)/Second.Movie.2021.mkv",
+    ] {
+        let path = root.join(relative_path);
+        tokio::fs::create_dir_all(path.parent().ok_or("missing parent")?).await?;
+        tokio::fs::write(&path, b"fixture").await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let fake_ffprobe = temp_dir.path().join("fake-ffprobe");
+    fs::write(
+        &fake_ffprobe,
+        r#"#!/bin/sh
+printf '%s' '{"format":{"format_name":"matroska","duration":"30","bit_rate":"128000"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},{"index":1,"codec_type":"audio","codec_name":"dts","channels":6}]}'
+"#,
+    )?;
+    let mut permissions = fs::metadata(&fake_ffprobe)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_ffprobe, permissions)?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let probe = MediaProbeService::new(
+        database.clone(),
+        FfprobeRunner::new(fake_ffprobe, Duration::from_secs(5)),
+    );
+    let initial_scan = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial_scan.id, 100, Some(probe.clone()))
+        .await?;
+    let initial_statuses: Vec<String> =
+        sqlx::query_scalar("SELECT probe_status FROM media_sources ORDER BY id")
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(initial_statuses, vec!["READY".to_owned(); 2]);
+
+    let added_path = "Third Movie (2024)/Third.Movie.2024.mkv";
+    let added = root.join(added_path);
+    tokio::fs::create_dir_all(added.parent().ok_or("missing parent")?).await?;
+    tokio::fs::write(&added, b"fixture").await?;
+
+    let rescan = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&rescan.id, 100, Some(probe)).await?;
+
+    let statuses: Vec<(String, String)> = sqlx::query_as(
+        "SELECT fe.relative_path, ms.probe_status
+         FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         ORDER BY fe.relative_path",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        statuses,
+        vec![
+            (
+                "First Movie (2020)/First.Movie.2020.mkv".to_owned(),
+                "READY".to_owned()
+            ),
+            (
+                "Second Movie (2021)/Second.Movie.2021.mkv".to_owned(),
+                "READY".to_owned()
+            ),
+            (added_path.to_owned(), "READY".to_owned()),
+        ]
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn full_scan_imports_existing_strm_media_info_sidecar_without_ffprobe()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::{fs, os::unix::fs::PermissionsExt};
