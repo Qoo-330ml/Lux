@@ -7,7 +7,9 @@ use std::{
 ///
 /// The batch only needs [`RECOMMENDATION_FEATURED_LIMIT`] curated slots, so the pool only has to
 /// be deep enough for the weighted draw and the diversity rules to have material to work with.
-pub(crate) const RECOMMENDATION_CANDIDATE_POOL: i64 = 60;
+/// 40 keeps the whole ranking tail reachable (0-based rank 39 still draws at ~5% of the top
+/// weight) while fetching a third fewer scored rows than the previous pool of 60.
+pub(crate) const RECOMMENDATION_CANDIDATE_POOL: i64 = 40;
 
 /// Leading home-carousel slots selected by [`daily_recommendation_items`].
 ///
