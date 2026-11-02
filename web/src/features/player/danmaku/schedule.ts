@@ -9,10 +9,22 @@
  *
  * All times here are media (video) seconds: the renderer advances this clock with `playbackRate`
  * (`engine.ts`), which keeps scrolling speed in step with the video rhythm at any playback rate.
+ *
+ * User layout settings (`DanmakuLayoutOptions`) are applied here rather than in the renderer, because
+ * blocking, the vertical display area, the text scale, the speed multiplier, and the time offset all
+ * change which entries are visible and how lanes are assigned. `updateLayout` re-lanes the current
+ * window in place, so changing a setting never reloads or re-parses the XML.
  */
 
 import { DANMAKU_LIMITS, type DanmakuMode, type LuxDanmakuEntry } from "./parse";
 import { createTextMeasurer, type MeasureText } from "./measure";
+import {
+  DANMAKU_SETTINGS_LIMITS,
+  DEFAULT_DANMAKU_LAYOUT,
+  danmakuLayoutsEqual,
+  type DanmakuArea,
+  type DanmakuLayoutOptions,
+} from "./settings";
 
 /**
  * Media-time tolerance shared with the renderer: a step beyond this is a seek (recompute lanes),
@@ -27,9 +39,23 @@ export const FIXED_LINE_HEIGHT = 34;
 /** Horizontal breathing room between two scrolling danmaku sharing a lane. */
 export const DANMAKU_LANE_GAP = 16;
 
+/** Fraction of the overlay height each display area may use for scrolling and top danmaku. */
+export const DANMAKU_AREA_FRACTIONS: Record<DanmakuArea, number> = {
+  full: 1,
+  half: 0.5,
+  quarter: 0.25,
+};
+
+/** Rendered font sizes stay legible after the user's scale without exploding memory/layout. */
+const MIN_RENDERED_FONT_SIZE = 8;
+const MAX_RENDERED_FONT_SIZE = 128;
+const MODES: readonly DanmakuMode[] = ["scroll", "top", "bottom"];
+
 export type DanmakuViewport = { width: number; height: number };
 
 export type ScheduledDanmaku = LuxDanmakuEntry & {
+  /** Media time the entry was scheduled for, already shifted by the user's time offset. */
+  scheduleStart: number;
   lane: number;
   duration: number;
   width: number;
@@ -45,6 +71,11 @@ export type DanmakuPlacement = ScheduledDanmaku & {
 export type DanmakuScheduler = {
   /** Applies a new viewport; the next `place()` recomputes lanes for the current window. */
   configure(viewport: DanmakuViewport): void;
+  /**
+   * Applies new layout settings and re-lanes the current window. Returns `true` when the settings
+   * actually changed (a no-op update does not disturb the lanes already on screen).
+   */
+  updateLayout(next: Partial<DanmakuLayoutOptions>): boolean;
   /** Drops the incremental lane state (used after a seek or a source change). */
   resync(): void;
   /** Returns the danmaku visible at `mediaTime`, with positions for that instant. */
@@ -57,44 +88,131 @@ export type DanmakuSchedulerOptions = {
   measure?: MeasureText;
   maxVisible?: number;
   gap?: number;
+  /** Initial user layout settings; `updateLayout` can replace them at runtime. */
+  layout?: Partial<DanmakuLayoutOptions>;
 };
 
-export function laneGeometry(height: number) {
+export function laneGeometry(height: number, area: DanmakuArea = "full") {
   const safeHeight = Math.max(1, height);
-  const fixedLaneCount = Math.max(2, Math.min(4, Math.floor((safeHeight * 0.16) / FIXED_LINE_HEIGHT)));
+  // The display area only limits the band scrolling and top danmaku may use; bottom danmaku stay
+  // pinned to the video bottom and keep the full-height lane count.
+  const bandHeight = Math.max(FIXED_LINE_HEIGHT, safeHeight * DANMAKU_AREA_FRACTIONS[area]);
+  const fixedLaneCount = Math.max(2, Math.min(4, Math.floor((bandHeight * 0.16) / FIXED_LINE_HEIGHT)));
   const fixedBandHeight = fixedLaneCount * FIXED_LINE_HEIGHT + 8;
-  const availableScrollHeight = Math.max(SCROLL_LINE_HEIGHT * 4, safeHeight - fixedBandHeight * 2);
-  const scrollLaneCount = Math.max(
-    4,
-    Math.min(18, Math.floor((availableScrollHeight * 0.64) / SCROLL_LINE_HEIGHT)),
+  const desiredScrollHeight = Math.max(SCROLL_LINE_HEIGHT * 4, bandHeight - fixedBandHeight * 2);
+  // Never place a scrolling lane outside the allowed band, even in a very short overlay.
+  const capacity = Math.max(
+    1,
+    Math.floor((bandHeight - fixedBandHeight - 8) / SCROLL_LINE_HEIGHT),
+  );
+  const scrollLaneCount = Math.min(
+    capacity,
+    Math.max(4, Math.min(18, Math.floor((desiredScrollHeight * 0.64) / SCROLL_LINE_HEIGHT))),
   );
   return { fixedLaneCount, fixedBandHeight, scrollLaneCount };
 }
 
-function durationFor(mode: DanmakuMode) {
-  return mode === "scroll" ? SCROLL_DURATION_SECONDS : FIXED_DURATION_SECONDS;
+function durationFor(mode: DanmakuMode, speed: number) {
+  const base = mode === "scroll" ? SCROLL_DURATION_SECONDS : FIXED_DURATION_SECONDS;
+  return base / speed;
 }
 
-function laneCountFor(mode: DanmakuMode, geometry: ReturnType<typeof laneGeometry>) {
-  return mode === "scroll" ? geometry.scrollLaneCount : geometry.fixedLaneCount;
+function laneCountFor(
+  mode: DanmakuMode,
+  areaGeometry: ReturnType<typeof laneGeometry>,
+  fullGeometry: ReturnType<typeof laneGeometry>,
+) {
+  if (mode === "scroll") return areaGeometry.scrollLaneCount;
+  // Bottom danmaku ignore the display-area restriction; top danmaku honour it.
+  return mode === "top" ? areaGeometry.fixedLaneCount : fullGeometry.fixedLaneCount;
 }
 
-function laneY(mode: DanmakuMode, lane: number, viewport: DanmakuViewport, geometry: ReturnType<typeof laneGeometry>) {
+function laneY(
+  mode: DanmakuMode,
+  lane: number,
+  viewport: DanmakuViewport,
+  areaGeometry: ReturnType<typeof laneGeometry>,
+) {
   if (mode === "top") return lane * FIXED_LINE_HEIGHT + 8;
   if (mode === "bottom") return viewport.height - (lane + 1) * FIXED_LINE_HEIGHT - 8;
-  return geometry.fixedBandHeight + lane * SCROLL_LINE_HEIGHT + 8;
+  return areaGeometry.fixedBandHeight + lane * SCROLL_LINE_HEIGHT + 8;
 }
 
-/** First index whose start is strictly greater than `time`. */
-function lowerBoundByStart(entries: readonly LuxDanmakuEntry[], time: number) {
+/** Case-insensitive plain substring match. Keywords are data, never a regular expression. */
+export function matchesDanmakuKeyword(text: string, keywords: readonly string[]): boolean {
+  if (keywords.length === 0) return false;
+  const haystack = text.toLowerCase();
+  return keywords.some((keyword) => haystack.includes(keyword));
+}
+
+export function isDanmakuEntryHidden(
+  entry: LuxDanmakuEntry,
+  layout: DanmakuLayoutOptions,
+): boolean {
+  return layout.blockedModes.includes(entry.mode)
+    || matchesDanmakuKeyword(entry.text, layout.keywords);
+}
+
+/** A source entry prepared for scheduling: filtered, with the user's time offset folded in. */
+type PreparedEntry = LuxDanmakuEntry & { scheduleStart: number };
+
+/** First index whose schedule start is strictly greater than `time`. */
+function lowerBoundByScheduleStart(entries: readonly PreparedEntry[], time: number) {
   let low = 0;
   let high = entries.length;
   while (low < high) {
     const mid = (low + high) >> 1;
-    if (entries[mid]!.start <= time) low = mid + 1;
+    if (entries[mid]!.scheduleStart <= time) low = mid + 1;
     else high = mid;
   }
   return low;
+}
+
+function clampNumber(value: unknown, min: number, max: number, fallback: number) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, value));
+}
+
+/**
+ * Defensive normalization of layout input. The settings module already normalizes, but the scheduler
+ * is also usable from tests and future call sites, so it never trusts the values it receives.
+ */
+function resolveLayout(input: Partial<DanmakuLayoutOptions> = {}): DanmakuLayoutOptions {
+  const area = input.area === "half" || input.area === "quarter" || input.area === "full"
+    ? input.area
+    : DEFAULT_DANMAKU_LAYOUT.area;
+  const blockedModes = [...new Set(input.blockedModes ?? [])]
+    .filter((mode): mode is DanmakuMode => MODES.includes(mode));
+  const keywords = [
+    ...new Set(
+      (input.keywords ?? [])
+        .filter((keyword): keyword is string => typeof keyword === "string" && keyword.length > 0)
+        .map((keyword) => keyword.toLowerCase()),
+    ),
+  ];
+  return {
+    area,
+    fontScale: clampNumber(
+      input.fontScale,
+      DANMAKU_SETTINGS_LIMITS.fontScaleMin,
+      DANMAKU_SETTINGS_LIMITS.fontScaleMax,
+      DEFAULT_DANMAKU_LAYOUT.fontScale,
+    ),
+    speed: clampNumber(
+      input.speed,
+      DANMAKU_SETTINGS_LIMITS.speedMin,
+      DANMAKU_SETTINGS_LIMITS.speedMax,
+      DEFAULT_DANMAKU_LAYOUT.speed,
+    ),
+    offsetSeconds: clampNumber(
+      input.offsetSeconds,
+      DANMAKU_SETTINGS_LIMITS.offsetMin,
+      DANMAKU_SETTINGS_LIMITS.offsetMax,
+      DEFAULT_DANMAKU_LAYOUT.offsetSeconds,
+    ),
+    blockedModes,
+    keywords,
+  };
 }
 
 export function createDanmakuScheduler(
@@ -103,7 +221,7 @@ export function createDanmakuScheduler(
 ): DanmakuScheduler {
   // Entries arrive sorted by start from the parser; sorting a copy keeps callers free to pass
   // anything (and keeps `place()` cheap).
-  const sorted = [...entries].sort((left, right) => left.start - right.start);
+  const sourceEntries = [...entries].sort((left, right) => left.start - right.start);
   const measure = options.measure ?? createTextMeasurer();
   const maxVisible = options.maxVisible ?? DANMAKU_LIMITS.maxVisible;
   const gap = options.gap ?? DANMAKU_LANE_GAP;
@@ -111,6 +229,10 @@ export function createDanmakuScheduler(
     width: Math.max(1, options.viewport.width),
     height: Math.max(1, options.viewport.height),
   };
+  let layout = resolveLayout(options.layout);
+  let prepared: PreparedEntry[] = [];
+  let areaGeometry = laneGeometry(viewport.height, layout.area);
+  let fullGeometry = laneGeometry(viewport.height);
   let lastTime = Number.NEGATIVE_INFINITY;
   let nextIndex = 0;
   let live: ScheduledDanmaku[] = [];
@@ -120,15 +242,26 @@ export function createDanmakuScheduler(
     bottom: [],
   };
 
+  function prepare() {
+    prepared = sourceEntries
+      .filter((entry) => !isDanmakuEntryHidden(entry, layout))
+      .map((entry) => ({
+        ...entry,
+        scheduleStart: entry.start - layout.offsetSeconds,
+      }));
+  }
+
   function applyViewport() {
-    const geometry = laneGeometry(viewport.height);
-    lanes.scroll = Array.from({ length: geometry.scrollLaneCount });
-    lanes.top = Array.from({ length: geometry.fixedLaneCount });
-    lanes.bottom = Array.from({ length: geometry.fixedLaneCount });
+    areaGeometry = laneGeometry(viewport.height, layout.area);
+    fullGeometry = laneGeometry(viewport.height);
+    lanes.scroll = Array.from({ length: areaGeometry.scrollLaneCount });
+    lanes.top = Array.from({ length: areaGeometry.fixedLaneCount });
+    lanes.bottom = Array.from({ length: fullGeometry.fixedLaneCount });
   }
 
   function reset(mediaTime: number) {
-    nextIndex = lowerBoundByStart(sorted, mediaTime - SCROLL_DURATION_SECONDS);
+    const longestLifetime = SCROLL_DURATION_SECONDS / layout.speed;
+    nextIndex = lowerBoundByScheduleStart(prepared, mediaTime - longestLifetime);
     live = [];
     applyViewport();
     lastTime = mediaTime;
@@ -136,29 +269,33 @@ export function createDanmakuScheduler(
 
   function fits(previous: ScheduledDanmaku | undefined, entry: ScheduledDanmaku) {
     if (!previous) return true;
-    if (previous.start + previous.duration <= entry.start) return true;
+    if (previous.scheduleStart + previous.duration <= entry.scheduleStart) return true;
     if (entry.mode !== "scroll") return false;
     // The previous danmaku must be far enough left that the new one enters behind it...
-    const elapsed = (entry.start - previous.start) / previous.duration;
+    const elapsed = (entry.scheduleStart - previous.scheduleStart) / previous.duration;
     const previousRightAtSpawn = viewport.width - elapsed * (viewport.width + previous.width) + previous.width;
     if (previousRightAtSpawn > viewport.width - gap) return false;
     // ...and it must stay behind until the previous one has fully left the screen, otherwise a
     // wider (faster) entry would catch up and overlap mid-lane.
     const newXWhenPreviousExits = viewport.width
-      - ((previous.start + previous.duration - entry.start) / entry.duration)
+      - ((previous.scheduleStart + previous.duration - entry.scheduleStart) / entry.duration)
       * (viewport.width + entry.width);
     return newXWhenPreviousExits >= gap;
   }
 
-  function schedule(source: LuxDanmakuEntry) {
-    const geometry = laneGeometry(viewport.height);
-    const duration = durationFor(source.mode);
+  function schedule(source: PreparedEntry) {
+    const duration = durationFor(source.mode, layout.speed);
+    const fontSize = Math.max(
+      MIN_RENDERED_FONT_SIZE,
+      Math.min(MAX_RENDERED_FONT_SIZE, Math.round(source.fontSize * layout.fontScale)),
+    );
     const width = Math.min(
       viewport.width * 0.9,
-      Math.max(24, measure(source.text, source.fontSize) + 8),
+      Math.max(24, measure(source.text, fontSize) + 8),
     );
     const candidate: ScheduledDanmaku = {
       ...source,
+      fontSize,
       lane: 0,
       duration,
       width,
@@ -166,7 +303,7 @@ export function createDanmakuScheduler(
       y: 0,
     };
     const modeLanes = lanes[source.mode];
-    const count = laneCountFor(source.mode, geometry);
+    const count = laneCountFor(source.mode, areaGeometry, fullGeometry);
     let lane = -1;
     for (let index = 0; index < count && index < modeLanes.length; index += 1) {
       if (fits(modeLanes[index], candidate)) {
@@ -177,7 +314,7 @@ export function createDanmakuScheduler(
     // No free lane: drop this danmaku rather than stacking it on top of another one.
     if (lane < 0) return;
     candidate.lane = lane;
-    candidate.y = laneY(source.mode, lane, viewport, geometry);
+    candidate.y = laneY(source.mode, lane, viewport, areaGeometry);
     modeLanes[lane] = candidate;
     live.push(candidate);
   }
@@ -196,17 +333,17 @@ export function createDanmakuScheduler(
     }
     lastTime = mediaTime;
 
-    while (nextIndex < sorted.length && sorted[nextIndex]!.start <= mediaTime) {
-      schedule(sorted[nextIndex]!);
+    while (nextIndex < prepared.length && prepared[nextIndex]!.scheduleStart <= mediaTime) {
+      schedule(prepared[nextIndex]!);
       nextIndex += 1;
     }
-    live = live.filter((entry) => entry.start + entry.duration > mediaTime);
+    live = live.filter((entry) => entry.scheduleStart + entry.duration > mediaTime);
 
     const visible: DanmakuPlacement[] = [];
     for (const entry of live) {
-      if (entry.start > mediaTime) continue;
+      if (entry.scheduleStart > mediaTime) continue;
       if (visible.length >= maxVisible) break;
-      const progress = Math.max(0, Math.min(1, (mediaTime - entry.start) / entry.duration));
+      const progress = Math.max(0, Math.min(1, (mediaTime - entry.scheduleStart) / entry.duration));
       const x = entry.mode === "scroll"
         ? viewport.width - progress * (viewport.width + entry.width)
         : (viewport.width - entry.width) / 2;
@@ -215,12 +352,23 @@ export function createDanmakuScheduler(
     return visible.sort((left, right) => left.start - right.start);
   }
 
+  prepare();
   reset(0);
 
   return {
     configure(next) {
       viewport = { width: Math.max(1, next.width), height: Math.max(1, next.height) };
       lastTime = Number.NEGATIVE_INFINITY;
+    },
+    updateLayout(next) {
+      const merged = resolveLayout({ ...layout, ...next });
+      if (danmakuLayoutsEqual(merged, layout)) return false;
+      layout = merged;
+      // Filtering, the display area, text scale, speed, and offset all affect lane assignment, so
+      // the whole current window is re-laned instead of keeping stale placements.
+      prepare();
+      lastTime = Number.NEGATIVE_INFINITY;
+      return true;
     },
     resync() {
       lastTime = Number.NEGATIVE_INFINITY;

@@ -30,6 +30,7 @@ export {
 } from "./measure";
 
 export {
+  DANMAKU_AREA_FRACTIONS,
   DANMAKU_LANE_GAP,
   DANMAKU_SEEK_THRESHOLD_SECONDS,
   FIXED_DURATION_SECONDS,
@@ -37,13 +38,38 @@ export {
   SCROLL_DURATION_SECONDS,
   SCROLL_LINE_HEIGHT,
   createDanmakuScheduler,
+  isDanmakuEntryHidden,
   laneGeometry,
+  matchesDanmakuKeyword,
   type DanmakuPlacement,
   type DanmakuScheduler,
   type DanmakuSchedulerOptions,
   type DanmakuViewport,
   type ScheduledDanmaku,
 } from "./schedule";
+
+export {
+  DANMAKU_SETTINGS_LIMITS,
+  DANMAKU_SETTINGS_STORAGE_KEY,
+  DEFAULT_DANMAKU_LAYOUT,
+  DEFAULT_DANMAKU_SETTINGS,
+  danmakuLayoutFromSettings,
+  danmakuLayoutsEqual,
+  normalizeDanmakuKeyword,
+  normalizeDanmakuKeywords,
+  normalizeDanmakuSettings,
+  readDanmakuSettings,
+  saveDanmakuSettings,
+  type DanmakuArea,
+  type DanmakuLayoutOptions,
+  type DanmakuSettings,
+} from "./settings";
+
+export {
+  useDanmakuSettings,
+  type DanmakuSettingsStore,
+  type UseDanmakuSettingsOptions,
+} from "./useDanmakuSettings";
 
 export {
   DANMAKU_MAX_INTERPOLATION_DRIFT_SECONDS,

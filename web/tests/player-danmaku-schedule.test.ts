@@ -6,8 +6,13 @@ import {
   createDanmakuScheduler,
   createTextMeasurer,
   laneGeometry,
+  matchesDanmakuKeyword,
   type MeasureText,
 } from "../src/features/player/danmaku";
+import {
+  DEFAULT_DANMAKU_LAYOUT,
+  type DanmakuLayoutOptions,
+} from "../src/features/player/danmaku/settings";
 import type { LuxDanmakuEntry } from "../src/features/player/danmaku";
 
 function entry(index: number, start: number, text = "弹幕"): LuxDanmakuEntry {
@@ -191,5 +196,161 @@ describe("LuxPlayer danmaku scheduler", () => {
 
     expect(wide.length).toBeGreaterThan(narrow.length);
     expect(new Set(narrow.map((placement) => placement.lane)).size).toBe(narrow.length);
+  });
+});
+
+describe("LuxPlayer danmaku layout settings", () => {
+  const heightMeasure: MeasureText = (text, fontSize) => text.length * fontSize;
+
+  function layout(overrides: Partial<DanmakuLayoutOptions> = {}): DanmakuLayoutOptions {
+    return {
+      ...DEFAULT_DANMAKU_LAYOUT,
+      blockedModes: [],
+      keywords: [],
+      ...overrides,
+    };
+  }
+
+  const scroll = entry(0, 0, "滚动");
+  const top: LuxDanmakuEntry = { ...entry(1, 0, "顶部"), mode: "top" };
+  const bottom: LuxDanmakuEntry = { ...entry(2, 0, "底部"), mode: "bottom" };
+
+  it("hides blocked modes without disturbing the remaining lanes", () => {
+    const scheduler = createDanmakuScheduler([scroll, top, bottom], {
+      viewport,
+      measure,
+      layout: layout({ blockedModes: ["scroll"] }),
+    });
+
+    expect(scheduler.place(0.5).map((placement) => placement.mode).sort()).toEqual(["bottom", "top"]);
+  });
+
+  it("blocks case-insensitive plain substrings and never treats them as regular expressions", () => {
+    const entries = [
+      entry(0, 0, "Hello World"),
+      entry(1, 0, "hello"),
+      entry(2, 0, "再见"),
+    ];
+    const scheduler = createDanmakuScheduler(entries, {
+      viewport,
+      measure,
+      layout: layout({ keywords: ["hello"] }),
+    });
+
+    // Second entry starts at the same time as the first, so only "再见" survives the filter.
+    expect(scheduler.place(0.5).map((placement) => placement.text)).toEqual(["再见"]);
+
+    expect(matchesDanmakuKeyword("Hello", ["hello"])).toBe(true);
+    expect(matchesDanmakuKeyword("hello", ["h.llo"])).toBe(false);
+    expect(matchesDanmakuKeyword("hello", [".*"])).toBe(false);
+    expect(() => matchesDanmakuKeyword("hello", ["["])).not.toThrow();
+  });
+
+  it("scales the text size and measured width with the font multiplier", () => {
+    const scheduler = createDanmakuScheduler([entry(0, 0, "12345")], {
+      viewport,
+      measure: heightMeasure,
+      layout: layout({ fontScale: 2 }),
+    });
+
+    const placement = scheduler.place(0)[0]!;
+    expect(placement.fontSize).toBe(50);
+    expect(placement.width).toBe(250 + 8);
+  });
+
+  it("scales the scrolling crossing time with the speed multiplier", () => {
+    const fast = createDanmakuScheduler([entry(0, 0)], {
+      viewport,
+      measure,
+      layout: layout({ speed: 2 }),
+    });
+    const slow = createDanmakuScheduler([entry(0, 0)], {
+      viewport,
+      measure,
+      layout: layout({ speed: 0.5 }),
+    });
+
+    expect(fast.place(0)[0]!.duration).toBe(SCROLL_DURATION_SECONDS / 2);
+    expect(slow.place(0)[0]!.duration).toBe(SCROLL_DURATION_SECONDS / 0.5);
+    // A faster crossing also means the entry leaves the screen sooner.
+    expect(fast.place(SCROLL_DURATION_SECONDS / 2 + 0.1)).toEqual([]);
+    expect(slow.place(SCROLL_DURATION_SECONDS / 2 + 0.1)).toHaveLength(1);
+  });
+
+  it("shows negative and positive time offsets at the expected media time", () => {
+    const entryAtFive = entry(7, 5, "偏移");
+
+    const early = createDanmakuScheduler([entryAtFive], {
+      viewport,
+      measure,
+      layout: layout({ offsetSeconds: 2 }),
+    });
+    expect(early.place(2.9)).toEqual([]);
+    expect(early.place(3).map((placement) => placement.text)).toEqual(["偏移"]);
+
+    const late = createDanmakuScheduler([entryAtFive], {
+      viewport,
+      measure,
+      layout: layout({ offsetSeconds: -2 }),
+    });
+    expect(late.place(5)).toEqual([]);
+    expect(late.place(7).map((placement) => placement.text)).toEqual(["偏移"]);
+  });
+
+  it("restricts scrolling and top lanes to the selected vertical band", () => {
+    const quarter = laneGeometry(720, "quarter");
+    const full = laneGeometry(720, "full");
+    expect(quarter.scrollLaneCount).toBeLessThan(full.scrollLaneCount);
+    expect(quarter.fixedLaneCount).toBeLessThanOrEqual(full.fixedLaneCount);
+
+    const scheduler = createDanmakuScheduler([scroll, top, bottom], {
+      viewport: { width: 1280, height: 720 },
+      measure,
+      layout: layout({ area: "quarter" }),
+    });
+    const placements = scheduler.place(0.5);
+    const band = 720 * 0.25;
+    for (const placement of placements.filter((item) => item.mode !== "bottom")) {
+      expect(placement.y).toBeLessThan(band);
+      expect(placement.y).toBeGreaterThanOrEqual(0);
+    }
+    // Bottom danmaku are pinned to the video bottom and stay outside the band restriction.
+    expect(placements.find((placement) => placement.mode === "bottom")!.y).toBeGreaterThan(720 / 2);
+  });
+
+  it("re-lanes the current window when settings change at runtime", () => {
+    const entries = Array.from({ length: 40 }, (_, index) => entry(index, 0, "长".repeat(8)));
+    const scheduler = createDanmakuScheduler(entries, { viewport, measure });
+
+    const fullCount = scheduler.place(0.5).length;
+    expect(fullCount).toBeGreaterThan(0);
+
+    expect(scheduler.updateLayout({ area: "quarter" })).toBe(true);
+    const quarter = scheduler.place(0.5);
+    expect(quarter.length).toBeLessThan(fullCount);
+    expect(quarter.every((placement) => placement.y < 450 * 0.25)).toBe(true);
+
+    expect(scheduler.updateLayout({ blockedModes: ["scroll"] })).toBe(true);
+    expect(scheduler.place(0.5)).toEqual([]);
+
+    expect(scheduler.updateLayout({ blockedModes: [] })).toBe(true);
+    const restored = scheduler.place(0.5);
+    const fresh = createDanmakuScheduler(entries, {
+      viewport,
+      measure,
+      layout: layout({ area: "quarter" }),
+    }).place(0.5);
+    expect(restored).toEqual(fresh);
+
+    // No-op updates must not force another lane assignment.
+    expect(scheduler.updateLayout({ area: "quarter", blockedModes: [] })).toBe(false);
+  });
+
+  it("applies a time offset change to the current window as well", () => {
+    const scheduler = createDanmakuScheduler([entry(0, 5, "稍后")], { viewport, measure });
+    expect(scheduler.place(0)).toEqual([]);
+
+    scheduler.updateLayout({ offsetSeconds: 5 });
+    expect(scheduler.place(0).map((placement) => placement.text)).toEqual(["稍后"]);
   });
 });
