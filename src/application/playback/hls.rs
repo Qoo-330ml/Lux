@@ -390,6 +390,11 @@ struct HlsOutput<'a> {
     segment_file_name: String,
     segment_container: HlsSegmentContainer,
     preserve_input_timestamps: bool,
+    /// Adds the channel-layout normalisation Web playback needs in front of the AAC encoder.
+    ///
+    /// Only the Web pipeline sets this: Chromium's MSE refuses a PCE-framed
+    /// `AudioSpecificConfig`, while Emby clients accept it, and the Emby output stays unchanged.
+    normalize_aac_channel_layout: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -974,6 +979,7 @@ impl HlsManager {
                     .into_owned(),
                     segment_container: specification.segment_container,
                     preserve_input_timestamps: true,
+                    normalize_aac_channel_layout: false,
                 },
             )?
         } else {
@@ -996,6 +1002,7 @@ impl HlsManager {
                         .into_owned(),
                     segment_container: specification.segment_container,
                     preserve_input_timestamps: false,
+                    normalize_aac_channel_layout: true,
                 },
             )?
         };
@@ -2109,7 +2116,7 @@ fn ffmpeg_args_with_audio(
     start_time_ticks: Option<i64>,
     audio_stream_index: Option<i64>,
 ) -> Result<Vec<String>, HlsError> {
-    ffmpeg_args_with_timeline_audio(
+    ffmpeg_args_in_shape(
         input,
         directory,
         tier,
@@ -2119,7 +2126,7 @@ fn ffmpeg_args_with_audio(
             start_time_ticks,
             audio_stream_index,
         },
-        false,
+        PipelineShape::Web,
     )
 }
 
@@ -2131,9 +2138,8 @@ fn ffmpeg_args_with_timeline(
     hardware_encoder: Option<&str>,
     video_bitrate: Option<i64>,
     start_time_ticks: Option<i64>,
-    preserve_input_timestamps: bool,
 ) -> Result<Vec<String>, HlsError> {
-    ffmpeg_args_with_timeline_audio(
+    ffmpeg_args_in_shape(
         input,
         directory,
         tier,
@@ -2143,8 +2149,18 @@ fn ffmpeg_args_with_timeline(
             start_time_ticks,
             audio_stream_index: None,
         },
-        preserve_input_timestamps,
+        PipelineShape::Emby,
     )
+}
+
+/// Which output shape a test builds arguments for.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum PipelineShape {
+    /// Lux Web HLS: reset timeline plus AAC channel-layout normalisation.
+    Web,
+    /// Emby VOD: preserved input timestamps and FFmpeg's default audio layout.
+    Emby,
 }
 
 #[cfg(test)]
@@ -2156,17 +2172,21 @@ fn encoding_for(hardware_encoder: Option<&str>) -> FfmpegEncodingOptions {
 }
 
 #[cfg(test)]
-fn ffmpeg_args_with_timeline_audio(
+fn ffmpeg_args_in_shape(
     input: &Path,
     directory: &Path,
     tier: ServerTier,
     hardware_encoder: Option<&str>,
     video_bitrate: Option<i64>,
     timing: FfmpegTimelineOptions,
-    preserve_input_timestamps: bool,
+    shape: PipelineShape,
 ) -> Result<Vec<String>, HlsError> {
     let manifest = directory.join("index.m3u8");
     let encoding = encoding_for(hardware_encoder);
+    let (preserve_input_timestamps, normalize_aac_channel_layout) = match shape {
+        PipelineShape::Web => (false, true),
+        PipelineShape::Emby => (true, false),
+    };
     ffmpeg_args_for_output_with_audio(
         input,
         tier,
@@ -2182,6 +2202,7 @@ fn ffmpeg_args_with_timeline_audio(
                 .into_owned(),
             segment_container: HlsSegmentContainer::FragmentedMp4,
             preserve_input_timestamps,
+            normalize_aac_channel_layout,
         },
     )
 }
@@ -2349,6 +2370,40 @@ fn sanitize_probe_error(stderr: &str) -> String {
     cleaned.trim().to_owned()
 }
 
+/// The decoded channel layouts FFmpeg's AAC encoder can signal through the standard
+/// `channelConfiguration` table, ordered from mono to 5.1.
+///
+/// Anything else — the `5.1(side)` mask AC-3, E-AC-3, DTS and TrueHD 5.1 tracks decode to, but
+/// also `5.0(side)`, `quad`, `6.1`, `7.1(wide)` and `7.1.4` — makes FFmpeg write a 25-byte
+/// `channelConfig=0` Program Config Element instead of the five-byte table entry. Chromium's MSE
+/// append rejects the PCE form (`CHUNK_DEMUXER_ERROR_APPEND_FAILED`, the player's
+/// "播放器引擎失败"), so Web playback has to fold the decoded layout into this table first.
+///
+/// The list is matched by channel count: FFmpeg keeps mono, stereo, 3.0, 4.0, 5.0 and 5.1
+/// sources as they are and downmixes everything wider into 5.1, which is the widest layout every
+/// browser AAC decoder supports. Sources wider than 5.1 are deliberately not kept as 6.1 or 7.1:
+/// recent FFmpeg versions signal those with the *extended* configurations 11/12 (verified with
+/// FFmpeg 9.0), and no Chromium build is known to accept them, while a 5.1 downmix always fits
+/// the classic table. The filter is also a no-op for a layout that is already in the list, so it
+/// is safe to apply even when the probe recorded no channel layout.
+const AAC_STANDARD_CHANNEL_LAYOUTS: &str = "mono|stereo|3.0|4.0|5.0|5.1";
+
+/// Tiers that re-encode the audio track to AAC (`Remux` copies it, `Direct` never transcodes).
+const fn reencodes_audio(tier: ServerTier) -> bool {
+    matches!(
+        tier,
+        ServerTier::AudioTranscode | ServerTier::HardwareTranscode | ServerTier::SoftwareTranscode
+    )
+}
+
+/// The `-af` pair that keeps the AAC encoder inside [`AAC_STANDARD_CHANNEL_LAYOUTS`].
+fn aac_channel_layout_arguments() -> [String; 2] {
+    [
+        "-af".to_owned(),
+        format!("aformat=channel_layouts={AAC_STANDARD_CHANNEL_LAYOUTS}"),
+    ]
+}
+
 fn ffmpeg_args_for_output_with_audio(
     input: &Path,
     tier: ServerTier,
@@ -2450,6 +2505,9 @@ fn ffmpeg_args_for_output_with_audio(
         // Direct play never transcodes; the caller only builds these arguments for transcode
         // tiers, so emitting no codec arguments is the safe fallback.
         ServerTier::Direct => {}
+    }
+    if output.normalize_aac_channel_layout && reencodes_audio(tier) {
+        args.extend(aac_channel_layout_arguments());
     }
     if matches!(
         tier,
@@ -3116,6 +3174,7 @@ mod tests {
                 segment_file_name: "session/segment_%06d.ts".to_owned(),
                 segment_container: HlsSegmentContainer::MpegTs,
                 preserve_input_timestamps: true,
+                normalize_aac_channel_layout: false,
             },
         )
         .unwrap();
@@ -3188,6 +3247,407 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["-c:a", "aac"]));
     }
 
+    /// Audio the Web pipeline re-encodes must reach AAC through a layout the standard
+    /// `channelConfiguration` table can describe.
+    ///
+    /// AC-3, E-AC-3, DTS and TrueHD 5.1 tracks decode to the `5.1(side)` channel mask, and FFmpeg
+    /// answers that mask (as well as `6.1`, `7.1(wide)` or `7.1.4`) with a 25-byte
+    /// `channelConfig=0` Program Config Element instead of the five-byte table entry. Chromium's
+    /// MSE append rejects the PCE form (`CHUNK_DEMUXER_ERROR_APPEND_FAILED`), so every Web
+    /// transcoding tier has to fold the decoded layout into the standard table first.
+    #[test]
+    fn web_audio_transcoding_normalises_the_aac_channel_layout() {
+        for (tier, hardware_encoder) in [
+            (ServerTier::AudioTranscode, None),
+            (ServerTier::HardwareTranscode, Some("h264_videotoolbox")),
+            (ServerTier::SoftwareTranscode, None),
+        ] {
+            let args = ffmpeg_args(
+                Path::new("movie.mkv"),
+                Path::new("session"),
+                tier,
+                hardware_encoder,
+                None,
+                None,
+            )
+            .unwrap();
+            let filter = args
+                .windows(2)
+                .find(|pair| pair[0] == "-af")
+                .map(|pair| pair[1].clone())
+                .unwrap_or_else(|| panic!("{tier:?} must normalise the AAC channel layout"));
+            assert!(
+                filter.starts_with("aformat=channel_layouts="),
+                "unexpected audio filter for {tier:?}: {filter}"
+            );
+            let layouts: Vec<&str> = filter
+                .rsplit_once('=')
+                .map(|(_, list)| list.split('|').collect())
+                .unwrap_or_default();
+            for layout in ["mono", "stereo", "3.0", "4.0", "5.0", "5.1"] {
+                assert!(
+                    layouts.contains(&layout),
+                    "{tier:?} must accept the AAC layout {layout}: {filter}"
+                );
+            }
+            for rejected in ["quad", "5.1(side)", "6.1", "7.1"] {
+                assert!(
+                    !layouts.contains(&rejected),
+                    "{tier:?} encoding {rejected} would emit a Program Config Element: {filter}"
+                );
+            }
+        }
+    }
+
+    /// Emby keeps its current FFmpeg arguments: its clients accept the PCE form, and the Web fix
+    /// must not change a protocol this task does not own.
+    #[test]
+    fn emby_audio_transcoding_keeps_the_ffmpeg_default_audio_layout() {
+        for (tier, hardware_encoder) in [
+            (ServerTier::AudioTranscode, None),
+            (ServerTier::HardwareTranscode, Some("h264_videotoolbox")),
+            (ServerTier::SoftwareTranscode, None),
+        ] {
+            let args = ffmpeg_args_with_timeline(
+                Path::new("movie.mkv"),
+                Path::new("session"),
+                tier,
+                hardware_encoder,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(
+                !args.iter().any(|value| value == "-af"),
+                "Emby {tier:?} arguments must stay unchanged: {args:?}"
+            );
+        }
+    }
+
+    /// A copied audio track cannot be filtered; the remux tier must keep `-c:a copy` alone.
+    #[test]
+    fn a_copied_audio_track_is_never_filtered() {
+        let args = ffmpeg_args(
+            Path::new("movie.mkv"),
+            Path::new("session"),
+            ServerTier::Remux,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(args.windows(2).any(|pair| pair == ["-c:a", "copy"]));
+        assert!(!args.iter().any(|value| value == "-af"));
+    }
+
+    /// End-to-end proof with a real FFmpeg: a `5.1(side)` source must reach the playlist through
+    /// the five-byte `AudioSpecificConfig` with `channelConfiguration=6`, not the PCE form.
+    ///
+    /// Ignored by default because it needs an FFmpeg binary with the `aac` and `ac3` encoders;
+    /// run it with `cargo test --locked --lib playback::hls -- --ignored`.
+    #[test]
+    #[ignore = "requires a local FFmpeg binary; run with `cargo test --locked --lib playback::hls -- --ignored`"]
+    fn five_point_one_side_audio_encodes_a_standard_aac_channel_configuration() {
+        let ffmpeg = std::env::var("LUX_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_owned());
+        if !ffmpeg_is_installed(&ffmpeg) {
+            eprintln!("skipping: no usable FFmpeg at {ffmpeg}");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temporary directory");
+        // AC-3, E-AC-3, DTS and TrueHD 5.1 all decode to this mask; the bitstream itself does not
+        // carry the back/side distinction.
+        let side_source = temp.path().join("side51.ac3");
+        write_audio_fixture(
+            &ffmpeg,
+            "ac3",
+            "pan=5.1(side)|FL=c0|FR=c0|FC=c0|LFE=c0|SL=c0|SR=c0",
+            &side_source,
+        );
+        // E-AC-3 can carry 8 channels, which exercises the wider-than-5.1 decision.
+        let wide_source = temp.path().join("wide71.eac3");
+        write_audio_fixture(
+            &ffmpeg,
+            "eac3",
+            "pan=7.1|FL=c0|FR=c0|FC=c0|LFE=c0|BL=c0|BR=c0|SL=c0|SR=c0",
+            &wide_source,
+        );
+        let stereo_source = temp.path().join("stereo.ac3");
+        write_audio_fixture(&ffmpeg, "ac3", "pan=stereo|FL=c0|FR=c0", &stereo_source);
+        let mono_source = temp.path().join("mono.ac3");
+        write_audio_fixture(&ffmpeg, "ac3", "pan=mono|FC=c0", &mono_source);
+
+        for tier in [ServerTier::AudioTranscode, ServerTier::SoftwareTranscode] {
+            let web = temp.path().join(format!("web-{tier:?}"));
+            run_hls_fixture(&ffmpeg, &side_source, tier, &web, true);
+            let asc = aac_audio_specific_config(&web.join("init.mp4"));
+            assert_eq!(
+                asc.len(),
+                5,
+                "{tier:?} must not carry a Program Config Element: {asc:02x?}"
+            );
+            assert_eq!(
+                aac_channel_configuration(&asc),
+                6,
+                "{tier:?} must describe the downmixed 5.1 layout: {asc:02x?}"
+            );
+
+            // Negative control: the Emby-shaped arguments keep FFmpeg's own layout, which is the
+            // 25-byte `channelConfig=0` form that made Chromium refuse the init segment. If a
+            // future FFmpeg encodes `5.1(side)` compactly, this assertion (not the Web one)
+            // should be dropped.
+            let emby = temp.path().join(format!("emby-{tier:?}"));
+            run_hls_fixture(&ffmpeg, &side_source, tier, &emby, false);
+            let asc = aac_audio_specific_config(&emby.join("init.mp4"));
+            assert_eq!(
+                aac_channel_configuration(&asc),
+                0,
+                "{tier:?} must keep the previous Emby output: {asc:02x?}"
+            );
+        }
+
+        // Wider than 5.1 is folded into 5.1: FFmpeg signals 7.1 with the extended
+        // `channelConfiguration` 12, which no Chromium build is known to accept.
+        let web = temp.path().join("web-wide");
+        run_hls_fixture(
+            &ffmpeg,
+            &wide_source,
+            ServerTier::AudioTranscode,
+            &web,
+            true,
+        );
+        let asc = aac_audio_specific_config(&web.join("init.mp4"));
+        assert_eq!(
+            asc.len(),
+            5,
+            "7.1 must fold into the 5.1 table entry: {asc:02x?}"
+        );
+        assert_eq!(
+            aac_channel_configuration(&asc),
+            6,
+            "7.1 must be downmixed into 5.1: {asc:02x?}"
+        );
+
+        // The filter must not touch a layout it already supports.
+        for (source, layout) in [(&stereo_source, 2), (&mono_source, 1)] {
+            let web = temp.path().join(format!("web-{layout}"));
+            run_hls_fixture(&ffmpeg, source, ServerTier::SoftwareTranscode, &web, true);
+            let asc = aac_audio_specific_config(&web.join("init.mp4"));
+            assert_eq!(
+                asc.len(),
+                5,
+                "{layout} channels must stay compact: {asc:02x?}"
+            );
+            assert_eq!(
+                aac_channel_configuration(&asc),
+                layout,
+                "{layout} channels must keep its layout: {asc:02x?}"
+            );
+        }
+    }
+
+    fn ffmpeg_is_installed(ffmpeg: &str) -> bool {
+        std::process::Command::new(ffmpeg)
+            .arg("-version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn write_audio_fixture(ffmpeg: &str, codec: &str, pan: &str, destination: &Path) {
+        let result = std::process::Command::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=2",
+                "-filter_complex",
+                pan,
+                "-c:a",
+                codec,
+            ])
+            .arg(destination)
+            .output()
+            .expect("run FFmpeg");
+        assert!(
+            result.status.success(),
+            "fixture generation failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    /// Runs the exact arguments the pipeline builds for `tier` and checks FFmpeg accepted them.
+    fn run_hls_fixture(
+        ffmpeg: &str,
+        source: &Path,
+        tier: ServerTier,
+        directory: &Path,
+        normalize_aac_channel_layout: bool,
+    ) {
+        std::fs::create_dir_all(directory).expect("output directory");
+        let shape = if normalize_aac_channel_layout {
+            super::PipelineShape::Web
+        } else {
+            super::PipelineShape::Emby
+        };
+        let args = super::ffmpeg_args_in_shape(
+            source,
+            directory,
+            tier,
+            None,
+            None,
+            super::FfmpegTimelineOptions {
+                start_time_ticks: None,
+                audio_stream_index: None,
+            },
+            shape,
+        )
+        .expect("HLS arguments");
+        let result = std::process::Command::new(ffmpeg)
+            .args(&args)
+            .output()
+            .expect("run FFmpeg");
+        assert!(
+            result.status.success(),
+            "FFmpeg failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    /// Reads every box of `parent` so callers can pick by type without knowing the order.
+    fn iso_boxes(data: &[u8], parent: (usize, usize)) -> Vec<([u8; 4], (usize, usize))> {
+        let mut boxes = Vec::new();
+        let mut position = parent.0;
+        while position + 8 <= parent.1 {
+            let size = u32::from_be_bytes(
+                data[position..position + 4]
+                    .try_into()
+                    .expect("box size is four bytes"),
+            ) as usize;
+            let (header, size) = match size {
+                1 if position + 16 <= parent.1 => {
+                    let large = u64::from_be_bytes(
+                        data[position + 8..position + 16]
+                            .try_into()
+                            .expect("large box size is eight bytes"),
+                    );
+                    (16, usize::try_from(large).expect("large box size in range"))
+                }
+                0 => (8, parent.1 - position),
+                size => (8, size),
+            };
+            if size < header || position + size > parent.1 {
+                break;
+            }
+            let kind: [u8; 4] = data[position + 4..position + 8]
+                .try_into()
+                .expect("box type is four bytes");
+            boxes.push((kind, (position + header, position + size)));
+            position += size;
+        }
+        boxes
+    }
+
+    /// AudioSpecificConfig bytes of the first AAC track of an init segment.
+    fn aac_audio_specific_config(init: &Path) -> Vec<u8> {
+        let data = std::fs::read(init).expect("read the initialization segment");
+        let moov = iso_boxes(&data, (0, data.len()))
+            .into_iter()
+            .find(|(kind, _)| kind == b"moov")
+            .expect("moov box")
+            .1;
+        for (kind, trak) in iso_boxes(&data, moov) {
+            if kind != *b"trak" {
+                continue;
+            }
+            let Some(stsd) =
+                [b"mdia", b"minf", b"stbl", b"stsd"]
+                    .iter()
+                    .try_fold(trak, |range, kind| {
+                        iso_boxes(&data, range)
+                            .into_iter()
+                            .find(|(child, _)| child == *kind)
+                            .map(|(_, range)| range)
+                    })
+            else {
+                continue;
+            };
+            // `stsd` holds a version/flags word and an entry count before the sample entry.
+            let Some((entry_kind, entry)) = iso_boxes(&data, (stsd.0 + 8, stsd.1)).first().copied()
+            else {
+                continue;
+            };
+            if entry_kind != *b"mp4a" {
+                continue;
+            }
+            // An AudioSampleEntry spends 28 bytes on its fixed fields before the child boxes.
+            let Some(esds) = iso_boxes(&data, (entry.0 + 28, entry.1))
+                .into_iter()
+                .find(|(kind, _)| kind == b"esds")
+                .map(|(_, range)| range)
+            else {
+                continue;
+            };
+            return esds_decoder_specific_info(&data, esds)
+                .expect("esds DecoderSpecificInfo descriptor");
+        }
+        panic!("no AAC track in {}", init.display());
+    }
+
+    /// Walks the MPEG-4 descriptors inside `esds` until the DecoderSpecificInfo (tag `0x05`).
+    fn esds_decoder_specific_info(data: &[u8], esds: (usize, usize)) -> Option<Vec<u8>> {
+        let mut position = esds.0 + 4; // version and flags
+        while position < esds.1 {
+            let tag = *data.get(position)?;
+            position += 1;
+            let mut length = 0usize;
+            for _ in 0..4 {
+                let byte = *data.get(position)?;
+                position += 1;
+                length = (length << 7) | usize::from(byte & 0x7F);
+                if byte & 0x80 == 0 {
+                    break;
+                }
+            }
+            match tag {
+                0x05 => {
+                    return data
+                        .get(position..position.checked_add(length)?)
+                        .map(<[u8]>::to_vec);
+                }
+                0x03 => {
+                    position += 2; // ES_ID
+                    let flags = *data.get(position)?;
+                    position += 1;
+                    if flags & 0x80 != 0 {
+                        position += 2; // dependsOn_ES_ID
+                    }
+                    if flags & 0x40 != 0 {
+                        let url_length = usize::from(*data.get(position)?);
+                        position += 1 + url_length;
+                    }
+                    if flags & 0x20 != 0 {
+                        position += 2; // OCR_ES_ID
+                    }
+                }
+                0x04 => position += 13, // object type, stream type, buffer, two bitrates
+                _ => position += length,
+            }
+        }
+        None
+    }
+
+    fn aac_channel_configuration(asc: &[u8]) -> u8 {
+        assert!(asc.len() >= 2, "AudioSpecificConfig too short: {asc:02x?}");
+        (asc[1] >> 3) & 0x0F
+    }
+
     #[test]
     fn video_transcoding_arguments_apply_requested_video_bitrate() {
         let args = ffmpeg_args(
@@ -3212,7 +3672,6 @@ mod tests {
             None,
             None,
             None,
-            true,
         )
         .unwrap();
 
@@ -3336,7 +3795,6 @@ mod tests {
             None,
             None,
             Some(8 * 10_000_000),
-            true,
         )
         .unwrap();
 
@@ -4039,6 +4497,7 @@ while :; do sleep 1; done
                 segment_file_name: "session/segment_%06d.m4s".to_owned(),
                 segment_container: HlsSegmentContainer::FragmentedMp4,
                 preserve_input_timestamps: false,
+                normalize_aac_channel_layout: true,
             },
         )
         .unwrap();
@@ -4073,6 +4532,7 @@ while :; do sleep 1; done
                 segment_file_name: "session/segment_%06d.m4s".to_owned(),
                 segment_container: HlsSegmentContainer::FragmentedMp4,
                 preserve_input_timestamps: false,
+                normalize_aac_channel_layout: true,
             },
         )
         .unwrap();
@@ -4234,6 +4694,7 @@ while :; do sleep 1; done
             segment_file_name: "session/segment_%06d.m4s".to_owned(),
             segment_container: HlsSegmentContainer::FragmentedMp4,
             preserve_input_timestamps: false,
+            normalize_aac_channel_layout: true,
         }
     }
 
