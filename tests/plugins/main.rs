@@ -2,7 +2,6 @@ mod danmaku;
 mod danmaku_api;
 mod danmaku_config;
 mod danmaku_config_api;
-mod danmaku_plugin;
 mod ip_location_plugins;
 mod media_info_config;
 mod media_info_config_api;
