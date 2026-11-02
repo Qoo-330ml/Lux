@@ -32,6 +32,7 @@ const engineState = vi.hoisted(() => ({
   hlsEngines: 0,
   /** Every URL handed to the HLS engine, in order. */
   hlsSources: [] as string[],
+  hlsPlays: 0,
 }));
 
 vi.mock("../src/features/player/mkv-playback-engine", () => ({
@@ -75,7 +76,10 @@ vi.mock("../src/features/player/hls-playback-engine", () => ({
       return Promise.resolve();
     }
     destroy() {}
-    play() { return Promise.resolve(); }
+    play() {
+      engineState.hlsPlays += 1;
+      return Promise.resolve();
+    }
     pause() {}
     seek() {}
     snapshot() { return { currentTime: 0, duration: 8, ended: false }; }
@@ -116,6 +120,7 @@ describe("PlayerPage native Direct Play fallback reload", () => {
     engineState.hevcEngines = 0;
     engineState.hlsEngines = 0;
     engineState.hlsSources = [];
+    engineState.hlsPlays = 0;
     mockPlaybackBootstrap();
     warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     vi.stubGlobal("MediaSource", { isTypeSupported: (mime: string) => mime.includes("avc1") });
@@ -254,6 +259,8 @@ describe("PlayerPage native Direct Play fallback reload", () => {
     expect(session).toHaveBeenCalledTimes(2);
     expect(engineState.hlsEngines).toBe(1);
     expect(engineState.hlsSources).toEqual([MANIFEST_URL]);
+    // The viewer was already watching, so the degraded session starts on its own.
+    expect(engineState.hlsPlays).toBeGreaterThanOrEqual(1);
   }
 
   it("restarts the new SERVER_HLS plan after a silent-audio fallback", async () => {
