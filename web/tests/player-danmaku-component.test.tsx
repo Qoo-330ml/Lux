@@ -3,7 +3,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { api } from "../src/lib/api/client";
+import { ApiError, api } from "../src/lib/api/client";
 import { PlayerDanmakuOverlay } from "../src/features/player/components/player-danmaku-overlay";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -88,5 +88,49 @@ describe("LuxPlayer danmaku overlay", () => {
       await Promise.resolve();
     });
     expect(container.querySelector("[data-lux-danmaku-overlay]")).toBeNull();
+  });
+
+  it('treats a 404 "no danmaku" answer as an empty result and asks only once per source', async () => {
+    // The real backend answers 404 (`NOT_FOUND`, “当前媒体源没有可用弹幕”) when a source has no
+    // danmaku sidecar. That is a normal empty state: no status message, no failure banner, and no
+    // repeated request on the next playback lifecycle (session fallback, track/quality switch).
+    const metadata = vi.spyOn(api, "webDanmaku").mockRejectedValue(
+      new ApiError("当前媒体源没有可用弹幕", { code: "NOT_FOUND", status: 404 }),
+    );
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    const onStatusChange = vi.fn();
+
+    const render = async (lifecycleKey: string) => {
+      await act(async () => {
+        root.render(
+          <PlayerDanmakuOverlay
+            itemId="item-without-danmaku"
+            sourceId="source-without-danmaku"
+            visible
+            currentTime={0}
+            playbackRate={1}
+            lifecycleKey={lifecycleKey}
+            onStatusChange={onStatusChange}
+          />,
+        );
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    };
+
+    await render("session-1");
+
+    expect(metadata).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(container.querySelector("[data-lux-danmaku-overlay]")).not.toBeNull();
+    expect(container.querySelector(".lux-player-danmaku-text")).toBeNull();
+    expect(onStatusChange).toHaveBeenCalledWith(null);
+    expect(onStatusChange).not.toHaveBeenCalledWith("弹幕加载失败");
+
+    // A replacement session re-runs the overlay effect with a new lifecycle key: the empty answer is
+    // already known, so nothing is requested again.
+    await render("session-2");
+
+    expect(metadata).toHaveBeenCalledTimes(1);
+    expect(onStatusChange).not.toHaveBeenCalledWith("弹幕加载失败");
   });
 });
