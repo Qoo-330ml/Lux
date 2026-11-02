@@ -12,6 +12,7 @@ export const queryKeys = {
   homeContinueWatching: ["home", "continue-watching"] as const,
   homeLatestLibraries: (libraryIds: readonly string[]) => ["home", "latest-libraries", [...libraryIds]] as const,
   favorites: ["favorites"] as const,
+  watchHistory: ["watch-history"] as const,
   libraries: ["libraries"] as const,
   library: (
     libraryId: string,
