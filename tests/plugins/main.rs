@@ -7,6 +7,7 @@ mod ip_location_plugins;
 mod media_info_config;
 mod media_info_config_api;
 mod notifier_bark;
+mod notifier_feishu;
 mod plugin_protocol;
 mod plugin_runtime;
 mod plugins;
