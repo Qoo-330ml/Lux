@@ -1198,6 +1198,16 @@ impl WebhookPayloadFormat {
 }
 
 impl WebhookEventType {
+    const fn is_playback(self) -> bool {
+        matches!(
+            self,
+            Self::PlaybackStarted
+                | Self::PlaybackPaused
+                | Self::PlaybackProgress
+                | Self::PlaybackStopped
+        )
+    }
+
     pub const ALL: [Self; 10] = [
         Self::MediaAdded,
         Self::MediaRemoved,
@@ -1553,28 +1563,70 @@ fn build_event_payload_for_format(
     payload_format: WebhookPayloadFormat,
     data: Value,
 ) -> Result<Value, WebhookError> {
+    // Keep the publisher's raw fields so the Emby adapter can read Emby-only fields. The Lux-native
+    // payload above still applies its allow-list, so native output does not change.
+    let raw = match &data {
+        Value::Object(map) => map.clone(),
+        _ => Map::new(),
+    };
     let lux_payload = build_event_payload(server_id, event_id, event_type, occurred_at, data)?;
     if payload_format == WebhookPayloadFormat::Lux {
         return Ok(lux_payload);
     }
-    let item_id = lux_payload.get("itemId").and_then(Value::as_str);
-    let play_session_id = lux_payload.get("playSessionId").and_then(Value::as_str);
+    let mut source = lux_payload.as_object().cloned().unwrap_or_default();
+    for (key, value) in raw {
+        source.entry(key).or_insert(value);
+    }
+    let lux_payload = Value::Object(source);
+    let text = |key: &str| {
+        lux_payload
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    let item_id = text("itemId");
+    let play_session_id = text("playSessionId");
+    let server_name = text("serverName")
+        .or_else(|| text("libraryName"))
+        .unwrap_or(server_id);
+    let user_name = text("userName");
+    let device_name = text("deviceName");
+    let item_name = text("itemTitle").or_else(|| text("itemName"));
+    let media_source = lux_payload
+        .get("mediaSource")
+        .filter(|value| value.is_object());
     let mut payload = json!({
         "Event": emby_event_name(event_type),
         "EventId": event_id,
         "Timestamp": occurred_at,
-        "Server": { "Id": server_id },
+        "Date": emby_date(occurred_at),
+        "Severity": "Info",
+        "Server": { "Id": server_id, "Name": server_name, "Version": env!("CARGO_PKG_VERSION") },
         "ServerID": server_id,
-        "ServerName": lux_payload
-            .get("serverName")
-            .or_else(|| lux_payload.get("libraryName"))
-            .and_then(Value::as_str)
-            .unwrap_or(server_id),
+        "ServerName": server_name,
         "TimeStamp": OffsetDateTime::from_unix_timestamp(occurred_at)
             .ok()
             .and_then(|value| value.format(&Rfc3339).ok())
             .unwrap_or_else(|| occurred_at.to_string()),
     });
+    payload["Title"] = match (event_type, user_name, device_name, item_name) {
+        (WebhookEventType::PlaybackStarted, Some(user), Some(device), Some(item)) => {
+            json!(format!("{user} 在 {device} 上开始播放 {item}"))
+        }
+        (WebhookEventType::PlaybackPaused, Some(user), Some(device), Some(item)) => {
+            json!(format!("{device} 上 {user} 已暂停播放 {item}"))
+        }
+        (WebhookEventType::PlaybackStopped, Some(user), Some(device), Some(item)) => {
+            json!(format!("{device} 上 {user} 已停止播放 {item}"))
+        }
+        _ => json!(text("title")),
+    };
+    // Emby sends a null description for pause and an empty one for start and stop.
+    payload["Description"] = match event_type {
+        WebhookEventType::PlaybackPaused => Value::Null,
+        event_type if event_type.is_playback() => json!(""),
+        _ => json!(text("content").unwrap_or("")),
+    };
     if let Some(item_id) = item_id {
         payload["Item"] = json!({ "Id": item_id });
         payload["ItemID"] = json!(item_id);
@@ -1602,8 +1654,53 @@ fn build_event_payload_for_format(
             }
         }
     }
+    if let Some(item) = payload.get_mut("Item").and_then(Value::as_object_mut) {
+        item.insert(
+            "Type".to_owned(),
+            json!(text("itemType").map(emby_item_type).unwrap_or_default()),
+        );
+        item.insert("Name".to_owned(), json!(item_name));
+        item.insert("MediaType".to_owned(), json!("Video"));
+        item.insert("Overview".to_owned(), json!(text("overview")));
+        item.insert(
+            "ProductionYear".to_owned(),
+            json!(lux_payload.get("productionYear")),
+        );
+        item.insert(
+            "RunTimeTicks".to_owned(),
+            json!(lux_payload.get("runtimeTicks")),
+        );
+        item.insert(
+            "ProviderIds".to_owned(),
+            json!(lux_payload.get("providerIds")),
+        );
+        item.insert("Path".to_owned(), json!(text("itemPath")));
+        item.insert(
+            "MediaStreams".to_owned(),
+            json!(media_source.and_then(|source| source.get("MediaStreams"))),
+        );
+        item.insert("FileName".to_owned(), json!(text("fileName")));
+    }
     if let Some(play_session_id) = play_session_id {
         payload["PlaySessionId"] = json!(play_session_id);
+    }
+    payload["User"] = json!({ "Name": user_name, "Id": text("userId") });
+    payload["Session"] = json!({
+        "Client": text("client"),
+        "DeviceName": device_name,
+        "ApplicationVersion": text("clientVersion"),
+        "RemoteEndPoint": text("remoteIp"),
+    });
+    payload["PlaybackInfo"] = json!({
+        "PositionTicks": lux_payload.get("positionTicks"),
+        "PlaySessionId": play_session_id,
+    });
+    if let Some(media_source) = media_source {
+        let mut media_source = media_source.clone();
+        if let Some(object) = media_source.as_object_mut() {
+            object.insert("Path".to_owned(), json!(text("itemPath")));
+        }
+        payload["PlaybackInfo"]["MediaSource"] = media_source;
     }
     let mappings = [
         ("mediaSourceId", "MediaSourceId"),
@@ -1626,6 +1723,27 @@ fn build_event_payload_for_format(
         }
     }
     Ok(payload)
+}
+
+fn emby_date(occurred_at: i64) -> String {
+    OffsetDateTime::from_unix_timestamp(occurred_at)
+        .ok()
+        .and_then(|value| value.format(&Rfc3339).ok())
+        .map(|value| value.replace('Z', ".0000000Z"))
+        .unwrap_or_else(|| occurred_at.to_string())
+}
+
+fn emby_item_type(value: &str) -> &str {
+    match value {
+        "MOVIE" => "Movie",
+        "EPISODE" => "Episode",
+        "SERIES" => "Series",
+        "SEASON" => "Season",
+        "AUDIO" => "Audio",
+        "MUSIC_ALBUM" => "MusicAlbum",
+        "PERSON" => "Person",
+        _ => value,
+    }
 }
 
 fn plugin_event_from_payload(payload_json: &str) -> Result<Value, WebhookError> {
@@ -2646,6 +2764,194 @@ mod tests {
         assert!(payload.get("seasonNumber").is_none());
         assert!(payload.get("path").is_none());
         assert!(payload.get("userId").is_none());
+    }
+
+    #[test]
+    fn emby_playback_payload_matches_emby_envelope_and_text() {
+        let payload = build_event_payload_for_format(
+            "server-1",
+            "event-emby-start",
+            WebhookEventType::PlaybackStarted,
+            1_700_000_000,
+            WebhookPayloadFormat::Emby,
+            json!({
+                "itemId": "item-1",
+                "itemType": "MOVIE",
+                "itemName": "示例电影",
+                "itemTitle": "示例电影",
+                "productionYear": 2024,
+                "runtimeTicks": 72_000_000_000_i64,
+                "providerIds": {"Imdb": "tt1", "Tmdb": "2"},
+                "overview": "简介",
+                "userId": "1234",
+                "userName": "alice",
+                "serverName": "Lux 服务器",
+                "playSessionId": "session-1",
+                "positionTicks": 42,
+                "client": "Lux",
+                "deviceName": "Chrome",
+                "clientVersion": "1.2.3",
+                "remoteIp": "192.0.2.10"
+            }),
+        )
+        .expect("Emby payload should be accepted");
+        assert_eq!(payload["Event"], "playback.start");
+        assert_eq!(payload["Title"], "alice 在 Chrome 上开始播放 示例电影");
+        assert_eq!(payload["Severity"], "Info");
+        assert_eq!(payload["Date"], "2023-11-14T22:13:20.0000000Z");
+        assert_eq!(payload["Server"]["Name"], "Lux 服务器");
+        assert_eq!(payload["User"]["Name"], "alice");
+        assert_eq!(payload["User"]["Id"], "1234");
+        assert_eq!(payload["Session"]["Client"], "Lux");
+        assert_eq!(payload["Session"]["DeviceName"], "Chrome");
+        assert_eq!(payload["Session"]["ApplicationVersion"], "1.2.3");
+        assert_eq!(payload["Session"]["RemoteEndPoint"], "192.0.2.10");
+        assert_eq!(payload["Item"]["Type"], "Movie");
+        assert_eq!(payload["Item"]["MediaType"], "Video");
+        assert_eq!(payload["Item"]["ProductionYear"], 2024);
+        assert_eq!(payload["Item"]["RunTimeTicks"], 72_000_000_000_i64);
+        assert_eq!(payload["Item"]["ProviderIds"]["Imdb"], "tt1");
+        assert_eq!(payload["PlaybackInfo"]["PositionTicks"], 42);
+        assert_eq!(payload["PlaybackInfo"]["PlaySessionId"], "session-1");
+        assert!(payload.get("path").is_none());
+        assert!(payload["Item"]["Path"].is_null());
+    }
+
+    #[test]
+    fn emby_playback_payload_includes_local_path_and_file_name_only_for_emby() {
+        let data = json!({
+            "itemId": "item-1",
+            "itemType": "MOVIE",
+            "itemTitle": "示例电影",
+            "userName": "alice",
+            "deviceName": "Chrome",
+            "playSessionId": "session-1",
+            "itemPath": "/media/movies/示例电影.mkv",
+            "fileName": "示例电影.mkv",
+            "remoteIp": "192.0.2.10"
+        });
+        let emby = build_event_payload_for_format(
+            "server-1",
+            "event-emby-path",
+            WebhookEventType::PlaybackStarted,
+            1_700_000_000,
+            WebhookPayloadFormat::Emby,
+            data.clone(),
+        )
+        .expect("Emby payload should be accepted");
+        assert_eq!(emby["Item"]["Path"], "/media/movies/示例电影.mkv");
+        assert_eq!(emby["Item"]["FileName"], "示例电影.mkv");
+
+        let native = build_event_payload_for_format(
+            "server-1",
+            "event-native-path",
+            WebhookEventType::PlaybackStarted,
+            1_700_000_000,
+            WebhookPayloadFormat::Lux,
+            data,
+        )
+        .expect("native payload should be accepted");
+        assert!(native.get("itemPath").is_none());
+        assert!(native.get("fileName").is_none());
+    }
+
+    #[test]
+    fn emby_playback_payload_carries_media_source_and_streams() {
+        let data = json!({
+            "itemId": "item-1",
+            "itemType": "MOVIE",
+            "itemTitle": "示例电影",
+            "playSessionId": "session-1",
+            "itemPath": "/media/movies/示例电影.mkv",
+            "mediaSource": {
+                "Id": "item-1",
+                "Container": "mkv",
+                "Size": 1234,
+                "MediaStreams": [
+                    {"Type": "Video", "Codec": "hevc", "Index": 0},
+                    {"Type": "Audio", "Codec": "aac", "Index": 1}
+                ]
+            }
+        });
+        let emby = build_event_payload_for_format(
+            "server-1",
+            "event-emby-source",
+            WebhookEventType::PlaybackStarted,
+            1_700_000_000,
+            WebhookPayloadFormat::Emby,
+            data.clone(),
+        )
+        .expect("Emby payload should be accepted");
+        assert_eq!(emby["Item"]["MediaStreams"][0]["Type"], "Video");
+        assert_eq!(emby["Item"]["MediaStreams"][1]["Codec"], "aac");
+        assert_eq!(emby["PlaybackInfo"]["MediaSource"]["Container"], "mkv");
+        assert_eq!(emby["PlaybackInfo"]["MediaSource"]["Size"], 1234);
+        assert_eq!(
+            emby["PlaybackInfo"]["MediaSource"]["Path"],
+            "/media/movies/示例电影.mkv"
+        );
+
+        let native = build_event_payload_for_format(
+            "server-1",
+            "event-native-source",
+            WebhookEventType::PlaybackStarted,
+            1_700_000_000,
+            WebhookPayloadFormat::Lux,
+            data,
+        )
+        .expect("native payload should be accepted");
+        assert!(native.get("mediaSource").is_none());
+    }
+
+    #[test]
+    fn emby_playback_pause_uses_the_server_pause_wording() {
+        let payload = build_event_payload_for_format(
+            "server-1",
+            "event-emby-pause",
+            WebhookEventType::PlaybackPaused,
+            1_700_000_000,
+            WebhookPayloadFormat::Emby,
+            json!({
+                "itemId": "item-1",
+                "itemTitle": "示例电影",
+                "userName": "alice",
+                "deviceName": "Chrome",
+                "playSessionId": "session-1",
+                "positionTicks": 42,
+                "remoteIp": "192.0.2.10"
+            }),
+        )
+        .expect("Emby payload should be accepted");
+        assert_eq!(payload["Event"], "playback.pause");
+        assert_eq!(payload["Title"], "Chrome 上 alice 已暂停播放 示例电影");
+        assert!(payload["Description"].is_null());
+    }
+
+    #[test]
+    fn emby_playback_stop_title_follows_emby_wording() {
+        let payload = build_event_payload_for_format(
+            "server-1",
+            "event-emby-stop",
+            WebhookEventType::PlaybackStopped,
+            1_700_000_000,
+            WebhookPayloadFormat::Emby,
+            json!({
+                "itemId": "item-1",
+                "itemType": "EPISODE",
+                "itemName": "第一集",
+                "seriesTitle": "示例剧",
+                "userName": "alice",
+                "serverName": "Lux 服务器",
+                "playSessionId": "session-1",
+                "positionTicks": 42,
+                "deviceName": "Chrome",
+                "remoteIp": "192.0.2.10"
+            }),
+        )
+        .expect("Emby payload should be accepted");
+        assert_eq!(payload["Event"], "playback.stop");
+        assert_eq!(payload["Title"], "Chrome 上 alice 已停止播放 第一集");
+        assert_eq!(payload["Item"]["Type"], "Episode");
     }
 
     #[test]

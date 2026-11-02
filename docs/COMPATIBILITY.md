@@ -1018,6 +1018,19 @@ Lux 原生 `PLAYBACK_*` 事件保留原始 `itemTitle`，并提供可空的 `ser
 `seriesSeasonCount`。剧集通知标题按剧名、（总季数大于一季时）季号、集名排列；第 0 季显示“特别篇”。
 电影和缺少剧集关联的事件继续使用 `itemTitle`。这些新增展示字段不会加入 Emby 风格 payload。
 
+Emby 风格 payload 已按 Emby Webhooks 1.0.39 的字段结构对齐（2026-11-02，依据 `docs/EMBY-WEBHOOK-PAYLOAD.md` 中的真实样例）：
+顶层增加 `Title`、`Description`、`Date`（RFC 3339，7 位小数）、`Severity`；`Server` 增加 `Name`、`Version`；
+新增 `User`（`Name`、`Id`）、`Session`（`Client`、`DeviceName`、`ApplicationVersion`、`RemoteEndPoint`）和
+`PlaybackInfo`（`PositionTicks`、`PlaySessionId`）；`Item` 增加 `Type`（Emby 名称，如 `Movie`、`Episode`）、
+`MediaType`、`Overview`、`ProductionYear`、`RunTimeTicks`、`ProviderIds`。播放开始、停止、暂停的 `Title` 使用 Emby 服务端中文资源文案（暂停文案按资源键名推断，尚未抓包证实）。
+远程 IP 在所有播放事件的 `Session.RemoteEndPoint` 中提供，不再只限停止事件。这是负责人的决定：Emby 风格目标的
+用户 ID、用户名和远程 IP 会进入该目标的 outbox 与请求正文，覆盖 LUX-183 中关于不包含用户 ID 与仅停止事件携带远程 IP 的限制。
+Lux 原生 `schemaVersion: 1` 合同不变，原生白名单仍生效。
+
+`Item.Path` 为库根与库内相对路径拼接出的本地绝对路径，`Item.FileName` 为其文件名；`.strm` 条目给出本地 `.strm` 文件路径。
+`Item.MediaStreams` 与 `PlaybackInfo.MediaSource`（含 `Container`、`Size`、`Bitrate`、`RunTimeTicks`、`Path` 与流详情）来自与 Emby API 相同的流 DTO，不含任何外部地址或签名 URL。
+仍未对齐：`Session.Id`；播放继续、进度的 `Title` 文案；媒体新增/移除、扫描、元数据和后台任务事件的 Emby 文案。`.strm` 的外部 URL 不发送。
+
 渠道以插件形式提供，见 docs/PLUGIN-SDK.md。
 
 - 媒体库实时监听默认开启，也可通过 `realtimeWatchEnabled` 关闭。关闭后不会为该库根路径创建实时 watcher，但手动扫描、调和和外部刷新仍可用；开启时复制到已配置根路径中的新视频会进入局部 `INCREMENTAL_SCAN`，只处理该事件路径，通常在几秒内进入索引。

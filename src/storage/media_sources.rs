@@ -425,6 +425,25 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
+    /// Returns the canonical library root and the root-relative path of a local media source.
+    /// `.strm` sources resolve to their local `.strm` file, never to the external URL.
+    pub(crate) async fn media_source_local_location(
+        &self,
+        source_id: &str,
+    ) -> Result<Option<(String, String)>, StorageError> {
+        self.query_as::<(String, String)>(
+            "SELECT root.canonical_path, fe.relative_path
+             FROM media_sources ms
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots root ON root.id = fe.library_root_id
+             WHERE ms.id = ?",
+        )
+        .bind(source_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(self.sqlx_err())
+    }
+
     pub(crate) async fn reassign_media_source_item(
         &self,
         filesystem_entry_id: &str,

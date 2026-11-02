@@ -1851,11 +1851,7 @@ pub(super) async fn handle_emby_playback_event(
                     &user.display_name,
                     AccessPrincipal::new(user.id, user.is_admin),
                     request.play_method.as_deref(),
-                    if event_type_is_stopped(event_type) {
-                        activity_remote_ip
-                    } else {
-                        None
-                    },
+                    activity_remote_ip,
                     resumed,
                 )
                 .await;
@@ -2010,10 +2006,6 @@ pub(super) fn playback_resumed(previous: Option<&StoredPlaybackSession>, state_n
     state_name == "PLAYING" && previous.is_some_and(|session| session.state == "PAUSED")
 }
 
-fn event_type_is_stopped(event_type: WebhookEventType) -> bool {
-    event_type == WebhookEventType::PlaybackStopped
-}
-
 #[derive(Clone, Debug, Default)]
 struct PlaybackNotificationContext {
     item_title: Option<String>,
@@ -2025,6 +2017,13 @@ struct PlaybackNotificationContext {
     bitrate: Option<i64>,
     overview: Option<String>,
     play_method: Option<String>,
+    item_type: Option<String>,
+    production_year: Option<i64>,
+    runtime_ticks: Option<i64>,
+    provider_ids: Option<serde_json::Map<String, Value>>,
+    item_path: Option<String>,
+    file_name: Option<String>,
+    media_source: Option<Value>,
 }
 
 async fn playback_notification_context(
@@ -2072,6 +2071,18 @@ async fn playback_notification_context(
         })
         .flatten()
         .and_then(|title| bounded_playback_text(Some(title)));
+    let location = match source {
+        Some(source) => state
+            .database()
+            .media_source_local_location(&source.id)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    let (item_path, file_name) = location
+        .map(|(root, relative_path)| local_item_path(&root, &relative_path))
+        .unwrap_or((None, None));
     PlaybackNotificationContext {
         item_title: bounded_playback_text(Some(&item.title)),
         series_title,
@@ -2084,7 +2095,54 @@ async fn playback_notification_context(
         bitrate: source.and_then(|source| source.bitrate.filter(|value| *value >= 0)),
         overview: bounded_playback_overview(item.overview.as_deref()),
         play_method,
+        item_path,
+        file_name,
+        media_source: source.map(|source| playback_media_source_json(item_id, source)),
+        item_type: bounded_playback_text(Some(&item.item_type)),
+        production_year: item.production_year.filter(|value| *value > 0),
+        runtime_ticks: item.runtime_ticks.filter(|value| *value >= 0),
+        provider_ids: (!item.provider_ids.is_empty()).then(|| {
+            item.provider_ids
+                .iter()
+                .map(|(key, value)| (key.clone(), json!(value)))
+                .collect()
+        }),
     }
+}
+
+/// Builds the Emby-style media source used by playback webhooks. It carries stream details and
+/// local container facts only; external `.strm` URLs and signed stream addresses are never included.
+fn playback_media_source_json(
+    item_id: &str,
+    source: &crate::application::catalog::CatalogSource,
+) -> Value {
+    let streams = source
+        .streams
+        .iter()
+        .map(super::emby_catalog::emby_media_stream_json)
+        .collect::<Vec<_>>();
+    json!({
+        "Id": emby_public_id(item_id),
+        "ItemId": emby_public_id(item_id),
+        "Protocol": "File",
+        "Type": "Default",
+        "Container": source.container,
+        "Size": source.size,
+        "Bitrate": source.bitrate,
+        "RunTimeTicks": source.duration_ticks,
+        "IsRemote": false,
+        "MediaStreams": streams,
+    })
+}
+
+/// Joins a library root with a root-relative file path for Emby-style `Item.Path` and `FileName`.
+fn local_item_path(root: &str, relative_path: &str) -> (Option<String>, Option<String>) {
+    let path = std::path::Path::new(root).join(relative_path);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned);
+    (path.to_str().map(str::to_owned), file_name)
 }
 
 fn normalize_play_method(value: &str) -> String {
@@ -2139,6 +2197,15 @@ pub(super) async fn publish_playback_webhook(
         "playback:{play_session_id}:{}:{occurred_at}:{position_ticks}",
         event_type.as_str(),
     );
+    let user_id = principal.user_id.map(|id| emby_public_id(&id.to_string()));
+    let server_name = state
+        .database()
+        .server_name()
+        .await
+        .ok()
+        .flatten()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| crate::application::admin_dashboard::DEFAULT_SERVER_NAME.to_owned());
     let context = playback_notification_context(
         state,
         principal,
@@ -2149,11 +2216,20 @@ pub(super) async fn publish_playback_webhook(
     .await;
     let data = json!({
         "itemId": emby_public_id(item_id),
+        "itemType": context.item_type,
+        "productionYear": context.production_year,
+        "runtimeTicks": context.runtime_ticks,
+        "providerIds": context.provider_ids,
+        "itemPath": context.item_path,
+        "fileName": context.file_name,
+        "mediaSource": context.media_source,
         "itemTitle": context.item_title,
         "seriesTitle": context.series_title,
         "seasonNumber": context.season_number,
         "seriesSeasonCount": context.series_season_count,
+        "userId": user_id,
         "userName": bounded_playback_text(Some(user_name)),
+        "serverName": server_name,
         "mediaSourceId": media_source_id,
         "playSessionId": play_session_id,
         "state": state_name,
@@ -4877,11 +4953,7 @@ pub(super) async fn lux_web_playback_event(
                 &user.display_name,
                 AccessPrincipal::new(user.id, user.is_admin),
                 web_playback_notification_method(&session),
-                if event_type_is_stopped(event_type) {
-                    activity_remote_ip
-                } else {
-                    None
-                },
+                activity_remote_ip,
                 resumed,
             )
             .await;
@@ -5199,11 +5271,7 @@ pub(super) async fn lux_post_progress(
                     &user.display_name,
                     AccessPrincipal::new(user.id, user.is_admin),
                     request.play_method.as_deref(),
-                    if event_type_is_stopped(event_type) {
-                        activity_remote_ip
-                    } else {
-                        None
-                    },
+                    activity_remote_ip,
                     resumed,
                 )
                 .await;
@@ -5469,8 +5537,8 @@ pub(super) async fn lux_set_played(
 mod emby_playback_tests {
     use super::{
         EmbyPlaybackInfoRequest, emby_force_transcode_from_raw, emby_hls_asset_kind,
-        emby_start_time_hint, is_emby_generation_init_asset, parse_emby_playback_info_request,
-        playback_resumed,
+        emby_start_time_hint, is_emby_generation_init_asset, local_item_path,
+        parse_emby_playback_info_request, playback_media_source_json, playback_resumed,
     };
     use crate::application::catalog::{CatalogSource, CatalogStream};
     use crate::application::playback::decision::{
@@ -5573,6 +5641,49 @@ mod emby_playback_tests {
             "a disabled user loses signed playback resources"
         );
         Ok(())
+    }
+
+    #[test]
+    fn local_item_path_joins_root_and_nested_relative_path() {
+        assert_eq!(
+            local_item_path("/media/movies", "剧场版/示例电影.mkv"),
+            (
+                Some("/media/movies/剧场版/示例电影.mkv".to_owned()),
+                Some("示例电影.mkv".to_owned()),
+            )
+        );
+        assert_eq!(
+            local_item_path("/media/strm", "show/S01E01.strm"),
+            (
+                Some("/media/strm/show/S01E01.strm".to_owned()),
+                Some("S01E01.strm".to_owned()),
+            )
+        );
+    }
+
+    #[test]
+    fn playback_media_source_json_carries_streams_and_never_external_urls() {
+        let mut source = profile_source("mkv", "hevc", "aac");
+        source.size = Some(1_234);
+        source.bitrate = Some(8_000_000);
+        source.duration_ticks = Some(72_000_000_000);
+        let value = playback_media_source_json("item-1", &source);
+        assert_eq!(value["Container"], "mkv");
+        assert_eq!(value["Size"], 1_234);
+        assert_eq!(value["Bitrate"], 8_000_000);
+        assert_eq!(value["RunTimeTicks"], 72_000_000_000_i64);
+        assert_eq!(value["Protocol"], "File");
+        assert_eq!(value["Type"], "Default");
+        assert_eq!(value["MediaStreams"][0]["Type"], "Video");
+        assert_eq!(value["MediaStreams"][0]["Codec"], "hevc");
+        assert_eq!(value["MediaStreams"][1]["Type"], "Audio");
+
+        let mut strm = profile_source("mkv", "hevc", "aac");
+        strm.source_kind = "STRM_URL".to_owned();
+        strm.external_url = Some("https://example.invalid/a.mkv?token=secret".to_owned());
+        let rendered = playback_media_source_json("item-1", &strm).to_string();
+        assert!(!rendered.contains("example.invalid"));
+        assert!(!rendered.contains("token=secret"));
     }
 
     fn profile_source(container: &str, video_codec: &str, audio_codec: &str) -> CatalogSource {

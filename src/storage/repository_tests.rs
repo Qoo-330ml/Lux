@@ -37093,3 +37093,84 @@ async fn sqlite_synchronous_level_reaches_the_connection_pragma()
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn media_source_local_location_resolves_nested_files_and_strm_files() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(root_path.join("Nested"))
+        .await
+        .expect("nested media root");
+    tokio::fs::write(
+        root_path.join("Nested").join("Local.Movie.2024.mkv"),
+        b"local",
+    )
+    .await
+    .expect("local movie");
+    tokio::fs::write(
+        root_path.join("Nested").join("Remote.Movie.2024.strm"),
+        b"https://media.example.invalid/remote.mkv",
+    )
+    .await
+    .expect("STRM file");
+    libraries
+        .add_root(library.id, root_path.to_str().expect("utf-8 media root"))
+        .await
+        .expect("library root");
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await
+        .expect("scan");
+
+    let sources = database
+        .list_media_sources_for_library_page(&library.id.to_string(), 10, 0)
+        .await
+        .expect("sources");
+    assert_eq!(sources.len(), 2);
+    let mut resolved = Vec::new();
+    for source in &sources {
+        let location = database
+            .media_source_local_location(&source.source_id)
+            .await
+            .expect("location query")
+            .expect("local location for a scanned source");
+        resolved.push(std::path::Path::new(&location.0).join(&location.1));
+    }
+    let mut names = resolved
+        .iter()
+        .map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["Local.Movie.2024.mkv", "Remote.Movie.2024.strm"]
+    );
+    assert!(
+        resolved
+            .iter()
+            .all(|path| path.parent().and_then(|parent| parent.file_name())
+                == Some(std::ffi::OsStr::new("Nested")))
+    );
+    assert!(
+        database
+            .media_source_local_location("missing-source")
+            .await
+            .expect("missing lookup")
+            .is_none()
+    );
+}
