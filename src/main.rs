@@ -14,6 +14,15 @@ use std::net::SocketAddr;
 use tokio::{net::TcpListener, sync::watch};
 use tracing::{error, info};
 
+// The benchmark feature installs its own counting allocator in the library crate.
+#[cfg(all(
+    target_os = "linux",
+    target_env = "gnu",
+    not(feature = "performance-benchmarks")
+))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[tokio::main]

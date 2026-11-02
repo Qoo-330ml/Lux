@@ -62,6 +62,11 @@ uuid = { version = "1", features = ["serde", "v7"] }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 zip = { version = "6.0.0", default-features = false, features = ["deflate"] }
 
+# glibc malloc keeps freed pages after bursts (scan, probe, image decode). jemalloc decays dirty
+# pages back to the OS, so the Linux/glibc container shrinks again when idle.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+tikv-jemallocator = "0.6"
+
 [dev-dependencies]
 tempfile = "3"
 
