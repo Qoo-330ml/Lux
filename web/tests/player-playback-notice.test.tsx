@@ -28,7 +28,6 @@ function surfaceProps(overrides: Partial<Parameters<typeof PlayerVideoSurface>[0
     onClick: () => undefined,
     onDoubleClick: () => undefined,
     onError: () => undefined,
-    centerSplash: null,
     fallbackLoading: false,
     fallbackSpeedX: null,
     errorMessage: null,
@@ -218,7 +217,7 @@ describe("PlayerVideoSurface playback notices", () => {
     );
 
     expect(markup).toContain("没有可用的服务端转码档位");
-    expect(markup).not.toContain("lux-player-center-play");
+    expect(markup).not.toContain("lux-player-center-control");
   });
 
   it("does not stack a banner behind a blocking error layer", () => {

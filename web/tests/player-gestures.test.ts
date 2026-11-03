@@ -54,7 +54,6 @@ function renderGestureSurface() {
       videoRef: () => undefined,
       onClick,
       onDoubleClick,
-      centerSplash: null,
       fallbackLoading: false,
       fallbackSpeedX: null,
       errorMessage: null,

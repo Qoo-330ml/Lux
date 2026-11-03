@@ -232,7 +232,7 @@ describe("light theme contrast", () => {
     expect(cssRule(":focus-visible")).toContain("outline: 2px solid var(--lux-focus-ring)");
     expect(lightThemeRule(".lux-library-strategy-toggle input:focus-visible + span + i")).toContain("outline: 2px solid var(--lux-focus-ring)");
     expect(lightThemeRule(".lux-thumbnail-scraping-mode input:focus-visible + span")).toContain("outline: 2px solid var(--lux-focus-ring)");
-    expect(stylesheet).toContain(".lux-player-center-play:focus-visible { outline: 3px solid rgba(255,255,255,.78)");
+    expect(stylesheet).toContain(".lux-player-center-control:focus-visible { outline: 3px solid rgba(255,255,255,.78)");
   });
 
   it("keeps the plugin configuration dialog readable in light mode", () => {

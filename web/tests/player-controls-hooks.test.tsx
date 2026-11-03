@@ -137,22 +137,17 @@ function keydown(key: string, init: KeyboardEventInit = {}) {
 }
 
 describe("usePlayerPlaybackControls", () => {
-  it("plays and pauses the video and clears the center splash", async () => {
-    vi.useFakeTimers();
+  it("plays a paused video and pauses a playing one", async () => {
     const video = fakeVideo({ paused: true });
     const { state } = mountHarness({ video });
 
     await act(async () => state.controls?.togglePlayPause());
     expect(video.play).toHaveBeenCalledTimes(1);
-    expect(state.controls?.centerSplash).toBe("play");
-    act(() => vi.advanceTimersByTime(600));
-    expect(state.controls?.centerSplash).toBeNull();
 
     const playing = fakeVideo({ paused: false });
     const second = mountHarness({ video: playing });
     act(() => second.state.controls?.togglePlayPause());
     expect(playing.pause).toHaveBeenCalledTimes(1);
-    expect(second.state.controls?.centerSplash).toBe("pause");
   });
 
   it("seeks through the runtime when one is attached and clamps the target", () => {

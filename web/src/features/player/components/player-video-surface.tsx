@@ -1,4 +1,4 @@
-import { AlertCircle, ArrowLeft, Pause, Play } from "lucide-react";
+import { AlertCircle, ArrowLeft } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   MouseEvent as ReactMouseEvent,
@@ -13,6 +13,7 @@ import {
 } from "./player-playback-notice";
 import type { PlaybackNotice } from "../playback-notices";
 import { usePlayerSurfaceGestures } from "./player-gestures";
+import { PlayerCenterControl } from "./player-center-control";
 import {
   readPlayerRuntimeCaptionTracks,
   type PlayerNativeCaptionTrack,
@@ -55,7 +56,6 @@ type PlayerVideoSurfaceProps = {
   presentation?: PlayerVideoPresentation;
   playing?: boolean;
   onTogglePlayback?: () => void;
-  centerSplash: "play" | "pause" | null;
   fallbackLoading: boolean;
   fallbackSpeedX: number | null;
   errorMessage: string | null;
@@ -108,7 +108,6 @@ export function PlayerVideoSurface({
   presentation = DEFAULT_VIDEO_PRESENTATION,
   playing = false,
   onTogglePlayback = () => undefined,
-  centerSplash,
   fallbackLoading,
   fallbackSpeedX,
   errorMessage,
@@ -331,26 +330,12 @@ export function PlayerVideoSurface({
         </video>
       ) : null}
 
-      {!playing && streamUrl && !fallbackLoading && !showError && !blockingNotice ? (
-        <button
-          type="button"
-          className="lux-player-center-play"
-          aria-label="播放"
-          title="播放 (空格)"
-          onClick={onTogglePlayback}
-        >
-          <Play size={34} fill="currentColor" aria-hidden="true" />
-        </button>
-      ) : null}
-
-      {centerSplash ? (
-        <div className="lux-player-center-splash" aria-hidden="true">
-          {centerSplash === "play" ? (
-            <Play size={38} fill="currentColor" />
-          ) : (
-            <Pause size={38} fill="currentColor" />
-          )}
-        </div>
+      {streamUrl && !showError && !blockingNotice ? (
+        <PlayerCenterControl
+          playing={Boolean(playing)}
+          loading={fallbackLoading}
+          onClick={() => onTogglePlayback?.()}
+        />
       ) : null}
 
       {fallbackLoading ? (

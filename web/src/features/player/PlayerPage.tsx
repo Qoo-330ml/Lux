@@ -10,6 +10,7 @@ import { useLocation, useNavigate, useParams, useSearchParams } from "react-rout
 import { ApiError } from "../../lib/api/client";
 import { imageUrl, mediaTitle } from "../home/media";
 import { usePlayerPlaybackControls } from "./usePlayerPlaybackControls";
+import { usePlayerTitleLogo } from "./usePlayerTitleLogo";
 import { usePlayerTimelineScrubber } from "./usePlayerTimelineScrubber";
 import { usePlayerKeyboardShortcuts } from "./usePlayerKeyboardShortcuts";
 import { usePlayerInfoPanel } from "./usePlayerInfoPanel";
@@ -224,6 +225,7 @@ export function PlayerPage() {
     && canUseRemoteMkvCaptionSidecar(source)
     && Boolean(clientMkvSourceUrl);
   const poster = media ? imageUrl(media, "fanart") ?? imageUrl(media) : null;
+  const titleLogoUrl = usePlayerTitleLogo(media);
   const chapterTimeline = useMemo(
     () => normalizePlayerChapters(source?.chapters, duration),
     [duration, source?.chapters],
@@ -263,7 +265,6 @@ export function PlayerPage() {
     isMuted,
     playbackRate,
     isFullscreen,
-    centerSplash,
     togglePlayPause,
     seekTo,
     seekRelative,
@@ -705,7 +706,6 @@ export function PlayerPage() {
           onActivity: resetControlsTimeout,
           onInteractionChange: setIsPointerInteracting,
         }}
-        centerSplash={centerSplash}
         fallbackLoading={fallbackLoading}
         fallbackSpeedX={fallbackSpeedX}
         captionTrack={captionTrack}
@@ -761,6 +761,7 @@ export function PlayerPage() {
 
       <PlayerTopBar
         title={mediaTitle(media)}
+        logoUrl={titleLogoUrl}
         subtitle={subtitleInfo}
         onBack={handleBack}
         airPlayAvailable={airPlay.available}

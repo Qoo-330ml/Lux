@@ -44,8 +44,8 @@ test("the top bar shows picture-in-picture on every viewport; portrait phones hi
 });
 
 test("center playback action uses a smaller visual footprint", () => {
-  assert.match(stylesheet, /\.lux-player-center-play, \.lux-player-center-splash\s*\{[^}]*width:\s*88px;[^}]*height:\s*88px/);
-  assert.match(stylesheet, /@media\s*\(max-width:\s*560px\)[\s\S]*?\.lux-player-center-play, \.lux-player-center-splash\s*\{[^}]*width:\s*68px;[^}]*height:\s*68px/);
+  assert.match(stylesheet, /\.lux-player-center-control\s*\{[^}]*width:\s*104px;[^}]*height:\s*104px/);
+  assert.match(stylesheet, /@media\s*\(max-width:\s*560px\)[\s\S]*?\.lux-player-center-control\s*\{[^}]*width:\s*76px;[^}]*height:\s*76px/);
 });
 
 test("volume slider keeps its full track available for both endpoints", () => {

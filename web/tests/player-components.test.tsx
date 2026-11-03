@@ -58,7 +58,6 @@ describe("LuxPlayer state components", () => {
         onPause={() => undefined}
         onTimeUpdate={() => undefined}
         onEnded={() => undefined}
-        centerSplash="play"
         fallbackLoading
         fallbackSpeedX={0.5}
         errorMessage="客户端解码失败"
@@ -87,7 +86,6 @@ describe("LuxPlayer state components", () => {
         videoRef={() => undefined}
         onClick={() => undefined}
         onDoubleClick={() => undefined}
-        centerSplash={null}
         fallbackLoading={false}
         fallbackSpeedX={null}
         errorMessage={null}
@@ -118,7 +116,6 @@ describe("LuxPlayer state components", () => {
         onClick={() => undefined}
         onDoubleClick={() => undefined}
         presentation={{ loop: true, aspectRatio: "16:9", flip: "vertical" }}
-        centerSplash={null}
         fallbackLoading={false}
         fallbackSpeedX={null}
         errorMessage={null}
@@ -141,7 +138,6 @@ describe("LuxPlayer state components", () => {
         videoRef={() => undefined}
         onClick={() => undefined}
         onDoubleClick={() => undefined}
-        centerSplash={null}
         fallbackLoading={false}
         fallbackSpeedX={null}
         errorMessage="decoder token https://example.test/private"
@@ -165,7 +161,6 @@ describe("LuxPlayer state components", () => {
         videoRef={() => undefined}
         onClick={() => undefined}
         onDoubleClick={() => undefined}
-        centerSplash={null}
         fallbackLoading={false}
         fallbackSpeedX={null}
         errorMessage={null}
