@@ -183,11 +183,17 @@ const REQUEST_MAX_ENTRIES: usize = 8192;
 /// Generous per-peer budget: a player fetching HLS segments and artwork bursts stays well below
 /// it, while a runaway client cannot monopolise the server.
 pub const DEFAULT_REQUESTS_PER_MINUTE: u32 = 2_400;
+/// Administrator danmaku searches allowed per session inside [`DANMAKU_SEARCH_WINDOW`].
+pub const DANMAKU_SEARCH_REQUESTS_PER_WINDOW: u32 = 2;
+/// Sliding window of [`DanmakuSearchRateLimiter`]; ADR-052 P5 asks for at most two searches per
+/// second and per administrator session because every search reaches an upstream provider.
+pub const DANMAKU_SEARCH_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct RequestRateLimiter {
     state: Arc<Mutex<RequestRateLimiterState>>,
     limit: u32,
+    window: Duration,
 }
 
 impl Default for RequestRateLimiter {
@@ -198,28 +204,34 @@ impl Default for RequestRateLimiter {
 
 impl RequestRateLimiter {
     pub fn new(limit: u32) -> Self {
+        Self::with_window(limit, REQUEST_WINDOW)
+    }
+
+    /// Builds a limiter with a shorter or longer window than the default minute.
+    pub fn with_window(limit: u32, window: Duration) -> Self {
         Self {
             state: Arc::new(Mutex::new(RequestRateLimiterState {
                 entries: HashMap::new(),
                 last_cleanup: Instant::now(),
             })),
             limit: limit.max(1),
+            window,
         }
     }
 
-    /// Counts one request for `key`; returns false once the minute budget is exhausted.
+    /// Counts one request for `key`; returns false once the window budget is exhausted.
     pub async fn allow(&self, key: &str) -> bool {
         let now = Instant::now();
         let mut state = self.state.lock().await;
-        if now.saturating_duration_since(state.last_cleanup) >= REQUEST_WINDOW {
-            state.entries.retain(|_, entry| {
-                now.saturating_duration_since(entry.started_at) < REQUEST_WINDOW
-            });
+        if now.saturating_duration_since(state.last_cleanup) >= self.window {
+            state
+                .entries
+                .retain(|_, entry| now.saturating_duration_since(entry.started_at) < self.window);
             state.last_cleanup = now;
         }
         let key = key_digest(key);
         if let Some(entry) = state.entries.get_mut(&key) {
-            if now.saturating_duration_since(entry.started_at) >= REQUEST_WINDOW {
+            if now.saturating_duration_since(entry.started_at) >= self.window {
                 *entry = RequestWindow {
                     started_at: now,
                     count: 1,
@@ -246,6 +258,30 @@ impl RequestRateLimiter {
     }
 }
 
+/// Per-administrator-session budget for the manual danmaku search endpoint (ADR-052 P5).
+///
+/// The key is the caller's session material, so two administrators never share a budget; the raw
+/// key is hashed before it is stored and never logged.
+#[derive(Clone)]
+pub struct DanmakuSearchRateLimiter(RequestRateLimiter);
+
+impl Default for DanmakuSearchRateLimiter {
+    fn default() -> Self {
+        Self::new(DANMAKU_SEARCH_REQUESTS_PER_WINDOW, DANMAKU_SEARCH_WINDOW)
+    }
+}
+
+impl DanmakuSearchRateLimiter {
+    pub fn new(limit: u32, window: Duration) -> Self {
+        Self(RequestRateLimiter::with_window(limit, window))
+    }
+
+    /// Counts one search for `key`; returns false once the window budget is exhausted.
+    pub async fn allow(&self, key: &str) -> bool {
+        self.0.allow(key).await
+    }
+}
+
 struct RequestRateLimiterState {
     entries: HashMap<[u8; 32], RequestWindow>,
     last_cleanup: Instant,
@@ -259,8 +295,8 @@ struct RequestWindow {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLEANUP_INTERVAL, DevicePairingRateLimiter, LoginAttempt, LoginRateLimiter, MAX_ENTRIES,
-        RequestRateLimiter, WINDOW, key_digest,
+        CLEANUP_INTERVAL, DanmakuSearchRateLimiter, DevicePairingRateLimiter, LoginAttempt,
+        LoginRateLimiter, MAX_ENTRIES, RequestRateLimiter, WINDOW, key_digest,
     };
     use std::time::{Duration, Instant};
 
@@ -336,5 +372,24 @@ mod tests {
         assert!(limiter.allow("peer-a").await);
         assert!(!limiter.allow("peer-a").await);
         assert!(limiter.allow("peer-b").await);
+    }
+
+    #[tokio::test]
+    async fn danmaku_search_limiter_allows_two_searches_per_session_per_second() {
+        let limiter = DanmakuSearchRateLimiter::default();
+        assert!(limiter.allow("session-a").await);
+        assert!(limiter.allow("session-a").await);
+        assert!(!limiter.allow("session-a").await);
+        // Another administrator session keeps its own budget.
+        assert!(limiter.allow("session-b").await);
+    }
+
+    #[tokio::test]
+    async fn danmaku_search_limiter_reopens_the_budget_after_the_window() {
+        let limiter = DanmakuSearchRateLimiter::new(1, Duration::from_millis(20));
+        assert!(limiter.allow("session-a").await);
+        assert!(!limiter.allow("session-a").await);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(limiter.allow("session-a").await);
     }
 }

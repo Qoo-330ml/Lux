@@ -1,7 +1,10 @@
 //! Danmaku match job lifecycle: creation, execution, cancellation, retry and
 //! the bounded worker pool that turns a stored source into a sidecar track.
 
-use std::{fmt, path::Path};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::Serialize;
@@ -18,17 +21,17 @@ use super::{
 use crate::{
     application::{
         plugin_protocol::DanmakuMatchStatus,
-        plugins::{DanmakuSettings, PluginService},
+        plugins::{DanmakuSettings, PluginService, PluginServiceError},
     },
     domain::ids::LibraryId,
     storage::{
-        NewDanmakuMatchJob, NewDanmakuTrack, StorageError, StoredDanmakuMatchJob,
+        Database, NewDanmakuMatchJob, NewDanmakuTrack, StorageError, StoredDanmakuMatchJob,
         StoredDanmakuSource,
     },
 };
 
 pub const DEFAULT_DANMAKU_CONCURRENCY: i64 = 2;
-const MAX_CONCURRENCY: i64 = 64;
+pub(super) const MAX_CONCURRENCY: i64 = 64;
 const MAX_EFFECTIVE_CONCURRENCY: usize = 4;
 const WORK_PAGE_SIZE: i64 = 100;
 const DANMAKU_CANCEL_CHECK_INTERVAL: usize = 8;
@@ -215,6 +218,15 @@ impl DanmakuService {
         if !matches!(job.status.as_str(), "FAILED" | "CANCELLED") {
             return Err(DanmakuServiceError::NotRetryable);
         }
+        // A manual job selects one episode; re-running it as a library sweep would silently widen
+        // the request, so the administrator re-issues the match instead.
+        if self
+            .database
+            .danmaku_match_job_has_manual_items(job_id)
+            .await?
+        {
+            return Err(DanmakuServiceError::NotRetryable);
+        }
         let library_id = job
             .library_id
             .parse::<LibraryId>()
@@ -295,6 +307,15 @@ impl DanmakuService {
                     }),
                     _ => None,
                 };
+                // A job item that already carries an episode is an administrator's manual match:
+                // the worker fetches that episode instead of asking the plugin to match a title.
+                let manual = item
+                    .provider_episode_id
+                    .clone()
+                    .map(|episode_id| ManualItemTarget {
+                        provider_anime_id: item.provider_anime_id.clone(),
+                        episode_id,
+                    });
                 let database = self.database.clone();
                 let plugins = plugins.clone();
                 let settings = settings.clone();
@@ -310,10 +331,20 @@ impl DanmakuService {
                             "media source is no longer available",
                         )));
                     };
-                    let result = process_danmaku_source_with_plugin(
-                        source, plugins, settings, overwrite, item.id,
-                    )
-                    .await;
+                    let result = match manual {
+                        Some(manual) => {
+                            process_manual_danmaku_source(
+                                source, plugins, database, manual, overwrite, item.id,
+                            )
+                            .await
+                        }
+                        None => {
+                            process_danmaku_source_with_plugin(
+                                source, plugins, settings, overwrite, item.id,
+                            )
+                            .await
+                        }
+                    };
                     Ok(Some(result))
                 });
                 items_since_cancel_check = items_since_cancel_check.saturating_add(1);
@@ -462,6 +493,26 @@ pub enum DanmakuServiceError {
     JobNotFound,
     NotRetryable,
     WorkerFailed,
+    /// The administrator's search query or page bound is outside the documented limits.
+    InvalidManualSearch,
+    /// The item exists but is not a movie/episode backed by a matchable media source.
+    UnsupportedItemType,
+    /// No enabled, configured danmaku plugin can serve a manual match.
+    ManualMatchUnavailable,
+    /// The enabled danmaku plugin only declares `danmaku.match` (ADR-052 P4/P5).
+    ManualMatchUnsupported,
+    /// The selected provider/anime/episode identifiers are missing or malformed.
+    InvalidManualTarget,
+    /// No `danmaku_tracks` row is registered for the requested media source.
+    SidecarNotFound,
+    /// A track without a provider was written next to the media file by the user.
+    UserSidecarConfirmationRequired,
+    /// The sidecar path leaves the media root or is not a regular file.
+    InvalidSidecarPath,
+    /// Removing the sidecar file failed for an IO reason.
+    SidecarDeleteFailed,
+    /// A plugin call for a manual match failed; the handler maps it without echoing its text.
+    Plugin(PluginServiceError),
     Storage(StorageError),
 }
 
@@ -481,6 +532,28 @@ impl fmt::Display for DanmakuServiceError {
             Self::JobNotFound => formatter.write_str("danmaku match job was not found"),
             Self::NotRetryable => formatter.write_str("danmaku match job cannot be retried"),
             Self::WorkerFailed => formatter.write_str("danmaku match worker failed"),
+            Self::InvalidManualSearch => formatter.write_str("danmaku search request is invalid"),
+            Self::UnsupportedItemType => {
+                formatter.write_str("item is not a matchable local danmaku video")
+            }
+            Self::ManualMatchUnavailable => {
+                formatter.write_str("danmaku manual match is not available")
+            }
+            Self::ManualMatchUnsupported => {
+                formatter.write_str("danmaku plugin does not support manual matching")
+            }
+            Self::InvalidManualTarget => {
+                formatter.write_str("danmaku manual match target is invalid")
+            }
+            Self::SidecarNotFound => formatter.write_str("danmaku sidecar is not registered"),
+            Self::UserSidecarConfirmationRequired => {
+                formatter.write_str("user-provided danmaku sidecar needs explicit confirmation")
+            }
+            Self::InvalidSidecarPath => formatter.write_str("danmaku sidecar path is invalid"),
+            Self::SidecarDeleteFailed => {
+                formatter.write_str("danmaku sidecar could not be removed")
+            }
+            Self::Plugin(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
         }
     }
@@ -550,6 +623,141 @@ impl WorkerResult {
     }
 }
 
+/// Paths and sidecar name a worker needs before it can decide what to do with one source.
+struct PreparedSource {
+    media_path: PathBuf,
+    target_path: PathBuf,
+    relative_sidecar_path: String,
+}
+
+/// Provider identity a worker records on the track row it writes.
+///
+/// The automatic path fills it from the `danmaku.match` answer; a manual match already knows the
+/// administrator's choice, so it fills the same fields from the job item and the track row.
+struct TrackIdentity<'a> {
+    provider: Option<&'a str>,
+    provider_anime_id: Option<&'a str>,
+    provider_episode_id: Option<&'a str>,
+}
+
+/// The episode an administrator selected for one media source (ADR-052 P5).
+struct ManualItemTarget {
+    provider_anime_id: Option<String>,
+    episode_id: String,
+}
+
+async fn prepare_worker_source(
+    source: &StoredDanmakuSource,
+    item_id: &str,
+) -> Result<PreparedSource, WorkerResult> {
+    let invalid_path = || {
+        WorkerResult::failed(
+            item_id.to_owned(),
+            "INVALID_SOURCE_PATH",
+            "media source path is invalid",
+        )
+    };
+    let (media_path, target_path) =
+        safe_danmaku_source_paths(&source.root_path, &source.relative_path)
+            .await
+            .map_err(|_| invalid_path())?;
+    let relative_sidecar_path = danmaku_sidecar_path(Path::new(&source.relative_path))
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|_| invalid_path())?;
+    Ok(PreparedSource {
+        media_path,
+        target_path,
+        relative_sidecar_path,
+    })
+}
+
+/// Applies the "an existing sidecar wins unless the caller asked to overwrite" rule.
+///
+/// `None` means the worker may fetch and write; `Some(result)` is the final answer for the item, so
+/// both the automatic and the manual path share the skip and invalid-sidecar behaviour.
+async fn existing_sidecar_result(
+    prepared: &PreparedSource,
+    source: &StoredDanmakuSource,
+    identity: &TrackIdentity<'_>,
+    overwrite: bool,
+    item_id: &str,
+) -> Option<WorkerResult> {
+    let metadata = fs::symlink_metadata(&prepared.target_path).await.ok()?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Some(WorkerResult::failed(
+            item_id.to_owned(),
+            "INVALID_SIDECAR",
+            "danmaku sidecar is not a regular file",
+        ));
+    }
+    match read_danmaku_file(&prepared.target_path).await {
+        Ok(bytes) if !overwrite && validate_danmaku_xml(&bytes).is_ok() => Some(WorkerResult {
+            item_id: item_id.to_owned(),
+            status: "SKIPPED",
+            success: false,
+            skipped: true,
+            provider_anime_id: identity.provider_anime_id.map(str::to_owned),
+            provider_episode_id: identity.provider_episode_id.map(str::to_owned),
+            error_code: None,
+            error_message: None,
+            track: Some(TrackWrite {
+                id: Uuid::now_v7().to_string(),
+                media_source_id: source.source_id.clone(),
+                relative_path: prepared.relative_sidecar_path.clone(),
+                provider: identity.provider.map(str::to_owned),
+                provider_anime_id: identity.provider_anime_id.map(str::to_owned),
+                provider_episode_id: identity.provider_episode_id.map(str::to_owned),
+                fingerprint: fingerprint(&bytes),
+            }),
+        }),
+        Ok(_) if !overwrite => Some(WorkerResult::failed(
+            item_id.to_owned(),
+            "INVALID_SIDECAR",
+            "existing danmaku sidecar is invalid",
+        )),
+        Ok(_) | Err(_) => None,
+    }
+}
+
+async fn write_worker_sidecar(
+    source: &StoredDanmakuSource,
+    prepared: &PreparedSource,
+    identity: &TrackIdentity<'_>,
+    xml: &[u8],
+    overwrite: bool,
+    item_id: String,
+) -> WorkerResult {
+    if atomic_write_danmaku_xml(&prepared.target_path, xml, overwrite)
+        .await
+        .is_err()
+    {
+        return WorkerResult::failed(
+            item_id,
+            "WRITE_FAILED",
+            "danmaku sidecar could not be written",
+        );
+    }
+    WorkerResult {
+        item_id,
+        status: "WRITTEN",
+        success: true,
+        skipped: false,
+        provider_anime_id: identity.provider_anime_id.map(str::to_owned),
+        provider_episode_id: identity.provider_episode_id.map(str::to_owned),
+        error_code: None,
+        error_message: None,
+        track: Some(TrackWrite {
+            id: Uuid::now_v7().to_string(),
+            media_source_id: source.source_id.clone(),
+            relative_path: prepared.relative_sidecar_path.clone(),
+            provider: identity.provider.map(str::to_owned),
+            provider_anime_id: identity.provider_anime_id.map(str::to_owned),
+            provider_episode_id: identity.provider_episode_id.map(str::to_owned),
+            fingerprint: fingerprint(xml),
+        }),
+    }
+}
+
 async fn process_danmaku_source_with_plugin(
     source: StoredDanmakuSource,
     plugins: PluginService,
@@ -557,67 +765,25 @@ async fn process_danmaku_source_with_plugin(
     overwrite: bool,
     item_id: String,
 ) -> WorkerResult {
-    let (media_path, target_path) = match safe_danmaku_source_paths(&source).await {
-        Ok(paths) => paths,
-        Err(_) => {
-            return WorkerResult::failed(
-                item_id,
-                "INVALID_SOURCE_PATH",
-                "media source path is invalid",
-            );
-        }
+    let identity = TrackIdentity {
+        provider: None,
+        provider_anime_id: None,
+        provider_episode_id: None,
     };
-    let relative_path = match danmaku_sidecar_path(Path::new(&source.relative_path)) {
-        Ok(path) => path.to_string_lossy().into_owned(),
-        Err(_) => {
-            return WorkerResult::failed(
-                item_id,
-                "INVALID_SOURCE_PATH",
-                "media source path is invalid",
-            );
-        }
+    let prepared = match prepare_worker_source(&source, &item_id).await {
+        Ok(prepared) => prepared,
+        Err(result) => return result,
     };
-    if let Ok(metadata) = fs::symlink_metadata(&target_path).await {
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-            return WorkerResult::failed(
-                item_id,
-                "INVALID_SIDECAR",
-                "danmaku sidecar is not a regular file",
-            );
-        }
-        match read_danmaku_file(&target_path).await {
-            Ok(bytes) if !overwrite && validate_danmaku_xml(&bytes).is_ok() => {
-                return WorkerResult {
-                    item_id,
-                    status: "SKIPPED",
-                    success: false,
-                    skipped: true,
-                    provider_anime_id: None,
-                    provider_episode_id: None,
-                    error_code: None,
-                    error_message: None,
-                    track: Some(TrackWrite {
-                        id: Uuid::now_v7().to_string(),
-                        media_source_id: source.source_id,
-                        relative_path,
-                        provider: None,
-                        provider_anime_id: None,
-                        provider_episode_id: None,
-                        fingerprint: fingerprint(&bytes),
-                    }),
-                };
-            }
-            Ok(_) if !overwrite => {
-                return WorkerResult::failed(
-                    item_id,
-                    "INVALID_SIDECAR",
-                    "existing danmaku sidecar is invalid",
-                );
-            }
-            Ok(_) | Err(_) => {}
-        }
+    if let Some(result) =
+        existing_sidecar_result(&prepared, &source, &identity, overwrite, &item_id).await
+    {
+        return result;
     }
-    let Some(file_name) = media_path.file_name().and_then(|name| name.to_str()) else {
+    let Some(file_name) = prepared
+        .media_path
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
         return WorkerResult::failed(item_id, "INVALID_SOURCE_PATH", "media filename is invalid");
     };
     let candidates = match_file_name_candidates(file_name, &source, &settings);
@@ -640,7 +806,7 @@ async fn process_danmaku_source_with_plugin(
     if matched.status == DanmakuMatchStatus::NoMatch {
         return WorkerResult::failed(item_id, "NO_MATCH", "danmaku plugin returned no match");
     }
-    let Some(episode_id) = matched.episode_id.clone() else {
+    let Some(episode_id) = matched.episode_id.as_deref() else {
         return WorkerResult::failed(
             item_id,
             "PLUGIN_INVALID_RESPONSE",
@@ -671,36 +837,70 @@ async fn process_danmaku_source_with_plugin(
             "danmaku plugin XML is invalid",
         );
     }
-    if atomic_write_danmaku_xml(&target_path, &xml, overwrite)
+    let identity = TrackIdentity {
+        provider: matched.provider.as_deref(),
+        provider_anime_id: matched.anime_id.as_deref(),
+        provider_episode_id: Some(episode_id),
+    };
+    write_worker_sidecar(&source, &prepared, &identity, &xml, overwrite, item_id).await
+}
+
+/// Runs one administrator-selected episode: no `danmaku.match`, only `danmaku.fetch`.
+///
+/// The chosen provider travels in the track row the job creation wrote, so a queued job keeps its
+/// target across restarts without a new column. The XML still goes through the same host decode,
+/// `validate_danmaku_xml` and atomic write as the automatic path.
+async fn process_manual_danmaku_source(
+    source: StoredDanmakuSource,
+    plugins: PluginService,
+    database: Database,
+    manual: ManualItemTarget,
+    overwrite: bool,
+    item_id: String,
+) -> WorkerResult {
+    let provider = database
+        .find_danmaku_track_provider(&source.source_id)
         .await
-        .is_err()
+        .ok()
+        .flatten();
+    let identity = TrackIdentity {
+        provider: provider.as_deref(),
+        provider_anime_id: manual.provider_anime_id.as_deref(),
+        provider_episode_id: Some(manual.episode_id.as_str()),
+    };
+    let prepared = match prepare_worker_source(&source, &item_id).await {
+        Ok(prepared) => prepared,
+        Err(result) => return result,
+    };
+    if let Some(result) =
+        existing_sidecar_result(&prepared, &source, &identity, overwrite, &item_id).await
     {
-        return WorkerResult::failed(
-            item_id,
-            "WRITE_FAILED",
-            "danmaku sidecar could not be written",
-        );
+        return result;
     }
-    let fingerprint = fingerprint(&xml);
-    WorkerResult {
-        item_id,
-        status: "WRITTEN",
-        success: true,
-        skipped: false,
-        provider_anime_id: matched.anime_id.clone(),
-        provider_episode_id: Some(episode_id.clone()),
-        error_code: None,
-        error_message: None,
-        track: Some(TrackWrite {
-            id: Uuid::now_v7().to_string(),
-            media_source_id: source.source_id,
-            relative_path,
-            provider: matched.provider,
-            provider_anime_id: matched.anime_id,
-            provider_episode_id: Some(episode_id),
-            fingerprint,
-        }),
-    }
+    let fetched = match plugins
+        .fetch_danmaku(identity.provider, &manual.episode_id)
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return WorkerResult::failed(
+                item_id,
+                danmaku_plugin_error_code(&error),
+                "danmaku plugin request failed",
+            );
+        }
+    };
+    let xml = match fetched.decode_xml() {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return WorkerResult::failed(
+                item_id,
+                "PLUGIN_INVALID_RESPONSE",
+                "danmaku plugin XML is invalid",
+            );
+        }
+    };
+    write_worker_sidecar(&source, &prepared, &identity, &xml, overwrite, item_id).await
 }
 
 #[cfg(test)]

@@ -531,6 +531,8 @@ impl From<DanmakuSourceRow> for StoredDanmakuSource {
 struct DanmakuMatchItemRow {
     id: String,
     media_source_id: String,
+    provider_anime_id: Option<String>,
+    provider_episode_id: Option<String>,
     root_path: Option<String>,
     relative_path: Option<String>,
     item_type: Option<String>,
@@ -547,6 +549,8 @@ impl From<DanmakuMatchItemRow> for StoredDanmakuMatchItem {
         Self {
             id: row.id,
             media_source_id: row.media_source_id,
+            provider_anime_id: row.provider_anime_id,
+            provider_episode_id: row.provider_episode_id,
             root_path: row.root_path,
             relative_path: row.relative_path,
             item_type: row.item_type,
@@ -556,6 +560,27 @@ impl From<DanmakuMatchItemRow> for StoredDanmakuMatchItem {
             original_title: row.original_title,
             series_title: row.series_title,
             series_original_title: row.series_original_title,
+        }
+    }
+}
+
+/// Row of `find_tracked_danmaku_source_for_item`: a registered track plus the media-root paths the
+/// delete endpoint canonicalises before removing the file.
+#[derive(Debug, sqlx::FromRow)]
+struct TrackedDanmakuSourceRow {
+    source_id: String,
+    root_path: String,
+    relative_path: String,
+    provider: Option<String>,
+}
+
+impl From<TrackedDanmakuSourceRow> for StoredTrackedDanmakuSource {
+    fn from(row: TrackedDanmakuSourceRow) -> Self {
+        Self {
+            source_id: row.source_id,
+            root_path: row.root_path,
+            relative_path: row.relative_path,
+            provider: row.provider,
         }
     }
 }
@@ -4962,6 +4987,161 @@ impl Database {
         transaction.commit().await.map_err(self.sqlx_err())
     }
 
+    /// Creates the single-item job of an administrator's manual danmaku match (ADR-052 P5).
+    ///
+    /// One transaction writes the job (always `total_count = 1`), its one prefilled item and the
+    /// track row that announces the chosen provider to the worker. The provider cannot travel in
+    /// the job item columns — they carry the provider's anime/episode identifiers — so the existing
+    /// `danmaku_tracks.provider` column is the durable carrier; a row that already exists keeps its
+    /// status and fingerprint, because a refresh must not hide a sidecar that is still valid.
+    pub(crate) async fn create_danmaku_manual_match_job(
+        &self,
+        job: NewDanmakuMatchJob<'_>,
+        item: NewDanmakuManualMatchItem<'_>,
+    ) -> Result<(), StorageError> {
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
+        self.query(
+            "INSERT INTO danmaku_match_jobs (
+                id, library_id, status, overwrite, concurrency, total_count
+             ) VALUES (?, ?, 'PENDING', ?, ?, 1)",
+        )
+        .bind(job.id)
+        .bind(job.library_id)
+        .bind(database_flag(job.overwrite))
+        .bind(job.concurrency)
+        .execute(&mut *transaction)
+        .await
+        .map_err(self.sqlx_err())?;
+        self.query(
+            "INSERT INTO danmaku_match_job_items (
+                id, job_id, media_source_id, status, provider_anime_id, provider_episode_id
+             ) VALUES (?, ?, ?, 'PENDING', ?, ?)",
+        )
+        .bind(item.id)
+        .bind(job.id)
+        .bind(item.media_source_id)
+        .bind(item.provider_anime_id)
+        .bind(item.provider_episode_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(self.sqlx_err())?;
+        self.query(
+            "INSERT INTO danmaku_tracks (
+                id, media_source_id, relative_path, format, provider,
+                provider_anime_id, provider_episode_id, status, last_checked_at
+             ) VALUES (?, ?, ?, 'XML', ?, ?, ?, 'MISSING', unixepoch())
+             ON CONFLICT(media_source_id) DO UPDATE SET
+                provider = excluded.provider,
+                provider_anime_id = excluded.provider_anime_id,
+                provider_episode_id = excluded.provider_episode_id,
+                updated_at = unixepoch()",
+        )
+        .bind(item.track_id)
+        .bind(item.media_source_id)
+        .bind(item.relative_sidecar_path)
+        .bind(item.provider)
+        .bind(item.provider_anime_id)
+        .bind(item.provider_episode_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())
+    }
+
+    /// Reads the provider label a media source's danmaku track announces.
+    ///
+    /// The manual-match worker reads it back to pass the administrator's choice to `danmaku.fetch`
+    /// and to keep it on the row it writes; `danmaku_tracks.provider` is the only existing column
+    /// that can carry an opaque provider label across a restart (ADR-052 P5, no new columns).
+    pub(crate) async fn find_danmaku_track_provider(
+        &self,
+        media_source_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        self.query_scalar("SELECT provider FROM danmaku_tracks WHERE media_source_id = ?")
+            .bind(media_source_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(self.sqlx_err())
+    }
+
+    /// Deletes the `danmaku_tracks` row of one media source; answers whether a row was removed.
+    pub(crate) async fn delete_danmaku_track(
+        &self,
+        media_source_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query("DELETE FROM danmaku_tracks WHERE media_source_id = ?")
+            .bind(media_source_id)
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected() > 0)
+            .map_err(self.sqlx_err())
+    }
+
+    /// Finds the registered track of an item's media source with the paths a delete needs.
+    pub(crate) async fn find_tracked_danmaku_source_for_item(
+        &self,
+        item_id: &str,
+        source_id: Option<&str>,
+    ) -> Result<Option<StoredTrackedDanmakuSource>, StorageError> {
+        let row = match source_id {
+            Some(source_id) => {
+                self.query_as::<TrackedDanmakuSourceRow>(
+                    "SELECT ms.id AS source_id, lr.canonical_path AS root_path,
+                            fe.relative_path, dt.provider
+                     FROM media_sources ms
+                     JOIN media_items mi ON mi.id = ms.item_id
+                     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                     JOIN library_roots lr ON lr.id = fe.library_root_id
+                     JOIN danmaku_tracks dt ON dt.media_source_id = ms.id
+                     WHERE mi.id = ? AND ms.id = ?
+                       AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
+                     LIMIT 1",
+                )
+                .bind(item_id)
+                .bind(source_id)
+                .fetch_optional(&self.pool)
+                .await
+            }
+            None => {
+                self.query_as::<TrackedDanmakuSourceRow>(
+                    "SELECT ms.id AS source_id, lr.canonical_path AS root_path,
+                            fe.relative_path, dt.provider
+                     FROM media_sources ms
+                     JOIN media_items mi ON mi.id = ms.item_id
+                     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                     JOIN library_roots lr ON lr.id = fe.library_root_id
+                     JOIN danmaku_tracks dt ON dt.media_source_id = ms.id
+                     WHERE mi.id = ? AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
+                     ORDER BY ms.is_default DESC, fe.relative_path
+                     LIMIT 1",
+                )
+                .bind(item_id)
+                .fetch_optional(&self.pool)
+                .await
+            }
+        }
+        .map_err(self.sqlx_err())?;
+        Ok(row.map(StoredTrackedDanmakuSource::from))
+    }
+
+    /// Whether a job only queues administrator-selected episodes instead of a library sweep.
+    pub(crate) async fn danmaku_match_job_has_manual_items(
+        &self,
+        job_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(
+                SELECT 1 FROM danmaku_match_job_items
+                WHERE job_id = ? AND provider_episode_id IS NOT NULL
+            ) THEN 1 ELSE 0 END",
+        )
+        .bind(job_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(self.sqlx_err())
+    }
+
     pub(crate) async fn has_active_danmaku_match_jobs(
         &self,
         library_id: &str,
@@ -5108,6 +5288,7 @@ impl Database {
     ) -> Result<Vec<StoredDanmakuMatchItem>, StorageError> {
         self.query_as::<DanmakuMatchItemRow>(
             "SELECT ji.id, ji.media_source_id,
+                    ji.provider_anime_id, ji.provider_episode_id,
                     mi.item_type, mi.season_number, mi.episode_number,
                     mi.title, mi.original_title,
                     series.title AS series_title,

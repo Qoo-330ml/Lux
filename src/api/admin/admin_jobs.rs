@@ -1204,6 +1204,110 @@ pub(crate) fn danmaku_service_error(headers: &HeaderMap, error: DanmakuServiceEr
             "弹幕匹配服务暂时不可用",
         )
         .into_response(),
+        DanmakuServiceError::InvalidManualSearch | DanmakuServiceError::InvalidManualTarget => {
+            api_error(
+                headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "弹幕搜索或匹配参数无效",
+            )
+            .into_response()
+        }
+        DanmakuServiceError::UnsupportedItemType => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "该条目不是可匹配弹幕的本地视频",
+        )
+        .into_response(),
+        // An enabled danmaku plugin that never declared `danmaku.search`/`danmaku.fetch` keeps
+        // automatic matching only; the administrator sees a documented conflict, never a `500`.
+        DanmakuServiceError::ManualMatchUnsupported => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::PluginUnavailable,
+            "弹幕插件不支持手动匹配",
+        )
+        .into_response(),
+        DanmakuServiceError::ManualMatchUnavailable => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::PluginUnavailable,
+            "弹幕插件未启用或配置未完成",
+        )
+        .into_response(),
+        DanmakuServiceError::SidecarNotFound => api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "当前媒体源没有已登记的弹幕旁车",
+        )
+        .into_response(),
+        DanmakuServiceError::UserSidecarConfirmationRequired => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "该弹幕旁车不是 Lux 写入的，需要 confirmUserSidecar=true 才会删除",
+        )
+        .into_response(),
+        DanmakuServiceError::InvalidSidecarPath => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "弹幕旁车路径不在媒体根内或不是普通文件",
+        )
+        .into_response(),
+        DanmakuServiceError::SidecarDeleteFailed => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "弹幕旁车删除失败",
+        )
+        .into_response(),
+        // Plugin text is host-owned (variant names and capability labels only); upstream addresses,
+        // tokens and provider responses never reach the response body or the log line.
+        DanmakuServiceError::Plugin(error) => danmaku_plugin_error(headers, error),
+    }
+}
+
+fn danmaku_plugin_error(headers: &HeaderMap, error: PluginServiceError) -> Response {
+    match error {
+        PluginServiceError::Unsupported(_) => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::PluginUnavailable,
+            "弹幕插件不支持手动匹配",
+        )
+        .into_response(),
+        PluginServiceError::UnknownPlugin(_)
+        | PluginServiceError::Unavailable(_)
+        | PluginServiceError::InvalidConfig => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::PluginUnavailable,
+            "弹幕插件未启用或配置未完成",
+        )
+        .into_response(),
+        PluginServiceError::InvalidRequest(_) => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "弹幕搜索参数无效",
+        )
+        .into_response(),
+        PluginServiceError::InvalidResponse
+        | PluginServiceError::Runtime(_)
+        | PluginServiceError::Store(_)
+        | PluginServiceError::NoUpdate
+        | PluginServiceError::ConfigIo(_)
+        | PluginServiceError::ImageAsset(_)
+        | PluginServiceError::Storage(_) => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::PluginUnavailable,
+            "弹幕插件暂时不可用",
+        )
+        .into_response(),
     }
 }
 

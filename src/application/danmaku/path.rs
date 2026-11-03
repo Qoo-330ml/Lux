@@ -12,8 +12,6 @@ use std::{
 
 use tokio::fs;
 
-use crate::storage::StoredDanmakuSource;
-
 pub fn danmaku_sidecar_path(video_path: &Path) -> Result<PathBuf, DanmakuPathError> {
     if video_path.is_absolute()
         || video_path
@@ -62,9 +60,10 @@ impl std::error::Error for DanmakuPathError {}
 /// Returns `Err(())` for any path that escapes the library root; callers map
 /// that to a protocol-level "not available" answer.
 pub(super) async fn safe_danmaku_source_paths(
-    source: &StoredDanmakuSource,
+    root_path: &str,
+    relative_path: &str,
 ) -> Result<(PathBuf, PathBuf), ()> {
-    let relative = Path::new(&source.relative_path);
+    let relative = Path::new(relative_path);
     if relative.is_absolute()
         || relative
             .components()
@@ -72,7 +71,7 @@ pub(super) async fn safe_danmaku_source_paths(
     {
         return Err(());
     }
-    let root = fs::canonicalize(&source.root_path).await.map_err(|_| ())?;
+    let root = fs::canonicalize(root_path).await.map_err(|_| ())?;
     let media_path = fs::canonicalize(root.join(relative))
         .await
         .map_err(|_| ())?;

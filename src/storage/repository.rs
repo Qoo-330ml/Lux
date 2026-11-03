@@ -5647,6 +5647,31 @@ pub(crate) struct NewDanmakuTrack<'a> {
     pub(crate) error_code: Option<&'a str>,
 }
 
+/// A tracked sidecar plus the media-root paths a delete needs (ADR-052 P5).
+///
+/// Unlike [`StoredDanmakuSource`] this joins `danmaku_tracks` without requiring a `READY` row, so an
+/// administrator can also remove a registration whose file already disappeared.
+#[derive(Clone, Debug)]
+pub(crate) struct StoredTrackedDanmakuSource {
+    pub(crate) source_id: String,
+    pub(crate) root_path: String,
+    pub(crate) relative_path: String,
+    pub(crate) provider: Option<String>,
+}
+
+/// The single job item of an administrator-initiated manual match.
+pub(crate) struct NewDanmakuManualMatchItem<'a> {
+    pub(crate) id: &'a str,
+    /// Identifier of the track row this job announces; never the job item id.
+    pub(crate) track_id: &'a str,
+    pub(crate) media_source_id: &'a str,
+    pub(crate) provider_anime_id: Option<&'a str>,
+    pub(crate) provider_episode_id: &'a str,
+    /// Sidecar path the track row announces before the worker writes the file.
+    pub(crate) relative_sidecar_path: &'a str,
+    pub(crate) provider: Option<&'a str>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct StoredDanmakuMatchJob {
     pub(crate) id: String,
@@ -5670,6 +5695,10 @@ pub(crate) struct StoredDanmakuMatchJob {
 pub(crate) struct StoredDanmakuMatchItem {
     pub(crate) id: String,
     pub(crate) media_source_id: String,
+    /// Prefilled by an administrator's manual match; a set episode id means the worker must fetch
+    /// the episode instead of running `danmaku.match` (ADR-052 P5).
+    pub(crate) provider_anime_id: Option<String>,
+    pub(crate) provider_episode_id: Option<String>,
     pub(crate) root_path: Option<String>,
     pub(crate) relative_path: Option<String>,
     pub(crate) item_type: Option<String>,

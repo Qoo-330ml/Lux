@@ -10,14 +10,18 @@
 //!   plugin error-code mapping.
 //! - `job`: match job lifecycle, cancellation, retry, the worker pool that calls
 //!   the plugin and writes the sidecar, and the per-item worker.
+//! - `manual`: the administrator-facing manual match (candidate search, the
+//!   single-item job and sidecar removal, ADR-052 P5).
 
 mod job;
+mod manual;
 mod matching;
 mod path;
 mod sidecar;
 mod xml;
 
 pub use job::{DEFAULT_DANMAKU_CONCURRENCY, DanmakuMatchJob, DanmakuServiceError};
+pub use manual::{DEFAULT_MANUAL_SEARCH_LIMIT, ManualMatchTarget};
 pub use matching::{ProviderBaseUrl, ProviderUrlError, validate_provider_base_url};
 pub use path::{DanmakuPathError, danmaku_sidecar_path};
 pub use sidecar::{DanmakuSidecarScope, DanmakuWriteError, atomic_write_danmaku_xml};
