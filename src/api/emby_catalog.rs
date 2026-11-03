@@ -5887,11 +5887,44 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        EmbyItemsQuery, catalog_filter_from_emby, emby_media_source_json_with_resolver,
-        emby_media_stream_json, emby_media_type, emby_page_params, emby_playback_container_name,
+        EmbyItemsQuery, catalog_filter_from_emby, catalog_filter_from_values,
+        emby_media_source_json_with_resolver, emby_media_stream_json, emby_media_type,
+        emby_page_params, emby_playback_container_name,
     };
 
-    use crate::application::catalog::{CatalogSource, CatalogStream};
+    use crate::application::catalog::{CatalogSort, CatalogSource, CatalogStream};
+
+    /// Yamby's home screen asks for a library's newest items as
+    /// `Items/Latest?EnableImageTypes=…&Fields=…&GroupItems=true&MediaTypes=Video&Limit=16&ParentId=…`
+    /// (Reqable capture, Yamby 2.0.5.5). `emby_user_latest` fills in `Movie,Series` for a library
+    /// scope and forces the `DateCreated` descending order, so this mapping is the whole request as
+    /// far as the catalog query is concerned.
+    #[test]
+    fn latest_request_maps_to_movies_and_series_sorted_by_date_created() {
+        let filter = catalog_filter_from_values(
+            Some("Movie,Series"),
+            None,
+            None,
+            None,
+            Some("DateCreated"),
+            Some("Descending"),
+            false,
+        );
+
+        assert_eq!(filter.item_types, ["MOVIE", "SERIES"]);
+        assert_eq!(filter.sort_by, CatalogSort::DateCreated);
+        assert!(filter.descending);
+        assert!(
+            filter.excluded_item_types.is_empty()
+                && filter.item_ids.is_none()
+                && filter.years.is_empty()
+                && filter.genre_keys.is_empty()
+                && filter.studio_keys.is_empty()
+                && filter.is_played.is_none()
+                && filter.is_favorite.is_none(),
+            "the Latest request carries no further restriction the read-model sort has to reject"
+        );
+    }
 
     fn catalog_source(quality_label: Option<&str>, streams: Vec<CatalogStream>) -> CatalogSource {
         CatalogSource {
