@@ -19296,15 +19296,33 @@ setup 启动的首轮 `RECONCILE_LIBRARY` 扫描，因此启动流程新增“�
 - 每条行为变化先写失败测试再实现；既有 `emby_media_stream_title_includes_available_audio_and_subtitle_details`
   等断言若与新规则冲突，必须在提交说明里逐条解释，而不是静默改测试。
 
-验收：
-- [ ] `cargo test --locked --lib emby_catalog::` 覆盖：视频/音频/字幕 DisplayTitle 新旧数据、无重复叠加、
-  `Title` 回退与省略、VideoRange 规范化、中文及新增语言别名。
-- [ ] 同一流 JSON 对不含新字段的旧 `CatalogStream`（`title`=旧 DisplayTitle、无详情）输出合理且不 panic。
-- [ ] `cargo test --locked --test <emby 相关组> <模块>::` 的相邻 PlaybackInfo / Items 响应用例无回归（按
-  `docs/TEST-TARGETS.md` 选择）。
-- [ ] `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
-  `scripts/check-migration-parity.py`、`scripts/check-backend-branches.py` 通过；完成门按 CLAUDE.md。
-- [ ] 在 `docs/COMPATIBILITY.md` 记录 Hills 对这些字段的读取行为（来源：逆向报告，确认/推断分级）。
+验收（2026-11-03，本机 `uname -m` = `arm64`）：
+- [x] `cargo test --locked --lib emby_catalog::` 33/33：视频/音频/字幕 DisplayTitle 新旧数据、无重复叠加、
+  `Title` 回退与省略、VideoRange 规范化、中文及新增语言别名、空白详情字符串省略。
+- [x] 不含新字段的旧 `CatalogStream`（`title`=旧 DisplayTitle、无详情）输出合理且不 panic
+  （`legacy_rows_without_details_still_render_useful_titles`）。
+- [x] `cargo test --locked --test emby` 39/39（PlaybackInfo / Items 相邻用例无回归）；
+  `cargo test --locked --test library series_api::` 1/1。`series_api` 里原先断言视频 `DisplayTitle` 为
+  `2160p` 的三处（VidHub 与 Filmly 的剧集 `MediaSources` 各一处、`Fields=MediaStreams` 投影一处）
+  按新规则改为 `2160p H264`：夹具的视频流是 H264 + 2160p 标签，规格要求视频 DisplayTitle 带编码，
+  属预期行为变化，不是回归。
+- [x] `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+  `scripts/check-migration-parity.py`、`scripts/check-backend-branches.py` 通过（无迁移、无新增
+  `DatabaseBackend::` 分支）。
+- [x] `docs/COMPATIBILITY.md` 记录 Hills 对这些字段的读取行为（确认/推断分级）。
+- 完成门 `cargo test --locked --all-targets --no-fail-fast -- --test-threads=4`（21 个 target，
+  load average 13–30）：通过 2775，失败 11。逐条复核：`series_api` 一条见上，已修复并复跑通过；
+  `media_info_config_api::media_info_plugin_config_api_drives_a_background_run`、
+  `web_playback::web_playback_bootstrap_accepts_the_max_height`、
+  `application::probe::tests::playback_probe_runs_once_for_a_pending_local_source`、
+  `application::watch::tests::realtime_incremental_scan_probes_the_source_it_indexes` 单独复跑通过
+  （高负载抖动）；其余 6 条单独复跑仍失败：`admin_settings::transcoding_settings_are_admin_only_validated_and_persisted`、
+  `remote::forwarded_headers_are_only_honoured_for_trusted_proxies`、
+  `web_playback::broken_hardware_encoder_falls_back_to_software_transcoding`、
+  `application::scanner::tests::local_metadata_worker_persists_capability_missing` 与两个 `web_static::*`
+  （本机缺 `web/dist`）。这 6 条与 LUX-877 验收记录的基线失败清单完全一致（基线提交 `02830e0d`
+  的 `src` 上同样失败），本任务未触及相关代码；本次没有在基线上重新复现它们。
+- [ ] 未验证：升级后 Hills 在真机上的实际显示；本地为 ARM64 宿主，不外推到 NAS/x86_64。
 
 依赖：无。LUX-879 依赖本任务（同一文件，串行）。
 

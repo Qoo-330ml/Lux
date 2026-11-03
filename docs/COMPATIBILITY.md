@@ -1,5 +1,37 @@
 # Lux 客户端兼容性矩阵
 
+## LUX-878 Emby MediaStream 显示字段与 Hills 读取行为（2026-11-03）
+
+来源：对 Hills 1.8.0（`com.mountains.hills`，Flutter release AOT，已混淆）的只读静态逆向分析，以及在
+Android 真机上对 Lux 详情页的截图核对。以下标注“确认”的结论有反汇编/交叉引用证据，“推断”的没有直接验证。
+
+- 确认：音频/字幕选择器条目文字取 `DisplayTitle → Title → DisplayLanguage → Language → "und"`；Hills
+  不自己拼“语言 + 编码 + 声道”。详情页“版本”行 = 视频流 `DisplayTitle` + ` / ` + `MediaSource.Size` +
+  ` / ` + `MediaSource.Bitrate`。因此客户端显示的信息量取决于服务端输出的 `DisplayTitle`/`Title`/`Language`。
+- 确认：“媒体信息”面板显示 17 项：Type、DisplayTitle、Title、DisplayLanguage、Language、Codec、
+  VideoRange、Profile、BitRate、BitDepth、PixelFormat、Width、Height、AspectRatio、AverageFrameRate、
+  IsDefault、IsExternal。`Channels`、`ChannelLayout`、`SampleRate`、`Level`、`RefFrames`、`TimeBase`、
+  `NalLengthSize` 被解析但不显示；`ColorSpace`、`VideoRangeType`、`IsHearingImpaired`、`CodecTag`、
+  `Comment`、`IsAVC` 完全不读取。
+- 确认：Hills 不读取 `DefaultAudioStreamIndex`/`DefaultSubtitleStreamIndex`，默认轨道按它自己的
+  偏好语言逻辑选择。
+- 推断：外挂字幕可能依赖 `DeliveryUrl`/`DeliveryMethod`/`IsExternalUrl`/`SubtitleLocationType`/流级
+  `Path`（Hills 解析这些键，且二进制里没有自己的字幕端点字面量）；本任务不输出它们，由 LUX-879 先确认。
+
+Lux 侧改动（`src/api/emby_catalog.rs`、`src/application/probe.rs`，无迁移、无新路由、不改 `/api/v1`）：
+
+- `DisplayTitle` 更有描述性：视频 `质量 编码 动态范围 位深`（不重复质量前缀），音频 `语言 编码 声道`，
+  字幕 `语言 (编码)` 并带 forced/SDH 标记；旧数据里已含完整描述的旧标题保持原样，不再叠加默认标记或
+  `Unknown`/`und` 占位。
+- 新增流级 `Title`：优先使用探测保存的原始轨道名；旧数据回退为旧 `DisplayTitle` 基础部分；缺失时省略键。
+- `VideoRange` 规范化为 `SDR`/`HDR10`/`HDR10+`/`HLG`/`Dolby Vision`，无法识别的值保持原值。
+- 语言：`chs`/`cht`/`zh-cn`/`zh-tw`/`zh-hk`/`zh-hans`/`zh-hant`/`cmn`/`yue` 输出 `Language: chi`，
+  `DisplayLanguage` 区分简体、繁体与粤语；补充 `fin`、`swe`、`dan`、`gre`/`ell`、`heb`、`hun`、
+  `cze`/`ces`、`rum`/`ron`、`ukr`、`nor`/`nob`、`hrv`、`may`/`msa`、`fil`、`slo`/`slk`。
+- 空白字符串详情字段不再输出。
+
+未验证：升级后 Hills 的实际显示未在真机复测；本地为 ARM64 宿主，不外推到 NAS/x86_64。
+
 ## Emby 筛选辅助端点：Genres、Studios、Years（2026-11-02）
 
 - 新增 `GET /Genres`、`/Studios`、`/Years`（同样挂在 `/emby` 前缀下，路径大小写不敏感）。需要 Emby token，按用户的媒体库权限和内容限制收窄；支持 `UserId`、`ParentId`（仅媒体库 ID，未授权或未知返回 404）、`IncludeItemTypes`、`StartIndex`、`Limit`（上限与 `/Persons` 相同，超限 400）。返回 `{ Items, TotalRecordCount, StartIndex }`，每项含 `Name`、不透明的 `Id`、`Type`（`Genre`/`Studio`/`Year`）和 `ChildCount`（可见条目数）；`Genres`、`Studios` 按名称排序，`Years` 由新到旧。
