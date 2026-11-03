@@ -4926,6 +4926,9 @@ pub(super) fn emby_media_stream_json(stream: &crate::application::catalog::Catal
         "IsDefault": stream.is_default,
         "IsForced": stream.is_forced,
     });
+    if let Some(display_language) = emby_stream_display_language(stream) {
+        value["DisplayLanguage"] = Value::String(display_language);
+    }
     if let Value::Object(object) = &mut value {
         for (key, detail) in &stream.details {
             let Some(detail) = normalize_emby_media_stream_detail(key, detail) else {
@@ -4980,14 +4983,7 @@ fn emby_media_stream_display_title(stream: &crate::application::catalog::Catalog
         return title.unwrap_or(stream_type).to_owned();
     }
 
-    let language = stream
-        .details
-        .get("DisplayLanguage")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .or_else(|| stream.language.as_deref().and_then(emby_language_name));
+    let language = emby_stream_display_language(stream);
     let codec = stream
         .codec
         .as_deref()
@@ -5053,10 +5049,17 @@ fn emby_media_stream_display_title(stream: &crate::application::catalog::Catalog
     }
 }
 
-/// ISO 639-2/B code, ISO 639-1 alias and English name for the languages Lux maps explicitly.
+/// ISO 639-2 code, ISO 639-1/CJK aliases and English name for the languages Lux maps explicitly.
 const EMBY_LANGUAGE_TABLE: &[(&str, &[&str], &str)] = &[
     ("eng", &["en"], "English"),
-    ("chi", &["zh", "zho"], "Chinese"),
+    (
+        "chi",
+        &[
+            "zh", "zho", "chs", "cht", "zh-cn", "zh-tw", "zh-hk", "zh-hans", "zh-hant", "cmn",
+            "yue",
+        ],
+        "Chinese",
+    ),
     ("jpn", &["ja"], "Japanese"),
     ("kor", &["ko"], "Korean"),
     ("ara", &["ar"], "Arabic"),
@@ -5073,6 +5076,29 @@ const EMBY_LANGUAGE_TABLE: &[(&str, &[&str], &str)] = &[
     ("tha", &["th"], "Thai"),
     ("tur", &["tr"], "Turkish"),
     ("vie", &["vi"], "Vietnamese"),
+    ("fin", &["fi"], "Finnish"),
+    ("swe", &["sv"], "Swedish"),
+    ("dan", &["da"], "Danish"),
+    ("ell", &["el", "gre"], "Greek"),
+    ("heb", &["he"], "Hebrew"),
+    ("hun", &["hu"], "Hungarian"),
+    ("ces", &["cs", "cze"], "Czech"),
+    ("ron", &["ro", "rum"], "Romanian"),
+    ("ukr", &["uk"], "Ukrainian"),
+    ("nor", &["no", "nob", "nb"], "Norwegian"),
+    ("hrv", &["hr"], "Croatian"),
+    ("msa", &["ms", "may"], "Malay"),
+    ("fil", &["tl"], "Filipino"),
+    ("slk", &["sk", "slo"], "Slovak"),
+];
+
+/// Chinese variants keep the shared `chi` code in `Language` but need a script/region specific
+/// name in `DisplayLanguage`, otherwise every Chinese track reads the same in Emby clients.
+const EMBY_LANGUAGE_VARIANT_NAMES: &[(&[&str], &str)] = &[
+    (&["zh-cn", "zh-sg", "zh-hans", "chs"], "中文（简体）"),
+    (&["zh-tw", "zh-mo", "zh-hant", "cht"], "中文（繁体）"),
+    (&["zh-hk", "yue"], "粤语"),
+    (&["cmn"], "中文（普通话）"),
 ];
 
 fn emby_language_entry(value: &str) -> Option<(&'static str, &'static str)> {
@@ -5088,16 +5114,38 @@ fn emby_language_entry(value: &str) -> Option<(&'static str, &'static str)> {
         })
 }
 
-fn emby_language_name(language: &str) -> Option<String> {
-    let language = language.trim();
+/// Human readable language label for `DisplayLanguage` and stream `DisplayTitle`.
+///
+/// Probe metadata wins because it already carries the variant a plugin recognised; a language
+/// code outside the table is kept verbatim instead of being guessed.
+fn emby_language_display(language: Option<&str>) -> Option<String> {
+    let language = language?.trim();
     if language.is_empty() || language.eq_ignore_ascii_case("und") {
         return None;
+    }
+    let normalized = language.to_ascii_lowercase();
+    if let Some((_, name)) = EMBY_LANGUAGE_VARIANT_NAMES
+        .iter()
+        .find(|(aliases, _)| aliases.contains(&normalized.as_str()))
+    {
+        return Some((*name).to_owned());
     }
     Some(
         emby_language_entry(language)
             .map(|(_, name)| name.to_owned())
             .unwrap_or_else(|| language.to_owned()),
     )
+}
+
+fn emby_stream_display_language(
+    stream: &crate::application::catalog::CatalogStream,
+) -> Option<String> {
+    stream
+        .details
+        .get("DisplayLanguage")
+        .and_then(Value::as_str)
+        .and_then(|value| emby_language_display(Some(value)))
+        .or_else(|| emby_language_display(stream.language.as_deref()))
 }
 
 /// Emby clients expect an ISO 639-2/B code in `Language`; values outside the table are kept
@@ -5583,6 +5631,111 @@ mod tests {
         assert_eq!(super::emby_language_code(None), "und");
         assert_eq!(super::emby_language_code(Some("  ")), "und");
         assert_eq!(super::emby_language_code(Some("tlh")), "tlh");
+    }
+
+    #[test]
+    fn chinese_variant_languages_share_the_chi_code_with_distinct_display_names() {
+        for alias in [
+            "chi", "zh", "zho", "chs", "cht", "zh-CN", "zh-TW", "zh-HK", "zh-Hans", "zh-Hant",
+            "cmn", "yue",
+        ] {
+            assert_eq!(
+                super::emby_language_code(Some(alias)),
+                "chi",
+                "language code for {alias}"
+            );
+        }
+        assert_eq!(
+            super::emby_language_display(Some("zh-CN")),
+            Some("中文（简体）".to_owned())
+        );
+        assert_eq!(
+            super::emby_language_display(Some("chs")),
+            Some("中文（简体）".to_owned())
+        );
+        assert_eq!(
+            super::emby_language_display(Some("zh-Hant")),
+            Some("中文（繁体）".to_owned())
+        );
+        assert_eq!(
+            super::emby_language_display(Some("yue")),
+            Some("粤语".to_owned())
+        );
+        assert_eq!(
+            super::emby_language_display(Some("chi")),
+            Some("Chinese".to_owned())
+        );
+    }
+
+    #[test]
+    fn additional_european_language_codes_are_normalized() {
+        for (alias, code, name) in [
+            ("fi", "fin", "Finnish"),
+            ("swe", "swe", "Swedish"),
+            ("dan", "dan", "Danish"),
+            ("ell", "ell", "Greek"),
+            ("gre", "ell", "Greek"),
+            ("heb", "heb", "Hebrew"),
+            ("hu", "hun", "Hungarian"),
+            ("cze", "ces", "Czech"),
+            ("rum", "ron", "Romanian"),
+            ("ukr", "ukr", "Ukrainian"),
+            ("nob", "nor", "Norwegian"),
+            ("hrv", "hrv", "Croatian"),
+            ("may", "msa", "Malay"),
+            ("fil", "fil", "Filipino"),
+            ("slo", "slk", "Slovak"),
+        ] {
+            assert_eq!(
+                super::emby_language_code(Some(alias)),
+                code,
+                "language code for {alias}"
+            );
+            assert_eq!(
+                super::emby_language_display(Some(alias)),
+                Some(name.to_owned()),
+                "display name for {alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn media_streams_report_a_display_language() {
+        let stream = CatalogStream {
+            index: 1,
+            stream_type: "AUDIO".to_owned(),
+            codec: Some("aac".to_owned()),
+            language: Some("zh-cn".to_owned()),
+            title: None,
+            is_external: false,
+            is_default: true,
+            is_forced: false,
+            details: BTreeMap::new(),
+        };
+        assert_eq!(
+            emby_media_stream_json(&stream)["DisplayLanguage"],
+            "中文（简体）"
+        );
+
+        let probed = CatalogStream {
+            details: BTreeMap::from([("DisplayLanguage".to_owned(), json!("Chinese Simplified"))]),
+            ..stream.clone()
+        };
+        assert_eq!(
+            emby_media_stream_json(&probed)["DisplayLanguage"],
+            "Chinese Simplified"
+        );
+
+        let undetermined = CatalogStream {
+            language: Some("und".to_owned()),
+            details: BTreeMap::new(),
+            ..stream.clone()
+        };
+        assert!(
+            emby_media_stream_json(&undetermined)
+                .get("DisplayLanguage")
+                .is_none()
+        );
     }
 
     #[test]
