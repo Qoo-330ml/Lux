@@ -19220,6 +19220,14 @@ setup 启动的首轮 `RECONCILE_LIBRARY` 扫描，因此启动流程新增“�
 - [x] `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
   `scripts/check-migration-parity.py`、`scripts/check-backend-branches.py` 通过（无迁移、无新增
   `DatabaseBackend::` 分支）。
+- [x] 完成门 `cargo test --locked --all-targets --no-fail-fast`（同机 load average ≈ 12）：lib 1810/3、
+  `plugins` 97/2、`admin` 24/1、`api_web` 53/4、`images` 54/1；`scanned_metadata` 与上述其余 target 通过。
+  逐条复核后没有一条与本改动相关：`probe::playback_probe_runs_once_…`、`watch::realtime_…`、
+  `plugins::admin_can_discover_…`、`image_writer::manual_scraper_image_selection_…` 单独复跑通过（高负载
+  抖动）；`danmaku_service_matches_…` 是 `docs/TEST-TARGETS.md` §5.2 记录的 250 ms 预算用例；
+  `scanner::local_metadata_worker_persists_capability_missing`、`admin_settings::transcoding_settings_…`、
+  `remote::forwarded_headers_…`、`web_playback::broken_hardware_encoder_…` 与两个 `web_static::*` 在
+  基线提交 `02830e0d` 的 `src` 上同样失败（环境/本机缺 `web/dist` 等），属既有基线失败。
 - [ ] 未验证：真实 `org.lux.danmaku` 插件（Lux-plugins 仓库另行升级）的 search/fetch 往返；本任务只用
   假插件夹具覆盖 RPC 边界。
 
