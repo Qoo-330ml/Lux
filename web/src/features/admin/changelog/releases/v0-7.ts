@@ -2,6 +2,15 @@ import type { ChangelogRelease } from "../types";
 
 export const changelogReleases07: ChangelogRelease[] = [
   {
+    version: "0.7.11",
+    date: "2026-11-03",
+    sections: [
+      { kind: "fixed", items: [
+        ".strm 直连播放到第二个请求就 410：直连播放接口原来把任何非 2xx 的 GET 都当成「播放结束」，而 .strm 指向的外部地址第一次请求就是 307 跳转，会话当场被判死，后续 Range 请求全部 410——表现是点了播放、第一下能连上，接着就播不动。现在 3xx 跳转按成功处理，同一个直连地址连着请求两次都能正常拿到流，也补了回归测试。",
+      ] },
+    ],
+  },
+  {
     version: "0.7.10",
     date: "2026-11-03",
     sections: [
