@@ -186,7 +186,8 @@ describe("control bar popovers and speed (DOM)", () => {
     const onChangeRate = vi.fn();
     const host = await mount({ onChangeRate, playbackRate: 1, playbackRates: [1, 1.5, 2] });
     const speed = host.querySelector<HTMLButtonElement>(".lux-player-speed-btn");
-    expect(speed?.textContent).toBe("标准");
+    expect(speed?.title).toBe("倍速：标准");
+    expect(speed?.textContent).toBe("");
     await act(async () => speed?.click());
     expect(onChangeRate).toHaveBeenLastCalledWith(1.5);
   });

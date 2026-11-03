@@ -1,6 +1,7 @@
 import {
   Airplay,
   AudioLines,
+  Gauge,
   Maximize,
   MessageCircleMore,
   Minimize,
@@ -399,12 +400,12 @@ export function PlayerControls({
           ) : null}
           <button
             type="button"
-            className="lux-player-speed-btn"
+            className={`lux-player-action-btn lux-player-speed-btn ${playbackRate !== 1 ? "is-active" : ""}`}
             aria-label="倍速"
             title={`倍速：${rateLabel(playbackRate)}`}
             onClick={cycleRate}
           >
-            {rateLabel(playbackRate)}
+            <Gauge size={20} aria-hidden="true" />
           </button>
           <button
             type="button"

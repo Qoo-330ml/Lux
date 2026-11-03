@@ -37,6 +37,7 @@ export function speedButton(container: HTMLElement): HTMLButtonElement {
   return button;
 }
 
+/** The speed button is icon-only; its tooltip carries the current rate. */
 export function speedLabel(rate: number): string {
-  return rate === 1 ? "标准" : `${rate}x`;
+  return `倍速：${rate === 1 ? "标准" : `${rate}x`}`;
 }

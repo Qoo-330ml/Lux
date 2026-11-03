@@ -206,10 +206,10 @@ describe("PlayerPage audio track switching", () => {
     expect(luxSelectValue(container!, "选择字幕")).toBe("7");
     expect(container?.textContent).not.toContain("（当前）");
 
-    for (let attempt = 0; attempt < 6 && speedButton(container!).textContent !== speedLabel(1.5); attempt += 1) {
+    for (let attempt = 0; attempt < 6 && speedButton(container!).title !== speedLabel(1.5); attempt += 1) {
       await act(async () => speedButton(container!).click());
     }
-    expect(speedButton(container!).textContent).toBe(speedLabel(1.5));
+    expect(speedButton(container!).title).toBe(speedLabel(1.5));
     expect(firstVideo.playbackRate).toBe(1.5);
 
     firstVideo.currentTime = 48;

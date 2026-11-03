@@ -105,6 +105,19 @@ export function PlayerPage() {
   const [showSettings, setShowSettings] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
   const [trackMenu, setTrackMenu] = useState<TrackMenu | null>(null);
+  // A pointer press outside the settings panel closes it. The settings button toggles it itself, and
+  // LuxSelect renders its option list into document.body, so both count as inside.
+  useEffect(() => {
+    if (!showSettings) return undefined;
+    const closeOnOutside = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      if (target.closest('.lux-player-settings-popover, .lux-select-menu, button[aria-label="播放器设置"]')) return;
+      setShowSettings(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutside);
+    return () => document.removeEventListener("pointerdown", closeOnOutside);
+  }, [showSettings]);
   const [showShortcutHelp, setShowShortcutHelp] = useState(false);
   const [isRemainingTime, setIsRemainingTime] = useState(false);
   const [isPointerInteracting, setIsPointerInteracting] = useState(false);

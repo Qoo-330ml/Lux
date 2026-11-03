@@ -397,7 +397,5 @@ html[data-lux-accent="silver"] .lux-player-page { --lux-accent: #cbd5e1; --lux-a
 .lux-player-track-popover { position: absolute; bottom: calc(100% + 12px); left: 0; z-index: 30; width: min(320px, calc(100vw - 32px)); padding: 14px; border: 1px solid rgba(255,255,255,.12); border-radius: 12px; background: rgba(18,18,24,.95); box-shadow: 0 14px 40px rgba(0,0,0,.5); backdrop-filter: blur(18px); }
 .lux-player-controls-right .lux-player-track-popover { left: auto; right: 0; }
 .lux-player-subtitle-btn.is-active, .lux-player-audio-btn.is-active { color: var(--lux-accent); }
-.lux-player-speed-btn { height: 32px; min-width: 46px; padding: 0 8px; border: 1px solid rgba(255,255,255,.2); border-radius: 8px; background: transparent; color: #fff; font: inherit; font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; cursor: pointer; }
-.lux-player-speed-btn:hover, .lux-player-speed-btn:focus-visible { background: rgba(255,255,255,.1); border-color: var(--lux-accent); }
 .lux-player-settings-info-row { display: flex; align-items: center; gap: 8px; width: 100%; padding: 8px 10px; border: 0; border-radius: 8px; background: transparent; color: #fff; font: inherit; font-size: 14px; cursor: pointer; }
 .lux-player-settings-info-row:hover, .lux-player-settings-info-row:focus-visible { background: rgba(255,255,255,.08); }

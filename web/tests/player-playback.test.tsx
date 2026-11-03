@@ -528,6 +528,55 @@ describe("PlayerPage playback synchronization", () => {
     expect(container.querySelector(".lux-player-shortcut-help")).toBeNull();
   });
 
+  it("closes the settings panel on a pointer press outside it but not inside it", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-settings-outside",
+      title: "设置外部点击测试",
+      itemType: "MOVIE",
+      mediaSources: [{ id: "source-settings-outside", isDefault: true, durationTicks: 1_200_000_000 }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({
+      positionTicks: 0,
+      isPlayed: false,
+      state: null,
+      isPaused: false,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-settings-outside"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const settings = container.querySelector<HTMLButtonElement>('button[aria-label="播放器设置"]');
+    if (!settings) throw new Error("settings control was not rendered");
+    await act(async () => settings.click());
+    expect(container.querySelector(".lux-player-settings-popover")).not.toBeNull();
+
+    await act(async () => {
+      container?.querySelector(".lux-player-settings-popover")?.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
+    });
+    expect(container.querySelector(".lux-player-settings-popover")).not.toBeNull();
+
+    await act(async () => {
+      document.body.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
+    });
+    expect(container.querySelector(".lux-player-settings-popover")).toBeNull();
+  });
+
   it("keeps presentation settings local without rebuilding the playback session", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-presentation",
