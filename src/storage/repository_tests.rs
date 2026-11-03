@@ -23591,6 +23591,73 @@ async fn catalog_read_model_shadow_matches_the_legacy_default_list()
 }
 
 #[tokio::test]
+async fn catalog_read_model_library_page_keeps_series_without_their_own_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('tv-lib', 'TV', 'SERIES')")
+        .execute(database.pool())
+        .await?;
+    // A series and a season never own a media source; they are visible because a child does.
+    for (id, item_type, parent_id, series_id, has_source) in [
+        ("tv-series", "SERIES", None, None, 0_i64),
+        (
+            "tv-season",
+            "SEASON",
+            Some("tv-series"),
+            Some("tv-series"),
+            0,
+        ),
+        (
+            "tv-episode",
+            "EPISODE",
+            Some("tv-season"),
+            Some("tv-series"),
+            1,
+        ),
+        ("tv-empty-series", "SERIES", None, None, 0),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, parent_id, series_id, title, sort_title,
+                 identification_status, has_available_source, added_at
+             ) VALUES (?, 'tv-lib', ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?, 5)",
+        )
+        .bind(id)
+        .bind(item_type)
+        .bind(parent_id)
+        .bind(series_id)
+        .bind(id)
+        .bind(id)
+        .bind(has_source)
+        .execute(database.pool())
+        .await?;
+    }
+    database.rebuild_catalog_items_batch(None, 100).await?;
+
+    let series_types = vec!["SERIES".to_owned()];
+    let none: Vec<String> = Vec::new();
+    for sort in [ReadModelSort::SortTitle, ReadModelSort::EffectiveAddedAt] {
+        let (ids, total) = database
+            .shadow_catalog_library_page(&ReadModelPageQuery {
+                library_id: "tv-lib",
+                item_types: &series_types,
+                excluded_item_types: &none,
+                sort,
+                descending: false,
+                offset: 0,
+                limit: 10,
+                include_total: true,
+            })
+            .await?;
+        assert_eq!(ids, vec!["tv-series".to_owned()]);
+        assert_eq!(total, 1);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn recently_added_read_model_matches_the_legacy_query()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::storage::test_database;

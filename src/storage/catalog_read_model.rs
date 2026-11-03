@@ -647,29 +647,54 @@ impl Database {
             ReadModelSort::ProductionYear => "production_year",
         };
         let direction = if descending { "DESC" } else { "ASC" };
+        // Mirrors `CATALOG_VISIBLE_PREDICATE`: an item with a source is visible, and so is a
+        // series, season, box set or folder without one when a visible child (or collection
+        // member) exists. Requiring `has_available_source = 1` alone hid every series.
         let mut conditions = vec![
-            "library_id = ?".to_owned(),
-            "removed_at IS NULL".to_owned(),
-            "merged_into IS NULL".to_owned(),
-            "has_available_source = 1".to_owned(),
+            "ci.library_id = ?".to_owned(),
+            "ci.removed_at IS NULL".to_owned(),
+            "ci.merged_into IS NULL".to_owned(),
+            "(ci.has_available_source = 1
+              OR (ci.item_type IN ('SERIES', 'SEASON', 'BOX_SET', 'FOLDER') AND (
+                  EXISTS (
+                      SELECT 1 FROM catalog_items visible_child
+                      WHERE visible_child.removed_at IS NULL
+                        AND visible_child.merged_into IS NULL
+                        AND visible_child.has_available_source = 1
+                        AND (visible_child.parent_id = ci.item_id
+                             OR visible_child.series_id = ci.item_id)
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM collection_items visible_collection_item
+                      JOIN collections visible_collection
+                        ON visible_collection.id = visible_collection_item.collection_id
+                      JOIN catalog_items visible_child
+                        ON visible_child.item_id = visible_collection_item.item_id
+                      WHERE visible_collection.item_id = ci.item_id
+                        AND visible_child.removed_at IS NULL
+                        AND visible_child.merged_into IS NULL
+                        AND visible_child.has_available_source = 1
+                  )
+              )))"
+            .to_owned(),
         ];
         if !item_types.is_empty() {
             let placeholders = std::iter::repeat_n("?", item_types.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            conditions.push(format!("item_type IN ({placeholders})"));
+            conditions.push(format!("ci.item_type IN ({placeholders})"));
         }
         if !excluded_item_types.is_empty() {
             let placeholders = std::iter::repeat_n("?", excluded_item_types.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            conditions.push(format!("item_type NOT IN ({placeholders})"));
+            conditions.push(format!("ci.item_type NOT IN ({placeholders})"));
         }
         let where_clause = conditions.join(" AND ");
         let list_query = format!(
-            "SELECT item_id FROM catalog_items
+            "SELECT ci.item_id FROM catalog_items ci
              WHERE {where_clause}
-             ORDER BY {order} {direction}, item_id
+             ORDER BY ci.{order} {direction}, ci.item_id
              LIMIT ? OFFSET ?"
         );
         let mut statement = self
@@ -691,7 +716,7 @@ impl Database {
             .map(|(id,)| id)
             .collect::<Vec<_>>();
         let total = if include_total {
-            let count_query = format!("SELECT COUNT(*) FROM catalog_items WHERE {where_clause}");
+            let count_query = format!("SELECT COUNT(*) FROM catalog_items ci WHERE {where_clause}");
             let mut count_statement = self
                 .query_scalar::<i64>(sqlx::AssertSqlSafe(count_query))
                 .bind(library_id);
