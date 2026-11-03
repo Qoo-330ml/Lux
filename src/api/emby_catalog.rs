@@ -5162,6 +5162,28 @@ fn emby_language_code(language: Option<&str>) -> String {
         .unwrap_or_else(|| language.to_owned())
 }
 
+/// Emby clients compare `VideoRange` against a fixed vocabulary (`SDR`, `HDR10`, `HDR10+`,
+/// `HLG`, `Dolby Vision`); probe plugins report spellings such as `HDR 10`, so normalize the
+/// known values and keep everything else verbatim instead of guessing.
+pub(super) fn emby_video_range(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return String::new();
+    }
+    let compact: String = value
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    match compact.to_ascii_lowercase().as_str() {
+        "sdr" => "SDR".to_owned(),
+        "hdr10" => "HDR10".to_owned(),
+        "hdr10+" | "hdr10plus" => "HDR10+".to_owned(),
+        "hlg" => "HLG".to_owned(),
+        "dolbyvision" | "dovi" => "Dolby Vision".to_owned(),
+        _ => value.to_owned(),
+    }
+}
+
 pub(super) fn normalize_emby_media_stream_detail(key: &str, value: &Value) -> Option<Value> {
     const INTEGER_FIELDS: [&str; 9] = [
         "BitRate",
@@ -5194,6 +5216,13 @@ pub(super) fn normalize_emby_media_stream_detail(key: &str, value: &Value) -> Op
         .any(|field| key.eq_ignore_ascii_case(field))
     {
         return emby_boolean_value(value);
+    }
+    if key.eq_ignore_ascii_case("VideoRange") {
+        let Value::String(raw) = value else {
+            return (!value.is_null()).then(|| value.clone());
+        };
+        let normalized = emby_video_range(raw);
+        return (!normalized.is_empty()).then(|| Value::String(normalized));
     }
     (!value.is_null()).then(|| value.clone())
 }
@@ -5736,6 +5765,38 @@ mod tests {
                 .get("DisplayLanguage")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn video_range_values_are_normalized_to_the_emby_vocabulary() {
+        assert_eq!(super::emby_video_range("HDR 10"), "HDR10");
+        assert_eq!(super::emby_video_range("hdr10"), "HDR10");
+        assert_eq!(super::emby_video_range("HDR10+"), "HDR10+");
+        assert_eq!(super::emby_video_range("HDR 10+"), "HDR10+");
+        assert_eq!(super::emby_video_range("Dolby Vision"), "Dolby Vision");
+        assert_eq!(super::emby_video_range("dolbyvision"), "Dolby Vision");
+        assert_eq!(super::emby_video_range("hlg"), "HLG");
+        assert_eq!(super::emby_video_range("SDR"), "SDR");
+        // Unrecognised values stay verbatim instead of being guessed.
+        assert_eq!(super::emby_video_range("HDR"), "HDR");
+        assert_eq!(super::emby_video_range("HDR12"), "HDR12");
+    }
+
+    #[test]
+    fn media_streams_report_the_normalized_video_range() {
+        let stream = CatalogStream {
+            index: 0,
+            stream_type: "VIDEO".to_owned(),
+            codec: Some("hevc".to_owned()),
+            language: None,
+            title: None,
+            is_external: false,
+            is_default: true,
+            is_forced: false,
+            details: BTreeMap::from([("VideoRange".to_owned(), json!("HDR 10"))]),
+        };
+
+        assert_eq!(emby_media_stream_json(&stream)["VideoRange"], "HDR10");
     }
 
     #[test]
