@@ -367,7 +367,8 @@ fn bool_field(object: &serde_json::Map<String, Value>, key: &str) -> bool {
 }
 
 fn media_info_stream_details(stream: &serde_json::Map<String, Value>) -> BTreeMap<String, Value> {
-    const FIELDS: [(&str, &str); 27] = [
+    const FIELDS: [(&str, &str); 28] = [
+        ("Title", "Title"),
         ("DisplayLanguage", "DisplayLanguage"),
         ("TimeBase", "TimeBase"),
         ("VideoRange", "VideoRange"),
@@ -2252,6 +2253,26 @@ mod tests {
 
         assert_eq!(initial, vec![first]);
         assert_eq!(reused, initial);
+    }
+
+    #[test]
+    fn media_info_sidecars_keep_the_original_track_title() {
+        let result = super::parse_media_info_json(
+            br#"[{"MediaSourceInfo":{"Container":"mkv","MediaStreams":[
+                {"Index":0,"Type":"Audio","Codec":"flac","Title":"FLAC stereo",
+                 "DisplayTitle":"FLAC stereo (\u9ed8\u8ba4)","ChannelLayout":"stereo","Channels":2}
+            ]}}]"#,
+        )
+        .expect("valid media info sidecar");
+
+        assert_eq!(
+            result.streams[0].details.get("Title"),
+            Some(&json!("FLAC stereo"))
+        );
+        assert_eq!(
+            result.streams[0].title.as_deref(),
+            Some("FLAC stereo (\u{9ed8}\u{8ba4})")
+        );
     }
 
     #[tokio::test]
