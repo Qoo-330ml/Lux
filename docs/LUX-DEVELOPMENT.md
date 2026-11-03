@@ -19182,19 +19182,28 @@ setup 启动的首轮 `RECONCILE_LIBRARY` 扫描，因此启动流程新增“�
 - `danmaku.search`：请求 `{ "query": string, "limit": number }`（camelCase、`deny_unknown_fields`），
   宿主发送前校验 `query` trim 后 1–200 字符且无控制字符、`limit` 1–50；结果
   `{ "candidates": [{ "provider"?, "animeId", "animeTitle", "episodes": [{ "episodeId", "title" }] }] }`。
-  宿主对插件返回值按请求 `limit`（≤50）与每候选 500 集裁剪，`animeId`/`episodeId` >128 字符、
-  `provider` >64、标题 >300，或任一字符串 trim 后为空/含控制字符，一律 `PluginInvalidResponse`；
-  整包沿用弹幕 RPC 现有 4 MiB 上限（`MAX_DANMAKU_RPC_RESULT_BYTES`，`danmaku.match` 改用同一常量，
-  行为不变）。
-- `danmaku.fetch`：请求 `{ "provider"?, "episodeId" }`（`episodeId` 1–128、`provider` 1–64），结果
+  插件应只返回不超过请求 `limit` 的候选且单条响应 ≤ 4 MiB，宿主仍按请求 `limit`（≤50）与每候选
+  180 集裁剪；180 集的上限是算出来的：50 候选 × 180 集 × （128 字符 ID + 300 字符标题）的绝对上界
+  仍在 4 MiB 单行预算内，因此文档化的“最大合法搜索”是插件可实际交付的形状。宿主对保留页内的
+  `animeId`/`episodeId` >128 字符、`provider` >64、标题 >300，或任一字符串 trim 后为空/含控制字符
+  的候选判为 `PluginInvalidResponse`；保留页之外的语义坏候选被直接丢弃。**形状**错误（未知/多余
+  字段、类型错误、非 JSON）不享受该裁剪：反序列化在前，整条响应无效。
+- 响应体积：单行 4 MiB 上限由插件运行时统一执行（`plugin_runtime::MAX_PLUGIN_RESPONSE_BYTES`），
+  搜索/获取调用把它映射成 `PluginServiceError::InvalidResponse`（作业层码
+  `PLUGIN_INVALID_RESPONSE`），不再落到 `Runtime`/503 `PLUGIN_UNAVAILABLE`；协议层不再重复一份
+  不可达的体积检查。
+- `danmaku.fetch`：请求 `{ "provider"?, "episodeId" }`（`episodeId` 1–128；`provider` 缺省、空串或
+  纯空白都按“未设置”处理，非空时 1–64），结果
   `{ "xmlBase64": string }`；沿用 `danmaku.match` 的响应上限，`xmlBase64` 为空即无效。宿主在返回前
   通过 `DanmakuFetchResult::decode_xml` 解码并执行 `validate_danmaku_xml`（含 50 MiB XML 上限），
   因此调用方拿到的一定是结构合法的文档，但本层不写盘。
 - 宿主 API：`PluginService::search_danmaku(query, limit)`、`fetch_danmaku(provider, episode_id)`、
   `danmaku_manual_match_supported()`。插件未安装 → `UnknownPlugin`；未启用/不可用 → `Unavailable`；
   未声明能力 → 新增 `Unsupported`；配置未完成 → `InvalidConfig`；宿主侧参数越界 → 新增
-  `InvalidRequest`。不 panic、不泛化为 Internal。`danmaku_plugin_error_code`、
-  `scraper_failure_reason` 与管理 API 错误映射同步覆盖 `PLUGIN_UNSUPPORTED`/`PLUGIN_INVALID_REQUEST`。
+  `InvalidRequest`。不 panic、不泛化为 Internal。作业层 `danmaku_plugin_error_code` 与 scraper 的
+  `scraper_failure_reason` 覆盖新错误，产出 `PLUGIN_UNSUPPORTED`/`PLUGIN_INVALID_REQUEST`；管理 API
+  **不新增错误码**，`Unsupported` 仍映射为 409 `PLUGIN_UNAVAILABLE`、`InvalidRequest` 为 400
+  `INVALID_REQUEST`。
 - 超时、隔离进程与脱敏沿用现有弹幕 RPC 路径：新增 `PluginService::with_danmaku_call_timeout`
   （生产默认取 supervisor 的 30 s，`danmaku.match` 与 search/fetch 共用同一调用封装），日志与错误
   只含能力名和宿主自有文案，不含上游 URL 或 token。
@@ -19204,15 +19213,19 @@ setup 启动的首轮 `RECONCILE_LIBRARY` 扫描，因此启动流程新增“�
 
 验收（2026-11-03，本机 `uname -m` = `arm64`）：
 
-- [x] `cargo test --locked --test plugins plugin_protocol::` 53/53：新增 manifest 用例（仅 match 通过、
+- [x] `cargo test --locked --test plugins plugin_protocol::` 54/54：新增 manifest 用例（仅 match 通过、
   match+search+fetch 通过、仅 search/仅 fetch/缺 match/未知 `danmaku.*` 均失败）、请求 JSON 形状与
-  路径/URL 字段拒绝、宿主侧 query/limit/episodeId 边界、候选与分集裁剪、空/超长/未知字段拒绝、
-  4 MiB 超限、fetch 解码与 `validate_danmaku_xml`。
-- [x] `cargo test --locked --test plugins danmaku::` 12/12：新增假插件覆盖正常 search+fetch、空标题
-  候选 → `InvalidResponse`、仅 match 旧插件 → `Unsupported`（且 `danmaku.match` 仍可用）、
-  300 ms 截止时间下的 `Runtime(Timeout)`、参数越界先于插件调用被拒绝（无插件时为 `UnknownPlugin`）。
+  路径/URL 字段拒绝、宿主侧 query/limit/episodeId 边界、`provider` 缺省/空串/纯空白等价、候选与分集
+  裁剪、空/超长/未知字段拒绝、fetch 解码与 `validate_danmaku_xml`，以及
+  `the_largest_allowed_search_shape_fits_the_transport_budget`（50 × 180 × 各字段上限的形状 ≤ 4 MiB
+  且被接受）。
+- [x] `cargo test --locked --test plugins danmaku::` 13/13：新增假插件覆盖正常 search+fetch（含空串/
+  纯空白 `provider` 成功）、空标题候选与坏 XML → `InvalidResponse`、超过 4 MiB 的 search/fetch 应答
+  → `InvalidResponse`（而非 `Runtime`/不可用）、仅 match 旧插件 → `Unsupported`（且 `danmaku.match`
+  仍可用）、300 ms 截止时间下的 `Runtime(Timeout)`、参数越界先于插件调用被拒绝（无插件时为
+  `UnknownPlugin`）。
 - [x] `cargo test --locked --lib plugin` 55/55。
-- [x] `cargo test --locked --test plugins -- --test-threads=2` 99/99；默认并行全组运行两次分别在
+- [x] `cargo test --locked --test plugins -- --test-threads=2` 101/101；默认并行全组运行两次分别在
   既有用例 `danmaku_service_matches_local_and_strm_sources_and_writes_sidecars`（10,000 源
   `create_job` 的 250 ms 预算，见 `docs/TEST-TARGETS.md` §5.2）与无关的
   `media_info_config_api::media_info_plugin_config_api_drives_a_background_run` 上超时，单独复跑
@@ -19230,6 +19243,27 @@ setup 启动的首轮 `RECONCILE_LIBRARY` 扫描，因此启动流程新增“�
   基线提交 `02830e0d` 的 `src` 上同样失败（环境/本机缺 `web/dist` 等），属既有基线失败。
 - [ ] 未验证：真实 `org.lux.danmaku` 插件（Lux-plugins 仓库另行升级）的 search/fetch 往返；本任务只用
   假插件夹具覆盖 RPC 边界。
+
+第 1 轮审查返工（2026-11-03）：
+
+- 搜索响应体积：运行时 4 MiB 单行上限原先报成 `Runtime`/503 `PLUGIN_UNAVAILABLE`，协议层那份体积检查
+  因此不可达且与文档矛盾。改为：运行时超限在搜索/获取调用中映射为
+  `PluginServiceError::InvalidResponse`（`PLUGIN_INVALID_RESPONSE`），删掉协议层重复且不可达的
+  `ResultTooLarge` 分支，每候选 `episodes` 上限 500 → 180，使“50 候选 × 180 集 × 各字段取上限”的形状
+  确实落在 4 MiB 内（新增 `the_largest_allowed_search_shape_fits_the_transport_budget` 固定该契约）。
+  语义写进 `docs/PLUGIN-SDK.md`：插件应只返回不超过请求 `limit` 的候选且响应 ≤ 4 MiB，宿主仍裁剪。
+- `danmaku.fetch` 的 `provider`：空串/纯空白按“未设置”（`None`）处理，非空时仍按 1–64 校验；协议层与
+  服务层测试覆盖 `None`/`Some("")`/`Some("  ")` 成功与超长/控制字符失败。
+- 裁剪范围措辞：明确“页内裁剪”只覆盖语义坏候选（空/超长/控制字符），未知字段、多余字段与类型错误在
+  反序列化阶段即使整条响应无效（`deny_unknown_fields`），不再笼统声称“坏候选不会毁掉整次搜索”。
+- 错误码措辞：管理 API 不新增错误码（`Unsupported` → 409 `PLUGIN_UNAVAILABLE`、`InvalidRequest` →
+  400 `INVALID_REQUEST`）；`PLUGIN_UNSUPPORTED`/`PLUGIN_INVALID_REQUEST` 只来自作业层与 scraper
+  失败原因。
+
+返工验收（2026-11-03，`arm64`）：`cargo test --locked --test plugins plugin_protocol::` 54/54、
+`danmaku::` 13/13、`--test plugins -- --test-threads=2` 101/101、`cargo test --locked --lib plugin`
+55/55；`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+`scripts/check-migration-parity.py`、`scripts/check-backend-branches.py` 通过。
 
 依赖：ADR-052 P4；D2（手动匹配 API）依赖本任务的宿主方法。
 

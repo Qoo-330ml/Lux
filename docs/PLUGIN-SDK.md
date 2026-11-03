@@ -41,12 +41,18 @@ Lux 只向插件发送不含路径和上游地址的文件名：
   "episodes":[{"episodeId":"ep-1","title":"第 1 集"}]}]}
 ```
 
-- 宿主对插件返回值做严格校验：候选列表超过请求的 `limit`（最多 50）或超过本身上限 50 时按
-  顺序裁剪，每个候选的 `episodes` 超过 500 时裁剪；`animeId`/`episodeId` 超过 128 字符、
-  `provider` 超过 64 字符、标题超过 300 字符，或任一字符串 trim 后为空／含控制字符，都视为
-  插件返回无效（`PluginInvalidResponse`）。裁剪发生在校验之前，因此超出页面的坏候选不会毁掉
-  整次搜索。
-- 整个响应体沿用弹幕 RPC 现有上限（4 MiB），超限同样视为插件返回无效。
+- 插件应只返回**不超过请求 `limit`** 的候选，且单条响应必须 ≤ 4 MiB（插件 RPC 的单行上限）。
+  宿主仍会裁剪：候选超过请求的 `limit`（本身上限 50）时按顺序截断，每个候选的 `episodes`
+  超过 180 时截断，因此插件多返回的部分不会让整次搜索失败。
+- 宿主对**保留下来**的候选做严格校验：`animeId`/`episodeId` 超过 128 字符、`provider` 超过
+  64 字符、标题超过 300 字符，或任一字符串 trim 后为空／含控制字符，都视为插件返回无效
+  （`PluginInvalidResponse`）。
+- 这份页内裁剪只覆盖“语义上坏掉的候选”：保留页之外的坏候选（空/超长/控制字符）会被直接丢弃，
+  不会毁掉整次搜索。但**形状**错误不在此列——未知字段、多余字段或类型错误在反序列化阶段就使
+  整个响应无效（`deny_unknown_fields`），裁剪发生在此之前。
+- 响应体超过 4 MiB 时传输层先拒绝，宿主按无效响应处理（`PLUGIN_INVALID_RESPONSE`），不会报成
+  插件不可用（503）。50 个候选 × 180 集 × 各字段取上限的形状仍在 4 MiB 以内，因此文档化的
+  上限是插件可实际交付的。
 
 `danmaku.fetch` 请求：
 
@@ -54,14 +60,16 @@ Lux 只向插件发送不含路径和上游地址的文件名：
 {"provider":"dandanplay","episodeId":"ep-1"}
 ```
 
-- `provider` 可选，1–64 字符；`episodeId` 1–128 字符。两者都不得包含控制字符。
+- `provider` 可选：缺省、空串或纯空白都表示“未设置”（不发送该字段），非空时 1–64 字符；
+  `episodeId` 1–128 字符。两者都不得包含控制字符。
 - 结果：
 
 ```json
 {"xmlBase64":"PGk+PGQgcD0iMSwxLDI1LDE2Nzc3MjE1LDAsMCwwLDAiPmhlbGxvPC9kPjwvaT4="}
 ```
 
-- `xmlBase64` 不得为空，响应体沿用同样的 4 MiB 上限。宿主在返回结果前解码并按 `danmaku.match`
+- `xmlBase64` 不得为空，响应体沿用同样的 4 MiB 上限（超限同样是 `PLUGIN_INVALID_RESPONSE`）。
+  宿主在返回结果前解码并按 `danmaku.match`
   的规则执行 `validate_danmaku_xml`（Bilibili/Dandanplay 结构校验）与 50 MiB XML 上限，因此
   调用方拿到的一定是结构合法的弹幕文档；该层不写盘，写旁车仍由宿主的调用方负责。
 - 宿主仍不向插件传路径、上游地址或用户信息，插件也不能写文件。
@@ -288,7 +296,7 @@ Actions 在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` runner 上分别构建。Relea
   未安装或未启用插件时返回 404；插件或 Bundle 不满足能力和大小边界时拒绝请求。该路由不触发远程媒体读取或
   SHA1 计算，SHA1、FF 缓存和远程缓存仍由 MediaTidy 负责。
 - `danmaku.match`：接收不含路径和上游地址的文件名（可带少量备选文件名），返回 `MATCHED`/`NO_MATCH` 和受大小限制的 `xmlBase64`；仅声明了 `danmaku.search` 与 `danmaku.fetch` 的插件才额外提供下面两个方法。
-- `danmaku.search`：接收 `{ "query": string, "limit": number }`（query 1–200 字符、limit 1–50，均经宿主校验），返回候选动画与分集列表；宿主按 `limit`/50 与每候选 500 集裁剪，并拒绝空或超长（animeId/episodeId 128、provider 64、标题 300）字段。
+- `danmaku.search`：接收 `{ "query": string, "limit": number }`（query 1–200 字符、limit 1–50，均经宿主校验），返回候选动画与分集列表；插件应只返回不超过 `limit` 的候选且整条响应 ≤ 4 MiB，宿主仍按 `limit`/50 与每候选 180 集裁剪，并拒绝空或超长（animeId/episodeId 128、provider 64、标题 300）字段，超限响应按 `PLUGIN_INVALID_RESPONSE` 处理。
 - `danmaku.fetch`：接收 `{ "provider"?: string, "episodeId": string }`，返回 `{ "xmlBase64": string }`；与 `danmaku.match` 使用同一响应上限，XML 结构与大小校验仍由宿主执行。
 - `ip.location`：接收一个已由 Lux 宿主校验的公网 IP，返回统一的归属地字段；第三方供应商协议只存在于插件进程。
 - `chapters.detect`：接收同一季度至少两个分集的有界 Chromaprint 指纹序列。每个分集只包含请求内临时 `key`、固定 `sampleRate: 11025`、`fingerprintPointDurationTicks: 1238095`、指纹 Base64、窗口起点和窗口时长；宿主对每个文件固定取第一个音频流并让 FFmpeg chromaprint muxer 输出 raw `uint32` 点序列，按 little-endian 编码，不能把 Base64 字节索引当作时间。插件不得接收路径、URL、媒体源 ID 或任务对象。结果只能返回 `IntroStart`、`IntroEnd` 和 `CreditsStart`，时间必须落在对应窗口内，置信度为 0-1。
