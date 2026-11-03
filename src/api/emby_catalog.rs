@@ -5460,6 +5460,13 @@ pub(super) fn normalize_emby_media_stream_detail(key: &str, value: &Value) -> Op
         let normalized = emby_video_range(raw);
         return (!normalized.is_empty()).then(|| Value::String(normalized));
     }
+    // Emby clients render blank text as an empty line; probe plugins can store whitespace-only
+    // values, so drop them instead of emitting `""`.
+    if let Value::String(text) = value
+        && text.trim().is_empty()
+    {
+        return None;
+    }
     (!value.is_null()).then(|| value.clone())
 }
 
@@ -6327,6 +6334,24 @@ mod tests {
             assert_eq!(json["Title"], legacy, "{stream_type}");
             assert_eq!(json["Language"], "und", "{stream_type}");
         }
+    }
+
+    #[test]
+    fn blank_detail_strings_are_omitted_from_stream_json() {
+        let json = emby_media_stream_json(&stream(
+            "AUDIO",
+            Some("aac"),
+            Some("eng"),
+            None,
+            BTreeMap::from([
+                ("Title".to_owned(), json!("   ")),
+                ("AspectRatio".to_owned(), json!("")),
+            ]),
+        ));
+
+        assert_eq!(json["DisplayTitle"], "English AAC");
+        assert_eq!(json["Title"], "English AAC");
+        assert!(json.get("AspectRatio").is_none());
     }
 
     #[test]
