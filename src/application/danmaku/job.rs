@@ -25,7 +25,7 @@ use crate::{
     },
     domain::ids::LibraryId,
     storage::{
-        Database, NewDanmakuMatchJob, NewDanmakuSingleItemJob, NewDanmakuTrack, StorageError,
+        NewDanmakuMatchJob, NewDanmakuSingleItemJob, NewDanmakuTrack, StorageError,
         StoredDanmakuMatchItem, StoredDanmakuMatchJob, StoredDanmakuSource,
     },
 };
@@ -222,12 +222,22 @@ impl DanmakuService {
             .library_id
             .parse::<LibraryId>()
             .map_err(|_| DanmakuServiceError::LibraryNotFound)?;
-        // A job that queued exactly one target is retried as that same target: re-running a manual
-        // match as a library sweep would silently widen it, and retrying a one-item library job one
-        // item at a time is the same work. Every other job keeps the library-wide retry.
         let items = self.database.list_danmaku_match_items(job_id).await?;
-        if job.total_count == 1 && items.len() == 1 {
-            return self.retry_single_item(&job, &items[0]).await;
+        // A manual match is retried as that same single episode; it must never turn into a library
+        // sweep. If its item is gone (for example the media file was removed and rescanned) there is
+        // nothing to retry.
+        if job.kind == "MANUAL" {
+            return match items.as_slice() {
+                [item] => self.retry_single_item(&job, item, true).await,
+                _ => Err(DanmakuServiceError::NotRetryable),
+            };
+        }
+        // A sweep that only had one target is retried as one target too, but it keeps matching:
+        // identifiers a sweep wrote on its item are results, not an administrator's choice.
+        if job.total_count == 1
+            && let [item] = items.as_slice()
+        {
+            return self.retry_single_item(&job, item, false).await;
         }
         self.create_job(library_id, job.concurrency, job.overwrite)
             .await
@@ -235,22 +245,21 @@ impl DanmakuService {
 
     /// Queues a new one-target job for the single item of a failed/cancelled job.
     ///
-    /// The prefilled provider identifiers of the old item are copied, so a manual match keeps
-    /// fetching the same episode instead of falling back to `danmaku.match`; a one-item library job
-    /// has none and keeps matching. Nothing in `danmaku_tracks` is rewritten here, so a retry can
-    /// never relabel a user-provided sidecar as Lux-written.
+    /// A manual match copies the administrator's episode and provider from the old item, so it
+    /// keeps fetching the same episode; a sweep retry copies nothing and runs `danmaku.match`
+    /// again. Nothing in `danmaku_tracks` is rewritten here.
     async fn retry_single_item(
         &self,
         job: &StoredDanmakuMatchJob,
         item: &StoredDanmakuMatchItem,
+        manual: bool,
     ) -> Result<DanmakuMatchJob, DanmakuServiceError> {
-        let Some(relative_path) = item.relative_path.as_deref() else {
+        if item.relative_path.is_none() {
             return Err(DanmakuServiceError::SourceNotFound);
-        };
-        let relative_sidecar_path = danmaku_sidecar_path(Path::new(relative_path))
-            .map_err(|_| DanmakuServiceError::SourceNotFound)?
-            .to_string_lossy()
-            .into_owned();
+        }
+        if manual && item.provider_episode_id.is_none() {
+            return Err(DanmakuServiceError::NotRetryable);
+        }
         if self
             .database
             .has_active_danmaku_match_jobs(&job.library_id)
@@ -258,13 +267,8 @@ impl DanmakuService {
         {
             return Err(DanmakuServiceError::AlreadyActive);
         }
-        let provider = self
-            .database
-            .find_danmaku_track_provider(&item.media_source_id)
-            .await?;
         let job_id = Uuid::now_v7().to_string();
         let item_row_id = format!("{job_id}:{}", item.media_source_id);
-        let track_id = Uuid::now_v7().to_string();
         self.database
             .create_danmaku_single_item_job(
                 NewDanmakuMatchJob {
@@ -275,12 +279,15 @@ impl DanmakuService {
                 },
                 NewDanmakuSingleItemJob {
                     id: &item_row_id,
-                    track_id: &track_id,
                     media_source_id: &item.media_source_id,
-                    provider_anime_id: item.provider_anime_id.as_deref(),
-                    provider_episode_id: item.provider_episode_id.as_deref(),
-                    relative_sidecar_path: &relative_sidecar_path,
-                    provider: provider.as_deref(),
+                    manual,
+                    provider_anime_id: manual
+                        .then_some(item.provider_anime_id.as_deref())
+                        .flatten(),
+                    provider_episode_id: manual
+                        .then_some(item.provider_episode_id.as_deref())
+                        .flatten(),
+                    provider: manual.then_some(item.provider.as_deref()).flatten(),
                 },
             )
             .await?;
@@ -305,13 +312,9 @@ impl DanmakuService {
         };
         // A library sweep may only run for a library the administrator selected in the plugin
         // configuration. A manual match names one item explicitly and is exempt (ADR-052 P5,
-        // `docs/LUX-DEVELOPMENT.md` §3.7), which is exactly a job whose every item carries the
-        // administrator's episode.
-        let manual_only = self
-            .database
-            .danmaku_match_job_is_manual_only(&job.id)
-            .await?;
-        if !manual_only && !settings.library_ids.contains(&job.library_id) {
+        // `docs/LUX-DEVELOPMENT.md` §3.7); only the job kind decides, never the item contents.
+        let manual_job = job.kind == "MANUAL";
+        if !manual_job && !settings.library_ids.contains(&job.library_id) {
             self.database
                 .finish_danmaku_match_job(&job.id, "FAILED", Some("LIBRARY_NOT_SELECTED"))
                 .await?;
@@ -367,15 +370,13 @@ impl DanmakuService {
                     }),
                     _ => None,
                 };
-                // A job item that already carries an episode is an administrator's manual match:
-                // the worker fetches that episode instead of asking the plugin to match a title.
-                let manual = item
-                    .provider_episode_id
-                    .clone()
-                    .map(|episode_id| ManualItemTarget {
-                        provider_anime_id: item.provider_anime_id.clone(),
-                        episode_id,
-                    });
+                // Only a MANUAL job fetches the administrator's episode; every other job asks the
+                // plugin to match a title, whatever identifiers its items carry.
+                let manual = manual_job.then(|| ManualItemTarget {
+                    provider: item.provider.clone(),
+                    provider_anime_id: item.provider_anime_id.clone(),
+                    episode_id: item.provider_episode_id.clone(),
+                });
                 let database = self.database.clone();
                 let plugins = plugins.clone();
                 let settings = settings.clone();
@@ -394,7 +395,7 @@ impl DanmakuService {
                     let result = match manual {
                         Some(manual) => {
                             process_manual_danmaku_source(
-                                source, plugins, database, manual, overwrite, item.id,
+                                source, plugins, manual, overwrite, item.id,
                             )
                             .await
                         }
@@ -702,8 +703,10 @@ struct TrackIdentity<'a> {
 
 /// The episode an administrator selected for one media source (ADR-052 P5).
 struct ManualItemTarget {
+    provider: Option<String>,
     provider_anime_id: Option<String>,
-    episode_id: String,
+    /// `None` only if the row is corrupt; the worker then fails the item instead of guessing.
+    episode_id: Option<String>,
 }
 
 async fn prepare_worker_source(
@@ -764,9 +767,12 @@ async fn existing_sidecar_result(
                 id: Uuid::now_v7().to_string(),
                 media_source_id: source.source_id.clone(),
                 relative_path: prepared.relative_sidecar_path.clone(),
-                provider: identity.provider.map(str::to_owned),
-                provider_anime_id: identity.provider_anime_id.map(str::to_owned),
-                provider_episode_id: identity.provider_episode_id.map(str::to_owned),
+                // A skipped item did not write the file, so the registration must not claim it for
+                // Lux: no provider, so a user's own sidecar still needs `confirmUserSidecar` to be
+                // deleted (ADR-052 P5).
+                provider: None,
+                provider_anime_id: None,
+                provider_episode_id: None,
                 fingerprint: fingerprint(&bytes),
             }),
         }),
@@ -907,26 +913,27 @@ async fn process_danmaku_source_with_plugin(
 
 /// Runs one administrator-selected episode: no `danmaku.match`, only `danmaku.fetch`.
 ///
-/// The chosen provider travels in the track row the job creation wrote, so a queued job keeps its
-/// target across restarts without a new column. The XML still goes through the same host decode,
+/// The chosen provider, anime and episode are stored on the job item, so a queued job keeps its
+/// target across restarts and never depends on a `danmaku_tracks` row. The XML still goes through the same host decode,
 /// `validate_danmaku_xml` and atomic write as the automatic path.
 async fn process_manual_danmaku_source(
     source: StoredDanmakuSource,
     plugins: PluginService,
-    database: Database,
     manual: ManualItemTarget,
     overwrite: bool,
     item_id: String,
 ) -> WorkerResult {
-    let provider = database
-        .find_danmaku_track_provider(&source.source_id)
-        .await
-        .ok()
-        .flatten();
+    let Some(episode_id) = manual.episode_id.as_deref() else {
+        return WorkerResult::failed(
+            item_id,
+            "INVALID_MANUAL_TARGET",
+            "manual match job item has no episode",
+        );
+    };
     let identity = TrackIdentity {
-        provider: provider.as_deref(),
+        provider: manual.provider.as_deref(),
         provider_anime_id: manual.provider_anime_id.as_deref(),
-        provider_episode_id: Some(manual.episode_id.as_str()),
+        provider_episode_id: Some(episode_id),
     };
     let prepared = match prepare_worker_source(&source, &item_id).await {
         Ok(prepared) => prepared,
@@ -937,10 +944,7 @@ async fn process_manual_danmaku_source(
     {
         return result;
     }
-    let fetched = match plugins
-        .fetch_danmaku(identity.provider, &manual.episode_id)
-        .await
-    {
+    let fetched = match plugins.fetch_danmaku(identity.provider, episode_id).await {
         Ok(value) => value,
         Err(error) => {
             return WorkerResult::failed(

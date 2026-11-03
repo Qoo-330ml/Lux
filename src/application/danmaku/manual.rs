@@ -12,7 +12,7 @@ use tokio::fs;
 use uuid::Uuid;
 
 use super::{
-    DanmakuService, DanmakuServiceError, danmaku_sidecar_path,
+    DanmakuService, DanmakuServiceError,
     path::{DanmakuSourcePathError, safe_danmaku_source_paths},
 };
 use crate::{
@@ -122,8 +122,9 @@ impl DanmakuService {
     ///
     /// The job reuses `danmaku_match_jobs`/`danmaku_match_job_items` with `total_count = 1` and the
     /// item's library, so cancellation, listing and the retention sweep keep working. The selected
-    /// episode is prefilled on the job item; the provider label travels in the existing
-    /// `danmaku_tracks.provider` column, which the worker reads before it fetches.
+    /// episode and the provider label the administrator chose are stored on the job item, and the
+    /// job is marked `MANUAL`; `danmaku_tracks` is not touched until the worker has written the
+    /// file, so a user's own sidecar can never be relabelled as Lux-written by a queued job.
     ///
     /// Unlike an automatic library sweep, a manual match does not require the library to be selected
     /// in the danmaku plugin configuration: it is an explicit administrator action on one item
@@ -163,13 +164,8 @@ impl DanmakuService {
         {
             return Err(DanmakuServiceError::AlreadyActive);
         }
-        let relative_sidecar_path = danmaku_sidecar_path(Path::new(&source.relative_path))
-            .map_err(|_| DanmakuServiceError::SourceNotFound)?
-            .to_string_lossy()
-            .into_owned();
         let job_id = Uuid::now_v7().to_string();
         let item_row_id = format!("{job_id}:{}", source.source_id);
-        let track_id = Uuid::now_v7().to_string();
         let concurrency = settings.concurrency.clamp(0, super::job::MAX_CONCURRENCY);
         self.database
             .create_danmaku_single_item_job(
@@ -181,11 +177,10 @@ impl DanmakuService {
                 },
                 NewDanmakuSingleItemJob {
                     id: &item_row_id,
-                    track_id: &track_id,
                     media_source_id: &source.source_id,
+                    manual: true,
                     provider_anime_id: target.anime_id.as_deref(),
                     provider_episode_id: Some(&target.episode_id),
-                    relative_sidecar_path: &relative_sidecar_path,
                     provider: target.provider.as_deref(),
                 },
             )

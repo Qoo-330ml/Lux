@@ -5055,9 +5055,11 @@ async fn postgres_danmaku_provenance_migration_upgrades_a_populated_database()
         .await?;
     assert_eq!(old_version, 247);
 
-    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('pg-legacy-library', 'Legacy', 'MOVIE')")
-        .execute(&pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind) VALUES ('pg-legacy-library', 'Legacy', 'MOVIE')",
+    )
+    .execute(&pool)
+    .await?;
     sqlx::query(
         "INSERT INTO library_roots (
              id, library_id, canonical_path, display_path, is_available, is_writable

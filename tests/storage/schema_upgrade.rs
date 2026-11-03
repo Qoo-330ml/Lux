@@ -102,7 +102,10 @@ async fn danmaku_provenance_columns_upgrade_existing_rows_in_place()
     let migrations = directory.path().join("migrations-old");
     copy_migrations(&migrations, NEW_MIGRATION)?;
     let pool = open_pool(&directory.path().join("lux.db")).await?;
-    Migrator::new(migrations.as_path()).await?.run(&pool).await?;
+    Migrator::new(migrations.as_path())
+        .await?
+        .run(&pool)
+        .await?;
     let old_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(&pool)
         .await?;
@@ -111,7 +114,10 @@ async fn danmaku_provenance_columns_upgrade_existing_rows_in_place()
 
     // Apply only the new migration, exactly as an upgraded deployment would.
     copy_one_migration(&migrations, NEW_MIGRATION)?;
-    Migrator::new(migrations.as_path()).await?.run(&pool).await?;
+    Migrator::new(migrations.as_path())
+        .await?
+        .run(&pool)
+        .await?;
 
     let new_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(&pool)

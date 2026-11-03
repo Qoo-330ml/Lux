@@ -533,6 +533,7 @@ struct DanmakuMatchItemRow {
     media_source_id: String,
     provider_anime_id: Option<String>,
     provider_episode_id: Option<String>,
+    provider: Option<String>,
     root_path: Option<String>,
     relative_path: Option<String>,
     item_type: Option<String>,
@@ -551,6 +552,7 @@ impl From<DanmakuMatchItemRow> for StoredDanmakuMatchItem {
             media_source_id: row.media_source_id,
             provider_anime_id: row.provider_anime_id,
             provider_episode_id: row.provider_episode_id,
+            provider: row.provider,
             root_path: row.root_path,
             relative_path: row.relative_path,
             item_type: row.item_type,
@@ -4987,14 +4989,13 @@ impl Database {
         transaction.commit().await.map_err(self.sqlx_err())
     }
 
-    /// Creates a one-target danmaku job: the job row, its single prefilled item and, only when the
-    /// source has no track row yet, the row that announces the chosen provider to the worker.
+    /// Creates a one-target danmaku job: the job row and its single item.
     ///
-    /// The provider label cannot travel in the job item columns — those carry the provider's
-    /// anime/episode identifiers — so `danmaku_tracks.provider`, which already exists, is the
-    /// durable carrier. The insert is `DO NOTHING` on conflict: a track row (and therefore its
-    /// provenance) is never rewritten before a worker actually writes the file, otherwise a
-    /// user-provided sidecar would be relabelled as Lux-written and could be deleted without the
+    /// `kind` records whether the job is an administrator's manual match (`MANUAL`) or a library
+    /// sweep retried one item at a time (`SWEEP`), and the item's `provider` records the source the
+    /// administrator chose. Nothing in `danmaku_tracks` is touched: a track row (and therefore its
+    /// provenance) is only written once a worker has really written or validated the file, otherwise
+    /// a user-provided sidecar could be relabelled as Lux-written and deleted without the
     /// `confirmUserSidecar` confirmation (ADR-052 P5).
     pub(crate) async fn create_danmaku_single_item_job(
         &self,
@@ -5004,11 +5005,12 @@ impl Database {
         let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         self.query(
             "INSERT INTO danmaku_match_jobs (
-                id, library_id, status, overwrite, concurrency, total_count
-             ) VALUES (?, ?, 'PENDING', ?, ?, 1)",
+                id, library_id, status, kind, overwrite, concurrency, total_count
+             ) VALUES (?, ?, 'PENDING', ?, ?, ?, 1)",
         )
         .bind(job.id)
         .bind(job.library_id)
+        .bind(if item.manual { "MANUAL" } else { "SWEEP" })
         .bind(database_flag(job.overwrite))
         .bind(job.concurrency)
         .execute(&mut *transaction)
@@ -5016,54 +5018,20 @@ impl Database {
         .map_err(self.sqlx_err())?;
         self.query(
             "INSERT INTO danmaku_match_job_items (
-                id, job_id, media_source_id, status, provider_anime_id, provider_episode_id
-             ) VALUES (?, ?, ?, 'PENDING', ?, ?)",
+                id, job_id, media_source_id, status,
+                provider_anime_id, provider_episode_id, provider
+             ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?)",
         )
         .bind(item.id)
         .bind(job.id)
         .bind(item.media_source_id)
         .bind(item.provider_anime_id)
         .bind(item.provider_episode_id)
+        .bind(item.provider)
         .execute(&mut *transaction)
         .await
         .map_err(self.sqlx_err())?;
-        // Only a job that targets one exact episode needs the provider hint; a one-target retry of
-        // a library item runs `danmaku.match` and must not create a registration out of nothing.
-        if item.provider_episode_id.is_some() {
-            self.query(
-                "INSERT INTO danmaku_tracks (
-                    id, media_source_id, relative_path, format, provider,
-                    provider_anime_id, provider_episode_id, status, last_checked_at
-                 ) VALUES (?, ?, ?, 'XML', ?, ?, ?, 'MISSING', unixepoch())
-                 ON CONFLICT(media_source_id) DO NOTHING",
-            )
-            .bind(item.track_id)
-            .bind(item.media_source_id)
-            .bind(item.relative_sidecar_path)
-            .bind(item.provider)
-            .bind(item.provider_anime_id)
-            .bind(item.provider_episode_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(self.sqlx_err())?;
-        }
         transaction.commit().await.map_err(self.sqlx_err())
-    }
-
-    /// Reads the provider label a media source's danmaku track announces.
-    ///
-    /// The manual-match worker reads it back to pass the administrator's choice to `danmaku.fetch`
-    /// and to keep it on the row it writes; `danmaku_tracks.provider` is the only existing column
-    /// that can carry an opaque provider label across a restart (ADR-052 P5, no new columns).
-    pub(crate) async fn find_danmaku_track_provider(
-        &self,
-        media_source_id: &str,
-    ) -> Result<Option<String>, StorageError> {
-        self.query_scalar("SELECT provider FROM danmaku_tracks WHERE media_source_id = ?")
-            .bind(media_source_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(self.sqlx_err())
     }
 
     /// Deletes the `danmaku_tracks` row of one media source; answers whether a row was removed.
@@ -5126,31 +5094,6 @@ impl Database {
         Ok(row.map(StoredTrackedDanmakuSource::from))
     }
 
-    /// Whether every item of a danmaku job is one administrator-selected episode.
-    ///
-    /// A manual match names one episode per item, so the "library must be selected in the plugin
-    /// configuration" rule of a library sweep does not apply to such a job (`docs/LUX-DEVELOPMENT.md`
-    /// §3.7). The job has to have items: an empty job is a sweep with nothing to do.
-    pub(crate) async fn danmaku_match_job_is_manual_only(
-        &self,
-        job_id: &str,
-    ) -> Result<bool, StorageError> {
-        self.query_scalar(
-            "SELECT CASE WHEN EXISTS(
-                SELECT 1 FROM danmaku_match_job_items WHERE job_id = ?
-            ) AND NOT EXISTS(
-                SELECT 1 FROM danmaku_match_job_items
-                WHERE job_id = ? AND provider_episode_id IS NULL
-            ) THEN 1 ELSE 0 END",
-        )
-        .bind(job_id)
-        .bind(job_id)
-        .fetch_one(&self.pool)
-        .await
-        .map(|value: i64| value != 0)
-        .map_err(self.sqlx_err())
-    }
-
     /// Lists every item of a danmaku job, whatever its status, for the retry projection.
     pub(crate) async fn list_danmaku_match_items(
         &self,
@@ -5158,7 +5101,7 @@ impl Database {
     ) -> Result<Vec<StoredDanmakuMatchItem>, StorageError> {
         self.query_as::<DanmakuMatchItemRow>(
             "SELECT ji.id, ji.media_source_id,
-                    ji.provider_anime_id, ji.provider_episode_id,
+                    ji.provider_anime_id, ji.provider_episode_id, ji.provider,
                     mi.item_type, mi.season_number, mi.episode_number,
                     mi.title, mi.original_title,
                     series.title AS series_title,
@@ -5207,7 +5150,7 @@ impl Database {
         id: &str,
     ) -> Result<Option<StoredDanmakuMatchJob>, StorageError> {
         self.query(
-            "SELECT id, library_id, status, overwrite, concurrency,
+            "SELECT id, library_id, status, kind, overwrite, concurrency,
                     total_count, processed_count, success_count,
                     skipped_count, failed_count, cancel_requested, error,
                     created_at, started_at, finished_at
@@ -5230,7 +5173,7 @@ impl Database {
     ) -> Result<Vec<StoredDanmakuMatchJob>, StorageError> {
         let rows = if let Some(status) = status {
             self.query(
-                "SELECT id, library_id, status, overwrite, concurrency,
+                "SELECT id, library_id, status, kind, overwrite, concurrency,
                         total_count, processed_count, success_count,
                         skipped_count, failed_count, cancel_requested, error,
                         created_at, started_at, finished_at
@@ -5245,7 +5188,7 @@ impl Database {
             .await
         } else {
             self.query(
-                "SELECT id, library_id, status, overwrite, concurrency,
+                "SELECT id, library_id, status, kind, overwrite, concurrency,
                         total_count, processed_count, success_count,
                         skipped_count, failed_count, cancel_requested, error,
                         created_at, started_at, finished_at
@@ -5331,7 +5274,7 @@ impl Database {
     ) -> Result<Vec<StoredDanmakuMatchItem>, StorageError> {
         self.query_as::<DanmakuMatchItemRow>(
             "SELECT ji.id, ji.media_source_id,
-                    ji.provider_anime_id, ji.provider_episode_id,
+                    ji.provider_anime_id, ji.provider_episode_id, ji.provider,
                     mi.item_type, mi.season_number, mi.episode_number,
                     mi.title, mi.original_title,
                     series.title AS series_title,

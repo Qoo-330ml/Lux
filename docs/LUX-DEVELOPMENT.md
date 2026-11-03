@@ -19328,7 +19328,7 @@ setup 启动的首轮 `RECONCILE_LIBRARY` 扫描，因此启动流程新增“�
 
 #### LUX-880：管理员手动弹幕匹配 API（ADR-052 P5）
 
-范围（ADR-052 P5，已获批准）：只做后端三个管理端点与它们的应用层服务，**不改数据库/迁移、不动
+范围（ADR-052 P5，已获批准）：只做后端三个管理端点与它们的应用层服务，**迁移只限第 2 轮返工批准的两列（见下）、不动
 Emby 路由、不改 `web/` 的界面**（D3 另做）。依赖 LUX-877 的 `search_danmaku`/`fetch_danmaku`/
 `danmaku_manual_match_supported`。
 
@@ -19344,16 +19344,19 @@ Emby 路由、不改 `web/` 的界面**（D3 另做）。依赖 LUX-877 的 `sea
 - `POST /api/v1/admin/items/{itemId}/danmaku/match`：`{ sourceId?, provider?, animeId?, episodeId,
   overwrite }`，创建**单条**持久化作业（复用 `danmaku_match_jobs`/`danmaku_match_job_items` 与现有
   Worker 池，`total_count = 1`，`library_id` 取条目所属库），返回 202 与现有 match-jobs DTO。
-  作业项预填 `provider_anime_id`/`provider_episode_id`，Worker 认领一个 `PENDING` 且已预填
-  `provider_episode_id` 的条目时跳过 `danmaku.match`，直接 `danmaku.fetch` → `decode_xml`（含
-  `validate_danmaku_xml`）→ `atomic_write_danmaku_xml` → 登记 `danmaku_tracks`。`provider` 是插件返回的
-  不透明标签，缺省/空串/纯空白按“未设置”处理；**不加新列**：它随创建作业时的
-  `danmaku_tracks.provider` 持久化（仅当该源还没有 track 行时插入 `status='MISSING'` 的行，
-  `ON CONFLICT DO NOTHING`），Worker 因此能在重启后仍知道该用哪个 provider 调用 `danmaku.fetch`；
-  已有 track 行的 provider 与来源**永不改写**（见下）。`overwrite=false` 且已有有效同名 `.xml` →
+  作业标记为 `danmaku_match_jobs.kind = 'MANUAL'`（自动整库作业为默认值 `'SWEEP'`），作业项记录
+  `provider_anime_id`/`provider_episode_id` 与管理员所选 `danmaku_match_job_items.provider`。Worker
+  **只看 `job.kind`**：`MANUAL` 作业对每个条目跳过 `danmaku.match`，直接用作业项的 provider 与分集
+  `danmaku.fetch` → `decode_xml`（含 `validate_danmaku_xml`）→ `atomic_write_danmaku_xml`，写入成功后
+  才登记 `danmaku_tracks` 并记下 provider；不再从 `provider_episode_id` 或 track 行推断。`provider` 是
+  插件返回的不透明标签，缺省/空串/纯空白按“未设置”处理。**创建作业不触碰任何 `danmaku_tracks` 行**；
+  跳过（`SKIPPED`）、失败、取消时 track 行保持原状（跳过时登记的 track 不带 provider，不把用户自带旁车
+  声明为 Lux 写入）。`overwrite=false` 且已有有效同名 `.xml` →
   作业项 `SKIPPED` 且保留原文件；`overwrite=true` 覆盖。库内已有活动弹幕作业 → 409
   （`AlreadyActive`）。媒体库无需在插件配置的“允许匹配的媒体库”中（见下）。`FAILED`/`CANCELLED`
-  的手动作业可 `/retry`：新建同样只含一个目标的作业，沿用已记录的 provider 与分集继续 fetch。
+  的手动作业可 `/retry`：新建同样只含一个目标的 `MANUAL` 作业，沿用作业项记录的 provider 与分集继续
+  fetch；作业项已被级联删除（如媒体文件被删后重扫）时返回 409，不会退化成整库作业。自动作业的重试
+  不预填分集，仍受“媒体库须已选择”约束。
 - `DELETE /api/v1/admin/items/{itemId}/danmaku?sourceId=&confirmUserSidecar=`：删除已登记的旁车
   `.xml` 与 `danmaku_tracks` 行，成功 204。仅当路径通过现有媒体根/符号链接校验时删文件；越界、符号
   链接或非普通文件 → 400 且不删任何东西；媒体文件已不存在导致无法确认路径安全 → 只清理登记，同样
@@ -19373,7 +19376,9 @@ Emby 路由、不改 `web/` 的界面**（D3 另做）。依赖 LUX-877 的 `sea
   `ManualDanmakuEpisode`，`types.ts` 转出同名类型，`client.ts` 新增 `manualDanmakuSearch`/
   `startManualDanmakuMatch`/`deleteItemDanmaku`，`query-keys.ts` 新增
   `adminItemDanmakuSearch`（仅 API 层，无 UI）。
-- 未改：数据库与迁移（无新列、无新表）、`src/api/emby*`、`web/src/features/**`。
+- 迁移（第 2 轮返工，负责人已批准，加性）：`danmaku_match_jobs.kind`（`SWEEP`/`MANUAL`，默认 `SWEEP`）与
+  `danmaku_match_job_items.provider`（可空），SQLite 0246、PostgreSQL 0248；未动 `danmaku_tracks`。
+- 未改：`src/api/emby*`、`web/src/features/**`。
 
 **规格裁决（已由负责人放宽）**：§3.7 原文“未选择的媒体库不能创建弹幕匹配任务”与手动匹配“由管理员
 显式触发、不受允许媒体库限制”冲突，已上报；负责人裁决放宽手动匹配。现 §3.7 改为“未选择的媒体库不能
@@ -19440,7 +19445,10 @@ Emby 路由、不改 `web/` 的界面**（D3 另做）。依赖 LUX-877 的 `sea
 `--test storage` 115/115；`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets
 --all-features -- -D warnings`、`scripts/check-migration-parity.py`、`scripts/check-backend-branches.py`、
 `scripts/check-api-types.sh` 通过；`pnpm --dir web build` 与 `pnpm --dir web test`（161 文件 / 1441
-用例）通过。无迁移、无新列。
+用例）通过。第 1 轮无迁移、无新列。
+
+第 2 轮返工：新增上述两列迁移，创建手动作业不再写 `danmaku_tracks`；provider 取自作业项；手动/自动
+只看 `job.kind`；手动作业重试按 `kind` 分支。
 
 ## 31. 参考资料
 

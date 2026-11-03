@@ -17,10 +17,10 @@
 | `--test metadata` | 元数据抓取与选择、NFO 回写、扫描后剧集元数据、人物、字幕 | 14 | 143 |
 | `--test images` | 图片变体、写回、缩略图与图片 API | 6 | 55 |
 | `--test playback` | 播放、播放令牌/历史/续播、观看状态归档、章节与片头片尾检测 | 10 | 35 |
-| `--test storage` | SQLite/PostgreSQL 存储、迁移、WAL、数据库维护与启动守卫 | 8 | 115 |
-| `--test plugins` | 插件协议与运行时、弹幕、IP 属地、媒体信息插件配置 | 11 | 117 |
+| `--test storage` | SQLite/PostgreSQL 存储、迁移、WAL、数据库维护与启动守卫 | 9 | 116 |
+| `--test plugins` | 插件协议与运行时、弹幕、IP 属地、媒体信息插件配置 | 11 | 120 |
 | `--test strm` | STRM 目标解析/探测/播放与 ffprobe | 9 | 42 |
-| 合计（12 组） |  | 125 | 900 |
+| 合计（12 组） |  | 126 | 904 |
 
 另有 7 个 binary 因为进程级共享状态或外部服务依赖保持独立，见第 4 节：`--test background_work_budget`、`--test image_variants_perf`、`--test performance`、`--test postgres_database`、`--test reidentify`、`--test scanned_metadata`、`--test shutdown`。合计 12 + 7 = 19 个集成测试 target。
 
@@ -143,10 +143,11 @@ cargo test --locked --test <新 target> <旧名>::
 | `log_migration` | 10 | `cargo test --locked --test storage log_migration::` |
 | `sqlite_wal` | 2 | `cargo test --locked --test storage sqlite_wal::` |
 | `storage` | 76 | `cargo test --locked --test storage storage::` |
+| † `schema_upgrade` | 1 | `cargo test --locked --test storage schema_upgrade::` |
 | † `index_audit` | 3 | `cargo test --locked --test storage index_audit::` |
 | `danmaku` | 13 | `cargo test --locked --test plugins danmaku::` |
 | `danmaku_api` | 2 | `cargo test --locked --test plugins danmaku_api::` |
-| † `danmaku_manual_api` | 16 | `cargo test --locked --test plugins danmaku_manual_api::` |
+| † `danmaku_manual_api` | 19 | `cargo test --locked --test plugins danmaku_manual_api::` |
 | `danmaku_config` | 2 | `cargo test --locked --test plugins danmaku_config::` |
 | `danmaku_config_api` | 1 | `cargo test --locked --test plugins danmaku_config_api::` |
 | `ip_location_plugins` | 3 | `cargo test --locked --test plugins ip_location_plugins::` |
@@ -171,7 +172,7 @@ cargo test --locked --test <新 target> <旧名>::
 | `reidentify` | 25 | `cargo test --locked --test reidentify`（本来就没有合并） |
 | `scanned_metadata` | 23 | `cargo test --locked --test scanned_metadata`（本来就没有合并） |
 | `shutdown` | 2 | `cargo test --locked --test shutdown`（本来就没有合并） |
-| **合计** | **1014** |  |
+| **合计** | **1018** |  |
 
 ## 3. 只跑某一个原文件的测试
 
@@ -251,7 +252,7 @@ cargo test --locked --test scanner
 | `plugins` | 84 | 117 | 新增 33 例（后续任务） |
 | `strm` | 42 | 42 | 一致 |
 | 独立 binary 合计 | 112 | 114 | 新增 2 例（后续任务） |
-| **合计** | **934** | **1014** | 差异均为合并后新增用例 |
+| **合计** | **934** | **1018** | 差异均为合并后新增用例 |
 
 ### 5.2 单个用例稳定性复核
 

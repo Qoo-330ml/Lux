@@ -1205,6 +1205,15 @@ async fn retrying_a_failed_manual_job_fetches_the_same_episode_again()
     .fetch_one(fixture.database.pool())
     .await?;
     assert_eq!(prefilled.as_deref(), Some("bad-xml"));
+    let (kind, provider): (String, Option<String>) = sqlx::query_as(
+        "SELECT j.kind, ji.provider FROM danmaku_match_jobs j
+         JOIN danmaku_match_job_items ji ON ji.job_id = j.id WHERE j.id = ?",
+    )
+    .bind(retried_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(kind, "MANUAL");
+    assert_eq!(provider.as_deref(), Some("stub"));
     assert_eq!(fixture.wait_for_job(retried_id).await?["status"], "FAILED");
     assert_eq!(
         fixture.fetch_calls(),
@@ -1264,8 +1273,8 @@ async fn manual_match_never_relabels_a_user_sidecar_as_lux_written()
     assert_eq!(unconfirmed.status(), reqwest::StatusCode::CONFLICT);
     assert!(tokio::fs::try_exists(fixture.sidecar_path()).await?);
 
-    // `overwrite=true` replaces the file, but the existing row is never relabelled either: the
-    // administrator's provider label only survives when the job itself created the row.
+    // `overwrite=true` really replaces the file with the fetched episode, so from then on the
+    // registration is Lux-written and records the administrator's provider.
     let created = fixture
         .client
         .post(fixture.match_url())
@@ -1282,15 +1291,138 @@ async fn manual_match_never_relabels_a_user_sidecar_as_lux_written()
     assert_eq!(fixture.wait_for_job(&job_id).await?["status"], "COMPLETED");
     assert_eq!(tokio::fs::read(fixture.sidecar_path()).await?, FETCH_XML);
     let (_, provider, _) = fixture.track_row().await?.ok_or("missing track")?;
-    assert_eq!(provider, None);
-    let still_unconfirmed = fixture
+    assert_eq!(provider.as_deref(), Some("stub"));
+    let confirmed_free = fixture
         .client
         .delete(fixture.delete_url())
         .header(COOKIE, &fixture.cookies)
         .header("x-csrf-token", &fixture.csrf)
         .send()
         .await?;
-    assert_eq!(still_unconfirmed.status(), reqwest::StatusCode::CONFLICT);
+    assert!(confirmed_free.status().is_success(), "{confirmed_free:?}");
+    Ok(())
+}
+
+async fn queue_manual_job(
+    fixture: &Fixture,
+    body: Value,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let created = fixture
+        .client
+        .post(fixture.match_url())
+        .header(COOKIE, &fixture.cookies)
+        .header("x-csrf-token", &fixture.csrf)
+        .json(&body)
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::ACCEPTED);
+    Ok(created.json::<Value>().await?["job"]["id"]
+        .as_str()
+        .ok_or("missing job id")?
+        .to_owned())
+}
+
+#[tokio::test]
+async fn a_manual_match_never_registers_an_unregistered_user_sidecar_as_lux_written()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = setup(
+        PluginSetup::manual(&[
+            DANMAKU_MATCH_CAPABILITY,
+            DANMAKU_SEARCH_CAPABILITY,
+            DANMAKU_FETCH_CAPABILITY,
+        ]),
+        None,
+    )
+    .await?;
+    // The user's file is on disk but no scan has registered it yet.
+    tokio::fs::write(fixture.sidecar_path(), USER_XML).await?;
+    assert!(fixture.track_row().await?.is_none());
+
+    // A failing overwrite leaves neither a registration nor a changed file behind.
+    let failed = queue_manual_job(&fixture, manual_match_body("bad-xml", true)).await?;
+    assert_eq!(fixture.wait_for_job(&failed).await?["status"], "FAILED");
+    assert!(fixture.track_row().await?.is_none());
+    assert_eq!(tokio::fs::read(fixture.sidecar_path()).await?, USER_XML);
+
+    // A skipped match registers the file without claiming it, so deleting it still needs the
+    // explicit confirmation.
+    let skipped = queue_manual_job(&fixture, manual_match_body("ep-1", false)).await?;
+    assert_eq!(fixture.wait_for_job(&skipped).await?["skippedCount"], 1);
+    let (_, provider, _) = fixture.track_row().await?.ok_or("missing track")?;
+    assert_eq!(provider, None);
+    let unconfirmed = fixture
+        .client
+        .delete(fixture.delete_url())
+        .header(COOKIE, &fixture.cookies)
+        .header("x-csrf-token", &fixture.csrf)
+        .send()
+        .await?;
+    assert_eq!(unconfirmed.status(), reqwest::StatusCode::CONFLICT);
+    assert!(tokio::fs::try_exists(fixture.sidecar_path()).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_manual_match_uses_the_selected_provider_even_when_the_track_has_another()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = setup(
+        PluginSetup::manual(&[
+            DANMAKU_MATCH_CAPABILITY,
+            DANMAKU_SEARCH_CAPABILITY,
+            DANMAKU_FETCH_CAPABILITY,
+        ]),
+        None,
+    )
+    .await?;
+    sqlx::query(
+        "INSERT INTO danmaku_tracks (id, media_source_id, relative_path, format, provider, status)
+         VALUES ('manual-api-other-provider', ?, 'Demo.Movie.2024.xml', 'XML', 'other', 'MISSING')",
+    )
+    .bind(&fixture.source_id)
+    .execute(fixture.database.pool())
+    .await?;
+    let job = queue_manual_job(&fixture, manual_match_body("ep-2", true)).await?;
+    assert_eq!(fixture.wait_for_job(&job).await?["status"], "COMPLETED");
+    let (_, provider, episode) = fixture.track_row().await?.ok_or("missing track")?;
+    assert_eq!(provider.as_deref(), Some("stub"));
+    assert_eq!(episode.as_deref(), Some("ep-2"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn retrying_a_manual_job_whose_item_is_gone_never_becomes_a_library_sweep()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = setup(
+        PluginSetup::manual(&[
+            DANMAKU_MATCH_CAPABILITY,
+            DANMAKU_SEARCH_CAPABILITY,
+            DANMAKU_FETCH_CAPABILITY,
+        ]),
+        None,
+    )
+    .await?;
+    let job_id = queue_manual_job(&fixture, manual_match_body("bad-xml", false)).await?;
+    assert_eq!(fixture.wait_for_job(&job_id).await?["status"], "FAILED");
+    // A rescan that removed the media file cascades the job item away.
+    sqlx::query("DELETE FROM danmaku_match_job_items WHERE job_id = ?")
+        .bind(&job_id)
+        .execute(fixture.database.pool())
+        .await?;
+    let retried = fixture
+        .client
+        .post(format!(
+            "{}/api/v1/admin/danmaku/match-jobs/{job_id}/retry",
+            fixture.base_url
+        ))
+        .header(COOKIE, &fixture.cookies)
+        .header("x-csrf-token", &fixture.csrf)
+        .send()
+        .await?;
+    assert_eq!(retried.status(), reqwest::StatusCode::CONFLICT);
+    let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM danmaku_match_jobs")
+        .fetch_one(fixture.database.pool())
+        .await?;
+    assert_eq!(jobs, 1);
     Ok(())
 }
 
