@@ -564,17 +564,83 @@ describe("PlayerPage playback synchronization", () => {
     const settings = container.querySelector<HTMLButtonElement>('button[aria-label="播放器设置"]');
     if (!settings) throw new Error("settings control was not rendered");
     await act(async () => settings.click());
-    expect(container.querySelector(".lux-player-settings-popover")).not.toBeNull();
+    expect(container.querySelector(".lux-player-settings-drawer")).not.toBeNull();
 
     await act(async () => {
-      container?.querySelector(".lux-player-settings-popover")?.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
+      container?.querySelector(".lux-player-settings-drawer")?.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
     });
-    expect(container.querySelector(".lux-player-settings-popover")).not.toBeNull();
+    expect(container.querySelector(".lux-player-settings-drawer")).not.toBeNull();
 
     await act(async () => {
       document.body.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
     });
-    expect(container.querySelector(".lux-player-settings-popover")).toBeNull();
+    expect(container.querySelector(".lux-player-settings-drawer")).toBeNull();
+  });
+
+  async function renderSimplePlayer(id: string) {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id,
+      title: "抽屉测试",
+      itemType: "MOVIE",
+      mediaSources: [{ id: `source-${id}`, isDefault: true, durationTicks: 1_200_000_000 }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({ positionTicks: 0, isPlayed: false, state: null, isPaused: false });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={[`/watch/${id}`]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    return container;
+  }
+
+  it("opens playback information as the settings drawer's info tab with the I key", async () => {
+    const host = await renderSimplePlayer("movie-info-key");
+    expect(host.querySelector(".lux-player-settings-drawer")).toBeNull();
+
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "i", bubbles: true }));
+    });
+    const drawer = host.querySelector(".lux-player-settings-drawer");
+    expect(drawer).not.toBeNull();
+    const selected = host.querySelector('[role="tab"][aria-selected="true"]');
+    expect(selected?.textContent?.trim()).toBe("播放信息");
+    expect(host.querySelector('[aria-label="复制播放信息"]')).not.toBeNull();
+
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "i", bubbles: true }));
+    });
+    expect(host.querySelector(".lux-player-settings-drawer")).toBeNull();
+  });
+
+  it("breathes the centre mark until the media element has data", async () => {
+    const host = await renderSimplePlayer("movie-center-loading");
+    const control = () => host.querySelector<HTMLButtonElement>(".lux-player-center-control");
+    if (!control()) throw new Error("centre control was not rendered");
+    expect(control()?.classList.contains("is-loading")).toBe(true);
+    expect(control()?.getAttribute("aria-label")).toBe("加载中");
+
+    const video = host.querySelector<HTMLVideoElement>("video");
+    await act(async () => video?.dispatchEvent(new Event("loadedmetadata")));
+    expect(control()?.classList.contains("is-loading")).toBe(false);
+    expect(control()?.getAttribute("aria-label")).toBe("播放");
+
+    await act(async () => video?.dispatchEvent(new Event("waiting")));
+    expect(control()?.classList.contains("is-loading")).toBe(true);
+    await act(async () => video?.dispatchEvent(new Event("playing")));
+    expect(control()?.classList.contains("is-loading")).toBe(false);
   });
 
   it("keeps presentation settings local without rebuilding the playback session", async () => {
@@ -616,37 +682,45 @@ describe("PlayerPage playback synchronization", () => {
     if (!settings) throw new Error("settings control was not rendered");
     await act(async () => settings.click());
 
+    const tab = (name: string) => Array.from(container?.querySelectorAll<HTMLButtonElement>('[role="tab"]') ?? [])
+      .find((candidate) => candidate.textContent?.trim() === name);
+    const choice = (group: string, value: string) =>
+      container?.querySelector<HTMLButtonElement>(`[role="radiogroup"][aria-label="${group}"] [data-value="${value}"]`);
+
     const loop = container.querySelector<HTMLButtonElement>('[role="switch"][aria-labelledby="lux-player-loop-label"]');
-    const aspect = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
-      .find((button) => button.textContent?.trim() === "4:3");
-    const flip = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
-      .find((button) => button.textContent?.trim() === "水平镜像");
     const video = container.querySelector<HTMLVideoElement>("video");
-    if (!loop || !aspect || !flip || !video) throw new Error("presentation controls were not rendered");
+    if (!loop || !video) throw new Error("presentation controls were not rendered");
     const sessionCallsBeforeSettings = vi.mocked(api.createWebPlaybackSession).mock.calls.length;
     const eventCallsBeforeSettings = vi.mocked(api.webPlaybackEvent).mock.calls.length;
 
     await act(async () => loop.click());
+    expect(loop.getAttribute("aria-checked")).toBe("true");
+    expect(video.loop).toBe(true);
+
+    await act(async () => tab("长宽比")?.click());
+    const aspect = choice("长宽比", "4:3");
+    const flip = choice("画面翻转", "horizontal");
+    if (!aspect || !flip) throw new Error("aspect and flip controls were not rendered");
     await act(async () => aspect.click());
     await act(async () => flip.click());
 
-    expect(loop.getAttribute("aria-checked")).toBe("true");
-    expect(video.loop).toBe(true);
     expect(video.style.aspectRatio).toBe("4 / 3");
     expect(video.style.transform).toBe("translate(-50%, -50%) scaleX(-1)");
     expect(vi.mocked(api.createWebPlaybackSession)).toHaveBeenCalledTimes(sessionCallsBeforeSettings);
     expect(vi.mocked(api.webPlaybackEvent)).toHaveBeenCalledTimes(eventCallsBeforeSettings);
 
-    const defaultAspect = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
-      .find((button) => button.textContent?.trim() === "默认");
-    const normalFlip = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
-      .find((button) => button.textContent?.trim() === "正常");
+    const defaultAspect = choice("长宽比", "default");
+    const normalFlip = choice("画面翻转", "normal");
     if (!defaultAspect || !normalFlip) throw new Error("default presentation controls were not rendered");
     await act(async () => defaultAspect.click());
     await act(async () => normalFlip.click());
 
     expect(video.style.aspectRatio).toBe("");
     expect(video.style.transform).toBe("");
+
+    await act(async () => tab("长宽比")?.click());
+    await act(async () => choice("长宽比", "fill")?.click());
+    expect(video.style.objectFit).toBe("cover");
   });
 
   it("restarts locally at the end only while loop is enabled", async () => {

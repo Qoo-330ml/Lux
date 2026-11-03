@@ -1,4 +1,4 @@
-import { LuxSelectField } from "../../../components/ui";
+import { PlayerOptionList } from "./player-option-list";
 import {
   shouldShowAudioTrackSelector,
   type AudioTrackOption,
@@ -38,22 +38,17 @@ export function PlayerAudioTrackSelector({
 
   return (
     <div className="lux-player-settings-section" data-settings-section="audio-track">
-      <label className="lux-player-settings-label" htmlFor="lux-player-audio-select">音轨</label>
-      <LuxSelectField
-        id="lux-player-audio-select"
-        className="lux-player-caption-select"
-        aria-label="选择音轨"
-        title="选择音轨"
+      <h4 className="lux-player-settings-label">音轨</h4>
+      <PlayerOptionList
+        label="选择音轨"
         value={current}
         disabled={switching || disabled}
-        onChange={(event) => onSelect(event.target.value)}
-      >
-        {tracks.map((track) => (
-          <option key={track.index} value={track.index}>
-            {track.isCurrent ? `${track.label}（当前）` : track.label}
-          </option>
-        ))}
-      </LuxSelectField>
+        options={tracks.map((track) => ({
+          value: track.index,
+          label: track.isCurrent ? `${track.label}（当前）` : track.label,
+        }))}
+        onSelect={onSelect}
+      />
       {status ? (
         <p className="lux-player-caption-status" role="status">{status}</p>
       ) : (

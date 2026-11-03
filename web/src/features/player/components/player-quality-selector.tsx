@@ -1,4 +1,4 @@
-import { LuxSelectField } from "../../../components/ui";
+import { PlayerOptionList } from "./player-option-list";
 import {
   shouldShowQualitySelector,
   type QualityOption,
@@ -41,22 +41,17 @@ export function PlayerQualitySelector({
 
   return (
     <div className="lux-player-settings-section" data-settings-section="quality">
-      <label className="lux-player-settings-label" htmlFor="lux-player-quality-select">画质</label>
-      <LuxSelectField
-        id="lux-player-quality-select"
-        className="lux-player-caption-select"
-        aria-label="选择画质"
-        title="选择画质"
+      <h4 className="lux-player-settings-label">清晰度</h4>
+      <PlayerOptionList
+        label="选择画质"
         value={current}
         disabled={switching || disabled}
-        onChange={(event) => onSelect(event.target.value)}
-      >
-        {options.map((option) => (
-          <option key={option.value || "auto"} value={option.value}>
-            {option.height !== null && option.isCurrent ? `${option.label}（当前）` : option.label}
-          </option>
-        ))}
-      </LuxSelectField>
+        options={options.map((option) => ({
+          value: option.value,
+          label: option.height !== null && option.isCurrent ? `${option.label}（当前）` : option.label,
+        }))}
+        onSelect={onSelect}
+      />
       <p className="lux-player-caption-status" role="status">
         {switching ? "正在切换画质…" : notice ?? status}
       </p>

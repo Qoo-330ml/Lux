@@ -126,6 +126,12 @@ export function PlayerVideoSurface({
   const captionOffsetControllerRef = useRef<ReturnType<typeof createNativeCaptionOffsetController> | null>(null);
   const runtimeCaptionIdsRef = useRef(new Map<number, string>());
   const [presentationSize, setPresentationSize] = useState<ReturnType<typeof playerVideoPresentationSize>>(null);
+  // True from the moment a stream is set until the media element has data, and again whenever it
+  // stalls; the centre control breathes while this holds.
+  const [mediaBuffering, setMediaBuffering] = useState(true);
+  useEffect(() => {
+    setMediaBuffering(true);
+  }, [streamUrl]);
   const gestures = usePlayerSurfaceGestures({
     enabled: Boolean(gestureOptions),
     currentTime: gestureOptions?.currentTime ?? 0,
@@ -307,7 +313,15 @@ export function PlayerVideoSurface({
           onPointerUp={gestures.onPointerUp}
           onPointerCancel={gestures.onPointerCancel}
           onError={onError}
-          onLoadedMetadata={onLoadedMetadata}
+          onLoadStart={() => setMediaBuffering(true)}
+          onWaiting={() => setMediaBuffering(true)}
+          onLoadedMetadata={() => {
+            setMediaBuffering(false);
+            onLoadedMetadata?.();
+          }}
+          onLoadedData={() => setMediaBuffering(false)}
+          onCanPlay={() => setMediaBuffering(false)}
+          onPlaying={() => setMediaBuffering(false)}
           onPlay={onPlay}
           onPause={onPause}
           onTimeUpdate={onTimeUpdate}
@@ -333,7 +347,7 @@ export function PlayerVideoSurface({
       {streamUrl && !showError && !blockingNotice ? (
         <PlayerCenterControl
           playing={Boolean(playing)}
-          loading={fallbackLoading}
+          loading={fallbackLoading || mediaBuffering}
           onClick={() => onTogglePlayback?.()}
         />
       ) : null}

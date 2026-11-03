@@ -27,7 +27,8 @@ describe("PlayerQualitySelector", () => {
       />,
     );
 
-    expect(markup).toContain('id="lux-player-quality-select"');
+    expect(markup).toContain('role="radiogroup"');
+    expect(markup).toContain('aria-checked="true"');
     expect(markup).toContain('aria-label="选择画质"');
     expect(markup).toContain("画质");
     // The trigger shows the current tier; the option list itself is a portal

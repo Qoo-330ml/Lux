@@ -1,4 +1,8 @@
-import { Check, Info, X } from "lucide-react";
+import { X } from "lucide-react";
+import type { PlayerInfoGroup } from "../player-stats";
+import { PlayerDanmakuSettings, type PlayerDanmakuSettingsProps } from "./player-danmaku-settings";
+import { PlayerInfoSection } from "./player-info-section";
+import { PlayerOptionList } from "./player-option-list";
 import type {
   PlayerAspectRatio,
   PlayerFlip,
@@ -8,7 +12,8 @@ import {
   PlayerQualitySelector,
   type PlayerQualitySection,
 } from "./player-quality-selector";
-import { PlayerDanmakuSettings, type PlayerDanmakuSettingsProps } from "./player-danmaku-settings";
+
+export type PlayerSettingsTab = "quality" | "aspect" | "danmaku" | "info";
 
 type PlayerPresentationSettings = PlayerVideoPresentation & {
   onToggleLoop: () => void;
@@ -22,22 +27,31 @@ type PlayerAutoPlaySettings = {
 };
 
 type PlayerSettingsPanelProps = {
+  tab?: PlayerSettingsTab;
+  onTabChange?: (tab: PlayerSettingsTab) => void;
   /** Independent quality (resolution ceiling) slot; omitted for Direct-only sources. */
   quality?: PlayerQualitySection;
   presentation?: PlayerPresentationSettings;
   autoPlay?: PlayerAutoPlaySettings;
-  /** Browser-local danmaku settings; omitted when the page does not render a danmaku track. */
+  /** Browser-local danmaku settings; the 弹幕 tab is omitted when the page has no danmaku track. */
   danmaku?: PlayerDanmakuSettingsProps;
-  /** Opens the playback information panel (subtitles, audio and speed live in the control bar). */
-  onOpenInfo?: () => void;
+  /** Playback information shown in the 播放信息 tab. */
+  info?: { groups: PlayerInfoGroup[]; copyText: string };
   onClose: () => void;
 };
 
-const ASPECT_RATIO_OPTIONS: readonly { value: PlayerAspectRatio; label: string }[] = [
-  { value: "default", label: "默认" },
+const TABS: readonly { value: PlayerSettingsTab; label: string }[] = [
+  { value: "quality", label: "画质" },
+  { value: "aspect", label: "长宽比" },
+  { value: "danmaku", label: "弹幕" },
+  { value: "info", label: "播放信息" },
+];
+
+const ASPECT_RATIO_OPTIONS: readonly { value: PlayerAspectRatio; label: string; note?: string }[] = [
+  { value: "default", label: "默认", note: "保持原始比例" },
   { value: "16:9", label: "16:9" },
   { value: "4:3", label: "4:3" },
-  { value: "fill", label: "填充" },
+  { value: "fill", label: "填充", note: "裁切铺满" },
 ];
 
 const FLIP_OPTIONS: readonly { value: PlayerFlip; label: string }[] = [
@@ -46,16 +60,23 @@ const FLIP_OPTIONS: readonly { value: PlayerFlip; label: string }[] = [
   { value: "vertical", label: "垂直镜像" },
 ];
 
+/**
+ * Right-hand settings drawer with three tabs: quality, aspect ratio and playback information.
+ * Subtitles, audio tracks and speed live in the control bar instead.
+ */
 export function PlayerSettingsPanel({
+  tab = "quality",
+  onTabChange = () => undefined,
   quality,
   presentation,
   autoPlay,
   danmaku,
-  onOpenInfo,
+  info,
   onClose,
 }: PlayerSettingsPanelProps) {
+  const tabs = TABS.filter((item) => item.value !== "danmaku" || danmaku);
   return (
-    <div className="lux-player-settings-popover" role="dialog" aria-label="播放设置">
+    <aside className="lux-player-settings-drawer" role="dialog" aria-label="播放设置">
       <div className="lux-player-settings-header">
         <span>播放设置</span>
         <button
@@ -65,87 +86,96 @@ export function PlayerSettingsPanel({
           title="关闭"
           onClick={onClose}
         >
-          <X size={16} aria-hidden="true" />
+          关闭
+          <X size={14} aria-hidden="true" />
         </button>
       </div>
-      {quality ? <PlayerQualitySelector {...quality} /> : null}
-      {autoPlay ? (
-        <div className="lux-player-settings-section">
-          <span className="lux-player-settings-label" id="lux-player-auto-play-label">
-            自动连播下一集
-          </span>
+
+      <div className="lux-player-settings-tabs" role="tablist" aria-label="设置分类">
+        {tabs.map((item) => (
           <button
+            key={item.value}
             type="button"
-            className={`lux-player-speed-pill ${autoPlay.enabled ? "is-active" : ""}`}
-            role="switch"
-            aria-label="自动连播下一集"
-            aria-checked={autoPlay.enabled}
-            onClick={autoPlay.onToggle}
+            role="tab"
+            aria-selected={tab === item.value}
+            className={`lux-player-settings-tab${tab === item.value ? " is-active" : ""}`}
+            onClick={() => onTabChange(item.value)}
           >
-            {autoPlay.enabled ? "已开启" : "已关闭"}
-            {autoPlay.enabled ? <Check size={14} aria-hidden="true" /> : null}
+            {item.label}
           </button>
-        </div>
-      ) : null}
-      {danmaku ? <PlayerDanmakuSettings {...danmaku} /> : null}
-      {presentation ? (
-        <>
-          <div className="lux-player-settings-section">
-            <span className="lux-player-settings-label" id="lux-player-loop-label">循环播放</span>
-            <button
-              type="button"
-              className={`lux-player-speed-pill ${presentation.loop ? "is-active" : ""}`}
-              role="switch"
-              aria-labelledby="lux-player-loop-label"
-              aria-checked={presentation.loop}
-              onClick={presentation.onToggleLoop}
-            >
-              {presentation.loop ? "已开启" : "已关闭"}
-              {presentation.loop ? <Check size={14} aria-hidden="true" /> : null}
-            </button>
-          </div>
-          <div className="lux-player-settings-section">
-            <span className="lux-player-settings-label" id="lux-player-aspect-ratio-label">长宽比</span>
-            <div className="lux-player-speed-grid" role="group" aria-labelledby="lux-player-aspect-ratio-label">
-              {ASPECT_RATIO_OPTIONS.map((option) => (
+        ))}
+      </div>
+
+      <div className="lux-player-settings-body" role="tabpanel">
+        {tab === "quality" ? (
+          <>
+            {quality ? <PlayerQualitySelector {...quality} /> : (
+              <p className="lux-player-caption-status">当前版本没有可选画质。</p>
+            )}
+            {autoPlay ? (
+              <div className="lux-player-settings-section">
+                <h4 className="lux-player-settings-label" id="lux-player-auto-play-label">自动连播下一集</h4>
                 <button
-                  key={option.value}
                   type="button"
-                  className={`lux-player-speed-pill ${presentation.aspectRatio === option.value ? "is-active" : ""}`}
-                  aria-pressed={presentation.aspectRatio === option.value}
-                  onClick={() => presentation.onChangeAspectRatio(option.value)}
+                  className={`lux-player-option${autoPlay.enabled ? " is-selected" : ""}`}
+                  role="switch"
+                  aria-label="自动连播下一集"
+                  aria-checked={autoPlay.enabled}
+                  onClick={autoPlay.onToggle}
                 >
-                  {option.label}
+                  <span className="lux-player-option-label">{autoPlay.enabled ? "已开启" : "已关闭"}</span>
                 </button>
-              ))}
-            </div>
-          </div>
-          <div className="lux-player-settings-section">
-            <span className="lux-player-settings-label" id="lux-player-flip-label">画面翻转</span>
-            <div className="lux-player-speed-grid" role="group" aria-labelledby="lux-player-flip-label">
-              {FLIP_OPTIONS.map((option) => (
+              </div>
+            ) : null}
+            {presentation ? (
+              <div className="lux-player-settings-section">
+                <h4 className="lux-player-settings-label" id="lux-player-loop-label">循环播放</h4>
                 <button
-                  key={option.value}
                   type="button"
-                  className={`lux-player-speed-pill ${presentation.flip === option.value ? "is-active" : ""}`}
-                  aria-pressed={presentation.flip === option.value}
-                  onClick={() => presentation.onChangeFlip(option.value)}
+                  className={`lux-player-option${presentation.loop ? " is-selected" : ""}`}
+                  role="switch"
+                  aria-labelledby="lux-player-loop-label"
+                  aria-checked={presentation.loop}
+                  onClick={presentation.onToggleLoop}
                 >
-                  {option.label}
+                  <span className="lux-player-option-label">{presentation.loop ? "已开启" : "已关闭"}</span>
                 </button>
-              ))}
-            </div>
-          </div>
-        </>
-      ) : null}
-      {onOpenInfo ? (
-        <div className="lux-player-settings-section">
-          <button type="button" className="lux-player-settings-info-row" onClick={onOpenInfo}>
-            <Info size={16} aria-hidden="true" />
-            播放信息
-          </button>
-        </div>
-      ) : null}
-    </div>
+              </div>
+            ) : null}
+          </>
+        ) : null}
+
+        {tab === "aspect" ? (
+          presentation ? (
+            <>
+              <div className="lux-player-settings-section">
+                <h4 className="lux-player-settings-label">长宽比</h4>
+                <PlayerOptionList
+                  label="长宽比"
+                  value={presentation.aspectRatio}
+                  options={ASPECT_RATIO_OPTIONS}
+                  onSelect={(value) => presentation.onChangeAspectRatio(value as PlayerAspectRatio)}
+                />
+              </div>
+              <div className="lux-player-settings-section">
+                <h4 className="lux-player-settings-label">画面翻转</h4>
+                <PlayerOptionList
+                  label="画面翻转"
+                  value={presentation.flip}
+                  options={FLIP_OPTIONS}
+                  onSelect={(value) => presentation.onChangeFlip(value as PlayerFlip)}
+                />
+              </div>
+            </>
+          ) : null
+        ) : null}
+
+        {tab === "danmaku" ? (danmaku ? <PlayerDanmakuSettings {...danmaku} /> : null) : null}
+
+        {tab === "info" ? (
+          info ? <PlayerInfoSection groups={info.groups} copyText={info.copyText} /> : null
+        ) : null}
+      </div>
+    </aside>
   );
 }

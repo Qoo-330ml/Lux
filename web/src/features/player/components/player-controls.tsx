@@ -169,6 +169,9 @@ export function PlayerControls({
   const bufferedPercent = duration > 0 ? (bufferedEnd / duration) * 100 : 0;
   const normalizedVolume = Number.isFinite(volume) ? Math.max(0, Math.min(1, muted ? 0 : volume)) : 0;
   const volumePercent = `${normalizedVolume * 100}%`;
+  const hoverChapterTitle = hoverTime === null
+    ? null
+    : chapters.find((chapter) => hoverTime >= chapter.start && hoverTime < chapter.end)?.title ?? null;
 
   // Track popovers (subtitles, audio) open from the control bar. Only one is open at a time;
   // a pointer press outside the control bar or Escape closes it.
@@ -232,7 +235,7 @@ export function PlayerControls({
         <div className="lux-player-timeline">
           {hoverTime !== null && hoverPercent !== null ? (
             <div className="lux-player-tooltip" style={{ left: `${hoverPercent}%` }} aria-hidden="true">
-              {formatTime(hoverTime)}
+              {hoverChapterTitle ? `${hoverChapterTitle} · ` : ""}{formatTime(hoverTime)}
             </div>
           ) : null}
 

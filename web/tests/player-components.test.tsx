@@ -194,41 +194,69 @@ describe("LuxPlayer state components", () => {
     expect(markup).toContain('aria-label="画中画"');
   });
 
-  it("keeps settings actions in a focused, keyboard-addressable panel", () => {
+  const presentation = {
+    loop: true,
+    aspectRatio: "4:3" as const,
+    flip: "horizontal" as const,
+    onToggleLoop: () => undefined,
+    onChangeAspectRatio: () => undefined,
+    onChangeFlip: () => undefined,
+  };
+
+  it("renders the settings drawer with quality, aspect ratio and playback information tabs", () => {
     const markup = renderToStaticMarkup(
-      <PlayerSettingsPanel
-        captionOffset={-1.2}
-        onChangeCaptionOffset={() => undefined}
-        presentation={{
-          loop: true,
-          aspectRatio: "4:3",
-          flip: "horizontal",
-          onToggleLoop: () => undefined,
-          onChangeAspectRatio: () => undefined,
-          onChangeFlip: () => undefined,
-        }}
-        onClose={() => undefined}
-      />,
+      <PlayerSettingsPanel presentation={presentation} onClose={() => undefined} />,
     );
 
     expect(markup).toContain('role="dialog"');
     expect(markup).toContain('aria-label="播放设置"');
+    expect(markup).toContain('role="tablist"');
+    for (const label of ["画质", "长宽比", "播放信息"]) expect(markup).toContain(`>${label}</button>`);
+    expect(markup).not.toContain(">弹幕</button>");
     // The played version is chosen on the detail page; the panel must not repeat it.
     expect(markup).not.toContain("播放版本");
-    expect(markup).not.toContain('id="lux-player-source-select"');
     expect(markup).not.toContain("播放速度");
+    expect(markup).not.toContain("快捷键提示");
+    expect(markup).toContain('aria-label="关闭播放设置"');
+  });
+
+  it("shows loop and auto-play switches on the quality tab", () => {
+    const markup = renderToStaticMarkup(
+      <PlayerSettingsPanel
+        tab="quality"
+        presentation={presentation}
+        autoPlay={{ enabled: false, onToggle: () => undefined }}
+        onClose={() => undefined}
+      />,
+    );
     expect(markup).toContain("循环播放");
+    expect(markup).toContain("自动连播下一集");
     expect(markup).toContain('role="switch"');
     expect(markup).toContain('aria-checked="true"');
-    expect(markup).toContain("长宽比");
-    expect(markup).toContain("4:3");
-    expect(markup).toContain("填充");
+    expect(markup).not.toContain('id="lux-player-caption-offset"');
+  });
+
+  it("lists aspect ratios with fill and the flip choices on the aspect tab", () => {
+    const markup = renderToStaticMarkup(
+      <PlayerSettingsPanel tab="aspect" presentation={presentation} onClose={() => undefined} />,
+    );
+    expect(markup).toContain('aria-label="长宽比"');
+    for (const label of ["默认", "16:9", "4:3", "填充"]) expect(markup).toContain(label);
     expect(markup).toContain("画面翻转");
     expect(markup).toContain("水平镜像");
-    expect(markup).not.toContain('id="lux-player-caption-offset"');
-    expect(markup).not.toContain("快捷键提示");
-    expect(markup).not.toContain("空格 / K");
-    expect(markup).toContain('aria-label="关闭播放设置"');
+    expect(markup).toMatch(/data-value="4:3"[^>]*>|aria-checked="true"[^>]*data-value="4:3"/);
+  });
+
+  it("shows playback information on its own tab", () => {
+    const markup = renderToStaticMarkup(
+      <PlayerSettingsPanel
+        tab="info"
+        info={{ groups: [{ title: "播放", rows: [{ label: "方式", value: "直连播放" }] }], copyText: "方式: 直连播放" }}
+        onClose={() => undefined}
+      />,
+    );
+    expect(markup).toContain('aria-label="复制播放信息"');
+    expect(markup).toContain("直连播放");
   });
 
   it("exposes a labeled keyboard timeline alongside the playback controls", () => {

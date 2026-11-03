@@ -1,4 +1,4 @@
-import { LuxSelectField } from "../../../components/ui";
+import { PlayerOptionList } from "./player-option-list";
 import type { PlayerCaptionOption } from "./player-captions";
 import {
   CAPTION_OFFSET_MAX,
@@ -38,26 +38,20 @@ export function PlayerSubtitleMenu({
 
   return (
     <div className="lux-player-settings-section" data-settings-section="subtitle">
-      <label className="lux-player-settings-label" htmlFor="lux-player-caption-select">字幕</label>
-      <LuxSelectField
-        id="lux-player-caption-select"
-        className="lux-player-caption-select"
-        aria-label="选择字幕"
+      <h4 className="lux-player-settings-label">字幕</h4>
+      <PlayerOptionList
+        label="选择字幕"
         value={selectedCaptionId ?? ""}
-        onChange={(event) => {
-          const value = event.target.value;
-          onSelectCaption(value === "" ? null : value);
-        }}
-      >
-        <option value="">关闭字幕</option>
-        {captions.map((caption) => (
-          <option key={caption.id} value={caption.id} disabled={!caption.available}>
-            {caption.unavailableReason
-              ? `${caption.label}（${caption.unavailableReason}）`
-              : caption.label}
-          </option>
-        ))}
-      </LuxSelectField>
+        options={[
+          { value: "", label: "关闭字幕" },
+          ...captions.map((caption) => ({
+            value: caption.id,
+            label: caption.unavailableReason ? `${caption.label}（${caption.unavailableReason}）` : caption.label,
+            disabled: !caption.available,
+          })),
+        ]}
+        onSelect={(value) => onSelectCaption(value === "" ? null : value)}
+      />
       {captionHelp ? <p className="lux-player-caption-status" role="status">{captionHelp}</p> : null}
       <div className="lux-player-caption-offset-heading">
         <label className="lux-player-settings-label" htmlFor="lux-player-caption-offset">字幕偏移</label>

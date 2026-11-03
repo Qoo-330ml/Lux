@@ -31,12 +31,11 @@ import {
 import { canUseRemoteMkvCaptionSidecar, isRemoteHttpStrmSource } from "./playback-selection";
 import { LuxPlayerRuntime } from "./core/player-runtime";
 import { PlayerControls } from "./components/player-controls";
-import { PlayerSettingsPanel } from "./components/player-settings-panel";
+import { PlayerSettingsPanel, type PlayerSettingsTab } from "./components/player-settings-panel";
 import { PlayerSubtitleMenu } from "./components/player-subtitle-menu";
 import type { TrackMenu } from "./components/player-controls";
 import { PlayerAudioTrackSelector } from "./components/player-audio-track-selector";
 import { shouldShowAudioTrackSelector } from "./audio-track-selection";
-import { PlayerInfoPanel } from "./components/player-info-panel";
 import { PlayerShortcutHelp } from "./components/player-shortcut-help";
 import { playerInfoCopyText } from "./player-stats";
 import { PlayerErrorState, PlayerLoadingState } from "./components/player-state";
@@ -75,7 +74,8 @@ import {
   isMatroskaSource,
 } from "./player-page-helpers";
 
-const PLAYBACK_SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+// Order matters: the control-bar speed button cycles through these in turn.
+const PLAYBACK_SPEEDS = [1.0, 1.25, 1.5, 2.0, 0.75];
 
 export function PlayerPage() {
   const { itemId = "" } = useParams();
@@ -103,7 +103,18 @@ export function PlayerPage() {
   const [aspectRatio, setAspectRatio] = useState<PlayerAspectRatio>("default");
   const [flip, setFlip] = useState<PlayerFlip>("normal");
   const [showSettings, setShowSettings] = useState(false);
-  const [showInfo, setShowInfo] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<PlayerSettingsTab>("quality");
+  // Playback information is the settings drawer's 播放信息 tab, so "info is open" is derived from it.
+  const showInfo = showSettings && settingsTab === "info";
+  const setShowInfo = useCallback((value: boolean | ((visible: boolean) => boolean)) => {
+    const next = typeof value === "function" ? value(showInfo) : value;
+    if (next) {
+      setSettingsTab("info");
+      setShowSettings(true);
+    } else if (showInfo) {
+      setShowSettings(false);
+    }
+  }, [showInfo]);
   const [trackMenu, setTrackMenu] = useState<TrackMenu | null>(null);
   // A pointer press outside the settings panel closes it. The settings button toggles it itself, and
   // LuxSelect renders its option list into document.body, so both count as inside.
@@ -112,7 +123,7 @@ export function PlayerPage() {
     const closeOnOutside = (event: PointerEvent) => {
       const target = event.target;
       if (!(target instanceof Element)) return;
-      if (target.closest('.lux-player-settings-popover, .lux-select-menu, button[aria-label="播放器设置"]')) return;
+      if (target.closest('.lux-player-settings-drawer, .lux-select-menu, button[aria-label="播放器设置"]')) return;
       setShowSettings(false);
     };
     document.addEventListener("pointerdown", closeOnOutside);
@@ -785,10 +796,9 @@ export function PlayerPage() {
 
       {showSettings ? (
         <PlayerSettingsPanel
-          onOpenInfo={() => {
-            setShowSettings(false);
-            setShowInfo(true);
-          }}
+          tab={settingsTab}
+          onTabChange={setSettingsTab}
+          info={{ groups: infoGroups, copyText: playerInfoCopyText(infoGroups) }}
           quality={{
             options: qualityOptions,
             selectedValue: selectedQualityValue,
@@ -816,14 +826,6 @@ export function PlayerPage() {
             onReset: resetDanmakuSettings,
           }}
           onClose={() => setShowSettings(false)}
-        />
-      ) : null}
-
-      {showInfo ? (
-        <PlayerInfoPanel
-          groups={infoGroups}
-          copyText={playerInfoCopyText(infoGroups)}
-          onClose={() => setShowInfo(false)}
         />
       ) : null}
 

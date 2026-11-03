@@ -10,6 +10,18 @@ function currentOptions(): HTMLElement[] {
 
 export type LuxSelectTarget = string | HTMLElement;
 
+/**
+ * The player's settings and track menus render one-of-many choices as a radiogroup of option rows
+ * (PlayerOptionList) instead of a dropdown; the helpers below accept either by aria-label.
+ */
+function radioGroup(container: ParentNode, target: LuxSelectTarget): HTMLElement | null {
+  if (typeof target !== "string") return target.getAttribute("role") === "radiogroup" ? target : null;
+  return [...container.querySelectorAll<HTMLElement>('[role="radiogroup"]')]
+    .find((element) => element.getAttribute("aria-label") === target) ?? null;
+}
+
+const radios = (group: HTMLElement) => [...group.querySelectorAll<HTMLButtonElement>('[role="radio"]')];
+
 function resolveTrigger(container: ParentNode, target: LuxSelectTarget): HTMLElement | null {
   if (typeof target !== "string") return target;
   const candidates = [...container.querySelectorAll<HTMLElement>('[role="combobox"]')];
@@ -18,7 +30,7 @@ function resolveTrigger(container: ParentNode, target: LuxSelectTarget): HTMLEle
 
 /** 查找 LuxSelect 的 combobox 触发器（按 aria-label 精确匹配）。 */
 export function luxCombobox(container: ParentNode, label: string): HTMLElement | null {
-  return resolveTrigger(container, label);
+  return resolveTrigger(container, label) ?? radioGroup(container, label);
 }
 
 /** 读取 LuxSelect 当前值。 */
@@ -28,6 +40,18 @@ export function luxSelectValue(container: ParentNode, label: LuxSelectTarget): s
 
 /** 打开 LuxSelect 并点选包含指定文案的选项。 */
 export async function chooseLuxOption(container: ParentNode, label: LuxSelectTarget, optionLabel: string): Promise<void> {
+  const group = radioGroup(container, label);
+  if (group) {
+    const rows = radios(group);
+    const row = rows.find((candidate) => candidate.textContent?.trim() === optionLabel)
+      ?? rows.find((candidate) => candidate.textContent?.includes(optionLabel));
+    if (!row) throw new Error(`未找到选项：${optionLabel}`);
+    await act(async () => {
+      row.click();
+      await Promise.resolve();
+    });
+    return;
+  }
   const trigger = resolveTrigger(container, label);
   if (!trigger) throw new Error(`未找到 LuxSelect：${typeof label === "string" ? label : label.id}`);
   await act(async () => {
@@ -46,6 +70,8 @@ export async function chooseLuxOption(container: ParentNode, label: LuxSelectTar
 
 /** 读取 LuxSelect 的选项值列表（打开后立即关闭）。 */
 export async function luxOptionValues(container: ParentNode, label: LuxSelectTarget): Promise<string[]> {
+  const group = radioGroup(container, label);
+  if (group) return radios(group).map((row) => row.dataset.value ?? "");
   const trigger = resolveTrigger(container, label);
   if (!trigger) throw new Error(`未找到 LuxSelect：${typeof label === "string" ? label : label.id}`);
   await act(async () => {
@@ -62,6 +88,16 @@ export async function luxOptionValues(container: ParentNode, label: LuxSelectTar
 
 /** 按选项值（而非文案）点选，等价于旧测试里的 select.value = value。 */
 export async function chooseLuxOptionByValue(container: ParentNode, label: LuxSelectTarget, value: string): Promise<void> {
+  const group = radioGroup(container, label);
+  if (group) {
+    const row = radios(group).find((candidate) => candidate.dataset.value === value);
+    if (!row) throw new Error(`未找到选项值：${value}`);
+    await act(async () => {
+      row.click();
+      await Promise.resolve();
+    });
+    return;
+  }
   const trigger = resolveTrigger(container, label);
   if (!trigger) throw new Error(`未找到 LuxSelect：${typeof label === "string" ? label : label.id}`);
   await act(async () => {
@@ -80,6 +116,14 @@ export type LuxOptionSnapshot = { value: string; label: string; disabled: boolea
 
 /** 读取 LuxSelect 的选项快照（值、文案、禁用态），读取后关闭菜单。 */
 export async function luxOptions(container: ParentNode, label: LuxSelectTarget): Promise<LuxOptionSnapshot[]> {
+  const group = radioGroup(container, label);
+  if (group) {
+    return radios(group).map((row) => ({
+      value: row.dataset.value ?? "",
+      label: row.textContent?.trim() ?? "",
+      disabled: row.disabled,
+    }));
+  }
   const trigger = resolveTrigger(container, label);
   if (!trigger) throw new Error(`未找到 LuxSelect：${typeof label === "string" ? label : label.id}`);
   await act(async () => {

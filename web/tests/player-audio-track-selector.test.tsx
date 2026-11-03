@@ -40,7 +40,8 @@ describe("PlayerAudioTrackSelector", () => {
       />,
     );
 
-    expect(markup).toContain('id="lux-player-audio-select"');
+    expect(markup).toContain('role="radiogroup"');
+    expect(markup).toContain('aria-checked="true"');
     expect(markup).toContain('aria-label="选择音轨"');
     expect(markup).toContain("音轨");
     expect(markup).toContain("中文");

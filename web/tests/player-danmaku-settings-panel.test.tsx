@@ -185,11 +185,12 @@ describe("LuxPlayer danmaku settings panel", () => {
     expect(onReset).toHaveBeenCalledTimes(1);
   });
 
-  it("is part of the existing player settings dialog", async () => {
+  it("is the 弹幕 tab of the player settings drawer", async () => {
     const onClose = vi.fn();
     await act(async () => {
       root.render(
         <PlayerSettingsPanel
+          tab="danmaku"
           danmaku={{
             settings: DEFAULT_DANMAKU_SETTINGS,
             onChange: vi.fn(),
@@ -200,7 +201,7 @@ describe("LuxPlayer danmaku settings panel", () => {
       );
     });
 
-    const dialog = byAriaLabel<HTMLElement>(container, "播放设置", "div")!;
+    const dialog = byAriaLabel<HTMLElement>(container, "播放设置", "aside")!;
     expect(dialog.getAttribute("role")).toBe("dialog");
     expect(byAriaLabel(container, "弹幕不透明度", "input")).not.toBeNull();
   });

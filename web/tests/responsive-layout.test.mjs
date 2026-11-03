@@ -204,12 +204,16 @@ test("mobile player controls use the remaining width", () => {
 
 test("mobile action surfaces scroll within the dynamic viewport", () => {
   const actionMenuRule = rule(".lux-media-action-menu");
-  const settingsRule = rule(".lux-player-settings-popover");
+  const drawerRule = rule(".lux-player-settings-drawer");
+  const drawerBodyRule = rule(".lux-player-settings-body");
 
   assert.match(actionMenuRule, /max-height:\s*[^;]*dvh/);
   assert.match(actionMenuRule, /overflow-y:\s*auto/);
-  assert.match(settingsRule, /max-height:\s*[^;]*dvh/);
-  assert.match(settingsRule, /overflow-y:\s*auto/);
+  // The settings drawer spans the full viewport height and scrolls its body inside it.
+  assert.match(drawerRule, /top:\s*0/);
+  assert.match(drawerRule, /bottom:\s*0/);
+  assert.match(drawerRule, /width:\s*min\(340px,\s*100vw\)/);
+  assert.match(drawerBodyRule, /overflow-y:\s*auto/);
 });
 
 test("mobile metadata identifier results keep a usable landscape height", () => {
