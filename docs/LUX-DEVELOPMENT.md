@@ -221,7 +221,7 @@ Lux 的核心价值不是功能数量，而是：
 
 - 弹幕使用独立的 Lux 弹幕服务和 Emby 兼容弹幕路由，不伪装成普通字幕轨。
 - 管理员可以配置一个 Dandanplay 兼容 API 基地址，也可以配置 `huangxd-/danmu_api` 的 API 基地址；地址可包含部署 token 路径。
-- 管理员可以在弹幕插件配置中选择允许匹配的媒体库；未选择的媒体库不能创建弹幕匹配任务，空选择表示不匹配任何媒体库。
+- 管理员可以在弹幕插件配置中选择允许匹配的媒体库；未选择的媒体库不能创建**自动**弹幕匹配任务（整库扫描与按计划执行），空选择表示不自动匹配任何媒体库。管理员对单个条目的**手动匹配**（先搜索候选、再选定某一集）是显式操作，不受该选择限制（ADR-052 P5）。
 - 弹幕匹配策略支持使用原始文件名、尝试本地已登记的简体/繁体标题、尝试本地已登记的英文/原始标题；按原始文件名、简繁标题、英文/原始标题的顺序逐个回退，仅在前一个候选没有匹配时请求下一个候选。
 - 弹幕文字的简繁转换由上游 `danmu_api` 的部署配置负责；Lux 不引入 OpenCC、不把简繁转换伪装成所有 Dandanplay 兼容服务都支持的请求参数，也不在首版筛选弹幕语言。
 - 后台匹配任务优先使用上游 `/api/v2/match`，不支持时回退到 Dandanplay 兼容的搜索、详情和弹幕接口。
@@ -19285,22 +19285,30 @@ Emby 路由、不改 `web/` 的界面**（D3 另做）。依赖 LUX-877 的 `sea
 - `POST /api/v1/admin/items/{itemId}/danmaku/match`：`{ sourceId?, provider?, animeId?, episodeId,
   overwrite }`，创建**单条**持久化作业（复用 `danmaku_match_jobs`/`danmaku_match_job_items` 与现有
   Worker 池，`total_count = 1`，`library_id` 取条目所属库），返回 202 与现有 match-jobs DTO。
-  作业项预填 `provider_anime_id`/`provider_episode_id`，Worker 见到预填 `provider_episode_id` 时跳过
-  `danmaku.match`，直接 `danmaku.fetch` → `decode_xml`（含 `validate_danmaku_xml`）→
-  `atomic_write_danmaku_xml` → 登记 `danmaku_tracks`。`provider` 是插件返回的不透明标签，缺省/空串/
-  纯空白按“未设置”处理；**不加新列**：它随创建作业时的 `danmaku_tracks.provider` 持久化
-  （新行 `status='MISSING'`，已存在行只更新 provider/anime/episode 三元组，不动 status/fingerprint），
-  Worker 因此能在重启后仍知道该用哪个 provider 调用 `danmaku.fetch`。`overwrite=false` 且已有有效同名
-  `.xml` → 作业项 `SKIPPED` 且保留原文件；`overwrite=true` 覆盖。库内已有活动弹幕作业 → 409
-  （`AlreadyActive`）。手动作业不可 `/retry`（409，避免把单集请求悄悄扩成整库扫描）。
+  作业项预填 `provider_anime_id`/`provider_episode_id`，Worker 认领一个 `PENDING` 且已预填
+  `provider_episode_id` 的条目时跳过 `danmaku.match`，直接 `danmaku.fetch` → `decode_xml`（含
+  `validate_danmaku_xml`）→ `atomic_write_danmaku_xml` → 登记 `danmaku_tracks`。`provider` 是插件返回的
+  不透明标签，缺省/空串/纯空白按“未设置”处理；**不加新列**：它随创建作业时的
+  `danmaku_tracks.provider` 持久化（仅当该源还没有 track 行时插入 `status='MISSING'` 的行，
+  `ON CONFLICT DO NOTHING`），Worker 因此能在重启后仍知道该用哪个 provider 调用 `danmaku.fetch`；
+  已有 track 行的 provider 与来源**永不改写**（见下）。`overwrite=false` 且已有有效同名 `.xml` →
+  作业项 `SKIPPED` 且保留原文件；`overwrite=true` 覆盖。库内已有活动弹幕作业 → 409
+  （`AlreadyActive`）。媒体库无需在插件配置的“允许匹配的媒体库”中（见下）。`FAILED`/`CANCELLED`
+  的手动作业可 `/retry`：新建同样只含一个目标的作业，沿用已记录的 provider 与分集继续 fetch。
 - `DELETE /api/v1/admin/items/{itemId}/danmaku?sourceId=&confirmUserSidecar=`：删除已登记的旁车
   `.xml` 与 `danmaku_tracks` 行，成功 204。仅当路径通过现有媒体根/符号链接校验时删文件；越界、符号
-  链接或非普通文件 → 400 且不删任何东西；未登记 → 404；文件已不存在但登记仍在 → 只清理登记。
+  链接或非普通文件 → 400 且不删任何东西；媒体文件已不存在导致无法确认路径安全 → 只清理登记，同样
+  204；未登记 → 404；旁车文件已不存在但登记仍在 → 只清理登记。
   `danmaku_tracks.provider` 为空（用户自带旁车）必须带 `confirmUserSidecar=true`，否则 409。文件删除
   走 `tokio::fs`（异步 fs，不在 Tokio 核心线程做阻塞 IO）。
 - 日志与审计：沿用 `record_audit_event`，新增 `DANMAKU_MANUAL_MATCH_STARTED`（只记条目、媒体源、
-  `overwrite`）与 `DANMAKU_SIDECAR_DELETED`；不记录搜索文本、插件返回、完整上游 URL 或 token。搜索
-  端点本身不写审计，避免把管理员输入落盘。
+  `overwrite`）与 `DANMAKU_SIDECAR_DELETED`（`targetId` 与 `metadata.sourceId` 均为实际解析出的媒体源
+  ID，不写请求参数里的 `null`）；不记录搜索文本、插件返回、完整上游 URL 或 token。搜索端点本身不写
+  审计，避免把管理员输入落盘。
+- 插件错误分类：搜索/创建不再用 `danmaku_manual_match_supported()` 的布尔值把“未配置”说成“不支持”。
+  创建路径先调用 `require_danmaku_manual_match_plugin()`，`Unsupported` → “弹幕插件不支持手动匹配”，
+  `UnknownPlugin`/`Unavailable`/`InvalidConfig` → “弹幕插件未启用或配置未完成”（两者都是 409
+  `PLUGIN_UNAVAILABLE`）；搜索路径直接映射 `danmaku.search` 的同类错误。
 - 文档与类型：`docs/API.md` 三个端点；`docs/API-TYPES-SYNC.md` 记录三个新 ts-rs DTO 与请求体的手写
   镜像；`web/src/lib/api/generated/` 新增 `ManualDanmakuSearchResponse`/`ManualDanmakuCandidate`/
   `ManualDanmakuEpisode`，`types.ts` 转出同名类型，`client.ts` 新增 `manualDanmakuSearch`/
@@ -19308,31 +19316,71 @@ Emby 路由、不改 `web/` 的界面**（D3 另做）。依赖 LUX-877 的 `sea
   `adminItemDanmakuSearch`（仅 API 层，无 UI）。
 - 未改：数据库与迁移（无新列、无新表）、`src/api/emby*`、`web/src/features/**`。
 
-**规格冲突（已上报，未自行决定）**：本任务的派遣说明要求手动匹配“不要求该库在插件配置的允许媒体库
-里”，但 `docs/LUX-DEVELOPMENT.md` §3.7 规定“未选择的媒体库不能创建弹幕匹配任务”，且自动匹配的
-Worker（`run_claimed`）对未选择媒体库直接以 `LIBRARY_NOT_SELECTED` 失败。实现按 §3.7 保留该规则
-（未选择 → 400“该媒体库未在弹幕插件配置中启用”），否则作业必然在 Worker 里失败；放宽该规则需要
-同时修改 §3.7、Worker 校验与本节，属于负责人决策，未在本任务内改动。
+**规格裁决（已由负责人放宽）**：§3.7 原文“未选择的媒体库不能创建弹幕匹配任务”与手动匹配“由管理员
+显式触发、不受允许媒体库限制”冲突，已上报；负责人裁决放宽手动匹配。现 §3.7 改为“未选择的媒体库不能
+创建**自动**弹幕匹配任务”，手动匹配不受该限制：`create_manual_job` 不再检查 `library_ids`，Worker
+（`run_claimed`）对“每个条目都带管理员选定分集”的作业跳过 `LIBRARY_NOT_SELECTED`，自动整库匹配的
+校验保持不变（`POST /api/v1/admin/libraries/{libraryId}/danmaku/match` 对未选择库仍返回 400）。
 
 验收（2026-11-03，本机 `uname -m` = `arm64`）：
 
-- [x] `cargo test --locked --test plugins danmaku_manual_api::` 10/10：非管理员 403 与缺 CSRF 被拒
-      （且不排队作业）、搜索成功与上限/越界参数、仅 match 插件 → 409 且提示“不支持手动匹配”、
-      速率限制 429 + `Retry-After: 1`、手动匹配建单条作业且 Worker 走 fetch 路径写旁车（写入的是
-      fetch XML 而非 match XML，track provider/`provider_episode_id` 正确）、`overwrite` 的
-      SKIPPED/覆盖语义、库内活动作业 409、未选媒体库 400、删除（Lux 写入的无需确认 / 用户自带需
-      `confirmUserSidecar` / 未登记 404 / 越界路径 400）。
-- [x] `cargo test --locked --test plugins danmaku::` 13/13、`danmaku_api::` 2/2、
-      `danmaku_config::`+`danmaku_config_api::` 3/3；`cargo test --locked --lib danmaku` 13/13、
-      `--lib security` 6/6（含每秒 2 次与窗口恢复）。
+- [x] `cargo test --locked --test plugins danmaku_manual_api::` 16/16（第 1 轮返工后）：非管理员 403 与
+      缺 CSRF 被拒（且不排队作业）、搜索成功与上限/越界参数、仅 match 插件 → 409 且提示“不支持手动
+      匹配”、已启用但未配置 → 409 且提示“配置未完成”、速率限制 429 + `Retry-After: 1`、手动匹配建单条
+      作业且 Worker 走 fetch 路径写旁车（写入的是 fetch XML 而非 match XML，track provider/
+      `provider_episode_id` 正确）、`overwrite` 的 SKIPPED/覆盖语义、库内活动作业 409、未选媒体库的
+      手动匹配仍成功且走 fetch、未选媒体库的自动整库匹配仍 400、整库作业 `/retry` → 202、手动作业
+      `/retry` → 202 且再次 fetch 同一集、用户自带旁车在 SKIPPED/覆盖后仍不被改记为 Lux 写入（DELETE
+      仍需确认）、删除（Lux 写入的无需确认 / 用户自带需 `confirmUserSidecar` / 未登记 404 / 越界路径
+      400 / 媒体文件已消失时只清理登记 204）。
+- [x] `cargo test --locked --test plugins danmaku::` 13/13、`plugin_protocol::` 54/54、
+      `danmaku_api::` 2/2、`danmaku_config::`+`danmaku_config_api::` 3/3；
+      `cargo test --locked --lib danmaku` 13/13、`--lib security` 6/6（含每秒 2 次与窗口恢复）。
 - [x] `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`
       通过；`scripts/check-migration-parity.py`、`scripts/check-backend-branches.py` 通过
       （无迁移、无新增 `DatabaseBackend::` 分支）；`scripts/check-api-types.sh` 通过（生成物与 Rust
       DTO 一致）。
 - [x] `pnpm --dir web build`、`pnpm --dir web test` 161 文件 / 1441 用例通过。
+- [x] 返工后复跑 `--test storage` 115/115（`finish_danmaku_match_item` 的 `COALESCE` 与新增查询不影响
+      既有断言）。
 - [ ] 未验证：真实 `org.lux.danmaku` 插件（Lux-plugins 仓库另行升级）的 search/fetch 往返；PostgreSQL
       实机；本机 `--test admin` 中 `admin_settings::transcoding_settings_…` 仍失败（断言本机没有可用
       VideoToolbox 编码器，本机实际可用，属既有环境相关失败，与本任务无关）。
+
+第 1 轮审查返工（2026-11-03）：
+
+- **A（规格裁决：放宽）**：删除 `create_manual_job` 的 `library_ids` 校验；`run_claimed` 通过
+  `danmaku_match_job_is_manual_only` 判断“每个条目都带管理员选定分集”，此类作业跳过
+  `LIBRARY_NOT_SELECTED`，自动整库匹配的校验不变。§3.7 改为“未选择的媒体库不能创建**自动**弹幕匹配
+  任务”；`docs/API.md` 同步。测试：未选库 → 手动匹配成功并走 fetch；未选库 → 自动整库匹配仍 400。
+- **B（整库作业 `/retry` 回归）**：删除“手动作业不可重试”守卫与 `danmaku_match_job_has_manual_items`。
+  `retry` 现在按**目标数量**而不是字段分流：`total_count = 1` 且只有一条作业项的作业用
+  `retry_single_item` 重建同目标作业（复制已记录的 provider/anime/episode，因此手动作业继续 fetch；
+  一源的整库作业等价于逐条重跑），其余作业仍走整库 `create_job`。`finish_danmaku_match_item` 改为
+  `COALESCE`，失败/跳过不再清空已知的 provider 标识，否则重试会退回 `danmaku.match`。
+  `NotRetryable` 仍只由“状态不是 FAILED/CANCELLED”触发，其他作业类型的判定未改。测试：整库作业
+  WRITTEN+FAILED → `/retry` 202 且新作业 `totalCount=2`；手动作业 FAILED → `/retry` 202、新作业仍带
+  预填分集并再次 fetch 同一集。
+- **C（不得改写用户自带旁车的来源）**：创建作业时的 track 写入改为 `ON CONFLICT(media_source_id) DO
+  NOTHING`，且只在作业带选定分集时插入；已有 track 行（含 `provider` 为空）永不改写。测试：用户自带
+  旁车 + `overwrite=false` → `SKIPPED` 且 track 保持 `provider = NULL`、DELETE 不带确认仍 409；随后
+  `overwrite=true` 覆盖写入后 track 仍为 `NULL`、DELETE 仍需确认（在 `docs/API.md` 里如实记录该保守
+  限制；扫描器重置 provider 的既有行为未改）。
+- **D（媒体文件缺失时的清理）**：`safe_danmaku_source_paths` 区分 `UnsafePath` 与 `Missing`；`Missing`
+  时只删除 `danmaku_tracks` 登记并返回 204（不动磁盘文件），`UnsafePath` 仍 400。测试：删除媒体文件后
+  DELETE → 204、登记消失、旁车文件保留；越界路径仍 400。
+- **E**：删除审计的 `targetId`/`metadata.sourceId` 改用实际解析出的媒体源 ID；搜索/创建改用
+  `require_danmaku_manual_match_plugin()` 的错误分类（`Unsupported` → “不支持手动匹配”，
+  `UnknownPlugin`/`Unavailable`/`InvalidConfig` → “未启用或配置未完成”），并补“已启用但未配置”的测试；
+  `docs/TEST-TARGETS.md` 第 1、2、5.1 节的逐组/逐模块测试数与两处合计按当前 `--list` 重新计算
+  （12 组 900 例 + 7 个独立 binary 114 例 = 1014 例），并标出合并后新增的模块。
+
+返工验收（2026-11-03，`arm64`）：`cargo test --locked --test plugins danmaku_manual_api::` 16/16、
+`danmaku::` 13/13、`plugin_protocol::` 54/54、`cargo test --locked --lib danmaku` 13/13、
+`--test storage` 115/115；`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets
+--all-features -- -D warnings`、`scripts/check-migration-parity.py`、`scripts/check-backend-branches.py`、
+`scripts/check-api-types.sh` 通过；`pnpm --dir web build` 与 `pnpm --dir web test`（161 文件 / 1441
+用例）通过。无迁移、无新列。
 
 ## 31. 参考资料
 

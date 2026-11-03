@@ -36,7 +36,11 @@ const USER_XML: &[u8] = b"<i><d p=\"3,1,25,16777215,0,0,0,0\">user</d></i>";
 
 /// Minimal `org.lux.danmaku` stub: one search candidate with two episodes, and a fetch answer that
 /// differs from the match answer.
-fn stub_script() -> String {
+///
+/// `Fail.*` file names are reported as `NO_MATCH` so a library sweep can fail one item, the
+/// `bad-xml` episode answers with an unusable payload, and every fetch appends its episode id to
+/// `fetch_log` so a retry can prove it fetched again.
+fn stub_script(fetch_log: &std::path::Path) -> String {
     let template = r#"#!/bin/sh
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/^{"id":"\([^"]*\)".*/\1/p')
@@ -45,7 +49,14 @@ while IFS= read -r line; do
       printf '{"id":"%s","result":{"id":"org.lux.danmaku","name":"danmaku stub","apiVersion":1,"capabilities":["danmaku.match","danmaku.search","danmaku.fetch"],"supportedItemTypes":[]}}\n' "$id"
       ;;
     *'"danmaku.match"'*)
-      printf '{"id":"%s","result":{"status":"MATCHED","provider":"stub","episodeId":"ep-1","xmlBase64":"__MATCH_XML__"}}\n' "$id"
+      case "$line" in
+        *'"fileName":"Fail.'*)
+          printf '{"id":"%s","result":{"status":"NO_MATCH"}}\n' "$id"
+          ;;
+        *)
+          printf '{"id":"%s","result":{"status":"MATCHED","provider":"stub","episodeId":"ep-1","xmlBase64":"__MATCH_XML__"}}\n' "$id"
+          ;;
+      esac
       ;;
     *'"danmaku.search"'*)
       case "$line" in
@@ -58,7 +69,16 @@ while IFS= read -r line; do
       esac
       ;;
     *'"danmaku.fetch"'*)
-      printf '{"id":"%s","result":{"xmlBase64":"__FETCH_XML__"}}\n' "$id"
+      episode=$(printf '%s' "$line" | sed -n 's/.*"episodeId":"\([^"]*\)".*/\1/p')
+      printf '%s\n' "$episode" >> '__FETCH_LOG__'
+      case "$line" in
+        *'"episodeId":"bad-xml"'*)
+          printf '{"id":"%s","result":{"xmlBase64":"PGh0bWwvPg=="}}\n' "$id"
+          ;;
+        *)
+          printf '{"id":"%s","result":{"xmlBase64":"__FETCH_XML__"}}\n' "$id"
+          ;;
+      esac
       ;;
     *'"plugin.shutdown"'*)
       printf '{"id":"%s","result":{"accepted":true}}\n' "$id"
@@ -76,6 +96,10 @@ done
     template
         .replace("__MATCH_XML__", &BASE64.encode(MATCH_XML))
         .replace("__FETCH_XML__", &BASE64.encode(FETCH_XML))
+        .replace(
+            "__FETCH_LOG__",
+            fetch_log.to_str().expect("utf-8 fetch log path"),
+        )
 }
 
 fn manifest_value(capabilities: &[&str]) -> Value {
@@ -116,12 +140,54 @@ struct Fixture {
     source_id: String,
     library_id: String,
     media_root: PathBuf,
+    fetch_log: PathBuf,
     server: JoinHandle<std::io::Result<()>>,
 }
 
 impl Fixture {
     fn sidecar_path(&self) -> PathBuf {
         self.media_root.join("Demo.Movie.2024.xml")
+    }
+
+    /// Episode ids `danmaku.fetch` was called with, in order.
+    fn fetch_calls(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.fetch_log)
+            .map(|log| log.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    fn library_match_url(&self) -> String {
+        format!(
+            "{}/api/v1/admin/libraries/{}/danmaku/match",
+            self.base_url, self.library_id
+        )
+    }
+
+    /// Writes one more movie into the library root and indexes it.
+    async fn add_movie(&self, file_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        tokio::fs::write(self.media_root.join(file_name), b"video").await?;
+        let library_id: luxd::domain::ids::LibraryId = self.library_id.parse()?;
+        LibraryScanner::new(self.database.clone())
+            .scan_movie_library(library_id)
+            .await?;
+        Ok(())
+    }
+
+    async fn start_library_match(&self) -> Result<String, Box<dyn std::error::Error>> {
+        let response = self
+            .client
+            .post(self.library_match_url())
+            .header(COOKIE, &self.cookies)
+            .header("x-csrf-token", &self.csrf)
+            .json(&json!({"concurrency": 2, "overwrite": true}))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+        let job = response.json::<Value>().await?["job"].clone();
+        job["id"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "missing library job id".into())
     }
 
     fn search_url(&self) -> String {
@@ -187,20 +253,37 @@ impl Drop for Fixture {
     }
 }
 
+/// How a fixture builds its plugin: the capabilities and whether the plugin gets configured.
+#[derive(Clone, Copy)]
+struct PluginSetup<'a> {
+    capabilities: &'a [&'a str],
+    configure: bool,
+}
+
+impl<'a> PluginSetup<'a> {
+    const fn manual(capabilities: &'a [&'a str]) -> Self {
+        Self {
+            capabilities,
+            configure: true,
+        }
+    }
+}
+
 /// Builds the fixture; `rate_limit` overrides the per-session search budget.
 async fn setup(
-    capabilities: &[&str],
+    plugin: PluginSetup<'_>,
     rate_limit: Option<(u32, Duration)>,
 ) -> Result<Fixture, Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let config_dir = directory.path().join("config");
     let media_root = directory.path().join("Movies");
+    let fetch_log = directory.path().join("fetch.log");
     tokio::fs::create_dir_all(&media_root).await?;
     tokio::fs::write(media_root.join("Demo.Movie.2024.mkv"), b"video").await?;
 
     let binaries = config_dir.join(format!("plugins/{PLUGIN_ID}/binaries"));
     tokio::fs::create_dir_all(&binaries).await?;
-    tokio::fs::write(binaries.join("plugin"), stub_script()).await?;
+    tokio::fs::write(binaries.join("plugin"), stub_script(&fetch_log)).await?;
     let mut permissions = tokio::fs::metadata(binaries.join("plugin"))
         .await?
         .permissions();
@@ -208,7 +291,7 @@ async fn setup(
     tokio::fs::set_permissions(binaries.join("plugin"), permissions).await?;
     tokio::fs::write(
         config_dir.join(format!("plugins/{PLUGIN_ID}/manifest.json")),
-        serde_json::to_vec(&manifest_value(capabilities))?,
+        serde_json::to_vec(&manifest_value(plugin.capabilities))?,
     )
     .await?;
 
@@ -279,20 +362,22 @@ async fn setup(
         .send()
         .await?;
     assert_eq!(installed.status(), reqwest::StatusCode::CREATED);
-    let configured = client
-        .put(format!(
-            "{base_url}/api/v1/admin/plugins/{PLUGIN_ID}/config"
-        ))
-        .header(COOKIE, &cookies)
-        .header("x-csrf-token", &csrf)
-        .json(&json!({
-            "providerBaseUrl": "https://danmu.example.test/api",
-            "libraryIds": [library.id.to_string()],
-            "schedule": "0 6 * * *"
-        }))
-        .send()
-        .await?;
-    assert_eq!(configured.status(), reqwest::StatusCode::OK);
+    if plugin.configure {
+        let configured = client
+            .put(format!(
+                "{base_url}/api/v1/admin/plugins/{PLUGIN_ID}/config"
+            ))
+            .header(COOKIE, &cookies)
+            .header("x-csrf-token", &csrf)
+            .json(&json!({
+                "providerBaseUrl": "https://danmu.example.test/api",
+                "libraryIds": [library.id.to_string()],
+                "schedule": "0 6 * * *"
+            }))
+            .send()
+            .await?;
+        assert_eq!(configured.status(), reqwest::StatusCode::OK);
+    }
 
     Ok(Fixture {
         directory,
@@ -305,6 +390,7 @@ async fn setup(
         source_id,
         library_id: library.id.to_string(),
         media_root,
+        fetch_log,
         server,
     })
 }
@@ -335,11 +421,11 @@ fn manual_match_body(episode_id: &str, overwrite: bool) -> Value {
 async fn manual_danmaku_endpoints_reject_non_administrators_and_missing_csrf()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = setup(
-        &[
+        PluginSetup::manual(&[
             DANMAKU_MATCH_CAPABILITY,
             DANMAKU_SEARCH_CAPABILITY,
             DANMAKU_FETCH_CAPABILITY,
-        ],
+        ]),
         None,
     )
     .await?;
@@ -424,11 +510,11 @@ async fn manual_search_returns_candidates_and_enforces_the_documented_bounds()
 -> Result<(), Box<dyn std::error::Error>> {
     // A generous per-session budget keeps the bounds assertions independent of request timing.
     let fixture = setup(
-        &[
+        PluginSetup::manual(&[
             DANMAKU_MATCH_CAPABILITY,
             DANMAKU_SEARCH_CAPABILITY,
             DANMAKU_FETCH_CAPABILITY,
-        ],
+        ]),
         Some((100, Duration::from_secs(60))),
     )
     .await?;
@@ -563,7 +649,7 @@ async fn manual_search_returns_candidates_and_enforces_the_documented_bounds()
 async fn manual_search_reports_an_unsupported_plugin_as_a_conflict()
 -> Result<(), Box<dyn std::error::Error>> {
     // A plugin that only declares `danmaku.match` keeps automatic matching and hides manual search.
-    let fixture = setup(&[DANMAKU_MATCH_CAPABILITY], None).await?;
+    let fixture = setup(PluginSetup::manual(&[DANMAKU_MATCH_CAPABILITY]), None).await?;
     let response = fixture
         .client
         .get(fixture.search_url())
@@ -602,11 +688,11 @@ async fn manual_search_is_rate_limited_per_administrator_session()
     // The production window is one second; the fixture pins a long one so the rejection is not a
     // timing race.
     let fixture = setup(
-        &[
+        PluginSetup::manual(&[
             DANMAKU_MATCH_CAPABILITY,
             DANMAKU_SEARCH_CAPABILITY,
             DANMAKU_FETCH_CAPABILITY,
-        ],
+        ]),
         Some((1, Duration::from_secs(60))),
     )
     .await?;
@@ -640,11 +726,11 @@ async fn manual_search_is_rate_limited_per_administrator_session()
 async fn manual_match_queues_one_job_and_writes_the_fetched_episode()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = setup(
-        &[
+        PluginSetup::manual(&[
             DANMAKU_MATCH_CAPABILITY,
             DANMAKU_SEARCH_CAPABILITY,
             DANMAKU_FETCH_CAPABILITY,
-        ],
+        ]),
         None,
     )
     .await?;
@@ -684,7 +770,7 @@ async fn manual_match_queues_one_job_and_writes_the_fetched_episode()
     assert_eq!(item_provider_anime.as_deref(), Some("anime-1"));
     assert_eq!(item_episode.as_deref(), Some("ep-2"));
 
-    // Retrying a manual job must not silently widen it into a library sweep.
+    // Only a failed or cancelled job can be retried; a completed manual job is still a conflict.
     let retried = fixture
         .client
         .post(format!(
@@ -695,7 +781,7 @@ async fn manual_match_queues_one_job_and_writes_the_fetched_episode()
         .header("x-csrf-token", &fixture.csrf)
         .send()
         .await?;
-    assert_ne!(retried.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(retried.status(), reqwest::StatusCode::CONFLICT);
     Ok(())
 }
 
@@ -703,11 +789,11 @@ async fn manual_match_queues_one_job_and_writes_the_fetched_episode()
 async fn manual_match_skips_an_existing_sidecar_unless_overwrite_is_set()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = setup(
-        &[
+        PluginSetup::manual(&[
             DANMAKU_MATCH_CAPABILITY,
             DANMAKU_SEARCH_CAPABILITY,
             DANMAKU_FETCH_CAPABILITY,
-        ],
+        ]),
         None,
     )
     .await?;
@@ -760,11 +846,11 @@ async fn manual_match_skips_an_existing_sidecar_unless_overwrite_is_set()
 async fn manual_match_conflicts_with_an_active_library_job()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = setup(
-        &[
+        PluginSetup::manual(&[
             DANMAKU_MATCH_CAPABILITY,
             DANMAKU_SEARCH_CAPABILITY,
             DANMAKU_FETCH_CAPABILITY,
-        ],
+        ]),
         None,
     )
     .await?;
@@ -795,20 +881,8 @@ async fn manual_match_conflicts_with_an_active_library_job()
     Ok(())
 }
 
-#[tokio::test]
-async fn manual_match_requires_the_library_to_be_selected_in_the_plugin_config()
--> Result<(), Box<dyn std::error::Error>> {
-    // docs/LUX-DEVELOPMENT.md §3.7: a library that is not selected cannot create danmaku match
-    // jobs. Manual matching keeps that rule instead of queuing a job the worker would fail.
-    let fixture = setup(
-        &[
-            DANMAKU_MATCH_CAPABILITY,
-            DANMAKU_SEARCH_CAPABILITY,
-            DANMAKU_FETCH_CAPABILITY,
-        ],
-        None,
-    )
-    .await?;
+/// Reconfigures the plugin so no library is selected for automatic matching.
+async fn deselect_every_library(fixture: &Fixture) -> Result<(), Box<dyn std::error::Error>> {
     let configured = fixture
         .client
         .put(format!(
@@ -825,7 +899,26 @@ async fn manual_match_requires_the_library_to_be_selected_in_the_plugin_config()
         .send()
         .await?;
     assert_eq!(configured.status(), reqwest::StatusCode::OK);
-    let response = fixture
+    Ok(())
+}
+
+#[tokio::test]
+async fn manual_match_works_for_a_library_that_is_not_selected_for_automatic_matching()
+-> Result<(), Box<dyn std::error::Error>> {
+    // docs/LUX-DEVELOPMENT.md §3.7: an unselected library cannot start an *automatic* sweep, but an
+    // administrator's manual match names one item explicitly and is exempt (ADR-052 P5).
+    let fixture = setup(
+        PluginSetup::manual(&[
+            DANMAKU_MATCH_CAPABILITY,
+            DANMAKU_SEARCH_CAPABILITY,
+            DANMAKU_FETCH_CAPABILITY,
+        ]),
+        None,
+    )
+    .await?;
+    deselect_every_library(&fixture).await?;
+
+    let created = fixture
         .client
         .post(fixture.match_url())
         .header(COOKIE, &fixture.cookies)
@@ -833,7 +926,51 @@ async fn manual_match_requires_the_library_to_be_selected_in_the_plugin_config()
         .json(&manual_match_body("ep-1", false))
         .send()
         .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::ACCEPTED);
+    let job_id = created.json::<Value>().await?["job"]["id"]
+        .as_str()
+        .ok_or("missing job id")?
+        .to_owned();
+    let finished = fixture.wait_for_job(&job_id).await?;
+    assert_eq!(finished["status"], "COMPLETED", "{finished}");
+    assert_eq!(finished["successCount"], 1);
+    // The worker skipped the LIBRARY_NOT_SELECTED guard and used the fetch path.
+    assert_eq!(tokio::fs::read(fixture.sidecar_path()).await?, FETCH_XML);
+    assert_eq!(fixture.fetch_calls(), vec!["ep-1".to_owned()]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn automatic_match_still_rejects_a_library_that_is_not_selected()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = setup(
+        PluginSetup::manual(&[
+            DANMAKU_MATCH_CAPABILITY,
+            DANMAKU_SEARCH_CAPABILITY,
+            DANMAKU_FETCH_CAPABILITY,
+        ]),
+        None,
+    )
+    .await?;
+    deselect_every_library(&fixture).await?;
+
+    let response = fixture
+        .client
+        .post(fixture.library_match_url())
+        .header(COOKIE, &fixture.cookies)
+        .header("x-csrf-token", &fixture.csrf)
+        .json(&json!({"concurrency": 2, "overwrite": false}))
+        .send()
+        .await?;
     assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body = response.json::<Value>().await?;
+    assert_eq!(body["error"]["code"], "INVALID_REQUEST");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("未在弹幕插件配置中启用")
+    );
     let job_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM danmaku_match_jobs")
         .fetch_one(fixture.database.pool())
         .await?;
@@ -845,11 +982,11 @@ async fn manual_match_requires_the_library_to_be_selected_in_the_plugin_config()
 async fn manual_delete_removes_lux_sidecars_and_protects_user_files()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = setup(
-        &[
+        PluginSetup::manual(&[
             DANMAKU_MATCH_CAPABILITY,
             DANMAKU_SEARCH_CAPABILITY,
             DANMAKU_FETCH_CAPABILITY,
-        ],
+        ]),
         None,
     )
     .await?;
@@ -931,11 +1068,11 @@ async fn manual_delete_removes_lux_sidecars_and_protects_user_files()
 async fn manual_delete_refuses_a_sidecar_path_outside_the_media_root()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = setup(
-        &[
+        PluginSetup::manual(&[
             DANMAKU_MATCH_CAPABILITY,
             DANMAKU_SEARCH_CAPABILITY,
             DANMAKU_FETCH_CAPABILITY,
-        ],
+        ]),
         None,
     )
     .await?;
@@ -968,5 +1105,285 @@ async fn manual_delete_refuses_a_sidecar_path_outside_the_media_root()
     assert_eq!(body["error"]["code"], "INVALID_REQUEST");
     assert!(tokio::fs::try_exists(&outside).await?);
     assert!(fixture.track_row().await?.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn retrying_a_failed_library_job_queues_a_new_sweep() -> Result<(), Box<dyn std::error::Error>>
+{
+    // A library job that wrote one sidecar and failed another item is still retryable; the old
+    // guard misread the provider ids the worker records on success as "this is a manual job".
+    let fixture = setup(
+        PluginSetup::manual(&[
+            DANMAKU_MATCH_CAPABILITY,
+            DANMAKU_SEARCH_CAPABILITY,
+            DANMAKU_FETCH_CAPABILITY,
+        ]),
+        None,
+    )
+    .await?;
+    fixture.add_movie("Fail.Movie.2024.mkv").await?;
+    let job_id = fixture.start_library_match().await?;
+    let finished = fixture.wait_for_job(&job_id).await?;
+    assert_eq!(finished["status"], "FAILED", "{finished}");
+    assert_eq!(finished["totalCount"], 2);
+    assert_eq!(finished["successCount"], 1);
+    assert_eq!(finished["failedCount"], 1);
+    assert!(tokio::fs::try_exists(fixture.sidecar_path()).await?);
+
+    let retried = fixture
+        .client
+        .post(format!(
+            "{}/api/v1/admin/danmaku/match-jobs/{job_id}/retry",
+            fixture.base_url
+        ))
+        .header(COOKIE, &fixture.cookies)
+        .header("x-csrf-token", &fixture.csrf)
+        .send()
+        .await?;
+    assert_eq!(retried.status(), reqwest::StatusCode::ACCEPTED);
+    let retried_job = retried.json::<Value>().await?["job"].clone();
+    assert_ne!(retried_job["id"], json!(job_id));
+    assert_eq!(retried_job["totalCount"], 2);
+    let finished = fixture
+        .wait_for_job(retried_job["id"].as_str().ok_or("missing job id")?)
+        .await?;
+    assert_eq!(finished["totalCount"], 2, "{finished}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn retrying_a_failed_manual_job_fetches_the_same_episode_again()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = setup(
+        PluginSetup::manual(&[
+            DANMAKU_MATCH_CAPABILITY,
+            DANMAKU_SEARCH_CAPABILITY,
+            DANMAKU_FETCH_CAPABILITY,
+        ]),
+        None,
+    )
+    .await?;
+    // The stub answers this episode with an unusable payload, so the manual job fails.
+    let created = fixture
+        .client
+        .post(fixture.match_url())
+        .header(COOKIE, &fixture.cookies)
+        .header("x-csrf-token", &fixture.csrf)
+        .json(&manual_match_body("bad-xml", false))
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::ACCEPTED);
+    let job_id = created.json::<Value>().await?["job"]["id"]
+        .as_str()
+        .ok_or("missing job id")?
+        .to_owned();
+    assert_eq!(fixture.wait_for_job(&job_id).await?["status"], "FAILED");
+    assert_eq!(fixture.fetch_calls(), vec!["bad-xml".to_owned()]);
+
+    let retried = fixture
+        .client
+        .post(format!(
+            "{}/api/v1/admin/danmaku/match-jobs/{job_id}/retry",
+            fixture.base_url
+        ))
+        .header(COOKIE, &fixture.cookies)
+        .header("x-csrf-token", &fixture.csrf)
+        .send()
+        .await?;
+    assert_eq!(retried.status(), reqwest::StatusCode::ACCEPTED);
+    let retried_job = retried.json::<Value>().await?["job"].clone();
+    let retried_id = retried_job["id"].as_str().ok_or("missing job id")?;
+    assert_ne!(retried_id, job_id.as_str());
+    assert_eq!(retried_job["totalCount"], 1);
+    // The retried job kept the administrator's episode and fetched it again instead of falling back
+    // to `danmaku.match`.
+    let prefilled: Option<String> = sqlx::query_scalar(
+        "SELECT provider_episode_id FROM danmaku_match_job_items WHERE job_id = ?",
+    )
+    .bind(retried_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(prefilled.as_deref(), Some("bad-xml"));
+    assert_eq!(fixture.wait_for_job(retried_id).await?["status"], "FAILED");
+    assert_eq!(
+        fixture.fetch_calls(),
+        vec!["bad-xml".to_owned(), "bad-xml".to_owned()]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn manual_match_never_relabels_a_user_sidecar_as_lux_written()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = setup(
+        PluginSetup::manual(&[
+            DANMAKU_MATCH_CAPABILITY,
+            DANMAKU_SEARCH_CAPABILITY,
+            DANMAKU_FETCH_CAPABILITY,
+        ]),
+        None,
+    )
+    .await?;
+    tokio::fs::write(fixture.sidecar_path(), USER_XML).await?;
+    sqlx::query(
+        "INSERT INTO danmaku_tracks (id, media_source_id, relative_path, format, status)
+         VALUES ('manual-api-user-sidecar', ?, 'Demo.Movie.2024.xml', 'XML', 'READY')",
+    )
+    .bind(&fixture.source_id)
+    .execute(fixture.database.pool())
+    .await?;
+
+    // `overwrite=false` keeps the user file, so the job is SKIPPED and the track must stay untouched.
+    let created = fixture
+        .client
+        .post(fixture.match_url())
+        .header(COOKIE, &fixture.cookies)
+        .header("x-csrf-token", &fixture.csrf)
+        .json(&manual_match_body("ep-1", false))
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::ACCEPTED);
+    let job_id = created.json::<Value>().await?["job"]["id"]
+        .as_str()
+        .ok_or("missing job id")?
+        .to_owned();
+    let finished = fixture.wait_for_job(&job_id).await?;
+    assert_eq!(finished["skippedCount"], 1, "{finished}");
+    let (status, provider, _) = fixture.track_row().await?.ok_or("missing track")?;
+    assert_eq!(status, "READY");
+    assert_eq!(provider, None, "a skipped job must not claim the sidecar");
+
+    let unconfirmed = fixture
+        .client
+        .delete(fixture.delete_url())
+        .header(COOKIE, &fixture.cookies)
+        .header("x-csrf-token", &fixture.csrf)
+        .send()
+        .await?;
+    assert_eq!(unconfirmed.status(), reqwest::StatusCode::CONFLICT);
+    assert!(tokio::fs::try_exists(fixture.sidecar_path()).await?);
+
+    // `overwrite=true` replaces the file, but the existing row is never relabelled either: the
+    // administrator's provider label only survives when the job itself created the row.
+    let created = fixture
+        .client
+        .post(fixture.match_url())
+        .header(COOKIE, &fixture.cookies)
+        .header("x-csrf-token", &fixture.csrf)
+        .json(&manual_match_body("ep-1", true))
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::ACCEPTED);
+    let job_id = created.json::<Value>().await?["job"]["id"]
+        .as_str()
+        .ok_or("missing job id")?
+        .to_owned();
+    assert_eq!(fixture.wait_for_job(&job_id).await?["status"], "COMPLETED");
+    assert_eq!(tokio::fs::read(fixture.sidecar_path()).await?, FETCH_XML);
+    let (_, provider, _) = fixture.track_row().await?.ok_or("missing track")?;
+    assert_eq!(provider, None);
+    let still_unconfirmed = fixture
+        .client
+        .delete(fixture.delete_url())
+        .header(COOKIE, &fixture.cookies)
+        .header("x-csrf-token", &fixture.csrf)
+        .send()
+        .await?;
+    assert_eq!(still_unconfirmed.status(), reqwest::StatusCode::CONFLICT);
+    Ok(())
+}
+
+#[tokio::test]
+async fn manual_delete_cleans_the_registration_when_the_media_file_is_gone()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = setup(
+        PluginSetup::manual(&[
+            DANMAKU_MATCH_CAPABILITY,
+            DANMAKU_SEARCH_CAPABILITY,
+            DANMAKU_FETCH_CAPABILITY,
+        ]),
+        None,
+    )
+    .await?;
+    tokio::fs::write(fixture.sidecar_path(), USER_XML).await?;
+    sqlx::query(
+        "INSERT INTO danmaku_tracks (id, media_source_id, relative_path, format, provider, status)
+         VALUES ('manual-api-gone-track', ?, 'Demo.Movie.2024.xml', 'XML', 'stub', 'MISSING')",
+    )
+    .bind(&fixture.source_id)
+    .execute(fixture.database.pool())
+    .await?;
+    // The media file disappears: the sidecar path can no longer be proven safe to unlink, but the
+    // registration itself must still be removable.
+    tokio::fs::remove_file(fixture.media_root.join("Demo.Movie.2024.mkv")).await?;
+
+    let response = fixture
+        .client
+        .delete(fixture.delete_url())
+        .header(COOKIE, &fixture.cookies)
+        .header("x-csrf-token", &fixture.csrf)
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert!(fixture.track_row().await?.is_none());
+    assert!(tokio::fs::try_exists(fixture.sidecar_path()).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_installed_but_unconfigured_plugin_reports_an_unfinished_configuration()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The plugin is enabled but never configured: that is `PLUGIN_UNAVAILABLE` with the
+    // "configuration unfinished" message, not "this plugin does not support manual matching".
+    let fixture = setup(
+        PluginSetup {
+            capabilities: &[
+                DANMAKU_MATCH_CAPABILITY,
+                DANMAKU_SEARCH_CAPABILITY,
+                DANMAKU_FETCH_CAPABILITY,
+            ],
+            configure: false,
+        },
+        None,
+    )
+    .await?;
+    let search = fixture
+        .client
+        .get(fixture.search_url())
+        .header(COOKIE, &fixture.cookies)
+        .send()
+        .await?;
+    assert_eq!(search.status(), reqwest::StatusCode::CONFLICT);
+    let body = search.json::<Value>().await?;
+    assert_eq!(body["error"]["code"], "PLUGIN_UNAVAILABLE");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("配置未完成"),
+        "{body}"
+    );
+    let create = fixture
+        .client
+        .post(fixture.match_url())
+        .header(COOKIE, &fixture.cookies)
+        .header("x-csrf-token", &fixture.csrf)
+        .json(&manual_match_body("ep-1", false))
+        .send()
+        .await?;
+    assert_eq!(create.status(), reqwest::StatusCode::CONFLICT);
+    let body = create.json::<Value>().await?;
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("配置未完成"),
+        "{body}"
+    );
+    let job_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM danmaku_match_jobs")
+        .fetch_one(fixture.database.pool())
+        .await?;
+    assert_eq!(job_count, 0);
     Ok(())
 }
