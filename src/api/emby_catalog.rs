@@ -5105,12 +5105,22 @@ fn emby_audio_stream_title(stream: &crate::application::catalog::CatalogStream) 
 fn emby_subtitle_stream_title(
     stream: &crate::application::catalog::CatalogStream,
 ) -> Option<String> {
-    let mut parts = Vec::new();
-    if let Some(language) = emby_stream_display_language(stream) {
-        parts.push(language);
-    }
+    let mut parts =
+        vec![emby_stream_display_language(stream).unwrap_or_else(|| "Unknown".to_owned())];
     if let Some(codec) = emby_stream_codec(stream) {
         parts.push(format!("({codec})"));
+    }
+    if stream.is_forced {
+        parts.push("Forced".to_owned());
+    }
+    if stream
+        .details
+        .get("IsHearingImpaired")
+        .and_then(emby_boolean_value)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        parts.push("SDH".to_owned());
     }
     let legacy = emby_stored_stream_title(stream, "Subtitle");
     emby_join_legacy_title(&parts, legacy.as_deref(), None)
@@ -6167,6 +6177,58 @@ mod tests {
         ));
 
         assert_eq!(json["DisplayTitle"], "English AAC stereo (默认)");
+    }
+
+    #[test]
+    fn subtitle_display_title_marks_forced_and_sdh_tracks() {
+        let sdh = emby_media_stream_json(&stream(
+            "SUBTITLE",
+            Some("subrip"),
+            Some("eng"),
+            None,
+            BTreeMap::from([("IsHearingImpaired".to_owned(), json!(true))]),
+        ));
+        assert_eq!(sdh["DisplayTitle"], "English (SUBRIP) SDH");
+
+        let forced = CatalogStream {
+            is_forced: true,
+            ..stream("SUBTITLE", Some("ass"), Some("eng"), None, BTreeMap::new())
+        };
+        assert_eq!(
+            emby_media_stream_json(&forced)["DisplayTitle"],
+            "English (ASS) Forced"
+        );
+    }
+
+    #[test]
+    fn subtitle_display_title_does_not_degrade_to_und() {
+        let json = emby_media_stream_json(&stream(
+            "SUBTITLE",
+            Some("ass"),
+            Some("und"),
+            None,
+            BTreeMap::new(),
+        ));
+
+        assert_eq!(json["Language"], "und");
+        assert_eq!(json["DisplayTitle"], "Unknown (ASS)");
+        assert_eq!(json["Title"], "Unknown (ASS)");
+    }
+
+    #[test]
+    fn subtitle_display_title_keeps_a_single_forced_marker() {
+        let json = emby_media_stream_json(&CatalogStream {
+            is_forced: true,
+            ..stream(
+                "SUBTITLE",
+                Some("ass"),
+                Some("eng"),
+                Some("English (ASS) Forced"),
+                BTreeMap::new(),
+            )
+        });
+
+        assert_eq!(json["DisplayTitle"], "English (ASS) Forced");
     }
 
     #[test]
