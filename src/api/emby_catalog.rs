@@ -5078,6 +5078,11 @@ fn emby_audio_stream_title(stream: &crate::application::catalog::CatalogStream) 
     if let Some(codec) = emby_stream_codec(stream) {
         parts.push(codec);
     }
+    let mut channels = stream
+        .details
+        .get("Channels")
+        .and_then(emby_integer_value)
+        .and_then(|value| value.as_i64());
     if let Some(layout) = stream
         .details
         .get("ChannelLayout")
@@ -5087,18 +5092,14 @@ fn emby_audio_stream_title(stream: &crate::application::catalog::CatalogStream) 
     {
         let layout = layout.split('(').next().unwrap_or(layout).trim();
         if !layout.is_empty() {
+            channels = channels.or_else(|| emby_layout_channels(layout));
             parts.push(layout.to_owned());
         }
-    } else if let Some(channels) = stream
-        .details
-        .get("Channels")
-        .and_then(emby_integer_value)
-        .and_then(|value| value.as_i64())
-    {
-        parts.push(format!("{channels} channels"));
+    } else if let Some(value) = channels {
+        parts.push(format!("{value} channels"));
     }
     let legacy = emby_stored_stream_title(stream, "Audio");
-    emby_join_legacy_title(parts.join(" "), legacy.as_deref())
+    emby_join_legacy_title(&parts, legacy.as_deref(), channels)
 }
 
 fn emby_subtitle_stream_title(
@@ -5112,27 +5113,107 @@ fn emby_subtitle_stream_title(
         parts.push(format!("({codec})"));
     }
     let legacy = emby_stored_stream_title(stream, "Subtitle");
-    emby_join_legacy_title(parts.join(" "), legacy.as_deref())
+    emby_join_legacy_title(&parts, legacy.as_deref(), None)
 }
 
-/// Joins a composed descriptor with the legacy probe title. The legacy value used to be a full
-/// `DisplayTitle` (`FLAC stereo (默认)`), so the two are merged instead of concatenated blindly.
-fn emby_join_legacy_title(display_title: String, legacy: Option<&str>) -> Option<String> {
+/// Joins a composed descriptor with the legacy probe title, which used to be a full
+/// `DisplayTitle` (`FLAC stereo (默认)`). When the legacy value already names every composed part
+/// it is the richer label (`Chinese Simplified DTS-HD MA 7.1 (默认)` beats `Chinese Simplified DTS
+/// 7.1`); otherwise only the legacy words that add information are appended, so markers such as
+/// `(默认)` appear once instead of being stacked.
+fn emby_join_legacy_title(
+    parts: &[String],
+    legacy: Option<&str>,
+    channels: Option<i64>,
+) -> Option<String> {
+    let composed = parts.join(" ");
     let Some(legacy) = legacy.map(str::trim).filter(|value| !value.is_empty()) else {
-        return (!display_title.is_empty()).then_some(display_title);
+        return (!composed.is_empty()).then_some(composed);
     };
-    if display_title.is_empty() {
+    if composed.is_empty() {
         return Some(legacy.to_owned());
     }
-    let display_title_lower = display_title.to_ascii_lowercase();
-    let legacy_lower = legacy.to_ascii_lowercase();
-    if display_title_lower.contains(&legacy_lower) {
-        return Some(display_title);
-    }
-    if legacy_lower.contains(&display_title_lower) {
+    if emby_title_covers_every_part(legacy, parts, channels) {
         return Some(legacy.to_owned());
     }
-    Some(format!("{display_title} {legacy}"))
+    let composed_lower = composed.to_lowercase();
+    let mut kept = Vec::new();
+    let mut kept_lower: Vec<String> = Vec::new();
+    for token in legacy.split_whitespace() {
+        let normalized = emby_normalize_title_token(token);
+        if normalized.is_empty() || kept_lower.contains(&normalized) {
+            continue;
+        }
+        if composed_lower.contains(&normalized) {
+            continue;
+        }
+        if let (Some(channels), Some(count)) = (channels, emby_layout_channels(&normalized))
+            && count == channels
+        {
+            continue;
+        }
+        kept.push(token.to_owned());
+        kept_lower.push(normalized);
+    }
+    if kept.is_empty() {
+        return Some(composed);
+    }
+    Some(format!("{composed} {}", kept.join(" ")))
+}
+
+fn emby_title_covers_every_part(legacy: &str, parts: &[String], channels: Option<i64>) -> bool {
+    if parts.is_empty() {
+        return false;
+    }
+    let legacy_lower = legacy.to_lowercase();
+    let legacy_tokens = legacy
+        .split_whitespace()
+        .map(emby_normalize_title_token)
+        .collect::<Vec<_>>();
+    parts.iter().all(|part| {
+        let part = emby_normalize_title_token(part);
+        if part.is_empty() || legacy_lower.contains(&part) {
+            return true;
+        }
+        // `6 channels` is also covered by a layout word that implies six channels (`5.1`).
+        let Some(count) = part
+            .strip_suffix(" channels")
+            .and_then(|count| count.trim().parse::<i64>().ok())
+        else {
+            return false;
+        };
+        channels == Some(count)
+            && legacy_tokens
+                .iter()
+                .any(|token| emby_layout_channels(token) == Some(count))
+    })
+}
+
+fn emby_normalize_title_token(token: &str) -> String {
+    token
+        .trim_matches(|character: char| {
+            matches!(
+                character,
+                '(' | ')' | '（' | '）' | '[' | ']' | ',' | ';' | ':'
+            )
+        })
+        .to_lowercase()
+}
+
+/// Channel count implied by a channel layout word, used to recognise that a legacy title already
+/// carries the channel information the composed descriptor derived from `Channels`.
+fn emby_layout_channels(value: &str) -> Option<i64> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "mono" | "1.0" => Some(1),
+        "stereo" | "2.0" => Some(2),
+        "2.1" | "3.0" => Some(3),
+        "4.0" | "quad" => Some(4),
+        "5.0" => Some(5),
+        "5.1" => Some(6),
+        "6.1" => Some(7),
+        "7.1" => Some(8),
+        _ => None,
+    }
 }
 
 /// ISO 639-2 code, ISO 639-1/CJK aliases and English name for the languages Lux maps explicitly.
@@ -6007,6 +6088,85 @@ mod tests {
         let empty = emby_media_stream_json(&stream("VIDEO", None, None, None, BTreeMap::new()));
         assert_eq!(empty["DisplayTitle"], "Video");
         assert!(empty.get("Title").is_none());
+    }
+
+    #[test]
+    fn audio_display_title_keeps_the_default_marker_without_restacking_the_track_name() {
+        let json = emby_media_stream_json(&stream(
+            "AUDIO",
+            Some("flac"),
+            Some("chi"),
+            Some("FLAC stereo (默认)"),
+            BTreeMap::from([
+                ("ChannelLayout".to_owned(), json!("stereo")),
+                ("Channels".to_owned(), json!(2)),
+            ]),
+        ));
+
+        assert_eq!(json["DisplayTitle"], "Chinese FLAC stereo (默认)");
+        assert_eq!(json["Title"], "Chinese FLAC stereo (默认)");
+    }
+
+    #[test]
+    fn audio_display_title_prefers_a_legacy_title_that_already_names_every_detail() {
+        let json = emby_media_stream_json(&stream(
+            "AUDIO",
+            Some("dts"),
+            Some("chi"),
+            Some("Chinese Simplified DTS-HD MA 7.1 (默认)"),
+            BTreeMap::from([
+                ("DisplayLanguage".to_owned(), json!("Chinese Simplified")),
+                ("ChannelLayout".to_owned(), json!("7.1")),
+                ("Channels".to_owned(), json!(8)),
+            ]),
+        ));
+
+        assert_eq!(
+            json["DisplayTitle"],
+            "Chinese Simplified DTS-HD MA 7.1 (默认)"
+        );
+    }
+
+    #[test]
+    fn audio_display_title_uses_channels_when_the_layout_is_missing() {
+        let json = emby_media_stream_json(&stream(
+            "AUDIO",
+            Some("aac"),
+            None,
+            Some("10 ch"),
+            BTreeMap::from([("Channels".to_owned(), json!(10))]),
+        ));
+
+        assert_eq!(json["DisplayTitle"], "AAC 10 channels");
+    }
+
+    #[test]
+    fn audio_display_title_keeps_a_legacy_layout_that_matches_the_channel_count() {
+        let json = emby_media_stream_json(&stream(
+            "AUDIO",
+            Some("aac"),
+            None,
+            Some("AAC 5.1"),
+            BTreeMap::from([("Channels".to_owned(), json!(6))]),
+        ));
+
+        assert_eq!(json["DisplayTitle"], "AAC 5.1");
+    }
+
+    #[test]
+    fn audio_display_title_adds_missing_parts_once() {
+        let json = emby_media_stream_json(&stream(
+            "AUDIO",
+            Some("aac"),
+            Some("eng"),
+            Some("AAC stereo (默认)"),
+            BTreeMap::from([
+                ("ChannelLayout".to_owned(), json!("stereo")),
+                ("Channels".to_owned(), json!(2)),
+            ]),
+        ));
+
+        assert_eq!(json["DisplayTitle"], "English AAC stereo (默认)");
     }
 
     #[test]
