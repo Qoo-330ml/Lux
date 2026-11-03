@@ -18,7 +18,7 @@
 | `--test images` | 图片变体、写回、缩略图与图片 API | 5 | 52 |
 | `--test playback` | 播放、播放令牌/历史/续播、观看状态归档、章节与片头片尾检测 | 10 | 34 |
 | `--test storage` | SQLite/PostgreSQL 存储、迁移、WAL、数据库维护与启动守卫 | 7 | 112 |
-| `--test plugins` | 插件协议与运行时、弹幕、IP 属地、媒体信息插件配置 | 11 | 84 |
+| `--test plugins` | 插件协议与运行时、弹幕、IP 属地、媒体信息插件配置 | 12 | 111 |
 | `--test strm` | STRM 目标解析/探测/播放与 ffprobe | 9 | 42 |
 | 合计（12 组） |  | 120 | 822 |
 
@@ -139,6 +139,7 @@ cargo test --locked --test <新 target> <旧名>::
 | `storage` | 76 | `cargo test --locked --test storage storage::` |
 | `danmaku` | 7 | `cargo test --locked --test plugins danmaku::` |
 | `danmaku_api` | 2 | `cargo test --locked --test plugins danmaku_api::` |
+| `danmaku_manual_api` | 10 | `cargo test --locked --test plugins danmaku_manual_api::` |
 | `danmaku_config` | 2 | `cargo test --locked --test plugins danmaku_config::` |
 | `danmaku_config_api` | 1 | `cargo test --locked --test plugins danmaku_config_api::` |
 | `danmaku_plugin` | 2 | `cargo test --locked --test plugins danmaku_plugin::` |

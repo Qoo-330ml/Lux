@@ -19267,6 +19267,73 @@ setup 启动的首轮 `RECONCILE_LIBRARY` 扫描，因此启动流程新增“�
 
 依赖：ADR-052 P4；D2（手动匹配 API）依赖本任务的宿主方法。
 
+#### LUX-878：管理员手动弹幕匹配 API（ADR-052 P5）
+
+范围（ADR-052 P5，已获批准）：只做后端三个管理端点与它们的应用层服务，**不改数据库/迁移、不动
+Emby 路由、不改 `web/` 的界面**（D3 另做）。依赖 LUX-877 的 `search_danmaku`/`fetch_danmaku`/
+`danmaku_manual_match_supported`。
+
+- `GET /api/v1/admin/items/{itemId}/danmaku/search?query=&sourceId=&limit=`：经插件搜索候选。`query`
+  缺省用条目标题（剧集用剧名），trim 后 1–200 字符且不得含控制字符；`limit` 默认 20、上限 50。
+  条目必须是 `MOVIE`/`EPISODE` 且有可用媒体源，否则 404/400。响应
+  `{ items: [{ provider, animeId, animeTitle, episodes: [{ episodeId, title }] }], supported: true }`。
+  插件未安装/未启用/配置未完成/未声明 `danmaku.search`+`danmaku.fetch` → 409 `PLUGIN_UNAVAILABLE`
+  （“不支持手动匹配”单独措辞，不落到 500/503）；插件返回无效数据 → 503 `PLUGIN_UNAVAILABLE`。
+  仅管理员 Web session 可用（普通用户 403），并按管理员会话限流：生产默认每秒 2 次
+  （`security::DanmakuSearchRateLimiter`，键为会话材料，存储前哈希），超限 429 `RATE_LIMITED` +
+  `Retry-After: 1`。普通用户请求永远不会触发上游请求。
+- `POST /api/v1/admin/items/{itemId}/danmaku/match`：`{ sourceId?, provider?, animeId?, episodeId,
+  overwrite }`，创建**单条**持久化作业（复用 `danmaku_match_jobs`/`danmaku_match_job_items` 与现有
+  Worker 池，`total_count = 1`，`library_id` 取条目所属库），返回 202 与现有 match-jobs DTO。
+  作业项预填 `provider_anime_id`/`provider_episode_id`，Worker 见到预填 `provider_episode_id` 时跳过
+  `danmaku.match`，直接 `danmaku.fetch` → `decode_xml`（含 `validate_danmaku_xml`）→
+  `atomic_write_danmaku_xml` → 登记 `danmaku_tracks`。`provider` 是插件返回的不透明标签，缺省/空串/
+  纯空白按“未设置”处理；**不加新列**：它随创建作业时的 `danmaku_tracks.provider` 持久化
+  （新行 `status='MISSING'`，已存在行只更新 provider/anime/episode 三元组，不动 status/fingerprint），
+  Worker 因此能在重启后仍知道该用哪个 provider 调用 `danmaku.fetch`。`overwrite=false` 且已有有效同名
+  `.xml` → 作业项 `SKIPPED` 且保留原文件；`overwrite=true` 覆盖。库内已有活动弹幕作业 → 409
+  （`AlreadyActive`）。手动作业不可 `/retry`（409，避免把单集请求悄悄扩成整库扫描）。
+- `DELETE /api/v1/admin/items/{itemId}/danmaku?sourceId=&confirmUserSidecar=`：删除已登记的旁车
+  `.xml` 与 `danmaku_tracks` 行，成功 204。仅当路径通过现有媒体根/符号链接校验时删文件；越界、符号
+  链接或非普通文件 → 400 且不删任何东西；未登记 → 404；文件已不存在但登记仍在 → 只清理登记。
+  `danmaku_tracks.provider` 为空（用户自带旁车）必须带 `confirmUserSidecar=true`，否则 409。文件删除
+  走 `tokio::fs`（异步 fs，不在 Tokio 核心线程做阻塞 IO）。
+- 日志与审计：沿用 `record_audit_event`，新增 `DANMAKU_MANUAL_MATCH_STARTED`（只记条目、媒体源、
+  `overwrite`）与 `DANMAKU_SIDECAR_DELETED`；不记录搜索文本、插件返回、完整上游 URL 或 token。搜索
+  端点本身不写审计，避免把管理员输入落盘。
+- 文档与类型：`docs/API.md` 三个端点；`docs/API-TYPES-SYNC.md` 记录三个新 ts-rs DTO 与请求体的手写
+  镜像；`web/src/lib/api/generated/` 新增 `ManualDanmakuSearchResponse`/`ManualDanmakuCandidate`/
+  `ManualDanmakuEpisode`，`types.ts` 转出同名类型，`client.ts` 新增 `manualDanmakuSearch`/
+  `startManualDanmakuMatch`/`deleteItemDanmaku`，`query-keys.ts` 新增
+  `adminItemDanmakuSearch`（仅 API 层，无 UI）。
+- 未改：数据库与迁移（无新列、无新表）、`src/api/emby*`、`web/src/features/**`。
+
+**规格冲突（已上报，未自行决定）**：本任务的派遣说明要求手动匹配“不要求该库在插件配置的允许媒体库
+里”，但 `docs/LUX-DEVELOPMENT.md` §3.7 规定“未选择的媒体库不能创建弹幕匹配任务”，且自动匹配的
+Worker（`run_claimed`）对未选择媒体库直接以 `LIBRARY_NOT_SELECTED` 失败。实现按 §3.7 保留该规则
+（未选择 → 400“该媒体库未在弹幕插件配置中启用”），否则作业必然在 Worker 里失败；放宽该规则需要
+同时修改 §3.7、Worker 校验与本节，属于负责人决策，未在本任务内改动。
+
+验收（2026-11-03，本机 `uname -m` = `arm64`）：
+
+- [x] `cargo test --locked --test plugins danmaku_manual_api::` 10/10：非管理员 403 与缺 CSRF 被拒
+      （且不排队作业）、搜索成功与上限/越界参数、仅 match 插件 → 409 且提示“不支持手动匹配”、
+      速率限制 429 + `Retry-After: 1`、手动匹配建单条作业且 Worker 走 fetch 路径写旁车（写入的是
+      fetch XML 而非 match XML，track provider/`provider_episode_id` 正确）、`overwrite` 的
+      SKIPPED/覆盖语义、库内活动作业 409、未选媒体库 400、删除（Lux 写入的无需确认 / 用户自带需
+      `confirmUserSidecar` / 未登记 404 / 越界路径 400）。
+- [x] `cargo test --locked --test plugins danmaku::` 13/13、`danmaku_api::` 2/2、
+      `danmaku_config::`+`danmaku_config_api::` 3/3；`cargo test --locked --lib danmaku` 13/13、
+      `--lib security` 6/6（含每秒 2 次与窗口恢复）。
+- [x] `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`
+      通过；`scripts/check-migration-parity.py`、`scripts/check-backend-branches.py` 通过
+      （无迁移、无新增 `DatabaseBackend::` 分支）；`scripts/check-api-types.sh` 通过（生成物与 Rust
+      DTO 一致）。
+- [x] `pnpm --dir web build`、`pnpm --dir web test` 161 文件 / 1441 用例通过。
+- [ ] 未验证：真实 `org.lux.danmaku` 插件（Lux-plugins 仓库另行升级）的 search/fetch 往返；PostgreSQL
+      实机；本机 `--test admin` 中 `admin_settings::transcoding_settings_…` 仍失败（断言本机没有可用
+      VideoToolbox 编码器，本机实际可用，属既有环境相关失败，与本任务无关）。
+
 ## 31. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

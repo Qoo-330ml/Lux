@@ -374,6 +374,29 @@ scripts/check-api-types.sh          # 只跑这一项
 `/api/v1/continue-watching`、`/favorites`、`/search`、`/children` 等 8 条路由共用 `G-Page` + `G-MediaItem`，
 所以第 3、4 步完成后一次就能覆盖它们。
 
+## 管理员手动弹幕匹配 DTO（ADR-052 P5）
+
+`GET /api/v1/admin/items/{item_id}/danmaku/search` 的响应在实现时就按具名结构体写，并直接接入
+ts-rs 生成流程（`--features ts-bindings` → `scripts/generate-api-types.sh`），因此不再需要手工镜像：
+
+| 类型 | 定义位置 | 覆盖路由 | 生成文件 |
+| --- | --- | --- | --- |
+| `ManualDanmakuSearchResponse` | `src/api/admin/admin_danmaku.rs` | `GET .../danmaku/search` | `ManualDanmakuSearchResponse.ts` |
+| `ManualDanmakuCandidate` | 同上 | 响应项 | `ManualDanmakuCandidate.ts` |
+| `ManualDanmakuEpisode` | 同上 | 候选内的分集 | `ManualDanmakuEpisode.ts` |
+
+- `web/src/lib/api/types.ts` 用 `export type { ... } from "./generated/..."` 转出这三个类型，导出名与
+  Rust 类型一致；`web/src/lib/api/client.ts` 的 `manualDanmakuSearch` / `startManualDanmakuMatch` /
+  `deleteItemDanmaku` 使用它们（`AdminDanmakuMatchJob` 继续复用现有手写类型）。
+- `provider` 在 Rust 是 `Option<String>`，因此生成 `provider: string | null`；服务端始终输出该键（不跳过
+  `null`），与 `WebDanmakuInfo.sourceId` 的处理一致。
+- **请求体不参与生成**（本文件范围约定）。`POST .../danmaku/match` 的请求形状
+  `{ sourceId?, provider?, animeId?, episodeId, overwrite }` 与 `DELETE .../danmaku` 的
+  `sourceId`/`confirmUserSidecar` 查询参数在 `client.ts` 里手写，字段名与 `docs/API.md` 一致。
+- `DELETE` 成功为 `204`，因此生成类型不适用；`POST` 复用现有 match-jobs 作业 DTO（`{ job }` 信封）。
+- 生成命令与防漂移检查沿用第 3 节：`scripts/generate-api-types.sh`、`scripts/check-api-types.sh`
+  （后者已接入 `scripts/check-all.sh`）。
+
 ## 已知限制
 
 1. **`i64` → `number` 的精度**：JSON 数字在 JS 里是 `f64`，超过 2^53 会丢精度。本项目的 `i64` 目前都是
