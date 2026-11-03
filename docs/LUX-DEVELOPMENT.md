@@ -19267,6 +19267,65 @@ setup 启动的首轮 `RECONCILE_LIBRARY` 扫描，因此启动流程新增“�
 
 依赖：ADR-052 P4；D2（手动匹配 API）依赖本任务的宿主方法。
 
+#### LUX-878：Emby MediaStream 对 Hills 等客户端的显示信息补全（Title、DisplayTitle、VideoRange、中文语言别名）
+
+背景：对 Hills（`com.mountains.hills`）的静态逆向分析（2026-11-03）确认：音频/字幕条目文字取
+`DisplayTitle → Title → DisplayLanguage → Language → "und"`，详情页“版本”行 = 视频流 `DisplayTitle` +
+`Size` + `Bitrate`；Hills 不自己拼“语言+编码+声道”，也不读 `DefaultAudioStreamIndex`。因此客户端显示
+的信息量完全取决于服务端输出的 `DisplayTitle`/`Title`/`Language`。
+
+范围：只改 Emby 兼容层的流 DTO 输出（`src/api/emby_catalog.rs` 的 `emby_media_stream_json`、
+`emby_media_source_stream_json`、`emby_media_stream_display_title`、`EMBY_LANGUAGE_TABLE` 等）以及必要时
+`src/application/probe.rs` 的字段白名单。**不改数据库与迁移、不改 Lux 自己的 `/api/v1` DTO 与 `web/`、
+不加路由**；不要求重新探测已入库数据（旧数据必须有合理回退）。
+
+- `DisplayTitle` 更有描述性（Emby 约定写法）：
+  - 视频：`<质量标签> <编码> <动态范围> <位深>` 风格，如 `2160p HEVC HDR10 10bit`；已含 `quality_label`
+    时不得重复前缀（保留现有去重）；缺失的部分直接省略，不出现多余空格或 `Video` 占位拼接。
+  - 音频：`语言 编码 声道布局`（沿用现有规则）；缺 `ChannelLayout` 时用 `Channels`；缺编码时不出现
+    `10 channels` 之外的杂项；`默认`/`Default` 等标记由流自身 title 带来时不得重复叠加。
+  - 字幕：`语言 (编码)` 并带 forced / SDH 标记；语言未知时不得只剩 `und`。
+- 新增流级 `Title`：输出流的人工可读轨道名。优先来自探测保存的原始轨道名；没有原始值的已入库旧数据，
+  回退为不含 `quality_label` 前缀的 `DisplayTitle` 基础部分。不得出现空字符串（缺失则省略键）。
+- `VideoRange` 规范化输出为 Emby 词表：`SDR` / `HDR10` / `HDR10+` / `HLG` / `Dolby Vision`；无法识别
+  的值保持原值，不猜测。
+- `Language`/`DisplayLanguage`：`EMBY_LANGUAGE_TABLE` 补中文变体 `chs`/`cht`/`zh-cn`/`zh-tw`/`zh-hk`/
+  `zh-hans`/`zh-hant`/`cmn`/`yue`，`Language` 统一输出 `chi`，`DisplayLanguage` 区分“中文（简体）/
+  中文（繁体）/ 粤语”等；同时补充常见的欧洲语言码（`fin`、`swe`、`dan`、`gre`/`ell`、`heb`、`hun`、
+  `cze`/`ces`、`rum`/`ron`、`ukr`、`nor`/`nob`、`hrv`、`may`/`msa`、`fil`、`slo`/`slk`）。
+- 每条行为变化先写失败测试再实现；既有 `emby_media_stream_title_includes_available_audio_and_subtitle_details`
+  等断言若与新规则冲突，必须在提交说明里逐条解释，而不是静默改测试。
+
+验收：
+- [ ] `cargo test --locked --lib emby_catalog::` 覆盖：视频/音频/字幕 DisplayTitle 新旧数据、无重复叠加、
+  `Title` 回退与省略、VideoRange 规范化、中文及新增语言别名。
+- [ ] 同一流 JSON 对不含新字段的旧 `CatalogStream`（`title`=旧 DisplayTitle、无详情）输出合理且不 panic。
+- [ ] `cargo test --locked --test <emby 相关组> <模块>::` 的相邻 PlaybackInfo / Items 响应用例无回归（按
+  `docs/TEST-TARGETS.md` 选择）。
+- [ ] `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+  `scripts/check-migration-parity.py`、`scripts/check-backend-branches.py` 通过；完成门按 CLAUDE.md。
+- [ ] 在 `docs/COMPATIBILITY.md` 记录 Hills 对这些字段的读取行为（来源：逆向报告，确认/推断分级）。
+
+依赖：无。LUX-879 依赖本任务（同一文件，串行）。
+
+#### LUX-879：外挂字幕的 Emby Delivery 字段（`DeliveryMethod`/`DeliveryUrl`/`IsExternalUrl`/`SubtitleLocationType`/流级 `Path`）
+
+背景：Hills 的 `MediaStream` 模型解析这 5 个键，二进制里没有自己的字幕端点字面量，推测外挂字幕依赖
+服务端给出的 Delivery 信息（**推断**，逆向未完全展开）。Lux 现在一个都不输出。
+
+范围：仅 Emby 流 DTO。对 `is_external` 的字幕流输出 `DeliveryMethod: "External"`、
+`SubtitleLocationType: "ExternalFile"`、`IsExternalUrl: false`，以及指向既有路由
+`/Videos/{item_id}/{media_source_id}/Subtitles/{stream_index}/Stream.{codec}` 的**相对** `DeliveryUrl`
+（不含 token、不含完整外部 URL、不带查询串中的凭据）；内嵌字幕输出 `DeliveryMethod: "Embed"`、
+`SubtitleLocationType: "InternalStream"`，不输出 `DeliveryUrl`。流级 `Path` 只对本地外挂字幕输出
+文件名（不输出绝对路径，遵守“不记录/不泄露完整路径”）。不新增路由，不改字幕下载行为。
+
+验收：先确认既有字幕路由在 `.srt/.ass/.vtt` 后缀下可用并有测试；新增 DTO 用例；STRM 与本地源都覆盖；
+安全检查：响应不含绝对路径、token 或外部 URL；通用检查同 LUX-878。**实现前须先在本任务里确认 Hills 是否
+真的使用 Delivery* 字段，否则只记录结论、不改行为。**
+
+依赖：LUX-878。
+
 ## 31. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
