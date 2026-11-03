@@ -4911,10 +4911,12 @@ fn emby_media_type(item_type: &str) -> Option<&'static str> {
 
 pub(super) fn emby_media_stream_json(stream: &crate::application::catalog::CatalogStream) -> Value {
     let language = emby_language_code(stream.language.as_deref());
-    let display_title = emby_media_stream_display_title(stream);
+    let stream_type = emby_stream_type(&stream.stream_type);
+    let base_title = emby_media_stream_base_title(stream);
+    let display_title = base_title.clone().unwrap_or_else(|| stream_type.to_owned());
     let mut value = json!({
         "Index": stream.index,
-        "Type": emby_stream_type(&stream.stream_type),
+        "Type": stream_type,
         "Codec": stream.codec,
         "Language": language,
         "DisplayTitle": display_title,
@@ -4928,6 +4930,9 @@ pub(super) fn emby_media_stream_json(stream: &crate::application::catalog::Catal
     });
     if let Some(display_language) = emby_stream_display_language(stream) {
         value["DisplayLanguage"] = Value::String(display_language);
+    }
+    if let Some(title) = emby_media_stream_title(stream, base_title.as_deref()) {
+        value["Title"] = Value::String(title);
     }
     if let Value::Object(object) = &mut value {
         for (key, detail) in &stream.details {
@@ -4972,81 +4977,162 @@ fn emby_media_source_stream_json(
     value
 }
 
-fn emby_media_stream_display_title(stream: &crate::application::catalog::CatalogStream) -> String {
-    let stream_type = emby_stream_type(&stream.stream_type);
-    let title = stream
+/// Human readable track descriptor without the source level quality label.
+///
+/// Emby clients render the stream `DisplayTitle` as-is (Hills: `DisplayTitle -> Title ->
+/// DisplayLanguage -> Language -> "und"`), so the descriptor has to carry the codec, the dynamic
+/// range and the bit depth instead of a bare stream type. `None` means the stored row has no
+/// inspectable detail at all and the caller falls back to the stream type.
+fn emby_media_stream_base_title(
+    stream: &crate::application::catalog::CatalogStream,
+) -> Option<String> {
+    match emby_stream_type(&stream.stream_type) {
+        "Video" => emby_video_stream_title(stream),
+        "Audio" => emby_audio_stream_title(stream),
+        "Subtitle" => emby_subtitle_stream_title(stream),
+        _ => emby_stored_stream_title(stream, ""),
+    }
+}
+
+/// `Title` is the human readable track name. Probe metadata already stores the plugin's `Title`
+/// for new rows; older rows only have the legacy probe `DisplayTitle`, which is exactly the base
+/// descriptor and therefore still worth exposing.
+fn emby_media_stream_title(
+    stream: &crate::application::catalog::CatalogStream,
+    base_title: Option<&str>,
+) -> Option<String> {
+    let probed = stream
+        .details
+        .get("Title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    probed
+        .map(str::to_owned)
+        .or_else(|| base_title.map(str::to_owned))
+}
+
+/// Legacy probe rows stored the plugin's `DisplayTitle` (for example `4K HDR 10 HEVC`) in both
+/// `media_streams.title` and the stream details; it is the only descriptor such rows have.
+fn emby_stored_stream_title(
+    stream: &crate::application::catalog::CatalogStream,
+    placeholder: &str,
+) -> Option<String> {
+    let stored = stream
         .title
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if !matches!(stream_type, "Audio" | "Subtitle") {
-        return title.unwrap_or(stream_type).to_owned();
-    }
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            stream
+                .details
+                .get("DisplayTitle")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })?;
+    (!stored.eq_ignore_ascii_case(placeholder)).then(|| stored.to_owned())
+}
 
-    let language = emby_stream_display_language(stream);
-    let codec = stream
+fn emby_stream_codec(stream: &crate::application::catalog::CatalogStream) -> Option<String> {
+    stream
         .codec
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| value.to_ascii_uppercase());
+        .map(str::to_ascii_uppercase)
+}
 
+fn emby_video_stream_title(stream: &crate::application::catalog::CatalogStream) -> Option<String> {
     let mut parts = Vec::new();
-    if let Some(language) = language {
+    if let Some(codec) = emby_stream_codec(stream) {
+        parts.push(codec);
+    }
+    if let Some(range) = stream.details.get("VideoRange").and_then(Value::as_str) {
+        let range = emby_video_range(range);
+        // Emby's own display titles leave the SDR default out; only flag real dynamic ranges.
+        if !range.is_empty() && !range.eq_ignore_ascii_case("SDR") {
+            parts.push(range);
+        }
+    }
+    if let Some(depth) = stream
+        .details
+        .get("BitDepth")
+        .and_then(emby_integer_value)
+        .and_then(|value| value.as_i64())
+        .filter(|value| *value > 0)
+    {
+        parts.push(format!("{depth}bit"));
+    }
+    if parts.is_empty() {
+        return emby_stored_stream_title(stream, "Video");
+    }
+    Some(parts.join(" "))
+}
+
+fn emby_audio_stream_title(stream: &crate::application::catalog::CatalogStream) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(language) = emby_stream_display_language(stream) {
         parts.push(language);
     }
-    if stream_type == "Audio" {
-        if let Some(codec) = codec {
-            parts.push(codec);
+    if let Some(codec) = emby_stream_codec(stream) {
+        parts.push(codec);
+    }
+    if let Some(layout) = stream
+        .details
+        .get("ChannelLayout")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let layout = layout.split('(').next().unwrap_or(layout).trim();
+        if !layout.is_empty() {
+            parts.push(layout.to_owned());
         }
-        if let Some(layout) = stream
-            .details
-            .get("ChannelLayout")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            let layout = layout.split('(').next().unwrap_or(layout).trim();
-            if !layout.is_empty() {
-                parts.push(layout.to_owned());
-            }
-        } else if let Some(channels) = stream
-            .details
-            .get("Channels")
-            .and_then(emby_integer_value)
-            .and_then(|value| value.as_i64())
-        {
-            parts.push(format!("{channels} channels"));
-        }
-    } else if let Some(codec) = codec {
+    } else if let Some(channels) = stream
+        .details
+        .get("Channels")
+        .and_then(emby_integer_value)
+        .and_then(|value| value.as_i64())
+    {
+        parts.push(format!("{channels} channels"));
+    }
+    let legacy = emby_stored_stream_title(stream, "Audio");
+    emby_join_legacy_title(parts.join(" "), legacy.as_deref())
+}
+
+fn emby_subtitle_stream_title(
+    stream: &crate::application::catalog::CatalogStream,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(language) = emby_stream_display_language(stream) {
+        parts.push(language);
+    }
+    if let Some(codec) = emby_stream_codec(stream) {
         parts.push(format!("({codec})"));
     }
+    let legacy = emby_stored_stream_title(stream, "Subtitle");
+    emby_join_legacy_title(parts.join(" "), legacy.as_deref())
+}
 
-    let mut display_title = parts.join(" ");
-    if let Some(title) = title.filter(|value| !value.eq_ignore_ascii_case(stream_type)) {
-        if display_title.is_empty() {
-            display_title.push_str(title);
-        } else if !display_title
-            .to_ascii_lowercase()
-            .contains(&title.to_ascii_lowercase())
-        {
-            if title
-                .to_ascii_lowercase()
-                .contains(&display_title.to_ascii_lowercase())
-            {
-                display_title = title.to_owned();
-            } else {
-                display_title.push(' ');
-                display_title.push_str(title);
-            }
-        }
-    }
-
+/// Joins a composed descriptor with the legacy probe title. The legacy value used to be a full
+/// `DisplayTitle` (`FLAC stereo (默认)`), so the two are merged instead of concatenated blindly.
+fn emby_join_legacy_title(display_title: String, legacy: Option<&str>) -> Option<String> {
+    let Some(legacy) = legacy.map(str::trim).filter(|value| !value.is_empty()) else {
+        return (!display_title.is_empty()).then_some(display_title);
+    };
     if display_title.is_empty() {
-        title.unwrap_or(stream_type).to_owned()
-    } else {
-        display_title
+        return Some(legacy.to_owned());
     }
+    let display_title_lower = display_title.to_ascii_lowercase();
+    let legacy_lower = legacy.to_ascii_lowercase();
+    if display_title_lower.contains(&legacy_lower) {
+        return Some(display_title);
+    }
+    if legacy_lower.contains(&display_title_lower) {
+        return Some(legacy.to_owned());
+    }
+    Some(format!("{display_title} {legacy}"))
 }
 
 /// ISO 639-2 code, ISO 639-1/CJK aliases and English name for the languages Lux maps explicitly.
@@ -5650,6 +5736,50 @@ mod tests {
 
     use crate::application::catalog::{CatalogSource, CatalogStream};
 
+    fn catalog_source(quality_label: Option<&str>, streams: Vec<CatalogStream>) -> CatalogSource {
+        CatalogSource {
+            id: "source-1".to_owned(),
+            source_kind: "LOCAL_FILE".to_owned(),
+            file_name: Some("Show.S01E02.mkv".to_owned()),
+            container: Some("mkv".to_owned()),
+            size: Some(1),
+            external_url: None,
+            edition_name: None,
+            quality_label: quality_label.map(str::to_owned),
+            bitrate: Some(1),
+            duration_ticks: Some(1),
+            is_default: true,
+            probe_status: "READY".to_owned(),
+            streams,
+            chapters: Vec::new(),
+        }
+    }
+
+    fn stream(
+        stream_type: &str,
+        codec: Option<&str>,
+        language: Option<&str>,
+        title: Option<&str>,
+        details: BTreeMap<String, serde_json::Value>,
+    ) -> CatalogStream {
+        CatalogStream {
+            index: 0,
+            stream_type: stream_type.to_owned(),
+            codec: codec.map(str::to_owned),
+            language: language.map(str::to_owned),
+            title: title.map(str::to_owned),
+            is_external: false,
+            is_default: true,
+            is_forced: false,
+            details,
+        }
+    }
+
+    fn source_stream_json(source: &CatalogSource) -> serde_json::Value {
+        let json = emby_media_source_json_with_resolver("item-1", source, true, false);
+        json["MediaStreams"][0].clone()
+    }
+
     #[test]
     fn languages_are_reported_with_iso639_2_codes() {
         assert_eq!(super::emby_language_code(Some("en")), "eng");
@@ -5800,6 +5930,86 @@ mod tests {
     }
 
     #[test]
+    fn video_display_title_describes_quality_codec_range_and_bit_depth() {
+        let source = catalog_source(
+            Some("2160p"),
+            vec![stream(
+                "VIDEO",
+                Some("hevc"),
+                None,
+                None,
+                BTreeMap::from([
+                    ("VideoRange".to_owned(), json!("HDR 10")),
+                    ("BitDepth".to_owned(), json!(10)),
+                ]),
+            )],
+        );
+
+        let json = source_stream_json(&source);
+
+        assert_eq!(json["DisplayTitle"], "2160p HEVC HDR10 10bit");
+        assert_eq!(json["Title"], "HEVC HDR10 10bit");
+        assert_eq!(json["VideoRange"], "HDR10");
+    }
+
+    #[test]
+    fn video_display_title_omits_missing_parts_without_extra_spaces() {
+        let source = catalog_source(
+            Some("1080p"),
+            vec![stream("VIDEO", Some("h264"), None, None, BTreeMap::new())],
+        );
+
+        assert_eq!(source_stream_json(&source)["DisplayTitle"], "1080p H264");
+    }
+
+    #[test]
+    fn video_display_title_falls_back_to_the_probed_title_for_old_rows() {
+        let json = emby_media_stream_json(&stream(
+            "VIDEO",
+            None,
+            None,
+            Some("4K HDR 10 HEVC"),
+            BTreeMap::new(),
+        ));
+
+        assert_eq!(json["DisplayTitle"], "4K HDR 10 HEVC");
+        assert_eq!(json["Title"], "4K HDR 10 HEVC");
+    }
+
+    #[test]
+    fn video_display_title_does_not_repeat_the_quality_label() {
+        let source = catalog_source(
+            Some("1080p"),
+            vec![stream(
+                "VIDEO",
+                None,
+                None,
+                Some("1080p H264"),
+                BTreeMap::new(),
+            )],
+        );
+
+        assert_eq!(source_stream_json(&source)["DisplayTitle"], "1080p H264");
+    }
+
+    #[test]
+    fn stream_title_prefers_the_probed_track_name_and_is_omitted_when_unknown() {
+        let probed = emby_media_stream_json(&stream(
+            "VIDEO",
+            Some("hevc"),
+            None,
+            Some("HEVC"),
+            BTreeMap::from([("Title".to_owned(), json!("Main feature"))]),
+        ));
+        assert_eq!(probed["DisplayTitle"], "HEVC");
+        assert_eq!(probed["Title"], "Main feature");
+
+        let empty = emby_media_stream_json(&stream("VIDEO", None, None, None, BTreeMap::new()));
+        assert_eq!(empty["DisplayTitle"], "Video");
+        assert!(empty.get("Title").is_none());
+    }
+
+    #[test]
     fn only_playable_items_report_a_media_type() {
         assert_eq!(emby_media_type("MOVIE"), Some("Video"));
         assert_eq!(emby_media_type("EPISODE"), Some("Video"));
@@ -5843,7 +6053,9 @@ mod tests {
 
         assert_eq!(json["Name"], "Show.S01E02.2160p.WEB-DL.mkv");
         assert_eq!(json["VideoType"], "2160p");
-        assert_eq!(json["MediaStreams"][0]["DisplayTitle"], "2160p");
+        // LUX-878: Emby display titles describe the stream, not just the quality label; Hills
+        // renders this string verbatim in its version row.
+        assert_eq!(json["MediaStreams"][0]["DisplayTitle"], "2160p HEVC");
     }
 
     #[test]
