@@ -42,14 +42,14 @@ use crate::{
             DanmakuMatchStatus, DanmakuSearchResult, DanmakuSearchRpcRequest,
             EMBY_MIGRATION_CAPABILITY, IP_LOCATION_CAPABILITY, IpLocationRpcRequest,
             IpLocationRpcResult, LOGIN_BACKGROUND_GET_CAPABILITY, LOGIN_BACKGROUND_GET_METHOD,
-            LoginBackgroundRpcResult, MAX_DANMAKU_RPC_RESULT_BYTES, MEDIA_PROBE_CAPABILITY,
-            MediaProbeRpcResult, MediaProbeRpcStreamType, NOTIFICATION_SEND_CAPABILITY,
-            NOTIFICATION_SEND_METHOD, NotificationSendRpcResult, PLUGIN_CATEGORY_MEDIA,
-            PLUGIN_CATEGORY_MIGRATION, PLUGIN_CATEGORY_NETWORK, PLUGIN_CATEGORY_NOTIFICATION,
-            PLUGIN_CATEGORY_SCRAPER, PLUGIN_CATEGORY_UTILITY, PLUGIN_TYPE_CHAPTER_DETECTOR,
-            PLUGIN_TYPE_DANMAKU, PLUGIN_TYPE_DATA_MIGRATION, PLUGIN_TYPE_IP_LOCATION,
-            PLUGIN_TYPE_LOGIN_BACKGROUND, PLUGIN_TYPE_NOTIFICATION, PLUGIN_TYPE_STRM_RESOLVER,
-            PluginConfigField, PluginConfigOption, PluginEmbyRouteRequest, PluginEmbyRouteResponse,
+            LoginBackgroundRpcResult, MEDIA_PROBE_CAPABILITY, MediaProbeRpcResult,
+            MediaProbeRpcStreamType, NOTIFICATION_SEND_CAPABILITY, NOTIFICATION_SEND_METHOD,
+            NotificationSendRpcResult, PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_MIGRATION,
+            PLUGIN_CATEGORY_NETWORK, PLUGIN_CATEGORY_NOTIFICATION, PLUGIN_CATEGORY_SCRAPER,
+            PLUGIN_CATEGORY_UTILITY, PLUGIN_TYPE_CHAPTER_DETECTOR, PLUGIN_TYPE_DANMAKU,
+            PLUGIN_TYPE_DATA_MIGRATION, PLUGIN_TYPE_IP_LOCATION, PLUGIN_TYPE_LOGIN_BACKGROUND,
+            PLUGIN_TYPE_NOTIFICATION, PLUGIN_TYPE_STRM_RESOLVER, PluginConfigField,
+            PluginConfigOption, PluginEmbyRouteRequest, PluginEmbyRouteResponse,
             SECRET_CONFIG_FIELD_KEY, STRM_RESOLVE_CAPABILITY, STRM_RESOLVE_METHOD,
             StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
             declares_danmaku_manual_match, is_valid_login_background_asset_id,
@@ -1277,12 +1277,6 @@ impl PluginService {
                 .map_err(|_| PluginServiceError::InvalidResponse)?,
             )
             .await?;
-        if serde_json::to_vec(&value)
-            .ok()
-            .is_none_or(|bytes| bytes.len() > MAX_DANMAKU_RPC_RESULT_BYTES)
-        {
-            return Err(PluginServiceError::InvalidResponse);
-        }
         let result: DanmakuMatchRpcResult =
             serde_json::from_value(value).map_err(|_| PluginServiceError::InvalidResponse)?;
         match result.status {
@@ -1449,7 +1443,11 @@ impl PluginService {
         Ok(())
     }
 
-    /// One danmaku RPC with the host deadline and the shared result budget applied.
+    /// One danmaku RPC with the host deadline applied.
+    ///
+    /// A response line above `plugin_runtime::MAX_PLUGIN_RESPONSE_BYTES` means the plugin answered
+    /// with something unusable, not that the process is broken, so it surfaces as
+    /// `InvalidResponse` (`PLUGIN_INVALID_RESPONSE`) instead of the unavailable/runtime bucket.
     async fn call_danmaku_rpc(
         &self,
         method: &'static str,
@@ -1463,7 +1461,13 @@ impl PluginService {
                 self.danmaku_call_timeout,
             )
             .await
-            .map_err(PluginServiceError::Runtime)
+            .map_err(|error| {
+                if error.is_oversized_response() {
+                    PluginServiceError::InvalidResponse
+                } else {
+                    PluginServiceError::Runtime(error)
+                }
+            })
     }
 
     pub async fn has_available_chapter_detector(

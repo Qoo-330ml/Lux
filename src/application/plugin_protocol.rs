@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::{Host, Url};
 
-use super::danmaku::{MAX_DANMAKU_XML_BYTES, validate_danmaku_xml};
+use super::danmaku::validate_danmaku_xml;
 use super::schedule::validate_cron;
 
 pub const PLUGIN_FORMAT_VERSION: u32 = 1;
@@ -1479,11 +1479,6 @@ pub fn declares_danmaku_manual_match(manifest: &PluginManifest) -> bool {
         })
 }
 
-/// Upper bound of the serialized result the host accepts for one danmaku RPC.
-///
-/// This is the `danmaku.match` budget the host already enforced; `danmaku.search` and
-/// `danmaku.fetch` reuse it so one plugin call can never hold an unbounded response.
-pub const MAX_DANMAKU_RPC_RESULT_BYTES: usize = 4 * 1024 * 1024;
 /// Longest manual search query the host forwards to a plugin, after trimming.
 pub const MAX_DANMAKU_SEARCH_QUERY_CHARS: usize = 200;
 /// Largest candidate count one manual search may request or return.
@@ -1491,7 +1486,11 @@ pub const MAX_DANMAKU_SEARCH_LIMIT: u32 = 50;
 /// Largest candidate list the host keeps from one plugin response.
 pub const MAX_DANMAKU_SEARCH_CANDIDATES: usize = 50;
 /// Largest episode list the host keeps from one search candidate.
-pub const MAX_DANMAKU_SEARCH_EPISODES: usize = 500;
+///
+/// 50 candidates times 180 episodes with 128-character ids and 300-character titles stays inside
+/// the plugin RPC line budget, so the documented "largest allowed search" is a shape a plugin can
+/// actually deliver instead of a shape the transport rejects first.
+pub const MAX_DANMAKU_SEARCH_EPISODES: usize = 180;
 /// Largest provider anime/episode identifier the host accepts.
 pub const MAX_DANMAKU_IDENTIFIER_CHARS: usize = 128;
 /// Largest provider label the host accepts.
@@ -1556,8 +1555,6 @@ pub struct DanmakuFetchResult {
 pub enum DanmakuRpcValidationError {
     /// The payload is not the documented JSON shape or an identifier is missing.
     InvalidPayload,
-    /// The serialized result exceeds [`MAX_DANMAKU_RPC_RESULT_BYTES`] or the XML byte budget.
-    ResultTooLarge,
     /// A provider/anime/episode identifier is empty, too long or contains control characters.
     InvalidIdentifier,
     /// A title is empty, too long or contains control characters.
@@ -1570,7 +1567,6 @@ impl fmt::Display for DanmakuRpcValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidPayload => formatter.write_str("danmaku RPC payload is invalid"),
-            Self::ResultTooLarge => formatter.write_str("danmaku RPC payload is too large"),
             Self::InvalidIdentifier => formatter.write_str("danmaku RPC identifier is invalid"),
             Self::InvalidText => formatter.write_str("danmaku RPC text is invalid"),
             Self::InvalidXml => formatter.write_str("danmaku XML payload is invalid"),
@@ -1604,11 +1600,13 @@ impl DanmakuFetchRpcRequest {
     /// Host-side request validation. An empty `provider` is treated as "not set".
     pub fn validate(self) -> Result<Self, DanmakuRpcValidationError> {
         let provider = match self.provider.as_deref() {
-            Some(provider) => Some(
+            // An empty or blank label carries no provider information: treat it as "not set"
+            // instead of failing a fetch the caller could already serve.
+            Some(provider) if !provider.trim().is_empty() => Some(
                 normalized_danmaku_identifier(provider, MAX_DANMAKU_PROVIDER_CHARS)
                     .ok_or(DanmakuRpcValidationError::InvalidIdentifier)?,
             ),
-            None => None,
+            Some(_) | None => None,
         };
         let episode_id =
             normalized_danmaku_identifier(&self.episode_id, MAX_DANMAKU_IDENTIFIER_CHARS)
@@ -1628,11 +1626,6 @@ impl DanmakuSearchResult {
     /// legitimately ignore the page bound. Identifiers and titles are validated instead of
     /// trimmed: an empty or oversized value is a broken plugin response, not extra data.
     pub fn from_value(value: Value, limit: u32) -> Result<Self, DanmakuRpcValidationError> {
-        let encoded =
-            serde_json::to_vec(&value).map_err(|_| DanmakuRpcValidationError::InvalidPayload)?;
-        if encoded.len() > MAX_DANMAKU_RPC_RESULT_BYTES {
-            return Err(DanmakuRpcValidationError::ResultTooLarge);
-        }
         let result: Self =
             serde_json::from_value(value).map_err(|_| DanmakuRpcValidationError::InvalidPayload)?;
         let limit = limit.clamp(1, MAX_DANMAKU_SEARCH_LIMIT) as usize;
@@ -1680,13 +1673,8 @@ impl DanmakuSearchResult {
 }
 
 impl DanmakuFetchResult {
-    /// Deserializes one `danmaku.fetch` result inside the same byte budget `danmaku.match` used.
+    /// Deserializes one `danmaku.fetch` result; the transport already bounded its size.
     pub fn from_value(value: Value) -> Result<Self, DanmakuRpcValidationError> {
-        let encoded =
-            serde_json::to_vec(&value).map_err(|_| DanmakuRpcValidationError::InvalidPayload)?;
-        if encoded.len() > MAX_DANMAKU_RPC_RESULT_BYTES {
-            return Err(DanmakuRpcValidationError::ResultTooLarge);
-        }
         let result: Self =
             serde_json::from_value(value).map_err(|_| DanmakuRpcValidationError::InvalidPayload)?;
         if result.xml_base64.trim().is_empty() {
@@ -1703,9 +1691,7 @@ impl DanmakuFetchResult {
         let bytes = BASE64
             .decode(&self.xml_base64)
             .map_err(|_| DanmakuRpcValidationError::InvalidPayload)?;
-        if bytes.len() > MAX_DANMAKU_XML_BYTES {
-            return Err(DanmakuRpcValidationError::ResultTooLarge);
-        }
+        // `validate_danmaku_xml` owns the structural rules and the 50 MiB XML ceiling.
         validate_danmaku_xml(&bytes).map_err(|_| DanmakuRpcValidationError::InvalidXml)?;
         Ok(bytes)
     }

@@ -32,7 +32,13 @@ const MAX_PLUGIN_FILES: usize = 512;
 /// A plugin manifest is small JSON; anything larger is not a valid package.
 const MAX_PLUGIN_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_PLUGIN_INFLIGHT: usize = 16;
-const MAX_PLUGIN_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+/// Largest single protocol line a plugin may write, shared by every plugin RPC.
+///
+/// Callers that own a structural response contract (danmaku search/fetch) treat an overflow as an
+/// invalid response rather than a runtime outage, so the cause stays distinguishable.
+pub const MAX_PLUGIN_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+/// Message the stdout reader uses when a plugin line exceeds [`MAX_PLUGIN_RESPONSE_BYTES`].
+pub(crate) const PLUGIN_RESPONSE_TOO_LARGE: &str = "plugin response is too large";
 
 #[derive(Clone, Debug)]
 enum PluginConfigAccess {
@@ -644,7 +650,7 @@ impl PluginProcess {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     let message = if error.kind() == io::ErrorKind::InvalidData {
-                        "plugin response is too large".to_owned()
+                        PLUGIN_RESPONSE_TOO_LARGE.to_owned()
                     } else {
                         format!("plugin stdout read failed: {error}")
                     };
@@ -844,6 +850,17 @@ pub enum PluginRuntimeError {
     Exited,
 }
 
+impl PluginRuntimeError {
+    /// True when the plugin answered but its protocol line exceeded
+    /// [`MAX_PLUGIN_RESPONSE_BYTES`].
+    ///
+    /// Callers with their own result contract report this as an invalid response instead of a
+    /// runtime outage: the plugin did answer, it just answered with something unusably large.
+    pub fn is_oversized_response(&self) -> bool {
+        matches!(self, Self::Protocol(message) if message == PLUGIN_RESPONSE_TOO_LARGE)
+    }
+}
+
 impl fmt::Display for PluginRuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -880,7 +897,7 @@ where
             if line.len().saturating_add(chunk_len) > max_bytes {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "plugin response is too large",
+                    PLUGIN_RESPONSE_TOO_LARGE,
                 ));
             }
             line.extend_from_slice(&available[..chunk_len]);

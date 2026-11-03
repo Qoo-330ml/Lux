@@ -17,6 +17,7 @@ use luxd::application::plugin_protocol::{
     SECRET_CONFIG_FIELD_KEY, STRM_RESOLVE_CAPABILITY, StrmResolveRpcRequest, StrmResolveRpcResult,
     StrmResolveStatus, declares_danmaku_manual_match,
 };
+use luxd::application::plugin_runtime::MAX_PLUGIN_RESPONSE_BYTES;
 use serde_json::{Value, json};
 
 #[test]
@@ -1301,18 +1302,21 @@ fn danmaku_manual_requests_stay_path_free_camel_case_contracts() {
         }))
         .is_err()
     );
-    assert_eq!(
-        serde_json::to_value(
-            DanmakuFetchRpcRequest {
-                provider: None,
-                episode_id: "42".to_owned(),
-            }
-            .validate()
-            .expect("fetch request without a provider should validate")
-        )
-        .expect("fetch request should serialize"),
-        json!({"episodeId": "42"})
-    );
+    // "No provider" has three spellings a caller may pass: absent, empty and blank. None of them
+    // may fail a fetch the host can already serve, and none of them is forwarded to the plugin.
+    for provider in [None, Some(String::new()), Some("   ".to_owned())] {
+        let request = DanmakuFetchRpcRequest {
+            provider,
+            episode_id: "42".to_owned(),
+        }
+        .validate()
+        .expect("a missing or blank provider means 'not set'");
+        assert!(request.provider.is_none());
+        assert_eq!(
+            serde_json::to_value(&request).expect("fetch request should serialize"),
+            json!({"episodeId": "42"})
+        );
+    }
 }
 
 #[test]
@@ -1346,6 +1350,14 @@ fn danmaku_manual_requests_enforce_host_bounds_before_the_plugin_is_called() {
     assert!(matches!(
         DanmakuFetchRpcRequest {
             provider: Some("p".repeat(MAX_DANMAKU_PROVIDER_CHARS + 1)),
+            episode_id: "42".to_owned(),
+        }
+        .validate(),
+        Err(DanmakuRpcValidationError::InvalidIdentifier)
+    ));
+    assert!(matches!(
+        DanmakuFetchRpcRequest {
+            provider: Some("bad\nprovider".to_owned()),
             episode_id: "42".to_owned(),
         }
         .validate(),
@@ -1464,29 +1476,49 @@ fn danmaku_search_result_rejects_empty_oversized_or_unknown_fields() {
         )
         .is_err()
     );
+}
 
-    let oversized_episodes = json!(
-        (0..MAX_DANMAKU_SEARCH_EPISODES)
-            .map(|index| json!({
-                "episodeId": format!("episode-{index}"),
-                "title": "t".repeat(MAX_DANMAKU_TITLE_CHARS),
-            }))
-            .collect::<Vec<_>>()
-    );
-    let oversized = json!({
+#[test]
+fn the_largest_allowed_search_shape_fits_the_transport_budget() {
+    // Every documented maximum at once: 50 candidates, MAX_DANMAKU_SEARCH_EPISODES each, and every
+    // identifier/title at its length limit. The transport caps one plugin line at
+    // MAX_PLUGIN_RESPONSE_BYTES, so the allowed shape has to fit inside it; otherwise the host
+    // would document a search no plugin could deliver and the oversize error would only ever come
+    // from the transport (which the host API reports as an invalid response).
+    let episodes =
+        json!((0..MAX_DANMAKU_SEARCH_EPISODES)
+        .map(|index| json!({
+            "episodeId": format!("{:0>width$}", index, width = MAX_DANMAKU_IDENTIFIER_CHARS),
+            "title": "t".repeat(MAX_DANMAKU_TITLE_CHARS),
+        }))
+        .collect::<Vec<_>>());
+    let largest = json!({
         "candidates": (0..MAX_DANMAKU_SEARCH_CANDIDATES)
-            .map(|index| {
-                let mut candidate = danmaku_search_candidate(index, 0);
-                candidate["animeTitle"] = json!("t".repeat(MAX_DANMAKU_TITLE_CHARS));
-                candidate["episodes"] = oversized_episodes.clone();
-                candidate
-            })
+            .map(|_index| json!({
+                "provider": "p".repeat(MAX_DANMAKU_PROVIDER_CHARS),
+                "animeId": "a".repeat(MAX_DANMAKU_IDENTIFIER_CHARS),
+                "animeTitle": "t".repeat(MAX_DANMAKU_TITLE_CHARS),
+                "episodes": episodes,
+            }))
             .collect::<Vec<_>>(),
     });
-    assert!(matches!(
-        DanmakuSearchResult::from_value(oversized, MAX_DANMAKU_SEARCH_LIMIT),
-        Err(DanmakuRpcValidationError::ResultTooLarge)
-    ));
+
+    let encoded = serde_json::to_vec(&largest).expect("largest search payload should serialize");
+    assert!(
+        encoded.len() <= MAX_PLUGIN_RESPONSE_BYTES,
+        "documented maximum search shape is {} bytes, above the {} byte transport budget",
+        encoded.len(),
+        MAX_PLUGIN_RESPONSE_BYTES
+    );
+    let result = DanmakuSearchResult::from_value(largest, MAX_DANMAKU_SEARCH_LIMIT)
+        .expect("the largest allowed search shape must be accepted");
+    assert_eq!(result.candidates.len(), MAX_DANMAKU_SEARCH_CANDIDATES);
+    assert!(
+        result
+            .candidates
+            .iter()
+            .all(|candidate| candidate.episodes.len() == MAX_DANMAKU_SEARCH_EPISODES)
+    );
 }
 
 #[test]

@@ -198,6 +198,10 @@ while IFS= read -r line; do
       ;;
     *'"danmaku.search"'*)
       case "$line" in
+        *'"query":"huge"'*)
+          filler=$(head -c 4300000 /dev/zero | tr '\0' 'a')
+          printf '{"id":"%s","result":{"candidates":[{"animeId":"a1","animeTitle":"%s","episodes":[]}]}}\n' "$id" "$filler"
+          ;;
         *'"query":"slow"'*)
           sleep 5
           printf '{"id":"%s","result":{"candidates":[]}}\n' "$id"
@@ -212,6 +216,10 @@ while IFS= read -r line; do
       ;;
     *'"danmaku.fetch"'*)
       case "$line" in
+        *'"episodeId":"huge"'*)
+          filler=$(head -c 4300000 /dev/zero | tr '\0' 'a')
+          printf '{"id":"%s","result":{"xmlBase64":"%s"}}\n' "$id" "$filler"
+          ;;
         *'"episodeId":"bad-xml"'*)
           printf '{"id":"%s","result":{"xmlBase64":"PGh0bWwvPg=="}}\n' "$id"
           ;;
@@ -527,6 +535,22 @@ async fn a_manual_match_plugin_serves_search_and_fetch_inside_the_host_bounds()
     assert_eq!(fetched.decode_xml()?, STUB_XML);
     let without_provider = plugins.fetch_danmaku(None, "ep-2").await?;
     assert_eq!(without_provider.decode_xml()?, STUB_XML);
+    // "No provider" also arrives as an empty or blank label from a form field; neither may fail a
+    // fetch the host can already serve.
+    assert_eq!(
+        plugins
+            .fetch_danmaku(Some(""), "ep-1")
+            .await?
+            .decode_xml()?,
+        STUB_XML
+    );
+    assert_eq!(
+        plugins
+            .fetch_danmaku(Some("   "), "ep-2")
+            .await?
+            .decode_xml()?,
+        STUB_XML
+    );
     Ok(())
 }
 
@@ -583,6 +607,36 @@ async fn a_match_only_plugin_keeps_working_and_reports_manual_search_as_unsuppor
     // The automatic contract must not change for plugins that never declared search or fetch.
     let matched = plugins.match_danmaku("Demo.Movie.2024.mkv").await?;
     assert_eq!(matched.episode_id.as_deref(), Some("34"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn oversized_plugin_answers_are_an_invalid_response_not_a_runtime_outage()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let plugins = danmaku_plugin_service(
+        directory.path(),
+        &[
+            DANMAKU_MATCH_CAPABILITY,
+            DANMAKU_SEARCH_CAPABILITY,
+            DANMAKU_FETCH_CAPABILITY,
+        ],
+        &danmaku_manual_plugin_script(),
+    )
+    .await?;
+
+    // The transport caps one plugin line at 4 MiB. A plugin that answers larger than that answered
+    // with an unusable payload, not with a crashed runtime, so both manual methods must report the
+    // invalid-response class (`PLUGIN_INVALID_RESPONSE`) instead of the runtime/unavailable one.
+    assert!(matches!(
+        plugins.search_danmaku("huge", 10).await,
+        Err(PluginServiceError::InvalidResponse)
+    ));
+    assert!(matches!(
+        plugins.fetch_danmaku(None, "huge").await,
+        Err(PluginServiceError::InvalidResponse)
+    ));
     Ok(())
 }
 
