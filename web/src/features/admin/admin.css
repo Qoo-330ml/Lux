@@ -943,9 +943,7 @@ html[data-lux-theme="light"] .lux-library-override-modes label { background: rgb
 
 .lux-now-playing-placeholder { color: var(--lux-now-card-placeholder) !important; font-weight: 500 !important; }
 
-.lux-danger-icon { color: var(--lux-danger); }
 
-.lux-icon-button-small { min-width: 32px; width: 32px; height: 32px; border-radius: 8px; box-shadow: none; }
 
 .lux-user-badge { padding: 5px 8px; border: 1px solid var(--lux-line-soft); border-radius: 999px; color: var(--lux-subtle); font-size: .67rem; white-space: nowrap; }
 
@@ -1355,54 +1353,6 @@ html[data-lux-theme="light"] .lux-library-delete-dialog { border-color: var(--lu
 html[data-lux-theme="light"] .lux-library-delete-heading h2 { color: var(--lux-text); }
 
 html[data-lux-theme="light"] .lux-library-cover-preview { background: #e7e6e3; }
-
-.lux-scan-activity { position: relative; }
-
-.lux-scan-activity-trigger { position: relative; display: inline-grid; place-items: center; width: 54px; height: 54px; border: 1px solid var(--lux-line); border-radius: 50%; color: var(--lux-text); background: rgba(5,5,6,.3); box-shadow: 0 6px 22px rgba(0,0,0,.18); transition: background .2s ease, border-color .2s ease, transform .2s var(--lux-ease); }
-
-.lux-scan-activity-trigger:hover, .lux-scan-activity-trigger[aria-expanded="true"] { border-color: rgba(255,255,255,.36); background: rgba(255,255,255,.1); transform: translateY(-1px); }
-
-.lux-scan-activity-trigger.is-active svg { animation: lux-scan-pulse 1.4s ease-in-out infinite; }
-
-.lux-scan-activity-dot { position: absolute; top: 10px; right: 10px; width: 8px; height: 8px; border: 2px solid rgba(5,5,6,.8); border-radius: 50%; background: var(--lux-status-success); box-shadow: 0 0 0 4px rgba(155,220,179,.12); }
-
-.lux-scan-activity-popover { position: absolute; top: calc(100% + 12px); right: 0; width: min(360px, calc(100vw - 30px)); overflow: hidden; border: 1px solid var(--lux-line); border-radius: 12px; color: var(--lux-text); background: rgba(17,17,21,.96); box-shadow: 0 22px 58px rgba(0,0,0,.42); backdrop-filter: blur(18px); }
-
-.lux-scan-activity-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 15px; border-bottom: 1px solid var(--lux-line-soft); }
-
-.lux-scan-activity-heading span { display: inline-flex; align-items: center; gap: 8px; color: var(--lux-muted); font-size: .74rem; }
-
-.lux-scan-activity-heading strong { color: #fff; font-size: .9rem; font-variant-numeric: tabular-nums; }
-
-.lux-scan-activity-list { display: grid; }
-
-.lux-scan-activity-row { display: grid; gap: 8px; padding: 13px 15px 14px; border-bottom: 1px solid var(--lux-line-soft); }
-
-.lux-scan-activity-row:last-child { border-bottom: 0; }
-
-.lux-scan-activity-row-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
-
-.lux-scan-activity-row-heading strong { color: #fff; font-size: .78rem; font-weight: 650; }
-
-.lux-scan-activity-row-heading span { color: var(--lux-subtle); font-size: .66rem; font-variant-numeric: tabular-nums; }
-
-.lux-scan-activity-row p { margin: 0; overflow: hidden; color: var(--lux-muted); font-size: .68rem; text-overflow: ellipsis; white-space: nowrap; }
-
-.lux-scan-activity-progress { height: 4px; overflow: hidden; border-radius: 999px; background: rgba(255,255,255,.12); }
-
-.lux-scan-activity-progress span { display: block; width: 35%; height: 100%; border-radius: inherit; background: var(--lux-accent); animation: lux-job-progress-indeterminate 1.2s ease-in-out infinite; }
-
-.lux-scan-activity-progress[aria-valuenow] span { animation: none; }
-
-.lux-scan-activity-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-
-.lux-scan-activity-actions a, .lux-scan-activity-actions button { display: inline-flex; align-items: center; gap: 6px; min-height: var(--lux-button-height-compact); padding: 0 9px; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-muted); background: rgba(255,255,255,.04); font-size: .67rem; transition: color .18s ease, background .18s ease, border-color .18s ease; }
-
-.lux-scan-activity-actions a:hover, .lux-scan-activity-actions button:hover:not(:disabled) { border-color: rgba(255,255,255,.25); color: #fff; background: rgba(255,255,255,.08); }
-
-.lux-scan-activity-actions button:disabled { cursor: default; opacity: .6; }
-
-.lux-scan-activity-empty { margin: 0; padding: 18px 15px; color: var(--lux-muted); font-size: .72rem; }
 
 .lux-admin-layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); width: 92%; min-height: 100vh; min-height: 100dvh; margin: 0 auto; padding: var(--lux-page-top) 0 90px; background: var(--lux-bg); }
 
@@ -1820,9 +1770,7 @@ html[data-lux-theme="light"] .lux-library-cover-preview { background: #e7e6e3; }
 
 .lux-admin-filter-select .lux-select-trigger { min-height: 36px; padding: 0 var(--lux-control-padding-x); color: var(--lux-muted); font-size: .74rem; }
 
-.lux-admin-pagination { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 14px; color: var(--lux-subtle); font-size: .72rem; }
 
-.lux-admin-pagination > div { display: flex; gap: 8px; }
 
 .lux-admin-job-list, .lux-admin-log-list { display: grid; gap: 7px; }
 
@@ -1904,11 +1852,8 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 
 .lux-admin-settings-form select:focus { border-color: rgba(184,164,236,.7); box-shadow: 0 0 0 3px rgba(154,126,232,.12); }
 
-.lux-admin-input-with-suffix { display: flex; align-items: center; max-width: 250px; border: 1px solid var(--lux-line-soft); border-radius: 8px; background: rgba(255,255,255,.05); }
 
-.lux-admin-input-with-suffix input { width: 100%; min-height: 42px; padding: 0 var(--lux-control-padding-x); border: 0; outline: 0; color: #fff; background: transparent; }
 
-.lux-admin-input-with-suffix em { padding-right: 12px; color: var(--lux-subtle); font-size: .74rem; font-style: normal; }
 
 .lux-admin-settings-form > label > input[type="url"] { min-height: 42px; padding: 0 var(--lux-control-padding-x); border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; color: #fff; background: rgba(255,255,255,.05); }
 
@@ -1934,22 +1879,6 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 @media (max-width: 560px) {
   .lux-admin-layout { width: 100%; }
   .lux-admin-content { padding: 24px max(12px, env(safe-area-inset-right)) 64px max(12px, env(safe-area-inset-left)); }
-  .lux-scan-activity-trigger { width: 46px; height: 46px; }
-  .lux-scan-activity-popover {
-    position: fixed;
-    z-index: 30;
-    top: calc(var(--lux-header-height) + 8px);
-    right: 12px;
-    left: 12px;
-    width: auto;
-    max-height: calc(100dvh - var(--lux-header-height) - 24px);
-    overflow-y: auto;
-    overscroll-behavior: contain;
-  }
-  .lux-scan-activity-row-heading { align-items: flex-start; flex-direction: column; gap: 4px; }
-  .lux-scan-activity-row p { white-space: normal; overflow-wrap: anywhere; }
-  .lux-scan-activity-actions { flex-wrap: wrap; }
-  .lux-scan-activity-actions a, .lux-scan-activity-actions button { flex: 1 1 120px; justify-content: center; }
   .lux-admin-page-heading:has(> .lux-button) { align-items: center; flex-direction: row; margin-bottom: 22px; }
   .lux-admin-layout { padding-top: var(--lux-header-height); }
   .lux-admin-panel { padding: var(--lux-panel-padding); }
@@ -1984,8 +1913,6 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-admin-job-actions, .lux-admin-log-row time { grid-column: 2; }
   .lux-admin-job-actions { flex-wrap: wrap; }
   .lux-admin-job-details li { grid-template-columns: 1fr; gap: 3px; }
-  .lux-admin-pagination { align-items: stretch; flex-direction: column; }
-  .lux-admin-pagination > div { display: grid; grid-template-columns: 1fr 1fr; }
 }
 
 /* Library manager reference layout */
@@ -2078,7 +2005,6 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-admin-permission-toggle { min-height: var(--lux-button-height-touch); }
 }
 
-.lux-account-playback-threshold .lux-admin-input-with-suffix { width: 100px; }
 
 html[data-lux-theme="light"] .lux-error-copy,
 html[data-lux-theme="light"] .lux-editor-error,
@@ -2112,14 +2038,6 @@ html[data-lux-theme="light"] .lux-admin-job-attention:hover { color: var(--lux-s
 html[data-lux-theme="light"] .lux-admin-job-error { color: var(--lux-status-danger); }
 
 html[data-lux-theme="light"] .lux-admin-library-cover-placeholder { color: var(--lux-subtle); background: radial-gradient(circle at 50% 20%, rgba(28,28,34,.07), transparent 44%), linear-gradient(145deg, #f1f0ee, #e5e4e2); }
-
-html[data-lux-theme="light"] .lux-scan-activity-trigger { border-color: var(--lux-line); color: var(--lux-text); background: rgba(255,255,255,.66); }
-
-html[data-lux-theme="light"] .lux-scan-activity-trigger:hover, html[data-lux-theme="light"] .lux-scan-activity-trigger[aria-expanded="true"] { border-color: var(--lux-line); background: rgba(28,28,34,.06); }
-
-html[data-lux-theme="light"] .lux-scan-activity-popover { border-color: var(--lux-line); color: var(--lux-text); background: rgba(255,255,255,.98); box-shadow: 0 18px 50px rgba(30,30,38,.18), 0 2px 7px rgba(30,30,38,.08); }
-
-html[data-lux-theme="light"] .lux-scan-activity-heading strong, html[data-lux-theme="light"] .lux-scan-activity-row-heading strong { color: var(--lux-text); }
 
 html[data-lux-theme="light"] .lux-app.is-home-route .lux-icon-button,
 html[data-lux-theme="light"] .lux-app.is-home-route .lux-user-button,
