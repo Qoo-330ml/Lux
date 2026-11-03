@@ -586,6 +586,13 @@ export type WebPlaybackBootstrap = {
 /** Metadata for a registered, same-origin Lux Web danmaku sidecar. */
 export type { WebDanmakuInfo } from "./generated/WebDanmakuInfo";
 
+/** Candidate of the administrator manual danmaku search (ADR-052 P5). */
+export type { ManualDanmakuCandidate } from "./generated/ManualDanmakuCandidate";
+/** One selectable episode of a manual danmaku search candidate. */
+export type { ManualDanmakuEpisode } from "./generated/ManualDanmakuEpisode";
+/** Body of `GET /api/v1/admin/items/{itemId}/danmaku/search`. */
+export type { ManualDanmakuSearchResponse } from "./generated/ManualDanmakuSearchResponse";
+
 export type AdminRoot = {
   id: string;
   libraryId: string;

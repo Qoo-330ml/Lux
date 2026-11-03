@@ -198,6 +198,8 @@ pub struct CoreState {
     login_rate_limiter: LoginRateLimiter,
     device_pairing_rate_limiter: DevicePairingRateLimiter,
     request_rate_limiter: crate::security::RequestRateLimiter,
+    /// Per-administrator-session budget for the manual danmaku search endpoint (ADR-052 P5).
+    danmaku_search_rate_limiter: crate::security::DanmakuSearchRateLimiter,
     /// Bounds the number of concurrent server-sent-event streams.
     sse_permits: SseConnectionBudget,
 }
@@ -728,6 +730,17 @@ impl AppState {
         self
     }
 
+    /// Overrides the manual danmaku search budget (tests pin the window so `429` is deterministic).
+    pub fn with_danmaku_search_rate_limit(
+        mut self,
+        limit: u32,
+        window: std::time::Duration,
+    ) -> Self {
+        self.core.danmaku_search_rate_limiter =
+            crate::security::DanmakuSearchRateLimiter::new(limit, window);
+        self
+    }
+
     pub fn ready(
         config: Config,
         database: Database,
@@ -981,6 +994,7 @@ impl AppState {
             login_rate_limiter: LoginRateLimiter::default(),
             device_pairing_rate_limiter: DevicePairingRateLimiter::default(),
             request_rate_limiter: crate::security::RequestRateLimiter::default(),
+            danmaku_search_rate_limiter: crate::security::DanmakuSearchRateLimiter::default(),
             sse_permits: SseConnectionBudget::default(),
         };
         // Built here (not in `start_realtime_watchers`) so the shutdown can reach its stop handle.

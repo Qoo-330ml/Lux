@@ -197,7 +197,8 @@ impl DanmakuService {
 }
 
 async fn read_validated_sidecar(source: &StoredDanmakuSource) -> Option<Vec<u8>> {
-    let Ok((_, target)) = safe_danmaku_source_paths(source).await else {
+    let Ok((_, target)) = safe_danmaku_source_paths(&source.root_path, &source.relative_path).await
+    else {
         return None;
     };
     let Ok(metadata) = fs::symlink_metadata(&target).await else {

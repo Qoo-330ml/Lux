@@ -1404,8 +1404,11 @@ impl PluginService {
     /// Resolves the enabled danmaku plugin and proves it may serve a manual-match RPC.
     ///
     /// Missing installation, a disabled plugin or an unfinished configuration each keep their own
-    /// error variant so callers do not have to guess from a generic failure.
-    async fn require_danmaku_manual_match_plugin(&self) -> Result<(), PluginServiceError> {
+    /// error variant so callers do not have to guess from a generic failure. Exposed to the danmaku
+    /// application service, which must not report an unconfigured plugin as "not supported".
+    pub(crate) async fn require_danmaku_manual_match_plugin(
+        &self,
+    ) -> Result<(), PluginServiceError> {
         let catalog = self.catalog_snapshot().await;
         let plugin = catalog
             .get(DANMAKU_PLUGIN_ID)

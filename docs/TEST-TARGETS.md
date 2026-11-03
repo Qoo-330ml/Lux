@@ -8,19 +8,19 @@
 
 | 新 target | 领域 | 原文件数 | 测试数 |
 |---|---|---|---|
-| `--test admin` | 管理后台、日志导出、可观测性与运维事件 | 13 | 23 |
-| `--test api_web` | HTTP 契约（错误/限流/压缩/健康/远程策略）、Web 会话、Webhook | 13 | 39 |
-| `--test auth_users` | 认证、会话、登录背景、用户与用户设置、设备配对、界面偏好迁移 | 10 | 70 |
-| `--test emby` | Emby 兼容层（认证、系统信息、增量刷新、发现、多段播放、检索、下载） | 10 | 38 |
-| `--test scanner` | 媒体库扫描、增量/混合扫描、计划任务、作业事件与关停 | 7 | 137 |
-| `--test library` | 媒体库生命周期、合并/拆分、集合、目录与系列 API | 12 | 49 |
+| `--test admin` | 管理后台、日志导出、可观测性与运维事件 | 14 | 25 |
+| `--test api_web` | HTTP 契约（错误/限流/压缩/健康/远程策略）、Web 会话、Webhook | 13 | 57 |
+| `--test auth_users` | 认证、会话、登录背景、用户与用户设置、设备配对、界面偏好迁移 | 10 | 71 |
+| `--test emby` | Emby 兼容层（认证、系统信息、增量刷新、发现、多段播放、检索、下载） | 11 | 39 |
+| `--test scanner` | 媒体库扫描、增量/混合扫描、计划任务、作业事件与关停 | 7 | 151 |
+| `--test library` | 媒体库生命周期、合并/拆分、集合、目录与系列 API | 12 | 50 |
 | `--test metadata` | 元数据抓取与选择、NFO 回写、扫描后剧集元数据、人物、字幕 | 14 | 143 |
-| `--test images` | 图片变体、写回、缩略图与图片 API | 5 | 52 |
-| `--test playback` | 播放、播放令牌/历史/续播、观看状态归档、章节与片头片尾检测 | 10 | 34 |
-| `--test storage` | SQLite/PostgreSQL 存储、迁移、WAL、数据库维护与启动守卫 | 7 | 112 |
-| `--test plugins` | 插件协议与运行时、弹幕、IP 属地、媒体信息插件配置 | 11 | 84 |
+| `--test images` | 图片变体、写回、缩略图与图片 API | 6 | 55 |
+| `--test playback` | 播放、播放令牌/历史/续播、观看状态归档、章节与片头片尾检测 | 10 | 35 |
+| `--test storage` | SQLite/PostgreSQL 存储、迁移、WAL、数据库维护与启动守卫 | 8 | 115 |
+| `--test plugins` | 插件协议与运行时、弹幕、IP 属地、媒体信息插件配置 | 11 | 117 |
 | `--test strm` | STRM 目标解析/探测/播放与 ffprobe | 9 | 42 |
-| 合计（12 组） |  | 120 | 822 |
+| 合计（12 组） |  | 125 | 900 |
 
 另有 7 个 binary 因为进程级共享状态或外部服务依赖保持独立，见第 4 节：`--test background_work_budget`、`--test image_variants_perf`、`--test performance`、`--test postgres_database`、`--test reidentify`、`--test scanned_metadata`、`--test shutdown`。合计 12 + 7 = 19 个集成测试 target。
 
@@ -34,7 +34,10 @@ cargo test --locked --test <新 target> <旧名>::
 
 例如 `cargo test --locked --test scanning_jobs` → `cargo test --locked --test scanner scanning_jobs::`。
 
-| 旧 target | 测试数 | 等价命令 |
+表中的测试数按当前 `cargo test --locked --test <group> <module>:: -- --list` 更新；合并当时的逐组对照见第
+5.1 节。标 † 的模块是合并后新增的（没有对应的旧 target 文件）。
+
+| 旧 target（模块） | 当前测试数 | 等价命令 |
 |---|---|---|
 | `admin_api_key` | 4 | `cargo test --locked --test admin admin_api_key::` |
 | `admin_dashboard` | 1 | `cargo test --locked --test admin admin_dashboard::` |
@@ -49,6 +52,7 @@ cargo test --locked --test <新 target> <旧名>::
 | `log_export` | 2 | `cargo test --locked --test admin log_export::` |
 | `observability` | 2 | `cargo test --locked --test admin observability::` |
 | `user_query_events` | 1 | `cargo test --locked --test admin user_query_events::` |
+| † `user_event_scoping` | 2 | `cargo test --locked --test admin user_event_scoping::` |
 | `acl` | 1 | `cargo test --locked --test api_web acl::` |
 | `api_error_contract` | 5 | `cargo test --locked --test api_web api_error_contract::` |
 | `domain` | 3 | `cargo test --locked --test api_web domain::` |
@@ -57,8 +61,8 @@ cargo test --locked --test <新 target> <旧名>::
 | `ready_version` | 2 | `cargo test --locked --test api_web ready_version::` |
 | `remote` | 8 | `cargo test --locked --test api_web remote::` |
 | `response_compression` | 2 | `cargo test --locked --test api_web response_compression::` |
-| `web_auth` | 4 | `cargo test --locked --test api_web web_auth::` |
-| `web_playback` | 3 | `cargo test --locked --test api_web web_playback::` |
+| `web_auth` | 10 | `cargo test --locked --test api_web web_auth::` |
+| `web_playback` | 15 | `cargo test --locked --test api_web web_playback::` |
 | `web_static` | 2 | `cargo test --locked --test api_web web_static::` |
 | `webhooks` | 6 | `cargo test --locked --test api_web webhooks::` |
 | `webhooks_api` | 1 | `cargo test --locked --test api_web webhooks_api::` |
@@ -67,7 +71,7 @@ cargo test --locked --test <新 target> <旧名>::
 | `device_pairings` | 8 | `cargo test --locked --test auth_users device_pairings::` |
 | `login_background` | 4 | `cargo test --locked --test auth_users login_background::` |
 | `lux_api_auth` | 1 | `cargo test --locked --test auth_users lux_api_auth::` |
-| `resume_favorites` | 5 | `cargo test --locked --test auth_users resume_favorites::` |
+| `resume_favorites` | 6 | `cargo test --locked --test auth_users resume_favorites::` |
 | `sessions` | 2 | `cargo test --locked --test auth_users sessions::` |
 | `setup` | 5 | `cargo test --locked --test auth_users setup::` |
 | `user_settings` | 2 | `cargo test --locked --test auth_users user_settings::` |
@@ -82,14 +86,15 @@ cargo test --locked --test <新 target> <旧名>::
 | `emby_system` | 2 | `cargo test --locked --test emby emby_system::` |
 | `mixed_library_api` | 3 | `cargo test --locked --test emby mixed_library_api::` |
 | `search` | 3 | `cargo test --locked --test emby search::` |
+| † `emby_facets` | 1 | `cargo test --locked --test emby emby_facets::` |
 | `job_events_api` | 2 | `cargo test --locked --test scanner job_events_api::` |
 | `mixed_scanner` | 1 | `cargo test --locked --test scanner mixed_scanner::` |
 | `scanner` | 18 | `cargo test --locked --test scanner scanner::` |
-| `scanning_jobs` | 95 | `cargo test --locked --test scanner scanning_jobs::` |
+| `scanning_jobs` | 96 | `cargo test --locked --test scanner scanning_jobs::` |
 | `scheduled_tasks` | 9 | `cargo test --locked --test scanner scheduled_tasks::` |
 | `series_scanner` | 11 | `cargo test --locked --test scanner series_scanner::` |
-| `shutdown_jobs` | 1 | `cargo test --locked --test scanner shutdown_jobs::` |
-| `catalog` | 3 | `cargo test --locked --test library catalog::` |
+| `shutdown_jobs` | 14 | `cargo test --locked --test scanner shutdown_jobs::` |
+| `catalog` | 4 | `cargo test --locked --test library catalog::` |
 | `cd_movie_versions` | 2 | `cargo test --locked --test library cd_movie_versions::` |
 | `collections` | 4 | `cargo test --locked --test library collections::` |
 | `item_merge` | 1 | `cargo test --locked --test library item_merge::` |
@@ -120,13 +125,14 @@ cargo test --locked --test <新 target> <旧名>::
 | `image_writer` | 20 | `cargo test --locked --test images image_writer::` |
 | `images` | 3 | `cargo test --locked --test images images::` |
 | `thumbnails` | 19 | `cargo test --locked --test images thumbnails::` |
+| † `image_resolve_cache` | 3 | `cargo test --locked --test images image_resolve_cache::` |
 | `chapter_detection` | 2 | `cargo test --locked --test playback chapter_detection::` |
 | `chapter_detection_api` | 1 | `cargo test --locked --test playback chapter_detection_api::` |
 | `chapters` | 1 | `cargo test --locked --test playback chapters::` |
 | `playback` | 6 | `cargo test --locked --test playback playback::` |
 | `playback_history_archive` | 5 | `cargo test --locked --test playback playback_history_archive::` |
 | `playback_strm_probe` | 1 | `cargo test --locked --test playback playback_strm_probe::` |
-| `playback_token` | 5 | `cargo test --locked --test playback playback_token::` |
+| `playback_token` | 6 | `cargo test --locked --test playback playback_token::` |
 | `playback_webhooks` | 1 | `cargo test --locked --test playback playback_webhooks::` |
 | `watch` | 5 | `cargo test --locked --test playback watch::` |
 | `watch_state_archive` | 7 | `cargo test --locked --test playback watch_state_archive::` |
@@ -137,15 +143,16 @@ cargo test --locked --test <新 target> <旧名>::
 | `log_migration` | 10 | `cargo test --locked --test storage log_migration::` |
 | `sqlite_wal` | 2 | `cargo test --locked --test storage sqlite_wal::` |
 | `storage` | 76 | `cargo test --locked --test storage storage::` |
-| `danmaku` | 7 | `cargo test --locked --test plugins danmaku::` |
+| † `index_audit` | 3 | `cargo test --locked --test storage index_audit::` |
+| `danmaku` | 13 | `cargo test --locked --test plugins danmaku::` |
 | `danmaku_api` | 2 | `cargo test --locked --test plugins danmaku_api::` |
+| † `danmaku_manual_api` | 16 | `cargo test --locked --test plugins danmaku_manual_api::` |
 | `danmaku_config` | 2 | `cargo test --locked --test plugins danmaku_config::` |
 | `danmaku_config_api` | 1 | `cargo test --locked --test plugins danmaku_config_api::` |
-| `danmaku_plugin` | 2 | `cargo test --locked --test plugins danmaku_plugin::` |
 | `ip_location_plugins` | 3 | `cargo test --locked --test plugins ip_location_plugins::` |
 | `media_info_config` | 2 | `cargo test --locked --test plugins media_info_config::` |
 | `media_info_config_api` | 1 | `cargo test --locked --test plugins media_info_config_api::` |
-| `plugin_protocol` | 41 | `cargo test --locked --test plugins plugin_protocol::` |
+| `plugin_protocol` | 54 | `cargo test --locked --test plugins plugin_protocol::` |
 | `plugin_runtime` | 14 | `cargo test --locked --test plugins plugin_runtime::` |
 | `plugins` | 9 | `cargo test --locked --test plugins plugins::` |
 | `probe` | 21 | `cargo test --locked --test strm probe::` |
@@ -160,11 +167,11 @@ cargo test --locked --test <新 target> <旧名>::
 | `background_work_budget` | 1 | `cargo test --locked --test background_work_budget`（本来就没有合并） |
 | `image_variants_perf` | 2 | `cargo test --locked --test image_variants_perf`（本来就没有合并） |
 | `performance` | 25 | `cargo test --locked --test performance`（本来就没有合并） |
-| `postgres_database` | 34 | `cargo test --locked --test postgres_database`（本来就没有合并） |
+| `postgres_database` | 36 | `cargo test --locked --test postgres_database`（本来就没有合并） |
 | `reidentify` | 25 | `cargo test --locked --test reidentify`（本来就没有合并） |
 | `scanned_metadata` | 23 | `cargo test --locked --test scanned_metadata`（本来就没有合并） |
 | `shutdown` | 2 | `cargo test --locked --test shutdown`（本来就没有合并） |
-| **合计** | **934** |  |
+| **合计** | **1014** |  |
 
 ## 3. 只跑某一个原文件的测试
 
@@ -223,24 +230,28 @@ cargo test --locked --test scanner
 
 **编译+链接**要分两个口径看：CPU 时间从 761 s 降到 540 s（-29%），说明总编译工作量确实减少了；但墙钟从 269 s 涨到 463 s。原因是并行度：合并前 cargo 能同时跑 127 个测试 target（本次测量中平均占用约 2.8 个核），合并后只有 19 个 unit（平均约 1.2 个核），最大的几个分组（`metadata` 143 例、`scanner` 137 例、`storage` 112 例）成为单点关键路径。同一布局重复测过一次 16 target 的中间版本，墙钟 343 s，可见墙钟差异同时受机器负载影响；以 CPU 时间判断趋势更稳。如果要同时压低链接墙钟，可以把超大分组再按子领域拆成 2~3 个 target，那是与本次目标（磁盘占用与测试执行时间）不同的取舍。
 
-### 5.1 逐组测试数对照（合并前后必须完全一致）
+### 5.1 逐组测试数对照（合并时一致；第四列按当前 `--list` 更新）
 
-| 新 target | 合并前同名文件测试数之和 | 合并后 `--test <group> -- --list` | 结果 |
+合并当时的校验标准是“合并前同名文件测试数之和 == 合并后 `--test <group> -- --list`”。合并之后各任务
+继续新增用例，因此下表保留合并前的数字，第三列改为当前值，第四列标出差异来源；第 1、2 节的数字与
+当前值一致。
+
+| 新 target | 合并前同名文件测试数之和 | 当前 `--test <group> -- --list` | 结果 |
 |---|---|---|---|
-| `admin` | 22 | 22 | 一致 |
-| `api_web` | 39 | 39 | 一致 |
-| `auth_users` | 70 | 70 | 一致 |
-| `emby` | 38 | 38 | 一致 |
-| `scanner` | 137 | 137 | 一致 |
-| `library` | 49 | 49 | 一致 |
+| `admin` | 22 | 25 | 新增 3 例（后续任务） |
+| `api_web` | 39 | 57 | 新增 18 例（后续任务） |
+| `auth_users` | 70 | 71 | 新增 1 例（后续任务） |
+| `emby` | 38 | 39 | 新增 1 例（后续任务） |
+| `scanner` | 137 | 151 | 新增 14 例（后续任务） |
+| `library` | 49 | 50 | 新增 1 例（后续任务） |
 | `metadata` | 143 | 143 | 一致 |
-| `images` | 52 | 52 | 一致 |
-| `playback` | 34 | 34 | 一致 |
-| `storage` | 112 | 112 | 一致 |
-| `plugins` | 84 | 84 | 一致 |
+| `images` | 52 | 55 | 新增 3 例（后续任务） |
+| `playback` | 34 | 35 | 新增 1 例（后续任务） |
+| `storage` | 112 | 115 | 新增 3 例（后续任务） |
+| `plugins` | 84 | 117 | 新增 33 例（后续任务） |
 | `strm` | 42 | 42 | 一致 |
-| 独立 binary 合计 | 112 | 112 | 一致 |
-| **合计** | **934** | **934** | 一致 |
+| 独立 binary 合计 | 112 | 114 | 新增 2 例（后续任务） |
+| **合计** | **934** | **1014** | 差异均为合并后新增用例 |
 
 ### 5.2 单个用例稳定性复核
 
