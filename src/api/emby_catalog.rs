@@ -5105,13 +5105,51 @@ fn emby_audio_stream_title(stream: &crate::application::catalog::CatalogStream) 
 fn emby_subtitle_stream_title(
     stream: &crate::application::catalog::CatalogStream,
 ) -> Option<String> {
-    let mut parts =
-        vec![emby_stream_display_language(stream).unwrap_or_else(|| "Unknown".to_owned())];
-    if let Some(codec) = emby_stream_codec(stream) {
+    let language = emby_stream_display_language(stream);
+    let codec = emby_stream_codec(stream);
+    let markers = emby_subtitle_markers(stream);
+    let legacy = emby_stored_stream_title(stream, "Subtitle");
+
+    let mut parts = Vec::new();
+    let mut legacy_merged = false;
+    match language {
+        Some(language) => parts.push(language),
+        // A legacy row only carries the probe `DisplayTitle`; it is the only language hint, so
+        // keep it as the label instead of stacking `Unknown` in front of it.
+        None => match legacy.as_deref() {
+            Some(legacy) => {
+                parts.push(legacy.to_owned());
+                legacy_merged = true;
+            }
+            None => parts.push("Unknown".to_owned()),
+        },
+    }
+    if let Some(codec) = codec.as_deref()
+        && !parts
+            .iter()
+            .any(|part| emby_codec_is_mentioned(&part.to_lowercase(), codec))
+    {
         parts.push(format!("({codec})"));
     }
+    for marker in markers {
+        if !parts
+            .iter()
+            .any(|part| part.to_lowercase().contains(&marker.to_lowercase()))
+        {
+            parts.push(marker);
+        }
+    }
+    if legacy_merged {
+        return Some(parts.join(" "));
+    }
+    emby_join_legacy_title(&parts, legacy.as_deref(), None)
+}
+
+/// Track flags Hills and other clients expect to see spelled out in a subtitle label.
+fn emby_subtitle_markers(stream: &crate::application::catalog::CatalogStream) -> Vec<String> {
+    let mut markers = Vec::new();
     if stream.is_forced {
-        parts.push("Forced".to_owned());
+        markers.push("Forced".to_owned());
     }
     if stream
         .details
@@ -5120,10 +5158,31 @@ fn emby_subtitle_stream_title(
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
     {
-        parts.push("SDH".to_owned());
+        markers.push("SDH".to_owned());
     }
-    let legacy = emby_stored_stream_title(stream, "Subtitle");
-    emby_join_legacy_title(&parts, legacy.as_deref(), None)
+    markers
+}
+
+/// Probe display titles often use the short codec spelling (`SRT` for `subrip`); treat those as
+/// already mentioned so a legacy label does not grow a second codec suffix.
+fn emby_codec_is_mentioned(title_lower: &str, codec: &str) -> bool {
+    let codec = codec.trim().to_lowercase();
+    if codec.is_empty() {
+        return false;
+    }
+    if title_lower.contains(&codec) {
+        return true;
+    }
+    let alias = match codec.as_str() {
+        "subrip" => "srt",
+        "ass" | "ssa" => "ass",
+        "webvtt" => "vtt",
+        "hdmv_pgs_subtitle" => "pgs",
+        "dvd_subtitle" => "dvdsub",
+        "mov_text" => "tx3g",
+        _ => return false,
+    };
+    title_lower.contains(alias)
 }
 
 /// Joins a composed descriptor with the legacy probe title, which used to be a full
@@ -6229,6 +6288,45 @@ mod tests {
         });
 
         assert_eq!(json["DisplayTitle"], "English (ASS) Forced");
+    }
+
+    #[test]
+    fn subtitle_display_title_keeps_a_legacy_label_as_the_language_hint() {
+        let named = emby_media_stream_json(&stream(
+            "SUBTITLE",
+            Some("subrip"),
+            Some("und"),
+            Some("Chinese (SRT)"),
+            BTreeMap::new(),
+        ));
+        assert_eq!(named["DisplayTitle"], "Chinese (SRT)");
+
+        let sdh = emby_media_stream_json(&stream(
+            "SUBTITLE",
+            Some("subrip"),
+            Some("und"),
+            Some("SDH"),
+            BTreeMap::from([("IsHearingImpaired".to_owned(), json!(true))]),
+        ));
+        assert_eq!(sdh["DisplayTitle"], "SDH (SUBRIP)");
+    }
+
+    #[test]
+    fn legacy_rows_without_details_still_render_useful_titles() {
+        for (stream_type, legacy) in [("VIDEO", "4K HDR 10 HEVC"), ("AUDIO", "FLAC stereo (默认)")]
+        {
+            let json = emby_media_stream_json(&stream(
+                stream_type,
+                None,
+                Some("und"),
+                Some(legacy),
+                BTreeMap::new(),
+            ));
+
+            assert_eq!(json["DisplayTitle"], legacy, "{stream_type}");
+            assert_eq!(json["Title"], legacy, "{stream_type}");
+            assert_eq!(json["Language"], "und", "{stream_type}");
+        }
     }
 
     #[test]
