@@ -5458,7 +5458,7 @@ pub(super) fn normalize_emby_media_stream_detail(key: &str, value: &Value) -> Op
             return (!value.is_null()).then(|| value.clone());
         };
         let normalized = emby_video_range(raw);
-        return (!normalized.is_empty()).then(|| Value::String(normalized));
+        return (!normalized.is_empty()).then_some(Value::String(normalized));
     }
     // Emby clients render blank text as an empty line; probe plugins can store whitespace-only
     // values, so drop them instead of emitting `""`.
