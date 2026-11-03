@@ -1,17 +1,23 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use luxd::application::plugin_protocol::{
     CHAPTER_DETECT_CAPABILITY, CHAPTER_LOOKUP_CAPABILITY, ChapterDetectMarkerType,
     ChapterDetectRpcRequest, ChapterDetectRpcResult, ChapterFingerprintRpcEpisode,
-    ChapterLookupRpcEpisode, ChapterLookupRpcRequest, DANMAKU_MATCH_CAPABILITY,
-    DANMAKU_MATCH_METHOD, DanmakuMatchRpcRequest, DanmakuMatchRpcResult, DanmakuMatchStatus,
-    IP_LOCATION_CAPABILITY, IpLocationRpcResult, LoginBackgroundContentKind,
-    LoginBackgroundRpcResult, LoginBackgroundRpcValidationError, MediaProbeRpcResult,
-    PLUGIN_API_VERSION, PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_NETWORK,
+    ChapterLookupRpcEpisode, ChapterLookupRpcRequest, DANMAKU_FETCH_CAPABILITY,
+    DANMAKU_FETCH_METHOD, DANMAKU_MATCH_CAPABILITY, DANMAKU_MATCH_METHOD,
+    DANMAKU_SEARCH_CAPABILITY, DANMAKU_SEARCH_METHOD, DanmakuFetchResult, DanmakuFetchRpcRequest,
+    DanmakuMatchRpcRequest, DanmakuMatchRpcResult, DanmakuMatchStatus, DanmakuRpcValidationError,
+    DanmakuSearchResult, DanmakuSearchRpcRequest, IP_LOCATION_CAPABILITY, IpLocationRpcResult,
+    LoginBackgroundContentKind, LoginBackgroundRpcResult, LoginBackgroundRpcValidationError,
+    MAX_DANMAKU_IDENTIFIER_CHARS, MAX_DANMAKU_PROVIDER_CHARS, MAX_DANMAKU_SEARCH_CANDIDATES,
+    MAX_DANMAKU_SEARCH_EPISODES, MAX_DANMAKU_SEARCH_LIMIT, MAX_DANMAKU_TITLE_CHARS,
+    MediaProbeRpcResult, PLUGIN_API_VERSION, PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_NETWORK,
     PLUGIN_CATEGORY_NOTIFICATION, PLUGIN_FORMAT_VERSION, PLUGIN_TYPE_CHAPTER_DETECTOR,
     PLUGIN_TYPE_DANMAKU, PLUGIN_TYPE_IP_LOCATION, PLUGIN_TYPE_STRM_RESOLVER,
     PluginEmbyRouteRequest, PluginEmbyRouteResponse, PluginManifest, PluginRequest,
     SECRET_CONFIG_FIELD_KEY, STRM_RESOLVE_CAPABILITY, StrmResolveRpcRequest, StrmResolveRpcResult,
-    StrmResolveStatus,
+    StrmResolveStatus, declares_danmaku_manual_match,
 };
+use luxd::application::plugin_runtime::MAX_PLUGIN_RESPONSE_BYTES;
 use serde_json::{Value, json};
 
 #[test]
@@ -1177,6 +1183,374 @@ fn accepts_a_danmaku_plugin_manifest_and_path_free_match_contract() {
     assert_eq!(DANMAKU_MATCH_METHOD, "danmaku.match");
     assert_eq!(result.status, DanmakuMatchStatus::Matched);
     assert_eq!(result.episode_id.as_deref(), Some("episode-2"));
+}
+
+fn danmaku_manifest(capabilities: &[&str]) -> Value {
+    json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.danmaku",
+        "name": "Danmaku provider",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": PLUGIN_TYPE_DANMAKU,
+        "category": PLUGIN_CATEGORY_MEDIA,
+        "capabilities": capabilities,
+        "permissions": {"network": ["danmaku.example"]},
+        "files": []
+    })
+}
+
+#[test]
+fn a_match_only_danmaku_manifest_keeps_the_automatic_contract() {
+    let manifest = PluginManifest::from_value(danmaku_manifest(&[DANMAKU_MATCH_CAPABILITY]))
+        .expect("match-only danmaku manifest should validate");
+
+    assert!(!declares_danmaku_manual_match(&manifest));
+    assert_eq!(manifest.capabilities, vec![DANMAKU_MATCH_CAPABILITY]);
+}
+
+#[test]
+fn a_danmaku_manifest_may_declare_search_and_fetch_together() {
+    let manifest = PluginManifest::from_value(danmaku_manifest(&[
+        DANMAKU_MATCH_CAPABILITY,
+        DANMAKU_SEARCH_CAPABILITY,
+        DANMAKU_FETCH_CAPABILITY,
+    ]))
+    .expect("manual match danmaku manifest should validate");
+
+    assert!(declares_danmaku_manual_match(&manifest));
+    assert_eq!(DANMAKU_SEARCH_CAPABILITY, "danmaku.search");
+    assert_eq!(DANMAKU_FETCH_CAPABILITY, "danmaku.fetch");
+    assert_eq!(DANMAKU_SEARCH_METHOD, "danmaku.search");
+    assert_eq!(DANMAKU_FETCH_METHOD, "danmaku.fetch");
+}
+
+#[test]
+fn a_danmaku_manifest_rejects_half_declared_or_unknown_capabilities() {
+    let rejected: [&[&str]; 6] = [
+        &[DANMAKU_SEARCH_CAPABILITY],
+        &[DANMAKU_FETCH_CAPABILITY],
+        &[DANMAKU_MATCH_CAPABILITY, DANMAKU_SEARCH_CAPABILITY],
+        &[DANMAKU_MATCH_CAPABILITY, DANMAKU_FETCH_CAPABILITY],
+        &[
+            DANMAKU_MATCH_CAPABILITY,
+            DANMAKU_SEARCH_CAPABILITY,
+            DANMAKU_FETCH_CAPABILITY,
+            "danmaku.merge",
+        ],
+        &[DANMAKU_MATCH_CAPABILITY, "danmaku.unknown"],
+    ];
+    for capabilities in rejected {
+        assert!(
+            PluginManifest::from_value(danmaku_manifest(capabilities)).is_err(),
+            "capabilities {capabilities:?} must be rejected"
+        );
+    }
+}
+
+fn danmaku_search_candidate(index: usize, episodes: usize) -> Value {
+    json!({
+        "provider": format!("provider-{index}"),
+        "animeId": format!("anime-{index}"),
+        "animeTitle": format!("Anime {index}"),
+        "episodes": (0..episodes)
+            .map(|episode| json!({
+                "episodeId": format!("episode-{index}-{episode}"),
+                "title": format!("Episode {episode}"),
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+#[test]
+fn danmaku_manual_requests_stay_path_free_camel_case_contracts() {
+    let search = DanmakuSearchRpcRequest {
+        query: "  Show  ".to_owned(),
+        limit: 20,
+    }
+    .validate()
+    .expect("trimmed query inside the bounds should validate");
+    assert_eq!(
+        serde_json::to_value(&search).expect("search request should serialize"),
+        json!({"query": "Show", "limit": 20})
+    );
+    assert!(
+        serde_json::from_value::<DanmakuSearchRpcRequest>(json!({
+            "query": "Show",
+            "limit": 20,
+            "path": "/media/Show.S01E02.mkv"
+        }))
+        .is_err()
+    );
+
+    let fetch = DanmakuFetchRpcRequest {
+        provider: Some(" dandanplay ".to_owned()),
+        episode_id: " 42 ".to_owned(),
+    }
+    .validate()
+    .expect("trimmed fetch request should validate");
+    assert_eq!(
+        serde_json::to_value(&fetch).expect("fetch request should serialize"),
+        json!({"provider": "dandanplay", "episodeId": "42"})
+    );
+    assert!(
+        serde_json::from_value::<DanmakuFetchRpcRequest>(json!({
+            "provider": "dandanplay",
+            "episodeId": "42",
+            "url": "https://danmaku.example/api"
+        }))
+        .is_err()
+    );
+    // "No provider" has three spellings a caller may pass: absent, empty and blank. None of them
+    // may fail a fetch the host can already serve, and none of them is forwarded to the plugin.
+    for provider in [None, Some(String::new()), Some("   ".to_owned())] {
+        let request = DanmakuFetchRpcRequest {
+            provider,
+            episode_id: "42".to_owned(),
+        }
+        .validate()
+        .expect("a missing or blank provider means 'not set'");
+        assert!(request.provider.is_none());
+        assert_eq!(
+            serde_json::to_value(&request).expect("fetch request should serialize"),
+            json!({"episodeId": "42"})
+        );
+    }
+}
+
+#[test]
+fn danmaku_manual_requests_enforce_host_bounds_before_the_plugin_is_called() {
+    for (query, limit) in [
+        ("", 10),
+        ("   ", 10),
+        (&"x".repeat(201), 10),
+        ("Show", 0),
+        ("Show", 51),
+    ] {
+        assert!(
+            DanmakuSearchRpcRequest {
+                query: query.to_owned(),
+                limit,
+            }
+            .validate()
+            .is_err(),
+            "query {query:?} limit {limit} must be rejected"
+        );
+    }
+
+    assert!(matches!(
+        DanmakuFetchRpcRequest {
+            provider: None,
+            episode_id: String::new(),
+        }
+        .validate(),
+        Err(DanmakuRpcValidationError::InvalidPayload)
+    ));
+    assert!(matches!(
+        DanmakuFetchRpcRequest {
+            provider: Some("p".repeat(MAX_DANMAKU_PROVIDER_CHARS + 1)),
+            episode_id: "42".to_owned(),
+        }
+        .validate(),
+        Err(DanmakuRpcValidationError::InvalidIdentifier)
+    ));
+    assert!(matches!(
+        DanmakuFetchRpcRequest {
+            provider: Some("bad\nprovider".to_owned()),
+            episode_id: "42".to_owned(),
+        }
+        .validate(),
+        Err(DanmakuRpcValidationError::InvalidIdentifier)
+    ));
+    assert!(matches!(
+        DanmakuFetchRpcRequest {
+            provider: None,
+            episode_id: "e".repeat(MAX_DANMAKU_IDENTIFIER_CHARS + 1),
+        }
+        .validate(),
+        Err(DanmakuRpcValidationError::InvalidPayload)
+    ));
+}
+
+#[test]
+fn danmaku_search_result_trims_candidates_and_episodes_to_the_host_bounds() {
+    let oversized = json!({
+        "candidates": (0..MAX_DANMAKU_SEARCH_CANDIDATES + 10)
+            .map(|index| danmaku_search_candidate(index, MAX_DANMAKU_SEARCH_EPISODES + 2))
+            .collect::<Vec<_>>(),
+    });
+    let result = DanmakuSearchResult::from_value(oversized, MAX_DANMAKU_SEARCH_LIMIT)
+        .expect("an oversized candidate list is trimmed, not rejected");
+    assert_eq!(result.candidates.len(), MAX_DANMAKU_SEARCH_CANDIDATES);
+    assert!(
+        result
+            .candidates
+            .iter()
+            .all(|candidate| candidate.episodes.len() == MAX_DANMAKU_SEARCH_EPISODES)
+    );
+
+    let ten_candidates = json!({
+        "candidates": (0..10)
+            .map(|index| danmaku_search_candidate(index, 1))
+            .collect::<Vec<_>>(),
+    });
+    let result = DanmakuSearchResult::from_value(ten_candidates.clone(), 3)
+        .expect("candidates above the requested limit are trimmed");
+    assert_eq!(result.candidates.len(), 3);
+    assert_eq!(result.candidates[0].anime_id, "anime-0");
+    assert_eq!(result.candidates[0].provider.as_deref(), Some("provider-0"));
+
+    // A broken candidate beyond the requested page never reaches the caller, so it cannot fail
+    // the whole search.
+    let mut ten_candidates = ten_candidates;
+    ten_candidates["candidates"][5]["animeTitle"] = json!("");
+    assert!(
+        DanmakuSearchResult::from_value(ten_candidates, 3)
+            .is_ok_and(|result| result.candidates.len() == 3)
+    );
+}
+
+#[test]
+fn danmaku_search_result_rejects_empty_oversized_or_unknown_fields() {
+    let candidate_with = |mutate: &dyn Fn(&mut Value)| {
+        let mut candidate = danmaku_search_candidate(0, 1);
+        mutate(&mut candidate);
+        DanmakuSearchResult::from_value(
+            json!({"candidates": [candidate]}),
+            MAX_DANMAKU_SEARCH_LIMIT,
+        )
+    };
+
+    let anime_id_too_long = "a".repeat(MAX_DANMAKU_IDENTIFIER_CHARS + 1);
+    assert_eq!(
+        candidate_with(&|candidate| candidate["animeId"] = json!(anime_id_too_long)).unwrap_err(),
+        DanmakuRpcValidationError::InvalidIdentifier
+    );
+    assert_eq!(
+        candidate_with(&|candidate| candidate["animeId"] = json!("   ")).unwrap_err(),
+        DanmakuRpcValidationError::InvalidIdentifier
+    );
+    assert_eq!(
+        candidate_with(&|candidate| candidate["episodes"][0]["episodeId"] = json!("")).unwrap_err(),
+        DanmakuRpcValidationError::InvalidIdentifier
+    );
+    assert_eq!(
+        candidate_with(&|candidate| {
+            candidate["provider"] = json!("p".repeat(MAX_DANMAKU_PROVIDER_CHARS + 1));
+        })
+        .unwrap_err(),
+        DanmakuRpcValidationError::InvalidIdentifier
+    );
+    let title_too_long = "t".repeat(MAX_DANMAKU_TITLE_CHARS + 1);
+    assert_eq!(
+        candidate_with(&|candidate| candidate["animeTitle"] = json!(title_too_long)).unwrap_err(),
+        DanmakuRpcValidationError::InvalidText
+    );
+    assert_eq!(
+        candidate_with(&|candidate| candidate["episodes"][0]["title"] = json!("")).unwrap_err(),
+        DanmakuRpcValidationError::InvalidText
+    );
+    assert_eq!(
+        candidate_with(&|candidate| candidate["episodes"][0]["title"] = json!("line\nbreak"))
+            .unwrap_err(),
+        DanmakuRpcValidationError::InvalidText
+    );
+    assert_eq!(
+        candidate_with(&|candidate| candidate["provider"] = json!("   ")).unwrap_err(),
+        DanmakuRpcValidationError::InvalidIdentifier
+    );
+    assert_eq!(
+        candidate_with(&|candidate| candidate["path"] = json!("/media/Show.mkv")).unwrap_err(),
+        DanmakuRpcValidationError::InvalidPayload
+    );
+    assert_eq!(
+        candidate_with(&|candidate| candidate["episodes"][0]["url"] = json!("https://example/"))
+            .unwrap_err(),
+        DanmakuRpcValidationError::InvalidPayload
+    );
+    assert!(
+        DanmakuSearchResult::from_value(
+            json!({"candidates": [], "total": 1}),
+            MAX_DANMAKU_SEARCH_LIMIT
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn the_largest_allowed_search_shape_fits_the_transport_budget() {
+    // Every documented maximum at once: 50 candidates, MAX_DANMAKU_SEARCH_EPISODES each, and every
+    // identifier/title at its length limit. The transport caps one plugin line at
+    // MAX_PLUGIN_RESPONSE_BYTES, so the allowed shape has to fit inside it; otherwise the host
+    // would document a search no plugin could deliver and the oversize error would only ever come
+    // from the transport (which the host API reports as an invalid response).
+    let episodes =
+        json!((0..MAX_DANMAKU_SEARCH_EPISODES)
+        .map(|index| json!({
+            "episodeId": format!("{:0>width$}", index, width = MAX_DANMAKU_IDENTIFIER_CHARS),
+            "title": "t".repeat(MAX_DANMAKU_TITLE_CHARS),
+        }))
+        .collect::<Vec<_>>());
+    let largest = json!({
+        "candidates": (0..MAX_DANMAKU_SEARCH_CANDIDATES)
+            .map(|_index| json!({
+                "provider": "p".repeat(MAX_DANMAKU_PROVIDER_CHARS),
+                "animeId": "a".repeat(MAX_DANMAKU_IDENTIFIER_CHARS),
+                "animeTitle": "t".repeat(MAX_DANMAKU_TITLE_CHARS),
+                "episodes": episodes,
+            }))
+            .collect::<Vec<_>>(),
+    });
+
+    let encoded = serde_json::to_vec(&largest).expect("largest search payload should serialize");
+    assert!(
+        encoded.len() <= MAX_PLUGIN_RESPONSE_BYTES,
+        "documented maximum search shape is {} bytes, above the {} byte transport budget",
+        encoded.len(),
+        MAX_PLUGIN_RESPONSE_BYTES
+    );
+    let result = DanmakuSearchResult::from_value(largest, MAX_DANMAKU_SEARCH_LIMIT)
+        .expect("the largest allowed search shape must be accepted");
+    assert_eq!(result.candidates.len(), MAX_DANMAKU_SEARCH_CANDIDATES);
+    assert!(
+        result
+            .candidates
+            .iter()
+            .all(|candidate| candidate.episodes.len() == MAX_DANMAKU_SEARCH_EPISODES)
+    );
+}
+
+#[test]
+fn danmaku_fetch_result_decodes_and_validates_the_returned_xml() {
+    let xml = br#"<i><d p="1,1,25,16777215,0,0,0,0">hello</d></i>"#;
+    let result = DanmakuFetchResult::from_value(json!({"xmlBase64": BASE64.encode(xml)}))
+        .expect("fetch result should deserialize");
+    assert_eq!(
+        result.decode_xml().expect("danmaku XML should validate"),
+        xml
+    );
+
+    let not_danmaku =
+        DanmakuFetchResult::from_value(json!({"xmlBase64": BASE64.encode(b"<html/>")}))
+            .expect("well formed JSON should deserialize");
+    assert_eq!(
+        not_danmaku.decode_xml().unwrap_err(),
+        DanmakuRpcValidationError::InvalidXml
+    );
+
+    assert!(DanmakuFetchResult::from_value(json!({"xmlBase64": "   "})).is_err());
+    assert!(DanmakuFetchResult::from_value(json!({"xmlBase64": ""})).is_err());
+    assert!(
+        DanmakuFetchResult::from_value(json!({"xmlBase64": "PD94bWw=", "path": "/media/x.xml"}))
+            .is_err()
+    );
+    let not_base64 = DanmakuFetchResult::from_value(json!({"xmlBase64": "not base64!"}))
+        .expect("base64 decoding happens in decode_xml");
+    assert_eq!(
+        not_base64.decode_xml().unwrap_err(),
+        DanmakuRpcValidationError::InvalidPayload
+    );
 }
 
 #[test]

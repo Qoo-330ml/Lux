@@ -538,6 +538,20 @@ pub(crate) fn plugin_error(headers: &HeaderMap, error: PluginServiceError) -> Re
             "插件配置无效",
         )
         .into_response(),
+        PluginServiceError::Unsupported(_) => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::PluginUnavailable,
+            "插件不支持该能力",
+        )
+        .into_response(),
+        PluginServiceError::InvalidRequest(_) => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "插件请求参数无效",
+        )
+        .into_response(),
         PluginServiceError::ImageAsset(error) => match error {
             crate::application::login_background_assets::LoginBackgroundAssetError::TooLarge => {
                 api_error(

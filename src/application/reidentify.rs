@@ -3062,6 +3062,8 @@ fn scraper_failure_reason(error: &ScraperError) -> &'static str {
         ScraperError::Plugin(error) => match error {
             PluginServiceError::UnknownPlugin(_) => "PLUGIN_UNKNOWN",
             PluginServiceError::Unavailable(_) => "PLUGIN_UNAVAILABLE",
+            PluginServiceError::Unsupported(_) => "PLUGIN_UNSUPPORTED",
+            PluginServiceError::InvalidRequest(_) => "PLUGIN_INVALID_REQUEST",
             PluginServiceError::InvalidConfig => "PLUGIN_CONFIG_INVALID",
             PluginServiceError::NoUpdate => "PLUGIN_NOT_READY",
             PluginServiceError::InvalidResponse => "PLUGIN_INVALID_RESPONSE",

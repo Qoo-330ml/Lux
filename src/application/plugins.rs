@@ -35,21 +35,24 @@ use crate::{
             CHAPTER_FINGERPRINT_POINT_DURATION_TICKS, CHAPTER_FINGERPRINT_SAMPLE_RATE,
             CHAPTER_LOOKUP_CAPABILITY, CHAPTER_LOOKUP_METHOD,
             CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES, ChapterDetectRpcRequest, ChapterDetectRpcResult,
-            ChapterLookupRpcRequest, ChapterLookupRpcResult, DANMAKU_MATCH_CAPABILITY,
-            DANMAKU_MATCH_METHOD, DanmakuMatchRpcRequest, DanmakuMatchRpcResult,
-            DanmakuMatchStatus, EMBY_MIGRATION_CAPABILITY, IP_LOCATION_CAPABILITY,
-            IpLocationRpcRequest, IpLocationRpcResult, LOGIN_BACKGROUND_GET_CAPABILITY,
-            LOGIN_BACKGROUND_GET_METHOD, LoginBackgroundRpcResult, MEDIA_PROBE_CAPABILITY,
-            MediaProbeRpcResult, MediaProbeRpcStreamType, NOTIFICATION_SEND_CAPABILITY,
-            NOTIFICATION_SEND_METHOD, NotificationSendRpcResult, PLUGIN_CATEGORY_MEDIA,
-            PLUGIN_CATEGORY_MIGRATION, PLUGIN_CATEGORY_NETWORK, PLUGIN_CATEGORY_NOTIFICATION,
-            PLUGIN_CATEGORY_SCRAPER, PLUGIN_CATEGORY_UTILITY, PLUGIN_TYPE_CHAPTER_DETECTOR,
-            PLUGIN_TYPE_DANMAKU, PLUGIN_TYPE_DATA_MIGRATION, PLUGIN_TYPE_IP_LOCATION,
-            PLUGIN_TYPE_LOGIN_BACKGROUND, PLUGIN_TYPE_NOTIFICATION, PLUGIN_TYPE_STRM_RESOLVER,
-            PluginConfigField, PluginConfigOption, PluginEmbyRouteRequest, PluginEmbyRouteResponse,
+            ChapterLookupRpcRequest, ChapterLookupRpcResult, DANMAKU_FETCH_CAPABILITY,
+            DANMAKU_FETCH_METHOD, DANMAKU_MATCH_CAPABILITY, DANMAKU_MATCH_METHOD,
+            DANMAKU_SEARCH_CAPABILITY, DANMAKU_SEARCH_METHOD, DanmakuFetchResult,
+            DanmakuFetchRpcRequest, DanmakuMatchRpcRequest, DanmakuMatchRpcResult,
+            DanmakuMatchStatus, DanmakuSearchResult, DanmakuSearchRpcRequest,
+            EMBY_MIGRATION_CAPABILITY, IP_LOCATION_CAPABILITY, IpLocationRpcRequest,
+            IpLocationRpcResult, LOGIN_BACKGROUND_GET_CAPABILITY, LOGIN_BACKGROUND_GET_METHOD,
+            LoginBackgroundRpcResult, MEDIA_PROBE_CAPABILITY, MediaProbeRpcResult,
+            MediaProbeRpcStreamType, NOTIFICATION_SEND_CAPABILITY, NOTIFICATION_SEND_METHOD,
+            NotificationSendRpcResult, PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_MIGRATION,
+            PLUGIN_CATEGORY_NETWORK, PLUGIN_CATEGORY_NOTIFICATION, PLUGIN_CATEGORY_SCRAPER,
+            PLUGIN_CATEGORY_UTILITY, PLUGIN_TYPE_CHAPTER_DETECTOR, PLUGIN_TYPE_DANMAKU,
+            PLUGIN_TYPE_DATA_MIGRATION, PLUGIN_TYPE_IP_LOCATION, PLUGIN_TYPE_LOGIN_BACKGROUND,
+            PLUGIN_TYPE_NOTIFICATION, PLUGIN_TYPE_STRM_RESOLVER, PluginConfigField,
+            PluginConfigOption, PluginEmbyRouteRequest, PluginEmbyRouteResponse,
             SECRET_CONFIG_FIELD_KEY, STRM_RESOLVE_CAPABILITY, STRM_RESOLVE_METHOD,
             StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
-            is_valid_login_background_asset_id,
+            declares_danmaku_manual_match, is_valid_login_background_asset_id,
         },
         plugin_runtime::{DiscoveredPlugin, PluginCatalog, PluginRuntimeError, PluginSupervisor},
         plugin_store::{
@@ -161,6 +164,9 @@ pub struct PluginService {
         Arc<std::sync::Mutex<Option<crate::application::background_loop::BackgroundLoop>>>,
     login_background_refresh_failures: Arc<Mutex<HashMap<String, LoginBackgroundRefreshFailure>>>,
     login_background_asset_upload_lock: Arc<Mutex<()>>,
+    /// Deadline for one danmaku plugin RPC. Production keeps the supervisor default; tests lower
+    /// it so the timeout path does not have to wait the full 30 s.
+    danmaku_call_timeout: Duration,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -195,6 +201,15 @@ impl PluginService {
         Self::build_with_proxy(database, config_dir, None)
     }
 
+    /// Overrides the deadline used for danmaku plugin RPCs.
+    ///
+    /// Production keeps the supervisor default (the same deadline `danmaku.match` always used).
+    /// A shorter deadline lets tests cover the timeout path without sleeping for 30 s.
+    pub fn with_danmaku_call_timeout(mut self, timeout: Duration) -> Self {
+        self.danmaku_call_timeout = timeout;
+        self
+    }
+
     fn build_with_proxy(
         database: Database,
         config_dir: PathBuf,
@@ -208,6 +223,7 @@ impl PluginService {
             .with_config_dir(config_dir.clone())
             .with_network_proxy_url(proxy_url.clone())
             .with_proxy_bypass(proxy_bypass);
+        let danmaku_call_timeout = supervisor.call_timeout();
         let store = PluginStore::new(config_dir.clone(), proxy_url).ok();
         Self {
             database,
@@ -226,6 +242,7 @@ impl PluginService {
             login_background_refresh_worker: Arc::new(std::sync::Mutex::new(None)),
             login_background_refresh_failures: Arc::new(Mutex::new(HashMap::new())),
             login_background_asset_upload_lock: Arc::new(Mutex::new(())),
+            danmaku_call_timeout,
         }
     }
 
@@ -1251,9 +1268,7 @@ impl PluginService {
             ));
         }
         let value = self
-            .supervisor
-            .call_isolated(
-                DANMAKU_PLUGIN_ID,
+            .call_danmaku_rpc(
                 DANMAKU_MATCH_METHOD,
                 serde_json::to_value(DanmakuMatchRpcRequest {
                     file_name: file_name.to_owned(),
@@ -1261,14 +1276,7 @@ impl PluginService {
                 })
                 .map_err(|_| PluginServiceError::InvalidResponse)?,
             )
-            .await
-            .map_err(PluginServiceError::Runtime)?;
-        if serde_json::to_vec(&value)
-            .ok()
-            .is_none_or(|bytes| bytes.len() > 4 * 1024 * 1024)
-        {
-            return Err(PluginServiceError::InvalidResponse);
-        }
+            .await?;
         let result: DanmakuMatchRpcResult =
             serde_json::from_value(value).map_err(|_| PluginServiceError::InvalidResponse)?;
         match result.status {
@@ -1306,6 +1314,160 @@ impl PluginService {
 
     pub async fn has_available_strm_resolver(&self) -> Result<bool, PluginServiceError> {
         Ok(!self.available_strm_resolver_ids().await?.is_empty())
+    }
+
+    /// Whether the enabled danmaku plugin can be used for manual matching (ADR-052 P4).
+    ///
+    /// A plugin that only declares `danmaku.match` keeps automatic matching; callers hide manual
+    /// search and episode selection for it. Any probe failure reports `false` instead of an error,
+    /// because the answer only decides whether an optional interface is exposed.
+    pub async fn danmaku_manual_match_supported(&self) -> bool {
+        let catalog = self.catalog_snapshot().await;
+        let Some(plugin) = catalog.get(DANMAKU_PLUGIN_ID) else {
+            return false;
+        };
+        if !declares_danmaku_manual_match(&plugin.manifest) {
+            return false;
+        }
+        let Ok((installed, enabled)) = self.plugin_state(DANMAKU_PLUGIN_ID).await else {
+            return false;
+        };
+        if !installed || !enabled {
+            return false;
+        }
+        matches!(
+            self.dynamic_view(plugin, installed, enabled).await,
+            Ok(view) if view.available
+        )
+    }
+
+    /// Searches danmaku candidates through the enabled plugin (ADR-052 P4).
+    ///
+    /// The host validates the query and page bound before the plugin is called, then validates
+    /// and trims the returned candidates. Only the query text and the bound reach the plugin; no
+    /// path, upstream address or user information is forwarded.
+    pub async fn search_danmaku(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<DanmakuSearchResult, PluginServiceError> {
+        let request = DanmakuSearchRpcRequest {
+            query: query.to_owned(),
+            limit,
+        }
+        .validate()
+        .map_err(|_| {
+            PluginServiceError::InvalidRequest(
+                "danmaku search needs a 1-200 character query and a 1-50 limit",
+            )
+        })?;
+        self.require_danmaku_manual_match_plugin().await?;
+        let params =
+            serde_json::to_value(&request).map_err(|_| PluginServiceError::InvalidResponse)?;
+        let value = self.call_danmaku_rpc(DANMAKU_SEARCH_METHOD, params).await?;
+        DanmakuSearchResult::from_value(value, request.limit)
+            .map_err(|_| PluginServiceError::InvalidResponse)
+    }
+
+    /// Fetches the danmaku XML of one episode through the enabled plugin (ADR-052 P4).
+    ///
+    /// The same byte budget and structural XML rules as `danmaku.match` apply, and nothing is
+    /// written here: the plugin payload is decoded and validated with `validate_danmaku_xml`
+    /// before it is returned, and callers still own persistence.
+    pub async fn fetch_danmaku(
+        &self,
+        provider: Option<&str>,
+        episode_id: &str,
+    ) -> Result<DanmakuFetchResult, PluginServiceError> {
+        let request = DanmakuFetchRpcRequest {
+            provider: provider.map(str::to_owned),
+            episode_id: episode_id.to_owned(),
+        }
+        .validate()
+        .map_err(|_| {
+            PluginServiceError::InvalidRequest(
+                "danmaku fetch needs a 1-64 character provider label and a 1-128 character episode id",
+            )
+        })?;
+        self.require_danmaku_manual_match_plugin().await?;
+        let params =
+            serde_json::to_value(&request).map_err(|_| PluginServiceError::InvalidResponse)?;
+        let value = self.call_danmaku_rpc(DANMAKU_FETCH_METHOD, params).await?;
+        let result = DanmakuFetchResult::from_value(value)
+            .map_err(|_| PluginServiceError::InvalidResponse)?;
+        result
+            .decode_xml()
+            .map_err(|_| PluginServiceError::InvalidResponse)?;
+        Ok(result)
+    }
+
+    /// Resolves the enabled danmaku plugin and proves it may serve a manual-match RPC.
+    ///
+    /// Missing installation, a disabled plugin or an unfinished configuration each keep their own
+    /// error variant so callers do not have to guess from a generic failure.
+    async fn require_danmaku_manual_match_plugin(&self) -> Result<(), PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let plugin = catalog
+            .get(DANMAKU_PLUGIN_ID)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(DANMAKU_PLUGIN_ID.to_owned()))?;
+        if !is_danmaku_plugin(plugin) {
+            return Err(PluginServiceError::Unavailable(
+                DANMAKU_PLUGIN_ID.to_owned(),
+            ));
+        }
+        for capability in [DANMAKU_SEARCH_CAPABILITY, DANMAKU_FETCH_CAPABILITY] {
+            if !plugin
+                .manifest
+                .capabilities
+                .iter()
+                .any(|declared| declared == capability)
+            {
+                return Err(PluginServiceError::Unsupported(capability));
+            }
+        }
+        let (installed, enabled) = self.plugin_state(DANMAKU_PLUGIN_ID).await?;
+        if !installed || !enabled {
+            return Err(PluginServiceError::Unavailable(
+                DANMAKU_PLUGIN_ID.to_owned(),
+            ));
+        }
+        let view = self.dynamic_view(plugin, installed, enabled).await?;
+        if !view.configured {
+            return Err(PluginServiceError::InvalidConfig);
+        }
+        if !view.available {
+            return Err(PluginServiceError::Unavailable(
+                DANMAKU_PLUGIN_ID.to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// One danmaku RPC with the host deadline applied.
+    ///
+    /// A response line above `plugin_runtime::MAX_PLUGIN_RESPONSE_BYTES` means the plugin answered
+    /// with something unusable, not that the process is broken, so it surfaces as
+    /// `InvalidResponse` (`PLUGIN_INVALID_RESPONSE`) instead of the unavailable/runtime bucket.
+    async fn call_danmaku_rpc(
+        &self,
+        method: &'static str,
+        params: Value,
+    ) -> Result<Value, PluginServiceError> {
+        self.supervisor
+            .call_isolated_with_timeout(
+                DANMAKU_PLUGIN_ID,
+                method,
+                params,
+                self.danmaku_call_timeout,
+            )
+            .await
+            .map_err(|error| {
+                if error.is_oversized_response() {
+                    PluginServiceError::InvalidResponse
+                } else {
+                    PluginServiceError::Runtime(error)
+                }
+            })
     }
 
     pub async fn has_available_chapter_detector(
@@ -3382,6 +3544,11 @@ pub struct PluginView {
 pub enum PluginServiceError {
     UnknownPlugin(String),
     Unavailable(String),
+    /// The installed plugin does not declare the capability the host asked for.
+    Unsupported(&'static str),
+    /// The host refused the caller's request before reaching the plugin. The payload is host-owned
+    /// text, so it never carries an upstream address, token or user input.
+    InvalidRequest(&'static str),
     InvalidConfig,
     NoUpdate,
     InvalidResponse,
@@ -3398,6 +3565,15 @@ impl fmt::Display for PluginServiceError {
             Self::UnknownPlugin(plugin_id) => write!(formatter, "unknown plugin: {plugin_id}"),
             Self::Unavailable(plugin_id) => {
                 write!(formatter, "plugin is unavailable: {plugin_id}")
+            }
+            Self::Unsupported(capability) => {
+                write!(
+                    formatter,
+                    "plugin capability is not supported: {capability}"
+                )
+            }
+            Self::InvalidRequest(reason) => {
+                write!(formatter, "invalid plugin request: {reason}")
             }
             Self::InvalidConfig => formatter.write_str("invalid plugin configuration"),
             Self::NoUpdate => formatter.write_str("plugin is already up to date"),
@@ -3421,6 +3597,8 @@ impl std::error::Error for PluginServiceError {
             Self::ImageAsset(error) => Some(error),
             Self::UnknownPlugin(_)
             | Self::Unavailable(_)
+            | Self::Unsupported(_)
+            | Self::InvalidRequest(_)
             | Self::InvalidConfig
             | Self::NoUpdate
             | Self::InvalidResponse => None,

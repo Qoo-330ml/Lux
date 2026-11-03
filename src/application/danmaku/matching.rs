@@ -156,6 +156,8 @@ pub(super) fn danmaku_plugin_error_code(error: &PluginServiceError) -> &'static 
         PluginServiceError::UnknownPlugin(_) | PluginServiceError::Unavailable(_) => {
             "PLUGIN_UNAVAILABLE"
         }
+        PluginServiceError::Unsupported(_) => "PLUGIN_UNSUPPORTED",
+        PluginServiceError::InvalidRequest(_) => "PLUGIN_INVALID_REQUEST",
         PluginServiceError::InvalidConfig => "PLUGIN_NOT_CONFIGURED",
         PluginServiceError::InvalidResponse => "PLUGIN_INVALID_RESPONSE",
         PluginServiceError::Runtime(_) => "PLUGIN_RUNTIME_ERROR",

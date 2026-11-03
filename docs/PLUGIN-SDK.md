@@ -4,8 +4,8 @@
 
 Lux 插件是放在 `/config/plugins` 中、由服务重启后发现的独立插件包。首版使用 `.zip` 包格式和独立进程运行时。插件不直接访问 Lux 数据库、媒体根目录或内部任务对象。除元数据插件外，SDK v1 也支持由 Lux 宿主调度的媒体探测、IP 归属地、通知和弹幕插件；任务、媒体库选择、通知队列、结果持久化和旁车写入仍由宿主负责。
 
-弹幕插件固定使用 `type: "danmaku"`、`category: "MEDIA"` 和 `danmaku.match` 能力。Lux
-只向插件发送不含路径和上游地址的文件名：
+弹幕插件使用 `type: "danmaku"`、`category: "MEDIA"`，并且必须声明 `danmaku.match` 能力。
+Lux 只向插件发送不含路径和上游地址的文件名：
 
 ```json
 {"fileName":"Show.S01E02.1080p.mkv"}
@@ -15,6 +15,68 @@ Lux 插件是放在 `/config/plugins` 中、由服务重启后发现的独立插
 `animeId`/`provider` 和受大小限制的 `xmlBase64`。插件负责上游请求、匹配回退、超时、响应
 限制和 XML 校验，宿主负责最终 XML 校验、原子写入同名 `.xml` 旁车、任务进度和 ACL。弹幕
 插件配置由 manifest 的 `configFields` 声明，不能通过普通服务器设置保存。
+
+### 弹幕手动匹配合同（可选能力，ADR-052 P4）
+
+弹幕插件可以额外声明两个可选能力，用于管理员“先搜索、再按集取弹幕”的手动匹配：
+
+- 能力名与方法名相同：`danmaku.search`、`danmaku.fetch`。
+- 两个能力必须**同时声明或同时不声明**；只声明其中一个的 manifest 无效。声明其他未知
+  `danmaku.*` 能力同样无效。`danmaku.match` 仍然必需，旧插件继续只走自动匹配。
+- 只有两个能力都声明、且插件已安装/启用/配置完成时，宿主才暴露手动匹配入口；否则宿主 API
+  返回明确错误（未安装 → `UnknownPlugin`、未启用/不可用 → `Unavailable`、未声明能力 →
+  `Unsupported`、配置未完成 → `InvalidConfig`），不 panic、不降级为通用内部错误。
+
+`danmaku.search` 请求（宿主已 trim，`deny_unknown_fields`）：
+
+```json
+{"query":"Show","limit":20}
+```
+
+- 宿主在发送前校验：`query` trim 后 1–200 个字符且不含控制字符，`limit` 为 1–50。
+- 结果：
+
+```json
+{"candidates":[{"provider":"dandanplay","animeId":"anime-1","animeTitle":"Show",
+  "episodes":[{"episodeId":"ep-1","title":"第 1 集"}]}]}
+```
+
+- 插件应只返回**不超过请求 `limit`** 的候选，且单条响应必须 ≤ 4 MiB（插件 RPC 的单行上限）。
+  宿主仍会裁剪：候选超过请求的 `limit`（本身上限 50）时按顺序截断，每个候选的 `episodes`
+  超过 180 时截断，因此插件多返回的部分不会让整次搜索失败。
+- 宿主对**保留下来**的候选做严格校验：`animeId`/`episodeId` 超过 128 字符、`provider` 超过
+  64 字符、标题超过 300 字符，或任一字符串 trim 后为空／含控制字符，都视为插件返回无效
+  （`PluginInvalidResponse`）。
+- 这份页内裁剪只覆盖“语义上坏掉的候选”：保留页之外的坏候选（空/超长/控制字符）会被直接丢弃，
+  不会毁掉整次搜索。但**形状**错误不在此列——未知字段、多余字段或类型错误在反序列化阶段就使
+  整个响应无效（`deny_unknown_fields`），裁剪发生在此之前。
+- 响应体超过 4 MiB 时传输层先拒绝，宿主按无效响应处理（`PLUGIN_INVALID_RESPONSE`），不会报成
+  插件不可用（503）。50 个候选 × 180 集 × 各字段取上限的形状仍在 4 MiB 以内，因此文档化的
+  上限是插件可实际交付的。
+
+`danmaku.fetch` 请求：
+
+```json
+{"provider":"dandanplay","episodeId":"ep-1"}
+```
+
+- `provider` 可选：缺省、空串或纯空白都表示“未设置”（不发送该字段），非空时 1–64 字符；
+  `episodeId` 1–128 字符。两者都不得包含控制字符。
+- 结果：
+
+```json
+{"xmlBase64":"PGk+PGQgcD0iMSwxLDI1LDE2Nzc3MjE1LDAsMCwwLDAiPmhlbGxvPC9kPjwvaT4="}
+```
+
+- `xmlBase64` 不得为空，响应体沿用同样的 4 MiB 上限（超限同样是 `PLUGIN_INVALID_RESPONSE`）。
+  宿主在返回结果前解码并按 `danmaku.match`
+  的规则执行 `validate_danmaku_xml`（Bilibili/Dandanplay 结构校验）与 50 MiB XML 上限，因此
+  调用方拿到的一定是结构合法的弹幕文档；该层不写盘，写旁车仍由宿主的调用方负责。
+- 宿主仍不向插件传路径、上游地址或用户信息，插件也不能写文件。
+
+版本兼容：旧宿主不会因为 manifest 多出 `danmaku.search`/`danmaku.fetch` 而拒绝升级后的插件
+（旧版只校验必需能力），只是永远不会调用这两个方法；新宿主对未声明这两个能力的旧插件保持
+完全相同的自动匹配行为，并在 UI 中隐藏手动匹配入口。
 
 ## 包格式
 
@@ -233,6 +295,9 @@ Actions 在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` runner 上分别构建。Relea
   `mediaInfoImport` Bundle，宿主负责校验目标并把媒体流、格式、时长、码率和章节写入已索引的 STRM 媒体源。
   未安装或未启用插件时返回 404；插件或 Bundle 不满足能力和大小边界时拒绝请求。该路由不触发远程媒体读取或
   SHA1 计算，SHA1、FF 缓存和远程缓存仍由 MediaTidy 负责。
+- `danmaku.match`：接收不含路径和上游地址的文件名（可带少量备选文件名），返回 `MATCHED`/`NO_MATCH` 和受大小限制的 `xmlBase64`；仅声明了 `danmaku.search` 与 `danmaku.fetch` 的插件才额外提供下面两个方法。
+- `danmaku.search`：接收 `{ "query": string, "limit": number }`（query 1–200 字符、limit 1–50，均经宿主校验），返回候选动画与分集列表；插件应只返回不超过 `limit` 的候选且整条响应 ≤ 4 MiB，宿主仍按 `limit`/50 与每候选 180 集裁剪，并拒绝空或超长（animeId/episodeId 128、provider 64、标题 300）字段，超限响应按 `PLUGIN_INVALID_RESPONSE` 处理。
+- `danmaku.fetch`：接收 `{ "provider"?: string, "episodeId": string }`，返回 `{ "xmlBase64": string }`；与 `danmaku.match` 使用同一响应上限，XML 结构与大小校验仍由宿主执行。
 - `ip.location`：接收一个已由 Lux 宿主校验的公网 IP，返回统一的归属地字段；第三方供应商协议只存在于插件进程。
 - `chapters.detect`：接收同一季度至少两个分集的有界 Chromaprint 指纹序列。每个分集只包含请求内临时 `key`、固定 `sampleRate: 11025`、`fingerprintPointDurationTicks: 1238095`、指纹 Base64、窗口起点和窗口时长；宿主对每个文件固定取第一个音频流并让 FFmpeg chromaprint muxer 输出 raw `uint32` 点序列，按 little-endian 编码，不能把 Base64 字节索引当作时间。插件不得接收路径、URL、媒体源 ID 或任务对象。结果只能返回 `IntroStart`、`IntroEnd` 和 `CreditsStart`，时间必须落在对应窗口内，置信度为 0-1。
 - `chapters.lookup`：接收请求内临时 `key`、TMDb/TVDb/IMDb ID、季号、集号和可选时长；插件不得接收路径、URL、媒体源 ID、音频指纹或任务对象。插件只能访问 manifest 声明的固定网络主机，返回 `IntroStart`、`IntroEnd` 和 `CreditsStart`；无数据时返回空标记，宿主不会因空响应删除已有标记。
