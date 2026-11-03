@@ -201,6 +201,13 @@ export function parseBilibiliDanmaku(input: string): LuxDanmakuEntry[] {
   return parseDanmakuXml(input).entries;
 }
 
+/**
+ * Applies the shared entry rules (`docs/LUX-DEVELOPMENT.md` §14.5).
+ *
+ * A dirty row returns `null` so the caller drops it. The font size is the one field the rules
+ * only require to be finite: the server normalizer clamps it to 12–64, so the renderer does the
+ * same instead of hiding entries the server accepts.
+ */
 function parseEntry(attributes: string, rawText: string): Omit<LuxDanmakuEntry, "id"> | null {
   if (rawText.includes("<")) return null;
   const values = /(?:^|[\s])p\s*=\s*(["'])(.*?)\1/i.exec(attributes)?.[2]?.split(",") ?? [];
@@ -217,13 +224,13 @@ function parseEntry(attributes: string, rawText: string): Omit<LuxDanmakuEntry, 
     || start < 0
     || start > DANMAKU_LIMITS.maxTimeSeconds
     || !Number.isFinite(fontSize)
-    || fontSize < DANMAKU_LIMITS.minFontSize
-    || fontSize > DANMAKU_LIMITS.maxFontSize
     || !Number.isInteger(colorValue)
     || colorValue < 0
     || colorValue > 0xffffff
     || !text
-    || text.length > DANMAKU_LIMITS.maxTextLength
+    // Count Unicode code points, not UTF-16 units: the server applies the same rule
+    // (MAX_DANMAKU_TEXT_CHARS), and the two sides must agree on shared validity vectors.
+    || [...text].length > DANMAKU_LIMITS.maxTextLength
     || CONTROL_CHARACTER_PATTERN.test(text)
   ) {
     return null;
@@ -233,7 +240,12 @@ function parseEntry(attributes: string, rawText: string): Omit<LuxDanmakuEntry, 
     mode,
     text,
     color: `#${colorValue.toString(16).padStart(6, "0")}`,
-    fontSize,
+    // The size only has to be a finite number to be usable; out-of-range sizes are clamped
+    // instead of dropped so the server-side normalization job and the renderer agree.
+    fontSize: Math.min(
+      DANMAKU_LIMITS.maxFontSize,
+      Math.max(DANMAKU_LIMITS.minFontSize, fontSize),
+    ),
   };
 }
 
