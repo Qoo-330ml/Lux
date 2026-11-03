@@ -3793,7 +3793,14 @@ STRM 来源状态区分“尚未配置”和“已经排队”：未被插件选
 受限的旁车写入能力和 Emby 兼容弹幕端点。
 
 插件声明 `type: "danmaku"`、`category: "MEDIA"`、`danmaku.match` 能力和统一 RPC 方法
-`danmaku.match`。主进程向插件发送已经过路径和媒体库 ACL 校验的本地视频或 `.strm` 索引文件描述及任务选项，
+`danmaku.match`。ADR-052 P4（LUX-877）之后，弹幕插件还可以**同时**声明可选的
+`danmaku.search`/`danmaku.fetch` 能力与方法：宿主用前者按关键词取候选动画与分集，用后者按
+`episodeId` 取回受大小限制的 XML；两个能力必须同时声明或同时不声明，声明其他未知
+`danmaku.*` 能力视为无效 manifest。旧插件只声明 `danmaku.match`，行为与宿主侧调用路径完全
+不变；只有声明了这两个能力的插件才具备手动匹配能力，宿主对其暴露
+`PluginService::search_danmaku`、`fetch_danmaku` 与 `danmaku_manual_match_supported`。
+宿主仍不向插件传路径、上游地址或用户信息，插件不能写文件，XML 写盘与 `validate_danmaku_xml`
+最终校验仍由宿主的调用方负责。主进程向插件发送已经过路径和媒体库 ACL 校验的本地视频或 `.strm` 索引文件描述及任务选项，
 插件返回结构化匹配状态和受大小限制的 XML；插件不得接收或执行用户直接提供的上游 URL，
 不得访问主进程配置目录以外的凭据。管理员配置 Dandanplay 兼容 API 基地址，或配置
 `huangxd-/danmu_api` 的 API 基地址，配置由插件 manifest 声明并通过插件配置界面保存。
@@ -19162,6 +19169,61 @@ setup 启动的首轮 `RECONCILE_LIBRARY` 扫描，因此启动流程新增“�
       `DatabaseBackend::` 分支）。
 - [ ] 未验证：PostgreSQL 实机（形状已对齐，没有 PG 环境）；NAS/x86_64 上的绝对收益（本机 arm64、
       测量期间同机有其它 worktree 的编译/测试负载）。
+
+#### LUX-877：弹幕插件协议 v2 宿主侧（`danmaku.search` / `danmaku.fetch` 与调用层）
+
+范围（ADR-052 P4，已获批准；插件本体在 Lux-plugins 仓库另行升级）：只做宿主协议与插件调用层。
+**不加任何 HTTP 路由/API、不改数据库与迁移、不动 `web/`**；D2 的手动匹配端点依赖本任务的两个
+宿主方法。
+
+- 能力与 manifest 校验：新增可选能力/方法常量 `danmaku.search`、`danmaku.fetch`。弹幕插件仍必须
+  声明 `danmaku.match`；`danmaku.search` 与 `danmaku.fetch` 必须**同时声明或同时不声明**，声明其他
+  未知 `danmaku.*` 能力使 manifest 无效。只声明 `danmaku.match` 的旧插件行为完全不变。
+- `danmaku.search`：请求 `{ "query": string, "limit": number }`（camelCase、`deny_unknown_fields`），
+  宿主发送前校验 `query` trim 后 1–200 字符且无控制字符、`limit` 1–50；结果
+  `{ "candidates": [{ "provider"?, "animeId", "animeTitle", "episodes": [{ "episodeId", "title" }] }] }`。
+  宿主对插件返回值按请求 `limit`（≤50）与每候选 500 集裁剪，`animeId`/`episodeId` >128 字符、
+  `provider` >64、标题 >300，或任一字符串 trim 后为空/含控制字符，一律 `PluginInvalidResponse`；
+  整包沿用弹幕 RPC 现有 4 MiB 上限（`MAX_DANMAKU_RPC_RESULT_BYTES`，`danmaku.match` 改用同一常量，
+  行为不变）。
+- `danmaku.fetch`：请求 `{ "provider"?, "episodeId" }`（`episodeId` 1–128、`provider` 1–64），结果
+  `{ "xmlBase64": string }`；沿用 `danmaku.match` 的响应上限，`xmlBase64` 为空即无效。宿主在返回前
+  通过 `DanmakuFetchResult::decode_xml` 解码并执行 `validate_danmaku_xml`（含 50 MiB XML 上限），
+  因此调用方拿到的一定是结构合法的文档，但本层不写盘。
+- 宿主 API：`PluginService::search_danmaku(query, limit)`、`fetch_danmaku(provider, episode_id)`、
+  `danmaku_manual_match_supported()`。插件未安装 → `UnknownPlugin`；未启用/不可用 → `Unavailable`；
+  未声明能力 → 新增 `Unsupported`；配置未完成 → `InvalidConfig`；宿主侧参数越界 → 新增
+  `InvalidRequest`。不 panic、不泛化为 Internal。`danmaku_plugin_error_code`、
+  `scraper_failure_reason` 与管理 API 错误映射同步覆盖 `PLUGIN_UNSUPPORTED`/`PLUGIN_INVALID_REQUEST`。
+- 超时、隔离进程与脱敏沿用现有弹幕 RPC 路径：新增 `PluginService::with_danmaku_call_timeout`
+  （生产默认取 supervisor 的 30 s，`danmaku.match` 与 search/fetch 共用同一调用封装），日志与错误
+  只含能力名和宿主自有文案，不含上游 URL 或 token。
+- 文档：`docs/PLUGIN-SDK.md` 新增「弹幕手动匹配合同（可选能力）」小节、两个 RPC 方法条目与版本
+  兼容说明；插件章节补充能力声明规则。`docs/API-TYPES-SYNC.md` 不涉及（无 `/api/v1` 路由与 DTO
+  变化）。
+
+验收（2026-11-03，本机 `uname -m` = `arm64`）：
+
+- [x] `cargo test --locked --test plugins plugin_protocol::` 53/53：新增 manifest 用例（仅 match 通过、
+  match+search+fetch 通过、仅 search/仅 fetch/缺 match/未知 `danmaku.*` 均失败）、请求 JSON 形状与
+  路径/URL 字段拒绝、宿主侧 query/limit/episodeId 边界、候选与分集裁剪、空/超长/未知字段拒绝、
+  4 MiB 超限、fetch 解码与 `validate_danmaku_xml`。
+- [x] `cargo test --locked --test plugins danmaku::` 12/12：新增假插件覆盖正常 search+fetch、空标题
+  候选 → `InvalidResponse`、仅 match 旧插件 → `Unsupported`（且 `danmaku.match` 仍可用）、
+  300 ms 截止时间下的 `Runtime(Timeout)`、参数越界先于插件调用被拒绝（无插件时为 `UnknownPlugin`）。
+- [x] `cargo test --locked --lib plugin` 55/55。
+- [x] `cargo test --locked --test plugins -- --test-threads=2` 99/99；默认并行全组运行两次分别在
+  既有用例 `danmaku_service_matches_local_and_strm_sources_and_writes_sidecars`（10,000 源
+  `create_job` 的 250 ms 预算，见 `docs/TEST-TARGETS.md` §5.2）与无关的
+  `media_info_config_api::media_info_plugin_config_api_drives_a_background_run` 上超时，单独复跑
+  均通过，属同机高负载抖动（load average ≈ 6）。
+- [x] `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+  `scripts/check-migration-parity.py`、`scripts/check-backend-branches.py` 通过（无迁移、无新增
+  `DatabaseBackend::` 分支）。
+- [ ] 未验证：真实 `org.lux.danmaku` 插件（Lux-plugins 仓库另行升级）的 search/fetch 往返；本任务只用
+  假插件夹具覆盖 RPC 边界。
+
+依赖：ADR-052 P4；D2（手动匹配 API）依赖本任务的宿主方法。
 
 ## 31. 参考资料
 
