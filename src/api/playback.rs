@@ -4609,7 +4609,10 @@ pub(super) async fn lux_web_playback_direct(
         None,
     )
     .await;
-    if method == Method::GET && !response.status().is_success() {
+    // `.strm` direct responses are 307 redirects; players re-request the same URL
+    // (Range probes, moov seeks), so only real failures end the session.
+    let status = response.status();
+    if method == Method::GET && !(status.is_success() || status.is_redirection()) {
         let _ = service.stop(&session_id, &session.user_id).await;
     }
     response

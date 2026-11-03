@@ -142,7 +142,8 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
     let proxy_address = proxy_listener.local_addr()?;
     let strm_proxy = tokio::spawn(async move {
-        for request_number in 0..3 {
+        let mut request_number = 0;
+        while request_number < 3 {
             let (mut stream, _) = proxy_listener
                 .accept()
                 .await
@@ -163,6 +164,21 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
                 }
             }
             let request = String::from_utf8(request).expect("STRM proxy request should be HTTP");
+            // `/direct` resolves the redirect target with a one-byte probe; answer it without
+            // consuming one of the scripted Range requests below.
+            if request.lines().any(|line| {
+                line.split_once(':').is_some_and(|(name, value)| {
+                    name.eq_ignore_ascii_case("range") && value.trim() == "bytes=0-0"
+                })
+            }) {
+                stream
+                    .write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/16\r\nConnection: close\r\n\r\n0")
+                    .await
+                    .expect("STRM proxy probe response should be writable");
+                continue;
+            }
+            request_number += 1;
+            let request_number = request_number - 1;
             let expected_range = if request_number < 2 {
                 "bytes=0-3"
             } else {
@@ -893,6 +909,26 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
         1,
         "subsequent STRM Range requests reuse the slot"
     );
+    // Players re-request the same /direct URL (Range probes, moov seeks): a 307 is not a failure
+    // and must not end the session.
+    let strm_direct_url = strm_direct_body["plan"]["url"]
+        .as_str()
+        .ok_or("missing STRM direct url")?;
+    let no_redirect_client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    for attempt in 0..2 {
+        let redirect = no_redirect_client
+            .get(format!("{base_url}{strm_direct_url}"))
+            .send()
+            .await?;
+        assert_eq!(
+            redirect.status(),
+            reqwest::StatusCode::TEMPORARY_REDIRECT,
+            "STRM /direct GET #{attempt} must keep redirecting"
+        );
+    }
     let strm_event = client
         .post(format!(
             "{base_url}/api/v1/playback/sessions/{strm_direct_session_id}/events"
