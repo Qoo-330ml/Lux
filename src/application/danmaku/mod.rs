@@ -21,7 +21,7 @@ mod sidecar;
 mod xml;
 
 pub use job::{DEFAULT_DANMAKU_CONCURRENCY, DanmakuMatchJob, DanmakuServiceError};
-pub use manual::{DEFAULT_MANUAL_SEARCH_LIMIT, ManualMatchTarget};
+pub use manual::{DEFAULT_MANUAL_SEARCH_LIMIT, ManualMatchJobStart, ManualMatchTarget};
 pub use matching::{ProviderBaseUrl, ProviderUrlError, validate_provider_base_url};
 pub use path::{DanmakuPathError, danmaku_sidecar_path};
 pub use sidecar::{DanmakuSidecarScope, DanmakuWriteError, atomic_write_danmaku_xml};

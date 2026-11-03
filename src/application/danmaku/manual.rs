@@ -31,6 +31,14 @@ pub const DEFAULT_MANUAL_SEARCH_LIMIT: u32 = 20;
 /// Item types an administrator may match danmaku for; a series or season container has no sidecar.
 const MATCHABLE_ITEM_TYPES: [&str; 2] = ["MOVIE", "EPISODE"];
 
+/// The queued manual-match job plus the media source the request actually resolved.
+///
+/// The resolved source id is what the audit event records: the request may omit `sourceId`.
+pub struct ManualMatchJobStart {
+    pub job: super::DanmakuMatchJob,
+    pub source_id: String,
+}
+
 /// One administrator-selected episode to fetch danmaku for.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ManualMatchTarget {
@@ -124,7 +132,7 @@ impl DanmakuService {
         &self,
         item_id: &str,
         target: ManualMatchTarget,
-    ) -> Result<super::DanmakuMatchJob, DanmakuServiceError> {
+    ) -> Result<ManualMatchJobStart, DanmakuServiceError> {
         let target = target.validated()?;
         let source = self
             .matchable_source(item_id, target.source_id.as_deref())
@@ -182,7 +190,10 @@ impl DanmakuService {
                 },
             )
             .await?;
-        self.get(&job_id).await
+        Ok(ManualMatchJobStart {
+            job: self.get(&job_id).await?,
+            source_id: source.source_id,
+        })
     }
 
     /// Removes the registered sidecar file and its `danmaku_tracks` row of one media source.

@@ -201,10 +201,10 @@ pub(crate) async fn start_manual_danmaku_match_job(
     service: &DanmakuService,
     item_id: &str,
     target: crate::application::danmaku::ManualMatchTarget,
-) -> Result<DanmakuMatchJob, DanmakuServiceError> {
-    let job = service.create_manual_job(item_id, target).await?;
-    spawn_danmaku_match_job(service, &job, false);
-    Ok(job)
+) -> Result<crate::application::danmaku::ManualMatchJobStart, DanmakuServiceError> {
+    let started = service.create_manual_job(item_id, target).await?;
+    spawn_danmaku_match_job(service, &started.job, false);
+    Ok(started)
 }
 
 pub(crate) async fn retry_danmaku_match_job(

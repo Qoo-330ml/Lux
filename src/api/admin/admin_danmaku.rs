@@ -219,7 +219,6 @@ pub(crate) async fn admin_start_manual_danmaku_match(
         )
         .into_response();
     }
-    let source_id = request.source_id.clone();
     let target = crate::application::danmaku::ManualMatchTarget {
         source_id: request.source_id,
         provider: request.provider,
@@ -228,12 +227,12 @@ pub(crate) async fn admin_start_manual_danmaku_match(
         overwrite: request.overwrite,
     };
     let service = state.danmaku();
-    let job = match crate::application::admin_job_workers::start_manual_danmaku_match_job(
+    let started = match crate::application::admin_job_workers::start_manual_danmaku_match_job(
         service, &item_id, target,
     )
     .await
     {
-        Ok(job) => job,
+        Ok(started) => started,
         Err(error) => return super::admin_jobs::danmaku_service_error(&headers, error),
     };
     record_audit_event(
@@ -241,16 +240,17 @@ pub(crate) async fn admin_start_manual_danmaku_match(
         &headers,
         "DANMAKU_MANUAL_MATCH_STARTED",
         Some("danmaku_match_job"),
-        Some(&job.id),
+        Some(&started.job.id),
         &json!({
             "itemId": item_id,
-            "sourceId": source_id,
-            "overwrite": job.overwrite,
+            // The resolved source, not the (possibly omitted) request field.
+            "sourceId": started.source_id,
+            "overwrite": started.job.overwrite,
         })
         .to_string(),
     )
     .await;
-    (StatusCode::ACCEPTED, Json(json!({ "job": job }))).into_response()
+    (StatusCode::ACCEPTED, Json(json!({ "job": started.job }))).into_response()
 }
 
 pub(crate) async fn admin_delete_item_danmaku(

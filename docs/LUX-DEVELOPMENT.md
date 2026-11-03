@@ -19302,9 +19302,9 @@ Emby 路由、不改 `web/` 的界面**（D3 另做）。依赖 LUX-877 的 `sea
   `danmaku_tracks.provider` 为空（用户自带旁车）必须带 `confirmUserSidecar=true`，否则 409。文件删除
   走 `tokio::fs`（异步 fs，不在 Tokio 核心线程做阻塞 IO）。
 - 日志与审计：沿用 `record_audit_event`，新增 `DANMAKU_MANUAL_MATCH_STARTED`（只记条目、媒体源、
-  `overwrite`）与 `DANMAKU_SIDECAR_DELETED`（`targetId` 与 `metadata.sourceId` 均为实际解析出的媒体源
-  ID，不写请求参数里的 `null`）；不记录搜索文本、插件返回、完整上游 URL 或 token。搜索端点本身不写
-  审计，避免把管理员输入落盘。
+  `overwrite`）与 `DANMAKU_SIDECAR_DELETED`；两个事件的 `metadata.sourceId` 都是服务实际解析出的媒体源
+  ID（不是请求里可能缺省的 `sourceId`），删除事件的 `targetId` 也是该源 ID；不记录搜索文本、插件返回、
+  完整上游 URL 或 token。搜索端点本身不写审计，避免把管理员输入落盘。
 - 插件错误分类：搜索/创建不再用 `danmaku_manual_match_supported()` 的布尔值把“未配置”说成“不支持”。
   创建路径先调用 `require_danmaku_manual_match_plugin()`，`Unsupported` → “弹幕插件不支持手动匹配”，
   `UnknownPlugin`/`Unavailable`/`InvalidConfig` → “弹幕插件未启用或配置未完成”（两者都是 409
@@ -19369,7 +19369,8 @@ Emby 路由、不改 `web/` 的界面**（D3 另做）。依赖 LUX-877 的 `sea
 - **D（媒体文件缺失时的清理）**：`safe_danmaku_source_paths` 区分 `UnsafePath` 与 `Missing`；`Missing`
   时只删除 `danmaku_tracks` 登记并返回 204（不动磁盘文件），`UnsafePath` 仍 400。测试：删除媒体文件后
   DELETE → 204、登记消失、旁车文件保留；越界路径仍 400。
-- **E**：删除审计的 `targetId`/`metadata.sourceId` 改用实际解析出的媒体源 ID；搜索/创建改用
+- **E**：删除审计的 `targetId`/`metadata.sourceId`、创建审计的 `metadata.sourceId` 改用实际解析出的
+  媒体源 ID；搜索/创建改用
   `require_danmaku_manual_match_plugin()` 的错误分类（`Unsupported` → “不支持手动匹配”，
   `UnknownPlugin`/`Unavailable`/`InvalidConfig` → “未启用或配置未完成”），并补“已启用但未配置”的测试；
   `docs/TEST-TARGETS.md` 第 1、2、5.1 节的逐组/逐模块测试数与两处合计按当前 `--list` 重新计算
