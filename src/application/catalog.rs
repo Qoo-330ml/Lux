@@ -6677,4 +6677,148 @@ mod tests {
         );
         Ok(())
     }
+
+    /// Yamby's home screen asks each library for its newest items as
+    /// `Items/Latest?ParentId=<library>&GroupItems=true&MediaTypes=Video&Limit=16`, which Lux turns
+    /// into `item_types = [MOVIE, SERIES]` ordered by `DateCreated` descending. A series owns no
+    /// media source, so the read-model page has to keep it through its visible children.
+    #[tokio::test]
+    async fn read_model_library_page_returns_series_for_the_latest_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::libraries::LibraryService, auth::users::UserStore, config::Config,
+            library::LibraryKind,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let user = UserStore::new(database.clone())?
+            .create_user("latest-viewer", "Latest Viewer", "test password", false)
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Latest TV", LibraryKind::Series, false)
+            .await?;
+        let library_id = library.id.to_string();
+        database
+            .set_user_library_access(&user.id.to_string(), &library_id, true)
+            .await?;
+        sqlx::query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('latest-root', ?, '/tv', '/tv', 1, 1)",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 device, inode, fingerprint, last_seen_generation, last_seen_change_kind
+             ) VALUES ('latest-fe', 'latest-root', 'Show/S01E01.mkv', 'FILE', 1, 1,
+                       1, 1, X'00', 'g1', 'NEW')",
+        )
+        .execute(database.pool())
+        .await?;
+        for (id, item_type, parent_id, series_id, added_at, has_source) in [
+            ("latest-series", "SERIES", None, None, 10_i64, 0_i64),
+            (
+                "latest-season",
+                "SEASON",
+                Some("latest-series"),
+                Some("latest-series"),
+                11,
+                0,
+            ),
+            (
+                "latest-episode",
+                "EPISODE",
+                Some("latest-season"),
+                Some("latest-series"),
+                12,
+                1,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, parent_id, series_id, title, sort_title,
+                     added_at, identification_status, has_available_source
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?)",
+            )
+            .bind(id)
+            .bind(&library_id)
+            .bind(item_type)
+            .bind(parent_id)
+            .bind(series_id)
+            .bind(id)
+            .bind(id)
+            .bind(added_at)
+            .bind(has_source)
+            .execute(database.pool())
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO media_sources (
+                 id, item_id, source_kind, filesystem_entry_id, quality_label, container,
+                 size, bitrate, duration_ticks, is_default, probe_status
+             ) VALUES ('latest-source', 'latest-episode', 'LOCAL_FILE', 'latest-fe',
+                       '1080p', 'mkv', 1000, 8000000, 7200000000, 1, 'READY')",
+        )
+        .execute(database.pool())
+        .await?;
+        database.rebuild_catalog_items_batch(None, 100).await?;
+        database
+            .advance_catalog_consumer(
+                &crate::application::catalog_read_model::catalog_items_consumer(),
+                0,
+            )
+            .await?;
+
+        let filter = super::CatalogFilter {
+            item_types: vec!["MOVIE".to_owned(), "SERIES".to_owned()],
+            sort_by: super::CatalogSort::DateCreated,
+            descending: true,
+            include_total: true,
+            ..super::CatalogFilter::default()
+        };
+        let principal = AccessPrincipal::new(user.id, false);
+        let read_model_page = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database.clone()),
+        )
+        .with_read_model_mode(super::ReadModelMode::On)
+        .list_library_items_filtered(principal, &library_id, &filter, 0, 16)
+        .await?;
+        let authoritative_page = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database),
+        )
+        .with_read_model_mode(super::ReadModelMode::Off)
+        .list_library_items_filtered(principal, &library_id, &filter, 0, 16)
+        .await?;
+
+        assert_eq!(
+            authoritative_page
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["latest-series"],
+            "the authoritative page lists the series through its episode"
+        );
+        assert_eq!(
+            read_model_page
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["latest-series"],
+            "the read-model page must answer the Latest request like the authoritative query"
+        );
+        assert_eq!(read_model_page.total, authoritative_page.total);
+        Ok(())
+    }
 }
