@@ -54,6 +54,8 @@ mod admin_health;
 #[path = "admin/admin_performance.rs"]
 mod admin_performance;
 pub(super) use crate::application::admin_dashboard::DEFAULT_SERVER_NAME;
+#[path = "admin/admin_danmaku.rs"]
+mod admin_danmaku;
 #[path = "admin/admin_database_diagnostics.rs"]
 mod admin_database_diagnostics;
 #[path = "admin/admin_jobs.rs"]
@@ -88,6 +90,7 @@ pub(super) fn api_routes() -> Router<ReadyAppState> {
         .merge(emby_migration_routes())
         .merge(scheduled_tasks_routes())
         .merge(jobs_routes())
+        .merge(danmaku_routes())
         .merge(webhooks_routes())
         .merge(logs_events_routes())
         .merge(health_routes())
@@ -138,6 +141,10 @@ pub(super) fn scheduled_tasks_routes() -> Router<ReadyAppState> {
 
 pub(super) fn jobs_routes() -> Router<ReadyAppState> {
     admin_jobs::api_routes()
+}
+
+pub(super) fn danmaku_routes() -> Router<ReadyAppState> {
+    admin_danmaku::api_routes()
 }
 
 pub(super) fn webhooks_routes() -> Router<ReadyAppState> {

@@ -96,6 +96,8 @@ export const queryKeys = {
   adminStrmProbeJobs: (status?: string) => ["admin", "strm-probe-jobs", status ?? "all"] as const,
   adminChapterDetectionJobs: (status?: string) => ["admin", "chapter-detection-jobs", status ?? "all"] as const,
   adminDanmakuMatchJobs: (status?: string) => ["admin", "danmaku-match-jobs", status ?? "all"] as const,
+  adminItemDanmakuSearch: (itemId: string, query: string, sourceId: string, limit: number) =>
+    ["admin", "item-danmaku-search", itemId, query, sourceId, limit] as const,
   adminLibraryCoverJobs: (status?: string) => ["admin", "library-cover-jobs", status ?? "all"] as const,
   adminLibraryDeletionJobs: (status?: string, page = 1) => ["admin", "library-deletion-jobs", status ?? "all", page] as const,
   adminUserInvitations: (status?: string, page = 1) => ["admin", "user-invitations", status ?? "all", page] as const,

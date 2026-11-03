@@ -28,6 +28,7 @@ import type {
   AdminStrmProbeJob,
   AdminChapterDetectionJob,
   AdminDanmakuMatchJob,
+  ManualDanmakuSearchResponse,
   AdminLibraryCoverJob,
   AdminLibraryDeletionJob,
   AdminLibraryDeletionJobsPage,
@@ -1992,6 +1993,64 @@ export class LuxApiClient {
     if (status) params.set("status", status);
     return this.request<{ jobs?: AdminLibraryCoverJob[] }>(
       `/api/v1/admin/library-cover-jobs?${params}`,
+    );
+  }
+
+  /**
+   * Administrator manual danmaku candidates for one item (ADR-052 P5).
+   *
+   * `query` defaults to the item's own title on the server; `limit` defaults to 20 and is capped at
+   * 50. Every search reaches the upstream provider, so the endpoint is rate limited per session and
+   * answers `429 RATE_LIMITED` when the budget is exhausted.
+   */
+  manualDanmakuSearch(
+    itemId: string,
+    options?: { query?: string; sourceId?: string; limit?: number },
+  ) {
+    const params = new URLSearchParams();
+    if (options?.query) params.set("query", options.query);
+    if (options?.sourceId) params.set("sourceId", options.sourceId);
+    if (options?.limit !== undefined) params.set("limit", String(options.limit));
+    const search = params.toString();
+    return this.request<ManualDanmakuSearchResponse>(
+      `/api/v1/admin/items/${encodeURIComponent(itemId)}/danmaku/search${search ? `?${search}` : ""}`,
+    );
+  }
+
+  /** Queues the single-item manual danmaku match job; answers `202` with the match job. */
+  startManualDanmakuMatch(
+    itemId: string,
+    selection: {
+      sourceId?: string;
+      provider?: string;
+      animeId?: string;
+      episodeId: string;
+      overwrite: boolean;
+    },
+  ) {
+    return this.request<{ job: AdminDanmakuMatchJob }>(
+      `/api/v1/admin/items/${encodeURIComponent(itemId)}/danmaku/match`,
+      { method: "POST", body: JSON.stringify(selection) },
+    );
+  }
+
+  /**
+   * Deletes the registered sidecar file and its danmaku track of one media source.
+   *
+   * A sidecar the user wrote next to the media file (no provider) is only removed with
+   * `confirmUserSidecar: true`; the server answers `409` otherwise.
+   */
+  deleteItemDanmaku(
+    itemId: string,
+    options?: { sourceId?: string; confirmUserSidecar?: boolean },
+  ) {
+    const params = new URLSearchParams();
+    if (options?.sourceId) params.set("sourceId", options.sourceId);
+    if (options?.confirmUserSidecar) params.set("confirmUserSidecar", "true");
+    const query = params.toString();
+    return this.request<void>(
+      `/api/v1/admin/items/${encodeURIComponent(itemId)}/danmaku${query ? `?${query}` : ""}`,
+      { method: "DELETE" },
     );
   }
 

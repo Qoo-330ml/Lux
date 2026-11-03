@@ -195,6 +195,18 @@ pub(crate) async fn start_danmaku_match_job(
     Ok(job)
 }
 
+/// Queues an administrator's manual danmaku match for one item and runs it on the same pool as the
+/// library-wide jobs, so listing, cancellation and retention keep working unchanged.
+pub(crate) async fn start_manual_danmaku_match_job(
+    service: &DanmakuService,
+    item_id: &str,
+    target: crate::application::danmaku::ManualMatchTarget,
+) -> Result<crate::application::danmaku::ManualMatchJobStart, DanmakuServiceError> {
+    let started = service.create_manual_job(item_id, target).await?;
+    spawn_danmaku_match_job(service, &started.job, false);
+    Ok(started)
+}
+
 pub(crate) async fn retry_danmaku_match_job(
     service: &DanmakuService,
     job_id: &str,

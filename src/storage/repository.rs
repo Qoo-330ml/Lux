@@ -5647,11 +5647,40 @@ pub(crate) struct NewDanmakuTrack<'a> {
     pub(crate) error_code: Option<&'a str>,
 }
 
+/// A tracked sidecar plus the media-root paths a delete needs (ADR-052 P5).
+///
+/// Unlike [`StoredDanmakuSource`] this joins `danmaku_tracks` without requiring a `READY` row, so an
+/// administrator can also remove a registration whose file already disappeared.
+#[derive(Clone, Debug)]
+pub(crate) struct StoredTrackedDanmakuSource {
+    pub(crate) source_id: String,
+    pub(crate) root_path: String,
+    pub(crate) relative_path: String,
+    pub(crate) provider: Option<String>,
+}
+
+/// The single job item of a one-target danmaku job (an administrator's manual match, or the retry
+/// of a one-item library job).
+pub(crate) struct NewDanmakuSingleItemJob<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) media_source_id: &'a str,
+    /// `true` for an administrator's manual match (`kind = 'MANUAL'`), `false` for a sweep retry.
+    pub(crate) manual: bool,
+    pub(crate) provider_anime_id: Option<&'a str>,
+    /// Set only for a manual match, which fetches one exact episode instead of running
+    /// `danmaku.match`.
+    pub(crate) provider_episode_id: Option<&'a str>,
+    /// Provider label the administrator selected; `None` for a sweep retry.
+    pub(crate) provider: Option<&'a str>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct StoredDanmakuMatchJob {
     pub(crate) id: String,
     pub(crate) library_id: String,
     pub(crate) status: String,
+    /// `SWEEP` (library sweep, the default) or `MANUAL` (an administrator's single-episode match).
+    pub(crate) kind: String,
     pub(crate) overwrite: bool,
     pub(crate) concurrency: i64,
     pub(crate) total_count: i64,
@@ -5670,6 +5699,12 @@ pub(crate) struct StoredDanmakuMatchJob {
 pub(crate) struct StoredDanmakuMatchItem {
     pub(crate) id: String,
     pub(crate) media_source_id: String,
+    /// Prefilled by an administrator's manual match; a set episode id means the worker must fetch
+    /// the episode instead of running `danmaku.match` (ADR-052 P5).
+    pub(crate) provider_anime_id: Option<String>,
+    pub(crate) provider_episode_id: Option<String>,
+    /// Provider label the administrator selected for a manual match.
+    pub(crate) provider: Option<String>,
     pub(crate) root_path: Option<String>,
     pub(crate) relative_path: Option<String>,
     pub(crate) item_type: Option<String>,
@@ -5737,6 +5772,7 @@ struct StoredDanmakuMatchJobRow {
     id: String,
     library_id: String,
     status: String,
+    kind: String,
     overwrite: i64,
     concurrency: i64,
     total_count: i64,
@@ -5757,6 +5793,7 @@ fn stored_danmaku_match_job(row: sqlx::any::AnyRow) -> Result<StoredDanmakuMatch
         id: row.id,
         library_id: row.library_id,
         status: row.status,
+        kind: row.kind,
         overwrite: row.overwrite != 0,
         concurrency: row.concurrency,
         total_count: row.total_count,

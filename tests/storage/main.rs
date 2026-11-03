@@ -4,5 +4,6 @@ mod database_setup_api;
 mod database_startup_guard;
 mod index_audit;
 mod log_migration;
+mod schema_upgrade;
 mod sqlite_wal;
 mod storage;
