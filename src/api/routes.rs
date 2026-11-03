@@ -702,15 +702,20 @@ async fn strip_client_request_id(mut request: Request<Body>, next: Next) -> Resp
 
 /// Same-origin policy for the bundled Web client.
 ///
+/// Media and network reads may also target any HTTPS host: `.strm` Direct Play redirects the
+/// element and the client MKV/HEVC engines to the remote origin (for example a 115 CDN). Scripts,
+/// frames and forms stay same-origin. `fetch` additionally needs the remote host to send CORS
+/// headers; the CSP cannot grant that.
+///
 /// The player needs blob workers (hls.js) and WebAssembly (HEVC), and the build has no inline
 /// scripts. `'wasm-unsafe-eval'` is ignored by browsers without it (Safari before 16.4), which
 /// then refuses WebAssembly; those clients fall back to the non-HEVC path.
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
      img-src 'self' data: blob: https://www.themoviedb.org; \
-     media-src 'self' blob:; \
+     media-src 'self' blob: https:; \
      script-src 'self' 'wasm-unsafe-eval'; \
      style-src 'self' 'unsafe-inline'; \
-     connect-src 'self'; \
+     connect-src 'self' https:; \
      worker-src 'self' blob:; \
      frame-ancestors 'none'; \
      base-uri 'self'; \
@@ -995,6 +1000,32 @@ mod tests {
             None
         );
         assert_eq!(web_asset_cache_control("/emby/Users", "text/html"), None);
+    }
+
+    fn csp_sources(directive: &str) -> Vec<&'static str> {
+        CONTENT_SECURITY_POLICY
+            .split(';')
+            .map(str::trim)
+            .find_map(|part| part.strip_prefix(directive)?.strip_prefix(' '))
+            .map(|sources| sources.split_whitespace().collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn csp_lets_the_player_read_remote_https_media_without_widening_scripts() {
+        // `.strm` Direct Play redirects the element and the client MKV/HEVC engines to arbitrary
+        // HTTPS hosts, so both `<video>` loads and Range `fetch` must be allowed to follow them.
+        assert!(csp_sources("media-src").contains(&"https:"));
+        assert!(csp_sources("connect-src").contains(&"https:"));
+        // Only media/network reads are widened; code and framing stay same-origin.
+        assert_eq!(
+            csp_sources("script-src"),
+            vec!["'self'", "'wasm-unsafe-eval'"]
+        );
+        assert_eq!(csp_sources("default-src"), vec!["'self'"]);
+        assert_eq!(csp_sources("frame-ancestors"), vec!["'none'"]);
+        assert_eq!(csp_sources("form-action"), vec!["'self'"]);
+        assert!(!CONTENT_SECURITY_POLICY.contains("http:"));
     }
 
     #[test]
