@@ -5659,14 +5659,16 @@ pub(crate) struct StoredTrackedDanmakuSource {
     pub(crate) provider: Option<String>,
 }
 
-/// The single job item of an administrator-initiated manual match.
-pub(crate) struct NewDanmakuManualMatchItem<'a> {
+/// The single job item of a one-target danmaku job (an administrator's manual match, or the retry
+/// of such a job).
+pub(crate) struct NewDanmakuSingleItemJob<'a> {
     pub(crate) id: &'a str,
-    /// Identifier of the track row this job announces; never the job item id.
+    /// Identifier of the track row this job may announce; never the job item id.
     pub(crate) track_id: &'a str,
     pub(crate) media_source_id: &'a str,
     pub(crate) provider_anime_id: Option<&'a str>,
-    pub(crate) provider_episode_id: &'a str,
+    /// Set only when the job must fetch one exact episode instead of running `danmaku.match`.
+    pub(crate) provider_episode_id: Option<&'a str>,
     /// Sidecar path the track row announces before the worker writes the file.
     pub(crate) relative_sidecar_path: &'a str,
     pub(crate) provider: Option<&'a str>,

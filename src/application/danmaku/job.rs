@@ -25,8 +25,8 @@ use crate::{
     },
     domain::ids::LibraryId,
     storage::{
-        Database, NewDanmakuMatchJob, NewDanmakuTrack, StorageError, StoredDanmakuMatchJob,
-        StoredDanmakuSource,
+        Database, NewDanmakuMatchJob, NewDanmakuSingleItemJob, NewDanmakuTrack, StorageError,
+        StoredDanmakuMatchItem, StoredDanmakuMatchJob, StoredDanmakuSource,
     },
 };
 
@@ -218,21 +218,73 @@ impl DanmakuService {
         if !matches!(job.status.as_str(), "FAILED" | "CANCELLED") {
             return Err(DanmakuServiceError::NotRetryable);
         }
-        // A manual job selects one episode; re-running it as a library sweep would silently widen
-        // the request, so the administrator re-issues the match instead.
-        if self
-            .database
-            .danmaku_match_job_has_manual_items(job_id)
-            .await?
-        {
-            return Err(DanmakuServiceError::NotRetryable);
-        }
         let library_id = job
             .library_id
             .parse::<LibraryId>()
             .map_err(|_| DanmakuServiceError::LibraryNotFound)?;
+        // A job that queued exactly one target is retried as that same target: re-running a manual
+        // match as a library sweep would silently widen it, and retrying a one-item library job one
+        // item at a time is the same work. Every other job keeps the library-wide retry.
+        let items = self.database.list_danmaku_match_items(job_id).await?;
+        if job.total_count == 1 && items.len() == 1 {
+            return self.retry_single_item(&job, &items[0]).await;
+        }
         self.create_job(library_id, job.concurrency, job.overwrite)
             .await
+    }
+
+    /// Queues a new one-target job for the single item of a failed/cancelled job.
+    ///
+    /// The prefilled provider identifiers of the old item are copied, so a manual match keeps
+    /// fetching the same episode instead of falling back to `danmaku.match`; a one-item library job
+    /// has none and keeps matching. Nothing in `danmaku_tracks` is rewritten here, so a retry can
+    /// never relabel a user-provided sidecar as Lux-written.
+    async fn retry_single_item(
+        &self,
+        job: &StoredDanmakuMatchJob,
+        item: &StoredDanmakuMatchItem,
+    ) -> Result<DanmakuMatchJob, DanmakuServiceError> {
+        let Some(relative_path) = item.relative_path.as_deref() else {
+            return Err(DanmakuServiceError::SourceNotFound);
+        };
+        let relative_sidecar_path = danmaku_sidecar_path(Path::new(relative_path))
+            .map_err(|_| DanmakuServiceError::SourceNotFound)?
+            .to_string_lossy()
+            .into_owned();
+        if self
+            .database
+            .has_active_danmaku_match_jobs(&job.library_id)
+            .await?
+        {
+            return Err(DanmakuServiceError::AlreadyActive);
+        }
+        let provider = self
+            .database
+            .find_danmaku_track_provider(&item.media_source_id)
+            .await?;
+        let job_id = Uuid::now_v7().to_string();
+        let item_row_id = format!("{job_id}:{}", item.media_source_id);
+        let track_id = Uuid::now_v7().to_string();
+        self.database
+            .create_danmaku_single_item_job(
+                NewDanmakuMatchJob {
+                    id: &job_id,
+                    library_id: &job.library_id,
+                    overwrite: job.overwrite,
+                    concurrency: job.concurrency,
+                },
+                NewDanmakuSingleItemJob {
+                    id: &item_row_id,
+                    track_id: &track_id,
+                    media_source_id: &item.media_source_id,
+                    provider_anime_id: item.provider_anime_id.as_deref(),
+                    provider_episode_id: item.provider_episode_id.as_deref(),
+                    relative_sidecar_path: &relative_sidecar_path,
+                    provider: provider.as_deref(),
+                },
+            )
+            .await?;
+        self.get(&job_id).await
     }
 
     async fn run_claimed(&self, job: StoredDanmakuMatchJob) -> Result<(), DanmakuServiceError> {
@@ -251,7 +303,15 @@ impl DanmakuService {
                 return Ok(());
             }
         };
-        if !settings.library_ids.contains(&job.library_id) {
+        // A library sweep may only run for a library the administrator selected in the plugin
+        // configuration. A manual match names one item explicitly and is exempt (ADR-052 P5,
+        // `docs/LUX-DEVELOPMENT.md` §3.7), which is exactly a job whose every item carries the
+        // administrator's episode.
+        let manual_only = self
+            .database
+            .danmaku_match_job_is_manual_only(&job.id)
+            .await?;
+        if !manual_only && !settings.library_ids.contains(&job.library_id) {
             self.database
                 .finish_danmaku_match_job(&job.id, "FAILED", Some("LIBRARY_NOT_SELECTED"))
                 .await?;

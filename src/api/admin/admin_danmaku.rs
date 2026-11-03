@@ -280,15 +280,18 @@ pub(crate) async fn admin_delete_item_danmaku(
         )
         .await
     {
-        Ok(()) => {
+        Ok(source_id) => {
+            // Audit the source the delete actually resolved (the item's default source when the
+            // request omitted `sourceId`), never a `null` request parameter.
             record_audit_event(
                 &state,
                 &headers,
                 "DANMAKU_SIDECAR_DELETED",
                 Some("danmaku_track"),
-                Some(&item_id),
+                Some(&source_id),
                 &json!({
-                    "sourceId": query.source_id,
+                    "itemId": item_id,
+                    "sourceId": source_id,
                     "confirmUserSidecar": query.confirm_user_sidecar.unwrap_or(false),
                 })
                 .to_string(),

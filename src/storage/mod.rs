@@ -904,7 +904,7 @@ pub(crate) use repository::{
     MediaProbeUpdate, MediaStreamUpdate, MetadataCapabilityResult, MetadataCapabilityWrite,
     MetadataImageAttemptUpdate, MetadataImageUnavailable, MigrationMediaIdentityLookup,
     MigrationPersonIdentityLookup, NewAccessToken, NewAuditEvent, NewChapterDetectionJob,
-    NewChapterDetectionJobItem, NewCollection, NewDanmakuManualMatchItem, NewDanmakuMatchJob,
+    NewChapterDetectionJobItem, NewCollection, NewDanmakuMatchJob, NewDanmakuSingleItemJob,
     NewDanmakuTrack, NewDeviceAccessToken, NewDevicePairing, NewEmbyDirectPlaybackTicket,
     NewEmbyMigrationJob, NewEpisodeFile, NewFilesystemEntry, NewHierarchyItem, NewLibrary,
     NewLibraryRoot, NewMailChallenge, NewMailOutboxMessage, NewMediaChapterMarker, NewMediaItem,

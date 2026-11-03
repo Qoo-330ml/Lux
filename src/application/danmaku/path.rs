@@ -55,45 +55,64 @@ impl fmt::Display for DanmakuPathError {
 
 impl std::error::Error for DanmakuPathError {}
 
-/// Resolves the canonical media path and the sidecar path for a stored source.
+/// Why a stored source could not be turned into safe filesystem paths.
 ///
-/// Returns `Err(())` for any path that escapes the library root; callers map
-/// that to a protocol-level "not available" answer.
+/// The delete endpoint has to tell "this path escapes the media root" (refuse) from "the media file
+/// is gone" (the registration can still be removed), so the two cases stay distinct here instead of
+/// collapsing into one `Err(())`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DanmakuSourcePathError {
+    /// The stored path or the canonical result leaves the library root.
+    UnsafePath,
+    /// The library root or the media file no longer resolves on disk.
+    Missing,
+}
+
+/// Resolves the canonical media path and the sidecar path for a stored source.
 pub(super) async fn safe_danmaku_source_paths(
     root_path: &str,
     relative_path: &str,
-) -> Result<(PathBuf, PathBuf), ()> {
+) -> Result<(PathBuf, PathBuf), DanmakuSourcePathError> {
     let relative = Path::new(relative_path);
     if relative.is_absolute()
         || relative
             .components()
             .any(|component| matches!(component, Component::ParentDir))
     {
-        return Err(());
+        return Err(DanmakuSourcePathError::UnsafePath);
     }
-    let root = fs::canonicalize(root_path).await.map_err(|_| ())?;
+    let root = fs::canonicalize(root_path)
+        .await
+        .map_err(|_| DanmakuSourcePathError::Missing)?;
     let media_path = fs::canonicalize(root.join(relative))
         .await
-        .map_err(|_| ())?;
+        .map_err(|_| DanmakuSourcePathError::Missing)?;
     if !media_path.starts_with(&root)
         && !crate::application::scanner::symlink::path_is_allowed(&root, &media_path)
     {
-        return Err(());
+        return Err(DanmakuSourcePathError::UnsafePath);
     }
-    let sidecar_relative = danmaku_sidecar_path(relative).map_err(|_| ())?;
-    let parent = media_path.parent().ok_or(())?.to_path_buf();
+    let sidecar_relative =
+        danmaku_sidecar_path(relative).map_err(|_| DanmakuSourcePathError::UnsafePath)?;
+    let parent = media_path
+        .parent()
+        .ok_or(DanmakuSourcePathError::UnsafePath)?
+        .to_path_buf();
     if !parent.starts_with(&root)
         && !crate::application::scanner::symlink::path_is_allowed(&root, &parent)
     {
-        return Err(());
+        return Err(DanmakuSourcePathError::UnsafePath);
     }
-    let sidecar_name = sidecar_relative.file_name().ok_or(())?.to_owned();
+    let sidecar_name = sidecar_relative
+        .file_name()
+        .ok_or(DanmakuSourcePathError::UnsafePath)?
+        .to_owned();
     let sidecar_path = parent.join(sidecar_name);
     if let Ok(canonical_sidecar) = fs::canonicalize(&sidecar_path).await {
         if !canonical_sidecar.starts_with(&root)
             && !crate::application::scanner::symlink::path_is_allowed(&root, &canonical_sidecar)
         {
-            return Err(());
+            return Err(DanmakuSourcePathError::UnsafePath);
         }
     }
     Ok((media_path, sidecar_path))

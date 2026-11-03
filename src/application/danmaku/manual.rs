@@ -12,14 +12,18 @@ use tokio::fs;
 use uuid::Uuid;
 
 use super::{
-    DanmakuService, DanmakuServiceError, danmaku_sidecar_path, path::safe_danmaku_source_paths,
+    DanmakuService, DanmakuServiceError, danmaku_sidecar_path,
+    path::{DanmakuSourcePathError, safe_danmaku_source_paths},
 };
 use crate::{
-    application::plugin_protocol::{
-        DanmakuSearchCandidate, MAX_DANMAKU_IDENTIFIER_CHARS, MAX_DANMAKU_PROVIDER_CHARS,
-        MAX_DANMAKU_SEARCH_LIMIT, MAX_DANMAKU_SEARCH_QUERY_CHARS,
+    application::{
+        plugin_protocol::{
+            DanmakuSearchCandidate, MAX_DANMAKU_IDENTIFIER_CHARS, MAX_DANMAKU_PROVIDER_CHARS,
+            MAX_DANMAKU_SEARCH_LIMIT, MAX_DANMAKU_SEARCH_QUERY_CHARS,
+        },
+        plugins::PluginServiceError,
     },
-    storage::{NewDanmakuManualMatchItem, NewDanmakuMatchJob, StoredDanmakuSource},
+    storage::{NewDanmakuMatchJob, NewDanmakuSingleItemJob, StoredDanmakuSource},
 };
 
 /// Candidate page the admin API uses when the request omits `limit`.
@@ -96,15 +100,13 @@ impl DanmakuService {
             .plugins
             .as_ref()
             .ok_or(DanmakuServiceError::ManualMatchUnavailable)?;
-        // A plugin that never declared `danmaku.search` keeps automatic matching only; answer with
-        // the documented "unsupported" class instead of a generic failure.
-        if !plugins.danmaku_manual_match_supported().await {
-            return Err(DanmakuServiceError::ManualMatchUnsupported);
-        }
+        // No separate "is manual match supported" probe: the plugin call already distinguishes a
+        // plugin that never declared `danmaku.search` (unsupported) from one that is disabled or
+        // not configured yet (unavailable), and the two must not be reported as the same thing.
         let result = plugins
             .search_danmaku(&query, limit)
             .await
-            .map_err(DanmakuServiceError::Plugin)?;
+            .map_err(manual_match_plugin_error)?;
         Ok(result.candidates)
     }
 
@@ -115,9 +117,9 @@ impl DanmakuService {
     /// episode is prefilled on the job item; the provider label travels in the existing
     /// `danmaku_tracks.provider` column, which the worker reads before it fetches.
     ///
-    /// The library must be selected in the danmaku plugin configuration: `docs/LUX-DEVELOPMENT.md`
-    /// §3.7 says an unselected library cannot create danmaku match jobs, and the worker enforces the
-    /// same rule (`LIBRARY_NOT_SELECTED`), so a manual job must not bypass it.
+    /// Unlike an automatic library sweep, a manual match does not require the library to be selected
+    /// in the danmaku plugin configuration: it is an explicit administrator action on one item
+    /// (`docs/LUX-DEVELOPMENT.md` §3.7, ADR-052 P5). The worker applies the same exception.
     pub async fn create_manual_job(
         &self,
         item_id: &str,
@@ -136,16 +138,16 @@ impl DanmakuService {
             .plugins
             .as_ref()
             .ok_or(DanmakuServiceError::ManualMatchUnavailable)?;
-        if !plugins.danmaku_manual_match_supported().await {
-            return Err(DanmakuServiceError::ManualMatchUnsupported);
-        }
+        plugins
+            .require_danmaku_manual_match_plugin()
+            .await
+            .map_err(manual_match_plugin_error)?;
         let settings = plugins
             .danmaku_settings()
             .await
             .map_err(|_| DanmakuServiceError::ManualMatchUnavailable)?;
-        if !settings.library_ids.iter().any(|id| id == &library_id) {
-            return Err(DanmakuServiceError::LibraryNotSelected);
-        }
+        // A manual match names one item explicitly, so it does not need the library to be selected
+        // for automatic sweeps (`docs/LUX-DEVELOPMENT.md` §3.7, ADR-052 P5).
         if self
             .database
             .has_active_danmaku_match_jobs(&library_id)
@@ -162,19 +164,19 @@ impl DanmakuService {
         let track_id = Uuid::now_v7().to_string();
         let concurrency = settings.concurrency.clamp(0, super::job::MAX_CONCURRENCY);
         self.database
-            .create_danmaku_manual_match_job(
+            .create_danmaku_single_item_job(
                 NewDanmakuMatchJob {
                     id: &job_id,
                     library_id: &library_id,
                     overwrite: target.overwrite,
                     concurrency,
                 },
-                NewDanmakuManualMatchItem {
+                NewDanmakuSingleItemJob {
                     id: &item_row_id,
                     track_id: &track_id,
                     media_source_id: &source.source_id,
                     provider_anime_id: target.anime_id.as_deref(),
-                    provider_episode_id: &target.episode_id,
+                    provider_episode_id: Some(&target.episode_id),
                     relative_sidecar_path: &relative_sidecar_path,
                     provider: target.provider.as_deref(),
                 },
@@ -194,7 +196,7 @@ impl DanmakuService {
         item_id: &str,
         source_id: Option<&str>,
         confirm_user_sidecar: bool,
-    ) -> Result<(), DanmakuServiceError> {
+    ) -> Result<String, DanmakuServiceError> {
         let Some(tracked) = self
             .database
             .find_tracked_danmaku_source_for_item(item_id, source_id)
@@ -209,11 +211,27 @@ impl DanmakuService {
         if is_user_sidecar && !confirm_user_sidecar {
             return Err(DanmakuServiceError::UserSidecarConfirmationRequired);
         }
-        let (_, sidecar_path) =
-            safe_danmaku_source_paths(&tracked.root_path, &tracked.relative_path)
-                .await
-                .map_err(|_| DanmakuServiceError::InvalidSidecarPath)?;
-        match fs::symlink_metadata(&sidecar_path).await {
+        match safe_danmaku_source_paths(&tracked.root_path, &tracked.relative_path).await {
+            Ok((_, sidecar_path)) => {
+                self.remove_sidecar_file(&sidecar_path).await?;
+            }
+            // The path is unsafe: refuse and keep everything as it is.
+            Err(DanmakuSourcePathError::UnsafePath) => {
+                return Err(DanmakuServiceError::InvalidSidecarPath);
+            }
+            // The media file (or its root) is gone, so no file can be proven safe to unlink; the
+            // registration itself can still be cleaned up.
+            Err(DanmakuSourcePathError::Missing) => {}
+        }
+        self.database
+            .delete_danmaku_track(&tracked.source_id)
+            .await?;
+        Ok(tracked.source_id)
+    }
+
+    /// Unlinks one canonical sidecar path, treating "already gone" as success.
+    async fn remove_sidecar_file(&self, sidecar_path: &Path) -> Result<(), DanmakuServiceError> {
+        match fs::symlink_metadata(sidecar_path).await {
             Ok(metadata)
                 if metadata.file_type().is_symlink() || !metadata.file_type().is_file() =>
             {
@@ -228,9 +246,6 @@ impl DanmakuService {
             // track MISSING); removing the registration still has to succeed.
             Err(_) => {}
         }
-        self.database
-            .delete_danmaku_track(&tracked.source_id)
-            .await?;
         Ok(())
     }
 
@@ -253,6 +268,21 @@ impl DanmakuService {
             return Err(DanmakuServiceError::UnsupportedItemType);
         }
         Ok(source)
+    }
+}
+
+/// Maps a plugin error to the manual-match contract.
+///
+/// A plugin that never declared `danmaku.search`/`danmaku.fetch` is "unsupported" (it keeps
+/// automatic matching), while a missing, disabled or not-yet-configured plugin is "unavailable".
+/// Both end up as a `409 PLUGIN_UNAVAILABLE`, but the administrator sees which one it is.
+fn manual_match_plugin_error(error: PluginServiceError) -> DanmakuServiceError {
+    match error {
+        PluginServiceError::Unsupported(_) => DanmakuServiceError::ManualMatchUnsupported,
+        PluginServiceError::UnknownPlugin(_)
+        | PluginServiceError::Unavailable(_)
+        | PluginServiceError::InvalidConfig => DanmakuServiceError::ManualMatchUnavailable,
+        other => DanmakuServiceError::Plugin(other),
     }
 }
 
