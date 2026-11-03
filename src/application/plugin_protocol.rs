@@ -1,9 +1,11 @@
 use std::{collections::BTreeMap, fmt, path::Path};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::{Host, Url};
 
+use super::danmaku::{MAX_DANMAKU_XML_BYTES, validate_danmaku_xml};
 use super::schedule::validate_cron;
 
 pub const PLUGIN_FORMAT_VERSION: u32 = 1;
@@ -31,6 +33,10 @@ pub const MEDIA_SOURCE_KIND_LOCAL_FILE: &str = "LOCAL_FILE";
 pub const MEDIA_SOURCE_KIND_STRM_URL: &str = "STRM_URL";
 pub const NOTIFICATION_SEND_CAPABILITY: &str = "notification.send";
 pub const DANMAKU_MATCH_CAPABILITY: &str = "danmaku.match";
+/// Optional manual-match capabilities (ADR-052 P4). A danmaku plugin either declares both or
+/// neither; a plugin that only declares `danmaku.match` keeps the automatic matching contract.
+pub const DANMAKU_SEARCH_CAPABILITY: &str = "danmaku.search";
+pub const DANMAKU_FETCH_CAPABILITY: &str = "danmaku.fetch";
 pub const LOGIN_BACKGROUND_GET_CAPABILITY: &str = "login_background.get";
 pub const EMBY_MIGRATION_CAPABILITY: &str = "migration.emby";
 pub const EMBY_ROUTE_CAPABILITY: &str = "emby.route";
@@ -46,6 +52,8 @@ pub const CHAPTER_DETECT_METHOD: &str = "chapters.detect";
 pub const CHAPTER_LOOKUP_METHOD: &str = "chapters.lookup";
 pub const NOTIFICATION_SEND_METHOD: &str = "notification.send";
 pub const DANMAKU_MATCH_METHOD: &str = "danmaku.match";
+pub const DANMAKU_SEARCH_METHOD: &str = "danmaku.search";
+pub const DANMAKU_FETCH_METHOD: &str = "danmaku.fetch";
 pub const LOGIN_BACKGROUND_GET_METHOD: &str = "login_background.get";
 pub const UNIFIED_LOGIN_BACKGROUND_PLUGIN_ID: &str = "org.lux.login-background";
 pub const LOGIN_BACKGROUND_CUSTOM_IMAGE_PATH: &str = "/api/v1/auth/login-background/custom-image";
@@ -305,6 +313,34 @@ impl PluginManifest {
                 {
                     return Err(PluginManifestError::Invalid(
                         "danmaku plugins must declare danmaku.match".to_owned(),
+                    ));
+                }
+                for capability in &self.capabilities {
+                    if capability.starts_with("danmaku.")
+                        && !matches!(
+                            capability.as_str(),
+                            DANMAKU_MATCH_CAPABILITY
+                                | DANMAKU_SEARCH_CAPABILITY
+                                | DANMAKU_FETCH_CAPABILITY
+                        )
+                    {
+                        return Err(PluginManifestError::Invalid(format!(
+                            "unsupported danmaku capability: {capability}"
+                        )));
+                    }
+                }
+                let declares_search = self
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == DANMAKU_SEARCH_CAPABILITY);
+                let declares_fetch = self
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == DANMAKU_FETCH_CAPABILITY);
+                if declares_search != declares_fetch {
+                    return Err(PluginManifestError::Invalid(
+                        "danmaku plugins must declare danmaku.search and danmaku.fetch together"
+                            .to_owned(),
                     ));
                 }
             }
@@ -1422,6 +1458,271 @@ pub struct DanmakuMatchRpcResult {
     pub episode_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xml_base64: Option<String>,
+}
+
+/// True when a danmaku plugin declares `danmaku.match` plus both optional manual-match
+/// capabilities. Only such a plugin may be asked to search or fetch by episode.
+pub fn declares_danmaku_manual_match(manifest: &PluginManifest) -> bool {
+    manifest.plugin_type == PLUGIN_TYPE_DANMAKU
+        && manifest.category == PLUGIN_CATEGORY_MEDIA
+        && [
+            DANMAKU_MATCH_CAPABILITY,
+            DANMAKU_SEARCH_CAPABILITY,
+            DANMAKU_FETCH_CAPABILITY,
+        ]
+        .iter()
+        .all(|required| {
+            manifest
+                .capabilities
+                .iter()
+                .any(|capability| capability == required)
+        })
+}
+
+/// Upper bound of the serialized result the host accepts for one danmaku RPC.
+///
+/// This is the `danmaku.match` budget the host already enforced; `danmaku.search` and
+/// `danmaku.fetch` reuse it so one plugin call can never hold an unbounded response.
+pub const MAX_DANMAKU_RPC_RESULT_BYTES: usize = 4 * 1024 * 1024;
+/// Longest manual search query the host forwards to a plugin, after trimming.
+pub const MAX_DANMAKU_SEARCH_QUERY_CHARS: usize = 200;
+/// Largest candidate count one manual search may request or return.
+pub const MAX_DANMAKU_SEARCH_LIMIT: u32 = 50;
+/// Largest candidate list the host keeps from one plugin response.
+pub const MAX_DANMAKU_SEARCH_CANDIDATES: usize = 50;
+/// Largest episode list the host keeps from one search candidate.
+pub const MAX_DANMAKU_SEARCH_EPISODES: usize = 500;
+/// Largest provider anime/episode identifier the host accepts.
+pub const MAX_DANMAKU_IDENTIFIER_CHARS: usize = 128;
+/// Largest provider label the host accepts.
+pub const MAX_DANMAKU_PROVIDER_CHARS: usize = 64;
+/// Largest anime or episode title the host accepts.
+pub const MAX_DANMAKU_TITLE_CHARS: usize = 300;
+
+/// `danmaku.search` request. The host sends only the query text and the page bound; never a path,
+/// an upstream address or user information.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DanmakuSearchRpcRequest {
+    pub query: String,
+    pub limit: u32,
+}
+
+/// `danmaku.search` result. Also the host-facing return type of
+/// [`PluginService::search_danmaku`](crate::application::plugins::PluginService::search_danmaku),
+/// so every value a caller sees already passed the host bounds checks.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DanmakuSearchResult {
+    pub candidates: Vec<DanmakuSearchCandidate>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DanmakuSearchCandidate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    pub anime_id: String,
+    pub anime_title: String,
+    pub episodes: Vec<DanmakuSearchEpisode>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DanmakuSearchEpisode {
+    pub episode_id: String,
+    pub title: String,
+}
+
+/// `danmaku.fetch` request. `provider` is the opaque label a search result carried.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DanmakuFetchRpcRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    pub episode_id: String,
+}
+
+/// `danmaku.fetch` result. Decoding and XML validation stay with the caller so this layer never
+/// touches the filesystem.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DanmakuFetchResult {
+    pub xml_base64: String,
+}
+
+/// Why a host-side danmaku request or a plugin payload was refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DanmakuRpcValidationError {
+    /// The payload is not the documented JSON shape or an identifier is missing.
+    InvalidPayload,
+    /// The serialized result exceeds [`MAX_DANMAKU_RPC_RESULT_BYTES`] or the XML byte budget.
+    ResultTooLarge,
+    /// A provider/anime/episode identifier is empty, too long or contains control characters.
+    InvalidIdentifier,
+    /// A title is empty, too long or contains control characters.
+    InvalidText,
+    /// The decoded payload is not a valid Bilibili/Dandanplay danmaku document.
+    InvalidXml,
+}
+
+impl fmt::Display for DanmakuRpcValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPayload => formatter.write_str("danmaku RPC payload is invalid"),
+            Self::ResultTooLarge => formatter.write_str("danmaku RPC payload is too large"),
+            Self::InvalidIdentifier => formatter.write_str("danmaku RPC identifier is invalid"),
+            Self::InvalidText => formatter.write_str("danmaku RPC text is invalid"),
+            Self::InvalidXml => formatter.write_str("danmaku XML payload is invalid"),
+        }
+    }
+}
+
+impl std::error::Error for DanmakuRpcValidationError {}
+
+impl DanmakuSearchRpcRequest {
+    /// Host-side request validation. The query is trimmed; both bounds are inclusive.
+    pub fn validate(self) -> Result<Self, DanmakuRpcValidationError> {
+        let query = self.query.trim();
+        if query.is_empty()
+            || query.chars().count() > MAX_DANMAKU_SEARCH_QUERY_CHARS
+            || query.chars().any(char::is_control)
+        {
+            return Err(DanmakuRpcValidationError::InvalidPayload);
+        }
+        if !(1..=MAX_DANMAKU_SEARCH_LIMIT).contains(&self.limit) {
+            return Err(DanmakuRpcValidationError::InvalidPayload);
+        }
+        Ok(Self {
+            query: query.to_owned(),
+            limit: self.limit,
+        })
+    }
+}
+
+impl DanmakuFetchRpcRequest {
+    /// Host-side request validation. An empty `provider` is treated as "not set".
+    pub fn validate(self) -> Result<Self, DanmakuRpcValidationError> {
+        let provider = match self.provider.as_deref() {
+            Some(provider) => Some(
+                normalized_danmaku_identifier(provider, MAX_DANMAKU_PROVIDER_CHARS)
+                    .ok_or(DanmakuRpcValidationError::InvalidIdentifier)?,
+            ),
+            None => None,
+        };
+        let episode_id =
+            normalized_danmaku_identifier(&self.episode_id, MAX_DANMAKU_IDENTIFIER_CHARS)
+                .ok_or(DanmakuRpcValidationError::InvalidPayload)?;
+        Ok(Self {
+            provider,
+            episode_id,
+        })
+    }
+}
+
+impl DanmakuSearchResult {
+    /// Deserializes one `danmaku.search` result and applies the host contract.
+    ///
+    /// Candidate and episode lists above [`MAX_DANMAKU_SEARCH_CANDIDATES`],
+    /// [`MAX_DANMAKU_SEARCH_EPISODES`] or the requested `limit` are trimmed, because a plugin may
+    /// legitimately ignore the page bound. Identifiers and titles are validated instead of
+    /// trimmed: an empty or oversized value is a broken plugin response, not extra data.
+    pub fn from_value(value: Value, limit: u32) -> Result<Self, DanmakuRpcValidationError> {
+        let encoded =
+            serde_json::to_vec(&value).map_err(|_| DanmakuRpcValidationError::InvalidPayload)?;
+        if encoded.len() > MAX_DANMAKU_RPC_RESULT_BYTES {
+            return Err(DanmakuRpcValidationError::ResultTooLarge);
+        }
+        let result: Self =
+            serde_json::from_value(value).map_err(|_| DanmakuRpcValidationError::InvalidPayload)?;
+        let limit = limit.clamp(1, MAX_DANMAKU_SEARCH_LIMIT) as usize;
+        let mut candidates = Vec::with_capacity(result.candidates.len().min(limit));
+        for candidate in result.candidates.into_iter().take(limit) {
+            let anime_id =
+                normalized_danmaku_identifier(&candidate.anime_id, MAX_DANMAKU_IDENTIFIER_CHARS)
+                    .ok_or(DanmakuRpcValidationError::InvalidIdentifier)?;
+            let anime_title =
+                normalized_danmaku_text(&candidate.anime_title, MAX_DANMAKU_TITLE_CHARS)
+                    .ok_or(DanmakuRpcValidationError::InvalidText)?;
+            let provider = match candidate.provider.as_deref() {
+                Some(provider) => Some(
+                    normalized_danmaku_identifier(provider, MAX_DANMAKU_PROVIDER_CHARS)
+                        .ok_or(DanmakuRpcValidationError::InvalidIdentifier)?,
+                ),
+                None => None,
+            };
+            let mut episodes =
+                Vec::with_capacity(candidate.episodes.len().min(MAX_DANMAKU_SEARCH_EPISODES));
+            for episode in candidate
+                .episodes
+                .into_iter()
+                .take(MAX_DANMAKU_SEARCH_EPISODES)
+            {
+                episodes.push(DanmakuSearchEpisode {
+                    episode_id: normalized_danmaku_identifier(
+                        &episode.episode_id,
+                        MAX_DANMAKU_IDENTIFIER_CHARS,
+                    )
+                    .ok_or(DanmakuRpcValidationError::InvalidIdentifier)?,
+                    title: normalized_danmaku_text(&episode.title, MAX_DANMAKU_TITLE_CHARS)
+                        .ok_or(DanmakuRpcValidationError::InvalidText)?,
+                });
+            }
+            candidates.push(DanmakuSearchCandidate {
+                provider,
+                anime_id,
+                anime_title,
+                episodes,
+            });
+        }
+        Ok(Self { candidates })
+    }
+}
+
+impl DanmakuFetchResult {
+    /// Deserializes one `danmaku.fetch` result inside the same byte budget `danmaku.match` used.
+    pub fn from_value(value: Value) -> Result<Self, DanmakuRpcValidationError> {
+        let encoded =
+            serde_json::to_vec(&value).map_err(|_| DanmakuRpcValidationError::InvalidPayload)?;
+        if encoded.len() > MAX_DANMAKU_RPC_RESULT_BYTES {
+            return Err(DanmakuRpcValidationError::ResultTooLarge);
+        }
+        let result: Self =
+            serde_json::from_value(value).map_err(|_| DanmakuRpcValidationError::InvalidPayload)?;
+        if result.xml_base64.trim().is_empty() {
+            return Err(DanmakuRpcValidationError::InvalidPayload);
+        }
+        Ok(result)
+    }
+
+    /// Decodes the payload and applies the host XML validation the automatic match path uses.
+    ///
+    /// The caller owns persistence: this helper never writes a sidecar, and callers must run it
+    /// before registering a track or exposing the XML.
+    pub fn decode_xml(&self) -> Result<Vec<u8>, DanmakuRpcValidationError> {
+        let bytes = BASE64
+            .decode(&self.xml_base64)
+            .map_err(|_| DanmakuRpcValidationError::InvalidPayload)?;
+        if bytes.len() > MAX_DANMAKU_XML_BYTES {
+            return Err(DanmakuRpcValidationError::ResultTooLarge);
+        }
+        validate_danmaku_xml(&bytes).map_err(|_| DanmakuRpcValidationError::InvalidXml)?;
+        Ok(bytes)
+    }
+}
+
+/// Trims an opaque provider identifier and enforces the host length and character rules.
+fn normalized_danmaku_identifier(value: &str, max_chars: usize) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()
+        && trimmed.chars().count() <= max_chars
+        && !trimmed.chars().any(char::is_control))
+    .then(|| trimmed.to_owned())
+}
+
+/// Trims human text and enforces the host length and character rules.
+fn normalized_danmaku_text(value: &str, max_chars: usize) -> Option<String> {
+    normalized_danmaku_identifier(value, max_chars)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

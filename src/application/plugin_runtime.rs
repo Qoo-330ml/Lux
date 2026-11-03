@@ -244,6 +244,12 @@ impl PluginSupervisor {
         self
     }
 
+    /// Default deadline for one plugin RPC, kept in one place so callers that override it per
+    /// workload (media probe, danmaku) start from the same budget.
+    pub(crate) fn call_timeout(&self) -> Duration {
+        self.call_timeout
+    }
+
     pub fn with_config_dir(mut self, config_dir: PathBuf) -> Self {
         self.config_dir = Some(config_dir);
         self

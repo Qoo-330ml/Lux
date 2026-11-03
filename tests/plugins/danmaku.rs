@@ -1,5 +1,6 @@
 use std::{path::Path, time::Duration};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use luxd::application::danmaku::{
     DanmakuService, DanmakuServiceError, DanmakuSidecarScope, MAX_DANMAKU_XML_BYTES,
     atomic_write_danmaku_xml, danmaku_sidecar_path, validate_danmaku_xml,
@@ -7,7 +8,11 @@ use luxd::application::danmaku::{
 };
 use luxd::application::{
     libraries::LibraryService,
-    plugins::{DANMAKU_PLUGIN_ID, PluginService},
+    plugin_protocol::{
+        DANMAKU_FETCH_CAPABILITY, DANMAKU_MATCH_CAPABILITY, DANMAKU_SEARCH_CAPABILITY,
+    },
+    plugin_runtime::PluginRuntimeError,
+    plugins::{DANMAKU_PLUGIN_ID, PluginService, PluginServiceError},
     scanner::LibraryScanner,
     scheduled_tasks::ScheduledTaskService,
     strm_probe::StrmProbeService,
@@ -164,24 +169,150 @@ done
 "#;
 
 #[cfg(unix)]
-fn write_danmaku_stub_plugin(plugin_root: &Path, xml_base64: &str) -> std::io::Result<()> {
+fn write_danmaku_stub_plugin(plugin_root: &Path, script: &str) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     std::fs::create_dir_all(plugin_root)?;
     let entrypoint = plugin_root.join("plugin");
-    std::fs::write(
-        &entrypoint,
-        DANMAKU_STUB_SCRIPT.replace("__XML_BASE64__", xml_base64),
-    )?;
+    std::fs::write(&entrypoint, script)?;
     std::fs::set_permissions(entrypoint, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Minimal stand-in for a danmaku plugin that also answers the optional manual-match methods
+/// (`danmaku.search` / `danmaku.fetch`, ADR-052 P4).
+///
+/// The query text selects the contract under test: `slow` blocks past the host deadline,
+/// `blank-title` returns a candidate the host must reject, and every other query returns one
+/// candidate with two episodes. Fetch always answers with the same XML the match stub uses, so the
+/// host-side decode and `validate_danmaku_xml` path is covered without a real provider.
+#[cfg(unix)]
+const DANMAKU_MANUAL_STUB_SCRIPT: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"plugin.hello"'*)
+      printf '{"id":"%s","result":{"id":"org.lux.danmaku","name":"danmaku stub","apiVersion":1,"capabilities":["danmaku.match","danmaku.search","danmaku.fetch"],"supportedItemTypes":[]}}\n' "$id"
+      ;;
+    *'"danmaku.match"'*)
+      printf '{"id":"%s","result":{"status":"MATCHED","provider":"stub","episodeId":"ep-1","xmlBase64":"__XML_BASE64__"}}\n' "$id"
+      ;;
+    *'"danmaku.search"'*)
+      case "$line" in
+        *'"query":"slow"'*)
+          sleep 5
+          printf '{"id":"%s","result":{"candidates":[]}}\n' "$id"
+          ;;
+        *'"query":"blank-title"'*)
+          printf '{"id":"%s","result":{"candidates":[{"provider":"stub","animeId":"anime-1","animeTitle":"   ","episodes":[{"episodeId":"ep-1","title":"Episode 1"}]}]}}\n' "$id"
+          ;;
+        *)
+          printf '{"id":"%s","result":{"candidates":[{"provider":"stub","animeId":"anime-1","animeTitle":"Demo Anime","episodes":[{"episodeId":"ep-1","title":"Episode 1"},{"episodeId":"ep-2","title":"Episode 2"}]}]}}\n' "$id"
+          ;;
+      esac
+      ;;
+    *'"danmaku.fetch"'*)
+      case "$line" in
+        *'"episodeId":"bad-xml"'*)
+          printf '{"id":"%s","result":{"xmlBase64":"PGh0bWwvPg=="}}\n' "$id"
+          ;;
+        *)
+          printf '{"id":"%s","result":{"xmlBase64":"__XML_BASE64__"}}\n' "$id"
+          ;;
+      esac
+      ;;
+    *'"plugin.shutdown"'*)
+      printf '{"id":"%s","result":{"accepted":true}}\n' "$id"
+      exit 0
+      ;;
+    *'"plugin.health"'*)
+      printf '{"id":"%s","result":{"available":true,"configured":true}}\n' "$id"
+      ;;
+    *)
+      printf '{"id":"%s","error":{"code":"PLUGIN_UNSUPPORTED_METHOD","message":"unsupported plugin method"}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
+/// The `org.lux.danmaku` manifest the host validates, with a caller-selected capability set.
+#[cfg(unix)]
+fn danmaku_manifest_value(capabilities: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "formatVersion": 1,
+        "id": DANMAKU_PLUGIN_ID,
+        "name": "弹幕匹配",
+        "version": "1.0.0",
+        "apiVersion": 1,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "danmaku",
+        "category": "MEDIA",
+        "capabilities": capabilities,
+        "configFields": [
+            {"key": "providerBaseUrl", "label": "弹幕接口地址", "type": "text", "required": true, "sensitive": true},
+            {"key": "libraryIds", "label": "媒体库", "type": "select", "multiple": true, "optionsSource": "media-libraries", "defaultValue": []},
+            {"key": "matchOriginalFilename", "label": "使用原始文件名", "type": "toggle", "defaultValue": true},
+            {"key": "matchSimplifiedTraditionalTitles", "label": "尝试简繁标题", "type": "toggle", "defaultValue": true},
+            {"key": "matchEnglishTitle", "label": "尝试英文标题", "type": "toggle", "defaultValue": false},
+            {"key": "schedule", "label": "执行计划", "type": "text", "required": true, "defaultValue": "* * * * *"}
+        ],
+        "scheduledTasks": [{
+            "taskType": "DANMAKU_MATCH",
+            "ownerType": "GLOBAL",
+            "name": "弹幕匹配",
+            "description": "按计划为选定媒体库匹配并下载 Bilibili XML 弹幕旁车。",
+            "scheduleConfigKey": "schedule",
+            "defaultSchedule": "* * * * *",
+            "requiredConfigKeys": ["providerBaseUrl", "libraryIds"],
+            "resourceLimit": {"concurrency": 2, "overwrite": false}
+        }],
+        "permissions": {"network": ["*"], "filesystem": []},
+        "files": []
+    })
+}
+
+/// Installs the stub danmaku plugin with `capabilities` and returns a ready service.
+#[cfg(unix)]
+async fn danmaku_plugin_service(
+    directory: &Path,
+    capabilities: &[&str],
+    script: &str,
+) -> Result<PluginService, Box<dyn std::error::Error>> {
+    let config_dir = directory.join("config");
+    let plugin_dir = config_dir.join("plugins/org.lux.danmaku");
+    std::fs::create_dir_all(plugin_dir.join("binaries"))?;
+    std::fs::write(
+        plugin_dir.join("manifest.json"),
+        serde_json::to_vec(&danmaku_manifest_value(capabilities))?,
+    )?;
+    write_danmaku_stub_plugin(&plugin_dir.join("binaries"), script)?;
+    std::fs::create_dir_all(config_dir.join("plugin-config"))?;
+    std::fs::write(
+        config_dir.join("plugin-config/org.lux.danmaku.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "providerBaseUrl": "https://danmu.example.test",
+            "schedule": "* * * * *"
+        }))?,
+    )?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    })
+    .await?;
+    let plugins = PluginService::new(database, config_dir);
+    plugins.install(DANMAKU_PLUGIN_ID).await?;
+    Ok(plugins)
+}
+
+#[cfg(unix)]
+fn danmaku_manual_plugin_script() -> String {
+    let base64 = BASE64.encode(STUB_XML);
+    DANMAKU_MANUAL_STUB_SCRIPT.replace("__XML_BASE64__", &base64)
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn danmaku_service_matches_local_and_strm_sources_and_writes_sidecars()
 -> Result<(), Box<dyn std::error::Error>> {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-
     let directory = tempfile::tempdir()?;
     let config_dir = directory.path().join("config");
     let media_root = directory.path().join("Movies");
@@ -212,41 +343,11 @@ async fn danmaku_service_matches_local_and_strm_sources_and_writes_sidecars()
 
     write_danmaku_stub_plugin(
         &config_dir.join("plugins/org.lux.danmaku/binaries"),
-        &BASE64.encode(STUB_XML),
+        &DANMAKU_STUB_SCRIPT.replace("__XML_BASE64__", &BASE64.encode(STUB_XML)),
     )?;
     tokio::fs::write(
         config_dir.join("plugins/org.lux.danmaku/manifest.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "formatVersion": 1,
-            "id": DANMAKU_PLUGIN_ID,
-            "name": "弹幕匹配",
-            "version": "1.0.0",
-            "apiVersion": 1,
-            "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
-            "type": "danmaku",
-            "category": "MEDIA",
-            "capabilities": ["danmaku.match"],
-            "configFields": [
-                {"key": "providerBaseUrl", "label": "弹幕接口地址", "type": "text", "required": true, "sensitive": true},
-                {"key": "libraryIds", "label": "媒体库", "type": "select", "multiple": true, "optionsSource": "media-libraries", "defaultValue": []},
-                {"key": "matchOriginalFilename", "label": "使用原始文件名", "type": "toggle", "defaultValue": true},
-                {"key": "matchSimplifiedTraditionalTitles", "label": "尝试简繁标题", "type": "toggle", "defaultValue": true},
-                {"key": "matchEnglishTitle", "label": "尝试英文标题", "type": "toggle", "defaultValue": false},
-                {"key": "schedule", "label": "执行计划", "type": "text", "required": true, "defaultValue": "* * * * *"}
-            ],
-            "scheduledTasks": [{
-                "taskType": "DANMAKU_MATCH",
-                "ownerType": "GLOBAL",
-                "name": "弹幕匹配",
-                "description": "按计划为选定媒体库匹配并下载 Bilibili XML 弹幕旁车。",
-                "scheduleConfigKey": "schedule",
-                "defaultSchedule": "* * * * *",
-                "requiredConfigKeys": ["providerBaseUrl", "libraryIds"],
-                "resourceLimit": {"concurrency": 2, "overwrite": false}
-            }],
-            "permissions": {"network": ["*"], "filesystem": []},
-            "files": []
-        }))?,
+        serde_json::to_vec(&danmaku_manifest_value(&["danmaku.match"]))?,
     )
     .await?;
     tokio::fs::create_dir_all(config_dir.join("plugin-config")).await?;
@@ -393,5 +494,156 @@ async fn danmaku_service_matches_local_and_strm_sources_and_writes_sidecars()
     .map_err(|_| "danmaku job creation materialized every source")??;
     assert_eq!(large_job.total_count, 10002);
 
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_manual_match_plugin_serves_search_and_fetch_inside_the_host_bounds()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let plugins = danmaku_plugin_service(
+        directory.path(),
+        &[
+            DANMAKU_MATCH_CAPABILITY,
+            DANMAKU_SEARCH_CAPABILITY,
+            DANMAKU_FETCH_CAPABILITY,
+        ],
+        &danmaku_manual_plugin_script(),
+    )
+    .await?;
+
+    assert!(plugins.danmaku_manual_match_supported().await);
+
+    let search = plugins.search_danmaku("Demo", 50).await?;
+    assert_eq!(search.candidates.len(), 1);
+    assert_eq!(search.candidates[0].provider.as_deref(), Some("stub"));
+    assert_eq!(search.candidates[0].anime_id, "anime-1");
+    assert_eq!(search.candidates[0].anime_title, "Demo Anime");
+    assert_eq!(search.candidates[0].episodes.len(), 2);
+    assert_eq!(search.candidates[0].episodes[1].episode_id, "ep-2");
+
+    let fetched = plugins.fetch_danmaku(Some("stub"), "ep-1").await?;
+    assert_eq!(fetched.decode_xml()?, STUB_XML);
+    let without_provider = plugins.fetch_danmaku(None, "ep-2").await?;
+    assert_eq!(without_provider.decode_xml()?, STUB_XML);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unusable_plugin_payloads_become_an_invalid_response()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let plugins = danmaku_plugin_service(
+        directory.path(),
+        &[
+            DANMAKU_MATCH_CAPABILITY,
+            DANMAKU_SEARCH_CAPABILITY,
+            DANMAKU_FETCH_CAPABILITY,
+        ],
+        &danmaku_manual_plugin_script(),
+    )
+    .await?;
+
+    // A candidate whose title trims to empty is a broken plugin response, not extra data.
+    assert!(matches!(
+        plugins.search_danmaku("blank-title", 10).await,
+        Err(PluginServiceError::InvalidResponse)
+    ));
+    // The fetch layer still applies the host XML rules before handing bytes to its caller.
+    assert!(matches!(
+        plugins.fetch_danmaku(None, "bad-xml").await,
+        Err(PluginServiceError::InvalidResponse)
+    ));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_match_only_plugin_keeps_working_and_reports_manual_search_as_unsupported()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let plugins = danmaku_plugin_service(
+        directory.path(),
+        &[DANMAKU_MATCH_CAPABILITY],
+        &DANMAKU_STUB_SCRIPT.replace("__XML_BASE64__", &BASE64.encode(STUB_XML)),
+    )
+    .await?;
+
+    assert!(!plugins.danmaku_manual_match_supported().await);
+    assert!(matches!(
+        plugins.search_danmaku("Demo", 10).await,
+        Err(PluginServiceError::Unsupported(DANMAKU_SEARCH_CAPABILITY))
+    ));
+    assert!(matches!(
+        plugins.fetch_danmaku(None, "ep-1").await,
+        Err(PluginServiceError::Unsupported(DANMAKU_SEARCH_CAPABILITY))
+    ));
+    // The automatic contract must not change for plugins that never declared search or fetch.
+    let matched = plugins.match_danmaku("Demo.Movie.2024.mkv").await?;
+    assert_eq!(matched.episode_id.as_deref(), Some("34"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn manual_search_reports_the_host_plugin_timeout() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let plugins = danmaku_plugin_service(
+        directory.path(),
+        &[
+            DANMAKU_MATCH_CAPABILITY,
+            DANMAKU_SEARCH_CAPABILITY,
+            DANMAKU_FETCH_CAPABILITY,
+        ],
+        &danmaku_manual_plugin_script(),
+    )
+    .await?;
+    let plugins = plugins.with_danmaku_call_timeout(Duration::from_millis(300));
+
+    assert!(matches!(
+        plugins.search_danmaku("slow", 10).await,
+        Err(PluginServiceError::Runtime(PluginRuntimeError::Timeout))
+    ));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn manual_requests_are_validated_before_the_plugin_is_consulted()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let config_dir = directory.path().join("config");
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    })
+    .await?;
+    let plugins = PluginService::new(database, config_dir);
+
+    assert!(!plugins.danmaku_manual_match_supported().await);
+    for (query, limit) in [("   ", 10), ("Demo", 0), ("Demo", 51)] {
+        assert!(
+            matches!(
+                plugins.search_danmaku(query, limit).await,
+                Err(PluginServiceError::InvalidRequest(_))
+            ),
+            "query {query:?} limit {limit} must be rejected before the plugin is consulted"
+        );
+    }
+    assert!(matches!(
+        plugins.fetch_danmaku(None, "").await,
+        Err(PluginServiceError::InvalidRequest(_))
+    ));
+    // Valid input without an installed plugin keeps a specific variant instead of panicking.
+    assert!(matches!(
+        plugins.search_danmaku("Demo", 10).await,
+        Err(PluginServiceError::UnknownPlugin(_))
+    ));
+    assert!(matches!(
+        plugins.fetch_danmaku(None, "ep-1").await,
+        Err(PluginServiceError::UnknownPlugin(_))
+    ));
     Ok(())
 }
