@@ -10,6 +10,13 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 
 ### 新增
 
+- **Emby 图片请求有了脱敏诊断日志**：每成功返回一张 Emby 图片，都会在 `luxd::emby_image_diag` 这个
+  日志 target 下留一行：客户端/设备名（`X-Emby-Client`、`Authorization` 头或 User-Agent 产品名，
+  截断到 32 字符并过滤字符）、图片类型、鉴权方式（登录 / 图片 tag / Filmly 兼容）、客户端传的
+  `maxWidth`/`maxHeight`/`width`/`height`/`quality`/`format` 和叠加参数，以及最终去向：命中哪一档
+  变体（`variant_width`），还是回退原图及原因（`no_size_hint`、`non_jpeg_format`、`overlay`、
+  `source_size_unknown`、`needs_original`、`variant_unavailable`）。日志里没有 token、API key、
+  完整 URL/查询串、Cookie、IP 和条目 ID；响应字节、状态码与头完全不变。
 - **Emby 客户端按请求尺寸命中图片变体缓存**：Emby 客户端用 `maxWidth`/`maxHeight`（或 `width`/`height`，大小写不敏感）说明自己要显示多大，服务端现在据此从图片变体缓存里挑最小够用的一档（长边 360 / 720 / 1280）返回，不再一律给原图；Lux 自己的网页接口行为不变，缓存仍由管理员全局开关控制。带 `format`（非 jpg/jpeg）或 `blur`、`percentPlayed`、`unplayedCount`、`addPlayedIndicator` 等叠加参数时仍返回原图，开关关闭时响应与以前完全一致。
 
 ## [0.7.11] - 2026-11-04

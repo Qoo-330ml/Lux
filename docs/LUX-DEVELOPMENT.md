@@ -19586,6 +19586,86 @@ Emby 用例放在既有 `image_variants` 模块（`--test images image_variants:
 尺寸命中，不做裁剪（与 LUX-826 一致）；Emby 的 `quality` 参数未参与选档；未在真实第三方 Emby 客户端
 （如 VidHub、Hills）上实测，仅用 HTTP 回归覆盖请求形状。变体缓存默认关闭，未开启时行为与字节完全不变。
 
+#### LUX-882：Emby 图片请求的脱敏诊断日志
+
+背景：LUX-881 让 Emby 图片路由按 `maxWidth`/`maxHeight` 命中变体缓存，但现有请求日志只记路径，管理员
+在真实 NAS 上无法判断 Infuse、Emby 官方、Hills、Filmly、Fileball 等第三方客户端是否发送尺寸参数，
+也无法判断某次响应是命中变体，还是因 `format`/叠加参数/超限等原因回退原图。
+
+范围：每个到达图片服务路径的 Emby 图片请求（`/Items/{id}/Images/{type}` 与 `/{type}/{index}` 的
+principal、tagged 无登录、Filmly 兼容分支，以及媒体库封面与人物头像两条不走缓存的路径）记录一条
+`tracing::info!`，target 固定为 `luxd::emby_image_diag`：
+
+- 请求形状：`client`、`device`（先取 `X-Emby-Client` / `X-Emby-Device-Name`，其次
+  `Authorization`/`X-Emby-Authorization` 里的 `Client=`/`Device=`，client 最后回退 `User-Agent` 的
+  产品名即第一个 `/` 或空白前的一段；都只保留 ASCII 字母数字与 `-_.` 并截断到 32 字符，`format` 只保留
+  字母数字并截断到 8 字符）、`image_type`（`normalize_image_type` 之后）、`has_tag`、`auth_mode`
+  （`principal` / `tag` / `filmly_compat`），以及 `max_width`、`max_height`、`width`、`height`、
+  `quality`、`format`、`overlay`。
+- 结果：`outcome=variant` 附 `variant_width`，或 `outcome=original` 附 `reason` ∈
+  `no_size_hint` / `non_jpeg_format` / `overlay` / `source_size_unknown` / `needs_original` /
+  `variant_unavailable`（`variant_unavailable` 覆盖开关关闭、不支持的类型、生成中、失败冷却、变体文件
+  读取失败，以及媒体库封面/人物头像/Filmly 兼容这些不查缓存的路径）。客户端未提供或无法解析的数值
+  字段不出现在事件里，而不是写 0 占位。
+- 严禁记录 token/api_key、完整 URL、完整查询串、Cookie、IP、完整 User-Agent、item_id；鉴权失败或
+  404 等没有解析到图片的请求不产生这条日志（已有请求日志覆盖）。
+
+实现：`EmbyImageDisplayQuery`（`src/api/emby_handlers.rs`）增解析 `quality`（只进日志、不参与选档，
+非数字忽略）并暴露 `variant_intent()`；`src/application/image_variants.rs` 新增纯函数
+`ImageVariantIntent::selection`，把请求形态（Web 精确宽度或 Emby 显示框，加叠加/非 JPEG 反对项）与
+原图尺寸映射为命中档位或 `OriginalImageReason`，`serve_image` / `serve_tagged_image` 改为返回
+`ServedImage`（响应 + 实际去向），Lux API 取 `.response`，行为不变。日志字段构造、客户端名清洗与限长
+集中在新增的 `src/api/emby_image_diag.rs`；两条 Emby 路由在 principal 与 Filmly 分支确定后构造一次
+记录，并在返回前写入。不新增依赖、migration、配置项，不改 Web，不改响应字节/状态码/头，不增加阻塞或
+I/O。
+
+预计文件：`src/application/image_variants.rs`、`src/api/emby_handlers.rs`、`src/api/emby_image_diag.rs`、
+`src/api/legacy.rs`、`src/api/media.rs`、`tests/images/image_variants.rs`、`docs/LUX-DEVELOPMENT.md`、
+`docs/CHANGELOG.md`、`docs/TEST-TARGETS.md`、`docs/DEPLOYMENT.md`。
+
+验收：
+
+- [x] 选档/回退纯函数覆盖六种 reason：缺尺寸、非 JPEG `format`、叠加参数、原图尺寸未知、所需长边
+      不小于原图或超过 1280；叠加参数优先于 `format`，两者都优先于尺寸提示。
+- [x] 客户端名清洗与限长单测覆盖：`X-Emby-Client` 优先于 UA、`Authorization` 的 `Client=`/`Device=`、
+      UA 产品名回退、超长截断到 32、控制字符剥离、含 token 的 UA 只保留产品名、纯符号/非 ASCII 名称
+      回退而不是记空串或原串。
+- [x] `quality` 被解析且大小写不敏感，非数字/空/负数忽略，不改变选档。
+- [x] 集成测试：开启变体后带 `maxWidth=300` 且把 `api_key` 放进查询串的 Emby 请求输出
+      `outcome=variant`、`variant_width=720`、`client=Infuse`、`auth_mode=principal`，
+      `format=png` 请求输出 `reason=non_jpeg_format`，捕获文本不含 access token 与 `api_key`。
+- [x] principal、tagged（无登录）、Filmly 兼容三条分支各记录一条；媒体库封面/人物头像按
+      `variant_unavailable` 记录（这两条路径本就不查缓存）。
+- [x] 响应字节、状态码、头与实施前一致：既有 `--test images image_variants::` 用例全部通过。
+- [x] 未新增依赖、migration、配置项；未改 Web。
+
+实施结果（2026-11-04，本机 `uname -m` = `arm64`，macOS 26.5）：按 TDD 分五次提交——纯选档/回退函数与
+单测、诊断字段构造与单测、两条路由接入并让 `serve_image`/`serve_tagged_image` 返回 `ServedImage`、
+日志捕获集成测试、集成测试在并行测试下的稳定性修复。`serve_image` 参数数量保持 7 个、
+`serve_tagged_image` 仍为 6 个，除 `ServedImage` 外没有新增服务或状态。集成测试把捕获订阅者装成
+进程默认（`tracing` 的 callsite 兴趣是进程级缓存，线程内订阅者会被并行测试先触发的同一条 callsite
+静音），断言只认本测试独有的 `client=Infuse` 标签，因此不会误读其他用例的请求。`docs/TEST-TARGETS.md`
+的 `image_variants` 模块（16 → 17）、`--test images` 组（62 → 63）与两处合计（911 → 912、1025 → 1026）
+按当前 `--list` 同步。
+
+验证命令与结果（本机 `uname -m` = `arm64`；未在 NAS/x86_64 上验证）：
+
+- `cargo build --locked` 通过。
+- `cargo test --locked --lib application::image_variants` 25/25 通过（含 3 条新的选档/回退用例）。
+- `cargo test --locked --lib emby_image_diag` 8/8 通过（客户端名清洗/限长、恶意输入、auth_mode、
+  结构化字段与捕获日志）。
+- `cargo test --locked --lib emby_image_display_query` 6/6 通过（含 `quality` 解析与 `variant_intent`）。
+- `cargo test --locked --test images image_variants::` 17/17 通过；并行跑 3 次结果一致。
+- `cargo test --locked --test emby` 39/39 通过（Emby 兼容层回归）。
+- `cargo fmt --all -- --check` 通过；`git diff --check` 通过。
+- `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过（无新增 lint 抑制）。
+
+限制与剩余风险：日志是 INFO 级，默认 `luxd=info` 过滤下会为每张 Emby 图片写一行，浏览大库时日志量
+随图片请求数增长（管理员可用 `RUST_LOG`/导出过滤），这是“默认可诊断”的取舍；客户端名是启发式清洗，
+只能保证不泄露、不可注入，不能保证与客户端显示名一致；`auth_mode=tag` 的请求若没有 tag 会直接 401、
+不产生该日志；日志无法区分冷缓存首次回退（记为 `variant_unavailable`）与开关关闭，需要结合设置判断；
+未在真实第三方 Emby 客户端上实测，只用 HTTP 回归覆盖请求形状。
+
 ## 31. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

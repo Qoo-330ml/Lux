@@ -79,6 +79,8 @@ PostgreSQL 需要在引导前准备好数据库、用户和网络访问权限，
 管理员可以在“任务与日志 → 系统日志”选择 UTC 起止日期并直接下载日志；选择单日会下载原始 `.log` 文件，跨日会下载 ZIP。也可以在宿主机使用
 `docker compose logs --no-color --timestamps --since 1h lux` 查看容器 stdout。日志文件和导出内容可能包含媒体相对路径及请求诊断信息，不要公开发布；不要把 `/config` 整目录、Cookie、配置凭据或数据库文件作为日志附件发送。
 
+第三方 Emby 客户端（Infuse、Emby 官方、Hills、Filmly、Fileball 等）是否发送尺寸参数、图片是否命中变体缓存，可以只看图片诊断这一组日志：`docker compose logs --no-color --since 1h lux 2>&1 | grep emby_image_diag`。每张成功返回的 Emby 图片一行，命中缓存时是 `outcome=variant` 加 `variant_width`，回退原图时是 `outcome=original` 加 `reason`；这些字段已脱敏（不含 token、URL、查询串、Cookie、IP 和条目 ID），客户端/设备名只保留截断后的产品名。
+
 ### SQLite 写入耐久性（LUX_SQLITE_SYNCHRONOUS）
 
 内置 SQLite 使用 WAL。每条池连接在建立时统一设置 `synchronous`，可以用部署环境变量在 `FULL` 与
