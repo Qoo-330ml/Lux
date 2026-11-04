@@ -3,7 +3,11 @@
 //! These tests exercise the real `AppState`, a temporary config directory and a
 //! real JPEG poster so the generation path is covered end to end.
 
-use std::time::Duration;
+use std::{
+    io::{self, Write},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use image::{Rgb, RgbImage};
 use luxd::{
@@ -873,5 +877,138 @@ async fn emby_variant_hints_keep_the_authorization_order() -> Result<(), Box<dyn
 
     // The rejected requests never reach the variant cache.
     assert!(!harness.config_dir.join("image-cache").exists());
+    Ok(())
+}
+
+struct CapturedDiagnosticLogWriterFactory(Arc<Mutex<Vec<u8>>>);
+
+struct CapturedDiagnosticLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedDiagnosticLogWriterFactory {
+    type Writer = CapturedDiagnosticLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        CapturedDiagnosticLogWriter(Arc::clone(&self.0))
+    }
+}
+
+impl Write for CapturedDiagnosticLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut output = self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("captured diagnostic log buffer is unavailable"))?;
+        output.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// LUX-882: every Emby image request leaves one desensitized diagnostic line naming the variant
+/// decision, and neither the API key in the URL nor the access token reaches the captured logs.
+#[tokio::test(flavor = "current_thread")]
+async fn emby_image_diagnostics_report_the_variant_without_credentials()
+-> Result<(), Box<dyn std::error::Error>> {
+    let captured_logs = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(CapturedDiagnosticLogWriterFactory(Arc::clone(
+            &captured_logs,
+        )))
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    // The dispatcher is thread-local, and a current-thread runtime serves the HTTP route on this
+    // same thread, so the capture stays inside this test instead of affecting its neighbours.
+    let _trace_guard = tracing::dispatcher::set_default(&dispatch);
+
+    let harness = start_harness().await?;
+    harness.enable_server_switch(true).await?;
+    let token = harness
+        .emby_token("admin", "correct password", "image-variant-diag")
+        .await?;
+
+    // Warm the cache first; the very first request may still fall back to the original while the
+    // variant generates in the background.
+    let warmed = harness
+        .emby_variant_response(&harness.item_id, Some(&token), "maxWidth=300")
+        .await?;
+    assert_eq!(
+        warmed.headers()[CACHE_CONTROL],
+        "private, max-age=31536000, immutable"
+    );
+
+    // The diagnosed request authenticates with the API key in the query string and identifies
+    // itself only through X-Emby-Client.
+    let diagnosed = harness
+        .client
+        .get(harness.emby_image_url(&harness.item_id, &format!("maxWidth=300&api_key={token}")))
+        .header("X-Emby-Client", "Infuse")
+        .send()
+        .await?;
+    assert_eq!(diagnosed.status(), StatusCode::OK);
+    let headers = diagnosed.headers().clone();
+    let body = diagnosed.bytes().await?;
+    assert_eq!(headers[CONTENT_TYPE], "image/jpeg");
+    assert_eq!(
+        headers[CACHE_CONTROL],
+        "private, max-age=31536000, immutable"
+    );
+    let etag = headers[ETAG].to_str()?;
+    assert!(etag.ends_with("-w720\""), "unexpected etag {etag}");
+    assert!(body.len() < harness.original_bytes.len());
+
+    // A non-JPEG format keeps the original and must report the reason.
+    let original = harness
+        .emby_fetch(&harness.item_id, Some(&token), "format=png&maxWidth=300")
+        .await?;
+    assert_eq!(original.status(), StatusCode::OK);
+    assert_eq!(
+        original.bytes().await?.as_ref(),
+        harness.original_bytes.as_slice()
+    );
+
+    let logs = String::from_utf8(
+        captured_logs
+            .lock()
+            .map_err(|_| "captured diagnostic log buffer is poisoned")?
+            .clone(),
+    )?;
+    let diagnostic_lines: Vec<&str> = logs
+        .lines()
+        .filter(|line| line.contains("\"target\":\"luxd::emby_image_diag\""))
+        .collect();
+    assert!(
+        !diagnostic_lines.is_empty(),
+        "no emby_image_diag line in {logs}"
+    );
+    let variant_line = diagnostic_lines
+        .iter()
+        .rev()
+        .find(|line| line.contains("\"outcome\":\"variant\""))
+        .ok_or("no variant outcome in the diagnostic lines")?;
+    assert!(variant_line.contains("\"variant_width\":720"));
+    assert!(variant_line.contains("\"client\":\"Infuse\""));
+    assert!(variant_line.contains("\"auth_mode\":\"principal\""));
+    assert!(variant_line.contains("\"image_type\":\"POSTER\""));
+    assert!(variant_line.contains("\"has_tag\":false"));
+    assert!(variant_line.contains("\"max_width\":300"));
+    assert!(
+        diagnostic_lines
+            .iter()
+            .any(|line| line.contains("\"reason\":\"non_jpeg_format\""))
+    );
+    // The API key in the URL, the tag path and the access token never reach the log.
+    assert!(
+        !logs.contains(&token),
+        "the access token leaked into {logs}"
+    );
+    assert!(
+        !logs.contains("api_key"),
+        "the query string leaked into {logs}"
+    );
     Ok(())
 }
