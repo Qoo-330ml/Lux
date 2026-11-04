@@ -16,7 +16,11 @@ use luxd::{
 use reqwest::header::COOKIE;
 use serde_json::{Value, json};
 use sha2::Digest;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    io::{self, Write},
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tokio::net::TcpListener;
 
 type HmacSha256 = Hmac<sha2::Sha256>;
@@ -488,6 +492,260 @@ async fn failed_web_logins_are_indexed_only_for_known_users_and_not_rate_limited
     assert!(!audit_json.contains("disabled password"));
     assert!(!audit_json.contains("failure-known"));
     assert!(!audit_json.contains("failure-disabled"));
+
+    server.abort();
+    Ok(())
+}
+
+/// Captures `WARN` JSON events for the test thread.
+///
+/// The in-process server is spawned on this test's current-thread runtime, so a thread-local
+/// dispatcher sees the handler's events without installing a process-wide subscriber that the
+/// other tests in this binary would share.
+fn capture_failed_login_events() -> (Arc<Mutex<Vec<u8>>>, tracing::dispatcher::DefaultGuard) {
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(FailedLoginLogWriter(Arc::clone(&buffer)))
+        .finish();
+    let guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+    (buffer, guard)
+}
+
+struct FailedLoginLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FailedLoginLogWriter {
+    type Writer = FailedLoginLogSink;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        FailedLoginLogSink(Arc::clone(&self.0))
+    }
+}
+
+struct FailedLoginLogSink(Arc<Mutex<Vec<u8>>>);
+
+impl Write for FailedLoginLogSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut output = self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("captured login log buffer is unavailable"))?;
+        output.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn failed_login_log_events(
+    buffer: &Arc<Mutex<Vec<u8>>>,
+) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
+    let logs = buffer
+        .lock()
+        .map_err(|_| "captured login log buffer is unavailable")?
+        .clone();
+    Ok(String::from_utf8(logs)?
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["fields"]["errorCode"] == "AUTH_LOGIN_FAILED")
+        .collect())
+}
+
+#[tokio::test]
+async fn unknown_usernames_emit_the_failed_login_event_without_changing_the_response()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("event-known", "Event Known", "correct password")
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    // The access-IP resolver needs the connection peer, which only the connect-info service
+    // attaches; without it the event legitimately has no `remoteIp`.
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let (buffer, _capture) = capture_failed_login_events();
+
+    let unknown = client
+        .post(format!("http://{address}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "event-missing",
+            "password": "missing password",
+        }))
+        .send()
+        .await?;
+    assert_eq!(unknown.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let unknown_body = unknown.json::<Value>().await?;
+
+    let known = client
+        .post(format!("http://{address}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "event-known",
+            "password": "wrong password",
+        }))
+        .send()
+        .await?;
+    assert_eq!(known.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let known_body = known.json::<Value>().await?;
+
+    // An unknown username must not be distinguishable from a wrong password.
+    assert_eq!(unknown_body["error"]["code"], known_body["error"]["code"]);
+    assert_eq!(
+        unknown_body["error"]["message"],
+        known_body["error"]["message"]
+    );
+    assert_eq!(unknown_body["error"]["code"], "INVALID_CREDENTIALS");
+
+    // One event per attempt: the unknown username emits it too, and the storage side of the
+    // known-user attempt does not repeat it.
+    let events = failed_login_log_events(&buffer)?;
+    assert_eq!(
+        events.len(),
+        2,
+        "each failed login must emit exactly one AUTH_LOGIN_FAILED event: {events:?}"
+    );
+    assert!(events.iter().all(|event| {
+        event["level"] == "WARN"
+            && event["fields"]["errorCode"] == "AUTH_LOGIN_FAILED"
+            && event["fields"]["remoteIp"] == "127.0.0.1"
+            && event["fields"]["message"] == "authentication failed"
+    }));
+    let logs = String::from_utf8(
+        buffer
+            .lock()
+            .map_err(|_| "captured login log buffer is unavailable")?
+            .clone(),
+    )?;
+    for secret in [
+        "event-missing",
+        "event-known",
+        "missing password",
+        "wrong password",
+    ] {
+        assert!(
+            !logs.contains(secret),
+            "the login event must not log {secret}: {logs}"
+        );
+    }
+
+    // The index row still exists only for the account that exists.
+    let indexed: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_activity_events WHERE event_type = 'AUTH_LOGIN_FAILED'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(indexed, 1);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn migration_authentication_errors_log_the_failure_without_indexing_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let user = setup
+        .complete("migration-failure", "Migration Failure", "correct password")
+        .await?;
+    // A pending migration binding whose secret file does not exist makes
+    // `authenticate_pending_user` fail with an IO error. The response stays 401
+    // INVALID_CREDENTIALS, but the failed login must still be visible to log tools
+    // instead of disappearing for as long as the migration backend is broken.
+    sqlx::query(
+        "INSERT INTO emby_migration_user_bindings (
+             lux_user_id, source_base_url, secret_ref, emby_user_id,
+             emby_username, password_pending
+         ) VALUES (?, 'https://emby.example', 'missing-secret.json', 'emby-user-1', ?, 1)",
+    )
+    .bind(user.id.to_string())
+    .bind("migration-failure")
+    .execute(database.pool())
+    .await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let (buffer, _capture) = capture_failed_login_events();
+
+    let response = client
+        .post(format!("http://{address}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "migration-failure",
+            "password": "wrong migration password",
+        }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let body = response.json::<Value>().await?;
+    assert_eq!(body["error"]["code"], "INVALID_CREDENTIALS");
+
+    let events = failed_login_log_events(&buffer)?;
+    assert_eq!(
+        events.len(),
+        1,
+        "a migration-backend failure must still emit exactly one failed login event"
+    );
+    assert_eq!(events[0]["level"], "WARN");
+    assert_eq!(events[0]["fields"]["errorCode"], "AUTH_LOGIN_FAILED");
+    assert_eq!(events[0]["fields"]["remoteIp"], "127.0.0.1");
+    let logs = String::from_utf8(
+        buffer
+            .lock()
+            .map_err(|_| "captured login log buffer is unavailable")?
+            .clone(),
+    )?;
+    assert!(!logs.contains("migration-failure"));
+    assert!(!logs.contains("wrong migration password"));
+
+    // The storage side stays gated: a server-side migration failure must not masquerade as the
+    // user's credential error in the activity index.
+    let indexed: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_activity_events WHERE event_type = 'AUTH_LOGIN_FAILED'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(indexed, 0);
 
     server.abort();
     Ok(())

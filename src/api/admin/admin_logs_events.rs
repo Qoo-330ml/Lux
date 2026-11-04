@@ -186,6 +186,33 @@ pub(crate) async fn record_activity_event(
     }
 }
 
+/// Emits the §18.3 failed-login event that Fail2Ban-style log tools parse.
+///
+/// The message and the field set are deliberately fixed: no username, credential, cookie,
+/// client-supplied device label, complete URL or query string may reach the log. The address is
+/// whatever the access-IP resolver produced at the call site; an unresolved address leaves the
+/// `remoteIp` field out entirely instead of logging a placeholder.
+///
+/// This touches no storage, so callers emit it for every failed attempt - including an unknown
+/// username or user id, which is exactly the credential-guessing case the ban list exists for -
+/// before they decide whether an account exists. It is separate from
+/// [`record_failed_authentication_event`] so one failure never produces two log lines.
+pub(crate) fn log_authentication_failure(remote_ip: Option<&str>) {
+    match remote_ip {
+        Some(remote_ip) => tracing::warn!(
+            "errorCode" = "AUTH_LOGIN_FAILED",
+            "remoteIp" = remote_ip,
+            "authentication failed"
+        ),
+        None => tracing::warn!("errorCode" = "AUTH_LOGIN_FAILED", "authentication failed"),
+    }
+}
+
+/// Records the storage side of a failed login for an account that actually exists.
+///
+/// The parseable log event is emitted by the call sites through [`log_authentication_failure`];
+/// this function owns only the activity index row, the audit record and the dashboard
+/// notification, so an unavailable database cannot silence the log event.
 pub(crate) async fn record_failed_authentication_event(
     database: Option<&Database>,
     admin_events: &AdminEventHub,
@@ -679,6 +706,165 @@ mod failed_authentication_activity_tests {
             receiver.try_recv(),
             Ok(AdminEventScope::Dashboard)
         ));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod failed_authentication_log_event_tests {
+    use std::{
+        error::Error,
+        io::{self, Write},
+        sync::{Arc, Mutex},
+    };
+
+    use serde_json::Value;
+
+    use super::*;
+
+    use crate::{
+        application::{admin_events::AdminEventHub, setup::SetupService},
+        config::Config,
+        storage::Database,
+    };
+
+    /// The smallest in-memory sink that lets a test read what `tracing` actually emitted.
+    #[derive(Clone)]
+    struct CapturedTraceWriterFactory(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedTraceWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedTraceWriterFactory {
+        type Writer = CapturedTraceWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedTraceWriter(Arc::clone(&self.0))
+        }
+    }
+
+    impl Write for CapturedTraceWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut output = self
+                .0
+                .lock()
+                .map_err(|_| io::Error::other("captured trace buffer is unavailable"))?;
+            output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Captures `WARN`-level JSON events for the current thread into `buffer`.
+    ///
+    /// The returned guard must stay alive until the code under test ran; dropping it restores the
+    /// thread's previous dispatcher.
+    fn capture_warn_json(buffer: &Arc<Mutex<Vec<u8>>>) -> tracing::dispatcher::DefaultGuard {
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(CapturedTraceWriterFactory(Arc::clone(buffer)))
+            .finish();
+        tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber))
+    }
+
+    fn captured_json_events(buffer: &Arc<Mutex<Vec<u8>>>) -> Result<Vec<Value>, Box<dyn Error>> {
+        let logs = buffer
+            .lock()
+            .map_err(|_| "captured trace buffer is unavailable")?
+            .clone();
+        Ok(String::from_utf8(logs)?
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .collect())
+    }
+
+    fn login_failure_event(events: &[Value]) -> Result<Value, Box<dyn Error>> {
+        events
+            .iter()
+            .find(|event| event["fields"]["errorCode"] == "AUTH_LOGIN_FAILED")
+            .cloned()
+            .ok_or_else(|| "a failed login must emit an AUTH_LOGIN_FAILED log event".into())
+    }
+
+    #[test]
+    fn authentication_failure_event_carries_the_stable_code_and_remote_ip()
+    -> Result<(), Box<dyn Error>> {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let _capture = capture_warn_json(&buffer);
+
+        log_authentication_failure(Some("203.0.113.9"));
+
+        let event = login_failure_event(&captured_json_events(&buffer)?)?;
+        assert_eq!(event["level"], "WARN");
+        let fields = &event["fields"];
+        assert_eq!(fields["errorCode"], "AUTH_LOGIN_FAILED");
+        assert_eq!(fields["remoteIp"], "203.0.113.9");
+        assert_eq!(fields["message"], "authentication failed");
+        Ok(())
+    }
+
+    #[test]
+    fn authentication_failure_event_omits_an_unknown_remote_ip() -> Result<(), Box<dyn Error>> {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let _capture = capture_warn_json(&buffer);
+
+        log_authentication_failure(None);
+
+        let event = login_failure_event(&captured_json_events(&buffer)?)?;
+        assert_eq!(event["level"], "WARN");
+        assert_eq!(event["fields"]["errorCode"], "AUTH_LOGIN_FAILED");
+        assert_eq!(event["fields"]["message"], "authentication failed");
+        // Documented choice: an unresolved address drops the field entirely instead of logging
+        // `remoteIp: null`, so downstream parsers never see a non-address value.
+        assert!(
+            event["fields"].get("remoteIp").is_none(),
+            "an unknown address must not produce a remoteIp field: {event}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recording_the_storage_side_emits_no_log_event() -> Result<(), Box<dyn Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let user = setup
+            .complete("log-failure", "Failure", "private password")
+            .await?;
+        let user_id = user.id.to_string();
+        let hub = AdminEventHub::new();
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let _capture = capture_warn_json(&buffer);
+
+        record_failed_authentication_event(
+            Some(&database),
+            &hub,
+            &user_id,
+            "LUX_WEB_CLIENT_MARKER",
+            Some("203.0.113.9".to_owned()),
+        )
+        .await;
+
+        // The caller already emits the one §18.3 event through
+        // `log_authentication_failure`; recording the row must not repeat it, and must not leak
+        // the client label or the internal user id either.
+        let captured = String::from_utf8(
+            buffer
+                .lock()
+                .map_err(|_| "captured trace buffer is unavailable")?
+                .clone(),
+        )?;
+        assert!(
+            captured.is_empty(),
+            "the storage side must not log the login failure again: {captured}"
+        );
         Ok(())
     }
 }
