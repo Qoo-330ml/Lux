@@ -19557,6 +19557,10 @@ Emby 用例放在既有 `image_variants` 模块（`--test images image_variants:
   `image_writer::manual_scraper_image_selection_claims_one_attempt_for_the_same_image`。该用例在
   `docs/TEST-TARGETS.md` 已记录为“两个并发任务需落在同一 40 ms 窗口、高负载下退化成串行”的时序敏感
   用例；单独重跑该用例 1/1 通过，与本任务无关。
+- 变异验证：临时把两条 Emby 图片路由的 `variant_request` 固定为 `ImageVariantRequest::Original`
+  后，`emby_max_width_serves_the_cached_variant`、`emby_size_hint_aliases_and_jpeg_formats_hit_the_cache`
+  与 `emby_tagged_image_hits_the_cached_variant` 三条断言失败，另外三条“保持原图/鉴权不变”用例仍通过；
+  恢复实现后 `--test images image_variants::` 15/15 通过，说明新用例不是空转。
 - `cargo fmt --all -- --check` 通过；`git diff --check` 通过。
 - `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过，本次运行没有告警输出
   （当前基线上 LUX-826/LUX-880 记录的既有 `too_many_arguments`、`type_complexity` 等诊断在并行改动
