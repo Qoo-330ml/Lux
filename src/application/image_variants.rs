@@ -553,6 +553,58 @@ fn is_supported_image_type(image_type: &str) -> bool {
     matches!(image_type, "POSTER" | "THUMB" | "FANART")
 }
 
+/// Chooses the cached variant width for a client that scales the artwork into a
+/// `maxWidth` × `maxHeight` box, as Emby clients do.
+///
+/// The client keeps the aspect ratio, so the scale factor is the tighter of the two hints and
+/// the long edge it ends up needing is `source_long_edge × scale`. The result is the smallest
+/// tier whose long edge still covers that size (a tier never upscales: a client asking for a
+/// long edge at or above `max(source_width, source_height)` gets the original). `None` means
+/// "serve the original": no usable hint, an unknown source size, or a needed long edge above
+/// the largest tier.
+pub(crate) fn variant_width_for_display_size(
+    requested_width: Option<u32>,
+    requested_height: Option<u32>,
+    source_width: u32,
+    source_height: u32,
+) -> Option<u32> {
+    if source_width == 0 || source_height == 0 {
+        return None;
+    }
+    let source_long_edge = u64::from(source_width.max(source_height));
+    let by_width = requested_width
+        .filter(|requested| *requested > 0)
+        .map(|requested| scaled_long_edge(requested, source_long_edge, source_width));
+    let by_height = requested_height
+        .filter(|requested| *requested > 0)
+        .map(|requested| scaled_long_edge(requested, source_long_edge, source_height));
+    let needed = match (by_width, by_height) {
+        // Both hints describe the same box, so the smaller needed long edge is the one the
+        // client actually renders.
+        (Some(by_width), Some(by_height)) => by_width.min(by_height),
+        (Some(needed), None) | (None, Some(needed)) => needed,
+        (None, None) => return None,
+    };
+    if needed >= source_long_edge {
+        return None;
+    }
+    if needed > u64::from(*IMAGE_VARIANT_WIDTHS.last()?) {
+        return None;
+    }
+    IMAGE_VARIANT_WIDTHS
+        .into_iter()
+        .find(|width| u64::from(*width) >= needed)
+        .filter(|width| u64::from(*width) < source_long_edge)
+}
+
+/// Long edge the client renders after scaling `requested` onto `source_edge`, rounded up so a
+/// hint one pixel below a tier boundary still reaches that tier.
+fn scaled_long_edge(requested: u32, source_long_edge: u64, source_edge: u32) -> u64 {
+    source_long_edge
+        .saturating_mul(u64::from(requested))
+        .div_ceil(u64::from(source_edge))
+}
+
 fn valid_content_tag(value: &str) -> Option<String> {
     (value.len() == 64
         && value
@@ -725,6 +777,92 @@ mod tests {
             width: Some(i64::from(width)),
             height: Some(i64::from(height)),
         }
+    }
+
+    #[test]
+    fn display_box_selects_the_smallest_covering_tier() {
+        // A 2:3 poster asking for a 300 px wide thumbnail needs a 450 px long edge.
+        assert_eq!(
+            variant_width_for_display_size(Some(300), None, 1000, 1500),
+            Some(720)
+        );
+        // 16:9 fanart constrained by height: 1920 × 200 / 1080 ≈ 355.6 px → next tier 360.
+        assert_eq!(
+            variant_width_for_display_size(None, Some(200), 1920, 1080),
+            Some(360)
+        );
+        // Both hints describe one box, so the tighter one wins: a 1600×2400 poster in an
+        // 800×400 box needs a 1200 px long edge by width and 400 px by height; the client only
+        // ever sees the 400 px height, so the 720 tier is enough.
+        assert_eq!(
+            variant_width_for_display_size(Some(800), Some(400), 1600, 2400),
+            Some(720)
+        );
+    }
+
+    #[test]
+    fn display_box_scales_the_long_edge_from_either_hint() {
+        // 1600×2400 at 800 px wide → 1200 px long edge → 1280.
+        assert_eq!(
+            variant_width_for_display_size(Some(800), None, 1600, 2400),
+            Some(1280)
+        );
+        // 1600×2400 at 300 px high → 300 px long edge → 360.
+        assert_eq!(
+            variant_width_for_display_size(None, Some(300), 1600, 2400),
+            Some(360)
+        );
+        // Ceiling rounding: 1500 × 299 / 1000 = 448.5 → 449 px → 720.
+        assert_eq!(
+            variant_width_for_display_size(Some(299), None, 1000, 1500),
+            Some(720)
+        );
+        // An exact tier boundary stays on that tier.
+        assert_eq!(
+            variant_width_for_display_size(Some(240), None, 1000, 1500),
+            Some(360)
+        );
+    }
+
+    #[test]
+    fn display_box_above_the_largest_tier_or_already_covered_keeps_the_original() {
+        // 1000 px wide on a 2:3 poster needs a 1500 px long edge, above 1280.
+        assert_eq!(
+            variant_width_for_display_size(Some(1000), None, 4000, 6000),
+            None
+        );
+        // The original is already smaller than the smallest tier.
+        assert_eq!(
+            variant_width_for_display_size(Some(300), None, 300, 200),
+            None
+        );
+        // Asking for the original size must not upsample into a tier.
+        assert_eq!(
+            variant_width_for_display_size(Some(1000), None, 1000, 1500),
+            None
+        );
+        // The covering tier is larger than the original, so no variant is smaller.
+        assert_eq!(
+            variant_width_for_display_size(Some(250), None, 400, 600),
+            None
+        );
+    }
+
+    #[test]
+    fn display_box_without_usable_hints_or_source_size_keeps_the_original() {
+        assert_eq!(variant_width_for_display_size(None, None, 1600, 2400), None);
+        assert_eq!(
+            variant_width_for_display_size(Some(0), Some(0), 1600, 2400),
+            None
+        );
+        assert_eq!(
+            variant_width_for_display_size(Some(300), None, 0, 1500),
+            None
+        );
+        assert_eq!(
+            variant_width_for_display_size(None, Some(300), 1600, 0),
+            None
+        );
     }
 
     #[test]
