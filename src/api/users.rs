@@ -999,23 +999,26 @@ pub(super) async fn auth_login(
     }
     let Some(session) = session else {
         state.login_rate_limiter.record_failure(&login_key).await;
-        if !migration_auth_failed {
-            // §18.3: every failed credential check emits the parseable event, including an
-            // unknown username - guessing usernames is exactly what the ban list is for. The
-            // resolver result is reused for the storage record below; an unknown username simply
-            // has no account to index, which must not change the response.
-            let failed_login_remote_ip = request_client_ip(&headers, &state).await;
-            log_authentication_failure(failed_login_remote_ip.as_deref());
-            if let Ok(Some(user_id)) = auth.find_user_id_by_username(&request.username).await {
-                record_failed_authentication_event(
-                    Some(state.database()),
-                    &state.admin_events,
-                    &user_id,
-                    "LUX_WEB",
-                    failed_login_remote_ip,
-                )
-                .await;
-            }
+        // §18.3: every failed credential check emits the parseable event, including an unknown
+        // username - guessing usernames is exactly what the ban list is for. This also covers a
+        // failed migration-backend call: the response below is already 401 INVALID_CREDENTIALS,
+        // and a broken migration path must not hide brute-force attempts while it stays broken.
+        // The resolver result is computed once and reused for the storage record below.
+        let failed_login_remote_ip = request_client_ip(&headers, &state).await;
+        log_authentication_failure(failed_login_remote_ip.as_deref());
+        // The storage side stays gated on the migration outcome: a server-side fault must not be
+        // recorded as the user's credential error in the admin activity index.
+        if !migration_auth_failed
+            && let Ok(Some(user_id)) = auth.find_user_id_by_username(&request.username).await
+        {
+            record_failed_authentication_event(
+                Some(state.database()),
+                &state.admin_events,
+                &user_id,
+                "LUX_WEB",
+                failed_login_remote_ip,
+            )
+            .await;
         }
         return api_error(
             &headers,
