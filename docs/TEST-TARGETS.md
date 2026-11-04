@@ -15,14 +15,14 @@
 | `--test scanner` | 媒体库扫描、增量/混合扫描、计划任务、作业事件与关停 | 7 | 151 |
 | `--test library` | 媒体库生命周期、合并/拆分、集合、目录与系列 API | 12 | 50 |
 | `--test metadata` | 元数据抓取与选择、NFO 回写、扫描后剧集元数据、人物、字幕 | 14 | 143 |
-| `--test images` | 图片变体、写回、缩略图与图片 API | 6 | 63 |
+| `--test images` | 图片变体、写回、缩略图与图片 API | 6 | 65 |
 | `--test playback` | 播放、播放令牌/历史/续播、观看状态归档、章节与片头片尾检测 | 10 | 35 |
 | `--test storage` | SQLite/PostgreSQL 存储、迁移、WAL、数据库维护与启动守卫 | 9 | 116 |
 | `--test plugins` | 插件协议与运行时、弹幕、IP 属地、媒体信息插件配置 | 11 | 120 |
 | `--test strm` | STRM 目标解析/探测/播放与 ffprobe | 9 | 42 |
-| 合计（12 组） |  | 126 | 912 |
+| 合计（12 组） |  | 126 | 914 |
 
-另有 7 个 binary 因为进程级共享状态或外部服务依赖保持独立，见第 4 节：`--test background_work_budget`、`--test image_variants_perf`、`--test performance`、`--test postgres_database`、`--test reidentify`、`--test scanned_metadata`、`--test shutdown`。合计 12 + 7 = 19 个集成测试 target。
+另有 8 个 binary 因为进程级共享状态或外部服务依赖保持独立，见第 4 节：`--test background_work_budget`、`--test filmly_image_diag`、`--test image_variants_perf`、`--test performance`、`--test postgres_database`、`--test reidentify`、`--test scanned_metadata`、`--test shutdown`。合计 12 + 8 = 20 个集成测试 target。
 
 ## 2. 旧 target 名 → 新命令
 
@@ -121,7 +121,7 @@ cargo test --locked --test <新 target> <旧名>::
 | `series_metadata` | 3 | `cargo test --locked --test metadata series_metadata::` |
 | `subtitles` | 1 | `cargo test --locked --test metadata subtitles::` |
 | `image_api` | 1 | `cargo test --locked --test images image_api::` |
-| `image_variants` | 17 | `cargo test --locked --test images image_variants::` |
+| `image_variants` | 19 | `cargo test --locked --test images image_variants::` |
 | `image_writer` | 20 | `cargo test --locked --test images image_writer::` |
 | `images` | 3 | `cargo test --locked --test images images::` |
 | `thumbnails` | 19 | `cargo test --locked --test images thumbnails::` |
@@ -172,7 +172,8 @@ cargo test --locked --test <新 target> <旧名>::
 | `reidentify` | 25 | `cargo test --locked --test reidentify`（本来就没有合并） |
 | `scanned_metadata` | 23 | `cargo test --locked --test scanned_metadata`（本来就没有合并） |
 | `shutdown` | 2 | `cargo test --locked --test shutdown`（本来就没有合并） |
-| **合计** | **1026** |  |
+| `filmly_image_diag` | 1 | `cargo test --locked --test filmly_image_diag`（本来就没有合并） |
+| **合计** | **1029** |  |
 
 ## 3. 只跑某一个原文件的测试
 
@@ -196,6 +197,7 @@ cargo test --locked --test scanner
 | target | 原因 |
 |---|---|
 | `--test background_work_budget` | 调用 `env::set_var`/`remove_var` 修改进程级环境变量，与同 binary 的其他测试并行运行会互相污染，必须独占一个进程。 |
+| `--test filmly_image_diag` | `AppState::ready` 在构造时读取进程级 `LUX_FILMLY_IMAGE_MODE`；用例需要开启 Filmly 兼容模式，因此独占一个只含该用例的进程，避免在并行测试里改动环境变量。 |
 | `--test image_variants_perf` | 读取 `LUX_PERF_IMAGE_DIR` 指向的外部图片目录，属于需要外部素材的性能测试。 |
 | `--test performance` | 安装全局 tracing subscriber（`set_global_default`）并读取 `LUX_PERF_*` 环境变量，进程级全局状态不可共享；同时是基准脚本的入口（`scripts/run-performance.sh`）。 |
 | `--test postgres_database` | 需要本机 PostgreSQL 实例，其用例默认 `#[ignore]`。 |

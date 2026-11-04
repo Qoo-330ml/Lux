@@ -19644,9 +19644,22 @@ I/O。
 日志捕获集成测试、集成测试在并行测试下的稳定性修复。`serve_image` 参数数量保持 7 个、
 `serve_tagged_image` 仍为 6 个，除 `ServedImage` 外没有新增服务或状态。集成测试把捕获订阅者装成
 进程默认（`tracing` 的 callsite 兴趣是进程级缓存，线程内订阅者会被并行测试先触发的同一条 callsite
-静音），断言只认本测试独有的 `client=Infuse` 标签，因此不会误读其他用例的请求。`docs/TEST-TARGETS.md`
+静音），断言只认本测试独有的 `client` 标签，因此不会误读其他用例的请求。`docs/TEST-TARGETS.md`
 的 `image_variants` 模块（16 → 17）、`--test images` 组（62 → 63）与两处合计（911 → 912、1025 → 1026）
 按当前 `--list` 同步。
+
+返工（2026-11-04，审查提出的 P2）：库封面、人物头像、Filmly 兼容三条分支此前无条件 `record`，而
+这些 `serve_*` 会返回 404/403/503，于是“没有解析到图片”的请求也被记成 `outcome=original
+reason=variant_unavailable`，与上面的约定和 `ServedImage` 注释矛盾。改为按响应状态门控：新增纯函数
+`response_carries_image`（2xx 或 304 才算真的送出了图片）与 `ServedImage::uncached`，两条路由的三条
+分支统一经 `record_served_image` 记录；成功路径（含 304）行为不变，错误响应不再产生该日志。先写失败
+测试再修：`emby_library_cover_errors_do_not_log_a_served_image`（无库权限的封面 404 不记录、管理员
+200 仍记录）、`emby_person_image_errors_do_not_log_a_served_image`（人物索引不可读导致 503 不记录），
+以及独立 binary `--test filmly_image_diag` 的 `filmly_compat_image_errors_do_not_log_a_served_image`
+（Filmly 兼容分支对不存在条目的 404 不记录、对已存在海报的 200 仍记录）。Filmly 兼容模式来自进程级
+env `LUX_FILMLY_IMAGE_MODE`，因此该用例单独成一个只含一条测试的 binary，避免在并行测试进程里改动
+环境变量。重跑计数：`image_variants` 模块 17 → 19、`--test images` 组 63 → 65、独立 binary 7 → 8、
+两处合计 912 → 914、1026 → 1029。
 
 验证命令与结果（本机 `uname -m` = `arm64`；未在 NAS/x86_64 上验证）：
 
@@ -19655,7 +19668,9 @@ I/O。
 - `cargo test --locked --lib emby_image_diag` 8/8 通过（客户端名清洗/限长、恶意输入、auth_mode、
   结构化字段与捕获日志）。
 - `cargo test --locked --lib emby_image_display_query` 6/6 通过（含 `quality` 解析与 `variant_intent`）。
-- `cargo test --locked --test images image_variants::` 17/17 通过；并行跑 3 次结果一致。
+- `cargo test --locked --lib served_image_tests` 1/1 通过（返工新增：只有 2xx/304 才算送出图片）。
+- `cargo test --locked --test images image_variants::` 19/19 通过；并行跑 3 次结果一致。
+- `cargo test --locked --test filmly_image_diag` 1/1 通过（返工新增的独立 binary）。
 - `cargo test --locked --test emby` 39/39 通过（Emby 兼容层回归）。
 - `cargo fmt --all -- --check` 通过；`git diff --check` 通过。
 - `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过（无新增 lint 抑制）。

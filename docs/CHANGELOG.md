@@ -11,7 +11,7 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 ### 新增
 
 - **Emby 图片请求有了脱敏诊断日志**：每成功返回一张 Emby 图片，都会在 `luxd::emby_image_diag` 这个
-  日志 target 下留一行：客户端/设备名（`X-Emby-Client`、`Authorization` 头或 User-Agent 产品名，
+  日志 target 下留一行（鉴权失败、404/5xx 等没有返回图片的请求不产生这一行）：客户端/设备名（`X-Emby-Client`、`Authorization` 头或 User-Agent 产品名，
   截断到 32 字符并过滤字符）、图片类型、鉴权方式（登录 / 图片 tag / Filmly 兼容）、客户端传的
   `maxWidth`/`maxHeight`/`width`/`height`/`quality`/`format` 和叠加参数，以及最终去向：命中哪一档
   变体（`variant_width`），还是回退原图及原因（`no_size_hint`、`non_jpeg_format`、`overlay`、
