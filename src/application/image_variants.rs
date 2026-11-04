@@ -583,6 +583,134 @@ impl ImageVariantRequest {
     }
 }
 
+/// Why an image request has to keep the stored bytes instead of a cached variant.
+///
+/// The variant cache is opaque JPEG without overlays, so the objections a client can raise are
+/// bounded and each one maps to one stable label in the Emby diagnostic log (LUX-882).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OriginalImageReason {
+    /// The client sent no usable size hint.
+    NoSizeHint,
+    /// The client asked for a format the JPEG-only cache cannot carry.
+    NonJpegFormat,
+    /// The client asked for an overlay (played indicator, blur, progress) baked into the image.
+    Overlay,
+    /// The image row carries no usable pixel size, so a display box cannot map onto a tier.
+    SourceSizeUnknown,
+    /// The needed long edge is not smaller than the source or is above the largest tier.
+    NeedsOriginal,
+    /// A tier was picked but the cache could not answer: switched off, unsupported image type,
+    /// generation in flight or cooling down after a failure, or a cache file that disappeared.
+    VariantUnavailable,
+}
+
+impl OriginalImageReason {
+    /// Stable label for the diagnostic log; these names are the documented RUST_LOG contract.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoSizeHint => "no_size_hint",
+            Self::NonJpegFormat => "non_jpeg_format",
+            Self::Overlay => "overlay",
+            Self::SourceSizeUnknown => "source_size_unknown",
+            Self::NeedsOriginal => "needs_original",
+            Self::VariantUnavailable => "variant_unavailable",
+        }
+    }
+}
+
+/// What one image request is served from: a cached tier, or the stored bytes plus the reason.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ImageVariantSelection {
+    Variant(u32),
+    Original(OriginalImageReason),
+}
+
+impl ImageVariantSelection {
+    pub(crate) const fn variant_width(self) -> Option<u32> {
+        match self {
+            Self::Variant(width) => Some(width),
+            Self::Original(_) => None,
+        }
+    }
+
+    pub(crate) const fn original_reason(self) -> Option<OriginalImageReason> {
+        match self {
+            Self::Variant(_) => None,
+            Self::Original(reason) => Some(reason),
+        }
+    }
+
+    pub(crate) const fn is_variant(self) -> bool {
+        matches!(self, Self::Variant(_))
+    }
+}
+
+/// How an image endpoint wants the stored image served, plus the objections an Emby image URL can
+/// raise against the JPEG-only variant cache.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ImageVariantIntent {
+    request: ImageVariantRequest,
+    overlay: bool,
+    non_jpeg_format: bool,
+}
+
+impl ImageVariantIntent {
+    /// Lux Web API request: an exact tier width, or the original when no width was asked for.
+    pub(crate) const fn exact(request: ImageVariantRequest) -> Self {
+        Self {
+            request,
+            overlay: false,
+            non_jpeg_format: false,
+        }
+    }
+
+    /// Emby image URL request: the parsed display box plus the overlay / format objections.
+    pub(crate) const fn display(
+        request: ImageVariantRequest,
+        overlay: bool,
+        non_jpeg_format: bool,
+    ) -> Self {
+        Self {
+            request,
+            overlay,
+            non_jpeg_format,
+        }
+    }
+
+    /// Tier this request can be served from, or the reason it keeps the stored image.
+    ///
+    /// Pure: it depends only on the request shape and the resolved source size, and the precedence
+    /// matches the serving path, so a reported reason always describes the bytes that went out.
+    /// Overlay and non-JPEG formats rule the cache out before the size hints; the display-box form
+    /// then needs a known source size and a needed long edge the tiers cover.
+    pub(crate) fn selection(self, source: Option<(u32, u32)>) -> ImageVariantSelection {
+        if self.overlay {
+            return ImageVariantSelection::Original(OriginalImageReason::Overlay);
+        }
+        if self.non_jpeg_format {
+            return ImageVariantSelection::Original(OriginalImageReason::NonJpegFormat);
+        }
+        match self.request {
+            ImageVariantRequest::Original => {
+                ImageVariantSelection::Original(OriginalImageReason::NoSizeHint)
+            }
+            ImageVariantRequest::Width(width) => ImageVariantSelection::Variant(width),
+            ImageVariantRequest::DisplaySize { .. } => {
+                let Some((source_width, source_height)) = source else {
+                    return ImageVariantSelection::Original(OriginalImageReason::SourceSizeUnknown);
+                };
+                match self
+                    .request
+                    .variant_width(Some((source_width, source_height)))
+                {
+                    Some(width) => ImageVariantSelection::Variant(width),
+                    None => ImageVariantSelection::Original(OriginalImageReason::NeedsOriginal),
+                }
+            }
+        }
+    }
+}
+
 /// Known dimensions of a resolved image as unsigned pixels, or `None` when the image row carries
 /// no usable size.
 pub(crate) fn source_pixel_dimensions(source: &ResolvedImage) -> Option<(u32, u32)> {
@@ -877,6 +1005,127 @@ mod tests {
             }
             .variant_width(None),
             None
+        );
+    }
+
+    #[test]
+    fn variant_intent_reports_why_the_stored_image_is_served() {
+        assert_eq!(
+            ImageVariantIntent::exact(ImageVariantRequest::Original).selection(Some((1600, 2400))),
+            ImageVariantSelection::Original(OriginalImageReason::NoSizeHint)
+        );
+        // The Web API width is exact and does not need the source size.
+        assert_eq!(
+            ImageVariantIntent::exact(ImageVariantRequest::Width(720)).selection(None),
+            ImageVariantSelection::Variant(720)
+        );
+        let display = |width, height| {
+            ImageVariantIntent::display(
+                ImageVariantRequest::DisplaySize { width, height },
+                false,
+                false,
+            )
+        };
+        // A 300 px wide 2:3 poster needs a 450 px long edge, which the 720 tier covers.
+        assert_eq!(
+            display(Some(300), None).selection(Some((1600, 2400))),
+            ImageVariantSelection::Variant(720)
+        );
+        // Without a stored source size a display box cannot be mapped onto a tier.
+        assert_eq!(
+            display(Some(300), None).selection(None),
+            ImageVariantSelection::Original(OriginalImageReason::SourceSizeUnknown)
+        );
+        // A client box whose needed long edge is not smaller than the source keeps it.
+        assert_eq!(
+            display(Some(1600), None).selection(Some((1600, 2400))),
+            ImageVariantSelection::Original(OriginalImageReason::NeedsOriginal)
+        );
+        // A source already smaller than the smallest tier is never upscaled.
+        assert_eq!(
+            display(Some(50), None).selection(Some((80, 120))),
+            ImageVariantSelection::Original(OriginalImageReason::NeedsOriginal)
+        );
+    }
+
+    #[test]
+    fn overlay_and_format_objections_win_over_the_size_hints() {
+        let overlay = ImageVariantIntent::display(
+            ImageVariantRequest::DisplaySize {
+                width: Some(300),
+                height: None,
+            },
+            true,
+            false,
+        );
+        assert_eq!(
+            overlay.selection(Some((1600, 2400))),
+            ImageVariantSelection::Original(OriginalImageReason::Overlay)
+        );
+        let non_jpeg = ImageVariantIntent::display(
+            ImageVariantRequest::DisplaySize {
+                width: Some(300),
+                height: None,
+            },
+            false,
+            true,
+        );
+        assert_eq!(
+            non_jpeg.selection(Some((1600, 2400))),
+            ImageVariantSelection::Original(OriginalImageReason::NonJpegFormat)
+        );
+        // Overlay and format can both be set; the log reports the overlay first.
+        let both = ImageVariantIntent::display(
+            ImageVariantRequest::DisplaySize {
+                width: Some(300),
+                height: None,
+            },
+            true,
+            true,
+        );
+        assert_eq!(
+            both.selection(Some((1600, 2400))),
+            ImageVariantSelection::Original(OriginalImageReason::Overlay)
+        );
+        // The objections also win over the absence of a size hint.
+        assert_eq!(
+            overlay.selection(None),
+            ImageVariantSelection::Original(OriginalImageReason::Overlay)
+        );
+    }
+
+    #[test]
+    fn original_reasons_map_to_stable_log_labels() {
+        let labels = [
+            (OriginalImageReason::NoSizeHint, "no_size_hint"),
+            (OriginalImageReason::NonJpegFormat, "non_jpeg_format"),
+            (OriginalImageReason::Overlay, "overlay"),
+            (
+                OriginalImageReason::SourceSizeUnknown,
+                "source_size_unknown",
+            ),
+            (OriginalImageReason::NeedsOriginal, "needs_original"),
+            (
+                OriginalImageReason::VariantUnavailable,
+                "variant_unavailable",
+            ),
+        ];
+        for (reason, label) in labels {
+            assert_eq!(reason.as_str(), label);
+        }
+        assert_eq!(
+            ImageVariantSelection::Variant(720).variant_width(),
+            Some(720)
+        );
+        assert_eq!(
+            ImageVariantSelection::Original(OriginalImageReason::Overlay).original_reason(),
+            Some(OriginalImageReason::Overlay)
+        );
+        assert!(ImageVariantSelection::Variant(360).is_variant());
+        assert!(
+            !ImageVariantSelection::Variant(360)
+                .original_reason()
+                .is_some()
         );
     }
 
