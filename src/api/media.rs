@@ -2228,9 +2228,6 @@ pub(super) async fn emby_image(
         query.tag.is_some(),
         emby_image_diag::EmbyImageAuthMode::for_request(principal.is_some(), filmly_branch),
     );
-    // Paths that never consult the variant cache still serve artwork; the log reports the stored
-    // original so an administrator can see which request shape took them.
-    let without_cache = ImageVariantSelection::Original(OriginalImageReason::VariantUnavailable);
     if normalize_image_type(&image_type) == Some("POSTER")
         && let Some(response) = serve_emby_library_cover(
             &state,
@@ -2243,8 +2240,7 @@ pub(super) async fn emby_image(
         )
         .await
     {
-        diagnostics.record(without_cache);
-        return response;
+        return record_served_image(&diagnostics, ServedImage::uncached(response));
     }
     if (principal.is_some() || query.tag.is_some())
         && let Some(response) = serve_emby_person_item_image(
@@ -2258,16 +2254,14 @@ pub(super) async fn emby_image(
         )
         .await
     {
-        diagnostics.record(without_cache);
-        return response;
+        return record_served_image(&diagnostics, ServedImage::uncached(response));
     }
     let images = state.images();
     if filmly_branch {
         let response =
             serve_filmly_compat_image(images, &headers, &method, &internal_item_id, &image_type, 0)
                 .await;
-        diagnostics.record(without_cache);
-        return response;
+        return record_served_image(&diagnostics, ServedImage::uncached(response));
     }
     let served = match principal {
         Some(principal) => {
@@ -2303,10 +2297,7 @@ pub(super) async fn emby_image(
             .await
         }
     };
-    if let Some(selection) = served.selection {
-        diagnostics.record(selection);
-    }
-    served.response
+    record_served_image(&diagnostics, served)
 }
 
 pub(super) fn is_filmly_image_request(headers: &HeaderMap) -> bool {
@@ -2370,7 +2361,6 @@ pub(super) async fn emby_image_at_index(
         query.tag.is_some(),
         emby_image_diag::EmbyImageAuthMode::for_request(principal.is_some(), filmly_branch),
     );
-    let without_cache = ImageVariantSelection::Original(OriginalImageReason::VariantUnavailable);
     if normalize_image_type(&image_type) == Some("POSTER")
         && let Some(response) = serve_emby_library_cover(
             &state,
@@ -2383,8 +2373,7 @@ pub(super) async fn emby_image_at_index(
         )
         .await
     {
-        diagnostics.record(without_cache);
-        return response;
+        return record_served_image(&diagnostics, ServedImage::uncached(response));
     }
     if (principal.is_some() || query.tag.is_some())
         && let Some(response) = serve_emby_person_item_image(
@@ -2398,8 +2387,7 @@ pub(super) async fn emby_image_at_index(
         )
         .await
     {
-        diagnostics.record(without_cache);
-        return response;
+        return record_served_image(&diagnostics, ServedImage::uncached(response));
     }
     let images = state.images();
     if filmly_branch {
@@ -2412,8 +2400,7 @@ pub(super) async fn emby_image_at_index(
             image_index,
         )
         .await;
-        diagnostics.record(without_cache);
-        return response;
+        return record_served_image(&diagnostics, ServedImage::uncached(response));
     }
     let served = match principal {
         Some(principal) => {
@@ -2449,10 +2436,7 @@ pub(super) async fn emby_image_at_index(
             .await
         }
     };
-    if let Some(selection) = served.selection {
-        diagnostics.record(selection);
-    }
-    served.response
+    record_served_image(&diagnostics, served)
 }
 
 async fn optional_emby_access_principal(
@@ -3737,7 +3721,27 @@ pub(super) struct ServedImage {
     pub selection: Option<ImageVariantSelection>,
 }
 
+/// Whether a response from a path that never consults the variant cache actually carries an image.
+///
+/// Error answers (401/403/404/5xx) resolved no image at all, so the diagnostic must stay silent;
+/// 2xx and 304 carry the stored bytes or their validator.
+fn response_carries_image(status: StatusCode) -> bool {
+    status.is_success() || status == StatusCode::NOT_MODIFIED
+}
+
 impl ServedImage {
+    /// Response from a path that never consults the variant cache (library cover, person image,
+    /// Filmly compatibility). It reports the stored original only when it really served one.
+    fn uncached(response: Response) -> Self {
+        let selection = response_carries_image(response.status()).then_some(
+            ImageVariantSelection::Original(OriginalImageReason::VariantUnavailable),
+        );
+        Self {
+            response,
+            selection,
+        }
+    }
+
     fn status(response: Response) -> Self {
         Self {
             response,
@@ -3828,6 +3832,17 @@ pub(super) async fn serve_image(
         .await,
         selection: Some(selection),
     }
+}
+
+/// Emits the one diagnostic event for a served image and returns the response untouched.
+fn record_served_image(
+    diagnostics: &emby_image_diag::EmbyImageDiagnostics,
+    served: ServedImage,
+) -> Response {
+    if let Some(selection) = served.selection {
+        diagnostics.record(selection);
+    }
+    served.response
 }
 
 pub(super) struct ServeTaggedImageTarget<'a> {
@@ -4544,6 +4559,28 @@ pub(super) fn lux_catalog_chapter_json(
         "markerType": chapter.marker_type,
         "chapterIndex": chapter.chapter_index,
     })
+}
+
+#[cfg(test)]
+mod served_image_tests {
+    use super::response_carries_image;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn only_responses_that_carry_an_image_report_a_served_original() {
+        for status in [200, 201, 206, 304] {
+            assert!(
+                response_carries_image(StatusCode::from_u16(status).expect("status")),
+                "{status} carries an image"
+            );
+        }
+        for status in [301, 400, 401, 403, 404, 416, 500, 503] {
+            assert!(
+                !response_carries_image(StatusCode::from_u16(status).expect("status")),
+                "{status} resolved no image"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

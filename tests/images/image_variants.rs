@@ -5,7 +5,7 @@
 
 use std::{
     io::{self, Write},
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex, Once},
     time::Duration,
 };
 
@@ -880,19 +880,30 @@ async fn emby_variant_hints_keep_the_authorization_order() -> Result<(), Box<dyn
     Ok(())
 }
 
-struct CapturedDiagnosticLogWriterFactory(Arc<Mutex<Vec<u8>>>);
+/// Target of the Emby image diagnostics; the capture keeps only this target.
+const DIAGNOSTIC_TARGET: &str = "luxd::emby_image_diag";
 
-struct CapturedDiagnosticLogWriter(Arc<Mutex<Vec<u8>>>);
+/// Process-wide capture shared by the diagnostic tests.
+///
+/// `tracing` installs one subscriber per process and caches call-site interest globally, so a
+/// per-test subscriber cannot be scoped to one test: every diagnostic test writes into this buffer
+/// and attributes its own lines through a `client` label that only it sends.
+static DIAGNOSTIC_LOGS: LazyLock<Arc<Mutex<Vec<u8>>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(Vec::new())));
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedDiagnosticLogWriterFactory {
-    type Writer = CapturedDiagnosticLogWriter;
+struct DiagnosticLogWriter;
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for DiagnosticLogWriter {
+    type Writer = DiagnosticLogSink;
 
     fn make_writer(&'a self) -> Self::Writer {
-        CapturedDiagnosticLogWriter(Arc::clone(&self.0))
+        DiagnosticLogSink(Arc::clone(&DIAGNOSTIC_LOGS))
     }
 }
 
-impl Write for CapturedDiagnosticLogWriter {
+struct DiagnosticLogSink(Arc<Mutex<Vec<u8>>>);
+
+impl Write for DiagnosticLogSink {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let mut output = self
             .0
@@ -907,26 +918,51 @@ impl Write for CapturedDiagnosticLogWriter {
     }
 }
 
+/// Installs the process-wide capture once; later calls are no-ops.
+fn install_diagnostic_capture() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                "luxd::emby_image_diag=info",
+            ))
+            .with_writer(DiagnosticLogWriter)
+            .finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    });
+}
+
+fn diagnostic_logs() -> String {
+    String::from_utf8(
+        DIAGNOSTIC_LOGS
+            .lock()
+            .expect("captured diagnostic log buffer")
+            .clone(),
+    )
+    .expect("captured diagnostic logs are UTF-8")
+}
+
+/// Diagnostic lines carrying the given client label; every test uses a label only it sends.
+fn diagnostic_lines_for(client: &str) -> Vec<String> {
+    let needle = format!("\"client\":\"{client}\"");
+    diagnostic_logs()
+        .lines()
+        .filter(|line| line.contains(DIAGNOSTIC_TARGET) && line.contains(&needle))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn diagnostic_line_count(client: &str) -> usize {
+    diagnostic_lines_for(client).len()
+}
+
 /// LUX-882: every Emby image request leaves one desensitized diagnostic line naming the variant
 /// decision, and neither the API key in the URL nor the access token reaches the captured logs.
 #[tokio::test(flavor = "current_thread")]
 async fn emby_image_diagnostics_report_the_variant_without_credentials()
 -> Result<(), Box<dyn std::error::Error>> {
-    let captured_logs = Arc::new(Mutex::new(Vec::new()));
-    let subscriber = tracing_subscriber::fmt()
-        .json()
-        .with_max_level(tracing::Level::INFO)
-        .with_writer(CapturedDiagnosticLogWriterFactory(Arc::clone(
-            &captured_logs,
-        )))
-        .finish();
-    // The capture has to be a process-wide default: `tracing` caches one interest value per call
-    // site for the whole process, so a thread-local dispatcher is silenced whenever a parallel
-    // test fires the same call site first without a subscriber. Assertions below only look at
-    // lines carrying this test's own Infuse client label, so neighbours cannot mask or fake them.
-    tracing::subscriber::set_global_default(subscriber)
-        .map_err(|_| "the image diagnostic test installs the process log subscriber")?;
-
+    install_diagnostic_capture();
     let harness = start_harness().await?;
     harness.enable_server_switch(true).await?;
     let token = harness
@@ -977,28 +1013,16 @@ async fn emby_image_diagnostics_report_the_variant_without_credentials()
         harness.original_bytes.as_slice()
     );
 
-    let logs = String::from_utf8(
-        captured_logs
-            .lock()
-            .map_err(|_| "captured diagnostic log buffer is poisoned")?
-            .clone(),
-    )?;
-    let diagnostic_lines: Vec<&str> = logs
-        .lines()
-        .filter(|line| line.contains("\"target\":\"luxd::emby_image_diag\""))
-        .collect();
+    let diagnostic_lines = diagnostic_lines_for("Infuse");
     assert!(
         !diagnostic_lines.is_empty(),
-        "no emby_image_diag line in {logs}"
+        "no emby_image_diag line in {}",
+        diagnostic_logs()
     );
-    // Only this test sends the Infuse client label, so the assertions stay attributable even if a
-    // neighbour logs its own image requests in the same process.
     let variant_line = diagnostic_lines
         .iter()
         .rev()
-        .find(|line| {
-            line.contains("\"outcome\":\"variant\"") && line.contains("\"client\":\"Infuse\"")
-        })
+        .find(|line| line.contains("\"outcome\":\"variant\""))
         .ok_or("no variant outcome in the diagnostic lines")?;
     assert!(variant_line.contains("\"variant_width\":720"));
     assert!(variant_line.contains("\"client\":\"Infuse\""));
@@ -1007,13 +1031,14 @@ async fn emby_image_diagnostics_report_the_variant_without_credentials()
     assert!(variant_line.contains("\"has_tag\":false"));
     assert!(variant_line.contains("\"max_width\":300"));
     assert!(
-        diagnostic_lines.iter().any(|line| {
-            line.contains("\"reason\":\"non_jpeg_format\"")
-                && line.contains("\"client\":\"Infuse\"")
-        }),
-        "no non_jpeg_format reason in {logs}"
+        diagnostic_lines
+            .iter()
+            .any(|line| line.contains("\"reason\":\"non_jpeg_format\"")),
+        "no non_jpeg_format reason in {:?}",
+        diagnostic_lines
     );
-    // The API key in the URL, the tag path and the access token never reach the log.
+    // The API key in the URL and the access token never reach the log.
+    let logs = diagnostic_logs();
     assert!(
         !logs.contains(&token),
         "the access token leaked into {logs}"
@@ -1021,6 +1046,122 @@ async fn emby_image_diagnostics_report_the_variant_without_credentials()
     assert!(
         !logs.contains("api_key"),
         "the query string leaked into {logs}"
+    );
+    Ok(())
+}
+
+/// LUX-882 review: the library-cover path only reports an original image when it actually served
+/// one. The 404 for a library the caller cannot see must stay silent, while the 200 still logs.
+#[tokio::test]
+async fn emby_library_cover_errors_do_not_log_a_served_image()
+-> Result<(), Box<dyn std::error::Error>> {
+    install_diagnostic_capture();
+    let harness = start_harness().await?;
+    let admin = harness
+        .emby_token("admin", "correct password", "diag-cover-admin")
+        .await?;
+    let viewer = harness
+        .emby_token("viewer", "viewer password", "diag-cover-viewer")
+        .await?;
+    // The viewer keeps no library access, so the cover branch answers 404 instead of an image.
+    sqlx::query("UPDATE users SET library_access_mode = 'SELECTED' WHERE id = ?")
+        .bind(&harness.viewer_id)
+        .execute(harness.database.pool())
+        .await?;
+    let library_id: String = sqlx::query_scalar("SELECT id FROM libraries WHERE name = 'Movies'")
+        .fetch_one(harness.database.pool())
+        .await?;
+    let covers_dir = harness.config_dir.join("library-covers");
+    tokio::fs::create_dir_all(&covers_dir).await?;
+    RgbImage::from_pixel(120, 180, Rgb([12, 34, 56])).save(covers_dir.join("diag-cover.jpg"))?;
+    sqlx::query(
+        "UPDATE libraries
+         SET cover_image_path = ?, cover_image_content_type = 'image/jpeg',
+             cover_image_size = ?, cover_image_tag = 'diag-cover-tag'
+         WHERE id = ?",
+    )
+    .bind("diag-cover.jpg")
+    .bind(1024_i64)
+    .bind(&library_id)
+    .execute(harness.database.pool())
+    .await?;
+
+    let cover_url = format!("{}/Items/{library_id}/Images/Primary", harness.base_url);
+    let before = diagnostic_line_count("CoverProbe");
+    let denied = harness
+        .client
+        .get(&cover_url)
+        .header("X-Emby-Client", "CoverProbe")
+        .header("X-Emby-Token", &viewer)
+        .send()
+        .await?;
+    assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+    let _ = denied.bytes().await?;
+    assert_eq!(
+        diagnostic_line_count("CoverProbe"),
+        before,
+        "a 404 cover response must not claim a served original: {}",
+        diagnostic_logs()
+    );
+
+    let served = harness
+        .client
+        .get(&cover_url)
+        .header("X-Emby-Client", "CoverProbe")
+        .header("X-Emby-Token", &admin)
+        .send()
+        .await?;
+    assert_eq!(served.status(), StatusCode::OK);
+    let _ = served.bytes().await?;
+    let lines = diagnostic_lines_for("CoverProbe");
+    assert_eq!(lines.len(), before + 1, "lines: {lines:?}");
+    let line = lines.last().ok_or("missing cover diagnostic")?;
+    assert!(line.contains("\"outcome\":\"original\""), "{line}");
+    assert!(
+        line.contains("\"reason\":\"variant_unavailable\""),
+        "{line}"
+    );
+    assert!(line.contains("\"auth_mode\":\"principal\""), "{line}");
+    Ok(())
+}
+
+/// LUX-882 review: the person-image path only reports an original image when it served one. A
+/// people index that cannot be read answers 503 and must stay silent.
+#[tokio::test]
+async fn emby_person_image_errors_do_not_log_a_served_image()
+-> Result<(), Box<dyn std::error::Error>> {
+    install_diagnostic_capture();
+    let harness = start_harness().await?;
+    let admin = harness
+        .emby_token("admin", "correct password", "diag-person-admin")
+        .await?;
+    // Replace the people index root with a regular file: the person lookup then fails with an I/O
+    // error and the route answers 503 instead of an image.
+    let people_root = harness.config_dir.join("metadata/people");
+    match tokio::fs::remove_dir_all(&people_root).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    tokio::fs::create_dir_all(harness.config_dir.join("metadata")).await?;
+    tokio::fs::write(&people_root, b"not a directory").await?;
+
+    let person_url = format!("{}/Items/Neo%20Person/Images/Primary", harness.base_url);
+    let before = diagnostic_line_count("PersonProbe");
+    let response = harness
+        .client
+        .get(&person_url)
+        .header("X-Emby-Client", "PersonProbe")
+        .header("X-Emby-Token", &admin)
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let _ = response.bytes().await?;
+    assert_eq!(
+        diagnostic_line_count("PersonProbe"),
+        before,
+        "a 503 person response must not claim a served original: {}",
+        diagnostic_logs()
     );
     Ok(())
 }
