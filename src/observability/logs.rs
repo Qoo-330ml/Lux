@@ -482,30 +482,61 @@ impl LogStore {
     }
 }
 
+/// Placeholder that replaces a whole sensitive key or value.
+pub(crate) const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
+
+/// Placeholder that replaces a whole string value carrying a URL.
+pub(crate) const REDACTED_URL_PLACEHOLDER: &str = "[REDACTED_URL]";
+
+/// Fragments a JSON key's normalized name (letters and digits only, lowercased) may contain for
+/// [`redact_sensitive_log_values`] to replace the whole value stored under that key.
+///
+/// This table, [`SENSITIVE_KEY_SUFFIXES`], [`SENSITIVE_VALUE_MARKERS`] and
+/// [`SENSITIVE_URL_MARKERS`] are the single source of the redaction rules:
+/// `redacting_writer::may_need_redaction` derives its fast pre-check from them. A rule added to
+/// these tables therefore cannot bypass the pre-check and silently stop redacting `tracing`
+/// output. Add rules here instead of writing literals inside the redactor.
+pub(crate) const SENSITIVE_KEY_FRAGMENTS: [&str; 7] = [
+    "password",
+    "token",
+    "secret",
+    "cookie",
+    "authorization",
+    "apikey",
+    "credential",
+];
+
+/// Normalized key suffixes that make the whole value sensitive regardless of the key's prefix.
+pub(crate) const SENSITIVE_KEY_SUFFIXES: [&str; 2] = ["url", "uri"];
+
+/// Markers that make a whole string value sensitive when they appear anywhere in its lowercased
+/// form.
+pub(crate) const SENSITIVE_VALUE_MARKERS: [&str; 8] = [
+    "token=",
+    "api_key=",
+    "apikey=",
+    "secret=",
+    "password=",
+    "cookie=",
+    "authorization:",
+    "bearer ",
+];
+
+/// Markers that make a whole string value a URL when they appear anywhere in its lowercased form.
+pub(crate) const SENSITIVE_URL_MARKERS: [&str; 2] = ["http://", "https://"];
+
+/// Replaces every sensitive key or value in `value`, recursing into nested objects and arrays.
+///
+/// The rules come from the `SENSITIVE_*` tables above and nowhere else, and every string
+/// comparison is case-insensitive: keys are normalized to letters and digits, value markers are
+/// matched against the lowercased string, and the URL markers likewise, so `HTTPS://EXAMPLE.COM/x`
+/// is replaced by [`REDACTED_URL_PLACEHOLDER`] just like its lowercase form.
 pub(crate) fn redact_sensitive_log_values(mut value: Value) -> Value {
     match &mut value {
         Value::Object(object) => {
             for (key, value) in object.iter_mut() {
-                let normalized_key = key
-                    .chars()
-                    .filter(|character| character.is_ascii_alphanumeric())
-                    .flat_map(char::to_lowercase)
-                    .collect::<String>();
-                if [
-                    "password",
-                    "token",
-                    "secret",
-                    "cookie",
-                    "authorization",
-                    "apikey",
-                    "credential",
-                ]
-                .iter()
-                .any(|needle| normalized_key.contains(needle))
-                    || normalized_key.ends_with("url")
-                    || normalized_key.ends_with("uri")
-                {
-                    *value = Value::String("[REDACTED]".to_owned());
+                if key_name_is_sensitive(key) {
+                    *value = Value::String(REDACTED_PLACEHOLDER.to_owned());
                 } else {
                     *value = redact_sensitive_log_values(value.clone());
                 }
@@ -518,27 +549,36 @@ pub(crate) fn redact_sensitive_log_values(mut value: Value) -> Value {
         }
         Value::String(value) => {
             let normalized = value.to_ascii_lowercase();
-            if value.contains("http://") || value.contains("https://") {
-                *value = "[REDACTED_URL]".to_owned();
-            } else if [
-                "token=",
-                "api_key=",
-                "apikey=",
-                "secret=",
-                "password=",
-                "cookie=",
-                "authorization:",
-                "bearer ",
-            ]
-            .iter()
-            .any(|needle| normalized.contains(needle))
+            if SENSITIVE_URL_MARKERS
+                .iter()
+                .any(|marker| normalized.contains(marker))
             {
-                *value = "[REDACTED]".to_owned();
+                *value = REDACTED_URL_PLACEHOLDER.to_owned();
+            } else if SENSITIVE_VALUE_MARKERS
+                .iter()
+                .any(|marker| normalized.contains(marker))
+            {
+                *value = REDACTED_PLACEHOLDER.to_owned();
             }
         }
         _ => {}
     }
     value
+}
+
+/// Whether the whole value stored under `key` is replaced.
+fn key_name_is_sensitive(key: &str) -> bool {
+    let normalized_key = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    SENSITIVE_KEY_FRAGMENTS
+        .iter()
+        .any(|fragment| normalized_key.contains(fragment))
+        || SENSITIVE_KEY_SUFFIXES
+            .iter()
+            .any(|suffix| normalized_key.ends_with(suffix))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3652,5 +3692,197 @@ mod export_redaction_tests {
         assert!(output.contains("plain text line"));
         assert!(output.contains("\"requestId\":\"abc\""));
         assert_eq!(output.lines().count(), 3);
+    }
+}
+
+#[cfg(test)]
+mod redaction_rule_tests {
+    use serde_json::{Value, json};
+
+    use super::{
+        REDACTED_PLACEHOLDER, REDACTED_URL_PLACEHOLDER, SENSITIVE_KEY_FRAGMENTS,
+        SENSITIVE_KEY_SUFFIXES, SENSITIVE_URL_MARKERS, SENSITIVE_VALUE_MARKERS,
+        redact_sensitive_log_values,
+    };
+
+    /// Redacts `{"<key>": "probe"}` and returns the value stored under `key`.
+    fn redact_under_key(key: &str) -> Value {
+        let mut object = serde_json::Map::new();
+        object.insert(key.to_owned(), Value::String("probe".to_owned()));
+        redact_sensitive_log_values(Value::Object(object))
+            .get(key)
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    #[test]
+    fn url_detection_ignores_case() {
+        for sample in [
+            "HTTPS://EXAMPLE.COM/a?token=abc",
+            "Http://x.test/",
+            "hTtPs://example.com/a",
+        ] {
+            assert_eq!(
+                redact_sensitive_log_values(Value::String(sample.to_owned())),
+                Value::String(REDACTED_URL_PLACEHOLDER.to_owned()),
+                "{sample}"
+            );
+        }
+        assert_eq!(
+            redact_sensitive_log_values(json!({"message": "Http://x.test/"})),
+            json!({"message": REDACTED_URL_PLACEHOLDER})
+        );
+    }
+
+    #[test]
+    fn value_markers_match_regardless_of_case() {
+        for marker in SENSITIVE_VALUE_MARKERS {
+            for marker in [marker.to_owned(), marker.to_uppercase()] {
+                let sample = format!("prefix {marker}suffix");
+                assert_eq!(
+                    redact_sensitive_log_values(Value::String(sample.clone())),
+                    Value::String(REDACTED_PLACEHOLDER.to_owned()),
+                    "{sample}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn key_rules_match_regardless_of_case_and_separators() {
+        for fragment in SENSITIVE_KEY_FRAGMENTS {
+            for key in [
+                fragment.to_owned(),
+                fragment.to_uppercase(),
+                format!("X-{fragment}Id"),
+            ] {
+                assert_eq!(
+                    redact_under_key(&key),
+                    Value::String(REDACTED_PLACEHOLDER.to_owned()),
+                    "{key}"
+                );
+            }
+        }
+        for suffix in SENSITIVE_KEY_SUFFIXES {
+            for key in [
+                format!("source{suffix}"),
+                format!("source{}", suffix.to_uppercase()),
+                format!("redirect_{suffix}"),
+            ] {
+                assert_eq!(
+                    redact_under_key(&key),
+                    Value::String(REDACTED_PLACEHOLDER.to_owned()),
+                    "{key}"
+                );
+            }
+        }
+        for key in ["requestId", "durationMs", "path", "method", "statusCode"] {
+            assert_eq!(
+                redact_under_key(key),
+                Value::String("probe".to_owned()),
+                "{key}"
+            );
+        }
+    }
+
+    /// The key rule re-stated from the shared tables only.
+    fn shared_table_redacts_key(key: &str) -> bool {
+        let normalized = key
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        SENSITIVE_KEY_FRAGMENTS
+            .iter()
+            .any(|fragment| normalized.contains(fragment))
+            || SENSITIVE_KEY_SUFFIXES
+                .iter()
+                .any(|suffix| normalized.ends_with(suffix))
+    }
+
+    /// The value rule re-stated from the shared tables only.
+    fn shared_table_redacts_value(value: &str) -> Option<&'static str> {
+        let normalized = value.to_ascii_lowercase();
+        if SENSITIVE_URL_MARKERS
+            .iter()
+            .any(|marker| normalized.contains(marker))
+        {
+            Some(REDACTED_URL_PLACEHOLDER)
+        } else if SENSITIVE_VALUE_MARKERS
+            .iter()
+            .any(|marker| normalized.contains(marker))
+        {
+            Some(REDACTED_PLACEHOLDER)
+        } else {
+            None
+        }
+    }
+
+    /// The redactor must agree with the shared tables on every sample, including samples that are
+    /// deliberately *not* redacted. Writing a rule inline in the redactor (for example a
+    /// `passwd=` marker) makes the two disagree and fails here.
+    #[test]
+    fn shared_tables_are_the_only_rule_source() {
+        let mut keys = Vec::new();
+        for fragment in SENSITIVE_KEY_FRAGMENTS {
+            keys.push(fragment.to_owned());
+            keys.push(fragment.to_uppercase());
+            keys.push(format!("X-{fragment}Id"));
+            keys.push(format!("{fragment}_value"));
+        }
+        for suffix in SENSITIVE_KEY_SUFFIXES {
+            keys.push(format!("source{suffix}"));
+            keys.push(format!("source{}", suffix.to_uppercase()));
+            keys.push(format!("redirect_{suffix}"));
+        }
+        for key in ["requestId", "durationMs", "path", "method", "statusCode"] {
+            keys.push(key.to_owned());
+        }
+
+        for key in keys {
+            let expected = if shared_table_redacts_key(&key) {
+                REDACTED_PLACEHOLDER
+            } else {
+                "probe"
+            };
+            assert_eq!(
+                redact_under_key(&key),
+                Value::String(expected.to_owned()),
+                "{key}"
+            );
+        }
+
+        let mut values = Vec::new();
+        for marker in SENSITIVE_VALUE_MARKERS {
+            values.push(format!("prefix {marker}suffix"));
+            values.push(format!("prefix {}suffix", marker.to_uppercase()));
+        }
+        for marker in SENSITIVE_URL_MARKERS {
+            values.push(format!("call {marker}example.test/a now"));
+            values.push(format!("call {}EXAMPLE.TEST/a now", marker.to_uppercase()));
+        }
+        for sample in [
+            "nothing to see",
+            "token expired",
+            "bearer",
+            "authorization header",
+            "https:/single-slash",
+            "ftp://example.com/a",
+            "passwd=abc",
+            "session=abc",
+            "private_key=abc",
+            "basic abc",
+        ] {
+            values.push(sample.to_owned());
+        }
+
+        for sample in values {
+            let expected = shared_table_redacts_value(&sample).unwrap_or(sample.as_str());
+            assert_eq!(
+                redact_sensitive_log_values(Value::String(sample.clone())),
+                Value::String(expected.to_owned()),
+                "{sample}"
+            );
+        }
     }
 }
