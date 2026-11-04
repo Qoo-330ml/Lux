@@ -1435,7 +1435,8 @@ fn read_activity_events(
     // Polled every 15 seconds, so this path keeps the small polling budget: when the newest 16 MiB
     // hold too few activity records the result is shorter than the per-category quota instead of
     // reading older segments, and the truncation flag returned by `scan_log_records` is ignored.
-    // (The dashboard is expected to move to the SQLite activity index; see the task notes.)
+    // The dashboard no longer calls this: it reads the SQLite activity index
+    // (`Database::list_activity_events`), so this reader is kept only for log-file tooling.
     scan_log_records(
         log_dir,
         archive_dir,

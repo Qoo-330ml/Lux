@@ -30698,8 +30698,11 @@ async fn list_activity_events_only_reads_events_inside_the_dashboard_window()
     .await?;
     let now = crate::clock::unix_timestamp();
     let inside = now - 60;
-    let boundary = now - DASHBOARD_ACTIVITY_WINDOW_SECONDS;
-    let outside = boundary - 1;
+    // The feed reads the clock again when it queries, so keep every row a minute away from the
+    // exact window edge: a one-second clock step between the two reads must not flip the result.
+    let window_edge = now - DASHBOARD_ACTIVITY_WINDOW_SECONDS;
+    let boundary = window_edge + 60;
+    let outside = window_edge - 60;
     for (id, event_type, occurred_at) in [
         ("inside-login", "AUTH_LOGIN", inside),
         ("inside-playback", "PLAYBACK_STARTED", inside),
