@@ -16,10 +16,26 @@
 //!   buffer first.
 //! - A line is only re-serialised when redaction actually changed the parsed value; parse and
 //!   serialisation failures fall back to the original bytes so a log line is never dropped.
+//! - When the wrapped writer itself fails, the lines that already reached the sink are removed
+//!   from the buffer before the error propagates, so the retry performed by `flush`/`drop` cannot
+//!   emit them twice. The failed line and everything after it stay buffered, so that retry can
+//!   still deliver them.
 //! - Text without a trailing newline is buffered and written on `flush`/`drop`; the writer never
 //!   swallows a partial line. Such a tail is passed through the same redaction, so a complete
 //!   JSON document without its newline is still redacted while a truncated one is copied
 //!   verbatim.
+//!
+//! # Field order
+//!
+//! A rewritten line is re-serialised from a [`serde_json::Value`], and this crate builds
+//! `serde_json` without its `preserve_order` feature: **object keys inside a redacted line are
+//! emitted in sorted order**, so the first field of such a line is no longer necessarily
+//! `timestamp`. Lines that need no change are written as their original bytes, so their field
+//! order and formatting are byte-for-byte identical to what the layer produced. Consumers must
+//! therefore read `tracing` output by key (`value["fields"]["message"]`, `value["span"]["path"]`)
+//! instead of depending on field positions or on the leading field of a line. Enabling
+//! `preserve_order` would keep the order but adds a dependency feature to both sinks, so the
+//! sorted-key behaviour is the accepted trade-off.
 
 use std::io::{self, Write};
 
@@ -72,7 +88,15 @@ impl<W: Write> RedactingWriter<W> {
             .position(|byte| *byte == b'\n')
         {
             let end = consumed + offset + 1;
-            write_redacted_line(&mut self.inner, &self.pending[consumed..end])?;
+            if let Err(error) = write_redacted_line(&mut self.inner, &self.pending[consumed..end]) {
+                // The lines before `consumed` already reached the sink, so drop them before
+                // unwinding: a later `flush`/`drop` retry must never emit them twice. The failed
+                // line and everything after it stay buffered so a retry can still deliver them;
+                // keeping the failed line is the lesser evil because dropping it would silently
+                // lose a log line, and `write_all` cannot tell us how much of it was written.
+                self.pending.drain(..consumed);
+                return Err(error);
+            }
             consumed = end;
         }
         if consumed > 0 {
@@ -83,6 +107,9 @@ impl<W: Write> RedactingWriter<W> {
 
     /// Writes the unterminated tail as-is and flushes the wrapped writer.
     fn flush_pending(&mut self) -> io::Result<()> {
+        // A line buffered by an earlier failed write is retried here per line, so the retry path
+        // keeps the same redaction as the initial one.
+        self.write_complete_lines()?;
         if !self.pending.is_empty() {
             let pending = std::mem::take(&mut self.pending);
             write_redacted_line(&mut self.inner, &pending)?;
@@ -99,7 +126,12 @@ impl<W: Write> Write for RedactingWriter<W> {
         // The `fmt` layer hands over a whole event in one call, so the common case is a single
         // terminated line: process it in place instead of copying it into the buffer.
         if self.pending.is_empty() && is_single_terminated_line(bytes) {
-            write_redacted_line(&mut self.inner, bytes)?;
+            if let Err(error) = write_redacted_line(&mut self.inner, bytes) {
+                // Keep the event for the retry in `flush`/`drop`, exactly like the buffered path
+                // below; this is the only error path that has to copy.
+                self.pending.extend_from_slice(bytes);
+                return Err(error);
+            }
             return Ok(bytes.len());
         }
         self.pending.extend_from_slice(bytes);
@@ -548,6 +580,83 @@ mod tests {
         let text = buffer.captured_text();
         assert!(!text.contains("abc"), "{text}");
         assert!(serde_json::from_str::<Value>(&text).is_ok(), "{text}");
+    }
+
+    /// Inner writer that fails one chosen `write` call and records everything it accepted.
+    struct FlakyWriter {
+        buffer: SharedBuffer,
+        fail_on_call: usize,
+        calls: usize,
+    }
+
+    impl Write for FlakyWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            if self.calls == self.fail_on_call {
+                return Err(io::Error::other("sink stopped accepting bytes"));
+            }
+            self.buffer.write_all(bytes)?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_write_never_repeats_lines_that_already_reached_the_sink() {
+        let buffer = SharedBuffer::default();
+        let mut writer = RedactingWriter::new(FlakyWriter {
+            buffer: buffer.clone(),
+            fail_on_call: 2,
+            calls: 0,
+        });
+        let first = "{\"fields\":{\"message\":\"first\"}}\n";
+        let second = "{\"fields\":{\"message\":\"second\"}}\n";
+        let third = "{\"fields\":{\"message\":\"third\"}}\n";
+
+        let error = writer
+            .write_all(format!("{first}{second}{third}").as_bytes())
+            .expect_err("the second inner write fails");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+
+        // The retry (here an explicit flush, then the implicit one in `drop`) still delivers the
+        // failed line and the line after it, but must not replay the line that already landed.
+        writer.flush().expect("retry succeeds");
+        drop(writer);
+
+        let text = buffer.captured_text();
+        assert_eq!(text.matches("\"first\"").count(), 1, "{text}");
+        assert_eq!(text.matches("\"second\"").count(), 1, "{text}");
+        assert_eq!(text.matches("\"third\"").count(), 1, "{text}");
+        assert_eq!(text.lines().count(), 3, "{text}");
+    }
+
+    #[test]
+    fn a_retried_line_keeps_the_redaction_of_the_first_attempt() {
+        let buffer = SharedBuffer::default();
+        let mut writer = RedactingWriter::new(FlakyWriter {
+            buffer: buffer.clone(),
+            fail_on_call: 1,
+            calls: 0,
+        });
+        let error = writer
+            .write_all(b"{\"fields\":{\"token\":\"tail-secret\"}}\n")
+            .expect_err("the only inner write fails");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+
+        drop(writer);
+        let text = buffer.captured_text();
+        assert!(
+            !text.contains("tail-secret"),
+            "retry leaked the value: {text}"
+        );
+        let event: Value = serde_json::from_str(text.trim_end()).expect("JSON event");
+        assert_eq!(
+            event["fields"]["token"],
+            Value::String("[REDACTED]".to_owned())
+        );
     }
 
     #[test]
