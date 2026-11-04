@@ -192,6 +192,22 @@ struct PluginInstallationStatusRow {
     is_enabled: i64,
 }
 
+/// Newest successful logins for the dashboard activity feed.
+pub(super) const ACTIVITY_FEED_LOGIN_SQL: &str = "SELECT id, user_id, actor_user_id, event_type,
+            target_type, target_id, metadata_json, occurred_at
+     FROM user_activity_events
+     WHERE event_type = 'AUTH_LOGIN'
+     ORDER BY occurred_at DESC, id DESC
+     LIMIT ?";
+
+/// Newest playback state changes for the dashboard activity feed.
+pub(super) const ACTIVITY_FEED_PLAYBACK_SQL: &str = "SELECT id, user_id, actor_user_id, event_type,
+            target_type, target_id, metadata_json, occurred_at
+     FROM user_activity_events
+     WHERE event_type IN ('PLAYBACK_STARTED', 'PLAYBACK_PAUSED', 'PLAYBACK_STOPPED')
+     ORDER BY occurred_at DESC, id DESC
+     LIMIT ?";
+
 /// Typed projection of one `user_activity_events` row.
 #[derive(sqlx::FromRow)]
 struct UserActivityEventRow {
@@ -2314,49 +2330,65 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
+    /// Dashboard feed: the newest logins and the newest playback events.
+    ///
+    /// Both category queries are bounded by `LIMIT` and ordered by
+    /// `idx_user_activity_events_retention (occurred_at, id)`, so a large index never turns into a
+    /// full-table scan or a whole-table sort. `AUTH_LOGIN_FAILED` stays out of the feed.
     pub(crate) async fn list_activity_events(
         &self,
         limit: i64,
     ) -> Result<Vec<StoredActivityEvent>, StorageError> {
         let category_limit = (limit / 2).max(1);
-        let file_events = self
-            .log_store
-            .list_activity_events(limit)
+        let login_rows = self
+            .query_as::<UserActivityEventRow>(sqlx::AssertSqlSafe(ACTIVITY_FEED_LOGIN_SQL))
+            .bind(category_limit)
+            .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Io {
-                path: self.path.clone(),
-                source,
-            })?;
-        let actor_user_ids = file_events
-            .iter()
-            .filter_map(|event| event.actor_user_id.clone())
+            .map_err(self.sqlx_err())?;
+        let playback_rows = self
+            .query_as::<UserActivityEventRow>(sqlx::AssertSqlSafe(ACTIVITY_FEED_PLAYBACK_SQL))
+            .bind(category_limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        let rows = login_rows
+            .into_iter()
+            .chain(playback_rows)
             .collect::<Vec<_>>();
-        let actor_usernames = self.list_usernames_by_ids(&actor_user_ids).await?;
-        let item_ids = file_events
+        let username_keys = rows
             .iter()
-            .filter_map(|event| event.target_id.clone())
+            .map(|row| {
+                row.actor_user_id
+                    .clone()
+                    .unwrap_or_else(|| row.user_id.clone())
+            })
+            .collect::<Vec<_>>();
+        let usernames = self.list_usernames_by_ids(&username_keys).await?;
+        let item_ids = rows
+            .iter()
+            .filter_map(|row| row.target_id.clone())
             .collect::<Vec<_>>();
         let item_metadata = self.list_media_item_metadata_by_ids(&item_ids).await?;
-        let mut events = file_events
+        let mut events = rows
             .into_iter()
-            .map(|event| StoredActivityEvent {
-                actor_username: event.actor_username.or_else(|| {
-                    actor_usernames
-                        .get(event.actor_user_id.as_deref()?)
-                        .cloned()
-                }),
-                target_title: event
-                    .target_id
-                    .as_deref()
-                    .and_then(|item_id| item_metadata.get(item_id))
-                    .map(|metadata| metadata.title.clone()),
-                id: event.id,
-                actor_user_id: event.actor_user_id,
-                event_type: event.event_type,
-                target_type: event.target_type,
-                target_id: event.target_id,
-                metadata_json: event.metadata_json,
-                created_at: event.created_at,
+            .map(|row| {
+                let username_key = row.actor_user_id.as_deref().unwrap_or(&row.user_id);
+                StoredActivityEvent {
+                    actor_username: usernames.get(username_key).cloned(),
+                    target_title: row
+                        .target_id
+                        .as_deref()
+                        .and_then(|item_id| item_metadata.get(item_id))
+                        .map(|metadata| metadata.title.clone()),
+                    id: row.id,
+                    actor_user_id: row.actor_user_id,
+                    event_type: row.event_type,
+                    target_type: row.target_type,
+                    target_id: row.target_id,
+                    metadata_json: row.metadata_json,
+                    created_at: row.occurred_at,
+                }
             })
             .collect::<Vec<_>>();
         events.sort_by(|left, right| {
@@ -2367,17 +2399,6 @@ impl Database {
         });
         let mut seen_ids = HashSet::with_capacity(events.len());
         events.retain(|event| seen_ids.insert(event.id.clone()));
-        let mut login_count = 0_i64;
-        let mut playback_count = 0_i64;
-        events.retain(|event| {
-            if event.event_type == "AUTH_LOGIN" {
-                login_count += 1;
-                login_count <= category_limit
-            } else {
-                playback_count += 1;
-                playback_count <= category_limit
-            }
-        });
         events.truncate(usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
         Ok(events)
     }

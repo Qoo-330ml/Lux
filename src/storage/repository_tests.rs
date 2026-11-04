@@ -30574,6 +30574,282 @@ async fn user_activity_index_retention_deletes_old_events_in_bounded_batches()
 }
 
 #[tokio::test]
+async fn list_activity_events_uses_the_activity_index_quota_and_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::users::{ACTIVITY_FEED_LOGIN_SQL, ACTIVITY_FEED_PLAYBACK_SQL};
+
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for (id, event_type, occurred_at) in [
+        ("login-old", "AUTH_LOGIN", 10_i64),
+        ("login-tie-a", "AUTH_LOGIN", 20),
+        ("login-tie-b", "AUTH_LOGIN", 20),
+        ("playback-started", "PLAYBACK_STARTED", 15),
+        ("playback-paused", "PLAYBACK_PAUSED", 25),
+        ("playback-stopped", "PLAYBACK_STOPPED", 35),
+        ("login-failed", "AUTH_LOGIN_FAILED", 40),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_activity_events (id, user_id, actor_user_id, event_type, occurred_at)
+             VALUES (?, 'feed-user', 'feed-user', ?, ?)",
+        )
+        .bind(id)
+        .bind(event_type)
+        .bind(occurred_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let events = database.list_activity_events(6).await?;
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "playback-stopped",
+            "playback-paused",
+            "login-tie-b",
+            "login-tie-a",
+            "playback-started",
+            "login-old",
+        ]
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event_type != "AUTH_LOGIN_FAILED")
+    );
+    assert_eq!(events[0].created_at, 35);
+    assert_eq!(events[0].event_type, "PLAYBACK_STOPPED");
+
+    // `limit / 2` per category with a floor of one, then the overall truncation.
+    let bounded = database.list_activity_events(2).await?;
+    assert_eq!(
+        bounded
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["playback-stopped", "login-tie-b"]
+    );
+    let single = database.list_activity_events(1).await?;
+    assert_eq!(
+        single
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["playback-stopped"]
+    );
+    assert!(database.list_activity_events(0).await?.is_empty());
+
+    // Both category queries are bounded by the retention index and never sort the whole table.
+    for sql in [ACTIVITY_FEED_LOGIN_SQL, ACTIVITY_FEED_PLAYBACK_SQL] {
+        let plan_rows = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+            .bind(5_i64)
+            .fetch_all(database.pool())
+            .await?;
+        let plan = plan_rows
+            .iter()
+            .filter_map(|row| sqlx::Row::try_get::<String, _>(row, 3).ok())
+            .collect::<Vec<_>>();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("idx_user_activity_events_retention")),
+            "activity feed query should use the retention index: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|line| line.to_ascii_uppercase().contains("TEMP B-TREE")),
+            "activity feed query should not sort the whole table: {plan:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_activity_events_joins_names_and_ignores_log_only_events()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('feed-library', 'Feed', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title,
+             identification_status, has_available_source
+         ) VALUES ('feed-item', 'feed-library', 'MOVIE', 'Feed Title', 'feed title',
+                   'LOCAL_CONFIRMED', 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    for (id, username) in [
+        ("feed-owner", "feed-owner-name"),
+        ("feed-actor", "feed-actor-name"),
+    ] {
+        sqlx::query(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash)
+             VALUES (?, ?, ?, 'test')",
+        )
+        .bind(id)
+        .bind(username)
+        .bind(username)
+        .execute(database.pool())
+        .await?;
+    }
+    type FeedEventRow<'a> = (
+        &'a str,
+        &'a str,
+        Option<&'a str>,
+        &'a str,
+        Option<&'a str>,
+        &'a str,
+        i64,
+    );
+    let rows: [FeedEventRow<'_>; 4] = [
+        (
+            "join-login",
+            "feed-owner",
+            Some("feed-owner"),
+            "AUTH_LOGIN",
+            None,
+            r#"{"remoteIp":"127.0.0.1"}"#,
+            100,
+        ),
+        (
+            "join-play",
+            "feed-owner",
+            Some("feed-actor"),
+            "PLAYBACK_STARTED",
+            Some("feed-item"),
+            "{}",
+            200,
+        ),
+        (
+            "owner-fallback-login",
+            "feed-owner",
+            None,
+            "AUTH_LOGIN",
+            None,
+            "{}",
+            50,
+        ),
+        (
+            "orphan-play",
+            "deleted-user",
+            None,
+            "PLAYBACK_PAUSED",
+            Some("deleted-item"),
+            "{}",
+            300,
+        ),
+    ];
+    for (id, user_id, actor_user_id, event_type, target_id, metadata_json, occurred_at) in rows {
+        sqlx::query(
+            "INSERT INTO user_activity_events (
+                 id, user_id, actor_user_id, event_type, target_type, target_id,
+                 metadata_json, occurred_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(actor_user_id)
+        .bind(event_type)
+        .bind(target_id.map(|_| "media_item"))
+        .bind(target_id)
+        .bind(metadata_json)
+        .bind(occurred_at)
+        .execute(database.pool())
+        .await?;
+    }
+    // A same-shaped activity record that only exists in the JSONL audit log must not be read.
+    crate::observability::logs::LogStore::new(&config.config_dir)
+        .append_json(serde_json::json!({
+            "recordType": "admin_audit_event",
+            "id": "log-only-activity",
+            "actorUserId": "feed-owner",
+            "actorUsername": "feed-owner-name",
+            "eventType": "AUTH_LOGIN",
+            "targetType": null,
+            "targetId": null,
+            "metadata": {},
+            "createdAt": 9_999,
+        }))
+        .await?;
+
+    let events = database.list_activity_events(10).await?;
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "orphan-play",
+            "join-play",
+            "join-login",
+            "owner-fallback-login",
+        ]
+    );
+    let join_play = &events[1];
+    assert_eq!(join_play.actor_user_id.as_deref(), Some("feed-actor"));
+    assert_eq!(join_play.actor_username.as_deref(), Some("feed-actor-name"));
+    assert_eq!(join_play.target_type.as_deref(), Some("media_item"));
+    assert_eq!(join_play.target_id.as_deref(), Some("feed-item"));
+    assert_eq!(join_play.target_title.as_deref(), Some("Feed Title"));
+    assert_eq!(join_play.created_at, 200);
+    let join_login = events
+        .iter()
+        .find(|event| event.id == "join-login")
+        .ok_or("missing joined login event")?;
+    assert_eq!(
+        join_login.actor_username.as_deref(),
+        Some("feed-owner-name")
+    );
+    assert_eq!(join_login.metadata_json, r#"{"remoteIp":"127.0.0.1"}"#);
+    assert_eq!(join_login.created_at, 100);
+    let fallback_login = events
+        .iter()
+        .find(|event| event.id == "owner-fallback-login")
+        .ok_or("missing fallback login event")?;
+    assert_eq!(fallback_login.actor_user_id, None);
+    assert_eq!(
+        fallback_login.actor_username.as_deref(),
+        Some("feed-owner-name")
+    );
+    let orphan_play = &events[0];
+    assert_eq!(orphan_play.actor_user_id, None);
+    assert!(orphan_play.actor_username.is_none());
+    assert_eq!(orphan_play.target_id.as_deref(), Some("deleted-item"));
+    assert!(orphan_play.target_title.is_none());
+
+    // Deleting the referenced rows keeps the feed readable with nullable names and titles.
+    sqlx::query("DELETE FROM users WHERE id = 'feed-actor'")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DELETE FROM media_items WHERE id = 'feed-item'")
+        .execute(database.pool())
+        .await?;
+    let after_delete = database.list_activity_events(10).await?;
+    let deleted_play = after_delete
+        .iter()
+        .find(|event| event.id == "join-play")
+        .ok_or("missing playback event after deletion")?;
+    assert_eq!(deleted_play.actor_user_id.as_deref(), Some("feed-actor"));
+    assert!(deleted_play.actor_username.is_none());
+    assert!(deleted_play.target_title.is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn user_activity_retention_setting_defaults_validates_and_recovers_invalid_values()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

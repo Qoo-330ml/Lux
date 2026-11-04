@@ -254,6 +254,34 @@ IP 封禁设计收敛为一项全站高级配置：**可信代理地址或网段
 - 沿用现有日志与审计机制，增加适合用户查询的有界索引，不在每个用户请求中反复扫描全部归档。
 - 活动保留期不清理观看进度、已看状态和收藏；登录失败记录不得包含密码、凭证或完整外部 URL。
 
+#### 仪表盘近期活动读取来源（取代 LUX-313 的文件读取）
+
+本任务记录 LUX-883：用户活动索引默认保留期由 90 天改为 7 天，管理仪表盘“近期活动”（登录与播放）改读
+`user_activity_events`。LUX-313 原本从 JSONL 文件审计日志读取该列表，每 15 秒被前端轮询一次；最新日志
+段很大时读取会扫描很久，服务器长时间没有新活动时又会在读取预算内找不到足够事件而返回空列表。文件读取
+侧无法根治这两个问题，而 `record_activity_event` 已对每个成功登录和播放状态变化同时写入活动索引与文件
+审计日志，因此仪表盘改读索引。
+
+- 保留期仍由 `server_settings` 的 `user_activity_retention_days` 控制，管理员仍可通过
+  `PATCH /api/v1/admin/settings` 的 `userActivityRetentionDays` 修改，范围保持 1–3650。
+  `DEFAULT_USER_ACTIVITY_RETENTION_DAYS` 从 90 改为 7，管理页“活动记录保留”的缺省展示同步为 7 天。
+  已经显式保存过该键的实例保持原值，不改写、不新增 migration。
+- `Database::list_activity_events(limit)` 不再调用 `LogStore::list_activity_events`，改为对
+  `user_activity_events` 的两条有界查询：`AUTH_LOGIN` 一条，`PLAYBACK_STARTED` / `PLAYBACK_PAUSED` /
+  `PLAYBACK_STOPPED` 一条；每条 `ORDER BY occurred_at DESC, id DESC LIMIT (limit/2).max(1)`，合并后按
+  `created_at`、`id` 倒序并截断到 `limit`。返回类型 `Vec<StoredActivityEvent>`、DTO 字段和“最多 24
+  条、登录/播放各 12 条”的配额不变；`AUTH_LOGIN_FAILED` 不进入仪表盘。用户名仍由
+  `list_usernames_by_ids` 关联，`actor_user_id` 为空时回退用活动所属 `user_id`；条目标题仍由
+  `list_media_item_metadata_by_ids` 按 `target_id` 关联，用户或媒体已删除时返回可空名称/标题。两条查询
+  走现有 `idx_user_activity_events_retention (occurred_at, id)`，不新增 migration 或索引。
+- 登录/播放活动仍同时写入文件审计日志；`LogStore::list_activity_events` 和 `read_activity_events` 原样
+  保留。LUX-313 的读取来源由本设计取代。
+- 索引写入在 `record_activity_event` 中先于文件写入且失败只发警告，因此个别事件可能只存在于文件审计
+  日志。仪表盘现在以索引为准，这类事件不会出现在仪表盘，但仍保留在文件审计日志中。
+- 未显式保存保留期的实例会在下一轮用户清理循环中按 7 天截止点有界批量删除更早的索引行；已经显式保存
+  保留期的实例不受影响。删除不会自动缩小 SQLite 文件，需要 VACUUM 或维护窗口，本任务不触发 VACUUM，
+  也不改清理 worker 的批量上限或调度。
+
 ### 原模块八：外挂字幕权限（已取消）
 
 本模块不实施用户级字幕下载/管理权限，也不新增字幕文件上传、替换或删除能力。现有字幕播放读取、管理员修改字幕元数据属性、字幕索引与扫描继续按 Lux 既有规格运行；这次范围调整不移除或改变这些现有功能。内容访问限制仍按模块五统一约束媒体内容访问，包括已有的字幕读取路径。
