@@ -34,10 +34,12 @@ const MAX_EVENT_SCAN_BYTES: u64 = 16 * 1024 * 1024;
 ///
 /// Both are opened on demand instead of being polled, so they may cover the whole retained volume.
 /// The ceiling is derived from the retention constants rather than hand-picked so a large
-/// installation cannot lose older records from those pages. The readers still stop early once a page
-/// is complete and no older day can outrank it, so the common case only touches the newest segments;
-/// the read is streamed with the byte prefilter and a page-sized buffer, so memory stays bounded even
-/// when the disk read grows with the retained volume.
+/// installation cannot lose older records from those pages. The audit list stops early once a page
+/// is complete and no older day can outrank it, so its common case only touches the newest segments.
+/// The job-event list never stops early because its response carries an exact `total`: even its
+/// first page reads the whole retained volume (up to this ceiling) while holding the log manager
+/// lock. Both reads are streamed with the byte prefilter and a page-sized buffer, so memory stays
+/// bounded even when the disk read grows with the retained volume.
 ///
 /// The job-event `total` is exact within the steady-state retention (at most `MAX_LOG_ARCHIVES`
 /// archives plus the daily files). Log migration defers archive pruning
