@@ -4211,7 +4211,7 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
                         source
                             .streams
                             .iter()
-                            .map(|stream| emby_media_source_stream_json(source, stream))
+                            .map(|stream| emby_media_source_stream_json(&item.id, source, stream))
                             .collect()
                     })
                     .unwrap_or_default(),
@@ -4724,7 +4724,7 @@ pub(super) fn emby_media_source_json_with_resolver_and_chapters(
                 source
                     .streams
                     .iter()
-                    .map(|stream| emby_media_source_stream_json(source, stream))
+                    .map(|stream| emby_media_source_stream_json(item_id, source, stream))
                     .collect(),
             ),
         );
@@ -4945,11 +4945,54 @@ pub(super) fn emby_media_stream_json(stream: &crate::application::catalog::Catal
     value
 }
 
+/// Subtitle file extension for the `Stream.<ext>` delivery route. Unknown codecs get no extension
+/// so the URL keeps pointing at the extensionless route instead of promising a format.
+fn emby_subtitle_delivery_extension(codec: Option<&str>) -> Option<&'static str> {
+    match codec?.trim().to_ascii_lowercase().as_str() {
+        "srt" | "subrip" => Some("srt"),
+        "ass" | "ssa" => Some("ass"),
+        "vtt" | "webvtt" => Some("vtt"),
+        _ => None,
+    }
+}
+
+/// Emby delivery metadata for subtitle tracks. External files are fetched through the subtitle
+/// route (a relative URL without credentials; clients append their own token); embedded tracks
+/// stay inside the container.
+fn emby_insert_subtitle_delivery(
+    value: &mut Value,
+    item_id: &str,
+    source: &crate::application::catalog::CatalogSource,
+    stream: &crate::application::catalog::CatalogStream,
+) {
+    value["IsExternalUrl"] = Value::Bool(false);
+    if !stream.is_external {
+        value["DeliveryMethod"] = Value::String("Embed".to_owned());
+        value["SubtitleLocationType"] = Value::String("InternalStream".to_owned());
+        return;
+    }
+    value["DeliveryMethod"] = Value::String("External".to_owned());
+    value["SubtitleLocationType"] = Value::String("ExternalFile".to_owned());
+    let suffix = emby_subtitle_delivery_extension(stream.codec.as_deref())
+        .map(|extension| format!(".{extension}"))
+        .unwrap_or_default();
+    value["DeliveryUrl"] = Value::String(format!(
+        "/Videos/{}/{}/Subtitles/{}/Stream{suffix}",
+        percent_encode_filename(&emby_public_id(item_id)),
+        percent_encode_filename(&source.id),
+        stream.index,
+    ));
+}
+
 fn emby_media_source_stream_json(
+    item_id: &str,
     source: &crate::application::catalog::CatalogSource,
     stream: &crate::application::catalog::CatalogStream,
 ) -> Value {
     let mut value = emby_media_stream_json(stream);
+    if emby_stream_type(&stream.stream_type) == "Subtitle" {
+        emby_insert_subtitle_delivery(&mut value, item_id, source, stream);
+    }
     let quality_label = source
         .quality_label
         .as_deref()
@@ -6237,6 +6280,109 @@ mod tests {
         );
 
         assert_eq!(source_stream_json(&source)["DisplayTitle"], "1080p H264");
+    }
+
+    fn subtitle_stream(index: i64, codec: Option<&str>, is_external: bool) -> CatalogStream {
+        CatalogStream {
+            index,
+            stream_type: "SUBTITLE".to_owned(),
+            codec: codec.map(str::to_owned),
+            language: Some("chi".to_owned()),
+            title: None,
+            is_external,
+            is_default: false,
+            is_forced: false,
+            details: BTreeMap::new(),
+        }
+    }
+
+    fn subtitle_json(stream: CatalogStream) -> serde_json::Value {
+        let source = catalog_source(None, vec![stream]);
+        emby_media_source_json_with_resolver("item-1", &source, true, false)["MediaStreams"][0]
+            .clone()
+    }
+
+    #[test]
+    fn external_subtitles_advertise_an_external_delivery_url() {
+        for (codec, extension) in [
+            ("srt", "srt"),
+            ("subrip", "srt"),
+            ("ass", "ass"),
+            ("ssa", "ass"),
+            ("webvtt", "vtt"),
+            ("vtt", "vtt"),
+        ] {
+            let json = subtitle_json(subtitle_stream(3, Some(codec), true));
+            assert_eq!(json["DeliveryMethod"], "External", "{codec}");
+            assert_eq!(json["SubtitleLocationType"], "ExternalFile", "{codec}");
+            assert_eq!(json["IsExternalUrl"], false, "{codec}");
+            assert_eq!(
+                json["DeliveryUrl"],
+                format!("/Videos/item-1/source-1/Subtitles/3/Stream.{extension}"),
+                "{codec}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_subtitle_with_an_unknown_codec_uses_the_extensionless_route() {
+        let json = subtitle_json(subtitle_stream(2, Some("weird/codec"), true));
+        assert_eq!(
+            json["DeliveryUrl"],
+            "/Videos/item-1/source-1/Subtitles/2/Stream"
+        );
+        let json = subtitle_json(subtitle_stream(2, None, true));
+        assert_eq!(
+            json["DeliveryUrl"],
+            "/Videos/item-1/source-1/Subtitles/2/Stream"
+        );
+    }
+
+    #[test]
+    fn embedded_subtitles_stay_inside_the_container_without_a_delivery_url() {
+        let json = subtitle_json(subtitle_stream(4, Some("subrip"), false));
+        assert_eq!(json["DeliveryMethod"], "Embed");
+        assert_eq!(json["SubtitleLocationType"], "InternalStream");
+        assert_eq!(json["IsExternalUrl"], false);
+        assert!(json.get("DeliveryUrl").is_none());
+    }
+
+    #[test]
+    fn non_subtitle_streams_carry_no_delivery_fields() {
+        let source = catalog_source(
+            Some("1080p"),
+            vec![
+                stream("VIDEO", Some("h264"), None, None, BTreeMap::new()),
+                stream("AUDIO", Some("aac"), Some("eng"), None, BTreeMap::new()),
+            ],
+        );
+        let json = emby_media_source_json_with_resolver("item-1", &source, true, false);
+        for index in 0..2 {
+            let stream = &json["MediaStreams"][index];
+            for key in [
+                "DeliveryMethod",
+                "DeliveryUrl",
+                "IsExternalUrl",
+                "SubtitleLocationType",
+            ] {
+                assert!(stream.get(key).is_none(), "{index} {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn delivery_urls_use_the_public_ids_and_carry_no_credentials() {
+        let mut source = catalog_source(None, vec![subtitle_stream(1, Some("srt"), true)]);
+        source.id = "src id/with?odd".to_owned();
+        let json = emby_media_source_json_with_resolver("item-1", &source, true, false);
+        let url = json["MediaStreams"][0]["DeliveryUrl"]
+            .as_str()
+            .unwrap_or("");
+        assert!(url.starts_with("/Videos/"), "{url}");
+        assert!(
+            !url.contains('?') && !url.contains("api_key") && !url.contains(' '),
+            "{url}"
+        );
     }
 
     #[test]

@@ -1588,8 +1588,17 @@ fn is_emby_subtitle_path(path: &str) -> bool {
         && segments.next().is_some_and(|segment| !segment.is_empty())
         && segments.next() == Some("Subtitles")
         && segments.next().is_some_and(|segment| !segment.is_empty())
-        && segments.next() == Some("Stream")
+        && segments.next().is_some_and(is_emby_subtitle_stream_segment)
         && segments.next().is_none()
+}
+
+/// `Stream` or `Stream.<format>`, the delivery shape Emby clients request for subtitle files.
+fn is_emby_subtitle_stream_segment(segment: &str) -> bool {
+    segment == "Stream"
+        || segment.strip_prefix("Stream.").is_some_and(|extension| {
+            (1..=8).contains(&extension.len())
+                && extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
 }
 
 fn is_emby_legacy_strm_path(path: &str) -> bool {
@@ -3215,6 +3224,20 @@ mod tests {
         assert!(!is_emby_subtitle_path(
             "/emby/videos/item-123/source-456/Subtitles/0/Stream"
         ));
+        for extension in ["srt", "ass", "vtt"] {
+            assert!(is_emby_subtitle_path(&format!(
+                "/emby/Videos/item-123/source-456/Subtitles/0/Stream.{extension}"
+            )));
+        }
+        for path in [
+            "/Videos/item-123/source-456/Subtitles/0/Stream.",
+            "/Videos/item-123/source-456/Subtitles/0/Stream.s-rt",
+            "/Videos/item-123/source-456/Subtitles/0/Stream.srt/extra",
+            "/Videos/item-123/source-456/Subtitles/0/Streams",
+            "/Videos/item-123/source-456/Subtitles/0/Stream.waytoolongext",
+        ] {
+            assert!(!is_emby_subtitle_path(path), "{path}");
+        }
     }
 
     #[test]

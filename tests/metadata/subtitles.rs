@@ -166,6 +166,39 @@ printf '%s' '{"format":{"format_name":"matroska","duration":"10","bit_rate":"100
     assert_eq!(streams[2]["IsExternal"], true);
     assert_eq!(streams[2]["IsForced"], false);
     assert_eq!(streams[3]["IsForced"], true);
+    // External files advertise a credential-free delivery URL that the same route serves, with or
+    // without the format suffix; embedded tracks stay inside the container.
+    assert_eq!(streams[2]["DeliveryMethod"], "External");
+    assert_eq!(streams[2]["SubtitleLocationType"], "ExternalFile");
+    assert_eq!(streams[2]["IsExternalUrl"], false);
+    let delivery_url = streams[2]["DeliveryUrl"]
+        .as_str()
+        .ok_or("missing delivery url")?
+        .to_owned();
+    assert!(delivery_url.starts_with("/Videos/"), "{delivery_url}");
+    assert!(
+        delivery_url.contains("/Subtitles/2/Stream"),
+        "{delivery_url}"
+    );
+    assert!(!delivery_url.contains("api_key"), "{delivery_url}");
+    assert_eq!(streams[4]["DeliveryMethod"], "Embed");
+    assert_eq!(streams[4]["SubtitleLocationType"], "InternalStream");
+    assert!(streams[4].get("DeliveryUrl").is_none());
+    let delivered = client
+        .get(format!("{base_url}{delivery_url}"))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(delivered.status(), reqwest::StatusCode::OK);
+    assert!(String::from_utf8(delivered.bytes().await?.to_vec())?.contains("Hello"));
+    let suffixed = client
+        .get(format!(
+            "{base_url}/Videos/{item_id}/{source_id}/Subtitles/2/Stream.srt"
+        ))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(suffixed.status(), reqwest::StatusCode::OK);
     let subtitle = client
         .get(format!(
             "{base_url}/Videos/{item_id}/{source_id}/Subtitles/2/Stream"
@@ -210,10 +243,18 @@ printf '%s' '{"format":{"format_name":"matroska","duration":"10","bit_rate":"100
         .get(format!(
             "{base_url}/Videos/{item_id}/{source_id}/Subtitles/2/Stream"
         ))
-        .header("X-Emby-Token", viewer_token)
+        .header("X-Emby-Token", &viewer_token)
         .send()
         .await?;
     assert_eq!(denied.status(), reqwest::StatusCode::NOT_FOUND);
+    let denied_suffixed = client
+        .get(format!(
+            "{base_url}/Videos/{item_id}/{source_id}/Subtitles/2/Stream.srt"
+        ))
+        .header("X-Emby-Token", viewer_token)
+        .send()
+        .await?;
+    assert_eq!(denied_suffixed.status(), reqwest::StatusCode::NOT_FOUND);
 
     server.abort();
     assert_ne!(admin.id, viewer.id);

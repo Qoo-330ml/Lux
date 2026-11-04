@@ -2559,6 +2559,25 @@ pub(super) async fn emby_subtitle_with_source(
     .await
 }
 
+/// `Stream.<format>` variant advertised in `DeliveryUrl`. The suffix is only a format hint for
+/// clients; the track is served exactly like the extensionless route.
+pub(super) async fn emby_subtitle_with_source_and_format(
+    headers: HeaderMap,
+    method: Method,
+    Path((item_id, media_source_id, stream_index, _format)): Path<(String, String, String, String)>,
+    query: Query<EmbyTokenQuery>,
+    state: State<ReadyAppState>,
+) -> Response {
+    emby_subtitle_with_source(
+        headers,
+        method,
+        Path((item_id, media_source_id, stream_index)),
+        query,
+        state,
+    )
+    .await
+}
+
 pub(super) async fn emby_subtitle_without_source(
     headers: HeaderMap,
     method: Method,

@@ -169,6 +169,10 @@ pub(super) fn api_routes() -> (Router<ReadyAppState>, Vec<String>) {
             get(emby_subtitle_with_source).head(emby_subtitle_with_source),
         )
         .route(
+            "/Videos/{item_id}/{media_source_id}/Subtitles/{stream_index}/Stream.{format}",
+            get(emby_subtitle_with_source_and_format).head(emby_subtitle_with_source_and_format),
+        )
+        .route(
             "/Videos/{item_id}/original.strm",
             get(emby_stream).head(emby_stream),
         )
