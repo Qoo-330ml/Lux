@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::application::{
-    image_variants::ImageVariantRequest,
+    image_variants::{ImageVariantIntent, ImageVariantRequest},
     plugin_protocol::{PluginEmbyRouteRequest, PluginEmbyRouteResponse, PluginMediaInfoTarget},
     probe::{media_probe_result_from_rpc, parse_media_info_json},
 };
@@ -2417,19 +2417,20 @@ pub(super) struct EmbyTokenQuery {
     pub(super) active_within_seconds: Option<i64>,
 }
 
-/// Display-size hints and overlay switches Emby clients append to image URLs.
+/// Display-size hints, quality and overlay switches Emby clients append to image URLs.
 ///
 /// The keys are matched case-insensitively from the raw query string because third-party
 /// clients disagree on the casing of `maxWidth` / `MaxWidth` and serde aliases cannot cover
 /// every spelling. Unparsable and zero hints count as absent. The cached variants are always
 /// opaque JPEG without overlays, so a non-JPEG `format` or any overlay parameter keeps the
-/// original image.
+/// original image. `quality` is parsed for the diagnostic log only and never picks a tier.
 #[derive(Debug, Default)]
 pub(super) struct EmbyImageDisplayQuery {
     max_width: Option<u32>,
     max_height: Option<u32>,
     width: Option<u32>,
     height: Option<u32>,
+    quality: Option<u32>,
     format: Option<String>,
     overlay: bool,
 }
@@ -2457,6 +2458,8 @@ impl EmbyImageDisplayQuery {
                 query.width = query.width.or(parse_emby_pixel_hint(&value));
             } else if key.eq_ignore_ascii_case("height") {
                 query.height = query.height.or(parse_emby_pixel_hint(&value));
+            } else if key.eq_ignore_ascii_case("quality") {
+                query.quality = query.quality.or_else(|| value.trim().parse::<u32>().ok());
             } else if key.eq_ignore_ascii_case("format") {
                 if query.format.is_none() {
                     query.format =
@@ -2484,6 +2487,42 @@ impl EmbyImageDisplayQuery {
             return ImageVariantRequest::Original;
         }
         ImageVariantRequest::DisplaySize { width, height }
+    }
+
+    /// Serving intent for this request: the display box plus the format and overlay objections, so
+    /// the server and the diagnostic log agree on why a variant was or was not used.
+    pub(super) fn variant_intent(&self) -> ImageVariantIntent {
+        ImageVariantIntent::display(self.variant_request(), self.overlay, !self.is_jpeg_format())
+    }
+
+    pub(super) fn max_width(&self) -> Option<u32> {
+        self.max_width
+    }
+
+    pub(super) fn max_height(&self) -> Option<u32> {
+        self.max_height
+    }
+
+    pub(super) fn width(&self) -> Option<u32> {
+        self.width
+    }
+
+    pub(super) fn height(&self) -> Option<u32> {
+        self.height
+    }
+
+    /// Parsed `quality` hint. Emby clients send it as an encoder hint; Lux never picks a tier from
+    /// it, and a non-numeric value is ignored.
+    pub(super) fn quality(&self) -> Option<u32> {
+        self.quality
+    }
+
+    pub(super) fn format(&self) -> Option<&str> {
+        self.format.as_deref()
+    }
+
+    pub(super) fn has_overlay(&self) -> bool {
+        self.overlay
     }
 
     fn is_jpeg_format(&self) -> bool {
@@ -3258,7 +3297,9 @@ mod parental_rating_tests {
 #[cfg(test)]
 mod emby_image_display_query_tests {
     use super::EmbyImageDisplayQuery;
-    use crate::application::image_variants::ImageVariantRequest;
+    use crate::application::image_variants::{
+        ImageVariantRequest, ImageVariantSelection, OriginalImageReason,
+    };
 
     #[test]
     fn size_hints_are_matched_case_insensitively() {
@@ -3342,6 +3383,63 @@ mod emby_image_display_query_tests {
                 "format {format} is satisfied by the JPEG cache"
             );
         }
+    }
+
+    #[test]
+    fn quality_is_parsed_but_never_changes_the_tier() {
+        let query = EmbyImageDisplayQuery::parse(Some("quality=90&maxWidth=300"));
+        assert_eq!(query.quality(), Some(90));
+        assert_eq!(
+            query.variant_intent().selection(Some((1600, 2400))),
+            ImageVariantSelection::Variant(720)
+        );
+        // A non-numeric or empty quality is ignored, not an error.
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("quality=high")).quality(),
+            None
+        );
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("Quality=")).quality(),
+            None
+        );
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("quality=-5")).quality(),
+            None
+        );
+        // Case-insensitive like the size hints.
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("QUALITY=70")).quality(),
+            Some(70)
+        );
+    }
+
+    #[test]
+    fn variant_intent_carries_the_format_and_overlay_objections() {
+        let original = |reason| ImageVariantSelection::Original(reason);
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("format=png&maxWidth=300"))
+                .variant_intent()
+                .selection(Some((1600, 2400))),
+            original(OriginalImageReason::NonJpegFormat)
+        );
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("blur=true&maxWidth=300"))
+                .variant_intent()
+                .selection(Some((1600, 2400))),
+            original(OriginalImageReason::Overlay)
+        );
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(None)
+                .variant_intent()
+                .selection(Some((1600, 2400))),
+            original(OriginalImageReason::NoSizeHint)
+        );
+        // The parsed hints reach the intent unchanged.
+        let query = EmbyImageDisplayQuery::parse(Some("maxWidth=300&maxHeight=400"));
+        assert_eq!(query.max_width(), Some(300));
+        assert_eq!(query.max_height(), Some(400));
+        assert_eq!(query.width(), None);
+        assert_eq!(query.height(), None);
     }
 
     #[test]

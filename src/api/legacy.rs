@@ -136,6 +136,8 @@ mod emby_handlers;
 use emby_handlers::*;
 #[path = "emby_catalog.rs"]
 mod emby_catalog;
+#[path = "emby_image_diag.rs"]
+mod emby_image_diag;
 #[allow(unused_imports)]
 use emby_catalog::*;
 #[path = "playback.rs"]
