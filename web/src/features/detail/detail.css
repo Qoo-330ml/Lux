@@ -95,13 +95,13 @@
 
 .lux-media-file-summary.is-compact > span + span::before { margin: 0 8px; color: var(--lux-subtle); content: "·"; }
 
-.lux-media-address-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 16px; min-width: 0; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--lux-line-soft); color: var(--lux-muted); font-size: .8rem; }
+.lux-media-address-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 16px; min-width: 0; margin-top: 14px; padding-top: 14px; color: var(--lux-muted); font-size: .8rem; }
 
 .lux-media-address-row[hidden] { display: none; }
 
-.lux-season-episode-row { display: grid; grid-template-columns: 188px minmax(0, 1fr) auto; align-items: center; gap: 18px; min-width: 0; padding: 0 4px 10px 0; border-bottom: 1px solid var(--lux-line-soft); color: var(--lux-muted); transition: color .2s ease, border-color .2s ease; }
+.lux-season-episode-row { display: grid; grid-template-columns: 188px minmax(0, 1fr) auto; align-items: center; gap: 18px; min-width: 0; padding: 0 4px 10px 0; color: var(--lux-muted); transition: color .2s ease; }
 
-.lux-season-episode-row:hover { border-color: rgba(255,255,255,.32); color: #fff; }
+.lux-season-episode-row:hover { color: #fff; }
 
 .lux-season-episode-arrow { flex: 0 0 auto; color: var(--lux-subtle); font-size: .72rem; white-space: nowrap; }
 
@@ -123,7 +123,7 @@ html[data-lux-theme="light"] .lux-season-card:hover,
 html[data-lux-theme="light"] .lux-episode-card:hover,
 html[data-lux-theme="light"] .lux-season-episode-row:hover { color: var(--lux-text); }
 
-html[data-lux-theme="light"] .lux-season-episode-row { color: var(--lux-text); border-bottom-color: var(--lux-line-soft); }
+html[data-lux-theme="light"] .lux-season-episode-row { color: var(--lux-text); }
 
 html[data-lux-theme="light"] .lux-season-episode-arrow { color: var(--lux-muted); font-weight: 550; }
 
@@ -245,13 +245,13 @@ html[data-lux-theme="light"] .lux-season-episode-arrow:hover { color: var(--lux-
 
 .lux-person-overview p { max-width: 70ch; margin: 12px 0 0; color: var(--lux-subtle); line-height: 1.8; white-space: pre-wrap; }
 
-.lux-person-works { margin-top: 58px; padding-top: 26px; border-top: 1px solid var(--lux-line-soft); }
+.lux-person-works { margin-top: 58px; padding-top: 26px; }
 
 .lux-person-works-grid { margin-top: 20px; }
 
 .lux-person-works-actions { display: flex; justify-content: center; margin-top: 28px; }
 
-.lux-source-selector { max-width: none; margin-top: 28px; padding-top: 20px; border-top: 1px solid var(--lux-line-soft); }
+.lux-source-selector { max-width: none; margin-top: 28px; padding-top: 20px; }
 
 .lux-source-select .lux-source-option-content { display: block; }
 
@@ -351,11 +351,11 @@ html[data-lux-theme="light"] .lux-season-episode-arrow:hover { color: var(--lux-
 
 .lux-media-stream-badges span.is-default { border-color: rgba(203,213,225,.35); color: #fff; background: rgba(203,213,225,.1); font-weight: 550; }
 
-.lux-media-stream-details { display: flex; flex-direction: column; gap: 2px; margin: 14px 0 0; padding-top: 10px; border-top: 1px solid var(--lux-line-soft); }
+.lux-media-stream-details { display: flex; flex-direction: column; gap: 2px; margin: 14px 0 0; padding-top: 10px; }
 
 .lux-series-children { max-width: none; margin-top: 76px; padding-top: 25px; }
 
-.lux-season-episodes, .lux-episode-rail { max-width: none; margin-top: 76px; padding-top: 25px; border-top: 1px solid var(--lux-line-soft); }
+.lux-season-episodes, .lux-episode-rail { max-width: none; margin-top: 76px; padding-top: 25px; }
 
 .lux-season-rail { display: flex; gap: 16px; margin-top: 22px; padding: 0 2px 14px; overflow-x: auto; scrollbar-width: thin; }
 

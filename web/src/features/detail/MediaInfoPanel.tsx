@@ -79,7 +79,7 @@ export function MediaInfoContent({
   return (
     <div className="space-y-4">
       {showHeader ? (
-        <div className="flex flex-col sm:flex-row sm:items-baseline justify-between gap-2 border-b border-[var(--lux-line-soft)] pb-3">
+        <div className="flex flex-col sm:flex-row sm:items-baseline justify-between gap-2 pb-3">
           <div className="flex items-baseline gap-3">
             <div className="lux-media-nfo-media-heading">
               <h3 id="media-file-heading" className="text-xl md:text-2xl font-bold text-white tracking-tight">媒体文件</h3>
@@ -259,7 +259,7 @@ function MediaStreamCard({
 
       {/* Card Bottom: Balanced Key-Value Rows */}
       {rows.length ? (
-        <div className="lux-media-stream-details grid gap-1 pt-3 mt-3 border-t border-[var(--lux-line-soft)] text-xs">
+        <div className="lux-media-stream-details grid gap-1 pt-3 mt-3 text-xs">
           {rows.map(([label, value]) => (
             <div key={label} className="lux-media-nfo-row flex items-center justify-between gap-2 py-0.5">
               <span className="text-[var(--lux-subtle)] shrink-0">{label}</span>

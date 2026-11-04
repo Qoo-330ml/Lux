@@ -73,7 +73,7 @@ export function MediaNfoPanel({
   return (
     <section className="lux-media-nfo space-y-4" aria-labelledby="media-nfo-heading">
       {/* Section Header */}
-      <div className="lux-media-nfo-heading flex items-baseline justify-between border-b border-[var(--lux-line-soft)] pb-3">
+      <div className="lux-media-nfo-heading flex items-baseline justify-between pb-3">
         <div className="lux-heading-lead">
           <h2 id="media-nfo-heading" className="text-xl md:text-2xl font-bold text-white tracking-tight">更多信息</h2>
           <span className="lux-section-heading-sub">ARCHIVE & DETAILS</span>
@@ -270,7 +270,7 @@ export function MediaNfoPanel({
 
           {/* External Database IDs & Links */}
           {providerIds.length || details?.website || details?.trailers?.length ? (
-            <div className="flex flex-wrap items-center justify-between gap-3 pt-3.5 border-t border-[var(--lux-line-soft)]">
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-3.5">
               <div className="flex flex-wrap items-center gap-2 text-xs">
                 <span className="text-[var(--lux-subtle)] mr-1">外部条目:</span>
                 {providerIds.map(([provider, id]) => (
