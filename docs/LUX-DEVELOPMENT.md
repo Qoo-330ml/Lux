@@ -19489,6 +19489,84 @@ Emby 路由、不改 `web/` 的界面**（D3 另做）。依赖 LUX-877 的 `sea
 第 2 轮返工：新增上述两列迁移，创建手动作业不再写 `danmaku_tracks`；provider 取自作业项；手动/自动
 只看 `job.kind`；手动作业重试按 `kind` 分支。
 
+#### LUX-881：Emby 图片路由接入派生图片变体缓存
+
+背景：LUX-826 的 `ImageVariantService` 只有 Lux API（`/api/v1/items/{id}/images/{type}`）在用。Emby 的
+`/Items/{id}/Images/{type}` 与 `/Items/{id}/Images/{type}/{index}` 调用 `serve_image` 时 variants 与
+width 都传 `None`，第三方 Emby 客户端一直拿原图。
+
+范围：让 Emby 客户端按其请求的尺寸参数命中 LUX-826 已经存在的同一份变体缓存（档位
+`IMAGE_VARIANT_WIDTHS = [360, 720, 1280]`，按长边，缓存目录 `/config/image-cache/v1/`）。不改客户端、
+不新增配置项、不改 Web 前端、不动数据库与迁移、不新增依赖；仍只由管理员全局
+`variantCache.enabled` 控制，关闭时响应字节、ETag 与 `Cache-Control` 与实施前完全一致。
+
+- 尺寸解析放在 Emby 层：新增 `EmbyImageDisplayQuery`（`src/api/emby_handlers.rs`），从原始查询串按
+  大小写不敏感匹配 `maxWidth`/`maxHeight`/`width`/`height`，`maxWidth`/`maxHeight` 优先于
+  `width`/`height`；`0` 与无法解析的值视为未提供。`format` 存在且不是 `jpg`/`jpeg`，或出现
+  `blur`、`percentPlayed`、`unplayedCount`、`addPlayedIndicator` 任一叠加参数时保持原图（缓存变体是
+  无叠加的 JPEG）。Lux API 的 `LuxImageQuery` 与 DTO 未改动。
+- 选档纯函数 `variant_width_for_display_size`（`src/application/image_variants.rs`）：按“客户端把图片
+  等比缩放进 `maxWidth`×`maxHeight` 框”的语义，两条提示各自换算出的所需长边取较小者，返回不小于该
+  长边的最小档位；两者都不给、原图尺寸未知、所需长边 ≥ 原图长边（不放大）或 > 1280 时返回 `None`
+  即原图。换算向上取整，避免差一个像素掉到更小档位。竖版 2:3 海报 `maxWidth=300` → 所需长边 450 →
+  返回 720。
+- 接入：`serve_image` 的最后一个参数由 `Option<u32>` 换成 `ImageVariantRequest`（`Original` /
+  `Width` / `DisplaySize`），Lux API 继续传精确宽度，Emby 传显示框；`serve_tagged_image` 的参数收敛为
+  `ServeTaggedImageTarget` 结构体并接收同一请求类型。Emby 带 principal 的两个分支与
+  `serve_tagged_image`（带 tag、无登录）都对解析结果调用 `resolve_variant`。`serve_filmly_compat_image`、
+  媒体库封面与人物头像路径未改，鉴权/权限顺序未动；未命中、生成失败、缓存不可写、超时仍回退原图，
+  响应与现状一致。类型限制仍由 `resolve_variant` 负责（只处理 POSTER/THUMB/FANART）。
+
+预计文件：`src/application/image_variants.rs`、`src/api/emby_handlers.rs`、`src/api/media.rs`、
+`tests/images/image_variants.rs`、`docs/TEST-TARGETS.md`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`、
+`docs/CHANGELOG.md`。
+
+验收：
+
+- [x] 选档纯函数覆盖竖版、横版、仅宽、仅高、两个提示取较小、超 1280、原图较小、缺尺寸、零值与
+      原图尺寸未知。
+- [x] 开启时 Emby 带 `maxWidth=300` 返回 JPEG 变体（1600×2400 夹具 → 480×720）、ETag 以 `-w720"`
+      结尾、`Cache-Control` 为 `private, max-age=31536000, immutable`，文件落在
+      `/config/image-cache/v1/<shard>/<item>/<content_tag>-w720.jpg`。
+- [x] `MaxWidth`/`maxwidth`、仅 `maxHeight`、`width`+`format=jpg`、`height`+`format=JPEG` 都命中同一档。
+- [x] 全局开关关闭时带尺寸参数返回与原图逐字节相同的响应、`Cache-Control: private, max-age=3600`，
+      且不创建缓存目录。
+- [x] 开启但无尺寸参数、`format=png`、带 `blur`/`percentPlayed`/`unplayedCount`/`addPlayedIndicator`
+      时返回原图。
+- [x] tagged 路径（`?tag=<item_images.id>&maxWidth=300`，无登录）同样返回宽度 720 的变体。
+- [x] 越权行为不变：匿名无 tag 仍 401，无媒体库访问权限的用户仍 404，不存在的条目仍 404，且这些请求
+      不会创建缓存文件。
+
+实施结果（2026-11-04，本机 `uname -m` = `arm64`）：按 TDD 分两次提交——先加选档纯函数与单测
+（失败编译 → 通过），再加 Emby 尺寸解析、`ImageVariantRequest` 与三条路由的接入。`serve_image` 参数
+数量保持 7 个，`serve_tagged_image` 由 7 个收敛到 6 个。`resolve_variant` 改为复用新的
+`source_pixel_dimensions`（与原实现一致，另把超过 `u32::MAX` 的尺寸按未知处理）。集成测试新增 6 条
+Emby 用例放在既有 `image_variants` 模块（`--test images image_variants::`），`docs/TEST-TARGETS.md`
+的 `image_variants` 模块（9 → 15）、`--test images` 组（55 → 61）与两处合计（904 → 910、1018 → 1024）
+按当前 `--list` 同步。
+
+验证命令与结果（本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 上验证）：
+
+- `cargo build --locked` 通过。
+- `cargo test --locked --lib application::image_variants` 21/21 通过（含新增 5 条选档/请求形态用例）。
+- `cargo test --locked --lib emby_image_display_query` 4/4 通过（大小写别名、缺省/零值/越界值、非 JPEG
+  `format`、叠加参数）。
+- `cargo test --locked --test images image_variants::` 15/15 通过。
+- `cargo test --locked --test emby` 39/39 通过（Emby 兼容层回归）。
+- `cargo test --locked --test images` 60 通过 / 1 失败，失败项为
+  `image_writer::manual_scraper_image_selection_claims_one_attempt_for_the_same_image`。该用例在
+  `docs/TEST-TARGETS.md` 已记录为“两个并发任务需落在同一 40 ms 窗口、高负载下退化成串行”的时序敏感
+  用例；单独重跑该用例 1/1 通过，与本任务无关。
+- `cargo fmt --all -- --check` 通过；`git diff --check` 通过。
+- `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过，本次运行没有告警输出
+  （当前基线上 LUX-826/LUX-880 记录的既有 `too_many_arguments`、`type_complexity` 等诊断在并行改动
+  合并后已不再出现）；本任务没有新增 lint 抑制，`serve_image` 仍为 7 个参数。
+
+限制与剩余风险：冷缓存首次请求仍按 LUX-826 的 300 ms 响应预算回退原图，变体在后台生成，客户端下一次
+刷新才会命中；Emby 客户端若在 URL 上带 `EnableImageEnhancers=true` 以外的裁剪/圆角要求，Lux 仍只按
+尺寸命中，不做裁剪（与 LUX-826 一致）；Emby 的 `quality` 参数未参与选档；未在真实第三方 Emby 客户端
+（如 VidHub、Hills）上实测，仅用 HTTP 回归覆盖请求形状。变体缓存默认关闭，未开启时行为与字节完全不变。
+
 ## 31. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

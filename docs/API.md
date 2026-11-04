@@ -340,7 +340,7 @@ Emby 目录查询要求有效 `X-Emby-Token` 或 `api_key`：
 - `GET /Shows/{seriesId}/Episodes?SeasonId={seasonId}&StartIndex=0&Limit=50`：返回剧集，可省略 `SeasonId` 获取整部剧集，支持分页；对齐 Emby 语义，省略 `StartIndex` 和 `Limit` 时返回完整剧集列表（Lux 设置 4,096 集安全上限），显式传入 `Limit` 时按该值分页。
 - `GET /Users/{userId}/Items/NextUp`：按该用户的播放状态返回未看完单集。
 - `GET /Shows/NextUp?UserId={userId}`：返回与 Emby 客户端兼容的用户未看完单集列表，支持 `StartIndex`、`Limit` 和 `Fields`。
-- `GET|HEAD /Items/{itemId}/Images/{Type}`、`/{Type}/{Index}`：读取与 Lux API 相同的本地图片记录，支持 `X-Emby-Token` 或 `api_key`。
+- `GET|HEAD /Items/{itemId}/Images/{Type}`、`/{Type}/{Index}`：读取与 Lux API 相同的本地图片记录，支持 `X-Emby-Token` 或 `api_key`。带 `maxWidth`/`maxHeight` 或 `width`/`height`（大小写不敏感）时，在管理员全局图片变体缓存开启的情况下按显示框返回对应档位（长边 360/720/1280）的 JPEG 变体，ETag 带宽度；无尺寸参数、`format` 不是 `jpg`/`jpeg`，或带 `blur`、`percentPlayed`、`unplayedCount`、`addPlayedIndicator` 等叠加参数时返回原图。
 - `GET /api/danmu/{itemId}`：返回旁车 XML 的兼容信息和读取地址；支持 `option=Refresh`、`option=GetJsonById` 别名，但不会在客户端请求中访问上游。
 - `GET /api/danmu/{itemId}/raw`：读取同目录同 basename 的有效 `.xml` 旁车，返回 `application/xml; charset=utf-8`；需要 `X-Emby-Token` 或 `api_key`，并执行媒体库 ACL。
 - `GET /Users/{userId}/Items/Resume`：按用户播放位置、已看状态和服务器 Resume 阈值返回继续观看列表。

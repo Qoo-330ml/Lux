@@ -15,12 +15,12 @@
 | `--test scanner` | 媒体库扫描、增量/混合扫描、计划任务、作业事件与关停 | 7 | 151 |
 | `--test library` | 媒体库生命周期、合并/拆分、集合、目录与系列 API | 12 | 50 |
 | `--test metadata` | 元数据抓取与选择、NFO 回写、扫描后剧集元数据、人物、字幕 | 14 | 143 |
-| `--test images` | 图片变体、写回、缩略图与图片 API | 6 | 55 |
+| `--test images` | 图片变体、写回、缩略图与图片 API | 6 | 61 |
 | `--test playback` | 播放、播放令牌/历史/续播、观看状态归档、章节与片头片尾检测 | 10 | 35 |
 | `--test storage` | SQLite/PostgreSQL 存储、迁移、WAL、数据库维护与启动守卫 | 9 | 116 |
 | `--test plugins` | 插件协议与运行时、弹幕、IP 属地、媒体信息插件配置 | 11 | 120 |
 | `--test strm` | STRM 目标解析/探测/播放与 ffprobe | 9 | 42 |
-| 合计（12 组） |  | 126 | 904 |
+| 合计（12 组） |  | 126 | 910 |
 
 另有 7 个 binary 因为进程级共享状态或外部服务依赖保持独立，见第 4 节：`--test background_work_budget`、`--test image_variants_perf`、`--test performance`、`--test postgres_database`、`--test reidentify`、`--test scanned_metadata`、`--test shutdown`。合计 12 + 7 = 19 个集成测试 target。
 
@@ -121,7 +121,7 @@ cargo test --locked --test <新 target> <旧名>::
 | `series_metadata` | 3 | `cargo test --locked --test metadata series_metadata::` |
 | `subtitles` | 1 | `cargo test --locked --test metadata subtitles::` |
 | `image_api` | 1 | `cargo test --locked --test images image_api::` |
-| `image_variants` | 9 | `cargo test --locked --test images image_variants::` |
+| `image_variants` | 15 | `cargo test --locked --test images image_variants::` |
 | `image_writer` | 20 | `cargo test --locked --test images image_writer::` |
 | `images` | 3 | `cargo test --locked --test images images::` |
 | `thumbnails` | 19 | `cargo test --locked --test images thumbnails::` |
@@ -172,7 +172,7 @@ cargo test --locked --test <新 target> <旧名>::
 | `reidentify` | 25 | `cargo test --locked --test reidentify`（本来就没有合并） |
 | `scanned_metadata` | 23 | `cargo test --locked --test scanned_metadata`（本来就没有合并） |
 | `shutdown` | 2 | `cargo test --locked --test shutdown`（本来就没有合并） |
-| **合计** | **1018** |  |
+| **合计** | **1024** |  |
 
 ## 3. 只跑某一个原文件的测试
 
