@@ -19509,7 +19509,11 @@ width 都传 `None`，第三方 Emby 客户端一直拿原图。
   等比缩放进 `maxWidth`×`maxHeight` 框”的语义，两条提示各自换算出的所需长边取较小者，返回不小于该
   长边的最小档位；两者都不给、原图尺寸未知、所需长边 ≥ 原图长边（不放大）或 > 1280 时返回 `None`
   即原图。换算向上取整，避免差一个像素掉到更小档位。竖版 2:3 海报 `maxWidth=300` → 所需长边 450 →
-  返回 720。
+  返回 720。图片行的 `width`/`height` 来自文件头（未旋转），而生成变体时会 `apply_orientation`，方向
+  只有在解码时才知道、请求路径上拿不到，因此选档同时按「已存宽高」和「交换宽高」两种读法各算一次所需
+  长边并取**较大**者：方向未知只会让档位偏保守（更大或回退原图），不会给出客户端还得放大的小档位。
+  例：存为 2400×1600 且方向需旋转的海报，`maxWidth=1000` 按旋转后的 1600×2400 需要 1500 长边，
+  超过 1280，直接返回原图而不是 1280 档。
 - 接入：`serve_image` 的最后一个参数由 `Option<u32>` 换成 `ImageVariantRequest`（`Original` /
   `Width` / `DisplaySize`），Lux API 继续传精确宽度，Emby 传显示框；`serve_tagged_image` 的参数收敛为
   `ServeTaggedImageTarget` 结构体并接收同一请求类型。Emby 带 principal 的两个分支与
@@ -19523,8 +19527,9 @@ width 都传 `None`，第三方 Emby 客户端一直拿原图。
 
 验收：
 
-- [x] 选档纯函数覆盖竖版、横版、仅宽、仅高、两个提示取较小、超 1280、原图较小、缺尺寸、零值与
-      原图尺寸未知。
+- [x] 选档纯函数覆盖竖版、横版、仅宽、仅高、两个提示取较小、超 1280、原图较小、缺尺寸、零值、
+      原图尺寸未知，以及 EXIF 方向未知时按两种宽高读法取较大所需长边（2400×1600 + `maxWidth=1000`
+      不得选 1280，返回原图）。
 - [x] 开启时 Emby 带 `maxWidth=300` 返回 JPEG 变体（1600×2400 夹具 → 480×720）、ETag 以 `-w720"`
       结尾、`Cache-Control` 为 `private, max-age=31536000, immutable`，文件落在
       `/config/image-cache/v1/<shard>/<item>/<content_tag>-w720.jpg`。
@@ -19534,6 +19539,8 @@ width 都传 `None`，第三方 Emby 客户端一直拿原图。
 - [x] 开启但无尺寸参数、`format=png`、带 `blur`/`percentPlayed`/`unplayedCount`/`addPlayedIndicator`
       时返回原图。
 - [x] tagged 路径（`?tag=<item_images.id>&maxWidth=300`，无登录）同样返回宽度 720 的变体。
+- [x] 带索引的 `/Items/{id}/Images/Primary/0?maxWidth=300` 同样命中：带 principal 与 tagged
+      （无登录）两条都返回 480×720 的 JPEG 变体，ETag 以 `-w720"` 结尾。
 - [x] 越权行为不变：匿名无 tag 仍 401，无媒体库访问权限的用户仍 404，不存在的条目仍 404，且这些请求
       不会创建缓存文件。
 
@@ -19542,16 +19549,24 @@ width 都传 `None`，第三方 Emby 客户端一直拿原图。
 数量保持 7 个，`serve_tagged_image` 由 7 个收敛到 6 个。`resolve_variant` 改为复用新的
 `source_pixel_dimensions`（与原实现一致，另把超过 `u32::MAX` 的尺寸按未知处理）。集成测试新增 6 条
 Emby 用例放在既有 `image_variants` 模块（`--test images image_variants::`），`docs/TEST-TARGETS.md`
-的 `image_variants` 模块（9 → 15）、`--test images` 组（55 → 61）与两处合计（904 → 910、1018 → 1024）
+的 `image_variants` 模块（9 → 16）、`--test images` 组（55 → 62）与两处合计（904 → 911、1018 → 1025）
 按当前 `--list` 同步。
+
+返工（2026-11-04，审查提出的两个 P3）：① EXIF 方向——选档改用「两种宽高读法取较大所需长边」的保守
+规则（见范围第二条），并补 `display_box_covers_both_exif_orientations`（原始 2400×1600 且方向需旋转、
+`maxWidth=1000` 返回 `None`；600 px 宽时取较粗的 1280 档；方图两读法一致）。原「仅高 300 → 360」用例
+因同一原因改为 720，并新增「短边上的宽度换算两读法一致」断言。② 带索引路由——新增
+`emby_image_index_route_hits_the_cached_variant`，覆盖 `/Images/Primary/0?maxWidth=300` 的带 principal
+与 tagged（无登录）两条路径。两次返工分别独立提交，`serve_image` / 选档函数签名未变。
 
 验证命令与结果（本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 上验证）：
 
 - `cargo build --locked` 通过。
-- `cargo test --locked --lib application::image_variants` 21/21 通过（含新增 5 条选档/请求形态用例）。
+- `cargo test --locked --lib application::image_variants` 22/22 通过（含 5 条选档/请求形态用例与
+  返工新增的方向保守用例）。
 - `cargo test --locked --lib emby_image_display_query` 4/4 通过（大小写别名、缺省/零值/越界值、非 JPEG
   `format`、叠加参数）。
-- `cargo test --locked --test images image_variants::` 15/15 通过。
+- `cargo test --locked --test images image_variants::` 16/16 通过（含带索引路由用例）。
 - `cargo test --locked --test emby` 39/39 通过（Emby 兼容层回归）。
 - `cargo test --locked --test images` 60 通过 / 1 失败，失败项为
   `image_writer::manual_scraper_image_selection_claims_one_attempt_for_the_same_image`。该用例在
