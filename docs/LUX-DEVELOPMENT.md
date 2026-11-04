@@ -19340,9 +19340,28 @@ setup 启动的首轮 `RECONCILE_LIBRARY` 扫描，因此启动流程新增“�
 `SubtitleLocationType: "InternalStream"`，不输出 `DeliveryUrl`。流级 `Path` 只对本地外挂字幕输出
 文件名（不输出绝对路径，遵守“不记录/不泄露完整路径”）。不新增路由，不改字幕下载行为。
 
-验收：先确认既有字幕路由在 `.srt/.ass/.vtt` 后缀下可用并有测试；新增 DTO 用例；STRM 与本地源都覆盖；
-安全检查：响应不含绝对路径、token 或外部 URL；通用检查同 LUX-878。**实现前须先在本任务里确认 Hills 是否
-真的使用 Delivery* 字段，否则只记录结论、不改行为。**
+实现结论与验收（2026-11-04，本机 `uname -m` = `arm64`）：
+
+- Hills 是否使用 Delivery* 字段：逆向只确认它**解析**这 5 个键，使用方式仍是推断；项目所有者明确要求实现，
+  这些是标准 Emby 字段，对不读取它们的客户端无影响，因此照规格实现。
+- 既有字幕路由原先**只有无后缀的 `…/Stream`**，带 `.srt/.ass/.vtt` 后缀会 404，所以本任务新增
+  `/Videos/{item}/{source}/Subtitles/{index}/Stream.{format}` 路由（后缀仅是格式提示，处理函数与无后缀路由
+  共用，ACL/鉴权不变），并让 `is_emby_subtitle_path` 接受 `Stream` 或 `Stream.<1–8 位字母数字>`。
+- 字幕流输出：外挂 → `DeliveryMethod: "External"`、`SubtitleLocationType: "ExternalFile"`、
+  `IsExternalUrl: false`、相对 `DeliveryUrl`（`/Videos/<item>/<source>/Subtitles/<index>/Stream.<ext>`，
+  `srt/subrip→srt`、`ass/ssa→ass`、`vtt/webvtt→vtt`，未知编码用无后缀路由；id 经百分号编码，不含 token、
+  查询串或外部 URL）；内嵌 → `Embed`、`InternalStream`，无 `DeliveryUrl`。视频/音频流不输出这些键。
+- 流级 `Path` **未实现**：`CatalogStream` 没有外挂文件路径字段，补它需要改存储读取层；且没有证据表明 Hills
+  使用它，也不应向客户端暴露路径。留待有证据时再做。
+- [x] `cargo test --locked --lib emby_catalog::` 43/43（外挂各编码、未知编码、内嵌、非字幕流无字段、
+  id 编码与无凭据）；`--lib api::` 180/180（含 `is_emby_subtitle_path` 后缀用例）。
+- [x] `cargo test --locked --test metadata subtitles::` 1/1：`DeliveryUrl` 无凭据，用该 URL 与
+  `Stream.srt` 都能取到字幕文件，无权限用户对带后缀路径同样 404；`--test emby` 39/39、
+  `--test playback` 33/33、`--test api_web acl::` 1/1、`--test library series_api::` 1/1。
+- [x] `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+  `scripts/check-migration-parity.py`、`scripts/check-backend-branches.py` 通过。本次没有重跑完整的
+  `--all-targets` 完成门；LUX-878 的完成门结果见上，6 条基线失败与本任务无关。
+- [ ] 未验证：Hills 是否真的使用 `DeliveryUrl` 加载外挂字幕；需要在真机上带外挂字幕的资源上复测。
 
 依赖：LUX-878。
 

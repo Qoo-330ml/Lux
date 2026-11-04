@@ -34,6 +34,14 @@ Lux 侧改动（`src/api/emby_catalog.rs`、`src/application/probe.rs`，无迁�
 
 未验证：升级后 Hills 的实际显示未在真机复测；本地为 ARM64 宿主，不外推到 NAS/x86_64。
 
+### LUX-879 外挂字幕 Delivery 字段（2026-11-04）
+
+- 字幕流新增 `DeliveryMethod`（外挂 `External` / 内嵌 `Embed`）、`SubtitleLocationType`
+  （`ExternalFile` / `InternalStream`）、`IsExternalUrl: false`；外挂字幕另有相对 `DeliveryUrl`
+  `/Videos/<item>/<source>/Subtitles/<index>/Stream.<srt|ass|vtt>`（未知编码用无后缀路由），不含 token。
+- 新增带格式后缀的字幕路由 `…/Subtitles/{index}/Stream.{format}`，与无后缀路由共用处理与 ACL。
+- 推断：Hills 解析这些键；它是否用 `DeliveryUrl` 加载外挂字幕未确认。流级 `Path` 未输出。
+
 ## Emby 筛选辅助端点：Genres、Studios、Years（2026-11-02）
 
 - 新增 `GET /Genres`、`/Studios`、`/Years`（同样挂在 `/emby` 前缀下，路径大小写不敏感）。需要 Emby token，按用户的媒体库权限和内容限制收窄；支持 `UserId`、`ParentId`（仅媒体库 ID，未授权或未知返回 404）、`IncludeItemTypes`、`StartIndex`、`Limit`（上限与 `/Persons` 相同，超限 400）。返回 `{ Items, TotalRecordCount, StartIndex }`，每项含 `Name`、不透明的 `Id`、`Type`（`Genre`/`Studio`/`Year`）和 `ChildCount`（可见条目数）；`Genres`、`Studios` 按名称排序，`Years` 由新到旧。
