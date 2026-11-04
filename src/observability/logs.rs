@@ -18,25 +18,37 @@ pub const MAX_LOG_ARCHIVES: usize = 20;
 const DEFAULT_EXPORT_DAYS: i64 = 7;
 const MAX_DAILY_LOG_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXPORT_BYTES: u64 = 128 * 1024 * 1024;
-/// Hard ceiling on the decompressed bytes one activity/audit page request may scan.
+/// Byte budget for the polled activity list.
 ///
-/// The admin dashboard polls the activity list every 15 seconds, so the read must stay cheap even
-/// when the retained log volume is large. Both daily files and archive members are read from their
-/// newest end first (see `read_daily_log_file` and `read_archive_member`), so the ceiling keeps the
-/// most recent records and drops older ones.
+/// The admin dashboard asks for this list every 15 seconds, so the read must stay cheap even when
+/// the retained log volume is large. Daily files and archive members are read from their newest end
+/// first (see `read_daily_log_file` and `read_archive_member`), and the read gives up once the
+/// budget is spent. Two honest consequences, both accepted for the polling path: the list can come
+/// back shorter than the login/playback quotas when the newest bytes carry too few activity records,
+/// and the truncation flag returned by `scan_log_records` is not reported to anyone.
+///
+/// Admin pages that must not silently miss older records use `MAX_RETAINED_SCAN_BYTES` instead.
 const MAX_EVENT_SCAN_BYTES: u64 = 16 * 1024 * 1024;
-/// Bytes one job-event page may scan.
+/// Byte ceiling for the admin pages that must not silently miss older records: the audit list and
+/// one job's event list.
 ///
-/// The response carries an exact `total`, so this path has to cover the whole retained volume
-/// instead of stopping early; the ceiling is derived from the retention constants so a large
-/// installation never loses older events from the admin job page. Only an administrator opening one
-/// job's event list pays for it (it is not on the dashboard polling path), and the read is still
-/// streamed with the byte prefilter and a page-sized buffer, so memory stays bounded even though the
-/// disk read is proportional to the retained volume.
-const MAX_JOB_EVENT_SCAN_BYTES: u64 = LOG_SEGMENT_BYTES.saturating_mul(MAX_LOG_ARCHIVES as u64 + 2);
+/// Both are opened on demand instead of being polled, so they may cover the whole retained volume.
+/// The ceiling is derived from the retention constants rather than hand-picked so a large
+/// installation cannot lose older records from those pages. The readers still stop early once a page
+/// is complete and no older day can outrank it, so the common case only touches the newest segments;
+/// the read is streamed with the byte prefilter and a page-sized buffer, so memory stays bounded even
+/// when the disk read grows with the retained volume.
+///
+/// The job-event `total` is exact within the steady-state retention (at most `MAX_LOG_ARCHIVES`
+/// archives plus the daily files). Log migration defers archive pruning
+/// (`storage::database_cleanup`), which can leave one extra archive per migrated day; while that
+/// happens the source count can exceed `MAX_EVENT_SCAN_FILES`, so `total` becomes a lower bound and
+/// the oldest events are unreachable. That window is transient and accepted.
+const MAX_RETAINED_SCAN_BYTES: u64 = LOG_SEGMENT_BYTES.saturating_mul(MAX_LOG_ARCHIVES as u64 + 2);
 /// Hard ceiling on the number of log files one page request may open: the retention keeps at most
-/// `MAX_LOG_ARCHIVES` archived segments plus the daily files still being written (migration batches
-/// can leave one daily file per migrated day).
+/// `MAX_LOG_ARCHIVES` archived segments plus the daily files still being written. Migration batches
+/// can leave one daily file per migrated day, and deferred pruning can leave extra archives, which
+/// is why a lower bound on `total` is possible (see `MAX_RETAINED_SCAN_BYTES`).
 const MAX_EVENT_SCAN_FILES: usize = MAX_LOG_ARCHIVES + 8;
 /// Deep pages are refused instead of materialised.
 ///
@@ -48,7 +60,7 @@ const MAX_LOG_PAGE_WINDOW: usize = 10_000;
 const MAX_EVENT_LINE_BYTES: usize = 1024 * 1024;
 
 const _: () = assert!(
-    MAX_JOB_EVENT_SCAN_BYTES >= LOG_SEGMENT_BYTES.saturating_mul(MAX_LOG_ARCHIVES as u64 + 1)
+    MAX_RETAINED_SCAN_BYTES >= LOG_SEGMENT_BYTES.saturating_mul(MAX_LOG_ARCHIVES as u64 + 1)
 );
 const _: () = assert!(MAX_EVENT_SCAN_FILES > MAX_LOG_ARCHIVES);
 
@@ -910,8 +922,11 @@ where
         let mut reader = io::BufReader::new(file);
         return scan_jsonl(&mut reader, remaining_bytes, on_item);
     }
-    file.seek(SeekFrom::Start(length.saturating_sub(*remaining_bytes)))?;
-    scan_segment_tail(io::BufReader::new(file), remaining_bytes, on_item)
+    // One byte before the budget window is kept so a record starting exactly at the cut survives
+    // (only the previous record's newline is then discarded by `scan_segment_tail`).
+    let skip = length.saturating_sub(remaining_bytes.saturating_add(1));
+    file.seek(SeekFrom::Start(skip))?;
+    scan_segment_tail(io::BufReader::new(file), skip > 0, remaining_bytes, on_item)
 }
 
 /// Reads one archive member, which is a segment of the same append-only JSONL as a daily file.
@@ -935,14 +950,18 @@ where
     if length <= *remaining_bytes {
         return scan_jsonl(&mut reader, remaining_bytes, on_item);
     }
-    discard_bytes(&mut reader, length.saturating_sub(*remaining_bytes))?;
-    scan_segment_tail(reader, remaining_bytes, on_item)
+    // Same one-byte back-off as `read_daily_log_file`: the cut must not swallow a whole record.
+    let skip = length.saturating_sub(remaining_bytes.saturating_add(1));
+    discard_bytes(&mut reader, skip)?;
+    scan_segment_tail(reader, skip > 0, remaining_bytes, on_item)
 }
 
-/// Parses a segment tail after its head was skipped: the skip can land inside a record, so the
-/// fragment is dropped instead of being parsed. Always reports `Stop` because the head was skipped.
+/// Parses a segment tail after its head was skipped: the skip can land inside a record, so that
+/// fragment is dropped instead of being parsed. Always reports `Stop` because the head was skipped,
+/// which means nothing older is reachable from this source.
 fn scan_segment_tail<R, F>(
     mut reader: R,
+    head_skipped: bool,
     remaining_bytes: &mut u64,
     on_item: &mut F,
 ) -> io::Result<ScanControl>
@@ -950,9 +969,14 @@ where
     R: io::BufRead,
     F: FnMut(ScanItem<'_>) -> io::Result<ScanControl>,
 {
-    if discard_partial_line(&mut reader)? {
-        scan_jsonl(&mut reader, remaining_bytes, on_item)?;
+    // The caller kept one byte before the budget window, so the parser may spend one extra byte: a
+    // record that starts exactly at the cut then survives intact.
+    let mut budget = (*remaining_bytes).saturating_add(1);
+    let parseable = !head_skipped || discard_partial_line(&mut reader)?;
+    if parseable {
+        scan_jsonl(&mut reader, &mut budget, on_item)?;
     }
+    *remaining_bytes = 0;
     Ok(ScanControl::Stop)
 }
 
@@ -1137,7 +1161,7 @@ fn read_scan_job_events(
     };
     let mut collector = PageCollector::new(offset, limit);
     let job_id_bytes = job_id.as_bytes();
-    scan_log_records(log_dir, archive_dir, MAX_JOB_EVENT_SCAN_BYTES, |item| {
+    scan_log_records(log_dir, archive_dir, MAX_RETAINED_SCAN_BYTES, |item| {
         if let ScanItem::Line(line) = item
             && contains_bytes(line, b"scan_job_event")
             && contains_bytes(line, job_id_bytes)
@@ -1145,10 +1169,13 @@ fn read_scan_job_events(
         {
             collector.push(event);
         }
-        // The API response carries an exact `total`, so every file still has to be visited.
+        // The response carries a `total` that must be exact inside the steady-state retention, so
+        // every file still has to be visited (no date-based early stop on this path).
         Ok(ScanControl::Continue)
     })?;
-    // Exact while the whole retained log fit into the scan ceiling, a lower bound once it was cut.
+    // Exact for the steady-state retention; a lower bound when the scan was cut by the byte or file
+    // ceiling, which is only reachable while log migration defers archive pruning (see
+    // `MAX_RETAINED_SCAN_BYTES`).
     let total = i64::try_from(collector.distinct_total()).unwrap_or(i64::MAX);
     Ok((total, collector.into_page()))
 }
@@ -1307,10 +1334,13 @@ fn read_audit_events(
         return Ok((0, Vec::new()));
     };
     let mut collector = PageCollector::new(offset, limit);
+    // The audit page is opened on demand, never polled, so it must not silently miss older records
+    // just because the newest segments are full of other records: use the full-retention ceiling.
+    // The date-based early stop below keeps the common case to the newest segment(s).
     scan_log_records(
         log_dir,
         archive_dir,
-        MAX_EVENT_SCAN_BYTES,
+        MAX_RETAINED_SCAN_BYTES,
         |item| match item {
             ScanItem::Line(line) => {
                 if contains_bytes(line, b"admin_audit_event")
@@ -1342,7 +1372,7 @@ fn read_audit_events(
             }
         },
     )?;
-    // Exact while the whole log fit into the scan ceiling, a lower bound once it was truncated.
+    // Exact while the scan reached every source, a lower bound once it was cut or stopped early.
     // Every current caller of this path discards the total (see `admin_list_audit`).
     let total = i64::try_from(collector.distinct_total()).unwrap_or(i64::MAX);
     Ok((total, collector.into_page()))
@@ -1360,6 +1390,10 @@ fn read_activity_events(
     let category_limit = usize::try_from((limit / 2).max(1)).unwrap_or(usize::MAX);
     let mut login_events = PageCollector::new(0, category_limit);
     let mut playback_events = PageCollector::new(0, category_limit);
+    // Polled every 15 seconds, so this path keeps the small polling budget: when the newest 16 MiB
+    // hold too few activity records the result is shorter than the per-category quota instead of
+    // reading older segments, and the truncation flag returned by `scan_log_records` is ignored.
+    // (The dashboard is expected to move to the SQLite activity index; see the task notes.)
     scan_log_records(
         log_dir,
         archive_dir,
@@ -2145,11 +2179,11 @@ mod tests {
 
     use super::{
         AuditLogEvent, LOG_SEGMENT_BYTES, LogDateRange, LogExport, LogExportError, LogManager,
-        LogStore, MAX_EVENT_SCAN_BYTES, MAX_EVENT_SCAN_FILES, MAX_JOB_EVENT_SCAN_BYTES,
-        MAX_LOG_ARCHIVES, MAX_LOG_PAGE_WINDOW, NewAuditLogEvent, ScanJobLogEvent, archive_dir,
-        export_logs, log_dir, log_file_name, log_segment_file_name, parse_date,
-        read_activity_events, read_audit_events, read_scan_job_events, sort_audit_events,
-        verify_archive,
+        LogStore, MAX_EVENT_SCAN_BYTES, MAX_EVENT_SCAN_FILES, MAX_LOG_ARCHIVES,
+        MAX_LOG_PAGE_WINDOW, MAX_RETAINED_SCAN_BYTES, NewAuditLogEvent, ScanControl, ScanItem,
+        ScanJobLogEvent, archive_dir, export_logs, log_dir, log_file_name, log_segment_file_name,
+        parse_date, read_activity_events, read_archive_member, read_audit_events,
+        read_daily_log_file, read_scan_job_events, sort_audit_events, verify_archive,
     };
     use serde_json::Value;
     use time::{Date, Month, OffsetDateTime};
@@ -2613,6 +2647,43 @@ mod tests {
         Ok(())
     }
 
+    /// Runs `read_daily_log_file` with an explicit budget and returns the parsed JSONL records.
+    fn scan_tail_lines(config_dir: &Path, date: Date, budget: u64) -> io::Result<Vec<String>> {
+        let file = fs::File::open(log_dir(config_dir).join(log_file_name(date)))?;
+        let mut remaining = budget;
+        let mut lines = Vec::new();
+        read_daily_log_file(file, &mut remaining, &mut |item| {
+            if let ScanItem::Line(line) = item {
+                lines.push(String::from_utf8_lossy(line).into_owned());
+            }
+            Ok(ScanControl::Continue)
+        })?;
+        Ok(lines)
+    }
+
+    /// Runs `read_archive_member` with an explicit budget and returns the parsed JSONL records.
+    fn scan_archive_tail_lines(
+        config_dir: &Path,
+        date: Date,
+        sequence: u64,
+        budget: u64,
+    ) -> io::Result<Vec<String>> {
+        let path =
+            archive_dir(config_dir).join(format!("{}.zip", log_segment_file_name(date, sequence)));
+        let mut archive = zip::ZipArchive::new(fs::File::open(path)?).map_err(io::Error::other)?;
+        let member = archive.by_index(0).map_err(io::Error::other)?;
+        let size = member.size();
+        let mut remaining = budget;
+        let mut lines = Vec::new();
+        read_archive_member(member, size, &mut remaining, &mut |item| {
+            if let ScanItem::Line(line) = item {
+                lines.push(String::from_utf8_lossy(line).into_owned());
+            }
+            Ok(ScanControl::Continue)
+        })?;
+        Ok(lines)
+    }
+
     fn collect_reference_json_lines(payload: &[u8], lines: &mut Vec<Vec<u8>>) {
         for line in payload.split(|byte| *byte == b'\n') {
             if !line.is_empty() {
@@ -3071,9 +3142,16 @@ mod tests {
         let config_dir = temp_dir.path();
         let newest = fixture_date("2026-08-09");
         let previous = fixture_date("2026-08-08");
+        // The polled activity list keeps the small 16 MiB budget, so an oversized segment makes the
+        // ceiling observable end to end.
         let padding = "p".repeat(48 * 1024);
         let noise_lines = usize::try_from(MAX_EVENT_SCAN_BYTES / (48 * 1024)).unwrap_or(0) + 32;
-        let mut payload = Vec::with_capacity(noise_lines);
+        let mut payload = Vec::with_capacity(noise_lines + 5);
+        payload.push(audit_fixture_line(
+            "head-login",
+            "AUTH_LOGIN",
+            day_start(newest) + 1,
+        ));
         for index in 0..noise_lines {
             payload.push(
                 serde_json::json!({"recordType": "program_log", "message": format!("{index}-{padding}")})
@@ -3082,31 +3160,48 @@ mod tests {
         }
         // The newest records sit at the end of the oversized segment: the tail must be read first.
         payload.push(audit_fixture_line(
-            "tail-1",
-            "SETTINGS_UPDATED",
-            day_start(newest) + 60,
+            "login-1",
+            "AUTH_LOGIN",
+            day_start(newest) + 100,
         ));
         payload.push(audit_fixture_line(
-            "tail-2",
-            "SETTINGS_UPDATED",
+            "login-2",
+            "AUTH_LOGIN",
             day_start(newest) + 120,
+        ));
+        payload.push(audit_fixture_line(
+            "playback-1",
+            "PLAYBACK_STARTED",
+            day_start(newest) + 140,
+        ));
+        payload.push(audit_fixture_line(
+            "playback-2",
+            "PLAYBACK_STOPPED",
+            day_start(newest) + 160,
         ));
         write_daily_segment(config_dir, newest, &payload)?;
         write_daily_segment(
             config_dir,
             previous,
-            &[audit_fixture_line(
-                "unreachable",
-                "SETTINGS_UPDATED",
-                day_start(previous),
-            )],
+            &[
+                audit_fixture_line("unreachable-login", "AUTH_LOGIN", day_start(previous) + 10),
+                audit_fixture_line(
+                    "unreachable-playback",
+                    "PLAYBACK_STARTED",
+                    day_start(previous) + 20,
+                ),
+            ],
         )?;
 
-        let (_, page) =
-            read_audit_events(&log_dir(config_dir), &archive_dir(config_dir), 0, 10, None)?;
+        let events = read_activity_events(&log_dir(config_dir), &archive_dir(config_dir), 4)?;
         assert_eq!(
-            event_ids(&page, |event| event.id.as_str()),
-            ["tail-2".to_owned(), "tail-1".to_owned()],
+            event_ids(&events, |event| event.id.as_str()),
+            [
+                "playback-2".to_owned(),
+                "playback-1".to_owned(),
+                "login-2".to_owned(),
+                "login-1".to_owned(),
+            ],
             "the byte ceiling must return the newest records and stop before older segments"
         );
         Ok(())
@@ -3119,14 +3214,15 @@ mod tests {
         let config_dir = temp_dir.path();
         let newest = fixture_date("2026-08-09");
         let previous = fixture_date("2026-08-08");
-        // An archived segment is a rotated daily file: its oldest records come first.
+        // An archived segment is a rotated daily file: its oldest records come first. Reading it
+        // through the polled activity path keeps the 16 MiB budget observable end to end.
         let padding = "p".repeat(48 * 1024);
         let noise_lines = usize::try_from(MAX_EVENT_SCAN_BYTES / (48 * 1024)).unwrap_or(0) + 32;
-        let mut payload = Vec::with_capacity(noise_lines + 3);
+        let mut payload = Vec::with_capacity(noise_lines + 5);
         payload.push(audit_fixture_line(
-            "head-oldest",
-            "SETTINGS_UPDATED",
-            day_start(newest),
+            "head-login",
+            "AUTH_LOGIN",
+            day_start(newest) + 1,
         ));
         for index in 0..noise_lines {
             payload.push(
@@ -3135,14 +3231,24 @@ mod tests {
             );
         }
         payload.push(audit_fixture_line(
-            "tail-1",
-            "SETTINGS_UPDATED",
-            day_start(newest) + 60,
+            "login-1",
+            "AUTH_LOGIN",
+            day_start(newest) + 100,
         ));
         payload.push(audit_fixture_line(
-            "tail-2",
-            "SETTINGS_UPDATED",
+            "login-2",
+            "AUTH_LOGIN",
             day_start(newest) + 120,
+        ));
+        payload.push(audit_fixture_line(
+            "playback-1",
+            "PLAYBACK_STARTED",
+            day_start(newest) + 140,
+        ));
+        payload.push(audit_fixture_line(
+            "playback-2",
+            "PLAYBACK_STOPPED",
+            day_start(newest) + 160,
         ));
         write_log_archive(config_dir, newest, 1, &payload)?;
         // The oversized member is the newest source: older archives must stay unopened.
@@ -3152,14 +3258,21 @@ mod tests {
             b"not a zip archive",
         )?;
 
-        let (_, page) =
-            read_audit_events(&log_dir(config_dir), &archive_dir(config_dir), 0, 10, None)?;
+        let events = read_activity_events(&log_dir(config_dir), &archive_dir(config_dir), 4)?;
         assert_eq!(
-            event_ids(&page, |event| event.id.as_str()),
-            ["tail-2".to_owned(), "tail-1".to_owned()],
+            event_ids(&events, |event| event.id.as_str()),
+            [
+                "playback-2".to_owned(),
+                "playback-1".to_owned(),
+                "login-2".to_owned(),
+                "login-1".to_owned(),
+            ],
             "an over-budget archive member must be read from its newest end"
         );
-        assert_eq!(page.len(), 2, "the skipped head must not leak its records");
+        assert!(
+            !events.iter().any(|event| event.id == "head-login"),
+            "the skipped head must not leak its records"
+        );
         Ok(())
     }
 
@@ -3257,14 +3370,16 @@ mod tests {
 
     #[test]
     fn retention_ceilings_cover_the_full_retained_log_volume() {
-        // Every retained archive slot plus the daily files still being written must fit, otherwise
-        // older job events would silently disappear from the admin page.
+        // Compile-time retention invariants, kept next to the readers so the relationship stays
+        // visible: the audit page and one job's event page share `MAX_RETAINED_SCAN_BYTES`, and it
+        // must cover every retained archive slot plus the daily files still being written, otherwise
+        // older records would silently disappear from those admin pages.
         const {
-            assert!(MAX_JOB_EVENT_SCAN_BYTES >= LOG_SEGMENT_BYTES * (MAX_LOG_ARCHIVES as u64 + 1));
+            assert!(MAX_RETAINED_SCAN_BYTES >= LOG_SEGMENT_BYTES * (MAX_LOG_ARCHIVES as u64 + 1));
             assert!(MAX_EVENT_SCAN_FILES > MAX_LOG_ARCHIVES);
-            assert!(MAX_EVENT_SCAN_BYTES < MAX_JOB_EVENT_SCAN_BYTES);
-            // The window must at least cover a full console page, and stay small enough to stay
-            // bounded.
+            // The polled activity list deliberately keeps the smaller budget.
+            assert!(MAX_EVENT_SCAN_BYTES < MAX_RETAINED_SCAN_BYTES);
+            // The window must cover a full console page and stay small enough to stay bounded.
             assert!(MAX_LOG_PAGE_WINDOW >= 100);
             assert!(MAX_LOG_PAGE_WINDOW <= 10_000);
         }
@@ -3358,6 +3473,110 @@ mod tests {
                 "offset={offset} limit={limit}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn audit_page_finds_events_behind_a_scan_heavy_newest_segment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path();
+        let newest = fixture_date("2026-08-09");
+        let previous = fixture_date("2026-08-08");
+        // A large scan can fill the newest segment with scan events alone. The polled 16 MiB budget
+        // would be spent before any audit record, so the audit page must use the retention ceiling.
+        let padding = "p".repeat(48 * 1024);
+        let noise_lines = usize::try_from(MAX_EVENT_SCAN_BYTES / (48 * 1024)).unwrap_or(0) + 32;
+        let mut payload = Vec::with_capacity(noise_lines);
+        for index in 0..noise_lines {
+            payload.push(
+                serde_json::json!({
+                    "recordType": "scan_job_event",
+                    "id": format!("scan-{index:05}"),
+                    "jobId": "job-1",
+                    "level": "INFO",
+                    "eventCode": "SCAN_IO",
+                    "message": format!("{index}-{padding}"),
+                    "details": {},
+                    "createdAt": day_start(newest) + i64::try_from(index).unwrap_or(0),
+                })
+                .to_string(),
+            );
+        }
+        write_daily_segment(config_dir, newest, &payload)?;
+        write_log_archive(
+            config_dir,
+            previous,
+            1,
+            &[
+                audit_fixture_line(
+                    "older-audit-1",
+                    "SETTINGS_UPDATED",
+                    day_start(previous) + 60,
+                ),
+                audit_fixture_line("older-audit-2", "USER_CREATED", day_start(previous) + 120),
+            ],
+        )?;
+
+        let (_, page) =
+            read_audit_events(&log_dir(config_dir), &archive_dir(config_dir), 0, 10, None)?;
+        assert_eq!(
+            event_ids(&page, |event| event.id.as_str()),
+            ["older-audit-2".to_owned(), "older-audit-1".to_owned()],
+            "the audit page must not return empty just because the newest segment is scan-only"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tail_segments_keep_the_record_that_starts_at_the_cut()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path();
+        let date = fixture_date("2026-08-09");
+        let first = audit_fixture_line("first", "SETTINGS_UPDATED", day_start(date) + 1);
+        let second = audit_fixture_line("second", "SETTINGS_UPDATED", day_start(date) + 2);
+        let third = audit_fixture_line("third", "SETTINGS_UPDATED", day_start(date) + 3);
+        let records = [first.clone(), second.clone(), third.clone()];
+        write_daily_segment(config_dir, date, &records)?;
+        write_log_archive(config_dir, date, 1, &records)?;
+
+        let total_length = u64::try_from(first.len() + second.len() + third.len() + 3).unwrap_or(0);
+        let second_start = u64::try_from(first.len() + 1).unwrap_or(0);
+        // The window starts exactly on the first byte of `second`; the one-byte back-off keeps that
+        // record and only the terminator of `first` is skipped.
+        let cut_at_record = total_length.saturating_sub(second_start);
+        let after_record_cut = vec![second.clone(), third.clone()];
+        assert_eq!(
+            scan_tail_lines(config_dir, date, cut_at_record)?,
+            after_record_cut,
+            "daily file: a record starting at the cut must survive"
+        );
+        assert_eq!(
+            scan_archive_tail_lines(config_dir, date, 1, cut_at_record)?,
+            after_record_cut,
+            "archive member: a record starting at the cut must survive"
+        );
+
+        // Control case: five bytes into `second` legitimately loses that record, not the later ones.
+        let cut_mid_record = cut_at_record.saturating_sub(5);
+        let mid_record_cut = vec![third.clone()];
+        assert_eq!(
+            scan_tail_lines(config_dir, date, cut_mid_record)?,
+            mid_record_cut
+        );
+        assert_eq!(
+            scan_archive_tail_lines(config_dir, date, 1, cut_mid_record)?,
+            mid_record_cut
+        );
+
+        // One byte short of the whole segment: nothing is skipped and every record survives.
+        let almost_whole = total_length.saturating_sub(1);
+        assert_eq!(scan_tail_lines(config_dir, date, almost_whole)?, records);
+        assert_eq!(
+            scan_archive_tail_lines(config_dir, date, 1, almost_whole)?,
+            records
+        );
         Ok(())
     }
 }
