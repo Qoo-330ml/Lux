@@ -920,10 +920,12 @@ async fn emby_image_diagnostics_report_the_variant_without_credentials()
             &captured_logs,
         )))
         .finish();
-    let dispatch = tracing::Dispatch::new(subscriber);
-    // The dispatcher is thread-local, and a current-thread runtime serves the HTTP route on this
-    // same thread, so the capture stays inside this test instead of affecting its neighbours.
-    let _trace_guard = tracing::dispatcher::set_default(&dispatch);
+    // The capture has to be a process-wide default: `tracing` caches one interest value per call
+    // site for the whole process, so a thread-local dispatcher is silenced whenever a parallel
+    // test fires the same call site first without a subscriber. Assertions below only look at
+    // lines carrying this test's own Infuse client label, so neighbours cannot mask or fake them.
+    tracing::subscriber::set_global_default(subscriber)
+        .map_err(|_| "the image diagnostic test installs the process log subscriber")?;
 
     let harness = start_harness().await?;
     harness.enable_server_switch(true).await?;
@@ -963,7 +965,11 @@ async fn emby_image_diagnostics_report_the_variant_without_credentials()
 
     // A non-JPEG format keeps the original and must report the reason.
     let original = harness
-        .emby_fetch(&harness.item_id, Some(&token), "format=png&maxWidth=300")
+        .client
+        .get(harness.emby_image_url(&harness.item_id, "format=png&maxWidth=300"))
+        .header("X-Emby-Token", &token)
+        .header("X-Emby-Client", "Infuse")
+        .send()
         .await?;
     assert_eq!(original.status(), StatusCode::OK);
     assert_eq!(
@@ -985,10 +991,14 @@ async fn emby_image_diagnostics_report_the_variant_without_credentials()
         !diagnostic_lines.is_empty(),
         "no emby_image_diag line in {logs}"
     );
+    // Only this test sends the Infuse client label, so the assertions stay attributable even if a
+    // neighbour logs its own image requests in the same process.
     let variant_line = diagnostic_lines
         .iter()
         .rev()
-        .find(|line| line.contains("\"outcome\":\"variant\""))
+        .find(|line| {
+            line.contains("\"outcome\":\"variant\"") && line.contains("\"client\":\"Infuse\"")
+        })
         .ok_or("no variant outcome in the diagnostic lines")?;
     assert!(variant_line.contains("\"variant_width\":720"));
     assert!(variant_line.contains("\"client\":\"Infuse\""));
@@ -997,9 +1007,11 @@ async fn emby_image_diagnostics_report_the_variant_without_credentials()
     assert!(variant_line.contains("\"has_tag\":false"));
     assert!(variant_line.contains("\"max_width\":300"));
     assert!(
-        diagnostic_lines
-            .iter()
-            .any(|line| line.contains("\"reason\":\"non_jpeg_format\""))
+        diagnostic_lines.iter().any(|line| {
+            line.contains("\"reason\":\"non_jpeg_format\"")
+                && line.contains("\"client\":\"Infuse\"")
+        }),
+        "no non_jpeg_format reason in {logs}"
     );
     // The API key in the URL, the tag path and the access token never reach the log.
     assert!(
