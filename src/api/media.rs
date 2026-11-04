@@ -1,6 +1,7 @@
 use super::*;
 use crate::application::image_variants::{
-    ImageVariantRequest, ImageVariantService, source_pixel_dimensions,
+    ImageVariantIntent, ImageVariantRequest, ImageVariantSelection, ImageVariantService,
+    OriginalImageReason, source_pixel_dimensions,
 };
 use crate::application::playback::session::EMBY_DIRECT_STREAM_TICKET_VERSION;
 
@@ -1656,9 +1657,12 @@ pub(super) async fn lux_image(
             image_type: &image_type,
             image_index: 0,
         },
-        width.map_or(ImageVariantRequest::Original, ImageVariantRequest::Width),
+        ImageVariantIntent::exact(
+            width.map_or(ImageVariantRequest::Original, ImageVariantRequest::Width),
+        ),
     )
     .await
+    .response
 }
 
 pub(super) async fn lux_image_at_index(
@@ -1692,9 +1696,12 @@ pub(super) async fn lux_image_at_index(
             image_type: &image_type,
             image_index,
         },
-        width.map_or(ImageVariantRequest::Original, ImageVariantRequest::Width),
+        ImageVariantIntent::exact(
+            width.map_or(ImageVariantRequest::Original, ImageVariantRequest::Width),
+        ),
     )
     .await
+    .response
 }
 
 fn lux_image_variant_width(
@@ -2195,8 +2202,8 @@ pub(super) async fn emby_image(
     let internal_item_id = emby_internal_id(&item_id);
     // Emby clients describe the size they render instead of the exact variant width the Web
     // client sends; the parsed box only ever narrows the answer to a cached variant.
-    let variant_request =
-        emby_handlers::EmbyImageDisplayQuery::parse(raw_query.as_deref()).variant_request();
+    let display = emby_handlers::EmbyImageDisplayQuery::parse(raw_query.as_deref());
+    let variant_intent = display.variant_intent();
     let filmly_compat = state.filmly_image_compat_mode == FilmlyImageCompatMode::Compat
         && is_filmly_image_request(&headers)
         && query.tag.is_none();
@@ -2204,6 +2211,26 @@ pub(super) async fn emby_image(
         Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
+    // Filmly's native image loader drops Emby auth headers and image tags. Its Windows
+    // WebView can also issue the backdrop request with a browser UA, so keep the exception
+    // limited to untagged backdrop artwork; media streams and tagged images remain gated.
+    let untagged_backdrop_compat = state.filmly_image_compat_mode == FilmlyImageCompatMode::Compat
+        && principal.is_none()
+        && query.tag.is_none()
+        && normalize_image_type(&image_type) == Some("FANART");
+    let filmly_branch = (filmly_compat || untagged_backdrop_compat) && principal.is_none();
+    // One desensitized record per served image request; it reports the answer and never the
+    // caller's token, URL, query string, Cookie, IP, full User-Agent or item id.
+    let diagnostics = emby_image_diag::EmbyImageDiagnostics::for_request(
+        &headers,
+        &display,
+        &image_type,
+        query.tag.is_some(),
+        emby_image_diag::EmbyImageAuthMode::for_request(principal.is_some(), filmly_branch),
+    );
+    // Paths that never consult the variant cache still serve artwork; the log reports the stored
+    // original so an administrator can see which request shape took them.
+    let without_cache = ImageVariantSelection::Original(OriginalImageReason::VariantUnavailable);
     if normalize_image_type(&image_type) == Some("POSTER")
         && let Some(response) = serve_emby_library_cover(
             &state,
@@ -2216,6 +2243,7 @@ pub(super) async fn emby_image(
         )
         .await
     {
+        diagnostics.record(without_cache);
         return response;
     }
     if (principal.is_some() || query.tag.is_some())
@@ -2230,28 +2258,18 @@ pub(super) async fn emby_image(
         )
         .await
     {
+        diagnostics.record(without_cache);
         return response;
     }
     let images = state.images();
-    // Filmly's native image loader drops Emby auth headers and image tags. Its Windows
-    // WebView can also issue the backdrop request with a browser UA, so keep the exception
-    // limited to untagged backdrop artwork; media streams and tagged images remain gated.
-    let untagged_backdrop_compat = state.filmly_image_compat_mode == FilmlyImageCompatMode::Compat
-        && principal.is_none()
-        && query.tag.is_none()
-        && normalize_image_type(&image_type) == Some("FANART");
-    if (filmly_compat || untagged_backdrop_compat) && principal.is_none() {
-        return serve_filmly_compat_image(
-            images,
-            &headers,
-            &method,
-            &internal_item_id,
-            &image_type,
-            0,
-        )
-        .await;
+    if filmly_branch {
+        let response =
+            serve_filmly_compat_image(images, &headers, &method, &internal_item_id, &image_type, 0)
+                .await;
+        diagnostics.record(without_cache);
+        return response;
     }
-    match principal {
+    let served = match principal {
         Some(principal) => {
             serve_image(
                 images,
@@ -2264,7 +2282,7 @@ pub(super) async fn emby_image(
                     image_type: &image_type,
                     image_index: 0,
                 },
-                variant_request,
+                variant_intent,
             )
             .await
         }
@@ -2280,11 +2298,15 @@ pub(super) async fn emby_image(
                     image_index: 0,
                     tag: query.tag.as_deref(),
                 },
-                variant_request,
+                variant_intent,
             )
             .await
         }
+    };
+    if let Some(selection) = served.selection {
+        diagnostics.record(selection);
     }
+    served.response
 }
 
 pub(super) fn is_filmly_image_request(headers: &HeaderMap) -> bool {
@@ -2331,8 +2353,8 @@ pub(super) async fn emby_image_at_index(
         return StatusCode::BAD_REQUEST.into_response();
     };
     let internal_item_id = emby_internal_id(&item_id);
-    let variant_request =
-        emby_handlers::EmbyImageDisplayQuery::parse(raw_query.as_deref()).variant_request();
+    let display = emby_handlers::EmbyImageDisplayQuery::parse(raw_query.as_deref());
+    let variant_intent = display.variant_intent();
     let filmly_compat = state.filmly_image_compat_mode == FilmlyImageCompatMode::Compat
         && is_filmly_image_request(&headers)
         && query.tag.is_none();
@@ -2340,6 +2362,15 @@ pub(super) async fn emby_image_at_index(
         Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
+    let filmly_branch = filmly_compat && principal.is_none();
+    let diagnostics = emby_image_diag::EmbyImageDiagnostics::for_request(
+        &headers,
+        &display,
+        &image_type,
+        query.tag.is_some(),
+        emby_image_diag::EmbyImageAuthMode::for_request(principal.is_some(), filmly_branch),
+    );
+    let without_cache = ImageVariantSelection::Original(OriginalImageReason::VariantUnavailable);
     if normalize_image_type(&image_type) == Some("POSTER")
         && let Some(response) = serve_emby_library_cover(
             &state,
@@ -2352,6 +2383,7 @@ pub(super) async fn emby_image_at_index(
         )
         .await
     {
+        diagnostics.record(without_cache);
         return response;
     }
     if (principal.is_some() || query.tag.is_some())
@@ -2366,11 +2398,12 @@ pub(super) async fn emby_image_at_index(
         )
         .await
     {
+        diagnostics.record(without_cache);
         return response;
     }
     let images = state.images();
-    if filmly_compat && principal.is_none() {
-        return serve_filmly_compat_image(
+    if filmly_branch {
+        let response = serve_filmly_compat_image(
             images,
             &headers,
             &method,
@@ -2379,8 +2412,10 @@ pub(super) async fn emby_image_at_index(
             image_index,
         )
         .await;
+        diagnostics.record(without_cache);
+        return response;
     }
-    match principal {
+    let served = match principal {
         Some(principal) => {
             serve_image(
                 images,
@@ -2393,7 +2428,7 @@ pub(super) async fn emby_image_at_index(
                     image_type: &image_type,
                     image_index,
                 },
-                variant_request,
+                variant_intent,
             )
             .await
         }
@@ -2409,11 +2444,15 @@ pub(super) async fn emby_image_at_index(
                     image_index,
                     tag: query.tag.as_deref(),
                 },
-                variant_request,
+                variant_intent,
             )
             .await
         }
+    };
+    if let Some(selection) = served.selection {
+        diagnostics.record(selection);
     }
+    served.response
 }
 
 async fn optional_emby_access_principal(
@@ -3689,6 +3728,31 @@ pub(super) struct ServeImageTarget<'a> {
     pub image_index: i64,
 }
 
+/// One served image response plus the variant decision the Emby diagnostic log reports.
+///
+/// `selection` stays `None` when the request ended without an image (401/404/403/503): no stored
+/// bytes were served in that case, so there is no original-image reason to report.
+pub(super) struct ServedImage {
+    pub response: Response,
+    pub selection: Option<ImageVariantSelection>,
+}
+
+impl ServedImage {
+    fn status(response: Response) -> Self {
+        Self {
+            response,
+            selection: None,
+        }
+    }
+
+    fn variant(response: Response, width: u32) -> Self {
+        Self {
+            response,
+            selection: Some(ImageVariantSelection::Variant(width)),
+        }
+    }
+}
+
 pub(super) async fn serve_image(
     images: &ImageService,
     variants: &Arc<ImageVariantService>,
@@ -3696,15 +3760,15 @@ pub(super) async fn serve_image(
     headers: &HeaderMap,
     method: &Method,
     target: ServeImageTarget<'_>,
-    variant_request: ImageVariantRequest,
-) -> Response {
+    intent: ImageVariantIntent,
+) -> ServedImage {
     let ServeImageTarget {
         item_id,
         image_type,
         image_index,
     } = target;
     let Some(image_type) = normalize_image_type(image_type) else {
-        return StatusCode::NOT_FOUND.into_response();
+        return ServedImage::status(StatusCode::NOT_FOUND.into_response());
     };
     let image = match images
         .resolve(principal, item_id, image_type, image_index)
@@ -3716,37 +3780,54 @@ pub(super) async fn serve_image(
             .await
         {
             Ok(Some(image)) => image,
-            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Ok(None) => return ServedImage::status(StatusCode::NOT_FOUND.into_response()),
             Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
-                return StatusCode::FORBIDDEN.into_response();
+                return ServedImage::status(StatusCode::FORBIDDEN.into_response());
             }
-            Err(ImageError::Io { .. }) => return StatusCode::NOT_FOUND.into_response(),
+            Err(ImageError::Io { .. }) => {
+                return ServedImage::status(StatusCode::NOT_FOUND.into_response());
+            }
             Err(ImageError::Storage(_)) => {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                return ServedImage::status(StatusCode::SERVICE_UNAVAILABLE.into_response());
             }
         },
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => return ServedImage::status(StatusCode::NOT_FOUND.into_response()),
         Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
-            return StatusCode::FORBIDDEN.into_response();
+            return ServedImage::status(StatusCode::FORBIDDEN.into_response());
         }
-        Err(ImageError::Io { .. }) => return StatusCode::NOT_FOUND.into_response(),
-        Err(ImageError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(ImageError::Io { .. }) => {
+            return ServedImage::status(StatusCode::NOT_FOUND.into_response());
+        }
+        Err(ImageError::Storage(_)) => {
+            return ServedImage::status(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        }
     };
-    if let Some(width) = variant_request.variant_width(source_pixel_dimensions(&image))
-        && let Some(variant) = variants.resolve_variant(item_id, &image, width).await
-        && let Some(response) = serve_variant_file(&variant, headers, method).await
-    {
-        return response;
+    let selection = match intent.selection(source_pixel_dimensions(&image)) {
+        ImageVariantSelection::Variant(width) => {
+            match variants.resolve_variant(item_id, &image, width).await {
+                Some(variant) => {
+                    if let Some(response) = serve_variant_file(&variant, headers, method).await {
+                        return ServedImage::variant(response, width);
+                    }
+                    ImageVariantSelection::Original(OriginalImageReason::VariantUnavailable)
+                }
+                None => ImageVariantSelection::Original(OriginalImageReason::VariantUnavailable),
+            }
+        }
+        original => original,
+    };
+    ServedImage {
+        response: serve_image_file(
+            &image.path,
+            image.content_type,
+            image.content_length,
+            &image.etag,
+            headers,
+            method,
+        )
+        .await,
+        selection: Some(selection),
     }
-    serve_image_file(
-        &image.path,
-        image.content_type,
-        image.content_length,
-        &image.etag,
-        headers,
-        method,
-    )
-    .await
 }
 
 pub(super) struct ServeTaggedImageTarget<'a> {
@@ -3762,8 +3843,8 @@ pub(super) async fn serve_tagged_image(
     headers: &HeaderMap,
     method: &Method,
     target: ServeTaggedImageTarget<'_>,
-    variant_request: ImageVariantRequest,
-) -> Response {
+    intent: ImageVariantIntent,
+) -> ServedImage {
     let ServeTaggedImageTarget {
         item_id,
         image_type,
@@ -3771,10 +3852,10 @@ pub(super) async fn serve_tagged_image(
         tag,
     } = target;
     let Some(tag) = tag.filter(|tag| !tag.is_empty()) else {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return ServedImage::status(StatusCode::UNAUTHORIZED.into_response());
     };
     let Some(image_type) = normalize_image_type(image_type) else {
-        return StatusCode::NOT_FOUND.into_response();
+        return ServedImage::status(StatusCode::NOT_FOUND.into_response());
     };
     let image = match images
         .resolve_tagged(item_id, image_type, image_index, tag)
@@ -3786,37 +3867,54 @@ pub(super) async fn serve_tagged_image(
             .await
         {
             Ok(Some(image)) => image,
-            Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+            Ok(None) => return ServedImage::status(StatusCode::UNAUTHORIZED.into_response()),
             Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
-                return StatusCode::FORBIDDEN.into_response();
+                return ServedImage::status(StatusCode::FORBIDDEN.into_response());
             }
-            Err(ImageError::Io { .. }) => return StatusCode::NOT_FOUND.into_response(),
+            Err(ImageError::Io { .. }) => {
+                return ServedImage::status(StatusCode::NOT_FOUND.into_response());
+            }
             Err(ImageError::Storage(_)) => {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                return ServedImage::status(StatusCode::SERVICE_UNAVAILABLE.into_response());
             }
         },
-        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+        Ok(None) => return ServedImage::status(StatusCode::UNAUTHORIZED.into_response()),
         Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
-            return StatusCode::FORBIDDEN.into_response();
+            return ServedImage::status(StatusCode::FORBIDDEN.into_response());
         }
-        Err(ImageError::Io { .. }) => return StatusCode::NOT_FOUND.into_response(),
-        Err(ImageError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(ImageError::Io { .. }) => {
+            return ServedImage::status(StatusCode::NOT_FOUND.into_response());
+        }
+        Err(ImageError::Storage(_)) => {
+            return ServedImage::status(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        }
     };
-    if let Some(width) = variant_request.variant_width(source_pixel_dimensions(&image))
-        && let Some(variant) = variants.resolve_variant(item_id, &image, width).await
-        && let Some(response) = serve_variant_file(&variant, headers, method).await
-    {
-        return response;
+    let selection = match intent.selection(source_pixel_dimensions(&image)) {
+        ImageVariantSelection::Variant(width) => {
+            match variants.resolve_variant(item_id, &image, width).await {
+                Some(variant) => {
+                    if let Some(response) = serve_variant_file(&variant, headers, method).await {
+                        return ServedImage::variant(response, width);
+                    }
+                    ImageVariantSelection::Original(OriginalImageReason::VariantUnavailable)
+                }
+                None => ImageVariantSelection::Original(OriginalImageReason::VariantUnavailable),
+            }
+        }
+        original => original,
+    };
+    ServedImage {
+        response: serve_image_file(
+            &image.path,
+            image.content_type,
+            image.content_length,
+            &image.etag,
+            headers,
+            method,
+        )
+        .await,
+        selection: Some(selection),
     }
-    serve_image_file(
-        &image.path,
-        image.content_type,
-        image.content_length,
-        &image.etag,
-        headers,
-        method,
-    )
-    .await
 }
 
 pub(super) async fn serve_filmly_compat_image(
