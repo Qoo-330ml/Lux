@@ -3,9 +3,21 @@ import type { ChangelogRelease } from "../types";
 export const changelogReleases07: ChangelogRelease[] = [
   {
     version: "0.7.11",
-    date: "2026-11-03",
+    date: "2026-11-04",
     sections: [
+      { kind: "added", items: [
+        "播放器中间那颗按钮换成了 Lux 标记：播放/暂停的中心控件改用本项目自己的标记，标题栏也用 logo 图代替文字标题，亮色主题下的对比度跟着调过。",
+        "播放器设置抽屉重做：设置面板改成带页签的结构，音轨、字幕、画质、倍速都改成一行一项的列表样式，选中态更清楚；切轨道或换画质时面板上会出现加载标记。",
+        "Emby 字幕轨带上了投递信息：字幕轨现在输出 DeliveryMethod、SubtitleLocationType、IsExternalUrl 和 DeliveryUrl。外挂字幕标成 External / ExternalFile，并给出一个不带凭据的相对地址（客户端自己附 token）；内嵌字幕标成 Embed / InternalStream，不给地址；音视频轨不带这些字段。",
+        "播放器能读远程 HTTPS 媒体了：内容安全策略里放开了远程 HTTPS 媒体源，外链片源在播放器里不再被 CSP 拦掉。",
+      ] },
+      { kind: "changed", items: [
+        "字幕下载地址支持带格式后缀：除了 /Videos/{item}/{source}/Subtitles/{index}/Stream，还接受 Stream.srt、Stream.ass、Stream.vtt 这种写法；后缀只当格式提示，服务端按同一个处理路径走，编码认不出来时仍旧给不带后缀的地址。路径校验只认 1 到 8 位字母数字后缀，Stream.、Stream.s-rt、Streams、多带一段路径这类都不路由。",
+        "Emby 视频的 DisplayTitle 先显示分辨率：探测到的分辨率排在编码前面。",
+      ] },
       { kind: "fixed", items: [
+        "播放器设置面板点外面收不起来：现在点面板外的空白处会关掉设置。",
+        "倍速按钮把文字挤在图标旁边：倍速只留图标。",
         ".strm 直连播放到第二个请求就 410：直连播放接口原来把任何非 2xx 的 GET 都当成「播放结束」，而 .strm 指向的外部地址第一次请求就是 307 跳转，会话当场被判死，后续 Range 请求全部 410——表现是点了播放、第一下能连上，接着就播不动。现在 3xx 跳转按成功处理，同一个直连地址连着请求两次都能正常拿到流，也补了回归测试。",
       ] },
     ],
