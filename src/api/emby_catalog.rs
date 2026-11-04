@@ -4968,6 +4968,9 @@ fn emby_media_source_stream_json(
         .unwrap_or("Video");
     if current_title.eq_ignore_ascii_case("Video") {
         value["DisplayTitle"] = Value::String(quality_label.to_owned());
+    } else if emby_title_has_resolution(current_title) {
+        // The probed frame size already produced a resolution; the filename label can disagree
+        // with the real file, so do not stack a second one.
     } else if !current_title
         .to_ascii_lowercase()
         .contains(&quality_label.to_ascii_lowercase())
@@ -4975,6 +4978,15 @@ fn emby_media_source_stream_json(
         value["DisplayTitle"] = Value::String(format!("{quality_label} {current_title}"));
     }
     value
+}
+
+/// True when a display title already starts with a resolution token such as `1080p`.
+fn emby_title_has_resolution(title: &str) -> bool {
+    title
+        .split_whitespace()
+        .next()
+        .and_then(|word| word.strip_suffix('p'))
+        .is_some_and(|digits| digits.len() >= 3 && digits.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// Human readable track descriptor without the source level quality label.
@@ -5043,8 +5055,53 @@ fn emby_stream_codec(stream: &crate::application::catalog::CatalogStream) -> Opt
         .map(str::to_ascii_uppercase)
 }
 
+/// Standard resolution bucket for a probed frame size. Widescreen crops (1920x800, 3840x1636)
+/// keep the label of the container they were mastered for, so either dimension can promote it.
+pub(super) fn emby_video_resolution_label(width: i64, height: i64) -> Option<String> {
+    let (width, height) = (width.max(0), height.max(0));
+    if width == 0 && height == 0 {
+        return None;
+    }
+    let bucket = |min_width: i64, min_height: i64| width >= min_width || height >= min_height;
+    let label = if bucket(7600, 4300) {
+        "4320p".to_owned()
+    } else if bucket(3700, 2100) {
+        "2160p".to_owned()
+    } else if bucket(2500, 1400) {
+        "1440p".to_owned()
+    } else if bucket(1880, 1040) {
+        "1080p".to_owned()
+    } else if bucket(1240, 700) {
+        "720p".to_owned()
+    } else if height >= 560 {
+        "576p".to_owned()
+    } else if height >= 460 {
+        "480p".to_owned()
+    } else if height > 0 {
+        format!("{height}p")
+    } else {
+        return None;
+    };
+    Some(label)
+}
+
+fn emby_stream_dimension(stream: &crate::application::catalog::CatalogStream, key: &str) -> i64 {
+    stream
+        .details
+        .get(key)
+        .and_then(emby_integer_value)
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0)
+}
+
 fn emby_video_stream_title(stream: &crate::application::catalog::CatalogStream) -> Option<String> {
     let mut parts = Vec::new();
+    if let Some(resolution) = emby_video_resolution_label(
+        emby_stream_dimension(stream, "Width"),
+        emby_stream_dimension(stream, "Height"),
+    ) {
+        parts.push(resolution);
+    }
     if let Some(codec) = emby_stream_codec(stream) {
         parts.push(codec);
     }
@@ -6180,6 +6237,94 @@ mod tests {
         );
 
         assert_eq!(source_stream_json(&source)["DisplayTitle"], "1080p H264");
+    }
+
+    #[test]
+    fn video_resolution_label_follows_the_larger_of_width_and_height_buckets() {
+        for (width, height, label) in [
+            (7680, 4320, Some("4320p")),
+            (3840, 1636, Some("2160p")),
+            (3840, 2160, Some("2160p")),
+            (2560, 1440, Some("1440p")),
+            (1920, 800, Some("1080p")),
+            (1920, 1080, Some("1080p")),
+            (1440, 1080, Some("1080p")),
+            (1280, 544, Some("720p")),
+            (720, 576, Some("576p")),
+            (720, 480, Some("480p")),
+            (640, 360, Some("360p")),
+            (1920, 0, Some("1080p")),
+            (0, 1080, Some("1080p")),
+            (0, 0, None),
+        ] {
+            assert_eq!(
+                super::emby_video_resolution_label(width, height).as_deref(),
+                label,
+                "{width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn video_display_title_includes_the_probed_resolution_without_a_quality_label() {
+        let json = emby_media_stream_json(&stream(
+            "VIDEO",
+            Some("hevc"),
+            None,
+            None,
+            BTreeMap::from([
+                ("Width".to_owned(), json!(1920)),
+                ("Height".to_owned(), json!(800)),
+            ]),
+        ));
+        assert_eq!(json["DisplayTitle"], "1080p HEVC");
+        assert_eq!(json["Title"], "1080p HEVC");
+
+        let hdr = emby_media_stream_json(&stream(
+            "VIDEO",
+            Some("hevc"),
+            None,
+            None,
+            BTreeMap::from([
+                ("Width".to_owned(), json!("3840")),
+                ("Height".to_owned(), json!(1636)),
+                ("VideoRange".to_owned(), json!("HDR 10")),
+                ("BitDepth".to_owned(), json!(10)),
+            ]),
+        ));
+        assert_eq!(hdr["DisplayTitle"], "2160p HEVC HDR10 10bit");
+    }
+
+    #[test]
+    fn video_display_title_uses_only_the_dimensions_when_nothing_else_is_known() {
+        let json = emby_media_stream_json(&stream(
+            "VIDEO",
+            None,
+            None,
+            None,
+            BTreeMap::from([("Height".to_owned(), json!(720))]),
+        ));
+        assert_eq!(json["DisplayTitle"], "720p");
+    }
+
+    #[test]
+    fn probed_resolution_wins_over_a_filename_quality_label() {
+        let dims = BTreeMap::from([
+            ("Width".to_owned(), json!(3840)),
+            ("Height".to_owned(), json!(1636)),
+        ]);
+        // The filename claims 1080p but the file is really 2160p: show the probed value once.
+        let source = catalog_source(
+            Some("1080p"),
+            vec![stream("VIDEO", Some("hevc"), None, None, dims.clone())],
+        );
+        assert_eq!(source_stream_json(&source)["DisplayTitle"], "2160p HEVC");
+
+        let matching = catalog_source(
+            Some("2160p"),
+            vec![stream("VIDEO", Some("hevc"), None, None, dims)],
+        );
+        assert_eq!(source_stream_json(&matching)["DisplayTitle"], "2160p HEVC");
     }
 
     #[test]

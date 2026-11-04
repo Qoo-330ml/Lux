@@ -285,10 +285,7 @@ fn decode_numeric_reference(lowered: &str) -> Option<char> {
     } else {
         lowered.strip_prefix('#')?
     };
-    let digits: String = digits
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
+    let digits: String = digits.chars().take_while(char::is_ascii_digit).collect();
     if digits.is_empty() {
         return None;
     }
@@ -302,7 +299,12 @@ fn decode_numeric_reference(lowered: &str) -> Option<char> {
 fn danmaku_p_attribute(event: &BytesStart<'_>) -> Option<String> {
     let attributes = event.attributes();
     for attribute in attributes.flatten() {
-        if !attribute.key.local_name().as_ref().eq_ignore_ascii_case(b"p") {
+        if !attribute
+            .key
+            .local_name()
+            .as_ref()
+            .eq_ignore_ascii_case(b"p")
+        {
             continue;
         }
         return std::str::from_utf8(attribute.value.as_ref())
@@ -489,10 +491,7 @@ mod tests {
 
     #[test]
     fn rejects_structurally_invalid_documents() {
-        assert_eq!(
-            inspect_danmaku_xml(b""),
-            Err(DanmakuXmlError::Empty)
-        );
+        assert_eq!(inspect_danmaku_xml(b""), Err(DanmakuXmlError::Empty));
         assert_eq!(
             inspect_danmaku_xml(&vec![b'x'; MAX_DANMAKU_XML_BYTES + 1]),
             Err(DanmakuXmlError::TooLarge)
