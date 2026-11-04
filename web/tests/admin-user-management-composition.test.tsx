@@ -175,7 +175,7 @@ describe("admin user management page composition", () => {
 function makeAdminSettings(): AdminSettings {
   return {
     userDeletionGraceDays: 7,
-    userActivityRetentionDays: 90,
+    userActivityRetentionDays: 7,
     newUserPermissions: {
       libraryAccessMode: "ALL",
       libraryIds: [],

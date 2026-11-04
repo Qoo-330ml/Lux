@@ -30583,9 +30583,9 @@ async fn user_activity_retention_setting_defaults_validates_and_recovers_invalid
     })
     .await?;
 
-    assert_eq!(database.user_activity_retention_days().await?, 90);
-    database.set_user_activity_retention_days(180).await?;
-    assert_eq!(database.user_activity_retention_days().await?, 180);
+    assert_eq!(database.user_activity_retention_days().await?, 7);
+    database.set_user_activity_retention_days(60).await?;
+    assert_eq!(database.user_activity_retention_days().await?, 60);
     assert!(database.set_user_activity_retention_days(0).await.is_err());
     assert!(database.set_user_activity_retention_days(-1).await.is_err());
     assert!(
@@ -30594,7 +30594,7 @@ async fn user_activity_retention_setting_defaults_validates_and_recovers_invalid
             .await
             .is_err()
     );
-    assert_eq!(database.user_activity_retention_days().await?, 180);
+    assert_eq!(database.user_activity_retention_days().await?, 60);
 
     sqlx::query(
         "UPDATE server_settings SET value = 'not-a-number'
@@ -30602,14 +30602,14 @@ async fn user_activity_retention_setting_defaults_validates_and_recovers_invalid
     )
     .execute(database.pool())
     .await?;
-    assert_eq!(database.user_activity_retention_days().await?, 90);
+    assert_eq!(database.user_activity_retention_days().await?, 7);
     sqlx::query(
         "UPDATE server_settings SET value = '0'
          WHERE key = 'user_activity_retention_days'",
     )
     .execute(database.pool())
     .await?;
-    assert_eq!(database.user_activity_retention_days().await?, 90);
+    assert_eq!(database.user_activity_retention_days().await?, 7);
     Ok(())
 }
 

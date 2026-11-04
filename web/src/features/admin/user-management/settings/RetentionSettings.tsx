@@ -72,7 +72,7 @@ export function AdminUserRetentionSettings() {
 function AdminUserActivityRetentionSettings() {
   const queryClient = useQueryClient();
   const settings = useQuery({ queryKey: queryKeys.adminSettings, queryFn: () => api.adminSettings() });
-  const [retentionDays, setRetentionDays] = useState("90");
+  const [retentionDays, setRetentionDays] = useState("7");
   const [notice, setNotice] = useState("");
   const update = useMutation({
     mutationFn: (days: number) => api.updateAdminSettings({ userActivityRetentionDays: days }),
@@ -85,7 +85,7 @@ function AdminUserActivityRetentionSettings() {
     onError: (error) => setNotice(error.message || "保存失败，请重试。"),
   });
   useEffect(() => {
-    setRetentionDays(String(settings.data?.userActivityRetentionDays ?? 90));
+    setRetentionDays(String(settings.data?.userActivityRetentionDays ?? 7));
   }, [settings.data?.userActivityRetentionDays]);
 
   if (settings.isPending) return <p className="lux-admin-muted" role="status">正在读取活动记录保留设置…</p>;
@@ -93,7 +93,7 @@ function AdminUserActivityRetentionSettings() {
 
   const parsedDays = Number(retentionDays);
   const validDays = Number.isInteger(parsedDays) && parsedDays >= 1 && parsedDays <= 3_650;
-  const hasChanges = parsedDays !== (settings.data.userActivityRetentionDays ?? 90);
+  const hasChanges = parsedDays !== (settings.data.userActivityRetentionDays ?? 7);
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();

@@ -194,7 +194,7 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
         .json()
         .await?;
     assert_eq!(initial_settings["userDeletionGraceDays"], 7);
-    assert_eq!(initial_settings["userActivityRetentionDays"], 90);
+    assert_eq!(initial_settings["userActivityRetentionDays"], 7);
     assert_eq!(
         initial_settings["newUserPermissions"]["libraryAccessMode"],
         "NONE"
