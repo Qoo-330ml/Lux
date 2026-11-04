@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::application::{
+    image_variants::ImageVariantRequest,
     plugin_protocol::{PluginEmbyRouteRequest, PluginEmbyRouteResponse, PluginMediaInfoTarget},
     probe::{media_probe_result_from_rpc, parse_media_info_json},
 };
@@ -2416,6 +2417,86 @@ pub(super) struct EmbyTokenQuery {
     pub(super) active_within_seconds: Option<i64>,
 }
 
+/// Display-size hints and overlay switches Emby clients append to image URLs.
+///
+/// The keys are matched case-insensitively from the raw query string because third-party
+/// clients disagree on the casing of `maxWidth` / `MaxWidth` and serde aliases cannot cover
+/// every spelling. Unparsable and zero hints count as absent. The cached variants are always
+/// opaque JPEG without overlays, so a non-JPEG `format` or any overlay parameter keeps the
+/// original image.
+#[derive(Debug, Default)]
+pub(super) struct EmbyImageDisplayQuery {
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+    width: Option<u32>,
+    height: Option<u32>,
+    format: Option<String>,
+    overlay: bool,
+}
+
+/// Overlay parameters that make the answer a composited image the variant cache cannot hold.
+const EMBY_IMAGE_OVERLAY_PARAMETERS: [&str; 4] = [
+    "blur",
+    "percentPlayed",
+    "unplayedCount",
+    "addPlayedIndicator",
+];
+
+impl EmbyImageDisplayQuery {
+    pub(super) fn parse(raw_query: Option<&str>) -> Self {
+        let mut query = Self::default();
+        let Some(raw_query) = raw_query else {
+            return query;
+        };
+        for (key, value) in url::form_urlencoded::parse(raw_query.as_bytes()) {
+            if key.eq_ignore_ascii_case("maxWidth") {
+                query.max_width = query.max_width.or(parse_emby_pixel_hint(&value));
+            } else if key.eq_ignore_ascii_case("maxHeight") {
+                query.max_height = query.max_height.or(parse_emby_pixel_hint(&value));
+            } else if key.eq_ignore_ascii_case("width") {
+                query.width = query.width.or(parse_emby_pixel_hint(&value));
+            } else if key.eq_ignore_ascii_case("height") {
+                query.height = query.height.or(parse_emby_pixel_hint(&value));
+            } else if key.eq_ignore_ascii_case("format") {
+                if query.format.is_none() {
+                    query.format =
+                        Some(value.trim().to_owned()).filter(|format| !format.is_empty());
+                }
+            } else if EMBY_IMAGE_OVERLAY_PARAMETERS
+                .iter()
+                .any(|parameter| key.eq_ignore_ascii_case(parameter))
+            {
+                query.overlay = true;
+            }
+        }
+        query
+    }
+
+    /// Variant this image request may be served from, or [`ImageVariantRequest::Original`] when
+    /// the response has to keep the stored bytes.
+    pub(super) fn variant_request(&self) -> ImageVariantRequest {
+        if self.overlay || !self.is_jpeg_format() {
+            return ImageVariantRequest::Original;
+        }
+        let width = self.max_width.or(self.width);
+        let height = self.max_height.or(self.height);
+        if width.is_none() && height.is_none() {
+            return ImageVariantRequest::Original;
+        }
+        ImageVariantRequest::DisplaySize { width, height }
+    }
+
+    fn is_jpeg_format(&self) -> bool {
+        self.format.as_deref().is_none_or(|format| {
+            format.eq_ignore_ascii_case("jpg") || format.eq_ignore_ascii_case("jpeg")
+        })
+    }
+}
+
+fn parse_emby_pixel_hint(value: &str) -> Option<u32> {
+    value.trim().parse::<u32>().ok().filter(|hint| *hint > 0)
+}
+
 #[derive(Deserialize, Default)]
 pub(super) struct EmbyRefreshQuery {
     #[serde(flatten)]
@@ -3171,5 +3252,114 @@ mod parental_rating_tests {
         assert_eq!(emby_parental_rating(Some("TV-MA")), Some(5));
         assert_eq!(emby_parental_rating(Some("unrated")), None);
         assert_eq!(emby_parental_rating(None), None);
+    }
+}
+
+#[cfg(test)]
+mod emby_image_display_query_tests {
+    use super::EmbyImageDisplayQuery;
+    use crate::application::image_variants::ImageVariantRequest;
+
+    #[test]
+    fn size_hints_are_matched_case_insensitively() {
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("maxWidth=300&maxHeight=400")).variant_request(),
+            ImageVariantRequest::DisplaySize {
+                width: Some(300),
+                height: Some(400)
+            }
+        );
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("MaxWidth=300&MAXHEIGHT=400")).variant_request(),
+            ImageVariantRequest::DisplaySize {
+                width: Some(300),
+                height: Some(400)
+            }
+        );
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("width=300&Height=450")).variant_request(),
+            ImageVariantRequest::DisplaySize {
+                width: Some(300),
+                height: Some(450)
+            }
+        );
+        // `maxWidth` / `maxHeight` win over the plain pair when a client sends both.
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("width=100&maxWidth=300")).variant_request(),
+            ImageVariantRequest::DisplaySize {
+                width: Some(300),
+                height: None
+            }
+        );
+    }
+
+    #[test]
+    fn missing_or_unusable_size_hints_keep_the_original() {
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(None).variant_request(),
+            ImageVariantRequest::Original
+        );
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("api_key=secret&tag=abc")).variant_request(),
+            ImageVariantRequest::Original
+        );
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("maxWidth=abc&maxHeight=-1")).variant_request(),
+            ImageVariantRequest::Original
+        );
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("maxWidth=0")).variant_request(),
+            ImageVariantRequest::Original
+        );
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("maxHeight=4294967296")).variant_request(),
+            ImageVariantRequest::Original
+        );
+    }
+
+    #[test]
+    fn non_jpeg_formats_keep_the_original() {
+        for format in ["png", "webp", "gif", "bmp"] {
+            assert_eq!(
+                EmbyImageDisplayQuery::parse(Some(
+                    format!("format={format}&maxWidth=300").as_str()
+                ))
+                .variant_request(),
+                ImageVariantRequest::Original,
+                "format {format} must keep the original"
+            );
+        }
+        for format in ["jpg", "jpeg", "JPG", "Jpeg"] {
+            assert_eq!(
+                EmbyImageDisplayQuery::parse(Some(
+                    format!("format={format}&maxWidth=300").as_str()
+                ))
+                .variant_request(),
+                ImageVariantRequest::DisplaySize {
+                    width: Some(300),
+                    height: None
+                },
+                "format {format} is satisfied by the JPEG cache"
+            );
+        }
+    }
+
+    #[test]
+    fn overlay_parameters_keep_the_original() {
+        for overlay in [
+            "blur=true",
+            "BLUR=1",
+            "percentPlayed=40",
+            "PercentPlayed=40",
+            "unplayedCount=3",
+            "addPlayedIndicator=true",
+        ] {
+            assert_eq!(
+                EmbyImageDisplayQuery::parse(Some(format!("{overlay}&maxWidth=300").as_str()))
+                    .variant_request(),
+                ImageVariantRequest::Original,
+                "overlay {overlay} must keep the original"
+            );
+        }
     }
 }

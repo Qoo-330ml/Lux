@@ -1,4 +1,7 @@
 use super::*;
+use crate::application::image_variants::{
+    ImageVariantRequest, ImageVariantService, source_pixel_dimensions,
+};
 use crate::application::playback::session::EMBY_DIRECT_STREAM_TICKET_VERSION;
 
 const LUX_SEARCH_ITEM_TYPES: [&str; 3] = ["MOVIE", "SERIES", "VIDEO"];
@@ -1644,7 +1647,7 @@ pub(super) async fn lux_image(
     let images = state.images();
     serve_image(
         images,
-        Some(state.image_variants()),
+        state.image_variants(),
         principal,
         &headers,
         &method,
@@ -1653,7 +1656,7 @@ pub(super) async fn lux_image(
             image_type: &image_type,
             image_index: 0,
         },
-        width,
+        width.map_or(ImageVariantRequest::Original, ImageVariantRequest::Width),
     )
     .await
 }
@@ -1680,7 +1683,7 @@ pub(super) async fn lux_image_at_index(
     let images = state.images();
     serve_image(
         images,
-        Some(state.image_variants()),
+        state.image_variants(),
         principal,
         &headers,
         &method,
@@ -1689,7 +1692,7 @@ pub(super) async fn lux_image_at_index(
             image_type: &image_type,
             image_index,
         },
-        width,
+        width.map_or(ImageVariantRequest::Original, ImageVariantRequest::Width),
     )
     .await
 }
@@ -2186,9 +2189,14 @@ pub(super) async fn emby_image(
     method: Method,
     Path((item_id, image_type)): Path<(String, String)>,
     Query(query): Query<EmbyTokenQuery>,
+    RawQuery(raw_query): RawQuery,
     State(state): State<ReadyAppState>,
 ) -> Response {
     let internal_item_id = emby_internal_id(&item_id);
+    // Emby clients describe the size they render instead of the exact variant width the Web
+    // client sends; the parsed box only ever narrows the answer to a cached variant.
+    let variant_request =
+        emby_handlers::EmbyImageDisplayQuery::parse(raw_query.as_deref()).variant_request();
     let filmly_compat = state.filmly_image_compat_mode == FilmlyImageCompatMode::Compat
         && is_filmly_image_request(&headers)
         && query.tag.is_none();
@@ -2247,7 +2255,7 @@ pub(super) async fn emby_image(
         Some(principal) => {
             serve_image(
                 images,
-                None,
+                state.image_variants(),
                 principal,
                 &headers,
                 &method,
@@ -2256,19 +2264,23 @@ pub(super) async fn emby_image(
                     image_type: &image_type,
                     image_index: 0,
                 },
-                None,
+                variant_request,
             )
             .await
         }
         None => {
             serve_tagged_image(
                 images,
+                state.image_variants(),
                 &headers,
                 &method,
-                &internal_item_id,
-                &image_type,
-                0,
-                query.tag.as_deref(),
+                ServeTaggedImageTarget {
+                    item_id: &internal_item_id,
+                    image_type: &image_type,
+                    image_index: 0,
+                    tag: query.tag.as_deref(),
+                },
+                variant_request,
             )
             .await
         }
@@ -2312,12 +2324,15 @@ pub(super) async fn emby_image_at_index(
     method: Method,
     Path((item_id, image_type, image_index)): Path<(String, String, String)>,
     Query(query): Query<EmbyTokenQuery>,
+    RawQuery(raw_query): RawQuery,
     State(state): State<ReadyAppState>,
 ) -> Response {
     let Ok(image_index) = image_index.parse::<i64>() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let internal_item_id = emby_internal_id(&item_id);
+    let variant_request =
+        emby_handlers::EmbyImageDisplayQuery::parse(raw_query.as_deref()).variant_request();
     let filmly_compat = state.filmly_image_compat_mode == FilmlyImageCompatMode::Compat
         && is_filmly_image_request(&headers)
         && query.tag.is_none();
@@ -2369,7 +2384,7 @@ pub(super) async fn emby_image_at_index(
         Some(principal) => {
             serve_image(
                 images,
-                None,
+                state.image_variants(),
                 principal,
                 &headers,
                 &method,
@@ -2378,19 +2393,23 @@ pub(super) async fn emby_image_at_index(
                     image_type: &image_type,
                     image_index,
                 },
-                None,
+                variant_request,
             )
             .await
         }
         None => {
             serve_tagged_image(
                 images,
+                state.image_variants(),
                 &headers,
                 &method,
-                &internal_item_id,
-                &image_type,
-                image_index,
-                query.tag.as_deref(),
+                ServeTaggedImageTarget {
+                    item_id: &internal_item_id,
+                    image_type: &image_type,
+                    image_index,
+                    tag: query.tag.as_deref(),
+                },
+                variant_request,
             )
             .await
         }
@@ -3672,12 +3691,12 @@ pub(super) struct ServeImageTarget<'a> {
 
 pub(super) async fn serve_image(
     images: &ImageService,
-    variants: Option<&Arc<crate::application::image_variants::ImageVariantService>>,
+    variants: &Arc<ImageVariantService>,
     principal: AccessPrincipal,
     headers: &HeaderMap,
     method: &Method,
     target: ServeImageTarget<'_>,
-    width: Option<u32>,
+    variant_request: ImageVariantRequest,
 ) -> Response {
     let ServeImageTarget {
         item_id,
@@ -3713,7 +3732,7 @@ pub(super) async fn serve_image(
         Err(ImageError::Io { .. }) => return StatusCode::NOT_FOUND.into_response(),
         Err(ImageError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    if let (Some(width), Some(variants)) = (width, variants)
+    if let Some(width) = variant_request.variant_width(source_pixel_dimensions(&image))
         && let Some(variant) = variants.resolve_variant(item_id, &image, width).await
         && let Some(response) = serve_variant_file(&variant, headers, method).await
     {
@@ -3730,15 +3749,27 @@ pub(super) async fn serve_image(
     .await
 }
 
+pub(super) struct ServeTaggedImageTarget<'a> {
+    pub item_id: &'a str,
+    pub image_type: &'a str,
+    pub image_index: i64,
+    pub tag: Option<&'a str>,
+}
+
 pub(super) async fn serve_tagged_image(
     images: &ImageService,
+    variants: &Arc<ImageVariantService>,
     headers: &HeaderMap,
     method: &Method,
-    item_id: &str,
-    image_type: &str,
-    image_index: i64,
-    tag: Option<&str>,
+    target: ServeTaggedImageTarget<'_>,
+    variant_request: ImageVariantRequest,
 ) -> Response {
+    let ServeTaggedImageTarget {
+        item_id,
+        image_type,
+        image_index,
+        tag,
+    } = target;
     let Some(tag) = tag.filter(|tag| !tag.is_empty()) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
@@ -3771,6 +3802,12 @@ pub(super) async fn serve_tagged_image(
         Err(ImageError::Io { .. }) => return StatusCode::NOT_FOUND.into_response(),
         Err(ImageError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    if let Some(width) = variant_request.variant_width(source_pixel_dimensions(&image))
+        && let Some(variant) = variants.resolve_variant(item_id, &image, width).await
+        && let Some(response) = serve_variant_file(&variant, headers, method).await
+    {
+        return response;
+    }
     serve_image_file(
         &image.path,
         image.content_type,

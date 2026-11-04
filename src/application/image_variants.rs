@@ -258,10 +258,7 @@ impl ImageVariantService {
             return None;
         }
         let content_tag = valid_content_tag(source.content_tag.as_deref()?)?;
-        let (source_width, source_height) = match (source.width, source.height) {
-            (Some(width), Some(height)) if width > 0 && height > 0 => (width as u32, height as u32),
-            _ => return None,
-        };
+        let (source_width, source_height) = source_pixel_dimensions(source)?;
         if source_width.max(source_height) <= width {
             return None;
         }
@@ -553,6 +550,49 @@ fn is_supported_image_type(image_type: &str) -> bool {
     matches!(image_type, "POSTER" | "THUMB" | "FANART")
 }
 
+/// How an image endpoint asked for a derived variant.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ImageVariantRequest {
+    /// The response keeps the stored image bytes.
+    #[default]
+    Original,
+    /// Exact long-edge width requested by the Lux Web API (`w=360|720|1280`).
+    Width(u32),
+    /// Display box an Emby client scales the artwork into; the tier comes from the source size
+    /// through [`variant_width_for_display_size`].
+    DisplaySize {
+        width: Option<u32>,
+        height: Option<u32>,
+    },
+}
+
+impl ImageVariantRequest {
+    /// Cached variant width for this request, or `None` when the original bytes are served.
+    ///
+    /// `source` is the resolved source size, which the display-box form needs and the Web API
+    /// form ignores.
+    pub(crate) fn variant_width(self, source: Option<(u32, u32)>) -> Option<u32> {
+        match self {
+            Self::Original => None,
+            Self::Width(width) => Some(width),
+            Self::DisplaySize { width, height } => {
+                let (source_width, source_height) = source?;
+                variant_width_for_display_size(width, height, source_width, source_height)
+            }
+        }
+    }
+}
+
+/// Known dimensions of a resolved image as unsigned pixels, or `None` when the image row carries
+/// no usable size.
+pub(crate) fn source_pixel_dimensions(source: &ResolvedImage) -> Option<(u32, u32)> {
+    let (width, height) = (source.width?, source.height?);
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
+}
+
 /// Chooses the cached variant width for a client that scales the artwork into a
 /// `maxWidth` × `maxHeight` box, as Emby clients do.
 ///
@@ -777,6 +817,36 @@ mod tests {
             width: Some(i64::from(width)),
             height: Some(i64::from(height)),
         }
+    }
+
+    #[test]
+    fn variant_request_forms_resolve_to_a_tier_or_the_original() {
+        assert_eq!(
+            ImageVariantRequest::Original.variant_width(Some((1600, 2400))),
+            None
+        );
+        // The Web API width is exact and does not need the source size.
+        assert_eq!(
+            ImageVariantRequest::Width(720).variant_width(None),
+            Some(720)
+        );
+        assert_eq!(
+            ImageVariantRequest::DisplaySize {
+                width: Some(300),
+                height: None
+            }
+            .variant_width(Some((1600, 2400))),
+            Some(720)
+        );
+        // Without a known source size a display box cannot be mapped onto a tier.
+        assert_eq!(
+            ImageVariantRequest::DisplaySize {
+                width: Some(300),
+                height: None
+            }
+            .variant_width(None),
+            None
+        );
     }
 
     #[test]

@@ -20,7 +20,8 @@ use luxd::{
 use reqwest::{
     StatusCode,
     header::{
-        CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, ETAG, IF_NONE_MATCH, SET_COOKIE,
+        AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, ETAG, IF_NONE_MATCH,
+        SET_COOKIE,
     },
 };
 use serde_json::{Value, json};
@@ -33,6 +34,8 @@ struct VariantHarness {
     cookies: String,
     csrf: String,
     item_id: String,
+    poster_tag: String,
+    viewer_id: String,
     config_dir: std::path::PathBuf,
     database: Database,
     original_bytes: Vec<u8>,
@@ -90,6 +93,19 @@ async fn start_harness() -> Result<VariantHarness, Box<dyn std::error::Error>> {
     .execute(database.pool())
     .await?;
 
+    let poster_tag: String = sqlx::query_scalar(
+        "SELECT id FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    // A user without library access exercises the Emby authorization order.
+    let viewer_id = luxd::auth::users::UserStore::new(database.clone())?
+        .create_user("viewer", "Viewer", "viewer password", false)
+        .await?
+        .id
+        .to_string();
+
     let web_auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let app = app_with_state(AppState::ready(
@@ -122,6 +138,8 @@ async fn start_harness() -> Result<VariantHarness, Box<dyn std::error::Error>> {
         cookies: format!("lux_session={session}; lux_csrf={csrf}"),
         csrf,
         item_id,
+        poster_tag,
+        viewer_id,
         config_dir: config.config_dir.clone(),
         database,
         original_bytes,
@@ -236,6 +254,67 @@ impl VariantHarness {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         Err("image variant was not generated within the test timeout".into())
+    }
+
+    async fn emby_token(
+        &self,
+        username: &str,
+        password: &str,
+        device_id: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let response = self
+            .client
+            .post(format!("{}/Users/AuthenticateByName", self.base_url))
+            .header(
+                AUTHORIZATION,
+                format!(
+                    "Emby Client=\"LuxTest\", Device=\"Mac\", DeviceId=\"{device_id}\", Version=\"1\""
+                ),
+            )
+            .json(&json!({ "Username": username, "Pw": password }))
+            .send()
+            .await?;
+        let body: Value = response.json().await?;
+        Ok(body["AccessToken"]
+            .as_str()
+            .ok_or("missing Emby access token")?
+            .to_owned())
+    }
+
+    fn emby_image_url(&self, item_id: &str, query: &str) -> String {
+        format!("{}/Items/{item_id}/Images/Primary?{query}", self.base_url)
+    }
+
+    async fn emby_fetch(
+        &self,
+        item_id: &str,
+        token: Option<&str>,
+        query: &str,
+    ) -> Result<reqwest::Response, Box<dyn std::error::Error>> {
+        let mut request = self.client.get(self.emby_image_url(item_id, query));
+        if let Some(token) = token {
+            request = request.header("X-Emby-Token", token);
+        }
+        Ok(request.send().await?)
+    }
+
+    /// Waits for the Emby route to answer from the variant cache instead of the
+    /// cold-start fallback, then returns that response.
+    async fn emby_variant_response(
+        &self,
+        item_id: &str,
+        token: Option<&str>,
+        query: &str,
+    ) -> Result<reqwest::Response, Box<dyn std::error::Error>> {
+        for _ in 0..600 {
+            let response = self.emby_fetch(item_id, token, query).await?;
+            if response.headers()[CACHE_CONTROL] == "private, max-age=31536000, immutable" {
+                return Ok(response);
+            }
+            let _ = response.bytes().await?;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(format!("Emby image variant was not generated for query {query}").into())
     }
 }
 
@@ -505,5 +584,211 @@ async fn auth_me_advertises_the_effective_variant_capability()
         .await?;
     assert!(disabled.get("imageVariantsAvailable").is_none());
     assert_eq!(disabled["imageVariantsEnabled"], json!(false));
+    Ok(())
+}
+
+/// LUX-881: Emby clients ask for a display size instead of the exact `w=` the
+/// Web client sends. The Emby routes must reuse the same variant cache.
+#[tokio::test]
+async fn emby_max_width_serves_the_cached_variant() -> Result<(), Box<dyn std::error::Error>> {
+    let harness = start_harness().await?;
+    harness.enable_server_switch(true).await?;
+    let token = harness
+        .emby_token("admin", "correct password", "image-variant-admin")
+        .await?;
+
+    // The fixture poster is 1600×2400, so a 300 px wide box needs a 450 px long edge and the
+    // 720 tier is the smallest one that covers it.
+    let response = harness
+        .emby_variant_response(
+            &harness.item_id,
+            Some(&token),
+            &format!("maxWidth=300&api_key={token}"),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers = response.headers().clone();
+    let body = response.bytes().await?;
+    assert!(body.len() < harness.original_bytes.len());
+    assert_eq!(headers[CONTENT_TYPE], "image/jpeg");
+    assert_eq!(headers[CONTENT_LENGTH], body.len().to_string().as_str());
+    let etag = headers[ETAG].to_str()?;
+    assert!(etag.ends_with("-w720\""), "unexpected etag {etag}");
+    assert_eq!(
+        headers[CACHE_CONTROL],
+        "private, max-age=31536000, immutable"
+    );
+    assert_eq!(&body[..2], &[0xFF, 0xD8], "variant must be a JPEG");
+    let decoded = image::load_from_memory(&body)?;
+    assert_eq!(decoded.width(), 480);
+    assert_eq!(decoded.height(), 720);
+
+    let shard = format!("{:02x}", Sha256::digest(harness.item_id.as_bytes())[0]);
+    let tag = format!("{:x}", Sha256::digest(&harness.original_bytes));
+    let cached = harness
+        .config_dir
+        .join("image-cache/v1")
+        .join(shard)
+        .join(&harness.item_id)
+        .join(format!("{tag}-w720.jpg"));
+    assert_eq!(tokio::fs::read(cached).await?, body);
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_size_hints_keep_the_original_while_the_switch_is_off()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = start_harness().await?;
+    let token = harness
+        .emby_token("admin", "correct password", "image-variant-admin")
+        .await?;
+
+    let response = harness
+        .emby_fetch(
+            &harness.item_id,
+            Some(&token),
+            &format!("maxWidth=300&maxHeight=400&api_key={token}"),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CACHE_CONTROL], "private, max-age=3600");
+    assert_eq!(
+        response.bytes().await?.as_ref(),
+        harness.original_bytes.as_slice()
+    );
+    assert!(!harness.config_dir.join("image-cache").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_requests_without_a_usable_variant_hint_keep_the_original()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = start_harness().await?;
+    harness.enable_server_switch(true).await?;
+    let token = harness
+        .emby_token("admin", "correct password", "image-variant-admin")
+        .await?;
+
+    // No size hint, a PNG request the JPEG cache cannot satisfy, and every overlay parameter
+    // must keep the original bytes even though the cache is enabled.
+    for query in [
+        "api_key=admin".to_owned(),
+        format!("format=png&maxWidth=300&api_key={token}"),
+        format!("blur=true&maxWidth=300&api_key={token}"),
+        format!("percentPlayed=40&maxWidth=300&api_key={token}"),
+        format!("unplayedCount=3&maxWidth=300&api_key={token}"),
+        format!("addPlayedIndicator=true&maxWidth=300&api_key={token}"),
+    ] {
+        let response = harness
+            .emby_fetch(&harness.item_id, Some(&token), &query)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK, "query {query}");
+        assert_eq!(
+            response.headers()[CACHE_CONTROL],
+            "private, max-age=3600",
+            "query {query}"
+        );
+        assert_eq!(
+            response.bytes().await?.as_ref(),
+            harness.original_bytes.as_slice(),
+            "query {query}"
+        );
+    }
+    assert!(!harness.config_dir.join("image-cache").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_size_hint_aliases_and_jpeg_formats_hit_the_cache()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = start_harness().await?;
+    harness.enable_server_switch(true).await?;
+    let token = harness
+        .emby_token("admin", "correct password", "image-variant-admin")
+        .await?;
+
+    // Every accepted spelling asks for the same 720 tier on the 1600×2400 fixture.
+    for query in [
+        format!("MaxWidth=300&api_key={token}"),
+        format!("maxwidth=300&api_key={token}"),
+        format!("maxHeight=450&api_key={token}"),
+        format!("width=300&format=jpg&api_key={token}"),
+        format!("height=450&format=JPEG&api_key={token}"),
+    ] {
+        let response = harness
+            .emby_variant_response(&harness.item_id, Some(&token), &query)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK, "query {query}");
+        let etag = response.headers()[ETAG].to_str()?.to_owned();
+        assert!(etag.ends_with("-w720\""), "query {query} gave etag {etag}");
+        let body = response.bytes().await?;
+        assert_eq!(&body[..2], &[0xFF, 0xD8], "query {query}");
+        let decoded = image::load_from_memory(&body)?;
+        assert_eq!(decoded.width().max(decoded.height()), 720, "query {query}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_tagged_image_hits_the_cached_variant() -> Result<(), Box<dyn std::error::Error>> {
+    let harness = start_harness().await?;
+    harness.enable_server_switch(true).await?;
+
+    // The tagged route needs no session: the tag itself is the capability.
+    let response = harness
+        .emby_variant_response(
+            &harness.item_id,
+            None,
+            &format!("tag={}&maxWidth=300", harness.poster_tag),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let etag = response.headers()[ETAG].to_str()?.to_owned();
+    assert!(etag.ends_with("-w720\""), "unexpected etag {etag}");
+    let body = response.bytes().await?;
+    assert_eq!(&body[..2], &[0xFF, 0xD8]);
+    let decoded = image::load_from_memory(&body)?;
+    assert_eq!(decoded.width().max(decoded.height()), 720);
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_variant_hints_keep_the_authorization_order() -> Result<(), Box<dyn std::error::Error>>
+{
+    let harness = start_harness().await?;
+    harness.enable_server_switch(true).await?;
+    let admin = harness
+        .emby_token("admin", "correct password", "image-variant-admin")
+        .await?;
+    // Restrict the viewer to an explicit library list so the item is out of reach.
+    sqlx::query("UPDATE users SET library_access_mode = 'SELECTED' WHERE id = ?")
+        .bind(&harness.viewer_id)
+        .execute(harness.database.pool())
+        .await?;
+    let viewer = harness
+        .emby_token("viewer", "viewer password", "image-variant-viewer")
+        .await?;
+
+    let anonymous = harness
+        .emby_fetch(&harness.item_id, None, "maxWidth=300")
+        .await?;
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let without_library_access = harness
+        .emby_fetch(&harness.item_id, Some(&viewer), "maxWidth=300")
+        .await?;
+    assert_eq!(without_library_access.status(), StatusCode::NOT_FOUND);
+
+    let missing_item = harness
+        .emby_fetch(
+            &uuid::Uuid::now_v7().to_string(),
+            Some(&admin),
+            "maxWidth=300",
+        )
+        .await?;
+    assert_eq!(missing_item.status(), StatusCode::NOT_FOUND);
+
+    // The rejected requests never reach the variant cache.
+    assert!(!harness.config_dir.join("image-cache").exists());
     Ok(())
 }
