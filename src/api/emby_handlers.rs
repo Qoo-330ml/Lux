@@ -2197,6 +2197,11 @@ pub(super) async fn emby_authenticate(
         }
         Ok(None) => {
             state.login_rate_limiter.record_failure(&login_key).await;
+            // §18.3: every failed credential check emits the parseable event, including an
+            // unknown username - guessing usernames is exactly what the ban list is for. Reuse
+            // the resolver result this handler already holds instead of resolving it again.
+            let failed_login_remote_ip = client_ip.map(|ip| ip.to_string());
+            log_authentication_failure(failed_login_remote_ip.as_deref());
             if let Ok(Some(user_id)) = auth
                 .find_failed_authentication_user_id(&request.username)
                 .await
@@ -2206,7 +2211,7 @@ pub(super) async fn emby_authenticate(
                     &state.admin_events,
                     &user_id,
                     "LUX_EMBY",
-                    request_client_ip(&headers, &state).await,
+                    failed_login_remote_ip,
                 )
                 .await;
             }
@@ -2248,13 +2253,16 @@ pub(super) async fn emby_authenticate_user_id(
         }
         Ok(None) => {
             state.login_rate_limiter.record_failure(&login_key).await;
+            // Same as above: log the attempt even when the id matches no account, once.
+            let failed_login_remote_ip = client_ip.map(|ip| ip.to_string());
+            log_authentication_failure(failed_login_remote_ip.as_deref());
             if let Ok(Some(user)) = auth.user_by_id(&user_id).await {
                 record_failed_authentication_event(
                     Some(state.database()),
                     &state.admin_events,
                     &user.id.to_string(),
                     "LUX_EMBY",
-                    request_client_ip(&headers, &state).await,
+                    failed_login_remote_ip,
                 )
                 .await;
             }

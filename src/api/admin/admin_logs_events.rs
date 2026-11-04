@@ -186,18 +186,19 @@ pub(crate) async fn record_activity_event(
     }
 }
 
-pub(crate) async fn record_failed_authentication_event(
-    database: Option<&Database>,
-    admin_events: &AdminEventHub,
-    user_id: &str,
-    client: &str,
-    remote_ip: Option<String>,
-) {
-    // §18.3 requires a fail2ban-parseable event for every failed login, so it is emitted before
-    // the storage writes and never skipped when the database is unavailable. The message and the
-    // field set are deliberately fixed: no username, credential, cookie, client-supplied device
-    // label, URL or query string may reach the log.
-    match remote_ip.as_deref() {
+/// Emits the §18.3 failed-login event that Fail2Ban-style log tools parse.
+///
+/// The message and the field set are deliberately fixed: no username, credential, cookie,
+/// client-supplied device label, complete URL or query string may reach the log. The address is
+/// whatever the access-IP resolver produced at the call site; an unresolved address leaves the
+/// `remoteIp` field out entirely instead of logging a placeholder.
+///
+/// This touches no storage, so callers emit it for every failed attempt - including an unknown
+/// username or user id, which is exactly the credential-guessing case the ban list exists for -
+/// before they decide whether an account exists. It is separate from
+/// [`record_failed_authentication_event`] so one failure never produces two log lines.
+pub(crate) fn log_authentication_failure(remote_ip: Option<&str>) {
+    match remote_ip {
         Some(remote_ip) => tracing::warn!(
             "errorCode" = "AUTH_LOGIN_FAILED",
             "remoteIp" = remote_ip,
@@ -205,6 +206,20 @@ pub(crate) async fn record_failed_authentication_event(
         ),
         None => tracing::warn!("errorCode" = "AUTH_LOGIN_FAILED", "authentication failed"),
     }
+}
+
+/// Records the storage side of a failed login for an account that actually exists.
+///
+/// The parseable log event is emitted by the call sites through [`log_authentication_failure`];
+/// this function owns only the activity index row, the audit record and the dashboard
+/// notification, so an unavailable database cannot silence the log event.
+pub(crate) async fn record_failed_authentication_event(
+    database: Option<&Database>,
+    admin_events: &AdminEventHub,
+    user_id: &str,
+    client: &str,
+    remote_ip: Option<String>,
+) {
     let Some(database) = database else {
         return;
     };
@@ -774,9 +789,45 @@ mod failed_authentication_log_event_tests {
             .ok_or_else(|| "a failed login must emit an AUTH_LOGIN_FAILED log event".into())
     }
 
-    #[tokio::test]
-    async fn failed_login_warns_with_a_stable_error_code_and_remote_ip()
+    #[test]
+    fn authentication_failure_event_carries_the_stable_code_and_remote_ip()
     -> Result<(), Box<dyn Error>> {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let _capture = capture_warn_json(&buffer);
+
+        log_authentication_failure(Some("203.0.113.9"));
+
+        let event = login_failure_event(&captured_json_events(&buffer)?)?;
+        assert_eq!(event["level"], "WARN");
+        let fields = &event["fields"];
+        assert_eq!(fields["errorCode"], "AUTH_LOGIN_FAILED");
+        assert_eq!(fields["remoteIp"], "203.0.113.9");
+        assert_eq!(fields["message"], "authentication failed");
+        Ok(())
+    }
+
+    #[test]
+    fn authentication_failure_event_omits_an_unknown_remote_ip() -> Result<(), Box<dyn Error>> {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let _capture = capture_warn_json(&buffer);
+
+        log_authentication_failure(None);
+
+        let event = login_failure_event(&captured_json_events(&buffer)?)?;
+        assert_eq!(event["level"], "WARN");
+        assert_eq!(event["fields"]["errorCode"], "AUTH_LOGIN_FAILED");
+        assert_eq!(event["fields"]["message"], "authentication failed");
+        // Documented choice: an unresolved address drops the field entirely instead of logging
+        // `remoteIp: null`, so downstream parsers never see a non-address value.
+        assert!(
+            event["fields"].get("remoteIp").is_none(),
+            "an unknown address must not produce a remoteIp field: {event}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recording_the_storage_side_emits_no_log_event() -> Result<(), Box<dyn Error>> {
         let temp_dir = tempfile::tempdir()?;
         let config = Config {
             http_addr: "127.0.0.1:8097".parse()?,
@@ -801,63 +852,18 @@ mod failed_authentication_log_event_tests {
         )
         .await;
 
-        let event = login_failure_event(&captured_json_events(&buffer)?)?;
-        assert_eq!(event["level"], "WARN");
-        let fields = &event["fields"];
-        assert_eq!(fields["errorCode"], "AUTH_LOGIN_FAILED");
-        assert_eq!(fields["remoteIp"], "203.0.113.9");
-        assert_eq!(fields["message"], "authentication failed");
-        let line = event.to_string();
+        // The caller already emits the one §18.3 event through
+        // `log_authentication_failure`; recording the row must not repeat it, and must not leak
+        // the client label or the internal user id either.
+        let captured = String::from_utf8(
+            buffer
+                .lock()
+                .map_err(|_| "captured trace buffer is unavailable")?
+                .clone(),
+        )?;
         assert!(
-            !line.contains("LUX_WEB_CLIENT_MARKER"),
-            "the client-supplied label must not be logged: {line}"
-        );
-        assert!(
-            !line.contains(&user_id),
-            "the internal user id must not be logged: {line}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn failed_login_warns_even_without_a_database() -> Result<(), Box<dyn Error>> {
-        let hub = AdminEventHub::new();
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let _capture = capture_warn_json(&buffer);
-
-        record_failed_authentication_event(
-            None,
-            &hub,
-            "internal-user-id",
-            "LUX_EMBY",
-            Some("198.51.100.7".to_owned()),
-        )
-        .await;
-
-        let event = login_failure_event(&captured_json_events(&buffer)?)?;
-        assert_eq!(event["level"], "WARN");
-        assert_eq!(event["fields"]["errorCode"], "AUTH_LOGIN_FAILED");
-        assert_eq!(event["fields"]["remoteIp"], "198.51.100.7");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn failed_login_omits_remote_ip_when_the_address_is_unknown() -> Result<(), Box<dyn Error>>
-    {
-        let hub = AdminEventHub::new();
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let _capture = capture_warn_json(&buffer);
-
-        record_failed_authentication_event(None, &hub, "internal-user-id", "LUX_WEB", None).await;
-
-        let event = login_failure_event(&captured_json_events(&buffer)?)?;
-        assert_eq!(event["level"], "WARN");
-        assert_eq!(event["fields"]["errorCode"], "AUTH_LOGIN_FAILED");
-        // Documented choice: an unresolved address drops the field entirely instead of logging
-        // `remoteIp: null`, so downstream parsers never see a non-address value.
-        assert!(
-            event["fields"].get("remoteIp").is_none(),
-            "an unknown address must not produce a remoteIp field: {event}"
+            captured.is_empty(),
+            "the storage side must not log the login failure again: {captured}"
         );
         Ok(())
     }

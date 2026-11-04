@@ -71,8 +71,8 @@ pub(super) use admin_jobs::{
     AdminJobsQuery, scan_job_json, scan_job_json_from_storage, spawn_library_scan, strm_probe_error,
 };
 pub(super) use admin_logs_events::{
-    playback_activity_event_type, record_activity_event, record_audit_event,
-    record_failed_authentication_event,
+    log_authentication_failure, playback_activity_event_type, record_activity_event,
+    record_audit_event, record_failed_authentication_event,
 };
 
 pub(super) fn api_routes() -> Router<ReadyAppState> {

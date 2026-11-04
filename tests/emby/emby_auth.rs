@@ -13,9 +13,13 @@ use luxd::{
     storage::Database,
 };
 use reqwest::header::AUTHORIZATION;
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{io::Cursor, net::SocketAddr};
+use std::{
+    io::{self, Cursor, Write},
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 use tokio::net::TcpListener;
 
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
@@ -2383,4 +2387,189 @@ fn playback_device() -> EmbyDeviceInfo {
         version: "1".to_owned(),
         user_id: None,
     }
+}
+
+/// Captures `WARN` JSON events for the test thread.
+///
+/// The in-process server is spawned on this test's current-thread runtime, so a thread-local
+/// dispatcher sees the handler's events without installing a process-wide subscriber that the
+/// other tests in this binary would share.
+fn capture_failed_login_events() -> (Arc<Mutex<Vec<u8>>>, tracing::dispatcher::DefaultGuard) {
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(FailedLoginLogWriter(Arc::clone(&buffer)))
+        .finish();
+    let guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+    (buffer, guard)
+}
+
+struct FailedLoginLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FailedLoginLogWriter {
+    type Writer = FailedLoginLogSink;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        FailedLoginLogSink(Arc::clone(&self.0))
+    }
+}
+
+struct FailedLoginLogSink(Arc<Mutex<Vec<u8>>>);
+
+impl Write for FailedLoginLogSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut output = self
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("captured login log buffer is unavailable"))?;
+        output.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn failed_login_log_events(
+    buffer: &Arc<Mutex<Vec<u8>>>,
+) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
+    let logs = buffer
+        .lock()
+        .map_err(|_| "captured login log buffer is unavailable")?
+        .clone();
+    Ok(String::from_utf8(logs)?
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["fields"]["errorCode"] == "AUTH_LOGIN_FAILED")
+        .collect())
+}
+
+fn captured_login_logs(buffer: &Arc<Mutex<Vec<u8>>>) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(String::from_utf8(
+        buffer
+            .lock()
+            .map_err(|_| "captured login log buffer is unavailable")?
+            .clone(),
+    )?)
+}
+
+/// An in-process server plus the thread-local log capture that observes its handlers.
+struct CapturedAuthServer {
+    address: SocketAddr,
+    buffer: Arc<Mutex<Vec<u8>>>,
+    _capture: tracing::dispatcher::DefaultGuard,
+    _server: AbortOnDrop<Result<(), std::io::Error>>,
+    _temp_dir: tempfile::TempDir,
+}
+
+async fn spawn_captured_auth_server() -> Result<CapturedAuthServer, Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("auth-event", "Auth Event", "correct password")
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    // The access-IP resolver needs the connection peer, which only the connect-info service
+    // attaches; without it the event legitimately has no `remoteIp`.
+    let server = AbortOnDrop(tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    }));
+    let (buffer, capture) = capture_failed_login_events();
+    Ok(CapturedAuthServer {
+        address,
+        buffer,
+        _capture: capture,
+        _server: server,
+        _temp_dir: temp_dir,
+    })
+}
+
+#[tokio::test]
+async fn unknown_emby_usernames_emit_the_failed_login_event()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = spawn_captured_auth_server().await?;
+    let address = server.address;
+    let client = reqwest::Client::builder().no_proxy().build()?;
+
+    let response = client
+        .post(format!("http://{address}/emby/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="Infuse", Device="iPhone", DeviceId="event-device", Version="1.2.3""#,
+        )
+        .json(&json!({ "Username": "missing-name", "Pw": "missing password" }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let events = failed_login_log_events(&server.buffer)?;
+    assert_eq!(
+        events.len(),
+        1,
+        "an unknown Emby username must still emit the failed login event"
+    );
+    assert_eq!(events[0]["level"], "WARN");
+    assert_eq!(events[0]["fields"]["errorCode"], "AUTH_LOGIN_FAILED");
+    assert_eq!(events[0]["fields"]["remoteIp"], "127.0.0.1");
+    assert_eq!(events[0]["fields"]["message"], "authentication failed");
+    let logs = captured_login_logs(&server.buffer)?;
+    assert!(!logs.contains("missing-name"));
+    assert!(!logs.contains("missing password"));
+    assert!(!logs.contains("event-device"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn unknown_emby_user_ids_emit_the_failed_login_event()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = spawn_captured_auth_server().await?;
+    let address = server.address;
+    let client = reqwest::Client::builder().no_proxy().build()?;
+
+    let response = client
+        .post(format!(
+            "http://{address}/emby/Users/00000000-0000-4000-8000-000000000000/Authenticate"
+        ))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="Infuse", Device="iPhone", DeviceId="event-device", Version="1.2.3""#,
+        )
+        .json(&json!({ "Pw": "missing password" }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let events = failed_login_log_events(&server.buffer)?;
+    assert_eq!(
+        events.len(),
+        1,
+        "an unknown Emby user id must still emit the failed login event"
+    );
+    assert_eq!(events[0]["level"], "WARN");
+    assert_eq!(events[0]["fields"]["errorCode"], "AUTH_LOGIN_FAILED");
+    assert_eq!(events[0]["fields"]["remoteIp"], "127.0.0.1");
+    let logs = captured_login_logs(&server.buffer)?;
+    assert!(!logs.contains("00000000-0000-4000-8000-000000000000"));
+    assert!(!logs.contains("missing password"));
+    assert!(!logs.contains("event-device"));
+    Ok(())
 }
