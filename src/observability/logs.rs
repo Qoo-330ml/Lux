@@ -21,16 +21,37 @@ const MAX_EXPORT_BYTES: u64 = 128 * 1024 * 1024;
 /// Hard ceiling on the decompressed bytes one activity/audit page request may scan.
 ///
 /// The admin dashboard polls the activity list every 15 seconds, so the read must stay cheap even
-/// when the retained log volume is large. The newest bytes are read first, so the ceiling keeps the
+/// when the retained log volume is large. Both daily files and archive members are read from their
+/// newest end first (see `read_daily_log_file` and `read_archive_member`), so the ceiling keeps the
 /// most recent records and drops older ones.
 const MAX_EVENT_SCAN_BYTES: u64 = 16 * 1024 * 1024;
-/// Job-event pages still report an exact `total`, so they have to finish the byte scan; bound it
-/// anyway so a pathological log directory cannot stall the request forever.
-const MAX_JOB_EVENT_SCAN_BYTES: u64 = 128 * 1024 * 1024;
-/// Hard ceiling on the number of log files one page request may open.
-const MAX_EVENT_SCAN_FILES: usize = 64;
+/// Bytes one job-event page may scan.
+///
+/// The response carries an exact `total`, so this path has to cover the whole retained volume
+/// instead of stopping early; the ceiling is derived from the retention constants so a large
+/// installation never loses older events from the admin job page. Only an administrator opening one
+/// job's event list pays for it (it is not on the dashboard polling path), and the read is still
+/// streamed with the byte prefilter and a page-sized buffer, so memory stays bounded even though the
+/// disk read is proportional to the retained volume.
+const MAX_JOB_EVENT_SCAN_BYTES: u64 = LOG_SEGMENT_BYTES.saturating_mul(MAX_LOG_ARCHIVES as u64 + 2);
+/// Hard ceiling on the number of log files one page request may open: the retention keeps at most
+/// `MAX_LOG_ARCHIVES` archived segments plus the daily files still being written (migration batches
+/// can leave one daily file per migrated day).
+const MAX_EVENT_SCAN_FILES: usize = MAX_LOG_ARCHIVES + 8;
+/// Deep pages are refused instead of materialised.
+///
+/// The admin console only requests the first page with at most 100 rows per page, so this still
+/// admits roughly the first hundred pages of the audit log while keeping one request from buffering
+/// the whole log (and holding the log mutex) for an arbitrarily large `offset`.
+const MAX_LOG_PAGE_WINDOW: usize = 10_000;
 /// A single JSONL record larger than this is skipped instead of being buffered in memory.
 const MAX_EVENT_LINE_BYTES: usize = 1024 * 1024;
+
+const _: () = assert!(
+    MAX_JOB_EVENT_SCAN_BYTES >= LOG_SEGMENT_BYTES.saturating_mul(MAX_LOG_ARCHIVES as u64 + 1)
+);
+const _: () = assert!(MAX_EVENT_SCAN_FILES > MAX_LOG_ARCHIVES);
+
 const ACTIVITY_EVENT_TYPES: [&str; 4] = [
     "AUTH_LOGIN",
     "PLAYBACK_STARTED",
@@ -510,13 +531,16 @@ pub(crate) fn redact_sensitive_log_values(mut value: Value) -> Value {
 // Bounded event reads
 //
 // The page readers below must do work proportional to the requested page instead of the retained
-// log volume. Two writer properties make that possible:
+// log volume. Three properties make that possible:
 //
 // * a record is stored in the file named after the record's own UTC day:
 //   `LogManager::write_line_for_date` derives the file date from `timestamp`/`createdAt`, and the
 //   migration batches in `storage::database_cleanup` keep both fields identical, so a newer day
 //   file only holds newer `createdAt` values;
-// * inside one day the file name says nothing about ordering, so a whole day is always read.
+// * inside one day the file name says nothing about ordering, so a whole day is always read;
+// * inside one segment (daily file or archive member) the JSONL is append-only, so the newest
+//   records sit at the end; a segment larger than the remaining budget is therefore read from its
+//   tail (`read_daily_log_file`, `read_archive_member`).
 //
 // Sources are therefore visited newest day first and a read stops once nothing left in an older day
 // can outrank the events already collected for the page. A stop is also refused when the weakest
@@ -586,20 +610,30 @@ impl RankedLogEvent for ScanJobLogEvent {
     }
 }
 
-fn ranks_before<T: RankedLogEvent>(left: &T, right: &T) -> bool {
-    left.rank_created_at() > right.rank_created_at()
-        || (left.rank_created_at() == right.rank_created_at() && left.rank_id() > right.rank_id())
+/// Sorts events by the shared ordering contract: newest `created_at` first, then highest id.
+fn sort_by_rank<T: RankedLogEvent>(events: &mut [T]) {
+    events.sort_by(|left, right| {
+        right
+            .rank_created_at()
+            .cmp(&left.rank_created_at())
+            .then_with(|| right.rank_id().cmp(left.rank_id()))
+    });
 }
 
 /// Keeps only the events that can still reach the requested page, so memory and sorting cost track
 /// the page size instead of the log volume.
+///
+/// `push` appends to a buffer and only folds the buffer into the sorted window once it is a window
+/// size long, so one event costs O(log window) amortised instead of moving the whole window.
 struct PageCollector<T> {
     offset: usize,
     limit: usize,
     /// Distinct events already known to rank before the requested page.
     settled: usize,
-    /// Best distinct events seen so far, highest rank first.
+    /// Best distinct events of the page window, highest rank first; only valid after `flush`.
     retained: Vec<T>,
+    /// Events seen since the last `flush`, not sorted yet.
+    pending: Vec<T>,
     seen_ids: HashSet<String>,
 }
 
@@ -610,6 +644,7 @@ impl<T: RankedLogEvent> PageCollector<T> {
             limit,
             settled: 0,
             retained: Vec::new(),
+            pending: Vec::new(),
             seen_ids: HashSet::new(),
         }
     }
@@ -618,10 +653,19 @@ impl<T: RankedLogEvent> PageCollector<T> {
         if !self.seen_ids.insert(event.rank_id().to_owned()) {
             return;
         }
-        let index = self
-            .retained
-            .partition_point(|existing| ranks_before(existing, &event));
-        self.retained.insert(index, event);
+        self.pending.push(event);
+        if self.pending.len() >= self.window().max(1) {
+            self.flush();
+        }
+    }
+
+    /// Folds the pending events into the sorted window and drops everything that cannot reach it.
+    fn flush(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        self.retained.append(&mut self.pending);
+        sort_by_rank(&mut self.retained);
         let window = self.window();
         self.retained.truncate(window);
     }
@@ -632,17 +676,22 @@ impl<T: RankedLogEvent> PageCollector<T> {
             .saturating_add(self.limit)
     }
 
+    /// `true` once enough distinct events are buffered to fill the page. Requires a `flush` first.
     fn is_page_complete(&self) -> bool {
         self.settled.saturating_add(self.retained.len()) >= self.offset.saturating_add(self.limit)
     }
 
-    /// Lowest `created_at` still inside the page window; `None` when the window is empty.
+    /// Lowest `created_at` still inside the page window; `None` when the window is empty. Requires a
+    /// `flush` first.
     fn floor_created_at(&self) -> Option<i64> {
         self.retained.last().map(RankedLogEvent::rank_created_at)
     }
 
-    /// Drops the events that certainly rank before the requested page. Only valid once a whole day
-    /// has been read.
+    /// Drops the events that certainly rank before the requested page.
+    ///
+    /// Only valid once a whole day has been read *and* the caller proved that the remaining days
+    /// cannot hold anything that outranks this window (`floor_dominates_older_days`): a migrated
+    /// record with an old `createdAt` can sit in a newer file, which reorders the window later.
     fn settle(&mut self) {
         let dropped = self
             .offset
@@ -658,7 +707,9 @@ impl<T: RankedLogEvent> PageCollector<T> {
         self.seen_ids.len()
     }
 
-    fn into_page(self) -> Vec<T> {
+    /// Applies a final `flush` and returns the requested page.
+    fn into_page(mut self) -> Vec<T> {
+        self.flush();
         self.retained
             .into_iter()
             .skip(self.offset.saturating_sub(self.settled))
@@ -673,6 +724,14 @@ fn page_offset(offset: i64) -> usize {
 
 fn page_limit(limit: i64) -> usize {
     usize::try_from(limit.max(0)).unwrap_or(usize::MAX)
+}
+
+/// Resolves `offset`/`limit` into a page window, or `None` for pages deeper than
+/// `MAX_LOG_PAGE_WINDOW`, which are answered without touching the log files at all.
+fn bounded_page_window(offset: i64, limit: i64) -> Option<(usize, usize)> {
+    let offset = page_offset(offset);
+    let limit = page_limit(limit);
+    (offset.saturating_add(limit) <= MAX_LOG_PAGE_WINDOW).then_some((offset, limit))
 }
 
 fn day_start_timestamp(date: Date) -> i64 {
@@ -824,8 +883,10 @@ where
                 if !member.name().ends_with(".log") {
                     continue;
                 }
-                let mut reader = io::BufReader::new(member);
-                if scan_jsonl(&mut reader, remaining_bytes, on_item)? == ScanControl::Stop {
+                let length = member.size();
+                if read_archive_member(member, length, remaining_bytes, on_item)?
+                    == ScanControl::Stop
+                {
                     return Ok(ScanControl::Stop);
                 }
             }
@@ -850,12 +911,68 @@ where
         return scan_jsonl(&mut reader, remaining_bytes, on_item);
     }
     file.seek(SeekFrom::Start(length.saturating_sub(*remaining_bytes)))?;
-    let mut reader = io::BufReader::new(file);
-    // The seek can land inside a record: drop its fragment instead of parsing it.
+    scan_segment_tail(io::BufReader::new(file), remaining_bytes, on_item)
+}
+
+/// Reads one archive member, which is a segment of the same append-only JSONL as a daily file.
+///
+/// When the remaining budget cannot cover the member's uncompressed size, the head is decompressed
+/// and dropped in a fixed-size buffer instead of being parsed, so the request still returns the
+/// member's newest records. The decode cost stays bounded by one segment (`LOG_SEGMENT_BYTES`), and
+/// nothing beyond the buffer reaches memory or the parser. A member this large is the newest source
+/// left, so the caller must not continue with older sources afterwards: the result is `Stop`.
+fn read_archive_member<R, F>(
+    member: R,
+    length: u64,
+    remaining_bytes: &mut u64,
+    on_item: &mut F,
+) -> io::Result<ScanControl>
+where
+    R: io::Read,
+    F: FnMut(ScanItem<'_>) -> io::Result<ScanControl>,
+{
+    let mut reader = io::BufReader::new(member);
+    if length <= *remaining_bytes {
+        return scan_jsonl(&mut reader, remaining_bytes, on_item);
+    }
+    discard_bytes(&mut reader, length.saturating_sub(*remaining_bytes))?;
+    scan_segment_tail(reader, remaining_bytes, on_item)
+}
+
+/// Parses a segment tail after its head was skipped: the skip can land inside a record, so the
+/// fragment is dropped instead of being parsed. Always reports `Stop` because the head was skipped.
+fn scan_segment_tail<R, F>(
+    mut reader: R,
+    remaining_bytes: &mut u64,
+    on_item: &mut F,
+) -> io::Result<ScanControl>
+where
+    R: io::BufRead,
+    F: FnMut(ScanItem<'_>) -> io::Result<ScanControl>,
+{
     if discard_partial_line(&mut reader)? {
         scan_jsonl(&mut reader, remaining_bytes, on_item)?;
     }
     Ok(ScanControl::Stop)
+}
+
+/// Advances a reader by `bytes` through a fixed-size buffer, decompressing but never buffering the
+/// skipped data.
+fn discard_bytes<R: io::Read>(reader: &mut R, mut bytes: u64) -> io::Result<()> {
+    let mut buffer = [0_u8; 8 * 1024];
+    while bytes > 0 {
+        let limit = usize::try_from(bytes.min(u64::try_from(buffer.len()).unwrap_or(u64::MAX)))
+            .unwrap_or(buffer.len());
+        if limit == 0 {
+            return Ok(());
+        }
+        let read = reader.read(&mut buffer[..limit])?;
+        if read == 0 {
+            return Ok(());
+        }
+        bytes = bytes.saturating_sub(u64::try_from(read).unwrap_or(0));
+    }
+    Ok(())
 }
 
 fn discard_partial_line<R: io::BufRead>(reader: &mut R) -> io::Result<bool> {
@@ -1013,7 +1130,12 @@ fn read_scan_job_events(
     offset: i64,
     limit: i64,
 ) -> io::Result<(i64, Vec<ScanJobLogEvent>)> {
-    let mut collector = PageCollector::new(page_offset(offset), page_limit(limit));
+    let Some((offset, limit)) = bounded_page_window(offset, limit) else {
+        // A page deeper than `MAX_LOG_PAGE_WINDOW` is refused instead of buffering the whole log;
+        // `total` reports the lower bound zero because counting it would need the declined scan.
+        return Ok((0, Vec::new()));
+    };
+    let mut collector = PageCollector::new(offset, limit);
     let job_id_bytes = job_id.as_bytes();
     scan_log_records(log_dir, archive_dir, MAX_JOB_EVENT_SCAN_BYTES, |item| {
         if let ScanItem::Line(line) = item
@@ -1026,7 +1148,7 @@ fn read_scan_job_events(
         // The API response carries an exact `total`, so every file still has to be visited.
         Ok(ScanControl::Continue)
     })?;
-    // Exact while the whole log fit into the scan ceiling, a lower bound once it was truncated.
+    // Exact while the whole retained log fit into the scan ceiling, a lower bound once it was cut.
     let total = i64::try_from(collector.distinct_total()).unwrap_or(i64::MAX);
     Ok((total, collector.into_page()))
 }
@@ -1178,7 +1300,13 @@ fn read_audit_events(
     limit: i64,
     event_types: Option<&[&str]>,
 ) -> io::Result<(i64, Vec<AuditLogEvent>)> {
-    let mut collector = PageCollector::new(page_offset(offset), page_limit(limit));
+    let Some((offset, limit)) = bounded_page_window(offset, limit) else {
+        // A page deeper than `MAX_LOG_PAGE_WINDOW` is refused instead of buffering the whole log.
+        // `total` reports the lower bound zero because counting it would need the scan we declined;
+        // the only caller of this path (`admin_list_audit`) discards the total.
+        return Ok((0, Vec::new()));
+    };
+    let mut collector = PageCollector::new(offset, limit);
     scan_log_records(
         log_dir,
         archive_dir,
@@ -1197,9 +1325,15 @@ fn read_audit_events(
                     // A name without a day cannot be ordered, so keep scanning instead of stopping.
                     return Ok(ScanControl::Continue);
                 }
-                collector.settle();
-                let page_is_final = collector.is_page_complete()
-                    && floor_dominates_older_days(collector.floor_created_at(), next);
+                collector.flush();
+                // Only settle once the remaining days provably cannot outrank this window; a
+                // migrated record with an old `createdAt` in a newer file would reorder it.
+                let page_is_ordered =
+                    floor_dominates_older_days(collector.floor_created_at(), next);
+                if page_is_ordered {
+                    collector.settle();
+                }
+                let page_is_final = page_is_ordered && collector.is_page_complete();
                 Ok(if page_is_final {
                     ScanControl::Stop
                 } else {
@@ -1219,6 +1353,10 @@ fn read_activity_events(
     archive_dir: &Path,
     limit: i64,
 ) -> io::Result<Vec<AuditLogEvent>> {
+    if bounded_page_window(0, limit).is_none() {
+        // Same refusal as the audit page: never buffer more than `MAX_LOG_PAGE_WINDOW` events.
+        return Ok(Vec::new());
+    }
     let category_limit = usize::try_from((limit / 2).max(1)).unwrap_or(usize::MAX);
     let mut login_events = PageCollector::new(0, category_limit);
     let mut playback_events = PageCollector::new(0, category_limit);
@@ -1243,6 +1381,8 @@ fn read_activity_events(
                 if completed.is_none() {
                     return Ok(ScanControl::Continue);
                 }
+                login_events.flush();
+                playback_events.flush();
                 let category_is_final = |collector: &PageCollector<AuditLogEvent>| {
                     collector.is_page_complete()
                         && floor_dominates_older_days(collector.floor_created_at(), next)
@@ -1267,12 +1407,7 @@ fn read_activity_events(
 }
 
 fn sort_audit_events(events: &mut [AuditLogEvent]) {
-    events.sort_by(|left, right| {
-        right
-            .created_at
-            .cmp(&left.created_at)
-            .then_with(|| right.id.cmp(&left.id))
-    });
+    sort_by_rank(events);
 }
 
 pub(crate) struct LogWriter {
@@ -2009,10 +2144,12 @@ mod tests {
     };
 
     use super::{
-        AuditLogEvent, LogDateRange, LogExport, LogExportError, LogManager, LogStore,
-        MAX_EVENT_SCAN_BYTES, NewAuditLogEvent, ScanJobLogEvent, archive_dir, export_logs, log_dir,
-        log_file_name, log_segment_file_name, parse_date, read_activity_events, read_audit_events,
-        read_scan_job_events, sort_audit_events, verify_archive,
+        AuditLogEvent, LOG_SEGMENT_BYTES, LogDateRange, LogExport, LogExportError, LogManager,
+        LogStore, MAX_EVENT_SCAN_BYTES, MAX_EVENT_SCAN_FILES, MAX_JOB_EVENT_SCAN_BYTES,
+        MAX_LOG_ARCHIVES, MAX_LOG_PAGE_WINDOW, NewAuditLogEvent, ScanJobLogEvent, archive_dir,
+        export_logs, log_dir, log_file_name, log_segment_file_name, parse_date,
+        read_activity_events, read_audit_events, read_scan_job_events, sort_audit_events,
+        verify_archive,
     };
     use serde_json::Value;
     use time::{Date, Month, OffsetDateTime};
@@ -2972,6 +3109,255 @@ mod tests {
             ["tail-2".to_owned(), "tail-1".to_owned()],
             "the byte ceiling must return the newest records and stop before older segments"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_archive_member_returns_its_newest_records()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path();
+        let newest = fixture_date("2026-08-09");
+        let previous = fixture_date("2026-08-08");
+        // An archived segment is a rotated daily file: its oldest records come first.
+        let padding = "p".repeat(48 * 1024);
+        let noise_lines = usize::try_from(MAX_EVENT_SCAN_BYTES / (48 * 1024)).unwrap_or(0) + 32;
+        let mut payload = Vec::with_capacity(noise_lines + 3);
+        payload.push(audit_fixture_line(
+            "head-oldest",
+            "SETTINGS_UPDATED",
+            day_start(newest),
+        ));
+        for index in 0..noise_lines {
+            payload.push(
+                serde_json::json!({"recordType": "program_log", "message": format!("{index}-{padding}")})
+                    .to_string(),
+            );
+        }
+        payload.push(audit_fixture_line(
+            "tail-1",
+            "SETTINGS_UPDATED",
+            day_start(newest) + 60,
+        ));
+        payload.push(audit_fixture_line(
+            "tail-2",
+            "SETTINGS_UPDATED",
+            day_start(newest) + 120,
+        ));
+        write_log_archive(config_dir, newest, 1, &payload)?;
+        // The oversized member is the newest source: older archives must stay unopened.
+        fs::create_dir_all(archive_dir(config_dir))?;
+        fs::write(
+            archive_dir(config_dir).join(format!("{}.zip", log_segment_file_name(previous, 1))),
+            b"not a zip archive",
+        )?;
+
+        let (_, page) =
+            read_audit_events(&log_dir(config_dir), &archive_dir(config_dir), 0, 10, None)?;
+        assert_eq!(
+            event_ids(&page, |event| event.id.as_str()),
+            ["tail-2".to_owned(), "tail-1".to_owned()],
+            "an over-budget archive member must be read from its newest end"
+        );
+        assert_eq!(page.len(), 2, "the skipped head must not leak its records");
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_timestamp_with_offset_returns_the_globally_ordered_row()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path();
+        let newest = fixture_date("2026-08-09");
+        let previous = fixture_date("2026-08-08");
+        // `legacy` keeps an old `createdAt` inside the newer file (a migrated record), so the day
+        // order cannot be trusted before both files are read.
+        write_daily_segment(
+            config_dir,
+            newest,
+            &[audit_fixture_line(
+                "legacy",
+                "SETTINGS_UPDATED",
+                day_start(fixture_date("2026-08-01")),
+            )],
+        )?;
+        write_daily_segment(
+            config_dir,
+            previous,
+            &[audit_fixture_line(
+                "recent",
+                "SETTINGS_UPDATED",
+                day_start(newest) - 60,
+            )],
+        )?;
+
+        let (_, page) =
+            read_audit_events(&log_dir(config_dir), &archive_dir(config_dir), 1, 1, None)?;
+        assert_eq!(
+            event_ids(&page, |event| event.id.as_str()),
+            ["legacy".to_owned()],
+            "the second row of the globally ordered log is the migrated record"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_timestamp_pages_match_a_full_scan_for_every_offset()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path();
+        let newest = fixture_date("2026-08-09");
+        let middle = fixture_date("2026-08-08");
+        let oldest = fixture_date("2026-08-07");
+        write_daily_segment(
+            config_dir,
+            newest,
+            &[
+                audit_fixture_line("newest-a", "SETTINGS_UPDATED", day_start(newest) + 60),
+                audit_fixture_line("legacy-a", "SETTINGS_UPDATED", day_start(oldest) + 90),
+                audit_fixture_line("legacy-b", "SETTINGS_UPDATED", day_start(middle) + 30),
+            ],
+        )?;
+        write_log_archive(
+            config_dir,
+            middle,
+            1,
+            &[
+                audit_fixture_line("middle-a", "SETTINGS_UPDATED", day_start(middle) + 60),
+                audit_fixture_line("legacy-c", "SETTINGS_UPDATED", day_start(oldest) + 30),
+            ],
+        )?;
+        write_daily_segment(
+            config_dir,
+            oldest,
+            &[
+                audit_fixture_line("oldest-a", "SETTINGS_UPDATED", day_start(oldest) + 60),
+                audit_fixture_line("oldest-b", "SETTINGS_UPDATED", day_start(oldest) + 120),
+            ],
+        )?;
+
+        for offset in [0_usize, 1, 2, 3] {
+            for limit in [1_i64, 2, 5] {
+                let (_, page) = read_audit_events(
+                    &log_dir(config_dir),
+                    &archive_dir(config_dir),
+                    i64::try_from(offset).unwrap_or(i64::MAX),
+                    limit,
+                    None,
+                )?;
+                assert_eq!(
+                    event_ids(&page, |event| event.id.as_str()),
+                    reference_audit_ids(config_dir, offset, usize::try_from(limit).unwrap_or(0))?,
+                    "offset={offset} limit={limit}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retention_ceilings_cover_the_full_retained_log_volume() {
+        // Every retained archive slot plus the daily files still being written must fit, otherwise
+        // older job events would silently disappear from the admin page.
+        const {
+            assert!(MAX_JOB_EVENT_SCAN_BYTES >= LOG_SEGMENT_BYTES * (MAX_LOG_ARCHIVES as u64 + 1));
+            assert!(MAX_EVENT_SCAN_FILES > MAX_LOG_ARCHIVES);
+            assert!(MAX_EVENT_SCAN_BYTES < MAX_JOB_EVENT_SCAN_BYTES);
+            // The window must at least cover a full console page, and stay small enough to stay
+            // bounded.
+            assert!(MAX_LOG_PAGE_WINDOW >= 100);
+            assert!(MAX_LOG_PAGE_WINDOW <= 10_000);
+        }
+    }
+
+    #[test]
+    fn deep_pages_are_refused_without_opening_log_files() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path();
+        fs::create_dir_all(archive_dir(config_dir))?;
+        fs::write(
+            archive_dir(config_dir).join("lux.2026-08-08.part-000001.log.zip"),
+            b"not a zip archive",
+        )?;
+        let deep_offset = i64::try_from(MAX_LOG_PAGE_WINDOW).unwrap_or(i64::MAX);
+
+        let (total, page) = read_audit_events(
+            &log_dir(config_dir),
+            &archive_dir(config_dir),
+            deep_offset,
+            1,
+            None,
+        )?;
+        assert_eq!(total, 0);
+        assert!(page.is_empty());
+        assert!(
+            read_activity_events(
+                &log_dir(config_dir),
+                &archive_dir(config_dir),
+                deep_offset.saturating_add(1),
+            )?
+            .is_empty()
+        );
+        let (total, events) = read_scan_job_events(
+            &log_dir(config_dir),
+            &archive_dir(config_dir),
+            "job-1",
+            None,
+            None,
+            deep_offset,
+            1,
+        )?;
+        assert_eq!(total, 0);
+        assert!(events.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn wide_page_windows_match_a_full_scan() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path();
+        let first = fixture_date("2026-08-06");
+        let second = fixture_date("2026-08-07");
+        let third = fixture_date("2026-08-08");
+        let mut first_day = Vec::with_capacity(2_000);
+        let mut second_day = Vec::with_capacity(2_000);
+        let mut third_day = Vec::with_capacity(2_000);
+        for index in 0..2_000 {
+            first_day.push(audit_fixture_line(
+                &format!("first-{index:05}"),
+                "SETTINGS_UPDATED",
+                day_start(first) + index,
+            ));
+            second_day.push(audit_fixture_line(
+                &format!("second-{index:05}"),
+                "SETTINGS_UPDATED",
+                day_start(second) + index,
+            ));
+            third_day.push(audit_fixture_line(
+                &format!("third-{index:05}"),
+                "SETTINGS_UPDATED",
+                day_start(third) + index,
+            ));
+        }
+        write_log_archive(config_dir, first, 1, &first_day)?;
+        write_daily_segment(config_dir, second, &second_day)?;
+        write_daily_segment(config_dir, third, &third_day)?;
+
+        for (offset, limit) in [(5_000_usize, 100_i64), (0, 100), (1_500, 100), (5_950, 100)] {
+            let (_, page) = read_audit_events(
+                &log_dir(config_dir),
+                &archive_dir(config_dir),
+                i64::try_from(offset).unwrap_or(i64::MAX),
+                limit,
+                None,
+            )?;
+            assert_eq!(
+                event_ids(&page, |event| event.id.as_str()),
+                reference_audit_ids(config_dir, offset, usize::try_from(limit).unwrap_or(0))?,
+                "offset={offset} limit={limit}"
+            );
+        }
         Ok(())
     }
 }
