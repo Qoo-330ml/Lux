@@ -42,7 +42,10 @@ use std::io::{self, Write};
 use serde_json::Value;
 use tracing_subscriber::fmt::MakeWriter;
 
-use super::logs::redact_sensitive_log_values;
+use super::logs::{
+    SENSITIVE_KEY_FRAGMENTS, SENSITIVE_KEY_SUFFIXES, SENSITIVE_URL_MARKERS,
+    SENSITIVE_VALUE_MARKERS, redact_sensitive_log_values,
+};
 
 /// Wraps a [`MakeWriter`] so every line it emits is redacted before it is written.
 pub(crate) struct RedactingMakeWriter<M> {
@@ -159,33 +162,47 @@ impl<W: Write> Drop for RedactingWriter<W> {
     }
 }
 
-/// Fragments the value rules search for inside a lowercased string. A value that the redactor
-/// rewrites contains one of them contiguously, so a case-insensitive substring test is exact for
-/// this half of the rules.
-const VALUE_FRAGMENTS: [&[u8]; 9] = [
-    b"password",
-    b"token",
-    b"secret",
-    b"cookie",
-    b"authorization",
-    b"apikey",
-    b"api_key",
-    b"bearer",
-    b"http",
-];
+/// Fragments the value rules search for inside a lowercased string, derived at compile time from
+/// the shared rule tables in [`super::logs`] rather than restated here. When the redactor rewrites
+/// a value, the marker's leading letters appear contiguously in the value, so a case-insensitive
+/// substring test is exact for this half of the rules. Only the marker's trailing punctuation is
+/// dropped (`token=` becomes `token`, `bearer ` becomes `bearer`), which keeps the scan wider than
+/// the rule: it parses a few extra lines but can never miss one.
+const VALUE_FRAGMENTS: &[&[u8]] = &search_fragments(SENSITIVE_VALUE_MARKERS);
+
+/// Same derivation for the URL value rule, kept apart only because that rule leaves a different
+/// placeholder behind.
+const URL_FRAGMENTS: &[&[u8]] = &search_fragments(SENSITIVE_URL_MARKERS);
 
 /// Fragments the key rules look for once non-alphanumeric separators are stripped. Keys are
 /// contiguous in the raw line, so any key that contains one of them also contains its letters in
 /// order; a subsequence scan of the key token is therefore a strict superset of the key rule.
-const KEY_FRAGMENTS: [&[u8]; 7] = [
-    b"password",
-    b"token",
-    b"secret",
-    b"cookie",
-    b"authorization",
-    b"apikey",
-    b"credential",
-];
+const KEY_FRAGMENTS: &[&[u8]] = &search_fragments(SENSITIVE_KEY_FRAGMENTS);
+
+/// The leading alphanumeric run of a rule marker, e.g. `token=` becomes `token`.
+const fn marker_fragment(marker: &'static str) -> &'static [u8] {
+    let bytes = marker.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && !bytes[end - 1].is_ascii_alphanumeric() {
+        end -= 1;
+    }
+    // `split_at_checked` is const and total, so this cannot panic or index out of bounds.
+    match bytes.split_at_checked(end) {
+        Some((head, _)) => head,
+        None => bytes,
+    }
+}
+
+/// Turns a shared marker table into the fragment table the byte scan uses.
+const fn search_fragments<const N: usize>(markers: [&'static str; N]) -> [&'static [u8]; N] {
+    let mut fragments: [&'static [u8]; N] = [b""; N];
+    let mut index = 0;
+    while index < N {
+        fragments[index] = marker_fragment(markers[index]);
+        index += 1;
+    }
+    fragments
+}
 
 /// Cheap, conservative pre-check: `false` only when the redactor provably cannot change the line.
 fn may_need_redaction(line: &[u8]) -> bool {
@@ -199,6 +216,7 @@ fn may_need_redaction(line: &[u8]) -> bool {
     }
     VALUE_FRAGMENTS
         .iter()
+        .chain(URL_FRAGMENTS.iter())
         .any(|fragment| contains_ignore_case(line, fragment))
         || key_fragments_present(line)
 }
@@ -287,28 +305,32 @@ fn contains_normalized_subsequence(text: &[u8], fragment: &[u8]) -> bool {
     false
 }
 
-/// Exact test for the `url`/`uri` key suffix rule, which looks at the key's trailing letters.
+/// Exact test for the key suffix rule, driven by the shared suffix table.
 fn normalized_suffix_is_url_or_uri(key: &[u8]) -> bool {
-    let mut tail = [0_u8; 3];
-    let mut count = 0;
+    SENSITIVE_KEY_SUFFIXES
+        .iter()
+        .any(|suffix| normalized_key_ends_with(key, suffix.as_bytes()))
+}
+
+/// Whether the key's normalized form (letters and digits only, lowercased) ends with `suffix`.
+fn normalized_key_ends_with(key: &[u8], suffix: &[u8]) -> bool {
+    let mut remaining = suffix.len();
+    if remaining == 0 {
+        return true;
+    }
     for &byte in key.iter().rev() {
         if !byte.is_ascii_alphanumeric() {
             continue;
         }
-        if count == tail.len() {
-            break;
+        remaining -= 1;
+        if byte.to_ascii_lowercase() != suffix[remaining] {
+            return false;
         }
-        tail[count] = byte.to_ascii_lowercase();
-        count += 1;
+        if remaining == 0 {
+            return true;
+        }
     }
-    if count < tail.len() {
-        return false;
-    }
-    // `tail` is filled from the end: index 0 is the last character, index 2 the third-to-last.
-    matches!(
-        (tail[0], tail[1], tail[2]),
-        (b'l', b'r', b'u') | (b'i', b'r', b'u')
-    )
+    false
 }
 
 /// Redacted encoding of `line`, or `None` when the line is safe or could not be processed.
@@ -354,6 +376,11 @@ mod tests {
         layer::SubscriberExt,
     };
 
+    use super::super::logs::{
+        REDACTED_PLACEHOLDER, REDACTED_URL_PLACEHOLDER, SENSITIVE_KEY_FRAGMENTS,
+        SENSITIVE_KEY_SUFFIXES, SENSITIVE_URL_MARKERS, SENSITIVE_VALUE_MARKERS,
+        redact_sensitive_log_values,
+    };
     use super::{RedactingMakeWriter, RedactingWriter, may_need_redaction};
 
     /// In-memory sink shared by the test subscriber and the assertions.
@@ -775,6 +802,62 @@ mod tests {
                 !may_need_redaction(line),
                 "fast path parsed {}",
                 String::from_utf8_lossy(line)
+            );
+        }
+    }
+
+    /// Every rule in the shared tables must be visible to the pre-check and must really be
+    /// applied. The cases are generated from the tables, so a rule added to them is covered here
+    /// without editing this test; a rule added only to the redactor instead of the tables makes
+    /// `logs::redaction_rule_tests::shared_tables_are_the_only_rule_source` fail.
+    #[test]
+    fn every_shared_rule_is_prechecked_and_redacted() {
+        let mut cases: Vec<(String, String, &str)> = Vec::new();
+        for fragment in SENSITIVE_KEY_FRAGMENTS {
+            cases.push((
+                format!(r#"{{"fields":{{"{fragment}":"sentinel"}}}}"#),
+                fragment.to_owned(),
+                REDACTED_PLACEHOLDER,
+            ));
+        }
+        for suffix in SENSITIVE_KEY_SUFFIXES {
+            let key = format!("source{suffix}");
+            cases.push((
+                format!(r#"{{"fields":{{"{key}":"sentinel"}}}}"#),
+                key,
+                REDACTED_PLACEHOLDER,
+            ));
+        }
+        for marker in SENSITIVE_VALUE_MARKERS {
+            cases.push((
+                format!(r#"{{"fields":{{"message":"sentinel {marker} value"}}}}"#),
+                "message".to_owned(),
+                REDACTED_PLACEHOLDER,
+            ));
+        }
+        for marker in SENSITIVE_URL_MARKERS {
+            cases.push((
+                format!(r#"{{"fields":{{"message":"sentinel {marker}example.test/a value"}}}}"#),
+                "message".to_owned(),
+                REDACTED_URL_PLACEHOLDER,
+            ));
+        }
+
+        for (line, field, expected) in cases {
+            assert!(
+                may_need_redaction(line.as_bytes()),
+                "pre-check missed {line}"
+            );
+            let value: Value = serde_json::from_str(&line).expect("tracing-style JSON line");
+            let redacted = redact_sensitive_log_values(value);
+            assert!(
+                !redacted.to_string().contains("sentinel"),
+                "the rule in {line} did not change the value"
+            );
+            assert_eq!(
+                redacted["fields"][field.as_str()],
+                Value::String(expected.to_owned()),
+                "{line}"
             );
         }
     }
