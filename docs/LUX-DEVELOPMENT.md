@@ -19568,7 +19568,7 @@ Emby 用例放在既有 `image_variants` 模块（`--test images image_variants:
   `format`、叠加参数）。
 - `cargo test --locked --test images image_variants::` 16/16 通过（含带索引路由用例）。
 - `cargo test --locked --test emby` 39/39 通过（Emby 兼容层回归）。
-- `cargo test --locked --test images` 60 通过 / 1 失败，失败项为
+- `cargo test --locked --test images` 61 通过 / 1 失败（返工后重跑），失败项为
   `image_writer::manual_scraper_image_selection_claims_one_attempt_for_the_same_image`。该用例在
   `docs/TEST-TARGETS.md` 已记录为“两个并发任务需落在同一 40 ms 窗口、高负载下退化成串行”的时序敏感
   用例；单独重跑该用例 1/1 通过，与本任务无关。
