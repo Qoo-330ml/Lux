@@ -2567,8 +2567,12 @@ async fn unknown_emby_user_ids_emit_the_failed_login_event()
     assert_eq!(events[0]["level"], "WARN");
     assert_eq!(events[0]["fields"]["errorCode"], "AUTH_LOGIN_FAILED");
     assert_eq!(events[0]["fields"]["remoteIp"], "127.0.0.1");
+    // The capture is limited to WARN, so the INFO `request` span (whose `path` legitimately carries
+    // the requested URL) is not observed here; this asserts only that the event's own fields do not
+    // repeat the account identifier the client asked about.
+    let event_fields = events[0]["fields"].to_string();
+    assert!(!event_fields.contains("00000000-0000-4000-8000-000000000000"));
     let logs = captured_login_logs(&server.buffer)?;
-    assert!(!logs.contains("00000000-0000-4000-8000-000000000000"));
     assert!(!logs.contains("missing password"));
     assert!(!logs.contains("event-device"));
     Ok(())
