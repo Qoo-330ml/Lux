@@ -602,6 +602,13 @@ pub(crate) fn source_pixel_dimensions(source: &ResolvedImage) -> Option<(u32, u3
 /// long edge at or above `max(source_width, source_height)` gets the original). `None` means
 /// "serve the original": no usable hint, an unknown source size, or a needed long edge above
 /// the largest tier.
+///
+/// `source_width` / `source_height` are the stored image dimensions, which come from the file
+/// header, while variant generation applies the EXIF orientation before resizing and the
+/// orientation is only known once the source is decoded (never on this request path). Both
+/// readings of the stored pair are therefore covered and the larger needed long edge wins: a
+/// source whose EXIF orientation swaps the axes can never be served from a tier that is too
+/// small for what the client renders.
 pub(crate) fn variant_width_for_display_size(
     requested_width: Option<u32>,
     requested_height: Option<u32>,
@@ -612,19 +619,19 @@ pub(crate) fn variant_width_for_display_size(
         return None;
     }
     let source_long_edge = u64::from(source_width.max(source_height));
-    let by_width = requested_width
-        .filter(|requested| *requested > 0)
-        .map(|requested| scaled_long_edge(requested, source_long_edge, source_width));
-    let by_height = requested_height
-        .filter(|requested| *requested > 0)
-        .map(|requested| scaled_long_edge(requested, source_long_edge, source_height));
-    let needed = match (by_width, by_height) {
-        // Both hints describe the same box, so the smaller needed long edge is the one the
-        // client actually renders.
-        (Some(by_width), Some(by_height)) => by_width.min(by_height),
-        (Some(needed), None) | (None, Some(needed)) => needed,
-        (None, None) => return None,
-    };
+    // `max(sw, sh)` is orientation invariant, so only the hint conversion can change.
+    let needed = [(source_width, source_height), (source_height, source_width)]
+        .into_iter()
+        .filter_map(|(width, height)| {
+            needed_long_edge(
+                requested_width,
+                requested_height,
+                source_long_edge,
+                width,
+                height,
+            )
+        })
+        .max()?;
     if needed >= source_long_edge {
         return None;
     }
@@ -635,6 +642,30 @@ pub(crate) fn variant_width_for_display_size(
         .into_iter()
         .find(|width| u64::from(*width) >= needed)
         .filter(|width| u64::from(*width) < source_long_edge)
+}
+
+/// Long edge one scaling of the client box needs for a single orientation reading, or `None`
+/// when neither hint carries a usable value.
+fn needed_long_edge(
+    requested_width: Option<u32>,
+    requested_height: Option<u32>,
+    source_long_edge: u64,
+    source_width: u32,
+    source_height: u32,
+) -> Option<u64> {
+    let by_width = requested_width
+        .filter(|requested| *requested > 0)
+        .map(|requested| scaled_long_edge(requested, source_long_edge, source_width));
+    let by_height = requested_height
+        .filter(|requested| *requested > 0)
+        .map(|requested| scaled_long_edge(requested, source_long_edge, source_height));
+    match (by_width, by_height) {
+        // Both hints describe the same box, so the smaller needed long edge is the one the
+        // client actually renders.
+        (Some(by_width), Some(by_height)) => Some(by_width.min(by_height)),
+        (Some(needed), None) | (None, Some(needed)) => Some(needed),
+        (None, None) => None,
+    }
 }
 
 /// Long edge the client renders after scaling `requested` onto `source_edge`, rounded up so a
@@ -877,9 +908,16 @@ mod tests {
             variant_width_for_display_size(Some(800), None, 1600, 2400),
             Some(1280)
         );
-        // 1600×2400 at 300 px high → 300 px long edge → 360.
+        // 1600×2400 at 300 px high: the unrotated reading needs a 300 px long edge, but the
+        // rotated 2400×1600 reading needs 450 px, and the orientation is unknown here, so the
+        // coarser 720 tier is kept.
         assert_eq!(
             variant_width_for_display_size(None, Some(300), 1600, 2400),
+            Some(720)
+        );
+        // A width hint on the short stored edge reads the same in both orientations.
+        assert_eq!(
+            variant_width_for_display_size(Some(200), None, 1600, 2400),
             Some(360)
         );
         // Ceiling rounding: 1500 × 299 / 1000 = 448.5 → 449 px → 720.
@@ -890,6 +928,29 @@ mod tests {
         // An exact tier boundary stays on that tier.
         assert_eq!(
             variant_width_for_display_size(Some(240), None, 1000, 1500),
+            Some(360)
+        );
+    }
+
+    #[test]
+    fn display_box_covers_both_exif_orientations() {
+        // The stored 2400×1600 comes from the file header; the variant pipeline applies the EXIF
+        // orientation before resizing, so the rendered artwork may be 1600×2400. A 1000 px wide
+        // client box then needs a 1500 px long edge, which no tier covers: serve the original
+        // instead of the 1280 tier an unrotated reading would pick.
+        assert_eq!(
+            variant_width_for_display_size(Some(1000), None, 2400, 1600),
+            None
+        );
+        // A rotated 2400×1600 poster rendered at 600 px wide needs 900 px, so the rotated
+        // reading forces the coarser 1280 tier.
+        assert_eq!(
+            variant_width_for_display_size(Some(600), None, 2400, 1600),
+            Some(1280)
+        );
+        // Square sources read the same in both orientations.
+        assert_eq!(
+            variant_width_for_display_size(Some(300), None, 1000, 1000),
             Some(360)
         );
     }
