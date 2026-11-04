@@ -18,6 +18,8 @@ const MAX_LOGIN_BACKGROUND_CACHE_BYTES: usize = 256 * 1024;
 const DEFAULT_USER_DELETION_GRACE_DAYS: i64 = 7;
 const MAX_USER_DELETION_GRACE_DAYS: i64 = 3_650;
 const DEFAULT_USER_ACTIVITY_RETENTION_DAYS: i64 = 7;
+/// The dashboard feed only looks this far back, so neither category query can scan the whole index.
+pub(super) const DASHBOARD_ACTIVITY_WINDOW_SECONDS: i64 = 30 * 24 * 60 * 60;
 const MAX_USER_ACTIVITY_RETENTION_DAYS: i64 = 3_650;
 const SECONDS_PER_DAY: i64 = 86_400;
 const MAX_USER_CONTENT_RESTRICTION_TAGS: usize = 100;
@@ -192,19 +194,20 @@ struct PluginInstallationStatusRow {
     is_enabled: i64,
 }
 
-/// Newest successful logins for the dashboard activity feed.
+/// Newest successful logins for the dashboard activity feed inside the dashboard window.
 pub(super) const ACTIVITY_FEED_LOGIN_SQL: &str = "SELECT id, user_id, actor_user_id, event_type,
             target_type, target_id, metadata_json, occurred_at
      FROM user_activity_events
-     WHERE event_type = 'AUTH_LOGIN'
+     WHERE event_type = 'AUTH_LOGIN' AND occurred_at >= ?
      ORDER BY occurred_at DESC, id DESC
      LIMIT ?";
 
-/// Newest playback state changes for the dashboard activity feed.
+/// Newest playback state changes for the dashboard activity feed inside the dashboard window.
 pub(super) const ACTIVITY_FEED_PLAYBACK_SQL: &str = "SELECT id, user_id, actor_user_id, event_type,
             target_type, target_id, metadata_json, occurred_at
      FROM user_activity_events
      WHERE event_type IN ('PLAYBACK_STARTED', 'PLAYBACK_PAUSED', 'PLAYBACK_STOPPED')
+       AND occurred_at >= ?
      ORDER BY occurred_at DESC, id DESC
      LIMIT ?";
 
@@ -2330,24 +2333,33 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
-    /// Dashboard feed: the newest logins and the newest playback events.
+    /// Dashboard feed: the newest logins and the newest playback events of the last
+    /// [`DASHBOARD_ACTIVITY_WINDOW_SECONDS`] days.
     ///
-    /// Both category queries are bounded by `LIMIT` and ordered by
-    /// `idx_user_activity_events_retention (occurred_at, id)`, so a large index never turns into a
-    /// full-table scan or a whole-table sort. `AUTH_LOGIN_FAILED` stays out of the feed.
+    /// `LIMIT` bounds the returned rows; the scan is bounded by that fixed `occurred_at` window
+    /// (and by the configured retention, which is at most 3650 days). Without the lower bound a
+    /// category that has few or no rows in the window would still walk the entire retention index
+    /// every 15 seconds. With it, each query is a range `SEARCH` on
+    /// `idx_user_activity_events_retention (occurred_at, id)`; a category without rows in the
+    /// window still reads the window's rows, but that count is bounded.
+    /// `AUTH_LOGIN_FAILED` stays out of the feed.
     pub(crate) async fn list_activity_events(
         &self,
         limit: i64,
     ) -> Result<Vec<StoredActivityEvent>, StorageError> {
         let category_limit = (limit / 2).max(1);
+        let window_start =
+            current_unix_timestamp().saturating_sub(DASHBOARD_ACTIVITY_WINDOW_SECONDS);
         let login_rows = self
             .query_as::<UserActivityEventRow>(sqlx::AssertSqlSafe(ACTIVITY_FEED_LOGIN_SQL))
+            .bind(window_start)
             .bind(category_limit)
             .fetch_all(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
         let playback_rows = self
             .query_as::<UserActivityEventRow>(sqlx::AssertSqlSafe(ACTIVITY_FEED_PLAYBACK_SQL))
+            .bind(window_start)
             .bind(category_limit)
             .fetch_all(&self.pool)
             .await

@@ -513,7 +513,8 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
         "INSERT INTO user_activity_events (
             id, user_id, actor_user_id, event_type, target_type, target_id, metadata_json, occurred_at
          ) VALUES ('activity-with-deleted-user-and-media', 'deleted-user', NULL,
-                   'PLAYBACK_PAUSED', 'media_item', 'deleted-media', '{\"state\":\"PAUSED\"}', 1)",
+                   'PLAYBACK_PAUSED', 'media_item', 'deleted-media', '{\"state\":\"PAUSED\"}',
+                   unixepoch() - 60)",
     )
     .execute(database.pool())
     .await?;

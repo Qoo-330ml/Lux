@@ -268,7 +268,8 @@ IP 封禁设计收敛为一项全站高级配置：**可信代理地址或网段
   已经显式保存过该键的实例保持原值，不改写、不新增 migration。
 - `Database::list_activity_events(limit)` 不再调用 `LogStore::list_activity_events`，改为对
   `user_activity_events` 的两条有界查询：`AUTH_LOGIN` 一条，`PLAYBACK_STARTED` / `PLAYBACK_PAUSED` /
-  `PLAYBACK_STOPPED` 一条；每条 `ORDER BY occurred_at DESC, id DESC LIMIT (limit/2).max(1)`，合并后按
+  `PLAYBACK_STOPPED` 一条；每条带 `occurred_at >= now - 30 天` 的固定窗口下界并按
+  `ORDER BY occurred_at DESC, id DESC LIMIT (limit/2).max(1)` 取数，合并后按
   `created_at`、`id` 倒序并截断到 `limit`。返回类型 `Vec<StoredActivityEvent>`、DTO 字段和“最多 24
   条、登录/播放各 12 条”的配额不变；`AUTH_LOGIN_FAILED` 不进入仪表盘。用户名仍由
   `list_usernames_by_ids` 关联，`actor_user_id` 为空时回退用活动所属 `user_id`；条目标题仍由
@@ -276,6 +277,10 @@ IP 封禁设计收敛为一项全站高级配置：**可信代理地址或网段
   走现有 `idx_user_activity_events_retention (occurred_at, id)`，不新增 migration 或索引。
 - 登录/播放活动仍同时写入文件审计日志；`LogStore::list_activity_events` 和 `read_activity_events` 原样
   保留。LUX-313 的读取来源由本设计取代。
+- 仪表盘近期活动只看最近 30 天的索引行：两条查询都带 `occurred_at >= now - 30 天` 的固定窗口下界，
+  扫描行数由此（以及保留期）限制，而不是只靠 `LIMIT` 限制返回行数。
+- 升级前已迁入文件日志、尚未进入活动索引的历史不会显示在仪表盘里。索引自 2026-10-20 起与文件日志
+  并行写入，保留期默认 7 天，所以实际影响仅限于升级前不足保留期的窗口。
 - 索引写入在 `record_activity_event` 中先于文件写入且失败只发警告，因此个别事件可能只存在于文件审计
   日志。仪表盘现在以索引为准，这类事件不会出现在仪表盘，但仍保留在文件审计日志中。
 - 未显式保存保留期的实例会在下一轮用户清理循环中按 7 天截止点有界批量删除更早的索引行；已经显式保存

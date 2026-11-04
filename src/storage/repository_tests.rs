@@ -30576,7 +30576,9 @@ async fn user_activity_index_retention_deletes_old_events_in_bounded_batches()
 #[tokio::test]
 async fn list_activity_events_uses_the_activity_index_quota_and_order()
 -> Result<(), Box<dyn std::error::Error>> {
-    use super::users::{ACTIVITY_FEED_LOGIN_SQL, ACTIVITY_FEED_PLAYBACK_SQL};
+    use super::users::{
+        ACTIVITY_FEED_LOGIN_SQL, ACTIVITY_FEED_PLAYBACK_SQL, DASHBOARD_ACTIVITY_WINDOW_SECONDS,
+    };
 
     let temp_dir = tempfile::tempdir()?;
     let database = Database::connect(&Config {
@@ -30584,14 +30586,15 @@ async fn list_activity_events_uses_the_activity_index_quota_and_order()
         config_dir: temp_dir.path().join("config"),
     })
     .await?;
+    let now = crate::clock::unix_timestamp();
     for (id, event_type, occurred_at) in [
-        ("login-old", "AUTH_LOGIN", 10_i64),
-        ("login-tie-a", "AUTH_LOGIN", 20),
-        ("login-tie-b", "AUTH_LOGIN", 20),
-        ("playback-started", "PLAYBACK_STARTED", 15),
-        ("playback-paused", "PLAYBACK_PAUSED", 25),
-        ("playback-stopped", "PLAYBACK_STOPPED", 35),
-        ("login-failed", "AUTH_LOGIN_FAILED", 40),
+        ("login-old", "AUTH_LOGIN", now - 70),
+        ("login-tie-a", "AUTH_LOGIN", now - 60),
+        ("login-tie-b", "AUTH_LOGIN", now - 60),
+        ("playback-started", "PLAYBACK_STARTED", now - 65),
+        ("playback-paused", "PLAYBACK_PAUSED", now - 55),
+        ("playback-stopped", "PLAYBACK_STOPPED", now - 45),
+        ("login-failed", "AUTH_LOGIN_FAILED", now - 40),
     ] {
         sqlx::query(
             "INSERT INTO user_activity_events (id, user_id, actor_user_id, event_type, occurred_at)
@@ -30624,7 +30627,7 @@ async fn list_activity_events_uses_the_activity_index_quota_and_order()
             .iter()
             .all(|event| event.event_type != "AUTH_LOGIN_FAILED")
     );
-    assert_eq!(events[0].created_at, 35);
+    assert_eq!(events[0].created_at, now - 45);
     assert_eq!(events[0].event_type, "PLAYBACK_STOPPED");
 
     // `limit / 2` per category with a floor of one, then the overall truncation.
@@ -30646,9 +30649,13 @@ async fn list_activity_events_uses_the_activity_index_quota_and_order()
     );
     assert!(database.list_activity_events(0).await?.is_empty());
 
-    // Both category queries are bounded by the retention index and never sort the whole table.
+    // Both category queries are range searches on the retention index: the window lower bound bounds
+    // the scanned rows, and the index order avoids a whole-table sort.
+    let window_start =
+        crate::clock::unix_timestamp().saturating_sub(DASHBOARD_ACTIVITY_WINDOW_SECONDS);
     for sql in [ACTIVITY_FEED_LOGIN_SQL, ACTIVITY_FEED_PLAYBACK_SQL] {
         let plan_rows = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+            .bind(window_start)
             .bind(5_i64)
             .fetch_all(database.pool())
             .await?;
@@ -30657,9 +30664,16 @@ async fn list_activity_events_uses_the_activity_index_quota_and_order()
             .filter_map(|row| sqlx::Row::try_get::<String, _>(row, 3).ok())
             .collect::<Vec<_>>();
         assert!(
-            plan.iter()
-                .any(|line| line.contains("idx_user_activity_events_retention")),
-            "activity feed query should use the retention index: {plan:?}"
+            plan.iter().any(|line| {
+                line.starts_with("SEARCH")
+                    && line.contains("idx_user_activity_events_retention")
+                    && line.contains("occurred_at>?")
+            }),
+            "activity feed query should range-search the retention index: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|line| line.starts_with("SCAN ")),
+            "activity feed query should not scan the whole table: {plan:?}"
         );
         assert!(
             !plan
@@ -30668,6 +30682,56 @@ async fn list_activity_events_uses_the_activity_index_quota_and_order()
             "activity feed query should not sort the whole table: {plan:?}"
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_activity_events_only_reads_events_inside_the_dashboard_window()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::users::DASHBOARD_ACTIVITY_WINDOW_SECONDS;
+
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let now = crate::clock::unix_timestamp();
+    let inside = now - 60;
+    let boundary = now - DASHBOARD_ACTIVITY_WINDOW_SECONDS;
+    let outside = boundary - 1;
+    for (id, event_type, occurred_at) in [
+        ("inside-login", "AUTH_LOGIN", inside),
+        ("inside-playback", "PLAYBACK_STARTED", inside),
+        ("boundary-playback", "PLAYBACK_PAUSED", boundary),
+        ("outside-login", "AUTH_LOGIN", outside),
+        ("outside-playback", "PLAYBACK_STOPPED", outside),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_activity_events (id, user_id, actor_user_id, event_type, occurred_at)
+             VALUES (?, 'window-user', 'window-user', ?, ?)",
+        )
+        .bind(id)
+        .bind(event_type)
+        .bind(occurred_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let events = database.list_activity_events(10).await?;
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["inside-playback", "inside-login", "boundary-playback"]
+    );
+    // Rows older than the window stay in the index but never reach the dashboard feed.
+    let stored_outside: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_activity_events WHERE id LIKE 'outside-%'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(stored_outside, 2);
     Ok(())
 }
 
@@ -30706,6 +30770,7 @@ async fn list_activity_events_joins_names_and_ignores_log_only_events()
         .execute(database.pool())
         .await?;
     }
+    let now = crate::clock::unix_timestamp();
     type FeedEventRow<'a> = (
         &'a str,
         &'a str,
@@ -30723,7 +30788,7 @@ async fn list_activity_events_joins_names_and_ignores_log_only_events()
             "AUTH_LOGIN",
             None,
             r#"{"remoteIp":"127.0.0.1"}"#,
-            100,
+            now - 300,
         ),
         (
             "join-play",
@@ -30732,7 +30797,7 @@ async fn list_activity_events_joins_names_and_ignores_log_only_events()
             "PLAYBACK_STARTED",
             Some("feed-item"),
             "{}",
-            200,
+            now - 200,
         ),
         (
             "owner-fallback-login",
@@ -30741,7 +30806,7 @@ async fn list_activity_events_joins_names_and_ignores_log_only_events()
             "AUTH_LOGIN",
             None,
             "{}",
-            50,
+            now - 400,
         ),
         (
             "orphan-play",
@@ -30750,7 +30815,7 @@ async fn list_activity_events_joins_names_and_ignores_log_only_events()
             "PLAYBACK_PAUSED",
             Some("deleted-item"),
             "{}",
-            300,
+            now - 100,
         ),
     ];
     for (id, user_id, actor_user_id, event_type, target_id, metadata_json, occurred_at) in rows {
@@ -30805,7 +30870,7 @@ async fn list_activity_events_joins_names_and_ignores_log_only_events()
     assert_eq!(join_play.target_type.as_deref(), Some("media_item"));
     assert_eq!(join_play.target_id.as_deref(), Some("feed-item"));
     assert_eq!(join_play.target_title.as_deref(), Some("Feed Title"));
-    assert_eq!(join_play.created_at, 200);
+    assert_eq!(join_play.created_at, now - 200);
     let join_login = events
         .iter()
         .find(|event| event.id == "join-login")
@@ -30815,7 +30880,7 @@ async fn list_activity_events_joins_names_and_ignores_log_only_events()
         Some("feed-owner-name")
     );
     assert_eq!(join_login.metadata_json, r#"{"remoteIp":"127.0.0.1"}"#);
-    assert_eq!(join_login.created_at, 100);
+    assert_eq!(join_login.created_at, now - 300);
     let fallback_login = events
         .iter()
         .find(|event| event.id == "owner-fallback-login")
