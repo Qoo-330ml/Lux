@@ -285,13 +285,29 @@ impl VariantHarness {
         format!("{}/Items/{item_id}/Images/Primary?{query}", self.base_url)
     }
 
+    fn emby_image_url_at_index(&self, item_id: &str, image_index: i64, query: &str) -> String {
+        format!(
+            "{}/Items/{item_id}/Images/Primary/{image_index}?{query}",
+            self.base_url
+        )
+    }
+
     async fn emby_fetch(
         &self,
         item_id: &str,
         token: Option<&str>,
         query: &str,
     ) -> Result<reqwest::Response, Box<dyn std::error::Error>> {
-        let mut request = self.client.get(self.emby_image_url(item_id, query));
+        self.emby_fetch_url(self.emby_image_url(item_id, query), token)
+            .await
+    }
+
+    async fn emby_fetch_url(
+        &self,
+        url: String,
+        token: Option<&str>,
+    ) -> Result<reqwest::Response, Box<dyn std::error::Error>> {
+        let mut request = self.client.get(url);
         if let Some(token) = token {
             request = request.header("X-Emby-Token", token);
         }
@@ -306,15 +322,24 @@ impl VariantHarness {
         token: Option<&str>,
         query: &str,
     ) -> Result<reqwest::Response, Box<dyn std::error::Error>> {
+        self.emby_variant_response_url(self.emby_image_url(item_id, query), token)
+            .await
+    }
+
+    async fn emby_variant_response_url(
+        &self,
+        url: String,
+        token: Option<&str>,
+    ) -> Result<reqwest::Response, Box<dyn std::error::Error>> {
         for _ in 0..600 {
-            let response = self.emby_fetch(item_id, token, query).await?;
+            let response = self.emby_fetch_url(url.clone(), token).await?;
             if response.headers()[CACHE_CONTROL] == "private, max-age=31536000, immutable" {
                 return Ok(response);
             }
             let _ = response.bytes().await?;
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        Err(format!("Emby image variant was not generated for query {query}").into())
+        Err(format!("Emby image variant was not generated for {url}").into())
     }
 }
 
@@ -748,6 +773,64 @@ async fn emby_tagged_image_hits_the_cached_variant() -> Result<(), Box<dyn std::
     let body = response.bytes().await?;
     assert_eq!(&body[..2], &[0xFF, 0xD8]);
     let decoded = image::load_from_memory(&body)?;
+    assert_eq!(decoded.width().max(decoded.height()), 720);
+    Ok(())
+}
+
+/// The indexed image route (`/Images/Primary/0`) resolves the same variant, both with a
+/// principal and through the tagged capability path.
+#[tokio::test]
+async fn emby_image_index_route_hits_the_cached_variant() -> Result<(), Box<dyn std::error::Error>>
+{
+    let harness = start_harness().await?;
+    harness.enable_server_switch(true).await?;
+    let token = harness
+        .emby_token("admin", "correct password", "image-variant-admin")
+        .await?;
+
+    let response = harness
+        .emby_variant_response_url(
+            harness.emby_image_url_at_index(
+                &harness.item_id,
+                0,
+                &format!("maxWidth=300&api_key={token}"),
+            ),
+            Some(&token),
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let etag = response.headers()[ETAG].to_str()?.to_owned();
+    assert!(etag.ends_with("-w720\""), "unexpected etag {etag}");
+    assert_eq!(
+        response.headers()[CACHE_CONTROL],
+        "private, max-age=31536000, immutable"
+    );
+    let body = response.bytes().await?;
+    assert_eq!(&body[..2], &[0xFF, 0xD8], "variant must be a JPEG");
+    let decoded = image::load_from_memory(&body)?;
+    assert_eq!(decoded.width(), 480);
+    assert_eq!(decoded.height(), 720);
+
+    // The same indexed route without a session but with the image tag.
+    let tagged = harness
+        .emby_variant_response_url(
+            harness.emby_image_url_at_index(
+                &harness.item_id,
+                0,
+                &format!("tag={}&maxWidth=300", harness.poster_tag),
+            ),
+            None,
+        )
+        .await?;
+    assert_eq!(tagged.status(), StatusCode::OK);
+    let tagged_etag = tagged.headers()[ETAG].to_str()?.to_owned();
+    assert!(
+        tagged_etag.ends_with("-w720\""),
+        "unexpected etag {tagged_etag}"
+    );
+    let tagged_body = tagged.bytes().await?;
+    assert_eq!(&tagged_body[..2], &[0xFF, 0xD8]);
+    let decoded = image::load_from_memory(&tagged_body)?;
     assert_eq!(decoded.width().max(decoded.height()), 720);
     Ok(())
 }
