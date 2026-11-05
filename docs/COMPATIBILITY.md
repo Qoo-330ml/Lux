@@ -12,7 +12,7 @@
   分辨率分档（`emby_video_resolution_label`）与插件协议。
 - 客户端可见行为不变：手动候选搜索对软删除条目、已停用媒体库中的条目仍返回 `ItemNotFound`（404），
   且不会调用上游或写入候选；该 404 此前搭在宽度策略的媒体库查询上，现由
-  `ensure_candidate_item_available` 单独承担，自动匹配请求仍跳过这次读取。
+  `ensure_candidate_item_available` 单独承担，携带已解析策略的自动匹配计划仍跳过这次读取；完整刷新（`FULL_REFRESH`）的自动匹配不带已解析策略，与以前一样会执行该查询。
 - 不需要数据库迁移：`media_strategy` 仍是同一列上的 JSON。
 - 未验证：未在真实第三方 Emby 客户端上复测 `MinWidth: 0` 的显示或抓图行为，只用 `emby_catalog`
   单测与 `--test admin admin_api_key::` 覆盖响应形状；旧设置的实际升级路径用单测与
