@@ -1331,7 +1331,11 @@ impl ScraperPluginClient {
             Ok(value) => {
                 let value = Arc::new(value);
                 self.response_cache
-                    .store_shared(&cache_key, Arc::clone(&value), ttl_for_method(method))
+                    .store_shared_for_owner(
+                        &cache_owner,
+                        Arc::clone(&value),
+                        ttl_for_method(method),
+                    )
                     .await;
                 cache_owner.finish();
                 Ok(value)
@@ -1339,7 +1343,7 @@ impl ScraperPluginClient {
             Err(error) => {
                 if is_negative_scraper_error(&error) {
                     self.response_cache
-                        .store_negative(&cache_key, 10 * 60)
+                        .store_negative_for_owner(&cache_owner, 10 * 60)
                         .await;
                 }
                 cache_owner.finish();
@@ -1444,6 +1448,15 @@ impl ScraperResolver {
     pub(crate) fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
         self.resources = Some(resources);
         self
+    }
+
+    /// Clears the response cache shared by every client this resolver builds.
+    ///
+    /// Assemblies that pass a `ScraperProvider::unconfigured()` placeholder to a service still
+    /// scrape through this resolver, so the cache lives on its `PluginService` and a clear on the
+    /// placeholder adapter alone would be a no-op.
+    pub(crate) async fn clear_response_cache(&self) {
+        self.plugins.provider_cache().clear().await;
     }
 
     async fn client_for_scraper(

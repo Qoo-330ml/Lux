@@ -723,6 +723,7 @@ impl PluginService {
         }
         self.database.install_plugin(&plugin_id).await?;
         self.invalidate_scraper_client_cache();
+        self.provider_cache.clear_provider(&plugin_id).await;
         let current_catalog = self.catalog_snapshot().await;
         if current_catalog
             .get(&plugin_id)
@@ -761,6 +762,7 @@ impl PluginService {
             .await
             .map_err(PluginServiceError::ConfigIo)?;
         self.invalidate_scraper_client_cache();
+        self.provider_cache.clear_provider(&plugin_id).await;
         let _catalog_refresh_guard = self.catalog_refresh_lock.lock().await;
         self.supervisor.stop(&plugin_id).await;
         remove_plugin_files(plugin)
@@ -887,6 +889,7 @@ impl PluginService {
             .set_plugin_enabled(&plugin_id, enabled)
             .await?;
         self.invalidate_scraper_client_cache();
+        self.provider_cache.clear_provider(&plugin_id).await;
         if !enabled {
             self.supervisor.stop(&plugin_id).await;
         } else if catalog
@@ -2436,6 +2439,9 @@ impl PluginService {
             .await
             .map_err(PluginServiceError::ConfigIo)?;
         self.invalidate_scraper_client_cache();
+        // The response cache key carries the plugin id but not its configuration, so a saved
+        // config would otherwise keep serving the previous plugin output until the TTL expires.
+        self.provider_cache.clear_provider(plugin_id).await;
         Ok(())
     }
 
@@ -2781,6 +2787,7 @@ impl PluginService {
         let _ = fs::remove_dir_all(&validation_dir).await;
         *self.catalog.write().await = catalog;
         self.invalidate_scraper_client_cache();
+        self.provider_cache.clear_provider(&entry.id).await;
         Ok(())
     }
 
@@ -4179,6 +4186,134 @@ mod plugin_discovery_tests {
             .await?;
 
         assert_ne!(revision, service.scraper_client_revision());
+        Ok(())
+    }
+
+    /// Saving a scraper plugin's config must drop that plugin's cached responses.
+    ///
+    /// The stub answers `metadata.images` from the config file it receives through
+    /// `LUX_PLUGIN_CONFIG_PATH` and appends one line per real RPC, so the second call before the
+    /// config change proves the response cache is used and the call after it proves the plugin is
+    /// asked again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn saving_scraper_config_invalidates_the_plugin_response_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::application::scraper::{ScraperImageRequest, ScraperItemType};
+
+        const PLUGIN_ID: &str = "org.example.scraper";
+
+        let root = tempdir()?;
+        let config_dir = root.path().join("config");
+        let plugin_dir = config_dir.join(format!("plugins/{PLUGIN_ID}"));
+        tokio::fs::create_dir_all(plugin_dir.join("binaries")).await?;
+        let call_log = root.path().join("plugin-calls.log");
+        let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"metadata.images"'*)
+      printf 'call\n' >> "__CALL_LOG__"
+      min_width=1000
+      if [ -f "$LUX_PLUGIN_CONFIG_PATH" ]; then
+        saved=$(sed -n 's/.*"minWidth"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$LUX_PLUGIN_CONFIG_PATH")
+        if [ -n "$saved" ]; then min_width="$saved"; fi
+      fi
+      printf '{"id":"%s","result":{"images":[{"Type":"Poster","Url":"https://images.example.test/poster.jpg","Width":%s,"Height":1500}],"originalLanguageMode":false}}\n' "$id" "$min_width"
+      ;;
+    *)
+      printf '{"id":"%s","error":{"code":"PLUGIN_UNSUPPORTED_METHOD","message":"unsupported"}}\n' "$id"
+      ;;
+  esac
+done
+"#
+        .replace(
+            "__CALL_LOG__",
+            call_log.to_str().ok_or("non-utf8 call log path")?,
+        );
+        let entrypoint = plugin_dir.join("binaries/plugin");
+        tokio::fs::write(&entrypoint, script).await?;
+        tokio::fs::set_permissions(&entrypoint, std::fs::Permissions::from_mode(0o700)).await?;
+        tokio::fs::write(
+            plugin_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "formatVersion": 1,
+                "id": PLUGIN_ID,
+                "name": "Scraper stub",
+                "version": "1.0.0",
+                "apiVersion": 1,
+                "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+                "type": "metadata",
+                "category": "SCRAPER",
+                "providerKey": "example",
+                "supportedItemTypes": ["Movie"],
+                "capabilities": ["metadata.images"],
+                "configFields": [{
+                    "key": "minWidth",
+                    "label": "Minimum width",
+                    "type": "number",
+                    "required": false,
+                    "defaultValue": 1000,
+                    "minimum": 0,
+                    "maximum": 8192
+                }],
+                "permissions": {"network": [], "filesystem": []},
+                "files": []
+            }))?,
+        )
+        .await?;
+
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.clone(),
+        };
+        let database = Database::connect(&config).await?;
+        let service = PluginService::new_without_login_background_worker_for_test(
+            database,
+            config.config_dir.clone(),
+        );
+        service.install(PLUGIN_ID).await?;
+        let client = service.scraper_client(PLUGIN_ID).await?;
+        let request = || ScraperImageRequest::new(ScraperItemType::Movie, "603", "zh-CN");
+
+        let first = client.images(request()).await?;
+        assert_eq!(first.images[0].width, Some(1000));
+        let cached = client.images(request()).await?;
+        assert_eq!(cached.images[0].width, Some(1000));
+        let calls_before = tokio::fs::read_to_string(&call_log)
+            .await
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(
+            calls_before, 1,
+            "the repeated call should hit the response cache instead of the plugin"
+        );
+
+        service
+            .update_dynamic_config(
+                PLUGIN_ID,
+                serde_json::Map::from_iter([("minWidth".to_owned(), json!(1500))]),
+            )
+            .await?;
+
+        let refreshed = client.images(request()).await?;
+        assert_eq!(
+            refreshed.images[0].width,
+            Some(1500),
+            "the next scrape must use the saved plugin configuration"
+        );
+        let calls_after = tokio::fs::read_to_string(&call_log)
+            .await
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(
+            calls_after, 2,
+            "the config change should force another plugin RPC"
+        );
         Ok(())
     }
 

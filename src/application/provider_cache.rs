@@ -40,6 +40,11 @@ struct CacheState {
     entries: HashMap<String, CacheEntry>,
     expiry_order: BTreeSet<(i64, String)>,
     inflight: HashMap<String, Arc<Notify>>,
+    /// Bumped by `clear`; an owner that began before the clear must not write its result back.
+    generation: u64,
+    /// Per-provider equivalents of `generation`, bumped by `clear_provider`. Per-provider scoping
+    /// keeps a plugin-config change from discarding a concurrent request of an unrelated plugin.
+    provider_generations: HashMap<String, u64>,
 }
 
 impl CacheState {
@@ -54,6 +59,28 @@ impl CacheState {
         self.expiry_order
             .remove(&(entry.expires_at, key.to_owned()));
         Some(entry)
+    }
+
+    fn provider_generation(&self, key: &str) -> u64 {
+        self.provider_generations
+            .get(provider_for_key(key))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn remove_provider(&mut self, provider: &str) -> usize {
+        let prefix = provider_prefix(provider);
+        let keys = self
+            .entries
+            .keys()
+            .filter(|key| key.starts_with(prefix.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let removed = keys.len();
+        for key in keys {
+            self.remove(&key);
+        }
+        removed
     }
 
     fn remove_expired(&mut self, now: i64) -> usize {
@@ -120,6 +147,8 @@ pub(crate) enum CacheLookup {
 pub(crate) struct CacheOwner {
     state: Arc<Mutex<CacheState>>,
     key: String,
+    generation: u64,
+    provider_generation: u64,
     notify: Arc<Notify>,
     released: bool,
 }
@@ -127,6 +156,11 @@ pub(crate) struct CacheOwner {
 impl CacheOwner {
     pub(crate) fn finish(mut self) {
         self.release();
+    }
+
+    fn is_current(&self, state: &CacheState) -> bool {
+        state.generation == self.generation
+            && state.provider_generation(&self.key) == self.provider_generation
     }
 
     fn release(&mut self) {
@@ -161,11 +195,7 @@ impl Drop for CacheOwner {
 impl ProviderResponseCache {
     pub(crate) fn new(path: Option<PathBuf>) -> Self {
         Self {
-            state: Arc::new(Mutex::new(CacheState {
-                entries: HashMap::new(),
-                expiry_order: BTreeSet::new(),
-                inflight: HashMap::new(),
-            })),
+            state: Arc::new(Mutex::new(CacheState::default())),
             load_once: Arc::new(OnceCell::new()),
             persist_lock: Arc::new(AsyncMutex::new(())),
             persist_notify: Arc::new(Notify::new()),
@@ -203,23 +233,56 @@ impl ProviderResponseCache {
         }
         let notify = Arc::new(Notify::new());
         state.inflight.insert(key.to_owned(), notify.clone());
+        let generation = state.generation;
+        let provider_generation = state.provider_generation(key);
         CacheLookup::Owner(CacheOwner {
             state: self.state.clone(),
             key: key.to_owned(),
+            generation,
+            provider_generation,
             notify,
             released: false,
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn store_shared(&self, key: &str, value: Arc<Value>, ttl_seconds: i64) {
+        self.store_shared_inner(key, value, ttl_seconds, None).await;
+    }
+
+    /// Stores a request result only if the cache was not cleared since the owner began.
+    ///
+    /// A plugin-config change clears the affected responses while a scrape may still be talking to
+    /// the plugin; discarding that in-flight write keeps the post-clear cache from being refilled
+    /// with a response produced under the previous configuration.
+    pub(crate) async fn store_shared_for_owner(
+        &self,
+        owner: &CacheOwner,
+        value: Arc<Value>,
+        ttl_seconds: i64,
+    ) -> bool {
+        self.store_shared_inner(&owner.key, value, ttl_seconds, Some(owner))
+            .await
+    }
+
+    async fn store_shared_inner(
+        &self,
+        key: &str,
+        value: Arc<Value>,
+        ttl_seconds: i64,
+        owner: Option<&CacheOwner>,
+    ) -> bool {
         if ttl_seconds <= 0 || !serialized_value_fits_limit(value.as_ref(), MAX_ENTRY_BYTES) {
-            return;
+            return false;
         }
         let Some(expires_at) = unix_now().checked_add(ttl_seconds) else {
-            return;
+            return false;
         };
         {
             let mut state = lock_state(&self.state);
+            if owner.is_some_and(|owner| !owner.is_current(&state)) {
+                return false;
+            }
             state.remove_expired(unix_now());
             state.remove(key);
             if state.entries.len() >= MAX_CACHE_ENTRIES {
@@ -235,14 +298,37 @@ impl ProviderResponseCache {
             );
         }
         self.schedule_persist().await;
+        true
     }
 
+    #[cfg(test)]
     pub(crate) async fn store_negative(&self, key: &str, ttl_seconds: i64) {
+        self.store_negative_inner(key, ttl_seconds, None).await;
+    }
+
+    pub(crate) async fn store_negative_for_owner(
+        &self,
+        owner: &CacheOwner,
+        ttl_seconds: i64,
+    ) -> bool {
+        self.store_negative_inner(&owner.key, ttl_seconds, Some(owner))
+            .await
+    }
+
+    async fn store_negative_inner(
+        &self,
+        key: &str,
+        ttl_seconds: i64,
+        owner: Option<&CacheOwner>,
+    ) -> bool {
         let Some(expires_at) = unix_now().checked_add(ttl_seconds) else {
-            return;
+            return false;
         };
         {
             let mut state = lock_state(&self.state);
+            if owner.is_some_and(|owner| !owner.is_current(&state)) {
+                return false;
+            }
             state.remove_expired(unix_now());
             state.remove(key);
             if state.entries.len() >= MAX_CACHE_ENTRIES {
@@ -258,16 +344,39 @@ impl ProviderResponseCache {
             );
         }
         self.schedule_persist().await;
+        true
     }
 
     pub(crate) async fn clear(&self) {
         self.ensure_loaded().await;
         {
             let mut state = lock_state(&self.state);
+            state.generation = state.generation.wrapping_add(1);
             state.entries.clear();
             state.expiry_order.clear();
         }
         self.schedule_persist().await;
+    }
+
+    /// Drops every cached response of one provider.
+    ///
+    /// `cache_key` prefixes each key with the plugin id, so `plugin_id` removes exactly the entries
+    /// that the plugin produced. The provider generation advances even when no entry matched, so an
+    /// in-flight request that began before this call cannot write its stale response back.
+    pub(crate) async fn clear_provider(&self, provider: &str) {
+        self.ensure_loaded().await;
+        let removed = {
+            let mut state = lock_state(&self.state);
+            let generation = state
+                .provider_generations
+                .entry(provider.to_owned())
+                .or_insert(0);
+            *generation = generation.wrapping_add(1);
+            state.remove_provider(provider)
+        };
+        if removed > 0 {
+            self.schedule_persist().await;
+        }
     }
 
     #[cfg(test)]
@@ -402,6 +511,14 @@ pub(crate) fn cache_key(provider: &str, method: &str, params: &Value) -> Option<
     Some(format!("{provider}\n{method}\n{params}"))
 }
 
+fn provider_prefix(provider: &str) -> String {
+    format!("{provider}\n")
+}
+
+fn provider_for_key(key: &str) -> &str {
+    key.split_once('\n').map_or(key, |(provider, _)| provider)
+}
+
 pub(crate) fn ttl_for_method(method: &str) -> i64 {
     match method {
         "metadata.search" => 5 * 60,
@@ -458,8 +575,8 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{CacheEntry, CacheLookup, CacheState, ProviderResponseCache};
-    use serde_json::json;
-    use std::collections::BTreeSet;
+    use serde_json::{Value, json};
+    use std::collections::{BTreeSet, HashMap};
     use std::sync::Arc;
     use tokio::time::{Duration, timeout};
 
@@ -692,5 +809,129 @@ mod tests {
         let snapshot = resources.snapshot().await;
         assert_eq!(snapshot.metadata.counters["cache.persist.success.count"], 1);
         assert!(snapshot.metadata.stage_p95_ms.contains_key("cache_persist"));
+    }
+
+    #[tokio::test]
+    async fn clearing_one_provider_keeps_other_providers_in_memory_and_on_disk() {
+        let directory = tempfile::tempdir().expect("temporary cache directory");
+        let path = directory.path().join("provider-cache.json");
+        let cache = ProviderResponseCache::new(Some(path.clone()));
+        let tmdb_images = super::cache_key(
+            "org.lux.tmdb",
+            "metadata.images",
+            &json!({"providerId": "603"}),
+        )
+        .expect("tmdb images key");
+        let tmdb_get = super::cache_key(
+            "org.lux.tmdb",
+            "metadata.get",
+            &json!({"providerId": "603"}),
+        )
+        .expect("tmdb get key");
+        let douban_images = super::cache_key(
+            "org.lux.douban",
+            "metadata.images",
+            &json!({"providerId": "603"}),
+        )
+        .expect("douban images key");
+
+        for (key, value) in [
+            (&tmdb_images, json!({"images": [1]})),
+            (&tmdb_get, json!({"metadata": {"Name": "Example"}})),
+            (&douban_images, json!({"images": [2]})),
+        ] {
+            let CacheLookup::Owner(owner) = cache.begin(key).await else {
+                panic!("first request should own {key}");
+            };
+            cache.store_shared(key, Arc::new(value), 60).await;
+            owner.finish();
+        }
+        cache.flush().await;
+
+        cache.clear_provider("org.lux.tmdb").await;
+        cache.flush().await;
+
+        assert!(matches!(
+            cache.begin(&tmdb_images).await,
+            CacheLookup::Owner(_)
+        ));
+        assert!(matches!(
+            cache.begin(&tmdb_get).await,
+            CacheLookup::Owner(_)
+        ));
+        assert!(matches!(
+            cache.begin(&douban_images).await,
+            CacheLookup::Hit(value) if value["images"][0] == 2
+        ));
+
+        let persisted: HashMap<String, Value> =
+            serde_json::from_slice(&std::fs::read(&path).expect("persisted cache file"))
+                .expect("persisted cache should be JSON");
+        assert!(!persisted.contains_key(&tmdb_images));
+        assert!(!persisted.contains_key(&tmdb_get));
+        assert!(persisted.contains_key(&douban_images));
+
+        let restored = ProviderResponseCache::new(Some(path));
+        assert!(matches!(
+            restored.begin(&tmdb_images).await,
+            CacheLookup::Owner(_)
+        ));
+        assert!(matches!(
+            restored.begin(&douban_images).await,
+            CacheLookup::Hit(value) if value["images"][0] == 2
+        ));
+    }
+
+    #[tokio::test]
+    async fn clearing_a_provider_discards_an_in_flight_response_for_that_provider() {
+        let cache = ProviderResponseCache::new(None);
+        let key = super::cache_key(
+            "org.lux.tmdb",
+            "metadata.images",
+            &json!({"providerId": "603"}),
+        )
+        .expect("tmdb images key");
+        let CacheLookup::Owner(owner) = cache.begin(&key).await else {
+            panic!("first request should own the key");
+        };
+
+        cache.clear_provider("org.lux.tmdb").await;
+
+        assert!(
+            !cache
+                .store_shared_for_owner(&owner, Arc::new(json!({"images": [1]})), 60)
+                .await,
+            "a response fetched before the config change must not repopulate the cache"
+        );
+        owner.finish();
+        assert!(matches!(cache.begin(&key).await, CacheLookup::Owner(_)));
+    }
+
+    #[tokio::test]
+    async fn clearing_a_provider_keeps_another_providers_in_flight_response() {
+        let cache = ProviderResponseCache::new(None);
+        let key = super::cache_key(
+            "org.lux.tmdb",
+            "metadata.images",
+            &json!({"providerId": "603"}),
+        )
+        .expect("tmdb images key");
+        let CacheLookup::Owner(owner) = cache.begin(&key).await else {
+            panic!("first request should own the key");
+        };
+
+        cache.clear_provider("org.lux.douban").await;
+
+        assert!(
+            cache
+                .store_shared_for_owner(&owner, Arc::new(json!({"images": [1]})), 60)
+                .await,
+            "an unrelated plugin's in-flight response stays valid"
+        );
+        owner.finish();
+        assert!(matches!(
+            cache.begin(&key).await,
+            CacheLookup::Hit(value) if value["images"][0] == 1
+        ));
     }
 }

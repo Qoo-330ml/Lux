@@ -1489,6 +1489,11 @@ impl MetadataReidentifyService {
             };
         if matches!(mode, MetadataRefreshMode::FullRefresh) {
             self.scraper.clear_response_cache().await;
+            if let Some(resolver) = &self.resolver {
+                // The production assembly scrapes through the resolver, so the placeholder
+                // `self.scraper` above has no cache to clear.
+                resolver.clear_response_cache().await;
+            }
         }
         let mut workers = JoinSet::new();
         let mut last_concurrency = None;
@@ -3780,6 +3785,60 @@ mod tests {
 
         assert_eq!(job.total_count, ITEM_COUNT as i64);
         assert_eq!(database.query_count(), 6);
+        Ok(())
+    }
+
+    /// The real assembly passes `ScraperProvider::unconfigured()` and scrapes through the resolver,
+    /// so `FULL_REFRESH` must clear the cache owned by the resolver's `PluginService`. Clearing the
+    /// placeholder adapter alone left every cached response in place and reproduced the field
+    /// report: a full refresh kept writing the pre-config-change plugin output for up to 24 hours.
+    #[tokio::test]
+    async fn full_refresh_clears_the_resolver_provider_response_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::application::provider_cache::{CacheLookup, cache_key};
+
+        let (_temp_dir, config, database, item_id) = role_test_fixture().await?;
+        let library_id = fixture_library_id(&database, &item_id).await?;
+        let plugins = crate::application::plugins::PluginService::new_without_login_background_worker_for_test(
+            database.clone(),
+            config.config_dir.clone(),
+        );
+        let cache = plugins.provider_cache();
+        let key = cache_key(
+            "org.lux.tmdb",
+            "metadata.images",
+            &serde_json::json!({"providerId": "603", "language": "zh-CN"}),
+        )
+        .ok_or("cache key should serialize")?;
+        let CacheLookup::Owner(owner) = cache.begin(&key).await else {
+            return Err("cache key should start empty".into());
+        };
+        cache
+            .store_shared(&key, Arc::new(serde_json::json!({"images": []})), 60)
+            .await;
+        owner.finish();
+        assert!(
+            matches!(cache.begin(&key).await, CacheLookup::Hit(_)),
+            "the fixture should start with a warm response cache"
+        );
+
+        let resolver = crate::application::scraper::ScraperResolver::new(database.clone(), plugins);
+        let service = super::MetadataReidentifyService::with_resolver(
+            database,
+            super::ScraperProvider::unconfigured(),
+            resolver,
+        );
+        let job = service
+            .create_library_refresh_job(&library_id, super::MetadataRefreshMode::FullRefresh)
+            .await?;
+        tokio::time::timeout(Duration::from_secs(30), service.run(&job.id))
+            .await
+            .expect("full refresh should finish");
+
+        assert!(
+            matches!(cache.begin(&key).await, CacheLookup::Owner(_)),
+            "FULL_REFRESH must drop the responses the resolver clients cached"
+        );
         Ok(())
     }
 
