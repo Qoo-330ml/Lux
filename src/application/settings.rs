@@ -118,7 +118,6 @@ pub(crate) struct MediaImageStrategySettings {
     #[serde(default)]
     pub(crate) write_to_metadata: bool,
     pub(crate) max_backdrop_count: i64,
-    pub(crate) min_download_width: i64,
     #[serde(default)]
     pub(crate) variant_cache: ImageVariantCacheSettings,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -161,8 +160,12 @@ pub(crate) struct ArtworkPolicySettings {
     pub(crate) overwrite: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) max_count: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) min_width: Option<i64>,
+    /// Accepted only so strategies saved by older versions, which wrote a per-cell
+    /// `minWidth`, still deserialize: the struct denies unknown fields, so without this
+    /// field the whole strategy (global or per-library) would fail to load. The value is
+    /// ignored and never serialized, so it disappears on the next save.
+    #[serde(default, rename = "minWidth", skip_serializing)]
+    pub(crate) legacy_min_width: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -252,7 +255,6 @@ impl Default for MediaStrategySettings {
                 wallpaper: false,
                 write_to_metadata: false,
                 max_backdrop_count: 4,
-                min_download_width: 1280,
                 variant_cache: ImageVariantCacheSettings::default(),
                 levels: BTreeMap::new(),
             },
@@ -901,7 +903,6 @@ pub(crate) fn validate_media_strategy(settings: &MediaStrategySettings) -> bool 
             .unwrap_or(true)
         && THUMBNAIL_SCRAPING_MODE_KEYS.contains(&settings.images.thumbnail_scraping_mode.as_str())
         && (0..=20).contains(&settings.images.max_backdrop_count)
-        && (0..=8192).contains(&settings.images.min_download_width)
         && settings.images.variant_cache.is_valid()
         && settings
             .images
@@ -944,9 +945,6 @@ fn valid_artwork_policy(image_type: &str, policy: &ArtworkPolicySettings) -> boo
         && policy
             .max_count
             .is_none_or(|count| (0..=20).contains(&count))
-        && policy
-            .min_width
-            .is_none_or(|width| (0..=8192).contains(&width))
 }
 
 fn valid_key_list(value: Option<&[String]>, allowed: &[&str]) -> bool {
@@ -1282,6 +1280,53 @@ mod image_level_tests {
     }
 
     #[test]
+    fn legacy_min_width_keys_load_and_are_dropped_on_save() {
+        let value = serde_json::json!({
+            "metadataLanguage": "zh-CN",
+            "imageLanguage": "zh-CN",
+            "region": "CN",
+            "scraperId": null,
+            "applyScope": "NEW_CONTENT",
+            "images": {
+                "poster": true,
+                "artwork": false,
+                "banner": false,
+                "logo": true,
+                "thumbnail": true,
+                "disc": false,
+                "wallpaper": false,
+                "maxBackdropCount": 2,
+                "minDownloadWidth": 1920,
+                "levels": {
+                    "movie": {
+                        "artworks": {
+                            "poster": {"overwrite": "FILL", "minWidth": 8193}
+                        }
+                    }
+                }
+            },
+            "subtitles": {
+                "autoDownload": false,
+                "languages": ["zh-CN"],
+                "forcedOnly": false,
+                "hearingImpaired": false
+            }
+        });
+        let settings: MediaStrategySettings =
+            serde_json::from_value(value).expect("legacy min-width keys must still load");
+        assert!(
+            validate_media_strategy(&settings),
+            "a removed width value must not invalidate the whole strategy"
+        );
+
+        let serialized = serde_json::to_value(&settings).expect("serialize");
+        assert!(serialized["images"].get("minDownloadWidth").is_none());
+        let poster = &serialized["images"]["levels"]["movie"]["artworks"]["poster"];
+        assert_eq!(poster["overwrite"], "FILL");
+        assert!(poster.get("minWidth").is_none());
+    }
+
+    #[test]
     fn valid_level_overrides_are_accepted() {
         let mut settings = MediaStrategySettings::default();
         settings.images.levels.insert(
@@ -1297,7 +1342,7 @@ mod image_level_tests {
                         scraper_roles: Some(vec!["PRIMARY".to_owned()]),
                         overwrite: Some("FILL".to_owned()),
                         max_count: Some(1),
-                        min_width: Some(720),
+                        ..ArtworkPolicySettings::default()
                     },
                 )]),
             },
@@ -1357,10 +1402,6 @@ mod image_level_tests {
             },
             ArtworkPolicySettings {
                 max_count: Some(21),
-                ..ArtworkPolicySettings::default()
-            },
-            ArtworkPolicySettings {
-                min_width: Some(8193),
                 ..ArtworkPolicySettings::default()
             },
         ];

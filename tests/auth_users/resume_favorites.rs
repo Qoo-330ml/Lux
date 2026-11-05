@@ -322,9 +322,11 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
         default_settings_body["mediaStrategy"]["images"]["poster"],
         true
     );
-    assert_eq!(
-        default_settings_body["mediaStrategy"]["images"]["minDownloadWidth"],
-        1280
+    assert!(
+        default_settings_body["mediaStrategy"]["images"]
+            .get("minDownloadWidth")
+            .is_none(),
+        "the removed minimum download width must not be part of the defaults"
     );
     assert_eq!(
         default_settings_body["mediaStrategy"]["images"]["disc"],
@@ -432,9 +434,11 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
         updated_settings_body["mediaStrategy"]["applyScope"],
         "ALL_CONTENT"
     );
-    assert_eq!(
-        updated_settings_body["mediaStrategy"]["images"]["minDownloadWidth"],
-        1920
+    assert!(
+        updated_settings_body["mediaStrategy"]["images"]
+            .get("minDownloadWidth")
+            .is_none(),
+        "a legacy width key in the request is ignored instead of echoed back"
     );
     assert_eq!(
         updated_settings_body["mediaStrategy"]["metadataRefreshMode"],

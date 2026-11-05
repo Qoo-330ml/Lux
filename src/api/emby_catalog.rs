@@ -5792,6 +5792,11 @@ pub(super) fn emby_virtual_folder_options_json(
     })
 }
 
+/// Emby clients expect a `MinWidth` on every image option. Lux no longer has a global
+/// minimum download width (width filtering moved to the scrapers), so the key is kept
+/// for wire compatibility with the fixed value `0` ("no minimum").
+const EMBY_IMAGE_OPTION_MIN_WIDTH: i64 = 0;
+
 pub(super) fn emby_library_type_options_json(
     item_type: &str,
     media_strategy: &MediaStrategySettings,
@@ -5801,49 +5806,49 @@ pub(super) fn emby_library_type_options_json(
         image_options.push(json!({
             "Type": "Primary",
             "Limit": 1,
-            "MinWidth": media_strategy.images.min_download_width,
+            "MinWidth": EMBY_IMAGE_OPTION_MIN_WIDTH,
         }));
     }
     if media_strategy.images.artwork {
         image_options.push(json!({
             "Type": "Art",
             "Limit": 1,
-            "MinWidth": media_strategy.images.min_download_width,
+            "MinWidth": EMBY_IMAGE_OPTION_MIN_WIDTH,
         }));
     }
     if media_strategy.images.banner {
         image_options.push(json!({
             "Type": "Banner",
             "Limit": 1,
-            "MinWidth": media_strategy.images.min_download_width,
+            "MinWidth": EMBY_IMAGE_OPTION_MIN_WIDTH,
         }));
     }
     if media_strategy.images.logo {
         image_options.push(json!({
             "Type": "Logo",
             "Limit": 1,
-            "MinWidth": media_strategy.images.min_download_width,
+            "MinWidth": EMBY_IMAGE_OPTION_MIN_WIDTH,
         }));
     }
     if media_strategy.images.thumbnail {
         image_options.push(json!({
             "Type": "Thumb",
             "Limit": 1,
-            "MinWidth": media_strategy.images.min_download_width,
+            "MinWidth": EMBY_IMAGE_OPTION_MIN_WIDTH,
         }));
     }
     if media_strategy.images.disc {
         image_options.push(json!({
             "Type": "Disc",
             "Limit": 1,
-            "MinWidth": media_strategy.images.min_download_width,
+            "MinWidth": EMBY_IMAGE_OPTION_MIN_WIDTH,
         }));
     }
     if media_strategy.images.backdrop && media_strategy.images.max_backdrop_count > 0 {
         image_options.push(json!({
             "Type": "Backdrop",
             "Limit": media_strategy.images.max_backdrop_count,
-            "MinWidth": media_strategy.images.min_download_width,
+            "MinWidth": EMBY_IMAGE_OPTION_MIN_WIDTH,
         }));
     }
 
@@ -6812,6 +6817,40 @@ mod tests {
         let filter = catalog_filter_from_emby(&query);
         assert_eq!(filter.is_played, Some(false));
         assert_eq!(filter.min_date_last_saved, Some(1_700_000_000));
+    }
+
+    /// Emby clients read `MinWidth` from the image options. Lux no longer has a minimum
+    /// download width, so the key stays for wire compatibility with the fixed value 0.
+    #[test]
+    fn image_options_keep_min_width_at_zero_for_emby_clients() {
+        let mut strategy = crate::application::settings::MediaStrategySettings::default();
+        strategy.images.artwork = true;
+        strategy.images.banner = true;
+        strategy.images.disc = true;
+        strategy.images.max_backdrop_count = 4;
+
+        let options = super::emby_library_type_options_json("Movie", &strategy);
+        let image_options = options["ImageOptions"]
+            .as_array()
+            .expect("ImageOptions is an array");
+        let types = image_options
+            .iter()
+            .map(|option| option["Type"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            [
+                "Primary", "Art", "Banner", "Logo", "Thumb", "Disc", "Backdrop"
+            ]
+        );
+        for option in image_options {
+            assert_eq!(
+                option["MinWidth"],
+                json!(0),
+                "every image option keeps the compatibility key: {option}"
+            );
+        }
+        assert_eq!(image_options[6]["Limit"], json!(4));
     }
 }
 

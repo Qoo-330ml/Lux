@@ -366,6 +366,16 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
             options["TypeOptions"][0]["ImageOptions"][0]["Type"],
             "Primary"
         );
+        // Lux no longer filters by image width, but Emby clients still read the key.
+        for image_option in options["TypeOptions"][0]["ImageOptions"]
+            .as_array()
+            .expect("ImageOptions is an array")
+        {
+            assert_eq!(
+                image_option["MinWidth"], 0,
+                "MinWidth stays for wire compatibility: {image_option}"
+            );
+        }
     }
 
     for path in [
