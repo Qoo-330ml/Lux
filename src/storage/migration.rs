@@ -744,7 +744,7 @@ pub(super) async fn ensure_server_id(
 /// The database cannot answer "was this server set up before?" on its own: a missing file and a
 /// first install look identical to SQLite, which creates the file on connect. The marker lives
 /// beside the database precisely so the two can be compared.
-const SERVER_STATE_FILE: &str = "server-state.json";
+use crate::config::SERVER_STATE_FILE;
 
 /// Refuses to start a previously initialized server against an empty database.
 ///

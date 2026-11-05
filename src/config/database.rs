@@ -10,6 +10,10 @@ use super::Config;
 const DATABASE_CONFIG_FILE: &str = "database.json";
 const DATABASE_SELECTION_MARKER_FILE: &str = ".database-selection-required";
 
+/// Marker written next to the configuration once a server identity exists; the storage startup
+/// guard reads it, and choosing a database during setup discards the placeholder's copy.
+pub(crate) const SERVER_STATE_FILE: &str = "server-state.json";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum DatabaseBackend {
@@ -241,7 +245,25 @@ impl Config {
             let _ = fs::remove_file(&temporary_path).await;
             return Err(DatabaseConfigurationError::Io { path, source });
         }
-        let _ = fs::remove_file(self.config_dir.join(DATABASE_SELECTION_MARKER_FILE)).await;
+        // While the selection marker exists, the database opened so far was only a placeholder for
+        // the setup wizard, and opening it wrote the server state marker. That marker describes the
+        // placeholder, not the database being chosen now; keeping it would make the restart that
+        // setup requires refuse the new, still empty database as a lost one.
+        let selection_marker = self.config_dir.join(DATABASE_SELECTION_MARKER_FILE);
+        if fs::metadata(&selection_marker).await.is_ok() {
+            let state_marker = self.config_dir.join(SERVER_STATE_FILE);
+            match fs::remove_file(&state_marker).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(DatabaseConfigurationError::Io {
+                        path: state_marker,
+                        source,
+                    });
+                }
+            }
+        }
+        let _ = fs::remove_file(selection_marker).await;
         Ok(())
     }
 }

@@ -4,6 +4,7 @@ use crate::network::proxy_url_from_env;
 
 pub mod database;
 
+pub(crate) use database::SERVER_STATE_FILE;
 pub use database::{
     DatabaseBackend, DatabaseConfiguration, DatabaseConfigurationError, PostgresConnection,
 };
