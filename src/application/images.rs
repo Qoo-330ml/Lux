@@ -811,7 +811,8 @@ impl ImageWriteService {
         {
             return Ok(false);
         }
-        if image_path_is_owned_by_other_type(&indexed_images, image_type, &path).await? {
+        if image_path_is_owned_by_other_row(&indexed_images, image_type, image_index, &path).await?
+        {
             return Ok(false);
         }
         if indexed_image_path_is_fallback(&indexed_images, image_type, image_index, &path).await? {
@@ -1020,8 +1021,13 @@ impl ImageWriteService {
                                 &path,
                             )
                             .await?)
-                        && !image_path_is_owned_by_other_type(indexed_images, image_type, &path)
-                            .await?
+                        && !image_path_is_owned_by_other_row(
+                            indexed_images,
+                            image_type,
+                            image_index as i64,
+                            &path,
+                        )
+                        .await?
                         && image_file_stamp(&path).await?.is_some()
                     {
                         found.insert(image_type.to_owned());
@@ -1062,7 +1068,13 @@ impl ImageWriteService {
                             &path,
                         )
                         .await?)
-                    && !image_path_is_owned_by_other_type(indexed_images, image_type, &path).await?
+                    && !image_path_is_owned_by_other_row(
+                        indexed_images,
+                        image_type,
+                        image_index as i64,
+                        &path,
+                    )
+                    .await?
                     && image_file_stamp(&path).await?.is_some()
                 {
                     found.insert(image_type.to_owned());
@@ -1176,14 +1188,8 @@ impl ImageWriteService {
 
         let _image_write_lock = acquire_image_write_lock(item_id).await;
         let (root, directory, movie_stem, episode_stem) = self.writeback_paths(item_id).await?;
-        let blocked_paths = self
-            .database
-            .list_item_images(item_id)
-            .await?
-            .into_iter()
-            .filter(|image| !image.image_type.eq_ignore_ascii_case(image_type))
-            .map(|image| PathBuf::from(image.local_path))
-            .collect::<Vec<_>>();
+        let indexed_images = self.database.list_item_images(item_id).await?;
+        let blocked_paths = blocked_image_paths(&indexed_images, image_type, image_index);
         let target = image_target(ImageTargetRequest {
             directory: &directory,
             image_type,
@@ -1899,25 +1905,28 @@ async fn image_target(request: ImageTargetRequest<'_>) -> Result<PathBuf, ImageW
     } else {
         image_lookup_stems(image_type, movie_stem, episode_stem, image_index)?
     };
-    if reuse_existing_path {
-        if let Some(existing) = find_existing_image_path(directory, &stems, None).await?
-            && !is_blocked(&existing)
-        {
-            return Ok(existing);
-        }
-    }
-    if let Some(existing) = find_existing_image_path(directory, &stems, Some(format)).await?
-        && !is_blocked(&existing)
+    let existing_paths = find_existing_image_paths(directory, &stems, None).await?;
+    // A blocked path belongs to another row, so keep looking: this row's own previous file may
+    // still be reusable even when an alias sorts before it.
+    if reuse_existing_path
+        && let Some(existing) = existing_paths.iter().find(|path| !is_blocked(path))
     {
-        return Ok(existing);
+        return Ok(existing.clone());
+    }
+    if let Some(existing) = existing_paths
+        .iter()
+        .find(|path| format.matches_path(path) && !is_blocked(path))
+    {
+        return Ok(existing.clone());
     }
     let (prefixed_stem, generic_stem) =
         canonical_image_stems(image_type, movie_stem, episode_stem, image_index)?;
     let target_stem = if let Some(prefixed_stem) = prefixed_stem {
-        let prefixed_exists =
-            find_existing_image_path(directory, std::slice::from_ref(&prefixed_stem), None)
-                .await?
-                .is_some();
+        let prefixed_exists = existing_paths.iter().any(|path| {
+            path.file_stem()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case(&prefixed_stem))
+        });
         if prefixed_exists || directory_has_multiple_media_files(directory).await? {
             prefixed_stem
         } else {
@@ -1929,6 +1938,14 @@ async fn image_target(request: ImageTargetRequest<'_>) -> Result<PathBuf, ImageW
     let target = directory.join(format!("{target_stem}.{}", format.extension()));
     if !is_blocked(&target) {
         return Ok(target);
+    }
+    // The canonical name is already registered by another row. Use the scanning-approved alias
+    // for this index instead of sharing that row's file or failing the refresh.
+    for stem in scanning_approved_index_stems(image_type, movie_stem, episode_stem, image_index) {
+        let candidate = directory.join(format!("{stem}.{}", format.extension()));
+        if !is_blocked(&candidate) {
+            return Ok(candidate);
+        }
     }
 
     let Some(conflict_free_stem) = conflict_free_image_stem(image_type, episode_stem) else {
@@ -1949,6 +1966,48 @@ async fn image_target(request: ImageTargetRequest<'_>) -> Result<PathBuf, ImageW
     Ok(conflict_free_target)
 }
 
+/// Registered paths a write of `(image_type, image_index)` must keep away from.
+///
+/// Every other image row of the item contributes its path, including rows of the *same* type at
+/// another index: one item never registers two images on one file, so fanart 1 must not land on
+/// the file fanart 4 already owns. The row's own path stays usable so a refresh overwrites its
+/// file instead of creating a duplicate next to it.
+fn blocked_image_paths(
+    indexed_images: &[StoredItemImage],
+    image_type: &str,
+    image_index: i64,
+) -> Vec<PathBuf> {
+    indexed_images
+        .iter()
+        .filter(|image| !is_same_image_row(image, image_type, image_index))
+        .map(|image| PathBuf::from(&image.local_path))
+        .collect()
+}
+
+fn is_same_image_row(image: &StoredItemImage, image_type: &str, image_index: i64) -> bool {
+    image.image_type.eq_ignore_ascii_case(image_type) && image.image_index == image_index
+}
+
+/// `fanart{k}` / `{movie_stem}-fanart{k}`: the indexed sidecar names the local scanner derives a
+/// FANART index from (`image_type_for_stem`/`image_type_for_media`). Episode fanart already writes
+/// its canonical `{episode_stem}-fanart{k}` name, so only movie and flat naming needs the alias.
+fn scanning_approved_index_stems(
+    image_type: &str,
+    movie_stem: Option<&str>,
+    episode_stem: Option<&str>,
+    image_index: i64,
+) -> Vec<String> {
+    if !image_type.eq_ignore_ascii_case("FANART") || image_index <= 0 || episode_stem.is_some() {
+        return Vec::new();
+    }
+    let mut stems = Vec::with_capacity(2);
+    if let Some(movie_stem) = movie_stem {
+        stems.push(format!("{movie_stem}-fanart{image_index}"));
+    }
+    stems.push(format!("fanart{image_index}"));
+    stems
+}
+
 fn conflict_free_image_stem(image_type: &str, episode_stem: Option<&str>) -> Option<String> {
     let episode_stem = episode_stem?;
     let suffix = match image_type {
@@ -1959,19 +2018,25 @@ fn conflict_free_image_stem(image_type: &str, episode_stem: Option<&str>) -> Opt
     Some(format!("{episode_stem}-{suffix}"))
 }
 
-async fn image_path_is_owned_by_other_type(
+/// Whether `path` is registered to a different image row of the item.
+///
+/// A path registered by another index of the same type is foreign too, so a read for
+/// `(image_type, image_index)` must not treat a sibling index's file as its own image.
+async fn image_path_is_owned_by_other_row(
     indexed_images: &[StoredItemImage],
     image_type: &str,
+    image_index: i64,
     path: &Path,
 ) -> Result<bool, ImageWriteError> {
     let comparable_path = canonical_path_for_comparison(path).await?;
     for image in indexed_images {
-        if !image.image_type.eq_ignore_ascii_case(image_type)
-            && image_paths_conflict(
-                &canonical_path_for_comparison(Path::new(&image.local_path)).await?,
-                &comparable_path,
-            )
-        {
+        if is_same_image_row(image, image_type, image_index) {
+            continue;
+        }
+        if image_paths_conflict(
+            &canonical_path_for_comparison(Path::new(&image.local_path)).await?,
+            &comparable_path,
+        ) {
             return Ok(true);
         }
     }
@@ -2111,10 +2176,18 @@ fn image_lookup_stems(
     let (legacy_prefixed, legacy_generic) = image_file_stems(image_type, movie_stem, episode_stem)?;
     let (canonical_prefixed, canonical_generic) =
         canonical_image_stems(image_type, movie_stem, episode_stem, image_index)?;
-    let mut stems = Vec::with_capacity(6);
+    let mut stems = Vec::with_capacity(8);
     if let Some(stem) = canonical_prefixed {
         stems.push(stem);
     }
+    // Keep the scanning-approved index names next to the canonical write name so reads and
+    // writes agree on which file index k owns.
+    stems.extend(scanning_approved_index_stems(
+        image_type,
+        movie_stem,
+        episode_stem,
+        image_index,
+    ));
     if let Some(stem) = legacy_prefixed {
         stems.push(indexed_legacy_stem(&stem, image_index));
     }
@@ -2203,6 +2276,21 @@ async fn find_existing_image_path(
     stems: &[String],
     format: Option<ImageFormat>,
 ) -> Result<Option<PathBuf>, ImageWriteError> {
+    Ok(find_existing_image_paths(directory, stems, format)
+        .await?
+        .into_iter()
+        .next())
+}
+
+/// Every existing image of `directory` whose stem is one of `stems`, in stem preference order.
+///
+/// The order lets a caller skip paths another image row already owns and keep looking for a
+/// reusable file instead of falling back to a brand-new name.
+async fn find_existing_image_paths(
+    directory: &Path,
+    stems: &[String],
+    format: Option<ImageFormat>,
+) -> Result<Vec<PathBuf>, ImageWriteError> {
     let mut candidates = Vec::new();
     let mut entries = fs::read_dir(directory)
         .await
@@ -2232,16 +2320,19 @@ async fn find_existing_image_path(
         }
     }
     candidates.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+    let mut ordered = Vec::with_capacity(candidates.len());
     for stem in stems {
-        if let Some(path) = candidates.iter().find(|path| {
-            path.file_stem()
+        for path in &candidates {
+            let matches = path
+                .file_stem()
                 .and_then(|value| value.to_str())
-                .is_some_and(|value| value.eq_ignore_ascii_case(stem))
-        }) {
-            return Ok(Some(path.clone()));
+                .is_some_and(|value| value.eq_ignore_ascii_case(stem));
+            if matches && !ordered.contains(path) {
+                ordered.push(path.clone());
+            }
         }
     }
-    Ok(None)
+    Ok(ordered)
 }
 
 async fn directory_has_multiple_media_files(directory: &Path) -> Result<bool, ImageWriteError> {
@@ -3257,14 +3348,14 @@ fn image_download_retry_delay(retry_count: u32) -> Duration {
 mod tests {
     use super::{
         IMAGE_GLOBAL_CONCURRENCY, IMAGE_RESOLUTION_CACHE_CAPACITY, IMAGE_RETRY_BASE_DELAY,
-        IMAGE_RETRY_MAX_DELAY, ImageDownloadConfig, ImageError, ImagePermitPool,
-        ImageResolutionCache, ImageResolutionKey, ImageService, ImageWriteError, ImageWriteService,
-        background_image_content_tag_and_dimensions_from_bytes, canonical_image_stems,
-        ensure_public_image_host, global_image_download_permits, global_image_write_permits,
-        image_attempt_failure, image_content_tag_and_dimensions_from_bytes,
-        image_download_retry_delay, image_language_matches, image_lookup_stems,
-        is_allowed_scraper_image_url, retryable_image_status, should_suppress_internal_image_write,
-        write_image_atomically,
+        IMAGE_RETRY_MAX_DELAY, ImageDownloadConfig, ImageError, ImageFormat, ImagePermitPool,
+        ImageResolutionCache, ImageResolutionKey, ImageService, ImageTargetRequest,
+        ImageWriteError, ImageWriteService, background_image_content_tag_and_dimensions_from_bytes,
+        canonical_image_stems, ensure_public_image_host, global_image_download_permits,
+        global_image_write_permits, image_attempt_failure,
+        image_content_tag_and_dimensions_from_bytes, image_download_retry_delay,
+        image_language_matches, image_lookup_stems, image_target, is_allowed_scraper_image_url,
+        retryable_image_status, should_suppress_internal_image_write, write_image_atomically,
     };
     use crate::{
         application::access::MediaAccessService,
@@ -3503,7 +3594,12 @@ mod tests {
         );
         let lookup = image_lookup_stems("FANART", None, None, 1).expect("fanart type");
         assert!(lookup.iter().any(|stem| stem == "backdrop1"));
+        assert!(lookup.iter().any(|stem| stem == "fanart1"));
         assert!(lookup.iter().any(|stem| stem == "fanart-1"));
+        let prefixed = image_lookup_stems("FANART", Some("Movie"), None, 2).expect("fanart type");
+        assert!(prefixed.iter().any(|stem| stem == "Movie-backdrop2"));
+        assert!(prefixed.iter().any(|stem| stem == "Movie-fanart2"));
+        assert!(prefixed.iter().any(|stem| stem == "fanart2"));
     }
 
     #[test]
@@ -3517,6 +3613,93 @@ mod tests {
         assert!(lookup.iter().any(|stem| stem == "Example.S01E01-fanart1"));
         assert!(lookup.iter().any(|stem| stem == "Example.S01E01-thumb1"));
         assert!(lookup.iter().any(|stem| stem == "Example.S01E01-thumb-1"));
+    }
+
+    #[tokio::test]
+    async fn indexed_fanart_never_reuses_a_path_registered_by_another_index() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let directory = tokio::fs::canonicalize(root.path())
+            .await
+            .expect("canonical image directory");
+        let shared = directory.join("Fanart.Movie.2020-backdrop1.png");
+        tokio::fs::write(&shared, b"registered by fanart 4")
+            .await
+            .expect("shared fanart file");
+        fn request<'a>(
+            directory: &'a std::path::Path,
+            blocked_paths: &'a [PathBuf],
+        ) -> ImageTargetRequest<'a> {
+            ImageTargetRequest {
+                directory,
+                image_type: "FANART",
+                format: ImageFormat::Png,
+                movie_stem: Some("Fanart.Movie.2020"),
+                episode_stem: None,
+                image_index: 1,
+                reuse_existing_path: true,
+                blocked_paths,
+            }
+        }
+
+        let blocked = [shared.clone()];
+        let target = image_target(request(&directory, &blocked))
+            .await
+            .expect("fanart target with a blocked sibling");
+        assert_ne!(
+            target, shared,
+            "index 1 must not take the file index 4 owns"
+        );
+        assert_eq!(target, directory.join("Fanart.Movie.2020-fanart1.png"));
+        assert_eq!(
+            tokio::fs::read(&shared).await.expect("shared file"),
+            b"registered by fanart 4"
+        );
+
+        // The row's own path is not blocked, so a refresh keeps reusing its file.
+        let target = image_target(request(&directory, &[]))
+            .await
+            .expect("fanart target reusing its own path");
+        assert_eq!(target, shared);
+    }
+
+    #[tokio::test]
+    async fn movie_fanart_reuses_the_scanning_approved_index_sidecar() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let directory = tokio::fs::canonicalize(root.path())
+            .await
+            .expect("canonical image directory");
+        let sidecar = directory.join("fanart2.jpg");
+        tokio::fs::write(&sidecar, b"local fanart 2")
+            .await
+            .expect("local fanart sidecar");
+        fn request<'a>(
+            directory: &'a std::path::Path,
+            blocked_paths: &'a [PathBuf],
+        ) -> ImageTargetRequest<'a> {
+            ImageTargetRequest {
+                directory,
+                image_type: "FANART",
+                format: ImageFormat::Png,
+                movie_stem: Some("Movie"),
+                episode_stem: None,
+                image_index: 2,
+                reuse_existing_path: true,
+                blocked_paths,
+            }
+        }
+
+        let target = image_target(request(&directory, &[]))
+            .await
+            .expect("fanart target reusing fanart2.jpg");
+        assert_eq!(target, sidecar);
+
+        // A different row owns fanart2.jpg: the refresh writes the canonical name instead of
+        // sharing that file.
+        let blocked = [sidecar.clone()];
+        let target = image_target(request(&directory, &blocked))
+            .await
+            .expect("fanart target with an owned sidecar");
+        assert_eq!(target, directory.join("backdrop2.png"));
     }
 
     fn stored_image_candidate(
@@ -3755,6 +3938,115 @@ mod tests {
         .fetch_one(database.pool())
         .await?;
         assert_eq!(images, 0);
+        database.close().await;
+        Ok(())
+    }
+
+    /// LUX-887: fanart indexes of one item never share a file. A sibling index's file is neither
+    /// reused nor overwritten, while the row's own index keeps reusing its canonical path.
+    #[tokio::test]
+    async fn refreshing_one_fanart_index_leaves_a_sibling_indexes_file_alone()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use sha2::{Digest, Sha256};
+
+        let (database, item_id, directory) = image_download_fixture().await?;
+        let movie_directory = directory.path().join("Movies").join("Image Movie (2020)");
+        let address = spawn_image_stub("image/png", TEST_PNG_1X1).await;
+        let service = ImageWriteService::with_config(
+            database.clone(),
+            ImageDownloadConfig {
+                max_bytes: 1024 * 1024,
+                allow_loopback_http: true,
+                direct_connection_only: true,
+                ..ImageDownloadConfig::default()
+            },
+        )?;
+        let insert_indexed_fanart =
+            |image_index: i64, local_path: &std::path::Path, content_tag: &'static str| {
+                let database = database.clone();
+                let item_id = item_id.clone();
+                let local_path = local_path.to_path_buf();
+                async move {
+                    sqlx::query(
+                        "INSERT INTO item_images (
+                            id, item_id, image_type, image_index, local_path, file_size,
+                            content_tag, source
+                         ) VALUES (?, ?, 'FANART', ?, ?, 12, ?, 'TMDB')",
+                    )
+                    .bind(uuid::Uuid::now_v7().to_string())
+                    .bind(item_id)
+                    .bind(image_index)
+                    .bind(local_path.to_string_lossy().as_ref())
+                    .bind(content_tag)
+                    .execute(database.pool())
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
+                }
+            };
+
+        // FANART/1 owns the canonical index-1 name and a refresh overwrites it in place.
+        let own_path = movie_directory.join("backdrop1.png");
+        tokio::fs::write(&own_path, b"fanart one").await?;
+        insert_indexed_fanart(1, &own_path, "fanart-one").await?;
+        let reused = service
+            .download_item_image_attempt_at_index(
+                &item_id,
+                "FANART",
+                &format!("http://{address}/fanart-one"),
+                "SCRAPER",
+                1,
+                true,
+            )
+            .await?
+            .ok_or("fanart 1 refresh was skipped")?;
+        assert_eq!(reused.path, own_path);
+        assert_eq!(tokio::fs::read(&own_path).await?, TEST_PNG_1X1);
+        let own_tag: Option<String> = sqlx::query_scalar(
+            "SELECT content_tag FROM item_images
+             WHERE item_id = ? AND image_type = 'FANART' AND image_index = 1",
+        )
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(
+            own_tag.as_deref(),
+            Some(format!("{:x}", Sha256::digest(TEST_PNG_1X1)).as_str())
+        );
+
+        // FANART/3 already registers the canonical index-2 file: neither the write nor the
+        // read-side existence check may treat that file as FANART/2's image.
+        let sibling_path = movie_directory.join("backdrop2.png");
+        tokio::fs::write(&sibling_path, b"fanart three").await?;
+        insert_indexed_fanart(3, &sibling_path, "fanart-three").await?;
+        assert!(
+            !service
+                .local_image_exists_at_index(&item_id, "FANART", 2)
+                .await?,
+            "index 2 has no image while index 3 registers the canonical index-2 file"
+        );
+        let written = service
+            .download_item_image_attempt_at_index(
+                &item_id,
+                "FANART",
+                &format!("http://{address}/fanart-two"),
+                "SCRAPER",
+                2,
+                true,
+            )
+            .await?
+            .ok_or("fanart 2 refresh was skipped")?;
+        assert_ne!(written.path, sibling_path);
+        assert_eq!(tokio::fs::read(&sibling_path).await?, b"fanart three");
+        let sibling: (String, Option<String>) = sqlx::query_as(
+            "SELECT local_path, content_tag FROM item_images
+             WHERE item_id = ? AND image_type = 'FANART' AND image_index = 3",
+        )
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(sibling.0, sibling_path.to_string_lossy());
+        assert_eq!(sibling.1.as_deref(), Some("fanart-three"));
         database.close().await;
         Ok(())
     }
