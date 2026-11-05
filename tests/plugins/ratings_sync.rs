@@ -18,6 +18,7 @@ use luxd::application::{
     plugins::PluginService,
     ratings_sync::{RatingsSyncError, RatingsSyncService, RatingsSyncTiming},
     scanner::{LibraryScanner, ScanJobService},
+    schedule::DEFAULT_RATINGS_SYNC_SCHEDULE,
     scheduled_tasks::{ScheduledTaskError, ScheduledTaskService},
     strm_probe::StrmProbeService,
 };
@@ -145,7 +146,7 @@ async fn write_ratings_plugin(config_dir: &Path, library_ids: &[String]) -> std:
                 {"key": "libraryIds", "label": "媒体库", "type": "select", "multiple": true,
                  "optionsSource": "media-libraries", "defaultValue": []},
                 {"key": "schedule", "label": "执行计划", "type": "text", "required": true,
-                 "defaultValue": "0 4 * * 0"}
+                 "defaultValue": DEFAULT_RATINGS_SYNC_SCHEDULE}
             ],
             "scheduledTasks": [{
                 "taskType": "RATINGS_SYNC",
@@ -154,7 +155,7 @@ async fn write_ratings_plugin(config_dir: &Path, library_ids: &[String]) -> std:
                 "description": "按计划把 Trakt 评分写入已有 NFO 旁车。",
                 "ownerConfigKey": "libraryIds",
                 "scheduleConfigKey": "schedule",
-                "defaultSchedule": "0 4 * * 0",
+                "defaultSchedule": DEFAULT_RATINGS_SYNC_SCHEDULE,
                 "requiredConfigKeys": ["clientId", "libraryIds"],
                 "resourceLimit": {}
             }],
@@ -172,7 +173,7 @@ async fn write_ratings_plugin(config_dir: &Path, library_ids: &[String]) -> std:
         serde_json::to_vec(&json!({
             "clientId": "test-client",
             "libraryIds": library_ids,
-            "schedule": "0 4 * * 0"
+            "schedule": DEFAULT_RATINGS_SYNC_SCHEDULE
         }))?,
     )
     .await?;

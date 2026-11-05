@@ -24,7 +24,7 @@ use luxd::application::{
     plugins::{MEDIA_INFO_PLUGIN_ID, PluginService},
     reidentify::MetadataReidentifyService,
     scanner::{LibraryScanner, ScanJobService},
-    schedule::DANMAKU_MATCH_TASK_TYPE,
+    schedule::{DANMAKU_MATCH_TASK_TYPE, DEFAULT_RATINGS_SYNC_SCHEDULE},
     scheduled_tasks::{METADATA_TASK_TYPE, ScheduledTaskService},
     scraper::ScraperProvider,
     strm_probe::StrmProbeService,
@@ -1137,7 +1137,7 @@ async fn ratings_sync_is_a_supported_library_task_that_needs_its_service()
                 {"key": "libraryIds", "label": "媒体库", "type": "select", "multiple": true,
                  "optionsSource": "media-libraries", "defaultValue": []},
                 {"key": "schedule", "label": "执行计划", "type": "text", "required": true,
-                 "defaultValue": "0 4 * * 0"}
+                 "defaultValue": DEFAULT_RATINGS_SYNC_SCHEDULE}
             ],
             "scheduledTasks": [{
                 "taskType": "RATINGS_SYNC",
@@ -1146,7 +1146,7 @@ async fn ratings_sync_is_a_supported_library_task_that_needs_its_service()
                 "description": "按计划把 Trakt 评分写入已有 NFO 旁车。",
                 "ownerConfigKey": "libraryIds",
                 "scheduleConfigKey": "schedule",
-                "defaultSchedule": "0 4 * * 0",
+                "defaultSchedule": DEFAULT_RATINGS_SYNC_SCHEDULE,
                 "requiredConfigKeys": ["clientId", "libraryIds"],
                 "resourceLimit": {}
             }],

@@ -324,8 +324,16 @@ impl RatingsSyncService {
             let mut tasks = self.tasks.lock().await;
             std::mem::take(&mut *tasks)
         };
+        // One deadline for every run: a run blocked in a 120 s plugin call must not stretch the
+        // shutdown by that much per library.
+        let deadline = Instant::now() + SHUTDOWN_WAIT;
         for task in tasks {
-            match tokio::time::timeout(SHUTDOWN_WAIT, task).await {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                tracing::warn!("ratings sync task did not stop before shutdown");
+                continue;
+            }
+            match tokio::time::timeout(remaining, task).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     tracing::warn!(%error, "ratings sync task stopped unexpectedly");
