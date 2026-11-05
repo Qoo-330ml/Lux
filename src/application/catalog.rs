@@ -2742,6 +2742,31 @@ impl CatalogService {
             .collect())
     }
 
+    /// Like [`Self::find_items`] for callers that only need titles, hierarchy ids, season
+    /// numbers and season counts (the admin activity feed). It skips the ACL filter, the
+    /// image-tag query and the chapter query; the last two dominate the cost of hydrating items
+    /// the caller never renders artwork or chapter lists for.
+    ///
+    /// The admin activity feed is the only caller, and it runs in the server-management context,
+    /// so this method does not accept a principal: a caller that must respect per-user library
+    /// access has to use [`Self::find_items`]. Items returned here carry empty image tags and
+    /// chapters, so a caller that renders cards or detail views must use [`Self::find_items`]
+    /// as well.
+    pub(crate) async fn find_item_summaries(
+        &self,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, CatalogItem>, CatalogError> {
+        if item_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut items = assemble_items(self.database.list_catalog_rows_by_ids(item_ids).await?);
+        self.populate_item_details(&mut items).await?;
+        Ok(items
+            .into_iter()
+            .map(|item| (item.id.clone(), item))
+            .collect())
+    }
+
     pub async fn find_item_by_media_source_id(
         &self,
         principal: AccessPrincipal,
