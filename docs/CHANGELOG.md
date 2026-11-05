@@ -23,6 +23,14 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 
 ### 修复
 
+- **Emby 列表的 `Filters=IsResumable` / `Filters=IsFavorite` 现在生效**：Emby 列表接口的 `Filters`
+  参数此前只识别 `IsPlayed`/`IsUnplayed`，`Filters=IsResumable` 被静默忽略、返回完整列表，
+  `Filters` 里的 `IsFavorite` 也不生效（只有单独的 `IsFavorite=true` 参数有效）。现在
+  `Filters=IsResumable` 与「继续观看」使用同一套判定（未标记已看、未隐藏续播、达到最小续播进度，且
+  低于该用户的已看百分比），只返回当前请求用户有未看完进度的条目；`Filters=IsFavorite` 等价于
+  `IsFavorite=true`。过滤器按 AND 组合，因此 `IsResumable` 与 `IsPlayed` 同时出现会返回空列表，而不是
+  让其中一个值静默生效。`/Users/{userId}/Items` 与带 `UserId` 的 `/Items`、根路径与 `/emby` 前缀行为
+  一致，分页与 `TotalRecordCount` 都基于过滤后的结果。
 - **已有光盘图的条目不再被海报覆盖**：刮削器返回的海报图（`Primary`/`Poster`）一直兼作 `DISC` 的
   兜底图，完整刷新时这条兜底会按覆盖策略复用同名文件，把媒体目录里已有的 `disc.jpg` 直接改写成海报的
   字节，结果海报和光盘图变成同一张。现在先写上游明确给出的 `Disc` 候选；只有它全部下载失败、且条目

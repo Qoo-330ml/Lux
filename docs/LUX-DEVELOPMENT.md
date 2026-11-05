@@ -20002,6 +20002,80 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
   `--test images image_writer::` 20/20、`--test reidentify` 25/25、fmt / clippy /
   `check-backend-branches.py` 通过。
 
+#### LUX-887：Emby `Filters=IsResumable` / `Filters=IsFavorite` 语义
+
+背景：Hills 1.8.0 二进制含 `IsResumable` 字符串，标准 Emby 的 `Filters` 参数支持 `IsResumable`
+（有未看完播放进度的条目）；同一参数也接受 `IsFavorite`，而 Lux 只支持独立的 `IsFavorite=true` 查询
+参数。Lux 的 Emby 列表查询只在 `Filters` 里读 `IsUnplayed`/`IsPlayed`，`IsResumable` 与 `Filters` 里的
+`IsFavorite` 被静默忽略：前者返回完整列表而不是“可继续观看”的条目。
+
+实现（`src/api/emby_catalog.rs`、`src/application/catalog.rs`、`src/storage/repository.rs`、
+`src/storage/catalog.rs`、`src/storage/mod.rs`；无迁移、无新路由、不改 `/api/v1` DTO 与 `web/`）：
+
+- `Filters` 解析改为一次遍历的大小写不敏感集合，新增 `IsResumable`、`IsFavorite`；未知值仍忽略，
+  `Filters` 内 `IsUnplayed` 优先于 `IsPlayed` 的旧规则保持不变。
+- `Filters=IsFavorite` 等价于 `IsFavorite=true`；两者同时出现时以显式查询参数为准。
+- `Filters=IsResumable` 新增 `CatalogFilter::is_resumable`，在 `storage` 落成相关子查询：
+  `user_item_state` 属于当前请求的目标用户、`is_played = 0`、`hide_from_resume = 0`、
+  `position_ticks >= resume_min_ticks`、条目有已知时长且 `position_ticks * 100 < runtime * played_percent`。
+  因此它不是字面意义上的 `PlaybackPositionTicks > 0`：低于最小时长和超过已看百分比的条目都不返回。
+- 判定复用：把 `Items/Resume` 的两个条件抽成 `resumable_state_predicate` /
+  `resumable_progress_predicate`，`list_resume_items_with_next_episode`、`count_resume_items` 与新的
+  列表过滤共用同一段 SQL；阈值来自 `home_resume_settings`（与 Resume 端点同一次读取），没有新增配置或
+  阈值。运行时长的兜底表达式仍复用 `resume_runtime_ticks_sql()`。
+- 组合规则：所有过滤器按 AND 组合。`IsResumable` 隐含未看完，`Filters=IsResumable,IsPlayed` 因此返回
+  空页，而不是让其中一个值静默覆盖另一个；`Filters=IsResumable,IsUnplayed` 等价于只有 `IsResumable`。
+- 分页与总数：过滤进入同一条 `catalog_filter_where_clause`，列表、`TotalRecordCount` 与分页共用，
+  服务端上限不变；多库 union 列表与读模型路径按既有规则对未覆盖的过滤集回退权威查询（新增
+  `is_resumable` 条件）。
+- 未覆盖：`SearchTerm` 搜索分支、`Ids` 单条查找分支与 `ParentId` 指向具体条目的系列分集/集合子项
+  分支不应用 `Filters`（与既有 `IsPlayed`/`IsUnplayed` 一致）；库页缓存 15 秒 TTL 不因播放进度写入
+  失效，刚续播后的列表最多滞后约 15 秒。
+
+验收：
+
+- [x] `Filters=IsResumable` 只返回有进度且未看完的条目；已看完、无任何进度、低于最小时长、超过已看
+      百分比与 `HideFromResume` 的条目都不返回。
+- [x] 进度按请求目标用户读取：另一个用户的进度不出现在响应中，也不影响当前用户的过滤结果。
+- [x] 分页与 `TotalRecordCount` 一致：`Limit=2` 的第 1 页返回 2 条、第 2 页返回 1 条，两页总数都是
+      过滤后的 3。
+- [x] `Filters=IsFavorite` 与 `IsFavorite=true` 返回同一组条目；`Filters=IsFavorite,IsResumable` 取交集。
+- [x] `/Users/{userId}/Items` 根路径与 `/emby` 前缀、大小写混用与逗号组合值均有覆盖。
+- [x] `Filters=IsResumable,IsPlayed` 返回空页；`Filters=IsResumable,IsUnplayed` 等价于 `IsResumable`。
+- [x] `Filters=IsUnplayed` 单独使用时行为不变，`IsResumable` 是它的严格子集。
+
+预计文件：`src/api/emby_catalog.rs`、`src/application/catalog.rs`、`src/storage/repository.rs`、
+`src/storage/catalog.rs`、`src/storage/mod.rs`、`tests/emby/emby_item_filters.rs`、
+`tests/emby/main.rs`、`docs/COMPATIBILITY.md`、`docs/LUX-DEVELOPMENT.md`。rebase 到当前 `test` 后
+另按审查要求补了 `docs/CHANGELOG.md`（Unreleased 修复条目）与 `docs/TEST-TARGETS.md`（`--test emby`
+与模块计数）。
+
+实施结果（2026-11-06，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 验证）：按 TDD 先提交失败的
+集成测试（`Filters` 里的两个新值被忽略时用 7 条/5 条全量结果复现），再实现使其通过。Hills 只确认到
+`IsResumable` 字符串存在，没有真机复测列表结果。任务编号用 `LUX-887`：基线上 `LUX-886` 已被“已有
+光盘图不再被海报覆盖”占用（本任务接到的说明里写的是 LUX-886）。
+
+验证命令与结果：
+
+- `cargo test --locked --test emby emby_item_filters::` 2/2（新增）。
+- `cargo test --locked --test emby emby_counts::` 1/1；`cargo test --locked --lib resume` 16/16
+  （含 `resume_items_apply_content_restrictions_before_ranking`、`home_resume_settings_are_read_with_one_query`）。
+- `cargo test --locked --test auth_users resume_favorites::` 6/6；`cargo test --locked --test library
+  catalog::` 5/5；`cargo test --locked --test library series_api::` 1/1。
+- `cargo fmt --all -- --check` 通过；`cargo clippy --locked --all-targets --all-features -- -D warnings`
+  通过（0 警告）。
+
+限制与剩余风险：
+
+- `IsResumable` 与 Resume 端点一样受 `resume_min_ticks`（默认 120 秒）和 `played_percent`（默认 95%）
+  约束；第三方客户端如果期望字面意义上的“任意进度 > 0”会看到更少的条目，需要所有者确认是否接受。
+- 播放进度写入不会失效库页缓存（15 秒 TTL），刚续播后紧接的列表请求可能读到旧页；与既有 `IsPlayed`
+  过滤相同，本任务未改缓存失效策略。
+- 搜索、`Ids` 单条查找与具体条目子项分支仍不应用 `Filters`；这些路径在改动前也不支持
+  `IsPlayed`/`IsUnplayed`，属于既有边界而非本任务新增缺口。
+- 没有在 Hills、SenPlayer、VidHub、Infuse 等真实客户端上验证该过滤参数的 UI 结果；Hills 只确认到
+  二进制字符串存在。
+
 ## 31. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

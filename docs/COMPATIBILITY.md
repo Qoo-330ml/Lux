@@ -1,5 +1,35 @@
 # Lux 客户端兼容性矩阵
 
+## LUX-887 Emby `Filters=IsResumable` / `Filters=IsFavorite`（2026-11-06）
+
+分级：**推断**。依据只有两条：Hills 1.8.0 的二进制里存在 `IsResumable` 字符串，以及标准 Emby 的
+`Filters` 参数接受 `IsResumable`/`IsFavorite`。本任务只在 Lux 服务端按该语义实现并用自动化测试覆盖，
+**没有**在 Hills 或任何第三方 Emby 客户端真机上复测列表结果。
+
+- `Filters` 仍是逗号分隔、大小写不敏感，未知值继续忽略。此前 Lux 只读取 `IsPlayed`/`IsUnplayed`，
+  `IsResumable` 与 `Filters` 里的 `IsFavorite` 被静默丢弃：前者返回完整列表，后者只有独立的
+  `IsFavorite=true` 参数才生效。
+- `Filters=IsResumable` 复用 `GET /Users/{userId}/Items/Resume` 的“继续观看”判定：当前用户
+  `user_item_state` 未标记已看、未设置 `HideFromResume`、播放位置达到 `resume_min_ticks`（默认 120 秒）、
+  条目有已知时长且播放位置低于该用户的已看百分比（`played_percent`，默认 95%）。所以它不是字面意义上的
+  `PlaybackPositionTicks > 0`：刚开始播放（低于最小时长）和接近看完（超过已看百分比）的条目不会返回。
+  阈值与 Resume 端点读取同一份设置（`home_resume_settings`），没有新增配置项。
+- `Filters=IsFavorite` 等价于查询参数 `IsFavorite=true`；两者同时出现时以显式参数为准。
+- 组合规则：所有过滤器按 AND 组合。`IsResumable` 隐含未看完，因此 `Filters=IsResumable,IsPlayed`
+  返回空页，不会让其中一个值静默覆盖另一个；`Filters=IsResumable,IsUnplayed` 等价于只有 `IsResumable`。
+  `Filters` 内 `IsUnplayed` 优先于 `IsPlayed` 的旧规则保持不变。
+- 覆盖范围：`/Users/{userId}/Items` 与带 `UserId` 的 `/Items`，根路径与 `/emby` 前缀一致；过滤发生在分页
+  之前，`TotalRecordCount` 是过滤后的总数，`StartIndex`/`Limit` 与服务端上限不变；进度严格按请求的目标
+  用户读取，其他用户的进度不会泄漏，也不影响当前用户的过滤结果。
+- 未覆盖（与既有 `IsPlayed`/`IsUnplayed` 一致）：带 `SearchTerm` 的搜索分支、`Ids` 单条查找分支，以及
+  `ParentId` 指向具体条目时走系列分集/集合子项的分支都不应用 `Filters`；媒体库范围
+  （`ParentId=<libraryId>`）与全库根列表已覆盖。
+- 库范围列表复用 15 秒 TTL 的库页缓存；播放进度写入不会主动失效该缓存，因此刚续播后的下一次
+  `IsResumable` 列表最多可能滞后约 15 秒（与既有 `IsPlayed` 过滤相同）。
+- 自动化：`cargo test --locked --test emby emby_item_filters::` 覆盖有进度/已看完/无进度/接近看完/低于
+  最小时长/隐藏续播/其他用户进度的隔离、分页与总数、`IsFavorite` 等价、组合值、大小写与两种路径。
+  该记录只证明 Lux 服务端合同，不代表 Hills 或其他客户端已确认该过滤行为。
+
 ## LUX-886 已有光盘图不再被海报覆盖（2026-11-05）
 
 - 行为变化：候选 JSON 里 `Primary`/`Poster` 类型的图会同时进入 `POSTER` 和 `DISC` 两个类型。
