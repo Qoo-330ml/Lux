@@ -19819,9 +19819,9 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
 实现：
 
 - `ProviderResponseCache::clear_provider(plugin_id)`：按 `cache_key` 的插件 id 前缀精确删除，内存
-  `entries` / `expiry_order` 同步维护，并复用现有防抖持久化；即使没有条目被删也推进该插件的 generation。
-  `cache_key` 的 `provider` 参数确认取的是插件 id（`ScraperPluginClient` 传入 `self.plugin_id`），因此
-  不需要把配置哈希塞进缓存键，也不需要清空整个 provider 缓存。
+  `entries` / `expiry_order` 同步维护，并立即同步落盘（不再等 2 秒防抖）；即使没有条目被删也推进该插件的
+  generation。`cache_key` 的 `provider` 参数确认取的是插件 id（`ScraperPluginClient` 传入
+  `self.plugin_id`），因此不需要把配置哈希塞进缓存键，也不需要清空整个 provider 缓存。
 - 并发：`CacheState` 增加全局 `generation` 和按插件的 `provider_generations`；`begin` 返回的
   `CacheOwner` 记录当时的两个值，`store_shared_for_owner` / `store_negative_for_owner` 在写入前比对，
   清理之后旧请求的结果不会写回。锁仍只在同步代码段持有，没有跨 `await` 持锁，`begin`/`store_shared`
@@ -19829,6 +19829,13 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
 - 调用点：`write_plugin_config` 覆盖配置更新、配置迁移、计划/库范围写入；`install`、`set_enabled`、
   `uninstall`（清配置/卸载）、`install_remote_package`（升级）在现有 `invalidate_scraper_client_cache()`
   旁清理该插件；上传登录背景图走 `write_plugin_config` 自动覆盖。
+- 进程重启顺序：配置写入后的第一次清理会先删旧条目，但旧插件进程要到上层 `admin_update_plugin_config`
+  调用 `restart()` 才换成新配置，这段时间仍可能产出旧响应并写回。`restart()` 在 `supervisor.stop()`
+  之后再清一次该插件；`uninstall`、`set_enabled(false)`、上传登录背景图也在各自 `supervisor.stop()`
+  之后补一次清理。进程换成新配置后缓存为空，下一次刮削重新向插件取数。
+- 持久化：`clear` / `clear_provider` 复用非 `#[cfg(test)]` 的 `persist_now()` 立即写盘，避免配置保存后
+  2 秒内重启进程又从文件读回旧条目；写盘失败只记不含路径和内容的 warn 日志，不影响配置保存结果，
+  内存中的清理仍然生效，后续正常持久化会再次尝试。测试用 `flush()` 语义不变。
 - `FULL_REFRESH`：新增 `ScraperResolver::clear_response_cache()` 清理其 `PluginService` 的响应缓存；
   `MetadataReidentifyService` 保留原 `self.scraper.clear_response_cache()`，装配了 resolver 时再清
   resolver 的缓存。未重构装配，`src/api/legacy.rs` 不变。
@@ -19841,6 +19848,10 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
 - [x] 单元：清理插件会丢弃该插件的 in-flight 写入，但不影响另一个插件的 in-flight 写入。
 - [x] 服务层：stub 刮削器从 `LUX_PLUGIN_CONFIG_PATH` 读取 `minWidth`；保存 `1500` 后同参数调用重新走
   插件（调用日志 1 → 2，宽度 1000 → 1500）。修复前该用例的第二次调用命中 24 小时响应缓存。
+- [x] 进程重启顺序：stub 在进程启动时快照配置；配置保存后、`restart()` 前用旧进程再取一次响应（宽度
+  1000），`restart()` 后下一次调用重新取数并得到 1500。修复前该用例返回缓存的 1000。
+- [x] 立即落盘：清理后不调用 `flush()`、不等待防抖，直接用同一路径新建缓存，被清条目不在，其他插件
+  条目仍在；`clear()` 全量清理同样立即落盘。
 - [x] `FULL_REFRESH`：用 resolver + `unconfigured()` 的真实装配创建并运行完整刷新任务，预热的缓存被清；
   修复前该用例失败（缓存仍命中），复现真机现象。
 - [x] 现有缓存单测（复用、负缓存、单飞、取消 owner、文件恢复、持久化指标）保持通过。
@@ -19857,17 +19868,35 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
   覆盖升级后插件行为变化。
 - `FULL_REFRESH` 的清理发生在 `run` 开头，和原来同一位置，没有改变任务状态机。
 
+返工（独立审查后，2026-11-05）：
+
+- 顺序问题：审查指出“写入后立即清理”到 `admin_update_plugin_config` 的 `restart()` 之间存在窗口，旧进程
+  在窗口内产出的响应会以清理后的代际写回。现在 `restart()` 在 `supervisor.stop()` 之后补一次
+  `clear_provider`；`uninstall`、`set_enabled(false)`、上传登录背景图也在各自 stop 之后补一次。新增
+  `restart_clears_responses_produced_between_config_save_and_restart`：stub 在进程启动时快照配置，保存
+  `1500` 后先用旧进程取到 `1000` 并写入缓存，`restart()` 后下一次调用必须重新取数得到 `1500`；修复前
+  该用例返回 `1000`。
+- 落盘问题：审查指出清理只走 2 秒防抖，保存配置后 2 秒内重启进程会从 `provider-responses.json` 读回旧
+  条目。`clear` / `clear_provider` 改为复用 `persist_now()` 立即同步写盘，写盘失败只记不含路径和内容的
+  warn 日志；`flush()` 保持测试语义不变。新增
+  `clearing_a_provider_persists_immediately_without_waiting_for_the_debounce` 和
+  `clearing_the_whole_cache_persists_immediately_without_waiting_for_the_debounce`：清理后不调用
+  `flush()`、不等待防抖，直接用同一路径重建缓存验证结果；修复前两条都会读到旧条目。
+
 验证命令与结果：
 
-- `cargo test --locked --lib provider_cache::` 11/11（含 3 条新增：按插件清理与持久化、清理丢弃本插件
-  in-flight 写入、不影响其他插件 in-flight 写入）。
-- `cargo test --locked --lib plugins::` 13/13（含新增
-  `saving_scraper_config_invalidates_the_plugin_response_cache`）。
+- `cargo test --locked --lib provider_cache::` 13/13（含 5 条新增：按插件清理与持久化、清理丢弃本插件
+  in-flight 写入、不影响其他插件 in-flight 写入、按插件清理立即落盘、全量清理立即落盘）。
+- `cargo test --locked --lib plugins::` 14/14（含新增
+  `saving_scraper_config_invalidates_the_plugin_response_cache` 与
+  `restart_clears_responses_produced_between_config_save_and_restart`）。
 - `cargo test --locked --lib scraper::` 12/12、`cargo test --locked --lib reidentify::` 48/48（含新增
   `full_refresh_clears_the_resolver_provider_response_cache`）。
 - 修复前失败复现：临时移除 `write_plugin_config` 的清理后，插件配置用例报
   `left: Some(1000) right: Some(1500)`；临时移除 reidentify 的 resolver 清理后，完整刷新用例报
-  “FULL_REFRESH must drop the responses the resolver clients cached”。两处恢复后均通过。
+  “FULL_REFRESH must drop the responses the resolver clients cached”；在实现前，重启顺序用例报
+  `restart must clear the response cached by the old process after it stops`（`left: Some(1000)`），
+  两条立即落盘用例在重建缓存时仍读到旧条目。恢复/实现后均通过。
 - `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
   `python3 scripts/check-backend-branches.py` 通过。
 - 集成测试未新增或改动用例，`docs/TEST-TARGETS.md` 的计数不变；相关分组回归：
@@ -19879,6 +19908,11 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
 - `unconfigured()` 占位 provider 自己的 `clear_response_cache()` 仍然保留为空实现，真实缓存由 resolver
   清理；其他把 `unconfigured()` 当刮削器、又没有 resolver 的装配本来就无法刮削，不受影响。
 - in-flight 响应在清理后会被丢弃而不是写回，调用方仍会拿到它，但下一次请求会重新向插件取数。
+- 重启顺序由 `restart()` / stop 之后的第二次清理兜底；若调用方直接调用 `update_dynamic_config` 却既不
+  重启进程也不结束插件会话，插件是否读取新配置取决于插件自身实现（本任务未改插件协议）。
+- 清理路径现在每次同步写一次 JSON（最多 `MAX_CACHE_ENTRIES` 条），配置保存会多一次有界磁盘写；写盘失败
+  只记 warn，内存清理仍生效，但若紧接着重启进程，磁盘上可能仍是旧文件，旧条目会被读回，需要等下一次
+  成功持久化。
 - 本机只验证了 stub 插件与 resolver 装配；未在真实 TMDb 插件上复测语言/最小宽度变更后的即时生效。
 
 ## 31. 参考资料
