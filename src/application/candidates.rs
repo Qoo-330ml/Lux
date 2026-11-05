@@ -1849,7 +1849,8 @@ fn explicitly_unavailable_image_types(
     SCRAPER_IMAGE_TYPES
         .into_iter()
         .filter(|image_type| match *image_type {
-            // `Primary` typed images feed both POSTER and DISC, so a poster URL covers both.
+            // `Primary` typed images feed both POSTER and DISC (DISC only as a fallback for an
+            // item that has no disc artwork), so a poster URL covers both.
             "POSTER" | "DISC" => !has_poster,
             // `Backdrop` typed images feed FANART/THUMB/BANNER/ART/WALLPAPER.
             "FANART" | "THUMB" | "BANNER" | "ART" | "WALLPAPER" => !has_backdrop,
@@ -2326,6 +2327,39 @@ fn candidate_images_by_type(
             .push(url.to_owned());
     }
     result
+}
+
+/// `DISC` candidate URLs separated by where the candidate got them from.
+#[derive(Default)]
+struct CandidateDiscUrls {
+    /// URLs an upstream `Disc` typed image supplied; they keep the normal overwrite rules.
+    explicit: Vec<String>,
+    /// URLs that only reached `DISC` because a `Primary`/`Poster` typed image fills both types.
+    /// They are a fallback for an item without disc artwork and are never written otherwise.
+    poster_fallback: Vec<String>,
+}
+
+/// Splits the stored `DISC` bucket into explicit disc artwork and poster-derived fallbacks.
+///
+/// `Primary`/`Poster` typed images are stored under both `POSTER` and `DISC`, so the candidate
+/// map cannot tell the two apart by key alone: a poster URL appears in both buckets. The poster
+/// bucket is the marker, and this split keeps the fallback from replacing real disc artwork.
+/// When the candidate also carries an explicit disc image, that image wins and the poster
+/// fallback is dropped so the same type is not written twice.
+fn candidate_disc_urls(images: &BTreeMap<String, Vec<String>>) -> CandidateDiscUrls {
+    let poster_urls = images.get("POSTER").map(Vec::as_slice).unwrap_or_default();
+    let mut urls = CandidateDiscUrls::default();
+    for url in images.get("DISC").into_iter().flatten() {
+        if poster_urls.iter().any(|poster| poster == url) {
+            urls.poster_fallback.push(url.clone());
+        } else {
+            urls.explicit.push(url.clone());
+        }
+    }
+    if !urls.explicit.is_empty() {
+        urls.poster_fallback.clear();
+    }
+    urls
 }
 
 fn generic_candidate_actors(
@@ -3412,6 +3446,10 @@ impl MetadataSelectionService {
                 image_policy.episode_image_policy(),
                 EpisodeImagePolicy::ScraperStill
             );
+        // A `Primary`/`Poster` typed image also fills `DISC`, but only as a fallback: it may fill
+        // an item that has no disc artwork and must never replace one that exists. Explicit
+        // `Disc` candidates keep the normal overwrite rules.
+        let disc_urls = candidate_disc_urls(&payload.images);
         if payload.typed_images_present {
             for image_type in image_policy.enabled_types_for_item_type(item_type) {
                 if screenshot_fallback_types.contains(image_type) || !scraper_allowed(image_type) {
@@ -3424,7 +3462,12 @@ impl MetadataSelectionService {
                 if max_count == 0 {
                     continue;
                 }
-                if let Some(urls) = payload.images.get(image_type).cloned() {
+                let candidate_urls = if image_type == "DISC" {
+                    (!disc_urls.explicit.is_empty()).then(|| disc_urls.explicit.clone())
+                } else {
+                    payload.images.get(image_type).cloned()
+                };
+                if let Some(urls) = candidate_urls {
                     if image_type == "FANART" && supplemental {
                         let urls = self
                             .filter_new_supplemental_image_urls(item_id, image_type, urls)
@@ -3482,6 +3525,20 @@ impl MetadataSelectionService {
             } else if max_count > 0 {
                 specs.push(("FANART", vec![url], 0));
             }
+        }
+        // A poster stands in for disc artwork only when the item has none. The item may have the
+        // disc as a local file, as a registered `item_images` row or as artwork owned by another
+        // type, so ask the image writer instead of trusting the candidate map. Explicit `Disc`
+        // candidates were handled above and keep the overwrite semantics of a full refresh.
+        let disc_policy = image_policy.type_policy_for_item_type(item_type, "DISC");
+        if !disc_urls.poster_fallback.is_empty()
+            && disc_policy.enabled
+            && max_count_for("DISC") > 0
+            && scraper_allowed("DISC")
+            && !screenshot_fallback_types.contains("DISC")
+            && !self.images.has_local_image(item_id, "DISC").await?
+        {
+            add_spec!("DISC", disc_urls.poster_fallback.clone());
         }
         let item_permits = Arc::new(Semaphore::new(IMAGE_ITEM_CONCURRENCY));
         let mut tasks = JoinSet::new();
@@ -5280,7 +5337,7 @@ mod tests {
         MAX_ACTOR_DETAIL_FETCHES, MetadataCandidateError, MetadataCandidateService,
         MetadataRequestPlan, MetadataSelectionMode, MetadataSelectionService, SCRAPER_IMAGE_TYPES,
         ScraperRoles, SelectionInputs, candidate_actor_credits, candidate_actors,
-        candidate_images_by_type, candidate_payload, capability_needs_request,
+        candidate_disc_urls, candidate_images_by_type, candidate_payload, capability_needs_request,
         completeness_capabilities, credits_need_actor_relation_check,
         default_image_selection_policy, enrich_actor_metadata, explicitly_unavailable_image_types,
         generic_candidate_actors, image_attempt_identities, local_metadata_completeness_plan,
@@ -7193,6 +7250,16 @@ mod tests {
             movie.get("FANART"),
             Some(&vec!["https://images.example/backdrop".to_owned()])
         );
+        let movie_disc = candidate_disc_urls(&movie);
+        assert!(
+            movie_disc.explicit.is_empty(),
+            "a poster typed image must not become explicit disc artwork"
+        );
+        assert_eq!(
+            movie_disc.poster_fallback,
+            movie.get("POSTER").cloned().unwrap_or_default(),
+            "poster typed images only reach DISC as a fallback"
+        );
 
         let episode = candidate_images_by_type(&images, ScraperItemType::Episode);
         assert_eq!(
@@ -7203,6 +7270,31 @@ mod tests {
             !episode.contains_key("THUMB"),
             "episode stills are not duplicated into other backdrop types"
         );
+    }
+
+    #[test]
+    fn explicit_disc_candidates_keep_their_urls_and_suppress_the_poster_fallback() {
+        let poster = "https://images.example/poster".to_owned();
+        let disc = "https://images.example/disc".to_owned();
+        let mut combined = BTreeMap::new();
+        combined.insert("POSTER".to_owned(), vec![poster.clone()]);
+        combined.insert("DISC".to_owned(), vec![poster, disc.clone()]);
+        let urls = candidate_disc_urls(&combined);
+        assert_eq!(urls.explicit, vec![disc.clone()]);
+        assert!(
+            urls.poster_fallback.is_empty(),
+            "an explicit disc image must not add a second DISC write"
+        );
+
+        let mut explicit_only = BTreeMap::new();
+        explicit_only.insert("DISC".to_owned(), vec![disc.clone()]);
+        let urls = candidate_disc_urls(&explicit_only);
+        assert_eq!(urls.explicit, vec![disc]);
+        assert!(urls.poster_fallback.is_empty());
+
+        let urls = candidate_disc_urls(&BTreeMap::new());
+        assert!(urls.explicit.is_empty());
+        assert!(urls.poster_fallback.is_empty());
     }
 
     #[test]
