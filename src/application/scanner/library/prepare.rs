@@ -245,6 +245,7 @@ impl LibraryScanner {
             .and_then(|extension| extension.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
+        let source_edition_name = hierarchy.source_edition_name(&parsed);
         let series_title = hierarchy.series_title;
         let series_sort_title = series_title.to_lowercase();
         Ok(Some(NewEpisodeFile {
@@ -274,7 +275,7 @@ impl LibraryScanner {
                 "LOCAL_FILE".to_owned()
             },
             strm_target_kind: strm_target_kind.map(str::to_owned),
-            edition_name: parsed.edition_name,
+            edition_name: source_edition_name,
             quality_label: parsed.quality_label,
             container,
             external_url: external_url.map(str::to_owned),
@@ -347,6 +348,7 @@ impl LibraryScanner {
             .and_then(|extension| extension.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
+        let source_edition_name = hierarchy.source_edition_name(&parsed);
         let series_title = hierarchy.series_title;
         let series_sort_title = series_title.to_lowercase();
         Ok(Some(NewEpisodeFile {
@@ -376,7 +378,7 @@ impl LibraryScanner {
                 "LOCAL_FILE".to_owned()
             },
             strm_target_kind: strm_target_kind.map(str::to_owned),
-            edition_name: parsed.edition_name,
+            edition_name: source_edition_name,
             quality_label: parsed.quality_label,
             container,
             external_url: external_url.map(str::to_owned),

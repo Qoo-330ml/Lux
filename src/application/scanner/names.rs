@@ -342,6 +342,8 @@ pub(super) struct EpisodeHierarchy {
     pub(super) production_year: Option<i32>,
     pub(super) provider_ids: BTreeMap<String, String>,
     pub(super) season_number: u32,
+    /// Version label taken from a `Season N <label>` directory, if any.
+    pub(super) season_label: Option<String>,
 }
 
 pub(super) fn episode_hierarchy(
@@ -383,13 +385,33 @@ pub(super) fn episode_hierarchy(
         .map(|value| value.provider_ids.clone())
         .filter(|provider_ids| !provider_ids.is_empty())
         .unwrap_or_else(|| parsed.provider_ids.clone());
-    let season_number = season_directory_number(directories).unwrap_or(parsed.season);
+    let season_directory = directories
+        .iter()
+        .rev()
+        .find_map(|value| parse_season_directory(value));
+    let season_number = season_directory
+        .as_ref()
+        .map_or(parsed.season, |(season, _)| *season);
+    let season_label = season_directory.and_then(|(_, label)| label);
     EpisodeHierarchy {
         series_path,
         series_title,
         production_year,
         provider_ids,
         season_number,
+        season_label,
+    }
+}
+
+impl EpisodeHierarchy {
+    /// Edition name stored on the media source: the filename's own edition wins,
+    /// otherwise the season directory label. It is deliberately not part of the
+    /// episode identity so differently labelled directories merge into one episode.
+    pub(super) fn source_edition_name(&self, parsed: &ParsedEpisodeFilename) -> Option<String> {
+        parsed
+            .edition_name
+            .clone()
+            .or_else(|| self.season_label.clone())
     }
 }
 
@@ -405,31 +427,54 @@ pub(super) fn legacy_series_identity(
         .map(|component| format!("series:{}:{component}", root.id))
 }
 
-pub(super) fn season_directory_number(components: &[&str]) -> Option<u32> {
-    components
-        .iter()
-        .rev()
-        .find_map(|value| parse_season_directory_name(value))
+pub(super) fn parse_season_directory_name(value: &str) -> Option<u32> {
+    parse_season_directory(value).map(|(season, _)| season)
 }
 
-pub(super) fn parse_season_directory_name(value: &str) -> Option<u32> {
-    let normalized = value.trim().to_ascii_lowercase();
-    if normalized == "specials" {
-        return Some(0);
+/// Parses a season directory name into its season number and optional version label.
+///
+/// Accepts `Season N`, `SN`, `Specials`, the legacy `Season N (digits)` form and
+/// `Season N <label>` where `<label>` is exactly one whitespace-free word (for
+/// example `DV`, `HDR` or `国语`). Directories sharing a season number belong to
+/// the same season; the label only names the media version.
+pub(super) fn parse_season_directory(value: &str) -> Option<(u32, Option<String>)> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("specials") {
+        return Some((0, None));
     }
-    let digits = normalized
-        .strip_prefix("season")
-        .or_else(|| normalized.strip_prefix('s'))?
-        .trim();
-    let digits = if let Some((prefix, suffix)) = digits.split_once('(') {
-        suffix.strip_suffix(')').filter(|value| {
-            !value.is_empty() && value.chars().all(|character| character.is_ascii_digit())
-        })?;
-        prefix.trim()
+    let lowered = trimmed.to_ascii_lowercase();
+    let prefix_len = if lowered.starts_with("season") {
+        "season".len()
+    } else if lowered.starts_with('s') {
+        1
     } else {
-        digits
+        return None;
     };
-    digits.parse::<u32>().ok()
+    let rest = trimmed[prefix_len..].trim_start();
+    let digits_len = rest
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let season = rest[..digits_len].parse::<u32>().ok()?;
+    let remainder = &rest[digits_len..];
+    if remainder.is_empty() {
+        return Some((season, None));
+    }
+    if !remainder.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let label = remainder.trim();
+    if let Some(inner) = label
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+        && !inner.is_empty()
+        && inner.chars().all(|character| character.is_ascii_digit())
+    {
+        return Some((season, None));
+    }
+    if label.is_empty() || label.contains(char::is_whitespace) {
+        return None;
+    }
+    Some((season, Some(label.to_owned())))
 }
 
 pub(super) fn trailing_hyphen_variant_candidates(filename: &str) -> Option<Vec<(&str, &str)>> {

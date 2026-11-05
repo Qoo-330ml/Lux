@@ -19698,6 +19698,18 @@ env `LUX_FILMLY_IMAGE_MODE`，因此该用例单独成一个只含一条测试�
 不产生该日志；日志无法区分冷缓存首次回退（记为 `variant_unavailable`）与开关关闭，需要结合设置判断；
 未在真实第三方 Emby 客户端上实测，只用 HTTP 回归覆盖请求形状。
 
+#### LUX-883：`Season N <标签>` 季目录合并为多版本剧集
+
+范围：季目录名为 `Season N`/`SN` 后跟恰好一个无空格词（如 `Season 1 DV`、`Season 1 HDR`、`Season 2 国语`）时，
+按季号 N 归入同一季；该词作为媒体源版本标签（`edition_name`）。文件名自带 edition 时以文件名为准。
+标签不进入集条目 identity，因此不同标签目录下的同一集合并为一个集条目的多个媒体源。多个词的目录
+（`Season 1 Part Two`）、`Season 1DV` 仍不识别为季目录；`Season N (数字)`、`Specials` 行为不变。
+Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 Lux 对网盘整理习惯的扩展。
+
+预计文件：`src/application/scanner/names.rs`、`src/application/scanner/library.rs`、`src/application/scanner/library/prepare.rs`、`src/application/scanner/tests.rs`、本文档。
+
+验证：`cargo test --locked --lib application::scanner` 76 passed；fmt 通过。限制：已被旧版本拆成多部"剧"的库需重扫才能并回，未验证迁移路径；未跑 all-targets/clippy。
+
 ## 31. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

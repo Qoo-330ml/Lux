@@ -1195,7 +1195,7 @@ impl LibraryScanner {
             self.database
                 .update_media_source_variant_labels(
                     &existing_entry.id,
-                    parsed.edition_name.as_deref(),
+                    hierarchy.source_edition_name(&parsed).as_deref(),
                     parsed.quality_label.as_deref(),
                 )
                 .await?;
@@ -1278,7 +1278,7 @@ impl LibraryScanner {
                 item_id: &ensured.episode_id,
                 source_kind: if is_strm { "STRM_URL" } else { "LOCAL_FILE" },
                 filesystem_entry_id: &entry_id,
-                edition_name: parsed.edition_name.as_deref(),
+                edition_name: hierarchy.source_edition_name(&parsed).as_deref(),
                 quality_label: parsed.quality_label.as_deref(),
                 container: &container,
                 size,
