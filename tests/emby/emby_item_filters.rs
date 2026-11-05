@@ -497,13 +497,14 @@ async fn emby_filters_is_resumable_paginates_and_is_favorite_matches_the_query_p
     );
     assert_eq!(item_ids(&favorite_parameter), item_ids(&favorite_filter));
 
-    // Combined values are intersected: only the favorite item with progress remains.
+    // Combined values are intersected: only the favorite item with progress remains. This also
+    // covers the root `/Items` route with an explicit `UserId`, the remaining route shape.
     let favorite_and_resumable = get_items(
         &server,
         &server.admin_token,
-        format!("/Users/{}/Items", server.admin_id),
+        "/Items".to_owned(),
         &[
-            ("ParentId", library_public_id.as_str()),
+            ("UserId", server.admin_id.as_str()),
             ("Recursive", "true"),
             ("IncludeItemTypes", "Movie"),
             ("Filters", "IsFavorite,IsResumable"),
