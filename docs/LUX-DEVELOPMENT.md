@@ -19806,6 +19806,81 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
 - 返工后复跑：`--lib candidates::` 44/44、`--lib application::settings` 12/12、`vitest run`
   `admin-libraries`（39 例）与 `image-level-policy`（15 例）全部通过。
 
+#### LUX-885：插件配置变更后刮削必须使用新配置（修复响应缓存不失效）
+
+背景：刮削响应缓存（`config_dir/metadata/provider-responses.json`）的键是
+`"{plugin_id}\n{method}\n{params}"`，不含插件配置；`metadata.get` / `metadata.images` /
+`metadata.credits` 的 TTL 是 24 小时。插件配置保存只推进刮削客户端版本，不清理该缓存，因此改最小宽度、
+语言、回退顺序或 API 地址后，下一次刮削仍读旧响应，最长 24 小时不生效。`FULL_REFRESH` 虽然调用
+`clear_response_cache()`，但真实装配（`src/api/legacy.rs`）传给 `MetadataReidentifyService` 的是
+`ScraperProvider::unconfigured()`，真正带缓存的客户端由 `ScraperResolver` 按条目创建，所以那次清理
+一直是空操作。
+
+实现：
+
+- `ProviderResponseCache::clear_provider(plugin_id)`：按 `cache_key` 的插件 id 前缀精确删除，内存
+  `entries` / `expiry_order` 同步维护，并复用现有防抖持久化；即使没有条目被删也推进该插件的 generation。
+  `cache_key` 的 `provider` 参数确认取的是插件 id（`ScraperPluginClient` 传入 `self.plugin_id`），因此
+  不需要把配置哈希塞进缓存键，也不需要清空整个 provider 缓存。
+- 并发：`CacheState` 增加全局 `generation` 和按插件的 `provider_generations`；`begin` 返回的
+  `CacheOwner` 记录当时的两个值，`store_shared_for_owner` / `store_negative_for_owner` 在写入前比对，
+  清理之后旧请求的结果不会写回。锁仍只在同步代码段持有，没有跨 `await` 持锁，`begin`/`store_shared`
+  路径不会 panic 或死锁；清理其他插件不会丢弃无关插件的 in-flight 结果。
+- 调用点：`write_plugin_config` 覆盖配置更新、配置迁移、计划/库范围写入；`install`、`set_enabled`、
+  `uninstall`（清配置/卸载）、`install_remote_package`（升级）在现有 `invalidate_scraper_client_cache()`
+  旁清理该插件；上传登录背景图走 `write_plugin_config` 自动覆盖。
+- `FULL_REFRESH`：新增 `ScraperResolver::clear_response_cache()` 清理其 `PluginService` 的响应缓存；
+  `MetadataReidentifyService` 保留原 `self.scraper.clear_response_cache()`，装配了 resolver 时再清
+  resolver 的缓存。未重构装配，`src/api/legacy.rs` 不变。
+- 缓存键格式、TTL、命中语义、插件协议、数据库 schema 均未改变；未改 `Lux-plugins`，未碰 TMDb 选图排序。
+
+验收：
+
+- [x] 单元：同一缓存中放入某插件的多条记录和另一个插件的记录，`clear_provider` 后前者消失、后者保留；
+  持久化文件内容一致，重建缓存后结论相同。
+- [x] 单元：清理插件会丢弃该插件的 in-flight 写入，但不影响另一个插件的 in-flight 写入。
+- [x] 服务层：stub 刮削器从 `LUX_PLUGIN_CONFIG_PATH` 读取 `minWidth`；保存 `1500` 后同参数调用重新走
+  插件（调用日志 1 → 2，宽度 1000 → 1500）。修复前该用例的第二次调用命中 24 小时响应缓存。
+- [x] `FULL_REFRESH`：用 resolver + `unconfigured()` 的真实装配创建并运行完整刷新任务，预热的缓存被清；
+  修复前该用例失败（缓存仍命中），复现真机现象。
+- [x] 现有缓存单测（复用、负缓存、单飞、取消 owner、文件恢复、持久化指标）保持通过。
+
+预计文件：`src/application/provider_cache.rs`、`src/application/scraper.rs`、
+`src/application/plugins.rs`、`src/application/reidentify.rs`、`docs/LUX-DEVELOPMENT.md`、
+`docs/CHANGELOG.md`。
+
+实施结果（2026-11-05，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 验证）：按 TDD 先补测试再实现。
+任务编号接 `LUX-884`。
+
+- `clear_provider` 只删 `"{plugin_id}\n"` 前缀的键；`clear()` 仍用于全量清理（如数据库维护语义）。
+- 配置保存、启停、安装、升级、卸载五条路径均接入；`install_remote_package` 用下载条目的 id 清理，
+  覆盖升级后插件行为变化。
+- `FULL_REFRESH` 的清理发生在 `run` 开头，和原来同一位置，没有改变任务状态机。
+
+验证命令与结果：
+
+- `cargo test --locked --lib provider_cache::` 11/11（含 3 条新增：按插件清理与持久化、清理丢弃本插件
+  in-flight 写入、不影响其他插件 in-flight 写入）。
+- `cargo test --locked --lib plugins::` 13/13（含新增
+  `saving_scraper_config_invalidates_the_plugin_response_cache`）。
+- `cargo test --locked --lib scraper::` 12/12、`cargo test --locked --lib reidentify::` 48/48（含新增
+  `full_refresh_clears_the_resolver_provider_response_cache`）。
+- 修复前失败复现：临时移除 `write_plugin_config` 的清理后，插件配置用例报
+  `left: Some(1000) right: Some(1500)`；临时移除 reidentify 的 resolver 清理后，完整刷新用例报
+  “FULL_REFRESH must drop the responses the resolver clients cached”。两处恢复后均通过。
+- `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+  `python3 scripts/check-backend-branches.py` 通过。
+- 集成测试未新增或改动用例，`docs/TEST-TARGETS.md` 的计数不变；相关分组回归：
+  `cargo test --locked --test plugins plugins::` 12/12、`cargo test --locked --test reidentify` 25/25。
+
+限制与剩余风险：
+
+- 清理是精确到插件 id 的；若某个插件通过别的插件 id 共享缓存（当前协议没有这种用法），不会被连带清理。
+- `unconfigured()` 占位 provider 自己的 `clear_response_cache()` 仍然保留为空实现，真实缓存由 resolver
+  清理；其他把 `unconfigured()` 当刮削器、又没有 resolver 的装配本来就无法刮削，不受影响。
+- in-flight 响应在清理后会被丢弃而不是写回，调用方仍会拿到它，但下一次请求会重新向插件取数。
+- 本机只验证了 stub 插件与 resolver 装配；未在真实 TMDb 插件上复测语言/最小宽度变更后的即时生效。
+
 ## 31. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
