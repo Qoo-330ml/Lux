@@ -111,8 +111,8 @@ Lux 的核心价值不是功能数量，而是：
 - 剧集库和混合库可各自选择一个已安装、已启用且可用的片头片尾数据源；未选择表示不为该库生成或输出片头片尾标记。
   片头片尾数据源必须声明 chapters.detect 或 chapters.lookup；电影库不能选择该来源。混合库只对其中的剧集/分集参与检测。
 - 管理员可在“全局策略”中设置媒体库的默认元数据、图像和字幕策略；媒体库可以继承全局默认值，也可以单独覆盖。
-- 全局图像策略包括海报、背景图（FANART/backdrop）、艺术图（Emby `Art`）、横幅图、徽标、缩略图、光盘封面、壁纸开关、每项最大背景图数量和最小下载宽度；媒体库可覆盖这些开关。
-- 图像策略支持“层级 × 类型”覆盖：电影、剧集、季度、单集四个层级都可以为每种图片类型单独设置是否抓取、允许来源（在线刮削 / 本地截图）、允许的刮削器角色（主 / 备用 / 补充）、覆盖策略（继承 / 保留 / 仅补缺 / 覆盖）、张数上限和最小宽度；单集另有“在线剧照 / 本地截图 / 都不要”三选一。未设置的字段逐级继承上层默认值。本地已有图片始终优先，任何配置都不能让“仅补全”覆盖本地图片。
+- 全局图像策略包括海报、背景图（FANART/backdrop）、艺术图（Emby `Art`）、横幅图、徽标、缩略图、光盘封面、壁纸开关和每项最大背景图数量；媒体库可覆盖这些开关。图片最小宽度不再由主程序设置，改由刮削器插件按图片类型负责（LUX-884）。
+- 图像策略支持“层级 × 类型”覆盖：电影、剧集、季度、单集四个层级都可以为每种图片类型单独设置是否抓取、允许来源（在线刮削 / 本地截图）、允许的刮削器角色（主 / 备用 / 补充）、覆盖策略（继承 / 保留 / 仅补缺 / 覆盖）和张数上限；单集另有“在线剧照 / 本地截图 / 都不要”三选一。未设置的字段逐级继承上层默认值。本地已有图片始终优先，任何配置都不能让“仅补全”覆盖本地图片。
 - 全局策略支持保守的存储预估，并明确应用范围：仅新内容、刷新选中内容或后台刷新全部内容；全局刮削可选择仅补全或完整刮削，批量刷新必须进入任务队列。
 - 不在用户请求路径中扫描目录、读取 NFO、调用 ffprobe 或访问 TMDb。唯一例外见 3.3：本地媒体源缺少媒体信息（`PENDING`）时，首次 `PlaybackInfo` 允许同步执行一次单源 `ffprobe`。
 
@@ -3093,7 +3093,9 @@ SQLite 0225 / PostgreSQL 0227 增加 `merge_suppressions`：手动拆分时把�
 - `backdrop` 开关控制 FANART 下载；`artwork` 只控制 Emby `Art`。关闭“艺术图”不再被误解为关闭背景图。
 - 覆盖策略与任务模式取更保守的一方：仅补全永不覆盖本地图片；`OVERWRITE` 只在完整刮削生效。
 - `maxBackdropCount` / 每格 `maxCount` 真正限制多图类型下载张数，0 表示不下载；上限 4 张。
-- 每格 `minWidth` 在候选入库前过滤低于阈值的上游图片；上游无宽度信息时保留。
+- ~~每格 `minWidth` 在候选入库前过滤低于阈值的上游图片~~ 已由 LUX-884 移除：全局 `minDownloadWidth`
+  与每格 `minWidth` 都不再存在，候选图不按上游宽度过滤（宽度选择归刮削器插件）；旧设置里的这两个键
+  仍能加载并被忽略。
 - 每格 `scraperRoles` 按条目所属媒体库的刮削器角色过滤；角色未知时保持原有放行行为。
 - 单集三选一分别控制在线剧照、ffmpeg 截图与两者都不要。
 - Web 全局策略与媒体库覆盖面板提供同一矩阵编辑器，未设置项显示“继承”并在清空后自动剪枝；
@@ -19709,6 +19711,75 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
 预计文件：`src/application/scanner/names.rs`、`src/application/scanner/library.rs`、`src/application/scanner/library/prepare.rs`、`src/application/scanner/tests.rs`、本文档。
 
 验证：`cargo test --locked --lib application::scanner` 76 passed；fmt 通过。限制：已被旧版本拆成多部"剧"的库需重扫才能并回，未验证迁移路径；未跑 all-targets/clippy。
+
+#### LUX-884：移除主程序的“最小下载宽度”设置
+
+背景：图片最小宽度此前由 Lux 主程序统一配置（全局 `images.minDownloadWidth` 和每层每格的
+`minWidth`），并在候选图入库前按上游报告的宽度丢弃过小的图。插件协议已经能让刮削器按自己的图片
+类型分别决定尺寸与选图（TMDb 等插件端负责），同一套阈值放在主程序既重复又无法表达各来源的差异，
+因此把这项设置和宽度过滤从主程序移除。
+
+移除内容：
+
+- 设置模型：删除 `MediaImageStrategySettings.min_download_width`、
+  `ArtworkPolicySettings.min_width`（改为只接收、不输出的 `legacy_min_width` 兼容字段）、
+  对应的默认值与 `0..=8192` 校验。
+- 候选图：`ImageSelectionPolicy` / `ImageTypePolicy` 与候选 JSON 解析结构不再携带宽度；
+  `filtered_candidate_images` 改为只按类型归并的 `candidate_images_by_type`，任何上游宽度的候选 URL
+  都会入库；顺带删除只为宽度过滤服务的媒体库策略查询。
+- Web：全局策略、媒体库覆盖与分层矩阵不再提供“最小下载宽度/最小宽度”控件，`MediaArtworkPolicySettings`
+  与 `MediaImageStrategySettings` 类型同步删除该字段，预设里不再有宽度档位。
+- Emby：`LibraryOptions.TypeOptions[].ImageOptions[].MinWidth` 保留，值固定为 `0`。
+
+兼容性处理：
+
+- 已保存的设置 JSON 里仍可能有 `minDownloadWidth` / `minWidth`（全局、媒体库覆盖、层级覆盖）。主程序的
+  设置结构不 `deny_unknown_fields`，这两个键按普通未知字段忽略；`ArtworkPolicySettings` 是
+  `deny_unknown_fields`，因此保留了一个只反序列化、不序列化的 `legacy_min_width` 字段，避免旧设置整份
+  解析失败（那会让全局策略退回默认值、媒体库覆盖退回全局值）。
+- 旧版 Web 页面或脚本提交带这些键的设置请求仍返回成功，键被忽略；下一次保存后它们自然消失。
+- 不需要数据库迁移：`media_strategy` 仍是同一列上的 JSON。
+
+验收：
+
+- [x] 带 `minDownloadWidth` / `minWidth` 的旧 JSON 能加载，`validate_media_strategy` 通过（包括旧的越界值
+      8193），序列化结果不再包含这两个键，同格其他字段保持不变。
+- [x] 低宽度（如 640px 海报、1280px 背景图）候选不再被丢弃，电影与单集宿主都保留全部 URL；按类型归并
+      与“单集剧照不扩散到其他背景图类型”的既有行为不变。
+- [x] Emby `ImageOptions` 仍包含 `MinWidth` 且值为 `0`（单测 + `--test admin admin_api_key::` 集成断言）。
+- [x] Web 全局策略、媒体库覆盖和分层矩阵不再出现宽度控件或文案，相关组件测试通过。
+- [x] 未新增依赖、migration 或配置项；未改插件协议与媒体流分辨率分档逻辑。
+
+预计文件：`src/application/settings.rs`、`src/application/candidates.rs`、`src/api/emby_catalog.rs`、
+`web/src/features/admin/AdminLibrariesPage.tsx`、`web/src/features/admin/ImageLevelPolicyEditor.tsx`、
+`web/src/features/admin/image-policy-presets.ts`、`web/src/lib/api/types.ts`、相关测试与
+`docs/CHANGELOG.md`、`docs/API.md`、`docs/COMPATIBILITY.md`。
+
+实施结果（2026-11-05，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 验证）：按 TDD 分三个提交——
+设置模型与 Emby 输出、候选图宽度过滤、Web 与文档。任务编号用 `LUX-884`：基线上 `LUX-883` 已被
+“`Season N <标签>` 季目录合并”占用（本任务接到的说明里最大编号是 `LUX-882`）。
+
+- 兼容字段：`ArtworkPolicySettings` 的 `legacy_min_width`（`rename = "minWidth"`、`skip_serializing`）
+  只用于反序列化；全局 `images.minDownloadWidth` 因该结构不 `deny_unknown_fields` 直接按未知字段忽略。
+- Emby 值用常量 `EMBY_IMAGE_OPTION_MIN_WIDTH: i64 = 0`，没有改 `emby_video_resolution_label` 的分档。
+- 删除只为宽度过滤服务的 `candidate_image_policy_for` 后，候选搜索少一次条目媒体策略查询；不涉及迁移。
+
+验证命令与结果：
+
+- `cargo test --locked --lib application::settings` 12/12、`--lib candidates::` 40/40、
+  `--lib api::legacy::emby_catalog` 44/44（含新增的 `image_options_keep_min_width_at_zero_for_emby_clients`）。
+- `cargo test --locked --test auth_users resume_favorites::` 6/6、`--test library libraries_api::` 14/14、
+  `--test admin admin_api_key::` 4/4、`--test metadata metadata_selection::` 39/39、
+  `--test emby` 41/41、`--test images image_writer::` 20/20。
+- `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+  `python3 scripts/check-backend-branches.py`、`python3 scripts/check-migration-parity.py` 通过。
+- Web：`tsc --noEmit`、`vite build`（含 `scripts/build-web.mjs` 预压缩）、`vitest run`
+  （165 文件 / 1501 用例）、`node --test tests/*.test.mjs`（165 用例）通过。本机 `pnpm` 是
+  `npx -y pnpm` 包装脚本、无网络时会挂起，因此用 `web/node_modules/.bin` 下的同一套工具执行。
+
+限制与剩余风险：旧设置里的宽度值会被静默丢弃（不提示管理员），已在 `docs/CHANGELOG.md` 与本文档说明；
+没有为 `minDownloadWidth` 保留只读字段，因此极老的第三方客户端若依赖响应回传该键，会看到它消失（Emby
+的 `MinWidth` 不受影响）；未在真实第三方 Emby 客户端上复测 `MinWidth: 0`。
 
 ## 31. 参考资料
 

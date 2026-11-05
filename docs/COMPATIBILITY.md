@@ -1,5 +1,20 @@
 # Lux 客户端兼容性矩阵
 
+## LUX-884 移除服务端最小下载宽度（2026-11-05）
+
+- 行为变化：候选图不再按上游报告的宽度过滤，宽度选择完全由刮削器插件负责。主程序设置里不再有全局
+  `images.minDownloadWidth` 与层级单元格的 `minWidth`。
+- 设置兼容：旧设置 JSON 里的这两个键仍能读取并被忽略，下一次保存后消失。`ArtworkPolicySettings`
+  使用 `deny_unknown_fields`，为此保留了只反序列化、不序列化的 `legacy_min_width`，否则旧设置会整份
+  解析失败（全局策略退回默认值、媒体库覆盖退回全局值）。旧版 Web 页面或脚本提交带这些键的请求仍然成功。
+- Emby 兼容：`GET /Library/VirtualFolders` 及其 `/emby` 别名返回的
+  `LibraryOptions.TypeOptions[].ImageOptions[].MinWidth` 仍然存在，值固定为 `0`；本任务不改动媒体流
+  分辨率分档（`emby_video_resolution_label`）与插件协议。
+- 不需要数据库迁移：`media_strategy` 仍是同一列上的 JSON。
+- 未验证：未在真实第三方 Emby 客户端上复测 `MinWidth: 0` 的显示或抓图行为，只用 `emby_catalog`
+  单测与 `--test admin admin_api_key::` 覆盖响应形状；旧设置的实际升级路径用单测与
+  `--test auth_users resume_favorites::` 覆盖。
+
 ## LUX-878 Emby MediaStream 显示字段与 Hills 读取行为（2026-11-03）
 
 来源：对 Hills 1.8.0（`com.mountains.hills`，Flutter release AOT，已混淆）的只读静态逆向分析，以及在
