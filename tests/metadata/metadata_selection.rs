@@ -286,6 +286,50 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
 }
 
 #[tokio::test]
+async fn empty_typed_image_map_falls_back_to_candidate_poster_url()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Online Title",
+            "productionYear": 2020,
+            "posterUrl": format!("{image_url}/poster"),
+            "backdropUrl": format!("{image_url}/fanart"),
+            "images": {}
+        }),
+    )
+    .await?;
+
+    let selection = MetadataSelectionService::with_config_dir(
+        fixture.database.clone(),
+        ImageWriteService::with_config_and_config_dir(
+            fixture.database.clone(),
+            local_image_config(),
+            fixture.config.config_dir.clone(),
+        )?,
+        fixture.config.config_dir.clone(),
+    );
+    let report = selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::FillMissing,
+        )
+        .await?;
+
+    assert!(report.image_types.contains(&"POSTER"));
+    assert_eq!(
+        tokio::fs::read(fixture.movie_dir.join("poster.png")).await?,
+        PNG_1X1
+    );
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn metadata_selection_refreshes_cached_catalog_and_home_images()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(false).await?;

@@ -1160,7 +1160,17 @@ impl MetadataCandidateService {
                     .as_ref()
                     .is_some_and(|response| response.images.is_empty())
                 && let Err(error) = self
-                    .record_explicitly_unavailable_images(item_id, scraper, &provider_id)
+                    .record_explicitly_unavailable_images(
+                        item_id,
+                        scraper,
+                        &provider_id,
+                        details
+                            .as_ref()
+                            .and_then(|value| value.poster_url.as_deref()),
+                        details
+                            .as_ref()
+                            .and_then(|value| value.backdrop_url.as_deref()),
+                    )
                     .await
             {
                 self.record_capability_writes(item_id, &capability_writes)
@@ -1558,8 +1568,14 @@ impl MetadataCandidateService {
                 .as_ref()
                 .is_some_and(|response| response.images.is_empty())
             {
-                self.record_explicitly_unavailable_images(item_id, scraper, &parent.provider_id)
-                    .await?;
+                self.record_explicitly_unavailable_images(
+                    item_id,
+                    scraper,
+                    &parent.provider_id,
+                    metadata.poster_url.as_deref(),
+                    metadata.backdrop_url.as_deref(),
+                )
+                .await?;
             }
             let images = images_response.unwrap_or_default();
             let title = metadata
@@ -1787,7 +1803,13 @@ impl MetadataCandidateService {
         item_id: &str,
         scraper: &ScraperProvider,
         provider_id: &str,
+        poster_url: Option<&str>,
+        backdrop_url: Option<&str>,
     ) -> Result<(), MetadataCandidateError> {
+        let image_types = explicitly_unavailable_image_types(poster_url, backdrop_url);
+        if image_types.is_empty() {
+            return Ok(());
+        }
         let sources = [
             scraper.plugin_id().unwrap_or(scraper.provider_key()),
             scraper.provider_key(),
@@ -1800,11 +1822,11 @@ impl MetadataCandidateService {
             .ok()
             .and_then(|duration| i64::try_from(duration.as_secs()).ok())
             .unwrap_or_default();
-        let mut candidate_keys = Vec::with_capacity(sources.len() * SCRAPER_IMAGE_TYPES.len());
+        let mut candidate_keys = Vec::with_capacity(sources.len() * image_types.len());
         for source in &sources {
-            for image_type in SCRAPER_IMAGE_TYPES {
+            for image_type in &image_types {
                 candidate_keys.push((
-                    image_type,
+                    *image_type,
                     image_no_candidate_key(source, image_type, provider_id),
                 ));
             }
@@ -1821,6 +1843,31 @@ impl MetadataCandidateService {
             .await
             .map_err(MetadataCandidateError::Storage)
     }
+}
+
+/// Image types an empty typed-image response may mark as unavailable for good.
+///
+/// An empty `metadata.images` result only means the provider has no *typed* image entries. When
+/// the same response's metadata payload still carries a poster or backdrop URL, that artwork is
+/// not missing: the candidate keeps the URL and Lux downloads it as a fallback. Recording
+/// `NO_IMAGE` for those types would drop the artwork and make every later fill-missing run skip
+/// the item, because the missing image is treated as settled.
+fn explicitly_unavailable_image_types(
+    poster_url: Option<&str>,
+    backdrop_url: Option<&str>,
+) -> Vec<&'static str> {
+    let has_poster = poster_url.is_some_and(|url| !url.trim().is_empty());
+    let has_backdrop = backdrop_url.is_some_and(|url| !url.trim().is_empty());
+    SCRAPER_IMAGE_TYPES
+        .into_iter()
+        .filter(|image_type| match *image_type {
+            // `Primary` typed images feed both POSTER and DISC, so a poster URL covers both.
+            "POSTER" | "DISC" => !has_poster,
+            // `Backdrop` typed images feed FANART/THUMB/BANNER/ART/WALLPAPER.
+            "FANART" | "THUMB" | "BANNER" | "ART" | "WALLPAPER" => !has_backdrop,
+            _ => true,
+        })
+        .collect()
 }
 
 struct CandidateMetadata {
@@ -3435,29 +3482,39 @@ impl MetadataSelectionService {
                     }
                 }
             }
-        } else {
-            if let Some(url) = payload.poster_url.clone() {
-                add_spec!("POSTER", vec![url]);
-            }
-            if let Some(url) = payload.fanart_url.clone()
-                && scraper_allowed("FANART")
-                && episode_still_allowed
-                && !screenshot_fallback_types.contains("FANART")
-            {
-                let max_count = max_count_for("FANART");
-                if supplemental {
-                    let mut urls = self
-                        .filter_new_supplemental_image_urls(item_id, "FANART", vec![url])
-                        .await?;
-                    if let Some(url) = urls.pop() {
-                        let start = self.images.next_image_index(item_id, "FANART").await?;
-                        if usize::try_from(start).unwrap_or(usize::MAX) < max_count {
-                            specs.push(("FANART", vec![url], start));
-                        }
+        }
+        // Typed images are authoritative only for the types they actually carry. A provider can
+        // return an empty or partial image map (no image in the requested language, a failed
+        // images call, or a scraper that only fills the legacy poster/backdrop fields) while the
+        // metadata payload still carries a poster or backdrop URL, so fall back per missing type
+        // instead of dropping artwork the provider already supplied.
+        let poster_is_typed = specs.iter().any(|(kind, _, _)| *kind == "POSTER");
+        if !poster_is_typed
+            && max_count_for("POSTER") > 0
+            && let Some(url) = payload.poster_url.clone()
+        {
+            add_spec!("POSTER", vec![url]);
+        }
+        let fanart_is_typed = specs.iter().any(|(kind, _, _)| *kind == "FANART");
+        if !fanart_is_typed
+            && let Some(url) = payload.fanart_url.clone()
+            && scraper_allowed("FANART")
+            && episode_still_allowed
+            && !screenshot_fallback_types.contains("FANART")
+        {
+            let max_count = max_count_for("FANART");
+            if supplemental {
+                let mut urls = self
+                    .filter_new_supplemental_image_urls(item_id, "FANART", vec![url])
+                    .await?;
+                if let Some(url) = urls.pop() {
+                    let start = self.images.next_image_index(item_id, "FANART").await?;
+                    if usize::try_from(start).unwrap_or(usize::MAX) < max_count {
+                        specs.push(("FANART", vec![url], start));
                     }
-                } else if max_count > 0 {
-                    specs.push(("FANART", vec![url], 0));
                 }
+            } else if max_count > 0 {
+                specs.push(("FANART", vec![url], 0));
             }
         }
         let item_permits = Arc::new(Semaphore::new(IMAGE_ITEM_CONCURRENCY));
@@ -5275,11 +5332,11 @@ mod tests {
         MetadataSelectionMode, MetadataSelectionService, SCRAPER_IMAGE_TYPES, ScraperRoles,
         SelectionInputs, candidate_actor_credits, candidate_actors, candidate_payload,
         capability_needs_request, completeness_capabilities, credits_need_actor_relation_check,
-        default_image_selection_policy, enrich_actor_metadata, filtered_candidate_images,
-        generic_candidate_actors, generic_candidate_images, image_attempt_identities,
-        local_metadata_completeness_plan, merge_actor_values, merge_supplemental_movie_nfo,
-        metadata_completeness_fingerprint, metadata_match_score, metadata_request_plan,
-        metadata_request_plan_has_work, parse_image_selection_policy,
+        default_image_selection_policy, enrich_actor_metadata, explicitly_unavailable_image_types,
+        filtered_candidate_images, generic_candidate_actors, generic_candidate_images,
+        image_attempt_identities, local_metadata_completeness_plan, merge_actor_values,
+        merge_supplemental_movie_nfo, metadata_completeness_fingerprint, metadata_match_score,
+        metadata_request_plan, metadata_request_plan_has_work, parse_image_selection_policy,
         replace_provider_id_with_candidate, run_bounded_completeness_plan_tasks,
         selected_scraper_provider_id,
     };
@@ -6148,6 +6205,45 @@ mod tests {
         );
         assert!(!images.contains_key("THUMB"));
         assert!(!images.contains_key("BANNER"));
+    }
+
+    #[test]
+    fn empty_typed_images_only_settle_types_without_a_fallback_url() {
+        // The provider returned nothing at all: every scraper image type stays settled.
+        assert_eq!(
+            explicitly_unavailable_image_types(None, None),
+            SCRAPER_IMAGE_TYPES.to_vec()
+        );
+        // A poster URL keeps the poster-derived types requestable.
+        let with_poster =
+            explicitly_unavailable_image_types(Some("https://example.invalid/poster.jpg"), None);
+        assert!(!with_poster.contains(&"POSTER"));
+        assert!(!with_poster.contains(&"DISC"));
+        assert!(with_poster.contains(&"FANART"));
+        assert!(with_poster.contains(&"LOGO"));
+        // A backdrop URL keeps every backdrop-derived type requestable.
+        let with_backdrop =
+            explicitly_unavailable_image_types(None, Some("https://example.invalid/backdrop.jpg"));
+        for image_type in ["FANART", "THUMB", "BANNER", "ART", "WALLPAPER"] {
+            assert!(
+                !with_backdrop.contains(&image_type),
+                "{image_type} should stay requestable"
+            );
+        }
+        assert!(with_backdrop.contains(&"POSTER"));
+        // Blank URLs are not artwork.
+        assert_eq!(
+            explicitly_unavailable_image_types(Some("  "), Some("")),
+            SCRAPER_IMAGE_TYPES.to_vec()
+        );
+        // Both URLs present: only LOGO has no metadata fallback.
+        assert_eq!(
+            explicitly_unavailable_image_types(
+                Some("https://example.invalid/poster.jpg"),
+                Some("https://example.invalid/backdrop.jpg")
+            ),
+            vec!["LOGO"]
+        );
     }
 
     #[test]
