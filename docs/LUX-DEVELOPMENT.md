@@ -3679,7 +3679,7 @@ Web 侧 `node --test tests/*.test.mjs`（150 项）、`vitest run`（861 项，�
 - [x] 本地视频在扫描完成后的后台阶段从默认 `00:03:01` 画面生成独立的 `POSTER`（2:3）和 `THUMB`（16:9），分别通过现有图片接口提供。
 - [x] 同一逻辑媒体项优先使用默认本地来源；已有有效本地图片和刮削器图片不被截图覆盖；缺少或失效的登记路径可以重建。
 - [x] 截图使用低优先级 `FFMPEG` 回退来源：没有选择刮削器、刮削器没有返回对应图片或截图先完成时，保留截图；刮削器后来获得对应图片时可以替换截图回退图；截图不能替换已经存在的非回退图片。
-- [x] `POSTER` 和 `THUMB` 独立判断：刮削器只返回其中一种图片时，另一种可以单独由截图补全；两种图片不共享登记路径。
+- [x] `POSTER` 和 `THUMB` 独立判断：刮削器只返回其中一种图片时，另一种可以单独由截图补全；两种图片不共享登记路径。LUX-887 起该规则覆盖同一媒体的所有图片行：同类型的不同索引（如 `FANART/1` 与 `FANART/4`）也不共享登记路径。
 - [x] `STRM_URL` 不进入候选查询或 ffmpeg 参数；纯 `.strm` 条目不会生成缩略图。
 - [x] ffmpeg 使用参数数组、路径根目录约束、原子输出和超时控制；单个文件失败不导致扫描任务失败。
 - [x] 扫描任务事件记录缩略图阶段的完成/失败计数；容器重启取消未完成任务后，下一次扫描仍可重试缺失项。
@@ -19914,6 +19914,97 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
   只记 warn，内存清理仍生效，但若紧接着重启进程，磁盘上可能仍是旧文件，旧条目会被读回，需要等下一次
   成功持久化。
 - 本机只验证了 stub 插件与 resolver 装配；未在真实 TMDb 插件上复测语言/最小宽度变更后的即时生效。
+
+#### LUX-887：图片写入的路径冲突检测与索引一致性（同类型多索引不再共用一个文件）
+
+背景：真机调查（调查者已在本地复现）发现同一条目的两个图片行指向同一个物理文件，旧行的
+`contentTag`/`fileSize` 与文件内容不符，图片缓存与 ETag 随之失效。原因是三层叠加：
+
+1. 写入侧只查 `…-fanart-{k}`、`…-backdrop{k}` 这类旧名，不查扫描侧认可的 `fanart{k}`，带索引的旁车永远
+   不会被复用，每次刷新另建 `{movie_stem}-backdrop{k}.<ext>`，原来的 `fanart{k}.jpg` 变成孤儿。
+2. `next_local_image_index` 每批从 0 重新发号，不看库里已有索引；重扫把孤儿旁车塞回 `FANART/1..n`，把上一
+   轮写入的文件挤到更高的索引。
+3. 真正的漏洞：写入的冲突检测只收集**其它类型**的行（`blocked_paths` 的
+   `filter(|image| !image.image_type.eq_ignore_ascii_case(image_type))`），`FANART/1` 的写入因此可以合法落
+   到 `FANART/4` 正在引用的 `-backdrop1.png`，写完只更新 `(FANART,1)`，`FANART/4` 保留旧 tag。数据库只有
+   `UNIQUE (item_id, image_type, image_index)`，`local_path` 没有约束，登记 upsert 也不检测路径冲突。
+
+实现：
+
+- 冲突检测覆盖同类型：`download_item_image_impl` 改用 `blocked_image_paths`，收集除本行（同 type 同 index）
+  以外**所有**行的路径。写 `FANART/1` 时 `FANART/4` 的文件被挡住；本行上一次的路径仍可复用，重复刷新不会
+  误判或重下。
+- 写入侧复用扫描命名（选 2a：只扩展写入/查找的命名集合，不改扫描侧命名）。`image_lookup_stems` 为 FANART
+  索引 k 增加 `fanart{k}` 与 `{movie_stem}-fanart{k}`；`image_target` 改用
+  `find_existing_image_paths`（按 stem 优先序列出全部候选）并跳过被其它行占用的路径，因此盘上已有的
+  `fanart2.jpg` 会被 `FANART/2` 直接复用；只有该索引的所有已知名字都被占用时，才新建文件（而不是返回
+  `ConcurrentModification`）。episode 的 `{episode_stem}-fanart{k}` 命名、`is_legacy_episode_fanart_path`
+  与历史 `…-thumb{k}` 兼容语义保持不变；写侧默认命名仍是 `backdrop{k}`，外部读取方看到的文件名不变。
+- 读取侧对齐：`image_path_is_owned_by_other_row` 取代 `image_path_is_owned_by_other_type`，把「同类型其它
+  索引」也算作别人的行；`local_image_exists_at_index` 与 `local_image_types_impl` 都传入索引。索引 k 不会
+  因为邻居索引登记的文件而误判「已有图」。`fallback_image_types` 只判断索引 0 的回退行与文件是否存在，
+  语义不变。
+- 索引分配避开已占用索引：`next_local_image_index` 改为「同一路径已登记的索引优先（重扫不换号），否则取
+  最小空闲索引」，并按 (type, index) 与其它路径比对；`prepare_local_image_batch_item`、
+  `prepare_scan_local_movie_image_batch_item` 和文件变化登记共用该分配器。电影扫描页为此每页多读一次
+  `list_item_images_by_ids`（`enrich_movie_library` 的语句数 2 → 3）。
+- 登记兜底：`insert_item_images_batch_at_indices` 在同一事务内用 `NOT EXISTS` 跳过「`local_path` 已属于同
+  条目其它行」的记录，并在 Rust 侧丢弃同一页里重复路径的后一条；语句数不变，未加唯一约束、未加迁移。
+- 未改 `candidates.rs` 的类型映射与 DISC 逻辑、未改插件与 Web、未做存量脏数据的一次性修复。
+
+验收：
+
+- [x] 两轮刷新 + 中间重扫（本地 HTTP stub：2 张海报候选、4 张背景、1 个 logo；本地旁车
+      `poster/disc/logo/fanart/fanart1..3/thumb/banner/art/wallpaper`）：修复后任意两行不共享 `local_path`，
+      每行 `content_tag` 等于文件内容的 SHA-256；FANART 行数保持 4（索引 0..3）。
+- [x] 写入侧复用：刷新 `FANART/{1,2,3}` 后不再出现 `Example.Movie.2020-backdrop{1,2,3}.*`，三行仍指向
+      `fanart{1,2,3}.jpg`。
+- [x] 单元：同类型 index A 占用路径 P 时写 index B 不落到 P（`image_target` 与 `ImageWriteService` 两层各
+      一条），写 index A 自己可复用 P。
+- [x] 单元：盘上有 `fanart2.jpg` 时写 `FANART/2` 复用它；`fanart2.jpg` 已被别的行占用时不复用。
+- [x] 单元：`next_local_image_index` 在库里已有 0..3 时不再发出 0..3，已登记同一路径的文件保留原索引。
+- [x] 登记层：同一页里重复的 `local_path` 只登记一次；路径已被其它行占用时跳过而不是改号。
+- [x] 回归：ART/BANNER/THUMB/WALLPAPER 用同一个上游 URL 时仍落成四个独立文件与四行登记
+      （`artwork_types_fed_by_one_source_write_distinct_files`）、episode 的 THUMB/FANART 隔离、
+      `image_repairs` 现有用例保持通过。
+
+预计文件：`src/application/images.rs`、`src/application/metadata.rs`、`src/storage/catalog.rs`、
+`src/storage/repository_tests.rs`、`tests/metadata/metadata_selection.rs`、`docs/LUX-DEVELOPMENT.md`、
+`docs/CHANGELOG.md`、`docs/TEST-TARGETS.md`。
+
+实施结果（2026-11-05，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 验证）：按 TDD 先写失败用例
+（`rescan_between_image_refreshes_keeps_indexes_on_their_own_files` 在修复前报
+`FANART/1 should stay on fanart1.jpg, got …-backdrop1.png`），再实现到全绿。任务编号接 `LUX-885`（并行任务
+取 `LUX-886`）。
+
+验证命令与结果：
+
+- `cargo test --locked --lib`：1951 通过 / 40 跳过（`#[ignore]` 含 PostgreSQL 用例）/ 2 条既有偶发失败
+  （`probe` 与 `watch` 各一条，与图片无关，单独重跑均通过）；含新增 5 条库内用例：图片写入冲突、旁车复用、
+  服务层同类型隔离、索引分配、登记跳过。
+- `cargo test --locked --lib images::` 35/35、`--lib metadata::` 35/35、`--lib candidates::` 44/44、
+  `--lib image_repairs::` 1/1（`candidates` 仅确认未被牵连）。
+- `cargo test --locked --test images` 66/66（新增 1 条同源异文件回归）、`cargo test --locked --test metadata`
+  151/151（`metadata_selection` 新增 1 条）。
+- `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+  `python3 scripts/check-backend-branches.py`、`python3 scripts/check-migration-parity.py` 通过。
+
+限制与剩余风险：
+
+- **已经存在的共用路径脏数据不会自动修复**：本次只保证新的写入、重扫与登记不再制造或扩大共用路径。库里已经
+  有两行指向同一文件时，重扫会把该文件登记到其中最小索引（另一行保留旧 tag），要彻底清理需要单独的一次性
+  修复任务（评估后另行处理，本次不做）。`image_repairs` 的 episode THUMB/FANART 修复范围也未扩大。
+- 数据库允许「一行的 `local_path` 与非同类型另一行相同」的历史数据继续存在；登记层只跳过**新**写入的重复
+  路径，不改已有行。未加唯一约束（按要求不改 schema）。
+- 写入侧优先复用扫描认可的 `fanart{k}` 会把在线图片内容写进 `.jpg` 扩展名的旁车（索引 0 早已如此）；这是既有
+  行为，本次没有统一扩展名。副作用是「完整刷新」现在会**覆盖**用户放在 `fanart2.jpg` 这类带索引旁车里的文件
+  （修复前这类旁车会被当成孤儿留下，刷新另建 `-backdrop{k}`）；这是让「索引 k ↔ 文件名」成立所必需的，但
+  用户自定义的多背景图会被在线图替换，需要保留时请关闭对应类型的覆盖策略。
+- `insert_item_images_batch_at_indices` 的新 SQL 用 `WITH … VALUES … INSERT … SELECT … WHERE NOT EXISTS`
+  （SQLite 与 PostgreSQL 共用）；本机只跑了 SQLite，PostgreSQL 用例按仓库惯例需要本地实例，未执行。
+- 电影扫描每页多一次 `list_item_images_by_ids` 读取（有索引、每页最多 16 项）；`enrich_movie_library` 的语句数
+  2 → 3，已同步更新对应单测断言。
+- 未在真实 TMDb 刮削与第三方 Emby 客户端上复测图片刷新后的 ETag/cache 行为，只用 stub 与集成用例覆盖。
 
 ## 31. 参考资料
 

@@ -10,6 +10,7 @@ use crate::common::{TestScraper, TestScraperConfig};
 use axum::{
     Json, Router,
     body::Body,
+    extract::Path as AxumPath,
     extract::State as AxumState,
     http::{Request, StatusCode},
     response::{IntoResponse, Response},
@@ -887,6 +888,176 @@ async fn supplemental_selection_appends_multiple_backdrops_after_main_image()
 
     let nfo = tokio::fs::read_to_string(fixture.movie_dir.join("movie.nfo")).await?;
     assert!(nfo.contains("<title>主来源标题</title>"));
+    image_server.abort();
+    Ok(())
+}
+
+/// LUX-887: two refreshes with a rescan in between must never make two image rows of one item
+/// share a file. Regression: the rescan moved a downloaded `-backdrop` file to another index and
+/// the next refresh reused it under a second index, leaving the first row's content tag stale.
+#[tokio::test]
+async fn rescan_between_image_refreshes_keeps_indexes_on_their_own_files()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Example Movie (2020)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    // Two media files force the media-prefixed image names the bug report describes.
+    tokio::fs::write(movie_dir.join("Example.Movie.2020.mkv"), b"fixture").await?;
+    tokio::fs::write(movie_dir.join("Companion.Movie.2021.mkv"), b"fixture").await?;
+    for sidecar in [
+        "poster.jpg",
+        "disc.jpg",
+        "logo.jpg",
+        "fanart.jpg",
+        "fanart1.jpg",
+        "fanart2.jpg",
+        "fanart3.jpg",
+        "thumb.jpg",
+        "banner.jpg",
+        "art.jpg",
+        "wallpaper.jpg",
+    ] {
+        tokio::fs::write(
+            movie_dir.join(sidecar),
+            format!("local-{sidecar}").as_bytes(),
+        )
+        .await?;
+    }
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let enricher = MetadataEnricher::new(database.clone());
+    enricher.enrich_movie_library(library.id).await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT ms.item_id
+         FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path LIKE '%Example.Movie.2020.mkv'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+
+    let (image_url, image_server) = start_varied_image_stub().await?;
+    let selection = MetadataSelectionService::new(
+        database.clone(),
+        ImageWriteService::with_config(database.clone(), local_image_config())?,
+    );
+    let refresh = |round: &'static str| {
+        let image_url = image_url.clone();
+        json!({
+            "title": format!("Refresh {round}"),
+            "images": {
+                "POSTER": [
+                    format!("{image_url}/{round}-poster-a"),
+                    format!("{image_url}/{round}-poster-b")
+                ],
+                "FANART": [
+                    format!("{image_url}/{round}-fanart-0"),
+                    format!("{image_url}/{round}-fanart-1"),
+                    format!("{image_url}/{round}-fanart-2"),
+                    format!("{image_url}/{round}-fanart-3")
+                ],
+                "LOGO": [format!("{image_url}/{round}-logo")]
+            }
+        })
+    };
+
+    let first_candidate = insert_candidate(&database, &item_id, refresh("first")).await?;
+    let first_report = selection
+        .select(
+            &item_id,
+            &first_candidate,
+            MetadataSelectionMode::RefreshUnlocked,
+        )
+        .await?;
+    assert!(first_report.image_types.contains(&"FANART"));
+    // The scanning-approved `fanart{k}` sidecars must be reused instead of a fresh `-backdrop{k}`.
+    for image_index in 1..=3 {
+        for extension in ["jpg", "png", "webp"] {
+            assert!(
+                !movie_dir
+                    .join(format!(
+                        "Example.Movie.2020-backdrop{image_index}.{extension}"
+                    ))
+                    .exists(),
+                "FANART/{image_index} must reuse fanart{image_index}.jpg instead of a new file"
+            );
+        }
+        let path: String = sqlx::query_scalar(
+            "SELECT local_path FROM item_images
+             WHERE item_id = ? AND image_type = 'FANART' AND image_index = ?",
+        )
+        .bind(&item_id)
+        .bind(image_index)
+        .fetch_one(database.pool())
+        .await?;
+        assert!(
+            path.ends_with(&format!("fanart{image_index}.jpg")),
+            "FANART/{image_index} should stay on fanart{image_index}.jpg, got {path}"
+        );
+    }
+
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    enricher.enrich_movie_library(library.id).await?;
+
+    let second_candidate = insert_candidate(&database, &item_id, refresh("second")).await?;
+    selection
+        .select(
+            &item_id,
+            &second_candidate,
+            MetadataSelectionMode::RefreshUnlocked,
+        )
+        .await?;
+
+    let rows: Vec<(String, i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT image_type, image_index, local_path, content_tag
+         FROM item_images
+         WHERE item_id = ?
+         ORDER BY local_path, image_type, image_index",
+    )
+    .bind(&item_id)
+    .fetch_all(database.pool())
+    .await?;
+    for pair in rows.windows(2) {
+        assert_ne!(
+            pair[0].2, pair[1].2,
+            "{}:{} and {}:{} share the registered path {}",
+            pair[0].0, pair[0].1, pair[1].0, pair[1].1, pair[0].2
+        );
+    }
+    let fanart_count = rows
+        .iter()
+        .filter(|(image_type, ..)| image_type == "FANART")
+        .count();
+    assert_eq!(
+        fanart_count, 4,
+        "the local fanart sidecars must stay registered at indexes 0..3"
+    );
+    for (image_type, image_index, path, content_tag) in &rows {
+        let bytes = tokio::fs::read(path).await?;
+        let expected = format!("{:x}", Sha256::digest(&bytes));
+        assert_eq!(
+            content_tag.as_deref(),
+            Some(expected.as_str()),
+            "{image_type}/{image_index} at {path} keeps a stale content tag"
+        );
+    }
+
     image_server.abort();
     Ok(())
 }
@@ -3508,6 +3679,30 @@ async fn start_image_stub()
                     .body(Body::empty())
                     .unwrap(),
             }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    Ok((
+        format!("http://{address}"),
+        tokio::spawn(async move { axum::serve(listener, app).await }),
+    ))
+}
+
+/// Serves a different (still valid) PNG payload per request path so a refresh always changes the
+/// file content and therefore its content tag.
+async fn start_varied_image_stub()
+-> Result<(String, tokio::task::JoinHandle<Result<(), std::io::Error>>), Box<dyn std::error::Error>>
+{
+    let app = Router::new().route(
+        "/{name}",
+        get(|AxumPath(name): AxumPath<String>| async move {
+            let mut body = PNG_1X1.to_vec();
+            body.extend_from_slice(name.as_bytes());
+            Response::builder()
+                .header(CONTENT_TYPE, "image/png")
+                .body(Body::from(body))
+                .unwrap()
         }),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
