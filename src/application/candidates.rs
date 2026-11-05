@@ -405,25 +405,6 @@ impl MetadataCandidateService {
         Self { database }
     }
 
-    async fn candidate_image_policy_for(
-        &self,
-        item_id: &str,
-        plan: MetadataRequestPlan,
-    ) -> Result<ImageSelectionPolicy, MetadataCandidateError> {
-        if let Some(policy) = plan.image_policy {
-            return Ok(policy);
-        }
-        let (library, global) = self
-            .database
-            .find_item_media_strategy_settings(item_id)
-            .await?
-            .ok_or(MetadataCandidateError::ItemNotFound)?;
-        Ok(ImageSelectionPolicy::from_json(
-            library.as_deref(),
-            global.as_deref(),
-        ))
-    }
-
     pub async fn list_pending(
         &self,
         offset: i64,
@@ -761,7 +742,6 @@ impl MetadataCandidateService {
             MediaKind::Series => crate::application::scraper::ScraperItemType::Series,
             MediaKind::Episode => return Err(MetadataCandidateError::InvalidSearch),
         };
-        let candidate_image_policy = self.candidate_image_policy_for(item_id, plan).await?;
         let direct_provider_id = selected_scraper_provider_id(current, scraper).filter(|_| {
             if plan != MetadataRequestPlan::full() {
                 return true;
@@ -1256,14 +1236,7 @@ impl MetadataCandidateService {
                     provider_id,
                     images: images_response
                         .as_ref()
-                        .map(|response| {
-                            filtered_candidate_images(
-                                &response.images,
-                                item_type,
-                                &current.item_type,
-                                candidate_image_policy,
-                            )
-                        })
+                        .map(|response| candidate_images_by_type(&response.images, item_type))
                         .unwrap_or_default(),
                     actors,
                     metadata_fetched: details.is_some(),
@@ -1454,7 +1427,6 @@ impl MetadataCandidateService {
             "EPISODE" => ScraperItemType::Episode,
             _ => return Err(MetadataCandidateError::InvalidSearch),
         };
-        let candidate_image_policy = self.candidate_image_policy_for(item_id, plan).await?;
         let season_number = current
             .season_number
             .and_then(|value| i32::try_from(value).ok())
@@ -1624,12 +1596,7 @@ impl MetadataCandidateService {
                     trailers: Vec::new(),
                     provider: parent.provider,
                     provider_id,
-                    images: filtered_candidate_images(
-                        &images.images,
-                        item_type,
-                        &current.item_type,
-                        candidate_image_policy,
-                    ),
+                    images: candidate_images_by_type(&images.images, item_type),
                     actors: Vec::new(),
                     metadata_fetched,
                     score: Some(parent.score),
@@ -2313,47 +2280,25 @@ fn candidate_image_targets(
 fn candidate_image_entries(
     images: &[crate::application::scraper::ScraperImage],
     item_type: ScraperItemType,
-) -> Vec<(&'static str, &str, Option<i32>)> {
+) -> Vec<(&'static str, &str)> {
     let mut entries = Vec::new();
     for image in images {
         for image_type in candidate_image_targets(&image.image_type, item_type) {
-            entries.push((*image_type, image.url.as_str(), image.width));
+            entries.push((*image_type, image.url.as_str()));
         }
     }
     entries
 }
 
-#[cfg(test)]
-fn generic_candidate_images(
-    images: &[crate::application::scraper::ScraperImage],
-    item_type: ScraperItemType,
-) -> BTreeMap<String, Vec<String>> {
-    let mut result = BTreeMap::<String, Vec<String>>::new();
-    for (image_type, url, _) in candidate_image_entries(images, item_type) {
-        result
-            .entry(image_type.to_owned())
-            .or_default()
-            .push(url.to_owned());
-    }
-    result
-}
-
-/// Candidate images that already dropped entries below the configured minimum
-/// width for the owning item type. Unknown upstream widths are kept.
-fn filtered_candidate_images(
+/// Candidate images grouped by the local image type they can fill. Every URL the
+/// scraper returned is kept: the minimum width moved to the scraper plugin, so the width
+/// the upstream reports no longer affects what is stored.
+fn candidate_images_by_type(
     images: &[crate::application::scraper::ScraperImage],
     scraper_item_type: ScraperItemType,
-    host_item_type: &str,
-    policy: ImageSelectionPolicy,
 ) -> BTreeMap<String, Vec<String>> {
     let mut result = BTreeMap::<String, Vec<String>>::new();
-    for (image_type, url, width) in candidate_image_entries(images, scraper_item_type) {
-        let cell = policy.type_policy_for_item_type(host_item_type, image_type);
-        let below_minimum =
-            cell.min_width > 0 && width.is_some_and(|width| i64::from(width) < cell.min_width);
-        if below_minimum {
-            continue;
-        }
+    for (image_type, url) in candidate_image_entries(images, scraper_item_type) {
         result
             .entry(image_type.to_owned())
             .or_default()
@@ -4434,10 +4379,9 @@ struct ArtworkPolicyOverride {
     sources: Option<ArtworkSources>,
     scraper_roles: Option<ScraperRoles>,
     overwrite: Option<ArtworkOverwrite>,
-    // Small numeric types keep the copyable policy compact; validated ranges
-    // are 0..=20 for counts and 0..=8192 for widths.
+    // A small numeric type keeps the copyable policy compact; the validated range is
+    // 0..=20 for counts.
     max_count: Option<u8>,
-    min_width: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -4455,7 +4399,6 @@ pub(crate) struct ImageTypePolicy {
     pub(crate) scraper_roles: ScraperRoles,
     pub(crate) overwrite: ArtworkOverwrite,
     pub(crate) max_count: usize,
-    pub(crate) min_width: i64,
 }
 
 fn is_multi_image_type(image_type: &str) -> bool {
@@ -4483,7 +4426,6 @@ pub(crate) struct ImageSelectionPolicy {
     wallpaper: bool,
     thumbnail_scraping_mode: ThumbnailScrapingMode,
     max_backdrop_count: i64,
-    min_download_width: i64,
     levels: [LevelOverrides; ImageLevel::ALL.len()],
 }
 
@@ -4558,7 +4500,6 @@ impl ImageSelectionPolicy {
             scraper_roles: ScraperRoles::default(),
             overwrite: ArtworkOverwrite::default(),
             max_count,
-            min_width: self.min_download_width,
         }
     }
 
@@ -4581,7 +4522,6 @@ impl ImageSelectionPolicy {
                 .max_count
                 .map(usize::from)
                 .unwrap_or(flat.max_count),
-            min_width: overrides.min_width.map(i64::from).unwrap_or(flat.min_width),
         })
     }
 
@@ -4675,8 +4615,6 @@ struct StoredImageStrategy {
     #[serde(default)]
     max_backdrop_count: Option<i64>,
     #[serde(default)]
-    min_download_width: Option<i64>,
-    #[serde(default)]
     levels: BTreeMap<String, StoredImageLevel>,
 }
 
@@ -4704,8 +4642,6 @@ struct StoredArtworkPolicy {
     overwrite: Option<String>,
     #[serde(default)]
     max_count: Option<i64>,
-    #[serde(default)]
-    min_width: Option<i64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -4722,7 +4658,6 @@ fn default_true() -> bool {
 /// Built-in cap for multi-image artwork; matches `MAX_IMAGE_VARIANTS` so the
 /// legacy "append several backdrops" behaviour stays the default.
 const DEFAULT_BACKDROP_MAX_COUNT: i64 = MAX_IMAGE_VARIANTS as i64;
-const DEFAULT_MIN_DOWNLOAD_WIDTH: i64 = 1280;
 
 fn default_image_selection_policy() -> ImageSelectionPolicy {
     ImageSelectionPolicy {
@@ -4732,7 +4667,6 @@ fn default_image_selection_policy() -> ImageSelectionPolicy {
         thumbnail: true,
         thumbnail_scraping_mode: ThumbnailScrapingMode::ScraperFirst,
         max_backdrop_count: DEFAULT_BACKDROP_MAX_COUNT,
-        min_download_width: DEFAULT_MIN_DOWNLOAD_WIDTH,
         ..ImageSelectionPolicy::default()
     }
 }
@@ -4789,9 +4723,6 @@ fn policy_from_stored_strategy(strategy: StoredImageStrategy) -> ImageSelectionP
                 max_count: policy
                     .max_count
                     .and_then(|count| u8::try_from(count.clamp(0, MAX_IMAGE_VARIANTS as i64)).ok()),
-                min_width: policy
-                    .min_width
-                    .and_then(|width| u16::try_from(width.clamp(0, 8192)).ok()),
             };
         }
         levels[level.index()] = overrides;
@@ -4809,9 +4740,6 @@ fn policy_from_stored_strategy(strategy: StoredImageStrategy) -> ImageSelectionP
         max_backdrop_count: strategy
             .max_backdrop_count
             .unwrap_or(DEFAULT_BACKDROP_MAX_COUNT),
-        min_download_width: strategy
-            .min_download_width
-            .unwrap_or(DEFAULT_MIN_DOWNLOAD_WIDTH),
         levels,
     }
 }
@@ -5330,13 +5258,13 @@ mod tests {
         EpisodeImagePolicy, FillMissingRequestPlan, ImageLevel, ImageSelectionPolicy,
         MAX_ACTOR_DETAIL_FETCHES, MetadataCandidateService, MetadataRequestPlan,
         MetadataSelectionMode, MetadataSelectionService, SCRAPER_IMAGE_TYPES, ScraperRoles,
-        SelectionInputs, candidate_actor_credits, candidate_actors, candidate_payload,
-        capability_needs_request, completeness_capabilities, credits_need_actor_relation_check,
-        default_image_selection_policy, enrich_actor_metadata, explicitly_unavailable_image_types,
-        filtered_candidate_images, generic_candidate_actors, generic_candidate_images,
-        image_attempt_identities, local_metadata_completeness_plan, merge_actor_values,
-        merge_supplemental_movie_nfo, metadata_completeness_fingerprint, metadata_match_score,
-        metadata_request_plan, metadata_request_plan_has_work, parse_image_selection_policy,
+        SelectionInputs, candidate_actor_credits, candidate_actors, candidate_images_by_type,
+        candidate_payload, capability_needs_request, completeness_capabilities,
+        credits_need_actor_relation_check, default_image_selection_policy, enrich_actor_metadata,
+        explicitly_unavailable_image_types, generic_candidate_actors, image_attempt_identities,
+        local_metadata_completeness_plan, merge_actor_values, merge_supplemental_movie_nfo,
+        metadata_completeness_fingerprint, metadata_match_score, metadata_request_plan,
+        metadata_request_plan_has_work, parse_image_selection_policy,
         replace_provider_id_with_candidate, run_bounded_completeness_plan_tasks,
         selected_scraper_provider_id,
     };
@@ -6190,7 +6118,7 @@ mod tests {
 
     #[test]
     fn episode_stills_are_not_duplicated_into_other_backdrop_types() {
-        let images = generic_candidate_images(
+        let images = candidate_images_by_type(
             &[ScraperImage {
                 image_type: "Backdrop".to_owned(),
                 url: "https://images.example/episode.jpg".to_owned(),
@@ -6983,6 +6911,8 @@ mod tests {
 
     #[test]
     fn type_policy_defaults_come_from_the_flat_limits_and_level_values_win() {
+        // Strategies saved by older versions still carry `minDownloadWidth` / `minWidth`;
+        // they are accepted and ignored, so only the remaining flat and cell limits apply.
         let policy = parse_image_selection_policy(
             r#"{"images":{"poster":true,"artwork":true,"maxBackdropCount":3,"minDownloadWidth":1920,
                  "levels":{"series":{"artworks":{"artwork":{"maxCount":1,"minWidth":720,"overwrite":"KEEP","sources":["SCRAPER"],"scraperRoles":["PRIMARY"]}}}}}}"#,
@@ -6993,7 +6923,6 @@ mod tests {
             .type_policy(ImageLevel::Movie, "ART")
             .expect("art cell");
         assert_eq!(movie_art.max_count, 3);
-        assert_eq!(movie_art.min_width, 1920);
         assert_eq!(movie_art.overwrite, ArtworkOverwrite::Inherit);
         assert!(movie_art.sources.scraper && movie_art.sources.screenshot);
 
@@ -7001,7 +6930,6 @@ mod tests {
             .type_policy(ImageLevel::Series, "ART")
             .expect("art cell");
         assert_eq!(series_art.max_count, 1);
-        assert_eq!(series_art.min_width, 720);
         assert_eq!(series_art.overwrite, ArtworkOverwrite::Keep);
         assert!(series_art.sources.scraper);
         assert!(!series_art.sources.screenshot);
@@ -7069,12 +6997,12 @@ mod tests {
     }
 
     #[test]
-    fn minimum_width_filters_candidate_images_per_level() {
+    fn candidate_images_keep_low_width_urls_for_every_level() {
         let images = vec![
             ScraperImage {
                 image_type: "Poster".to_owned(),
                 url: "https://images.example/poster-small".to_owned(),
-                width: Some(1000),
+                width: Some(640),
                 ..ScraperImage::default()
             },
             ScraperImage {
@@ -7096,28 +7024,30 @@ mod tests {
                 ..ScraperImage::default()
             },
         ];
-        let policy = parse_image_selection_policy(
-            r#"{"images":{"minDownloadWidth":1920,"levels":{"season":{"artworks":{"backdrop":{"minWidth":1000}}}}}}"#,
-        )
-        .expect("strategy JSON is valid");
 
-        let movie = filtered_candidate_images(&images, ScraperItemType::Movie, "MOVIE", policy);
+        let movie = candidate_images_by_type(&images, ScraperItemType::Movie);
         assert_eq!(
             movie.get("POSTER"),
             Some(&vec![
+                "https://images.example/poster-small".to_owned(),
                 "https://images.example/poster-large".to_owned(),
                 "https://images.example/poster-unknown".to_owned()
-            ])
+            ]),
+            "a 640px poster must no longer be dropped before it is stored"
         );
-        assert!(
-            !movie.contains_key("FANART"),
-            "a 1280px backdrop is below the 1920px movie minimum"
+        assert_eq!(
+            movie.get("FANART"),
+            Some(&vec!["https://images.example/backdrop".to_owned()])
         );
 
-        let season = filtered_candidate_images(&images, ScraperItemType::Season, "SEASON", policy);
+        let episode = candidate_images_by_type(&images, ScraperItemType::Episode);
         assert_eq!(
-            season.get("FANART"),
+            episode.get("FANART"),
             Some(&vec!["https://images.example/backdrop".to_owned()])
+        );
+        assert!(
+            !episode.contains_key("THUMB"),
+            "episode stills are not duplicated into other backdrop types"
         );
     }
 
