@@ -6229,6 +6229,20 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
+    /// The season/episode numbers that identify an episode inside a Kodi multi-episode NFO.
+    pub(crate) async fn find_media_item_season_episode_numbers(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<(Option<i64>, Option<i64>)>, StorageError> {
+        sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
+            "SELECT season_number, episode_number FROM media_items WHERE id = ?",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(self.sqlx_err())
+    }
+
     pub(crate) async fn find_first_episode_source_path(
         &self,
         item_id: &str,
