@@ -2,6 +2,18 @@ import type { ChangelogRelease } from "../types";
 
 export const changelogReleases07: ChangelogRelease[] = [
   {
+    version: "0.7.13",
+    date: "2026-11-05",
+    sections: [
+      { kind: "fixed", items: [
+        "Emby/Jellyfin 写法的 <ratings> 容器现在能读到评分：旁车 NFO 里的评分以前只认根节点下平铺的 <rating> / <votes>，其他工具写成 <ratings><rating name=\"tmdb\"><value>7.6</value><votes>204</votes> 这种容器形式的条目会被静默忽略，详情页、NFO 面板和第三方 Emby 客户端拿到的 CommunityRating 都是空的。现在容器里按 default=\"true\" → TMDb 条目（tmdb / themoviedb）→ 第一个可读条目的顺序取值，max 不是 10 时归一到 0-10，票数取同一条目；平铺字段仍然优先，两种写法不会把一家的分值和另一家的票数凑一起。userrating 继续不读，评分来源还是记 NFO。",
+        "刮削器只给了海报字段时不再丢封面：以前只要候选 JSON 里带 images 对象（哪怕没有 POSTER / FANART 条目），写图就完全按类型图走，插件 get 返回的 PosterUrl / BackdropUrl 被直接忽略。TMDb 插件在首选语言下拿不到图、图片接口报错或根本没有类型图时，就会出现「元数据刮到了、封面是空的」。现在按图片类型逐个判断：类型图里没有 POSTER / FANART 就回退到候选的 PosterUrl / BackdropUrl，媒体库图片策略（开关、来源、覆盖、张数上限）照旧生效。",
+        "上游给了海报地址的条目不再被永久判成「没有图」：类型图接口返回空列表时，Lux 会把该条目参与的图片类型整批记成 UNAVAILABLE / NO_IMAGE，之后的「补全」认为这块已经查过，连图片接口都不再请求，于是永远停在「有 NFO、没封面」，只有手动重新识别或完整刷新才会重来。现在只有上游连 PosterUrl / BackdropUrl 都没给时才记「确实没有图」；只要元数据里还有海报或背景图地址，POSTER / DISC 或 FANART / THUMB / BANNER / ART / WALLPAPER 就继续算缺图，交给回退逻辑落盘。",
+        "首次启动时选了 PostgreSQL 会卡在空数据库上起不来：第一次启动还没选数据库时，向导会先开一个占位的 SQLite 库，开它的时候顺手写了 server-state.json；等你在向导里改成 PostgreSQL、进程重启，启动检查读到这个标记，再看新库空着、没有 server_id，直接以 EmptyDatabase 拒绝启动。现在只要在选择标记还没落定时保存数据库配置，就会把这个占位标记删掉，已经初始化过的实例不受影响。",
+      ] },
+    ],
+  },
+  {
     version: "0.7.12",
     date: "2026-11-05",
     sections: [
