@@ -765,6 +765,9 @@ impl PluginService {
         self.provider_cache.clear_provider(&plugin_id).await;
         let _catalog_refresh_guard = self.catalog_refresh_lock.lock().await;
         self.supervisor.stop(&plugin_id).await;
+        // The process may have answered one last request while it was stopping; drop those
+        // responses too, now that no process can still be running with the removed config.
+        self.provider_cache.clear_provider(&plugin_id).await;
         remove_plugin_files(plugin)
             .await
             .map_err(PluginServiceError::ConfigIo)?;
@@ -892,6 +895,7 @@ impl PluginService {
         self.provider_cache.clear_provider(&plugin_id).await;
         if !enabled {
             self.supervisor.stop(&plugin_id).await;
+            self.provider_cache.clear_provider(&plugin_id).await;
         } else if catalog
             .get(&plugin_id)
             .is_some_and(is_login_background_plugin)
@@ -1785,6 +1789,7 @@ impl PluginService {
             return Err(error);
         }
         self.supervisor.stop(&plugin_id).await;
+        self.provider_cache.clear_provider(&plugin_id).await;
         self.request_login_background_refresh();
         if let Err(error) = assets.prune_except(&uploaded.asset_id).await {
             return Err(PluginServiceError::ImageAsset(error));
@@ -2618,6 +2623,10 @@ impl PluginService {
         let catalog = self.catalog_snapshot().await;
         let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
         self.supervisor.stop(&plugin_id).await;
+        // A config save clears the cache before the process is replaced. The old process can still
+        // answer during that window, so clear again after it has stopped; otherwise that response
+        // stays cached under the new generation until the TTL expires.
+        self.provider_cache.clear_provider(&plugin_id).await;
     }
 
     pub async fn stop_all(&self) {
@@ -4189,50 +4198,21 @@ mod plugin_discovery_tests {
         Ok(())
     }
 
-    /// Saving a scraper plugin's config must drop that plugin's cached responses.
-    ///
-    /// The stub answers `metadata.images` from the config file it receives through
-    /// `LUX_PLUGIN_CONFIG_PATH` and appends one line per real RPC, so the second call before the
-    /// config change proves the response cache is used and the call after it proves the plugin is
-    /// asked again.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn saving_scraper_config_invalidates_the_plugin_response_cache()
-    -> Result<(), Box<dyn std::error::Error>> {
+    const SCRAPER_STUB_PLUGIN_ID: &str = "org.example.scraper";
+
+    /// Installs a scraper stub whose `metadata.images` answer carries the width supplied by the
+    /// script, and returns a service that can call it.
+    #[cfg(unix)]
+    async fn install_scraper_stub(
+        root: &std::path::Path,
+        script: &str,
+    ) -> Result<PluginService, Box<dyn std::error::Error>> {
         use std::os::unix::fs::PermissionsExt;
 
-        use crate::application::scraper::{ScraperImageRequest, ScraperItemType};
-
-        const PLUGIN_ID: &str = "org.example.scraper";
-
-        let root = tempdir()?;
-        let config_dir = root.path().join("config");
-        let plugin_dir = config_dir.join(format!("plugins/{PLUGIN_ID}"));
+        let config_dir = root.join("config");
+        let plugin_dir = config_dir.join(format!("plugins/{SCRAPER_STUB_PLUGIN_ID}"));
         tokio::fs::create_dir_all(plugin_dir.join("binaries")).await?;
-        let call_log = root.path().join("plugin-calls.log");
-        let script = r#"#!/bin/sh
-while IFS= read -r line; do
-  id=$(printf '%s' "$line" | sed -n 's/^{"id":"\([^"]*\)".*/\1/p')
-  case "$line" in
-    *'"metadata.images"'*)
-      printf 'call\n' >> "__CALL_LOG__"
-      min_width=1000
-      if [ -f "$LUX_PLUGIN_CONFIG_PATH" ]; then
-        saved=$(sed -n 's/.*"minWidth"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$LUX_PLUGIN_CONFIG_PATH")
-        if [ -n "$saved" ]; then min_width="$saved"; fi
-      fi
-      printf '{"id":"%s","result":{"images":[{"Type":"Poster","Url":"https://images.example.test/poster.jpg","Width":%s,"Height":1500}],"originalLanguageMode":false}}\n' "$id" "$min_width"
-      ;;
-    *)
-      printf '{"id":"%s","error":{"code":"PLUGIN_UNSUPPORTED_METHOD","message":"unsupported"}}\n' "$id"
-      ;;
-  esac
-done
-"#
-        .replace(
-            "__CALL_LOG__",
-            call_log.to_str().ok_or("non-utf8 call log path")?,
-        );
         let entrypoint = plugin_dir.join("binaries/plugin");
         tokio::fs::write(&entrypoint, script).await?;
         tokio::fs::set_permissions(&entrypoint, std::fs::Permissions::from_mode(0o700)).await?;
@@ -4240,7 +4220,7 @@ done
             plugin_dir.join("manifest.json"),
             serde_json::to_vec_pretty(&json!({
                 "formatVersion": 1,
-                "id": PLUGIN_ID,
+                "id": SCRAPER_STUB_PLUGIN_ID,
                 "name": "Scraper stub",
                 "version": "1.0.0",
                 "apiVersion": 1,
@@ -4270,12 +4250,51 @@ done
             config_dir: config_dir.clone(),
         };
         let database = Database::connect(&config).await?;
-        let service = PluginService::new_without_login_background_worker_for_test(
-            database,
-            config.config_dir.clone(),
+        let service =
+            PluginService::new_without_login_background_worker_for_test(database, config_dir);
+        service.install(SCRAPER_STUB_PLUGIN_ID).await?;
+        Ok(service)
+    }
+
+    /// Saving a scraper plugin's config must drop that plugin's cached responses.
+    ///
+    /// The stub answers `metadata.images` from the config file it receives through
+    /// `LUX_PLUGIN_CONFIG_PATH` and appends one line per real RPC, so the second call before the
+    /// config change proves the response cache is used and the call after it proves the plugin is
+    /// asked again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn saving_scraper_config_invalidates_the_plugin_response_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::application::scraper::{ScraperImageRequest, ScraperItemType};
+
+        let root = tempdir()?;
+        let call_log = root.path().join("plugin-calls.log");
+        let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"metadata.images"'*)
+      printf 'call\n' >> "__CALL_LOG__"
+      min_width=1000
+      if [ -f "$LUX_PLUGIN_CONFIG_PATH" ]; then
+        saved=$(sed -n 's/.*"minWidth"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$LUX_PLUGIN_CONFIG_PATH")
+        if [ -n "$saved" ]; then min_width="$saved"; fi
+      fi
+      printf '{"id":"%s","result":{"images":[{"Type":"Poster","Url":"https://images.example.test/poster.jpg","Width":%s,"Height":1500}],"originalLanguageMode":false}}\n' "$id" "$min_width"
+      ;;
+    *)
+      printf '{"id":"%s","error":{"code":"PLUGIN_UNSUPPORTED_METHOD","message":"unsupported"}}\n' "$id"
+      ;;
+  esac
+done
+"#
+        .replace(
+            "__CALL_LOG__",
+            call_log.to_str().ok_or("non-utf8 call log path")?,
         );
-        service.install(PLUGIN_ID).await?;
-        let client = service.scraper_client(PLUGIN_ID).await?;
+        let service = install_scraper_stub(root.path(), &script).await?;
+        let client = service.scraper_client(SCRAPER_STUB_PLUGIN_ID).await?;
         let request = || ScraperImageRequest::new(ScraperItemType::Movie, "603", "zh-CN");
 
         let first = client.images(request()).await?;
@@ -4294,7 +4313,7 @@ done
 
         service
             .update_dynamic_config(
-                PLUGIN_ID,
+                SCRAPER_STUB_PLUGIN_ID,
                 serde_json::Map::from_iter([("minWidth".to_owned(), json!(1500))]),
             )
             .await?;
@@ -4314,6 +4333,81 @@ done
             calls_after, 2,
             "the config change should force another plugin RPC"
         );
+        Ok(())
+    }
+
+    /// A plugin process keeps the configuration it read when it started, so a scrape that runs
+    /// between the config write (and its first cache clear) and `restart()` can cache a response
+    /// produced under the old config. Restart must clear that response once the process has been
+    /// replaced, otherwise it survives until the 24h TTL.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_clears_responses_produced_between_config_save_and_restart()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::application::scraper::{ScraperImageRequest, ScraperItemType};
+
+        let root = tempdir()?;
+        let call_log = root.path().join("plugin-calls.log");
+        // Snapshot the config at process start, like a real plugin that reads
+        // `LUX_PLUGIN_CONFIG_PATH` once while starting up.
+        let script = r#"#!/bin/sh
+min_width=1000
+if [ -f "$LUX_PLUGIN_CONFIG_PATH" ]; then
+  saved=$(sed -n 's/.*"minWidth"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$LUX_PLUGIN_CONFIG_PATH")
+  if [ -n "$saved" ]; then min_width="$saved"; fi
+fi
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"metadata.images"'*)
+      printf 'call\n' >> "__CALL_LOG__"
+      printf '{"id":"%s","result":{"images":[{"Type":"Poster","Url":"https://images.example.test/poster.jpg","Width":%s,"Height":1500}],"originalLanguageMode":false}}\n' "$id" "$min_width"
+      ;;
+    *)
+      printf '{"id":"%s","error":{"code":"PLUGIN_UNSUPPORTED_METHOD","message":"unsupported"}}\n' "$id"
+      ;;
+  esac
+done
+"#
+        .replace(
+            "__CALL_LOG__",
+            call_log.to_str().ok_or("non-utf8 call log path")?,
+        );
+        let service = install_scraper_stub(root.path(), &script).await?;
+        let client = service.scraper_client(SCRAPER_STUB_PLUGIN_ID).await?;
+        let request = || ScraperImageRequest::new(ScraperItemType::Movie, "603", "zh-CN");
+
+        let first = client.images(request()).await?;
+        assert_eq!(first.images[0].width, Some(1000));
+
+        service
+            .update_dynamic_config(
+                SCRAPER_STUB_PLUGIN_ID,
+                serde_json::Map::from_iter([("minWidth".to_owned(), json!(1500))]),
+            )
+            .await?;
+        // The old process still answers with its startup snapshot after the immediate clear.
+        let stale = client.images(request()).await?;
+        assert_eq!(
+            stale.images[0].width,
+            Some(1000),
+            "the old process should still answer with the pre-change config"
+        );
+
+        service.restart(SCRAPER_STUB_PLUGIN_ID).await;
+
+        let refreshed = client.images(request()).await?;
+        assert_eq!(
+            refreshed.images[0].width,
+            Some(1500),
+            "restart must clear the response cached by the old process after it stops"
+        );
+        let calls = tokio::fs::read_to_string(&call_log)
+            .await
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(calls, 3, "the post-restart call should reach a new process");
         Ok(())
     }
 
