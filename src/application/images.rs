@@ -1204,6 +1204,15 @@ impl ImageWriteService {
         if !target.starts_with(&root) {
             return Err(ImageWriteError::PathOutsideRoot(target));
         }
+        // The target was chosen from a snapshot taken under the per-item write lock, which the
+        // scanner does not take. Re-read right before writing: if a scan registered the file for
+        // another index of this type in the meantime, do not overwrite it for the wrong row.
+        let latest_images = self.database.list_item_images(item_id).await?;
+        if image_path_is_owned_by_other_row(&latest_images, image_type, image_index, &target)
+            .await?
+        {
+            return Err(ImageWriteError::ConcurrentModification(target));
+        }
         let metadata_target = if self.config_dir.is_some()
             && item_metadata_writeback_enabled(&self.database, item_id).await?
         {
@@ -1262,39 +1271,39 @@ impl ImageWriteService {
             source_url: Some(image_url),
         };
         let id = match attempt {
-            Some(attempt) => {
-                self.database
-                    .upsert_item_image_at_index_and_finish_attempt(
-                        item_id,
-                        image_type,
-                        image_index,
-                        &target,
-                        crate::storage::ItemImageAttemptCommit {
-                            metadata: image_metadata,
-                            update: MetadataImageAttemptUpdate {
-                                item_id: attempt.item_id,
-                                image_type: attempt.image_type,
-                                candidate_key: attempt.candidate_key,
-                                status: "AVAILABLE",
-                                next_retry_at: None,
-                                error_code: None,
-                                now: current_unix_timestamp(),
-                            },
+            Some(attempt) => self
+                .database
+                .upsert_item_image_at_index_and_finish_attempt(
+                    item_id,
+                    image_type,
+                    image_index,
+                    &target,
+                    crate::storage::ItemImageAttemptCommit {
+                        metadata: image_metadata,
+                        update: MetadataImageAttemptUpdate {
+                            item_id: attempt.item_id,
+                            image_type: attempt.image_type,
+                            candidate_key: attempt.candidate_key,
+                            status: "AVAILABLE",
+                            next_retry_at: None,
+                            error_code: None,
+                            now: current_unix_timestamp(),
                         },
-                    )
-                    .await?
-            }
-            None => {
-                self.database
-                    .upsert_item_image_at_index(
-                        item_id,
-                        image_type,
-                        image_index,
-                        &target,
-                        image_metadata,
-                    )
-                    .await?
-            }
+                    },
+                )
+                .await
+                .map_err(|error| image_row_write_error(&target, error))?,
+            None => self
+                .database
+                .upsert_item_image_at_index(
+                    item_id,
+                    image_type,
+                    image_index,
+                    &target,
+                    image_metadata,
+                )
+                .await
+                .map_err(|error| image_row_write_error(&target, error))?,
         };
         if let Some(resources) = &self.resources {
             resources.record_metadata_stage("image_write", write_started.elapsed());
@@ -2534,6 +2543,16 @@ fn image_attempt_failure(
     }
 }
 
+/// A registration path taken by another index of the same type is a concurrent modification: the
+/// next refresh re-reads the blocked paths and picks another file, so it stays retryable instead
+/// of being recorded as a permanent storage failure.
+fn image_row_write_error(target: &Path, error: StorageError) -> ImageWriteError {
+    match error {
+        StorageError::Conflict(_) => ImageWriteError::ConcurrentModification(target.to_owned()),
+        other => ImageWriteError::Storage(other),
+    }
+}
+
 fn image_io_error(path: &Path, source: std::io::Error) -> ImageWriteError {
     ImageWriteError::Io {
         path: path.to_owned(),
@@ -3354,8 +3373,9 @@ mod tests {
         canonical_image_stems, ensure_public_image_host, global_image_download_permits,
         global_image_write_permits, image_attempt_failure,
         image_content_tag_and_dimensions_from_bytes, image_download_retry_delay,
-        image_language_matches, image_lookup_stems, image_target, is_allowed_scraper_image_url,
-        retryable_image_status, should_suppress_internal_image_write, write_image_atomically,
+        image_language_matches, image_lookup_stems, image_row_write_error, image_target,
+        is_allowed_scraper_image_url, retryable_image_status, should_suppress_internal_image_write,
+        write_image_atomically,
     };
     use crate::{
         application::access::MediaAccessService,
@@ -3660,6 +3680,27 @@ mod tests {
             .await
             .expect("fanart target reusing its own path");
         assert_eq!(target, shared);
+    }
+
+    #[test]
+    fn a_registration_path_owned_by_another_index_stays_retryable() {
+        let target = PathBuf::from("/media/backdrop1.png");
+        let conflict = image_row_write_error(
+            &target,
+            crate::storage::StorageError::Conflict("path already registered".to_owned()),
+        );
+        assert!(matches!(
+            &conflict,
+            ImageWriteError::ConcurrentModification(path) if path == &target
+        ));
+        assert!(matches!(
+            image_attempt_failure(&conflict, 100, 1),
+            ("FAILED", Some(_), "TRANSIENT_FAILURE")
+        ));
+        assert!(matches!(
+            image_row_write_error(&target, crate::storage::StorageError::LastManager),
+            ImageWriteError::Storage(crate::storage::StorageError::LastManager)
+        ));
     }
 
     #[tokio::test]

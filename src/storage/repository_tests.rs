@@ -6637,8 +6637,8 @@ async fn local_item_image_batch_is_bounded_idempotent_and_atomic() {
             .expect("read updated poster path"),
         "/media/first/poster-updated.jpg"
     );
-    // One item never registers two image rows on one path: a path another row owns is skipped
-    // instead of being written a second time under a different index.
+    // A path another index of the *same* type owns is skipped instead of being written a second
+    // time; the same path under a different type is still a legal registration.
     let owned_path_batch = [ItemImageBatchInsert {
         item_id: item_ids[0].clone(),
         images: vec![
@@ -6651,10 +6651,20 @@ async fn local_item_image_batch_is_bounded_idempotent_and_atomic() {
         database
             .insert_item_images_batch_at_indices(&owned_path_batch)
             .await
-            .expect("skip an image path another row owns"),
-        0,
-        "a page cannot register a path another image row already owns"
+            .expect("skip only the same-type path conflict"),
+        1,
+        "the same-type index conflict is skipped and the cross-type row stays"
     );
+    let logo_path: String = database
+        .query_scalar(
+            "SELECT local_path FROM item_images
+             WHERE item_id = ? AND image_type = 'LOGO' AND image_index = 0",
+        )
+        .bind(&item_ids[0])
+        .fetch_one(database.pool())
+        .await
+        .expect("read the cross-type registration");
+    assert_eq!(logo_path, "/media/first/fanart-2.jpg");
     // Two rows of one page that repeat a new path keep the first registration only.
     let repeated_path_batch = [ItemImageBatchInsert {
         item_id: item_ids[0].clone(),
@@ -6697,6 +6707,68 @@ async fn local_item_image_batch_is_bounded_idempotent_and_atomic() {
                 4,
                 "/media/first/fanart-new.jpg".to_owned(),
                 "duplicate-a".to_owned()
+            ),
+        ]
+    );
+
+    // Cross-type shared paths stay legal: the STRM thumbnail registers POSTER and THUMB on one
+    // file, and a repeated probe must refresh that row instead of dropping it.
+    let strm_thumbnail_path = "/media/second/Image.Movie.2020-thumbnail.jpg";
+    let strm_batch = [ItemImageBatchInsert {
+        item_id: item_ids[1].clone(),
+        images: vec![
+            make_image("POSTER", 0, strm_thumbnail_path, "strm-thumb-letterbox"),
+            make_image("THUMB", 0, strm_thumbnail_path, "strm-thumb-letterbox"),
+        ],
+        clear_poster_fallback: true,
+    }];
+    assert_eq!(
+        database
+            .insert_item_images_batch_at_indices(&strm_batch)
+            .await
+            .expect("register the STRM thumbnail for both types"),
+        2,
+        "POSTER and THUMB may share the STRM thumbnail path"
+    );
+    let refreshed_thumbnail_batch = [ItemImageBatchInsert {
+        item_id: item_ids[1].clone(),
+        images: vec![make_image(
+            "THUMB",
+            0,
+            strm_thumbnail_path,
+            "strm-thumb-reprobed",
+        )],
+        clear_poster_fallback: false,
+    }];
+    assert_eq!(
+        database
+            .insert_item_images_batch_at_indices(&refreshed_thumbnail_batch)
+            .await
+            .expect("refresh the STRM thumbnail row"),
+        1,
+        "a repeated registration updates the shared-path row instead of skipping it"
+    );
+    let strm_rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT image_type, local_path, content_tag FROM item_images
+         WHERE item_id = ? AND local_path = ? ORDER BY image_type",
+    )
+    .bind(&item_ids[1])
+    .bind(strm_thumbnail_path)
+    .fetch_all(database.pool())
+    .await
+    .expect("read the STRM thumbnail rows");
+    assert_eq!(
+        strm_rows,
+        vec![
+            (
+                "POSTER".to_owned(),
+                strm_thumbnail_path.to_owned(),
+                "strm-thumb-letterbox".to_owned()
+            ),
+            (
+                "THUMB".to_owned(),
+                strm_thumbnail_path.to_owned(),
+                "strm-thumb-reprobed".to_owned()
             ),
         ]
     );
@@ -6817,6 +6889,118 @@ async fn local_item_image_batch_is_bounded_idempotent_and_atomic() {
         .await
         .expect("read rolled-back fallback flags");
     assert_eq!(fallback, vec![1, 1]);
+    database.close().await;
+}
+
+/// LUX-887: the image writer picks its target from a snapshot taken before its upsert, while a
+/// scan can register the same file for another index of the same type in between (the two paths
+/// take different locks). The upsert must refuse the second row instead of leaving two indexes
+/// on one file.
+#[tokio::test]
+async fn item_image_upsert_rejects_a_path_registered_between_snapshot_and_write() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Race Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir)
+        .await
+        .expect("movie directory");
+    tokio::fs::write(movie_dir.join("Race.Movie.2024.mkv"), b"video")
+        .await
+        .expect("movie file");
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Local image race", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    libraries
+        .add_root(library.id, media_root.to_str().expect("media root"))
+        .await
+        .expect("library root");
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await
+        .expect("index movies");
+    let item_id: String = database
+        .query_scalar("SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE'")
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await
+        .expect("movie id");
+    let shared_path = movie_dir.join("backdrop1.png");
+    tokio::fs::write(&shared_path, b"registered first")
+        .await
+        .expect("shared file");
+
+    // The scan registration that raced the writer's snapshot.
+    database
+        .upsert_item_image_at_index(
+            &item_id,
+            "FANART",
+            4,
+            &shared_path,
+            ItemImageMetadata {
+                file_size: 15,
+                width: None,
+                height: None,
+                content_tag: "fanart-four",
+                source: "LOCAL",
+                source_url: None,
+            },
+        )
+        .await
+        .expect("register the placeholder fanart index");
+
+    let error = database
+        .upsert_item_image_at_index(
+            &item_id,
+            "FANART",
+            1,
+            &shared_path,
+            ItemImageMetadata {
+                file_size: 15,
+                width: None,
+                height: None,
+                content_tag: "fanart-one",
+                source: "SCRAPER",
+                source_url: None,
+            },
+        )
+        .await
+        .expect_err("a second index must not register the same path");
+    assert!(matches!(error, StorageError::Conflict(_)));
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT image_index, local_path FROM item_images
+         WHERE item_id = ? AND image_type = 'FANART' ORDER BY image_index",
+    )
+    .bind(&item_id)
+    .fetch_all(database.pool())
+    .await
+    .expect("fanart rows");
+    assert_eq!(rows, vec![(4, shared_path.to_string_lossy().into_owned())]);
+
+    // The owning row still refreshes its own path.
+    database
+        .upsert_item_image_at_index(
+            &item_id,
+            "FANART",
+            4,
+            &shared_path,
+            ItemImageMetadata {
+                file_size: 15,
+                width: None,
+                height: None,
+                content_tag: "fanart-four-updated",
+                source: "LOCAL",
+                source_url: None,
+            },
+        )
+        .await
+        .expect("refresh the owning index");
     database.close().await;
 }
 

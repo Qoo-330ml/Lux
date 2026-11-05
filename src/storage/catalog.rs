@@ -9930,11 +9930,16 @@ impl Database {
         let mut registered_paths = std::collections::HashSet::with_capacity(image_count);
         for item in items {
             for image in &item.images {
-                // Two images of one item never share a registration path. The scanner allocates a
-                // free index per file, so a page that repeats a path is stale (a moved file whose
-                // previous row was not pruned); keep the first registration instead of writing
-                // the same file twice under two indexes.
-                if !registered_paths.insert((item.item_id.as_str(), image.local_path.as_str())) {
+                // Two indexes of one image type never share a registration path. The scanner
+                // allocates a free index per file, so a page that repeats a path is stale (a moved
+                // file whose previous row was not pruned); keep the first registration instead of
+                // writing the same file twice under two indexes. Sharing one path across types
+                // stays legal: the STRM thumbnail registers POSTER and THUMB on one file.
+                if !registered_paths.insert((
+                    item.item_id.as_str(),
+                    image.image_type.as_str(),
+                    image.local_path.as_str(),
+                )) {
                     continue;
                 }
                 image_rows.push((&item.item_id, image));
@@ -9962,11 +9967,9 @@ impl Database {
                 WHERE NOT EXISTS (
                     SELECT 1 FROM item_images existing
                     WHERE existing.item_id = page.item_id
+                      AND existing.image_type = page.image_type
                       AND existing.local_path = page.local_path
-                      AND NOT (
-                          existing.image_type = page.image_type
-                          AND existing.image_index = page.image_index
-                      )
+                      AND existing.image_index <> page.image_index
                 )
                 ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET
                     id = excluded.id,
@@ -10126,36 +10129,66 @@ impl Database {
         row: ItemImageRowWrite<'_>,
         metadata: ItemImageMetadata<'_>,
     ) -> Result<(), StorageError> {
-        self.query(
-            "INSERT INTO item_images (
-                id, item_id, image_type, image_index, local_path, width, height,
-                file_size, content_tag, source, source_url
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET
-                id = excluded.id,
-                local_path = excluded.local_path,
-                width = excluded.width,
-                height = excluded.height,
-                file_size = excluded.file_size,
-                content_tag = excluded.content_tag,
-                source = excluded.source,
-                source_url = excluded.source_url,
-                updated_at = unixepoch()",
-        )
-        .bind(row.id)
-        .bind(row.item_id)
-        .bind(row.image_type)
-        .bind(row.image_index)
-        .bind(row.local_path.to_string_lossy().as_ref())
-        .bind(metadata.width)
-        .bind(metadata.height)
-        .bind(metadata.file_size)
-        .bind(metadata.content_tag)
-        .bind(metadata.source)
-        .bind(metadata.source_url)
-        .execute(&mut **transaction)
-        .await
-        .map_err(self.sqlx_err())?;
+        // The writer picked its target from a snapshot taken before this transaction. A scan can
+        // register the same file for another index of the same type in between (the two paths use
+        // different locks), so the upsert re-checks inside the transaction and refuses to make a
+        // second row share the path. Sharing across image types stays legal (STRM thumbnails).
+        let local_path = row.local_path.to_string_lossy();
+        let result = self
+            .query(
+                "WITH candidate(
+                    id, item_id, image_type, image_index, local_path, width, height,
+                    file_size, content_tag, source, source_url
+                ) AS (VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?))
+                INSERT INTO item_images (
+                    id, item_id, image_type, image_index, local_path, width, height,
+                    file_size, content_tag, source, source_url
+                )
+                SELECT id, item_id, image_type, image_index, local_path, width, height,
+                       file_size, content_tag, source, source_url
+                FROM candidate
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM item_images existing
+                    WHERE existing.item_id = candidate.item_id
+                      AND existing.image_type = candidate.image_type
+                      AND existing.local_path = candidate.local_path
+                      AND existing.image_index <> candidate.image_index
+                )
+                ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET
+                    id = excluded.id,
+                    local_path = excluded.local_path,
+                    width = excluded.width,
+                    height = excluded.height,
+                    file_size = excluded.file_size,
+                    content_tag = excluded.content_tag,
+                    source = excluded.source,
+                    source_url = excluded.source_url,
+                    updated_at = unixepoch()",
+            )
+            .bind(row.id)
+            .bind(row.item_id)
+            .bind(row.image_type)
+            .bind(row.image_index)
+            .bind(local_path.as_ref())
+            .bind(metadata.width)
+            .bind(metadata.height)
+            .bind(metadata.file_size)
+            .bind(metadata.content_tag)
+            .bind(metadata.source)
+            .bind(metadata.source_url)
+            .bind(row.item_id)
+            .bind(row.image_type)
+            .bind(local_path.as_ref())
+            .bind(row.image_index)
+            .execute(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())?;
+        if result.rows_affected() == 0 {
+            return Err(StorageError::Conflict(
+                "image path is already registered by another index of the same image type"
+                    .to_owned(),
+            ));
+        }
         Ok(())
     }
 
