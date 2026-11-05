@@ -5196,3 +5196,41 @@ async fn postgres_danmaku_provenance_migration_upgrades_a_populated_database()
     drop_postgres_test_database(&database_name).await?;
     Ok(())
 }
+
+/// A release before the placeholder fix wrote `server-state.json` for the wizard's throwaway SQLite
+/// database; choosing PostgreSQL afterwards then refused the empty database as a lost one.
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn a_marker_left_by_the_setup_placeholder_does_not_block_a_fresh_postgres_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    // The placeholder, opened the way the old code did (no selection marker): it records the marker.
+    Database::connect(&config).await?.close().await;
+    let placeholder_marker = fs::read(config.config_dir.join("server-state.json"))?;
+
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let result = async {
+        let database = Database::connect_with_configuration(&config, &connection).await?;
+        let server_id: String =
+            sqlx::query_scalar("SELECT value FROM lux_meta WHERE key = 'server_id'")
+                .fetch_one(database.pool())
+                .await?;
+        database.close().await;
+        let marker: serde_json::Value =
+            serde_json::from_slice(&fs::read(config.config_dir.join("server-state.json"))?)?;
+        assert_eq!(marker["serverId"], serde_json::json!(server_id));
+        assert_ne!(
+            fs::read(config.config_dir.join("server-state.json"))?,
+            placeholder_marker,
+            "the marker must now describe the PostgreSQL database"
+        );
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    drop_postgres_test_database(&database_name).await?;
+    result
+}

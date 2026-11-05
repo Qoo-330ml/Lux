@@ -763,7 +763,10 @@ pub(super) async fn refuse_empty_database_when_initialized(
     }
     let has_identity = match backend {
         DatabaseBackend::Sqlite => sqlite_database_has_identity(path).await?,
-        DatabaseBackend::Postgres => postgres_database_has_identity(database_url).await?,
+        DatabaseBackend::Postgres => {
+            postgres_database_has_identity(database_url).await?
+                || discard_marker_of_unused_placeholder(config_dir).await?
+        }
     };
     if has_identity {
         return Ok(());
@@ -771,6 +774,80 @@ pub(super) async fn refuse_empty_database_when_initialized(
     Err(StorageError::EmptyDatabase {
         path: path.to_path_buf(),
     })
+}
+
+/// True only when the marker's `serverId` is the identity of the SQLite database in the
+/// configuration directory and that database has never had a user.
+///
+/// "Never had a user" is the evidence that setup did not complete there, so nothing of value was
+/// ever stored: the marker was written for the wizard's placeholder. Any doubt (missing or
+/// unreadable marker or database, other identity, existing users) answers `false`, because the
+/// wrong `true` would lift the protection for a server that really was in use.
+async fn marker_belongs_to_unused_placeholder(config_dir: &Path) -> Result<bool, StorageError> {
+    let marker = config_dir.join(SERVER_STATE_FILE);
+    let Ok(bytes) = fs::read(&marker).await else {
+        return Ok(false);
+    };
+    let Some(marker_server_id) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|value| value.get("serverId")?.as_str().map(str::to_owned))
+    else {
+        return Ok(false);
+    };
+    let path = config_dir.join("lux.db");
+    if fs::metadata(&path).await.is_err() {
+        return Ok(false);
+    }
+    let Ok(options) = AnyConnectOptions::from_str(&format!("sqlite://{}?mode=ro", path.display()))
+    else {
+        return Ok(false);
+    };
+    let Ok(pool) = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+    else {
+        return Ok(false);
+    };
+    let answer = async {
+        let identity: Option<String> =
+            sqlx::query_scalar("SELECT value FROM lux_meta WHERE key = 'server_id'")
+                .fetch_optional(&pool)
+                .await?;
+        if identity.as_deref() != Some(marker_server_id.as_str()) {
+            return Ok::<bool, sqlx::Error>(false);
+        }
+        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&pool)
+            .await?;
+        Ok(users == 0)
+    }
+    .await
+    .unwrap_or(false);
+    pool.close().await;
+    Ok(answer)
+}
+
+/// Releases before the placeholder fix wrote the marker for the wizard's throwaway SQLite
+/// database, so choosing PostgreSQL afterwards looked like a lost database. When the marker provably
+/// belongs to that never-used placeholder it carries no information: drop it so the chosen
+/// database starts and records its own identity. Returns whether it was discarded.
+async fn discard_marker_of_unused_placeholder(config_dir: &Path) -> Result<bool, StorageError> {
+    if !marker_belongs_to_unused_placeholder(config_dir).await? {
+        return Ok(false);
+    }
+    tracing::warn!(
+        "server state marker was written for the setup placeholder database; discarding it"
+    );
+    let marker = config_dir.join(SERVER_STATE_FILE);
+    match fs::remove_file(&marker).await {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(source) => Err(StorageError::Io {
+            path: marker,
+            source,
+        }),
+    }
 }
 
 async fn server_state_marker_present(config_dir: &Path) -> Result<bool, StorageError> {
@@ -939,4 +1016,73 @@ pub(super) async fn record_server_state(
             path: marker,
             source,
         })
+}
+
+#[cfg(test)]
+mod stale_marker_tests {
+    use super::*;
+
+    async fn placeholder_with_marker(
+        users: i64,
+    ) -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: dir.path().to_path_buf(),
+        };
+        // Written the way a release before the fix did: no selection marker, so connecting records
+        // the server state for what is really only the wizard's placeholder.
+        let database = crate::storage::Database::connect(&config).await?;
+        for index in 0..users {
+            sqlx::query(
+                "INSERT INTO users (id, username_normalized, display_name, password_hash)
+                 VALUES (?, ?, ?, 'x')",
+            )
+            .bind(format!("user-{index}"))
+            .bind(format!("user{index}"))
+            .bind(format!("User {index}"))
+            .execute(database.pool())
+            .await?;
+        }
+        database.close().await;
+        assert!(dir.path().join(SERVER_STATE_FILE).exists());
+        Ok(dir)
+    }
+
+    #[tokio::test]
+    async fn a_marker_left_by_an_unused_placeholder_is_stale()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = placeholder_with_marker(0).await?;
+        assert!(marker_belongs_to_unused_placeholder(dir.path()).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_marker_of_a_database_that_has_users_is_not_stale()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = placeholder_with_marker(1).await?;
+        assert!(!marker_belongs_to_unused_placeholder(dir.path()).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_marker_without_its_database_is_not_stale() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = placeholder_with_marker(0).await?;
+        tokio::fs::remove_file(dir.path().join("lux.db")).await?;
+        assert!(!marker_belongs_to_unused_placeholder(dir.path()).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_marker_from_another_server_is_not_stale() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = placeholder_with_marker(0).await?;
+        tokio::fs::write(
+            dir.path().join(SERVER_STATE_FILE),
+            br#"{"serverId":"someone-else","initializedAt":1}"#,
+        )
+        .await?;
+        assert!(!marker_belongs_to_unused_placeholder(dir.path()).await?);
+        Ok(())
+    }
 }

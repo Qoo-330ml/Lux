@@ -1396,7 +1396,11 @@ impl Database {
                 path: path.clone(),
                 source,
             })?;
-        migration::record_server_state(&config.config_dir, &server_id).await?;
+        // While the wizard still has to pick a database, this one is a placeholder. Recording it
+        // would make the database chosen next look like a lost one at the restart setup requires.
+        if !config.database_selection_pending().await {
+            migration::record_server_state(&config.config_dir, &server_id).await?;
+        }
 
         Ok(Self {
             pool,
