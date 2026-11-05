@@ -329,7 +329,7 @@
 
 .lux-library-strategy-toggle-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
 
-.lux-library-strategy-image-limits { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 15px; }
+.lux-library-strategy-image-limits { grid-template-columns: minmax(0, 1fr); margin-top: 15px; }
 
 .lux-library-strategy-image-limits label { max-width: 340px; }
 
@@ -367,7 +367,7 @@
 
 .lux-level-policy-reset:hover { color: var(--lux-text); background: var(--lux-surface); }
 
-.lux-level-policy-table td:nth-child(5), .lux-level-policy-table td:nth-child(6) { max-width: 112px; }
+.lux-level-policy-table td:nth-child(5) { max-width: 112px; }
 
 .lux-library-strategy-footer { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 15px; color: var(--lux-muted); font-size: .73rem; }
 
@@ -395,7 +395,7 @@
 
 .lux-library-override-toggles .lux-library-strategy-toggle strong { font-size: .69rem; }
 
-.lux-library-override-fields { display: grid; grid-template-columns: 1.2fr .8fr .8fr; gap: 10px; }
+.lux-library-override-fields { display: grid; grid-template-columns: 1.2fr .8fr; gap: 10px; }
 
 .lux-library-override-fields label { display: grid; gap: 7px; color: var(--lux-muted); font-size: .71rem; }
 
@@ -2301,7 +2301,7 @@ html[data-lux-theme="light"] .lux-admin-library-page .lux-library-dialog select 
   .lux-library-strategy-form-grid, .lux-library-strategy-image-limits, .lux-library-strategy-toggle-grid { grid-template-columns: 1fr; }
   .lux-level-policy-table, .lux-level-policy-table thead, .lux-level-policy-table tbody, .lux-level-policy-table tr, .lux-level-policy-table th, .lux-level-policy-table td { display: block; width: 100%; }
   .lux-level-policy-table td { padding-left: 0; }
-  .lux-level-policy-table td:nth-child(5), .lux-level-policy-table td:nth-child(6) { max-width: none; }
+  .lux-level-policy-table td:nth-child(5) { max-width: none; }
   .lux-library-strategy-footer { align-items: stretch; flex-direction: column; }
   .lux-library-strategy-footer-actions { justify-content: stretch; }
   .lux-library-strategy-footer-actions .lux-library-toolbar-button { flex: 1; }

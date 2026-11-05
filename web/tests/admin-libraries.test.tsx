@@ -988,6 +988,16 @@ describe("AdminLibrariesPage library cards", () => {
     expect(stylesheet).toMatch(/\.lux-admin-scraper-field\s+\.lux-admin-scraper-clear\s*\{[^}]*width:\s*auto;[^}]*min-height:\s*32px;[^}]*white-space:\s*nowrap;/s);
   });
 
+  it("sizes the image strategy grids for the fields that remain", () => {
+    // Both grids lost the minimum-width field; a leftover empty track would show as a gap.
+    expect(allStyles).toMatch(/\.lux-library-strategy-image-limits\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\);/s);
+    expect(allStyles).toMatch(/\.lux-library-override-fields\s*\{[^}]*grid-template-columns:\s*1\.2fr \.8fr;/s);
+    // The removed width column was the only reason to cap two matrix cells; the scraper-role
+    // column must keep its full width.
+    expect(allStyles).not.toMatch(/\.lux-level-policy-table td:nth-child\(6\)/);
+    expect(allStyles).toMatch(/\.lux-level-policy-table td:nth-child\(5\)\s*\{ max-width: 112px; \}/);
+  });
+
   it("shows global image and subtitle defaults in the strategy view", async () => {
     await renderPage();
 
@@ -1003,6 +1013,8 @@ describe("AdminLibrariesPage library cards", () => {
     expect(container.textContent).toContain("光盘封面");
     expect(container.textContent).toContain("壁纸");
     expect(container.textContent).not.toContain("最小下载宽度");
+    // Only the backdrop count is left in that grid, so it must not occupy a second empty track.
+    expect(container.querySelector(".lux-library-strategy-image-limits")?.children).toHaveLength(1);
     expect(container.textContent).toContain("字幕默认值");
     expect(container.textContent).toContain("存储预估");
   });
@@ -1160,6 +1172,8 @@ describe("AdminLibrariesPage library cards", () => {
 
     const customMode = container.querySelectorAll<HTMLInputElement>(".lux-library-override-modes input")[1];
     await act(async () => customMode?.click());
+    // Metadata language and backdrop count remain; the width select no longer leaves a gap.
+    expect(container.querySelectorAll(".lux-library-override-fields > *")).toHaveLength(2);
     const thumbnailMode = container.querySelector<HTMLElement>("[role='radiogroup'][aria-label='缩略图刮削方式']");
     await act(async () => thumbnailMode?.querySelector<HTMLInputElement>("input[value='NONE']")?.click());
     await act(async () => {

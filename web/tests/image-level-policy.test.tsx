@@ -189,6 +189,22 @@ describe("image level policy editor preset controls", () => {
     expect(luxCombobox(container!, "单集背景图最小宽度")).toBeNull();
     expect(luxCombobox(container!, "电影海报最小宽度")).toBeNull();
     expect(container!.textContent).not.toContain("最小宽度");
+
+    // Every header must still own exactly one cell, so removing the width column cannot
+    // leave an empty track behind in any level table.
+    const tables = container!.querySelectorAll(".lux-level-policy-table");
+    expect(tables).toHaveLength(4);
+    for (const table of tables) {
+      const headers = [...table.querySelectorAll("thead th")].map(
+        (header) => header.textContent,
+      );
+      expect(headers).toEqual(["图片类型", "开关", "来源", "覆盖", "张数", "刮削器角色"]);
+      const rows = [...table.querySelectorAll("tbody tr")];
+      expect(rows.length).toBeGreaterThan(0);
+      for (const row of rows) {
+        expect(row.querySelectorAll("td")).toHaveLength(headers.length - 1);
+      }
+    }
   });
 });
 describe("inherit label follows the settings level", () => {
