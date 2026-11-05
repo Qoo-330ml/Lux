@@ -20036,7 +20036,15 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
   `prepare_scan_local_movie_image_batch_item` 和文件变化登记共用该分配器。电影扫描页为此每页多读一次
   `list_item_images_by_ids`（`enrich_movie_library` 的语句数 2 → 3）。
 - 登记兜底：`insert_item_images_batch_at_indices` 在同一事务内用 `NOT EXISTS` 跳过「`local_path` 已属于同
-  条目其它行」的记录，并在 Rust 侧丢弃同一页里重复路径的后一条；语句数不变，未加唯一约束、未加迁移。
+  条目**同类型其它索引**」的记录，并在 Rust 侧按 `(item_id, image_type, local_path)` 丢弃同一页里重复的
+  后一条；**跨类型共用路径仍然合法**（STRM 缩略图刻意把 `POSTER/0` 与 `THUMB/0` 登记到同一个
+  `{stem}-thumbnail.jpg`，该批次必须两行都写入、重复探测时 THUMB 行照常更新 tag）。语句数不变，未加唯一
+  约束、未加迁移。
+- 写侧并发兜底：`write_item_image_at_index_in_transaction`（下载/刮削写入的 upsert）在同一事务内再做一次
+  「同类型其它索引是否已登记该路径」检查（`WITH candidate … WHERE NOT EXISTS`）。写路径与扫描登记分别持有
+  `image_write_lock` 与 `metadata_write_lock`，扫描可能在写侧取快照之后、upsert 之前把同一路径登记到同类型
+  另一索引；此前纯 upsert 会静默造成两行同路径。冲突时返回 `StorageError::Conflict`（上层记为该次图片尝试
+  失败，下次刷新重新选路径），本行自己的路径仍可正常更新。
 - 未改 `candidates.rs` 的类型映射与 DISC 逻辑、未改插件与 Web、未做存量脏数据的一次性修复。
 
 验收：
@@ -20050,7 +20058,11 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
       一条），写 index A 自己可复用 P。
 - [x] 单元：盘上有 `fanart2.jpg` 时写 `FANART/2` 复用它；`fanart2.jpg` 已被别的行占用时不复用。
 - [x] 单元：`next_local_image_index` 在库里已有 0..3 时不再发出 0..3，已登记同一路径的文件保留原索引。
-- [x] 登记层：同一页里重复的 `local_path` 只登记一次；路径已被其它行占用时跳过而不是改号。
+- [x] 登记层：同一页里重复的 `local_path`（同类型不同索引）只登记一次；路径已被同类型其它索引占用时
+      跳过而不是改号；跨类型共用路径（STRM 缩略图 `POSTER/0` + `THUMB/0` 同一文件）两行都写入，重复登记
+      更新 tag。
+- [x] 写侧并发：模拟「写侧取快照之后、upsert 之前」扫描把同一路径登记到同类型另一索引，upsert 返回
+      `StorageError::Conflict`，占位行不被改写；本行自己的路径仍可正常刷新。
 - [x] 回归：ART/BANNER/THUMB/WALLPAPER 用同一个上游 URL 时仍落成四个独立文件与四行登记
       （`artwork_types_fed_by_one_source_write_distinct_files`）、episode 的 THUMB/FANART 隔离、
       `image_repairs` 现有用例保持通过。
@@ -20062,33 +20074,57 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
 实施结果（2026-11-05，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 验证）：按 TDD 先写失败用例
 （`rescan_between_image_refreshes_keeps_indexes_on_their_own_files` 在修复前报
 `FANART/1 should stay on fanart1.jpg, got …-backdrop1.png`），再实现到全绿。任务编号接 `LUX-885`（并行任务
-取 `LUX-886`）。
+取 `LUX-886`，已把 `tspace/keep-existing-disc`（LUX-886）合入本分支；`test` 当时尚未包含该任务，冲突仅在
+文档：两条任务条目并存、TEST-TARGETS 计数按两任务叠加）。
 
-验证命令与结果：
+返工（独立审查后，2026-11-05）：
 
-- `cargo test --locked --lib`：1951 通过 / 40 跳过（`#[ignore]` 含 PostgreSQL 用例）/ 2 条既有偶发失败
-  （`probe` 与 `watch` 各一条，与图片无关，单独重跑均通过）；含新增 5 条库内用例：图片写入冲突、旁车复用、
-  服务层同类型隔离、索引分配、登记跳过。
-- `cargo test --locked --lib images::` 35/35、`--lib metadata::` 35/35、`--lib candidates::` 44/44、
-  `--lib image_repairs::` 1/1（`candidates` 仅确认未被牵连）。
+- P1：初版把批量登记去重键写成 `(item_id, local_path)`，会连同**跨类型**共用路径的第二行一起跳过，破坏
+  STRM 缩略图 `POSTER/0` + `THUMB/0` 同文件的既定行为（`--test strm` 的
+  `strm_probe_plugin_persists_media_info_and_compatible_sidecar` 由 2 行变 1 行）。现在去重键与 SQL
+  `NOT EXISTS` 都限定为同类型其它索引；先复现失败（`assert_eq!(left: 1, right: 2)`），再修到通过，并在
+  `repository_tests` 增加跨类型共用路径两行写入 + 重复登记更新 tag 的断言。
+- P2：写侧 upsert 原文没有事务内兜底，快照与 upsert 之间扫描把同一路径登记到同类型另一索引时仍会共用。
+  现在加事务内 `NOT EXISTS` 检查并返回 `StorageError::Conflict`，用「手工插入占位行模拟交错」的用例锁定。
+- 复核 `insert_item_images_batch_at_indices` 的全部调用方：`metadata.rs` 的文件变化登记、电影扫描页（含
+  逐项重试）、series 批量/单项登记，以及 `strm_probe.rs` 的缩略图批次；前四者都是同类型路径唯一的本地登记，
+  只有 STRM 缩略图刻意跨类型共用，本次按类型限定后行为恢复。
+
+验证命令与结果（返工后，合并 LUX-886 基线）：
+
+- `cargo test --locked --lib`：1954 通过 / 40 跳过 / 2 条既有偶发失败（`probe` 与 `watch` 各一条，与图片
+  无关，单独重跑均通过；与本任务返工前同一组偶发用例）。
+- `cargo test --locked --lib images::` 36/36、`--lib metadata::` 35/35、`--lib candidates::` 45/45
+  （含 LUX-886 的用例，仅确认未被牵连）。
 - `cargo test --locked --test images` 66/66（新增 1 条同源异文件回归）、`cargo test --locked --test metadata`
-  151/151（`metadata_selection` 新增 1 条）。
+  157/157（`metadata_selection` 新增 1 条；总数含 LUX-886 的 6 条）、`cargo test --locked --test strm` 42/42
+  （含 STRM 缩略图 `POSTER/0` + `THUMB/0` 同文件用例；返工前该用例因跨类型去重失败为
+  `left: 1, right: 2`）。
+- 库内新增 6 条用例：图片写入冲突、旁车复用、服务层同类型隔离、索引分配、交错 upsert 拒绝、冲突错误保持可重试；
+  另扩展批量登记与旁车命名两条既有用例（跨类型共用路径两行写入 + 重复登记更新 tag）。
 - `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
   `python3 scripts/check-backend-branches.py`、`python3 scripts/check-migration-parity.py` 通过。
 
 限制与剩余风险：
 
 - **已经存在的共用路径脏数据不会自动修复**：本次只保证新的写入、重扫与登记不再制造或扩大共用路径。库里已经
-  有两行指向同一文件时，重扫会把该文件登记到其中最小索引（另一行保留旧 tag），要彻底清理需要单独的一次性
-  修复任务（评估后另行处理，本次不做）。`image_repairs` 的 episode THUMB/FANART 修复范围也未扩大。
-- 数据库允许「一行的 `local_path` 与非同类型另一行相同」的历史数据继续存在；登记层只跳过**新**写入的重复
-  路径，不改已有行。未加唯一约束（按要求不改 schema）。
+  有两行（同类型不同索引）指向同一文件时，重扫会为该文件算出其中一个已登记索引，但批量登记的 `NOT EXISTS`
+  发现另一索引也登记着同一路径，于是**该记录被整条跳过**（同一页的其他图片照常登记）：两行都不更新，tag
+  保持原样（不会刷新、也不会让最小索引行"接管"文件）。写侧会在写文件前重读登记再校验一次，遇到同一路径
+  返回 `ConcurrentModification`（可重试），不会改写该文件。要彻底清理需要单独的一次性修复任务（评估后另行
+  处理，本次不做），`image_repairs` 的 episode THUMB/FANART 修复范围也未扩大。
+- 写文件与 upsert 之间仍有极窄窗口：若扫描恰好在这段时间把该路径登记到同类型另一索引，文件已被覆盖，而
+  upsert 会返回 `StorageError::Conflict`（上层转为 `ConcurrentModification`）。由于本索引行没有写入，下一次
+  重扫会按该路径刷新占用行的 tag，不会留下"两行同路径"的登记。
+- 跨类型共用登记路径是既定合法行为（STRM 缩略图），本次**不**拦截；数据库里已有的跨类型同路径行既不会被跳过
+  也不会被改写。同类型不同索引的已有共用行同样保留，未加唯一约束（按要求不改 schema）。
 - 写入侧优先复用扫描认可的 `fanart{k}` 会把在线图片内容写进 `.jpg` 扩展名的旁车（索引 0 早已如此）；这是既有
   行为，本次没有统一扩展名。副作用是「完整刷新」现在会**覆盖**用户放在 `fanart2.jpg` 这类带索引旁车里的文件
   （修复前这类旁车会被当成孤儿留下，刷新另建 `-backdrop{k}`）；这是让「索引 k ↔ 文件名」成立所必需的，但
   用户自定义的多背景图会被在线图替换，需要保留时请关闭对应类型的覆盖策略。
-- `insert_item_images_batch_at_indices` 的新 SQL 用 `WITH … VALUES … INSERT … SELECT … WHERE NOT EXISTS`
-  （SQLite 与 PostgreSQL 共用）；本机只跑了 SQLite，PostgreSQL 用例按仓库惯例需要本地实例，未执行。
+- 批量登记与单行 upsert 的新 SQL 都用 `WITH … VALUES … INSERT … SELECT … WHERE NOT EXISTS`（SQLite 与
+  PostgreSQL 共用）；本机只跑了 SQLite，PostgreSQL 用例按仓库惯例需要本地实例，未执行。单行 upsert 用
+  `rows_affected() == 0` 判定冲突，依赖两个后端都把被 `NOT EXISTS` 过滤掉的语句计为 0 行。
 - 电影扫描每页多一次 `list_item_images_by_ids` 读取（有索引、每页最多 16 项）；`enrich_movie_library` 的语句数
   2 → 3，已同步更新对应单测断言。
 - 未在真实 TMDb 刮削与第三方 Emby 客户端上复测图片刷新后的 ETag/cache 行为，只用 stub 与集成用例覆盖。
