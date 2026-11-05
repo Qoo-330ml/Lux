@@ -26,8 +26,11 @@
 
 # Local tool caches and build artifacts (never part of a commit)
 /.pnpm-store/
+/.pnpm/
 /.vite/
 /.tscli/
+/.cache/
+/.playwright-browsers/
 /.rustc_info.json
 /debug/
 

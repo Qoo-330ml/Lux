@@ -38,6 +38,27 @@
 - Emby routes/DTOs remain separate from Lux API routes/DTOs and domain types.
 - All lists are paginated and have a server-side upper bound.
 
+## Build output location
+
+This checkout lives on the external drive (`/Volumes/Toshiba/mywork/Lux`) with ample free space.
+The internal SSD is small, and heavy writes to built-in-disk paths repeatedly froze this machine.
+
+- Write every build artifact, cache, test fixture, benchmark work directory, log and screenshot
+  inside this project directory: Rust to `target/`, Web to `web/node_modules/` and `web/dist/`,
+  temporary data to `.tmp/`.
+- Never use `/tmp`, `/private/tmp`, `/var/tmp`, `/var/folders`, `~/Library/Caches` or `~/.cache`
+  as a project build, test, benchmark or scratch location, and never copy the repo or `target/`
+  onto the internal disk to compile or compare.
+- Before any build or test command, run `source scripts/lux-env.sh`; it points
+  `CARGO_TARGET_DIR`, `TMPDIR`, `SQLITE_TMPDIR`, `XDG_CACHE_HOME`, `PNPM_HOME` and
+  `PLAYWRIGHT_BROWSERS_PATH` at project directories.
+- New scripts create scratch space with
+  `mktemp -d "${LUX_ROOT}/.tmp/<purpose>.XXXXXX"`, not bare `mktemp -d`.
+- Docker build cache lives in the Docker Desktop VM image on the internal disk; relocate that image
+  or prune the builder before and after large builds, and keep build contexts out of `/private/tmp`.
+- Delete scratch directories when the task ends and verify with section 6 of
+  `docs/BUILD-OUTPUT-LOCATIONS.md` that the internal disk did not grow.
+
 ## Security and reliability rules
 
 - Never commit passwords, user tokens, cookies, real `.strm` URLs, or user data. The project owner has explicitly approved the fixed third-party TMDb fallback key embedded in the built-in TMDb implementation; it must never be returned by an API or written to logs.

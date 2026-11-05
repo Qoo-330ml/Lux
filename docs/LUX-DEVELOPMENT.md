@@ -756,6 +756,23 @@ docker compose up
 
 scripts/check-all.sh 应只是上述命令的可移植封装，不隐藏错误、不自动修改文件。
 
+### 9.1 构建产物和临时文件位置
+
+本项目位于外置盘 `/Volumes/Toshiba/mywork/Lux`，构建空间充足；内置 SSD 长期只剩 20–30 GiB，
+承载 GB 级增量构建和测试临时数据时会持续高 I/O 并令整机卡死。因此：
+
+- 所有构建产物、缓存、测试 fixture、基准工作目录、日志和截图必须写在项目文件夹内：
+  Rust 用 `target/`，Web 用 `web/node_modules/`、`web/dist/`，临时数据统一用 `.tmp/`。
+- 禁止把项目文件、构建输出或实验目录写到 `/tmp`、`/private/tmp`、`/var/tmp`、
+  `/var/folders`、`~/Library/Caches`、`~/.cache` 等内置盘位置。
+- 运行上述任何命令前先加载 `scripts/lux-env.sh`，它导出 `CARGO_TARGET_DIR`、`TMPDIR`、
+  `SQLITE_TMPDIR`、`XDG_CACHE_HOME`、`PNPM_HOME`、`PLAYWRIGHT_BROWSERS_PATH` 到项目目录。
+- 新建脚本的临时目录使用 `mktemp -d "${LUX_ROOT}/.tmp/<用途>.XXXXXX"`，不用裸 `mktemp -d`。
+- Docker 构建缓存位于 Docker Desktop 虚拟磁盘映像内，大规模构建前先把映像迁到外置盘或构建后
+  `docker builder prune -af`，不要用 `/private/tmp` 存放 build context 或导出镜像。
+
+完整规则、各工具落盘位置、验证命令和清理流程见 `docs/BUILD-OUTPUT-LOCATIONS.md`。
+
 ---
 
 ## 10. 代码风格和工程边界
