@@ -534,6 +534,25 @@ impl MetadataCandidateService {
         self.list_pending_for_current(item_id, current).await
     }
 
+    /// Manual candidate searches reject items that are soft-deleted or whose library is
+    /// disabled. This used to fall out of the media-strategy lookup that also supplied the
+    /// (now removed) image-width policy; only its availability result remains. Automatic
+    /// plans already carry a resolved policy and deliberately skip this read.
+    async fn ensure_candidate_item_available(
+        &self,
+        item_id: &str,
+        plan: MetadataRequestPlan,
+    ) -> Result<(), MetadataCandidateError> {
+        if plan.image_policy.is_some() {
+            return Ok(());
+        }
+        self.database
+            .find_item_media_strategy_settings(item_id)
+            .await?
+            .ok_or(MetadataCandidateError::ItemNotFound)?;
+        Ok(())
+    }
+
     pub async fn search_and_store(
         &self,
         item_id: &str,
@@ -742,6 +761,7 @@ impl MetadataCandidateService {
             MediaKind::Series => crate::application::scraper::ScraperItemType::Series,
             MediaKind::Episode => return Err(MetadataCandidateError::InvalidSearch),
         };
+        self.ensure_candidate_item_available(item_id, plan).await?;
         let direct_provider_id = selected_scraper_provider_id(current, scraper).filter(|_| {
             if plan != MetadataRequestPlan::full() {
                 return true;
@@ -1427,6 +1447,7 @@ impl MetadataCandidateService {
             "EPISODE" => ScraperItemType::Episode,
             _ => return Err(MetadataCandidateError::InvalidSearch),
         };
+        self.ensure_candidate_item_available(item_id, plan).await?;
         let season_number = current
             .season_number
             .and_then(|value| i32::try_from(value).ok())
@@ -5256,17 +5277,17 @@ mod tests {
     use super::{
         ACTOR_METADATA_FETCH_CONCURRENCY, ArtworkOverwrite, COMPLETENESS_PLAN_ITEM_CONCURRENCY,
         EpisodeImagePolicy, FillMissingRequestPlan, ImageLevel, ImageSelectionPolicy,
-        MAX_ACTOR_DETAIL_FETCHES, MetadataCandidateService, MetadataRequestPlan,
-        MetadataSelectionMode, MetadataSelectionService, SCRAPER_IMAGE_TYPES, ScraperRoles,
-        SelectionInputs, candidate_actor_credits, candidate_actors, candidate_images_by_type,
-        candidate_payload, capability_needs_request, completeness_capabilities,
-        credits_need_actor_relation_check, default_image_selection_policy, enrich_actor_metadata,
-        explicitly_unavailable_image_types, generic_candidate_actors, image_attempt_identities,
-        local_metadata_completeness_plan, merge_actor_values, merge_supplemental_movie_nfo,
-        metadata_completeness_fingerprint, metadata_match_score, metadata_request_plan,
-        metadata_request_plan_has_work, parse_image_selection_policy,
-        replace_provider_id_with_candidate, run_bounded_completeness_plan_tasks,
-        selected_scraper_provider_id,
+        MAX_ACTOR_DETAIL_FETCHES, MetadataCandidateError, MetadataCandidateService,
+        MetadataRequestPlan, MetadataSelectionMode, MetadataSelectionService, SCRAPER_IMAGE_TYPES,
+        ScraperRoles, SelectionInputs, candidate_actor_credits, candidate_actors,
+        candidate_images_by_type, candidate_payload, capability_needs_request,
+        completeness_capabilities, credits_need_actor_relation_check,
+        default_image_selection_policy, enrich_actor_metadata, explicitly_unavailable_image_types,
+        generic_candidate_actors, image_attempt_identities, local_metadata_completeness_plan,
+        merge_actor_values, merge_supplemental_movie_nfo, metadata_completeness_fingerprint,
+        metadata_match_score, metadata_request_plan, metadata_request_plan_has_work,
+        parse_image_selection_policy, replace_provider_id_with_candidate,
+        run_bounded_completeness_plan_tasks, selected_scraper_provider_id,
     };
     use crate::application::images::ImageWriteService;
     use crate::application::scraper::{
@@ -5862,6 +5883,139 @@ mod tests {
         .fetch_one(database.pool())
         .await?;
         assert_eq!(capability_rows, 60);
+        database.close().await;
+        Ok(())
+    }
+
+    /// Soft-deletes every catalog item in the fixture's database.
+    async fn soft_delete_fixture_items(
+        database: &Database,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        sqlx::query("UPDATE media_items SET removed_at = unixepoch()")
+            .execute(database.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// Disables the fixture's library without touching its items.
+    async fn disable_fixture_library(
+        database: &Database,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        sqlx::query("UPDATE libraries SET is_enabled = 0")
+            .execute(database.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// Inserts a plain season row in the fixture's library, enough to reach the child branch.
+    async fn insert_season_item(database: &Database) -> Result<String, Box<dyn std::error::Error>> {
+        let library_id: String = sqlx::query_scalar("SELECT library_id FROM media_items LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+        let item_id = "season-for-availability".to_owned();
+        sqlx::query(
+            "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, season_number,
+                    identification_status, has_available_source
+                 ) VALUES (?, ?, 'SEASON', 'Season 1', 'season 1', 1, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&item_id)
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        Ok(item_id)
+    }
+
+    async fn stored_candidate_count(
+        database: &Database,
+        item_id: &str,
+    ) -> Result<i64, Box<dyn std::error::Error>> {
+        Ok(
+            sqlx::query_scalar("SELECT COUNT(*) FROM metadata_candidates WHERE item_id = ?")
+                .bind(item_id)
+                .fetch_one(database.pool())
+                .await?,
+        )
+    }
+
+    // Manual searches used to reject soft-deleted items and items in disabled libraries through
+    // the media-strategy lookup that also supplied the (now removed) width policy. Only the
+    // availability result of that lookup must survive.
+
+    #[tokio::test]
+    async fn manual_movie_search_rejects_a_soft_deleted_item()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, item_id, _directory) = candidate_search_fixture().await?;
+        let service = MetadataCandidateService::new(database.clone());
+        let scraper = ScraperProvider::from_adapter(ManyCandidateAdapter { candidates: 1 });
+
+        soft_delete_fixture_items(&database).await?;
+        assert!(matches!(
+            service
+                .search_and_store(&item_id, "Example", None, &scraper)
+                .await,
+            Err(MetadataCandidateError::ItemNotFound)
+        ));
+        assert_eq!(stored_candidate_count(&database, &item_id).await?, 0);
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_movie_search_rejects_an_item_in_a_disabled_library()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, item_id, _directory) = candidate_search_fixture().await?;
+        let service = MetadataCandidateService::new(database.clone());
+        let scraper = ScraperProvider::from_adapter(ManyCandidateAdapter { candidates: 1 });
+
+        disable_fixture_library(&database).await?;
+        assert!(matches!(
+            service
+                .search_and_store(&item_id, "Example", None, &scraper)
+                .await,
+            Err(MetadataCandidateError::ItemNotFound)
+        ));
+        assert_eq!(stored_candidate_count(&database, &item_id).await?, 0);
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_child_search_rejects_a_soft_deleted_item()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, _movie_id, _directory) = candidate_search_fixture().await?;
+        let season_id = insert_season_item(&database).await?;
+        let service = MetadataCandidateService::new(database.clone());
+        let scraper = ScraperProvider::from_adapter(ManyCandidateAdapter { candidates: 1 });
+
+        soft_delete_fixture_items(&database).await?;
+        assert!(matches!(
+            service
+                .search_and_store(&season_id, "Example", None, &scraper)
+                .await,
+            Err(MetadataCandidateError::ItemNotFound)
+        ));
+        assert_eq!(stored_candidate_count(&database, &season_id).await?, 0);
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_child_search_rejects_an_item_in_a_disabled_library()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, _movie_id, _directory) = candidate_search_fixture().await?;
+        let season_id = insert_season_item(&database).await?;
+        let service = MetadataCandidateService::new(database.clone());
+        let scraper = ScraperProvider::from_adapter(ManyCandidateAdapter { candidates: 1 });
+
+        disable_fixture_library(&database).await?;
+        assert!(matches!(
+            service
+                .search_and_store(&season_id, "Example", None, &scraper)
+                .await,
+            Err(MetadataCandidateError::ItemNotFound)
+        ));
+        assert_eq!(stored_candidate_count(&database, &season_id).await?, 0);
         database.close().await;
         Ok(())
     }
