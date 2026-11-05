@@ -2332,10 +2332,12 @@ fn candidate_images_by_type(
 /// `DISC` candidate URLs separated by where the candidate got them from.
 #[derive(Default)]
 struct CandidateDiscUrls {
-    /// URLs an upstream `Disc` typed image supplied; they keep the normal overwrite rules.
+    /// URLs an upstream `Disc` typed image supplied; they are tried first and keep the normal
+    /// overwrite rules.
     explicit: Vec<String>,
     /// URLs that only reached `DISC` because a `Primary`/`Poster` typed image fills both types.
-    /// They are a fallback for an item without disc artwork and are never written otherwise.
+    /// They are the fallback for an item without disc artwork, used only when no explicit disc
+    /// candidate produced an image.
     poster_fallback: Vec<String>,
 }
 
@@ -2343,9 +2345,8 @@ struct CandidateDiscUrls {
 ///
 /// `Primary`/`Poster` typed images are stored under both `POSTER` and `DISC`, so the candidate
 /// map cannot tell the two apart by key alone: a poster URL appears in both buckets. The poster
-/// bucket is the marker, and this split keeps the fallback from replacing real disc artwork.
-/// When the candidate also carries an explicit disc image, that image wins and the poster
-/// fallback is dropped so the same type is not written twice.
+/// bucket is the marker. Both lists are kept because the fallback is still needed when every
+/// explicit disc URL fails.
 fn candidate_disc_urls(images: &BTreeMap<String, Vec<String>>) -> CandidateDiscUrls {
     let poster_urls = images.get("POSTER").map(Vec::as_slice).unwrap_or_default();
     let mut urls = CandidateDiscUrls::default();
@@ -2355,9 +2356,6 @@ fn candidate_disc_urls(images: &BTreeMap<String, Vec<String>>) -> CandidateDiscU
         } else {
             urls.explicit.push(url.clone());
         }
-    }
-    if !urls.explicit.is_empty() {
-        urls.poster_fallback.clear();
     }
     urls
 }
@@ -3526,20 +3524,18 @@ impl MetadataSelectionService {
                 specs.push(("FANART", vec![url], 0));
             }
         }
-        // A poster stands in for disc artwork only when the item has none. The item may have the
-        // disc as a local file, as a registered `item_images` row or as artwork owned by another
-        // type, so ask the image writer instead of trusting the candidate map. Explicit `Disc`
-        // candidates were handled above and keep the overwrite semantics of a full refresh.
+        // A poster stands in for disc artwork only as the last attempt: the explicit `Disc`
+        // candidates are written first, and the poster URLs are used only when none of them
+        // produced an image and the item still has no disc artwork. Whether the item already has
+        // disc artwork is checked right before that attempt, where a failed probe can be handled
+        // without failing the selection.
         let disc_policy = image_policy.type_policy_for_item_type(item_type, "DISC");
-        if !disc_urls.poster_fallback.is_empty()
+        let poster_disc_fallback = (!disc_urls.poster_fallback.is_empty()
             && disc_policy.enabled
             && max_count_for("DISC") > 0
             && scraper_allowed("DISC")
-            && !screenshot_fallback_types.contains("DISC")
-            && !self.images.has_local_image(item_id, "DISC").await?
-        {
-            add_spec!("DISC", disc_urls.poster_fallback.clone());
-        }
+            && !screenshot_fallback_types.contains("DISC"))
+        .then(|| disc_urls.poster_fallback.clone());
         let item_permits = Arc::new(Semaphore::new(IMAGE_ITEM_CONCURRENCY));
         let mut tasks = JoinSet::new();
         for (index, (image_type, urls, image_index)) in specs.into_iter().enumerate() {
@@ -3637,7 +3633,63 @@ impl MetadataSelectionService {
                 result.push(image_type);
             }
         }
+        // Last attempt for disc artwork: every explicit `Disc` candidate failed (or the candidate
+        // only had poster-derived URLs), so use the poster when the item still has no disc. A
+        // failed probe must not fail the whole selection, so `disc_artwork_present` reports
+        // "present" on errors and only logs a desensitized warning.
+        if let Some(poster_urls) = poster_disc_fallback
+            && !result.contains(&"DISC")
+            && !self.disc_artwork_present(item_id).await
+        {
+            let mut written = false;
+            let mut failed = false;
+            for url in poster_urls.into_iter().take(4) {
+                match self
+                    .images
+                    .try_download_item_image_if_missing_from_scraper_at_index(
+                        item_id, "DISC", &url, source, 0,
+                    )
+                    .await
+                {
+                    Ok(Some(_)) => {
+                        written = true;
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(_) => failed = true,
+                }
+            }
+            if written {
+                result.push("DISC");
+            } else if failed {
+                tracing::warn!(
+                    item_id,
+                    image_type = "DISC",
+                    "metadata image candidates were unavailable"
+                );
+            }
+        }
         Ok(result)
+    }
+
+    /// Whether the item already has disc artwork.
+    ///
+    /// The probe is optional groundwork for the poster fallback, and it can fail on paths the
+    /// writer deliberately refuses to follow (for example a symlinked `disc.jpg`). Such a failure
+    /// counts as "present" so the fallback is skipped and the selection keeps going; the warning
+    /// carries no path or URL.
+    async fn disc_artwork_present(&self, item_id: &str) -> bool {
+        match self.images.has_local_image(item_id, "DISC").await {
+            Ok(present) => present,
+            Err(_) => {
+                tracing::warn!(
+                    item_id,
+                    image_type = "DISC",
+                    "could not check existing disc artwork; skipping the poster fallback"
+                );
+                true
+            }
+        }
     }
 
     async fn filter_new_supplemental_image_urls(
@@ -7273,17 +7325,18 @@ mod tests {
     }
 
     #[test]
-    fn explicit_disc_candidates_keep_their_urls_and_suppress_the_poster_fallback() {
+    fn explicit_disc_candidates_keep_the_poster_fallback_for_a_later_attempt() {
         let poster = "https://images.example/poster".to_owned();
         let disc = "https://images.example/disc".to_owned();
         let mut combined = BTreeMap::new();
         combined.insert("POSTER".to_owned(), vec![poster.clone()]);
-        combined.insert("DISC".to_owned(), vec![poster, disc.clone()]);
+        combined.insert("DISC".to_owned(), vec![poster.clone(), disc.clone()]);
         let urls = candidate_disc_urls(&combined);
         assert_eq!(urls.explicit, vec![disc.clone()]);
-        assert!(
-            urls.poster_fallback.is_empty(),
-            "an explicit disc image must not add a second DISC write"
+        assert_eq!(
+            urls.poster_fallback,
+            vec![poster.clone()],
+            "the poster URLs must stay available when every explicit Disc URL fails"
         );
 
         let mut explicit_only = BTreeMap::new();
@@ -7291,6 +7344,13 @@ mod tests {
         let urls = candidate_disc_urls(&explicit_only);
         assert_eq!(urls.explicit, vec![disc]);
         assert!(urls.poster_fallback.is_empty());
+
+        let mut poster_only = BTreeMap::new();
+        poster_only.insert("POSTER".to_owned(), vec![poster.clone()]);
+        poster_only.insert("DISC".to_owned(), vec![poster.clone()]);
+        let urls = candidate_disc_urls(&poster_only);
+        assert!(urls.explicit.is_empty());
+        assert_eq!(urls.poster_fallback, vec![poster]);
 
         let urls = candidate_disc_urls(&BTreeMap::new());
         assert!(urls.explicit.is_empty());
