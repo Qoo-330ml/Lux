@@ -500,6 +500,167 @@ async fn full_refresh_preserves_locked_nfo_fields_and_replaces_existing_images()
     Ok(())
 }
 
+/// A `Primary`/`Poster` typed image feeds both `POSTER` and `DISC`, so the stored candidate JSON
+/// carries the same URL under both keys. That disc entry is only a fallback: refreshing an item
+/// that already has a disc must not replace `disc.jpg` with the poster bytes.
+#[tokio::test]
+async fn full_refresh_keeps_existing_disc_artwork_when_the_candidate_only_has_a_poster()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    configure_image_strategy(&fixture.database, &fixture.item_id).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let disc_path = fixture.movie_dir.join("disc.jpg");
+    tokio::fs::write(&disc_path, b"existing-disc").await?;
+    let poster_url = format!("{image_url}/poster");
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Online Title",
+            "images": {
+                "POSTER": [poster_url.clone()],
+                "DISC": [poster_url.clone()]
+            }
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+    );
+
+    let report = selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::RefreshUnlocked,
+        )
+        .await?;
+
+    assert_eq!(
+        report.image_types,
+        vec!["POSTER"],
+        "a poster-derived DISC must not be written when the item already has disc artwork"
+    );
+    assert_eq!(
+        tokio::fs::read(&disc_path).await?,
+        b"existing-disc",
+        "a full refresh must not overwrite the existing disc artwork with the poster"
+    );
+    assert_eq!(
+        tokio::fs::read(fixture.movie_dir.join("poster.png")).await?,
+        PNG_1X1,
+        "the poster itself must still be refreshed"
+    );
+
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn full_refresh_still_fills_a_missing_disc_with_the_poster_fallback()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    configure_image_strategy(&fixture.database, &fixture.item_id).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let poster_url = format!("{image_url}/poster");
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Online Title",
+            "images": {
+                "POSTER": [poster_url.clone()],
+                "DISC": [poster_url.clone()]
+            }
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+    );
+
+    let report = selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::RefreshUnlocked,
+        )
+        .await?;
+
+    assert!(
+        report.image_types.contains(&"DISC"),
+        "an item without disc artwork must still get the poster fallback"
+    );
+    assert_eq!(
+        tokio::fs::read(fixture.movie_dir.join("disc.png")).await?,
+        PNG_1X1
+    );
+    let source_url: Option<String> = sqlx::query_scalar(
+        "SELECT source_url FROM item_images WHERE item_id = ? AND image_type = 'DISC'",
+    )
+    .bind(&fixture.item_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(source_url.as_deref(), Some(poster_url.as_str()));
+
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn full_refresh_uses_an_explicit_disc_candidate_over_existing_disc_artwork()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    configure_image_strategy(&fixture.database, &fixture.item_id).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let disc_path = fixture.movie_dir.join("disc.jpg");
+    tokio::fs::write(&disc_path, b"existing-disc").await?;
+    let disc_url = format!("{image_url}/disc");
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Online Title",
+            "images": {
+                "POSTER": [format!("{image_url}/poster")],
+                "DISC": [disc_url.clone()]
+            }
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+    );
+
+    let report = selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::RefreshUnlocked,
+        )
+        .await?;
+
+    assert!(report.image_types.contains(&"DISC"));
+    assert_eq!(
+        tokio::fs::read(&disc_path).await?,
+        PNG_1X1,
+        "an explicit Disc candidate keeps the overwrite semantics of a full refresh"
+    );
+    let source_url: Option<String> = sqlx::query_scalar(
+        "SELECT source_url FROM item_images WHERE item_id = ? AND image_type = 'DISC'",
+    )
+    .bind(&fixture.item_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(source_url.as_deref(), Some(disc_url.as_str()));
+
+    image_server.abort();
+    Ok(())
+}
+
 #[tokio::test]
 async fn full_refresh_keeps_nfo_when_image_download_fails() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -3493,7 +3654,7 @@ async fn start_image_stub()
                     .header(CONTENT_TYPE, "image/png")
                     .body(Body::from(b"broken".to_vec()))
                     .unwrap(),
-                "poster-first" | "logo" | "thumb" | "banner" | "art" | "wallpaper" => {
+                "poster-first" | "logo" | "thumb" | "banner" | "art" | "wallpaper" | "disc" => {
                     Response::builder()
                         .header(CONTENT_TYPE, "image/png")
                         .body(Body::from(PNG_1X1.to_vec()))
