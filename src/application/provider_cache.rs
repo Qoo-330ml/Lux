@@ -355,7 +355,7 @@ impl ProviderResponseCache {
             state.entries.clear();
             state.expiry_order.clear();
         }
-        self.schedule_persist().await;
+        self.persist_after_clear().await;
     }
 
     /// Drops every cached response of one provider.
@@ -375,7 +375,19 @@ impl ProviderResponseCache {
             state.remove_provider(provider)
         };
         if removed > 0 {
-            self.schedule_persist().await;
+            self.persist_after_clear().await;
+        }
+    }
+
+    /// Writes the cleared state synchronously so a restart right after a config save cannot reload
+    /// the removed responses from disk. Failures are logged without request data and never affect
+    /// the caller.
+    async fn persist_after_clear(&self) {
+        if self.path.is_none() {
+            return;
+        }
+        if !self.persist_now().await {
+            tracing::warn!("provider response cache could not be persisted after it was cleared");
         }
     }
 
@@ -905,6 +917,79 @@ mod tests {
         );
         owner.finish();
         assert!(matches!(cache.begin(&key).await, CacheLookup::Owner(_)));
+    }
+
+    #[tokio::test]
+    async fn clearing_a_provider_persists_immediately_without_waiting_for_the_debounce() {
+        let directory = tempfile::tempdir().expect("temporary cache directory");
+        let path = directory.path().join("provider-cache.json");
+        let cache = ProviderResponseCache::new(Some(path.clone()));
+        let tmdb_images = super::cache_key(
+            "org.lux.tmdb",
+            "metadata.images",
+            &json!({"providerId": "603"}),
+        )
+        .expect("tmdb images key");
+        let douban_images = super::cache_key(
+            "org.lux.douban",
+            "metadata.images",
+            &json!({"providerId": "603"}),
+        )
+        .expect("douban images key");
+        for (key, value) in [
+            (&tmdb_images, json!({"images": [1]})),
+            (&douban_images, json!({"images": [2]})),
+        ] {
+            let CacheLookup::Owner(owner) = cache.begin(key).await else {
+                panic!("first request should own {key}");
+            };
+            cache.store_shared(key, Arc::new(value), 60).await;
+            owner.finish();
+        }
+        cache.flush().await;
+
+        cache.clear_provider("org.lux.tmdb").await;
+
+        // No `flush()` and no debounce wait: a restart right after the clear must not reload the
+        // removed entry from the persisted file.
+        let restored = ProviderResponseCache::new(Some(path));
+        assert!(matches!(
+            restored.begin(&tmdb_images).await,
+            CacheLookup::Owner(_)
+        ));
+        assert!(matches!(
+            restored.begin(&douban_images).await,
+            CacheLookup::Hit(value) if value["images"][0] == 2
+        ));
+    }
+
+    #[tokio::test]
+    async fn clearing_the_whole_cache_persists_immediately_without_waiting_for_the_debounce() {
+        let directory = tempfile::tempdir().expect("temporary cache directory");
+        let path = directory.path().join("provider-cache.json");
+        let cache = ProviderResponseCache::new(Some(path.clone()));
+        for key in ["first", "second"] {
+            let CacheLookup::Owner(owner) = cache.begin(key).await else {
+                panic!("first request should own {key}");
+            };
+            cache
+                .store_shared(key, Arc::new(json!({"id": key})), 60)
+                .await;
+            owner.finish();
+        }
+        cache.flush().await;
+
+        cache.clear().await;
+
+        let restored = ProviderResponseCache::new(Some(path));
+        assert!(matches!(
+            restored.begin("first").await,
+            CacheLookup::Owner(_)
+        ));
+        assert!(matches!(
+            restored.begin("second").await,
+            CacheLookup::Owner(_)
+        ));
     }
 
     #[tokio::test]
