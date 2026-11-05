@@ -661,6 +661,187 @@ async fn full_refresh_uses_an_explicit_disc_candidate_over_existing_disc_artwork
     Ok(())
 }
 
+/// The explicit `Disc` candidate is tried first, but when every explicit URL fails the poster
+/// URLs are still available as the last attempt for an item that has no disc artwork.
+#[tokio::test]
+async fn full_refresh_falls_back_to_the_poster_when_the_explicit_disc_candidate_fails()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    configure_image_strategy(&fixture.database, &fixture.item_id).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let poster_url = format!("{image_url}/poster");
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Online Title",
+            "images": {
+                "POSTER": [poster_url.clone()],
+                "DISC": [format!("{image_url}/missing-disc"), poster_url.clone()]
+            }
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+    );
+
+    let report = selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::RefreshUnlocked,
+        )
+        .await?;
+
+    assert!(
+        report.image_types.contains(&"DISC"),
+        "a failing explicit Disc candidate must fall back to the poster"
+    );
+    assert_eq!(
+        tokio::fs::read(fixture.movie_dir.join("disc.png")).await?,
+        PNG_1X1,
+        "the fallback writes the poster bytes as the disc artwork"
+    );
+    let source_url: Option<String> = sqlx::query_scalar(
+        "SELECT source_url FROM item_images WHERE item_id = ? AND image_type = 'DISC'",
+    )
+    .bind(&fixture.item_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(source_url.as_deref(), Some(poster_url.as_str()));
+
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn full_refresh_does_not_add_a_poster_disc_when_the_explicit_disc_succeeds()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    configure_image_strategy(&fixture.database, &fixture.item_id).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let disc_url = format!("{image_url}/disc-webp");
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Online Title",
+            "images": {
+                "POSTER": [format!("{image_url}/poster")],
+                "DISC": [disc_url.clone()]
+            }
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+    );
+
+    let report = selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::RefreshUnlocked,
+        )
+        .await?;
+
+    assert!(report.image_types.contains(&"DISC"));
+    assert_eq!(
+        tokio::fs::read(fixture.movie_dir.join("disc.webp")).await?,
+        b"RIFF\x04\x00\x00\x00WEBP",
+        "the disc must keep the explicit candidate bytes"
+    );
+    assert!(
+        !fixture.movie_dir.join("disc.png").exists(),
+        "a successful explicit Disc candidate must not add the poster fallback"
+    );
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'DISC'",
+    )
+    .bind(&fixture.item_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(rows, 1);
+    let source_url: Option<String> = sqlx::query_scalar(
+        "SELECT source_url FROM item_images WHERE item_id = ? AND image_type = 'DISC'",
+    )
+    .bind(&fixture.item_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(source_url.as_deref(), Some(disc_url.as_str()));
+
+    image_server.abort();
+    Ok(())
+}
+
+/// A `disc.jpg` symlink makes the existing-artwork probe fail. That optional check must not fail
+/// the whole selection: NFO writeback and the poster continue, and the fallback is simply skipped.
+#[cfg(unix)]
+#[tokio::test]
+async fn full_refresh_survives_a_symlinked_disc_artwork_probe()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(true).await?;
+    configure_image_strategy(&fixture.database, &fixture.item_id).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let target = fixture.movie_dir.join("external-disc.jpg");
+    tokio::fs::write(&target, b"existing-disc").await?;
+    let disc_path = fixture.movie_dir.join("disc.jpg");
+    std::os::unix::fs::symlink(&target, &disc_path)?;
+    let poster_url = format!("{image_url}/poster");
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Online Title",
+            "overview": "Online Overview",
+            "images": {
+                "POSTER": [poster_url.clone()],
+                "DISC": [poster_url.clone()]
+            }
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+    );
+
+    let report = selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::RefreshUnlocked,
+        )
+        .await?;
+
+    assert_eq!(
+        report.image_types,
+        vec!["POSTER"],
+        "a failed disc probe skips the fallback instead of failing the selection"
+    );
+    assert!(
+        tokio::fs::symlink_metadata(&disc_path)
+            .await?
+            .file_type()
+            .is_symlink(),
+        "the symlinked disc artwork must stay untouched"
+    );
+    assert_eq!(tokio::fs::read(&target).await?, b"existing-disc");
+    assert_eq!(
+        tokio::fs::read(fixture.movie_dir.join("poster.png")).await?,
+        PNG_1X1
+    );
+    let nfo = tokio::fs::read_to_string(fixture.movie_dir.join("movie.nfo")).await?;
+    assert!(nfo.contains("<title>Online Title</title>"));
+    assert!(nfo.contains("<plot>Online Overview</plot>"));
+
+    image_server.abort();
+    Ok(())
+}
+
 #[tokio::test]
 async fn full_refresh_keeps_nfo_when_image_download_fails() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -3646,10 +3827,12 @@ async fn start_image_stub()
                     .header(CONTENT_TYPE, "image/png")
                     .body(Body::from(PNG_1X1.to_vec()))
                     .unwrap(),
-                "fanart" | "fanart-supplement-1" | "fanart-supplement-2" => Response::builder()
-                    .header(CONTENT_TYPE, "image/webp")
-                    .body(Body::from(b"RIFF\x04\x00\x00\x00WEBP".to_vec()))
-                    .unwrap(),
+                "fanart" | "fanart-supplement-1" | "fanart-supplement-2" | "disc-webp" => {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "image/webp")
+                        .body(Body::from(b"RIFF\x04\x00\x00\x00WEBP".to_vec()))
+                        .unwrap()
+                }
                 "poster-second" => Response::builder()
                     .header(CONTENT_TYPE, "image/png")
                     .body(Body::from(b"broken".to_vec()))
