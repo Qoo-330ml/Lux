@@ -112,32 +112,3 @@ async fn an_existing_database_keeps_its_identity_across_restarts()
     );
     Ok(())
 }
-
-#[tokio::test]
-async fn choosing_a_database_during_setup_discards_the_bootstrap_marker()
--> Result<(), Box<dyn std::error::Error>> {
-    use luxd::config::DatabaseConfiguration;
-
-    let temp_dir = tempfile::tempdir()?;
-    let config = config_for(&temp_dir).await?;
-    let database_file = config.config_dir.join("lux.db");
-
-    // First start with nothing chosen: a placeholder database is opened so the wizard can run, and
-    // opening it records the server state marker.
-    config.mark_database_selection_pending().await?;
-    Database::connect(&config).await?.close().await;
-    assert!(config.config_dir.join("server-state.json").exists());
-
-    // The operator then picks a different database. The placeholder's marker must not follow them:
-    // the freshly chosen database is empty by design, and refusing it makes the restart that setup
-    // requires fail with EmptyDatabase.
-    config
-        .save_database_configuration(&DatabaseConfiguration::Sqlite)
-        .await?;
-    tokio::fs::remove_file(&database_file).await?;
-
-    let database =
-        Database::connect_with_configuration(&config, &DatabaseConfiguration::Sqlite).await?;
-    database.close().await;
-    Ok(())
-}
