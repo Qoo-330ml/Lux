@@ -10,6 +10,9 @@
 - Emby 兼容：`GET /Library/VirtualFolders` 及其 `/emby` 别名返回的
   `LibraryOptions.TypeOptions[].ImageOptions[].MinWidth` 仍然存在，值固定为 `0`；本任务不改动媒体流
   分辨率分档（`emby_video_resolution_label`）与插件协议。
+- 客户端可见行为不变：手动候选搜索对软删除条目、已停用媒体库中的条目仍返回 `ItemNotFound`（404），
+  且不会调用上游或写入候选；该 404 此前搭在宽度策略的媒体库查询上，现由
+  `ensure_candidate_item_available` 单独承担，自动匹配请求仍跳过这次读取。
 - 不需要数据库迁移：`media_strategy` 仍是同一列上的 JSON。
 - 未验证：未在真实第三方 Emby 客户端上复测 `MinWidth: 0` 的显示或抓图行为，只用 `emby_catalog`
   单测与 `--test admin admin_api_key::` 覆盖响应形状；旧设置的实际升级路径用单测与

@@ -19726,7 +19726,8 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
   对应的默认值与 `0..=8192` 校验。
 - 候选图：`ImageSelectionPolicy` / `ImageTypePolicy` 与候选 JSON 解析结构不再携带宽度；
   `filtered_candidate_images` 改为只按类型归并的 `candidate_images_by_type`，任何上游宽度的候选 URL
-  都会入库；顺带删除只为宽度过滤服务的媒体库策略查询。
+  都会入库；原先兼作宽度策略来源的媒体库查询保留下来作为条目可用性检查（见兼容性处理），不再携带任何
+  宽度逻辑。
 - Web：全局策略、媒体库覆盖与分层矩阵不再提供“最小下载宽度/最小宽度”控件，`MediaArtworkPolicySettings`
   与 `MediaImageStrategySettings` 类型同步删除该字段，预设里不再有宽度档位。
 - Emby：`LibraryOptions.TypeOptions[].ImageOptions[].MinWidth` 保留，值固定为 `0`。
@@ -19738,6 +19739,9 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
   `deny_unknown_fields`，因此保留了一个只反序列化、不序列化的 `legacy_min_width` 字段，避免旧设置整份
   解析失败（那会让全局策略退回默认值、媒体库覆盖退回全局值）。
 - 旧版 Web 页面或脚本提交带这些键的设置请求仍返回成功，键被忽略；下一次保存后它们自然消失。
+- 手动候选搜索的 404 语义不变：软删除条目、已停用媒体库中的条目仍返回 `ItemNotFound`。这条校验此前
+  搭在宽度策略的媒体库查询上，移除宽度后改为独立的 `ensure_candidate_item_available`，只丢弃策略内容；
+  自动匹配请求自带已解析策略，仍和以前一样跳过这次读取。
 - 不需要数据库迁移：`media_strategy` 仍是同一列上的 JSON。
 
 验收：
@@ -19748,12 +19752,14 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
       与“单集剧照不扩散到其他背景图类型”的既有行为不变。
 - [x] Emby `ImageOptions` 仍包含 `MinWidth` 且值为 `0`（单测 + `--test admin admin_api_key::` 集成断言）。
 - [x] Web 全局策略、媒体库覆盖和分层矩阵不再出现宽度控件或文案，相关组件测试通过。
+- [x] 手动候选搜索对软删除条目、停用媒体库条目仍返回 `ItemNotFound`（电影/剧集与季度/单集两条路径各
+      有单测）。
 - [x] 未新增依赖、migration 或配置项；未改插件协议与媒体流分辨率分档逻辑。
 
 预计文件：`src/application/settings.rs`、`src/application/candidates.rs`、`src/api/emby_catalog.rs`、
 `web/src/features/admin/AdminLibrariesPage.tsx`、`web/src/features/admin/ImageLevelPolicyEditor.tsx`、
-`web/src/features/admin/image-policy-presets.ts`、`web/src/lib/api/types.ts`、相关测试与
-`docs/CHANGELOG.md`、`docs/API.md`、`docs/COMPATIBILITY.md`。
+`web/src/features/admin/admin.css`、`web/src/features/admin/image-policy-presets.ts`、
+`web/src/lib/api/types.ts`、相关测试与 `docs/CHANGELOG.md`、`docs/API.md`、`docs/COMPATIBILITY.md`。
 
 实施结果（2026-11-05，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 验证）：按 TDD 分三个提交——
 设置模型与 Emby 输出、候选图宽度过滤、Web 与文档。任务编号用 `LUX-884`：基线上 `LUX-883` 已被
@@ -19762,11 +19768,13 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
 - 兼容字段：`ArtworkPolicySettings` 的 `legacy_min_width`（`rename = "minWidth"`、`skip_serializing`）
   只用于反序列化；全局 `images.minDownloadWidth` 因该结构不 `deny_unknown_fields` 直接按未知字段忽略。
 - Emby 值用常量 `EMBY_IMAGE_OPTION_MIN_WIDTH: i64 = 0`，没有改 `emby_video_resolution_label` 的分档。
-- 删除只为宽度过滤服务的 `candidate_image_policy_for` 后，候选搜索少一次条目媒体策略查询；不涉及迁移。
+- 可用性校验：`candidate_image_policy_for` 换成 `ensure_candidate_item_available(item_id, plan)`，仍在
+  `plan.image_policy.is_none()`（手动搜索）时调用 `find_item_media_strategy_settings`，`None` 映射为
+  `ItemNotFound`；电影/剧集分支与季度/单集分支各调用一次。候选搜索的查询次数与实施前一致，不涉及迁移。
 
 验证命令与结果：
 
-- `cargo test --locked --lib application::settings` 12/12、`--lib candidates::` 40/40、
+- `cargo test --locked --lib application::settings` 12/12、`--lib candidates::` 44/44、
   `--lib api::legacy::emby_catalog` 44/44（含新增的 `image_options_keep_min_width_at_zero_for_emby_clients`）。
 - `cargo test --locked --test auth_users resume_favorites::` 6/6、`--test library libraries_api::` 14/14、
   `--test admin admin_api_key::` 4/4、`--test metadata metadata_selection::` 39/39、
@@ -19780,6 +19788,23 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
 限制与剩余风险：旧设置里的宽度值会被静默丢弃（不提示管理员），已在 `docs/CHANGELOG.md` 与本文档说明；
 没有为 `minDownloadWidth` 保留只读字段，因此极老的第三方客户端若依赖响应回传该键，会看到它消失（Emby
 的 `MinWidth` 不受影响）；未在真实第三方 Emby 客户端上复测 `MinWidth: 0`。
+
+返工（独立审查后，2026-11-05）：
+
+- 手动候选搜索的条目可用性 404 恢复：`candidate_image_policy_for` 换成
+  `ensure_candidate_item_available(item_id, plan)`，仍在 `plan.image_policy.is_none()` 时调用
+  `find_item_media_strategy_settings` 并只取“能否查到”的结果，电影/剧集与季度/单集两条路径各一次调用。
+  新增 4 条单测：`manual_movie_search_rejects_a_soft_deleted_item`、
+  `manual_movie_search_rejects_an_item_in_a_disabled_library`、
+  `manual_child_search_rejects_a_soft_deleted_item`、
+  `manual_child_search_rejects_an_item_in_a_disabled_library`；四条都先确认在修复前失败，并断言没有写入
+  `metadata_candidates`。此前“候选搜索少一次条目媒体策略查询”的说法作废，查询次数与实施前一致。
+- 样式补齐：矩阵表的 `td:nth-child(6)` 只属于已删除的宽度列，从基础规则和窄屏覆盖里去掉，张数列的
+  `td:nth-child(5)` 保留；`.lux-library-strategy-image-limits` 由 2 列改为 1 列，
+  `.lux-library-override-fields` 由 3 列改为 2 列（`1.2fr .8fr`）。Web 测试新增矩阵表头/单元格数量一致
+  断言、两处网格子项数量断言和 CSS 轨道断言；把 CSS 回退到修改前时该用例失败，说明断言有效。
+- 返工后复跑：`--lib candidates::` 44/44、`--lib application::settings` 12/12、`vitest run`
+  `admin-libraries`（39 例）与 `image-level-policy`（15 例）全部通过。
 
 ## 31. 参考资料
 
