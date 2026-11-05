@@ -8,8 +8,10 @@ import {
   Settings2,
   X,
 } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
 import { createContext, useContext, useEffect, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
+import { prefetchAdminPage } from "../../features/admin/admin-navigation";
 import { api } from "../../lib/api/client";
 import type { LuxUser } from "../../lib/api/types";
 import { applyAccountAccent, applyAccountTheme, readAccountSettings } from "../../features/account/account-settings";
@@ -46,6 +48,13 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
   const sseConnectionState = useUserEvents();
   const navigate = useNavigate();
   const location = useLocation();
+  const queryClient = useQueryClient();
+  // Hovering the admin entry also warms the dashboard page chunk and its data, so opening the
+  // console does not wait for layout chunk -> page chunk -> data one after another.
+  const preload = (to: string) => {
+    preloadShellRoute(to);
+    if (to === "/admin") prefetchAdminPage(queryClient, to);
+  };
   const [mobileOpen, setMobileOpen] = useState(false);
   const [avatarUrl, setAvatarUrl] = useState<string | null>(() => api.avatarUrl());
   const [avatarImageFailed, setAvatarImageFailed] = useState(false);
@@ -95,20 +104,20 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
               <NavLink className={navClass} to="/">
                 首页
               </NavLink>
-              <NavLink className={navClass} to="/libraries" onPointerEnter={() => preloadShellRoute("/libraries")} onFocus={() => preloadShellRoute("/libraries")}>
+              <NavLink className={navClass} to="/libraries" onPointerEnter={() => preload("/libraries")} onFocus={() => preload("/libraries")}>
                 媒体库
               </NavLink>
-              <NavLink className={navClass} to="/favorites" onPointerEnter={() => preloadShellRoute("/favorites")} onFocus={() => preloadShellRoute("/favorites")}>
+              <NavLink className={navClass} to="/favorites" onPointerEnter={() => preload("/favorites")} onFocus={() => preload("/favorites")}>
                 收藏
               </NavLink>
-              <NavLink className={navClass} to="/history" onPointerEnter={() => preloadShellRoute("/history")} onFocus={() => preloadShellRoute("/history")}>
+              <NavLink className={navClass} to="/history" onPointerEnter={() => preload("/history")} onFocus={() => preload("/history")}>
                 历史
               </NavLink>
-              <NavLink className={navClass} to="/search" onPointerEnter={() => preloadShellRoute("/search")} onFocus={() => preloadShellRoute("/search")}>
+              <NavLink className={navClass} to="/search" onPointerEnter={() => preload("/search")} onFocus={() => preload("/search")}>
                 搜索
               </NavLink>
               {user.canManageServer ? (
-                <NavLink className={navClass} to="/admin" onPointerEnter={() => preloadShellRoute("/admin")} onFocus={() => preloadShellRoute("/admin")}>
+                <NavLink className={navClass} to="/admin" onPointerEnter={() => preload("/admin")} onFocus={() => preload("/admin")}>
                   管理
                 </NavLink>
               ) : null}
@@ -121,8 +130,8 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
               className="lux-user-button"
               type="button"
               aria-label="打开账户"
-              onPointerEnter={() => preloadShellRoute("/account")}
-              onFocus={() => preloadShellRoute("/account")}
+              onPointerEnter={() => preload("/account")}
+              onFocus={() => preload("/account")}
               onClick={() => navigate(`/account/${encodeURIComponent(user.id)}`)}
             >
               <span className="lux-avatar">
@@ -155,24 +164,24 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
             <span className="lux-mobile-nav-icon" aria-hidden="true"><Home size={18} /></span>
             <span className="lux-mobile-nav-label">首页</span>
           </NavLink>
-          <NavLink className={mobileNavClass} to="/libraries" onPointerEnter={() => preloadShellRoute("/libraries")} onFocus={() => preloadShellRoute("/libraries")} onClick={() => setMobileOpen(false)}>
+          <NavLink className={mobileNavClass} to="/libraries" onPointerEnter={() => preload("/libraries")} onFocus={() => preload("/libraries")} onClick={() => setMobileOpen(false)}>
             <span className="lux-mobile-nav-icon" aria-hidden="true"><Library size={18} /></span>
             <span className="lux-mobile-nav-label">媒体库</span>
           </NavLink>
-          <NavLink className={mobileNavClass} to="/favorites" onPointerEnter={() => preloadShellRoute("/favorites")} onFocus={() => preloadShellRoute("/favorites")} onClick={() => setMobileOpen(false)}>
+          <NavLink className={mobileNavClass} to="/favorites" onPointerEnter={() => preload("/favorites")} onFocus={() => preload("/favorites")} onClick={() => setMobileOpen(false)}>
             <span className="lux-mobile-nav-icon" aria-hidden="true"><Heart size={18} /></span>
             <span className="lux-mobile-nav-label">收藏</span>
           </NavLink>
-          <NavLink className={mobileNavClass} to="/history" onPointerEnter={() => preloadShellRoute("/history")} onFocus={() => preloadShellRoute("/history")} onClick={() => setMobileOpen(false)}>
+          <NavLink className={mobileNavClass} to="/history" onPointerEnter={() => preload("/history")} onFocus={() => preload("/history")} onClick={() => setMobileOpen(false)}>
             <span className="lux-mobile-nav-icon" aria-hidden="true"><History size={18} /></span>
             <span className="lux-mobile-nav-label">历史</span>
           </NavLink>
-          <NavLink className={mobileNavClass} to="/search" onPointerEnter={() => preloadShellRoute("/search")} onFocus={() => preloadShellRoute("/search")} onClick={() => setMobileOpen(false)}>
+          <NavLink className={mobileNavClass} to="/search" onPointerEnter={() => preload("/search")} onFocus={() => preload("/search")} onClick={() => setMobileOpen(false)}>
             <span className="lux-mobile-nav-icon" aria-hidden="true"><Search size={18} /></span>
             <span className="lux-mobile-nav-label">搜索</span>
           </NavLink>
           {user.canManageServer ? (
-            <NavLink className={mobileNavClass} to="/admin" onPointerEnter={() => preloadShellRoute("/admin")} onFocus={() => preloadShellRoute("/admin")} onClick={() => setMobileOpen(false)}>
+            <NavLink className={mobileNavClass} to="/admin" onPointerEnter={() => preload("/admin")} onFocus={() => preload("/admin")} onClick={() => setMobileOpen(false)}>
               <span className="lux-mobile-nav-icon" aria-hidden="true"><Settings2 size={18} /></span>
               <span className="lux-mobile-nav-label">管理控制台</span>
             </NavLink>

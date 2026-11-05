@@ -29,6 +29,19 @@ export function preloadAdminPage(to: string): Promise<void> {
   return loader ? loader().then(() => undefined) : Promise.resolve();
 }
 
+/**
+ * Normalized admin console path for a browser entry, or null when the entry is not the console.
+ * Trailing slashes are dropped so `/admin/` and `/admin/users/` match the loader table, and the
+ * check is a path segment match, not a prefix match: `/administrator` is not the console.
+ */
+export function adminEntryPath(pathname: string): string | null {
+  const normalized = pathname.replace(/\/+$/, "");
+  if (normalized === "/admin" || normalized.startsWith("/admin/")) {
+    return normalized;
+  }
+  return null;
+}
+
 export function prefetchAdminPage(queryClient: QueryClient, to: string): void {
   void preloadAdminPage(to);
 

@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
 import { Route, Routes, Navigate, useLocation, useParams } from "react-router-dom";
-import { Component, lazy, Suspense, useEffect } from "react";
+import { Component, lazy, Suspense, useEffect, useRef } from "react";
 import type { ReactNode } from "react";
 import { api, ApiError } from "../lib/api/client";
 import { queryKeys } from "../lib/api/query-keys";
@@ -14,6 +14,8 @@ import { SetupPage } from "../features/auth/SetupPage";
 import { HomePage } from "../features/home/HomePage";
 import { ImageVariantsContext } from "../features/home/image-variants";
 import {
+  adminEntryPath,
+  prefetchAdminPage,
   loadAdminChangelogPage,
   loadAdminDashboardPage,
   loadAdminLibrariesPage,
@@ -119,7 +121,17 @@ function SessionRoutes({ me }: { me: UseQueryResult<Awaited<ReturnType<typeof ap
 }
 
 function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?: string | null }) {
+  const queryClient = useQueryClient();
+  // Snapshot on purpose: a cold entry into the console should start the page chunk and its data
+  // once, in parallel with the AdminLayout chunk. In-app navigation is covered by the hover
+  // prefetch in LuxShell, so this must not re-run when the location changes later.
+  const entryPath = useRef(adminEntryPath(useLocation().pathname));
   useEffect(() => attachTouchCardHoverTracking(document, window), []);
+  useEffect(() => {
+    if (user.canManageServer && entryPath.current) {
+      prefetchAdminPage(queryClient, entryPath.current);
+    }
+  }, [queryClient, user.canManageServer]);
 
   return (
     <RouteErrorBoundary>
