@@ -3124,6 +3124,9 @@ impl Database {
             query.content_restrictions,
         );
         let runtime_ticks = resume_runtime_ticks_sql();
+        let resume_state = resumable_state_predicate("us");
+        let resume_progress =
+            resumable_progress_predicate("position_ticks", "resume_runtime_ticks");
         let resume_rank = Self::resume_rank_expression(latest_episode_per_series);
         let (next_episode_ctes, ranking_ctes) = Self::resume_next_episode_query_parts(
             include_next_unplayed_episode,
@@ -3140,15 +3143,14 @@ impl Database {
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                  JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
                  WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
-                   AND us.is_played = 0 AND us.hide_from_resume = 0 AND us.position_ticks >= ?
+                   AND {resume_state}
                    AND mi.library_id IN ({library_placeholders}){content_restriction_predicate}
              ),
              eligible AS (
                  SELECT id, item_type, series_id, season_number, episode_number,
                         sort_title, last_played_at
                  FROM candidates
-                 WHERE resume_runtime_ticks > 0
-                   AND position_ticks * 100 < resume_runtime_ticks * ?
+                 WHERE {resume_progress}
              ){next_episode_ctes}{ranking_ctes},
              qualified AS (
                  SELECT id, sort_title, last_played_at,
@@ -3272,6 +3274,9 @@ impl Database {
             query.content_restrictions,
         );
         let runtime_ticks = resume_runtime_ticks_sql();
+        let resume_state = resumable_state_predicate("us");
+        let resume_progress =
+            resumable_progress_predicate("position_ticks", "resume_runtime_ticks");
         let resume_rank = Self::resume_rank_expression(latest_episode_per_series);
         let (next_episode_ctes, ranking_ctes) = Self::resume_next_episode_query_parts(
             include_next_unplayed_episode,
@@ -3289,14 +3294,13 @@ impl Database {
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                  JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
                  WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
-                   AND us.is_played = 0 AND us.hide_from_resume = 0 AND us.position_ticks >= ?
+                   AND {resume_state}
                    AND mi.library_id IN ({library_placeholders}){content_restriction_predicate}
              ), eligible AS (
                  SELECT id, item_type, series_id, season_number, episode_number,
                         sort_title, last_played_at
                  FROM candidates
-                 WHERE resume_runtime_ticks > 0
-                   AND position_ticks * 100 < resume_runtime_ticks * ?
+                 WHERE {resume_progress}
              ){next_episode_ctes}{ranking_ctes}
              SELECT COUNT(*) FROM ranked WHERE resume_rank = 1"
         );
@@ -11026,6 +11030,7 @@ fn catalog_list_union_selected_sql<'a>(
         || !filter.studio_keys.is_empty()
         || filter.is_played.is_some()
         || filter.is_favorite.is_some()
+        || filter.is_resumable.is_some()
         || filter.min_date_last_saved.is_some()
         || filter.metadata_pending
         || filter.sort_by != CatalogSort::DateCreated
@@ -11404,6 +11409,7 @@ mod tests {
             studio_keys: &[],
             is_played: None,
             is_favorite: None,
+            is_resumable: None,
             min_date_last_saved: None,
             metadata_pending: false,
             parent_id_scope: None,
@@ -11513,6 +11519,7 @@ mod tests {
             studio_keys: &[],
             is_played: None,
             is_favorite: None,
+            is_resumable: None,
             min_date_last_saved: None,
             metadata_pending: false,
             parent_id_scope: None,
@@ -11681,6 +11688,7 @@ mod tests {
             studio_keys: &[],
             is_played: None,
             is_favorite: None,
+            is_resumable: None,
             min_date_last_saved: None,
             metadata_pending: false,
             parent_id_scope: None,
@@ -11717,6 +11725,7 @@ mod tests {
             studio_keys: &[],
             is_played: None,
             is_favorite: None,
+            is_resumable: None,
             min_date_last_saved: None,
             metadata_pending: false,
             parent_id_scope: None,

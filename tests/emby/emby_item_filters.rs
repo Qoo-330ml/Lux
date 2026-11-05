@@ -390,7 +390,16 @@ async fn emby_filters_is_resumable_paginates_and_is_favorite_matches_the_query_p
         insert_movie(&server, item_id, title).await?;
     }
     for item_id in ["resume-a", "resume-b", "resume-c"] {
-        set_user_state(&server, &server.admin_id, item_id, 1_800, false, false, false).await?;
+        set_user_state(
+            &server,
+            &server.admin_id,
+            item_id,
+            1_800,
+            false,
+            false,
+            false,
+        )
+        .await?;
     }
     // A favorite without any playback progress, and a favorite with progress.
     set_user_state(

@@ -4945,6 +4945,7 @@ fn catalog_filter_where_clause<'a>(
     let studio_keys = filter.studio_keys;
     let is_played = filter.is_played;
     let is_favorite = filter.is_favorite;
+    let is_resumable = filter.is_resumable;
     let min_date_last_saved = filter.min_date_last_saved;
     let metadata_pending = filter.metadata_pending;
     let mut where_clause = format!(
@@ -5192,6 +5193,28 @@ fn catalog_filter_where_clause<'a>(
         }
         binds.push(CatalogBind::Text(user_id));
         binds.push(CatalogBind::Integer(i64::from(is_favorite)));
+    }
+    if let Some(resume) = is_resumable {
+        // Same decision as `Items/Resume`, expressed as a correlated existence check so the list
+        // keeps its one-row-per-item projection and its filtered `TotalRecordCount`.
+        where_clause.push_str(&format!(
+            " AND EXISTS (
+                SELECT 1
+                FROM user_item_state resumable_state
+                WHERE resumable_state.user_id = ?
+                  AND resumable_state.item_id = mi.id
+                  AND {}
+                  AND {}
+            )",
+            resumable_state_predicate("resumable_state"),
+            resumable_progress_predicate(
+                "resumable_state.position_ticks",
+                resume_runtime_ticks_sql()
+            ),
+        ));
+        binds.push(CatalogBind::Text(user_id));
+        binds.push(CatalogBind::Integer(resume.minimum_ticks));
+        binds.push(CatalogBind::Integer(resume.played_percent));
     }
     if metadata_pending {
         where_clause.push_str(
@@ -5473,6 +5496,23 @@ fn resume_runtime_ticks_sql() -> &'static str {
     )"
 }
 
+/// The user-state half of the continue-watching decision.
+///
+/// Shared by the `Items/Resume` queries and the `Filters=IsResumable` catalog filter so both only
+/// accept rows of the same unpaused, unhidden and started-yet-unfinished state. Binds one value:
+/// the minimum progress ticks.
+fn resumable_state_predicate(state_alias: &str) -> String {
+    format!(
+        "{state_alias}.is_played = 0 AND {state_alias}.hide_from_resume = 0 AND {state_alias}.position_ticks >= ?"
+    )
+}
+
+/// The progress half of the continue-watching decision: the item has a known runtime and has not
+/// reached the configured watched percentage. Binds one value: the played percentage.
+fn resumable_progress_predicate(position_expression: &str, runtime_expression: &str) -> String {
+    format!("{runtime_expression} > 0 AND {position_expression} * 100 < {runtime_expression} * ?")
+}
+
 #[derive(Clone, Copy)]
 enum CatalogBind<'a> {
     Text(&'a str),
@@ -5522,6 +5562,8 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) studio_keys: &'a [String],
     pub(crate) is_played: Option<bool>,
     pub(crate) is_favorite: Option<bool>,
+    /// `Filters=IsResumable`: keep the items the continue-watching list would offer this user.
+    pub(crate) is_resumable: Option<ResumeThresholds>,
     pub(crate) min_date_last_saved: Option<i64>,
     pub(crate) metadata_pending: bool,
     pub(crate) parent_id_scope: Option<Option<&'a str>>,
@@ -5531,6 +5573,16 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) offset: i64,
     pub(crate) limit: i64,
     pub(crate) include_total: bool,
+}
+
+/// The continue-watching thresholds a filter compares against.
+///
+/// The values are the ones `Items/Resume` reads (`home_resume_settings`), so
+/// `Filters=IsResumable` cannot drift into a second set of thresholds.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResumeThresholds {
+    pub(crate) played_percent: i64,
+    pub(crate) minimum_ticks: i64,
 }
 
 pub(crate) struct ResumeItemsQuery<'a> {

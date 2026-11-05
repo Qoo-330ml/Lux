@@ -920,7 +920,7 @@ pub(crate) use repository::{
     OutboxStream, PLAYBACK_SESSION_STALE_AFTER_SECONDS, PersonMatchCandidateRestore,
     PlaybackEventEffects, ReadModelPageQuery, ReadModelSort, RecentByLibraryReadModelQuery,
     RecentReadModelQuery, ReconciliationBatchCommit, ReconciliationBatchCommitResult,
-    ResumeItemsQuery, ResumePointerQuery, SEARCH_OUTBOX, SEARCH_REINDEX_CONSUMER,
+    ResumeItemsQuery, ResumePointerQuery, ResumeThresholds, SEARCH_OUTBOX, SEARCH_REINDEX_CONSUMER,
     ScanFingerprintMigrationCommit, ScanManifestRemovalCandidateQuery, SelectedMetadataUpdate,
     StoredAccessTokenDevice, StoredActivityEvent, StoredAdminUserListItem, StoredCanonicalPerson,
     StoredCanonicalPersonMatch, StoredCatalogDetail, StoredCatalogImageTag,
