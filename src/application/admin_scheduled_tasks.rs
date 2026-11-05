@@ -26,6 +26,7 @@ pub(crate) struct ScheduledTaskConfigUpdate {
 pub(crate) enum ScheduledTaskConfigUpdateError {
     TaskNotRegistered,
     ChapterPluginNotRegistered,
+    RatingsPluginNotRegistered,
     RequiredSchedule(RequiredScheduledTaskSchedule),
     InvalidSchedule,
     ServiceUnavailable,
@@ -38,6 +39,7 @@ pub(crate) enum RequiredScheduledTaskSchedule {
     StrmMediaInfo,
     DanmakuMatch,
     ChapterDetection,
+    RatingsSync,
 }
 
 pub(crate) async fn update_scheduled_task_config(
@@ -184,6 +186,29 @@ pub(crate) async fn update_scheduled_task_config(
                         plugins.ok_or(ScheduledTaskConfigUpdateError::ServiceUnavailable)?;
                     plugins
                         .update_chapter_detector_schedule(&plugin_id, schedule)
+                        .await
+                        .map_err(ScheduledTaskConfigUpdateError::Plugin)?;
+                    fetch_library_scheduled_task(database, &library_id_text, &request.task_type)
+                        .await
+                }
+                "RATINGS_SYNC" => {
+                    let Some(schedule) = schedule.as_deref() else {
+                        return Err(ScheduledTaskConfigUpdateError::RequiredSchedule(
+                            RequiredScheduledTaskSchedule::RatingsSync,
+                        ));
+                    };
+                    let task = database
+                        .find_scheduled_task_config("LIBRARY", &library_id_text, &request.task_type)
+                        .await
+                        .map_err(|_| ScheduledTaskConfigUpdateError::StorageUnavailable)?
+                        .ok_or(ScheduledTaskConfigUpdateError::TaskNotRegistered)?;
+                    let plugin_id = task
+                        .plugin_id
+                        .ok_or(ScheduledTaskConfigUpdateError::RatingsPluginNotRegistered)?;
+                    let plugins =
+                        plugins.ok_or(ScheduledTaskConfigUpdateError::ServiceUnavailable)?;
+                    plugins
+                        .update_ratings_sync_schedule(&plugin_id, schedule)
                         .await
                         .map_err(ScheduledTaskConfigUpdateError::Plugin)?;
                     fetch_library_scheduled_task(database, &library_id_text, &request.task_type)

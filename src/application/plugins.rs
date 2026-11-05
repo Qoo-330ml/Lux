@@ -63,7 +63,7 @@ use crate::{
         schedule::{
             DEFAULT_CHAPTER_DETECTION_SCHEDULE, DEFAULT_DANMAKU_MATCH_SCHEDULE,
             DEFAULT_ONLINE_CHAPTER_DETECTION_SCHEDULE, DEFAULT_STRM_MEDIA_INFO_SCHEDULE,
-            validate_cron,
+            RATINGS_SYNC_TASK_TYPE, validate_cron,
         },
         strm_target::{StrmTargetKind, classify_strm_target},
     },
@@ -1939,6 +1939,43 @@ impl PluginService {
         chapter_detector_settings_from_values(&plugin_id, &fields, &values)?;
         self.write_plugin_config(&plugin_id, &values).await?;
         self.sync_chapter_detection_scheduled_tasks().await
+    }
+
+    /// Rewrites the schedule of the library-scoped `RATINGS_SYNC` task the plugin declares.
+    ///
+    /// The schedule lives in the plugin configuration (`scheduleConfigKey`) exactly like the other
+    /// manifest tasks, so the task page edits the same value the plugin settings page shows and a
+    /// manifest sync afterwards keeps both in step.
+    pub async fn update_ratings_sync_schedule(
+        &self,
+        plugin_id: &str,
+        schedule: &str,
+    ) -> Result<(), PluginServiceError> {
+        let schedule = schedule.trim();
+        validate_cron(schedule).map_err(|_| PluginServiceError::InvalidConfig)?;
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
+        let plugin = catalog
+            .get(&plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
+        let Some(task) =
+            plugin.manifest.scheduled_tasks.iter().find(|task| {
+                task.task_type == RATINGS_SYNC_TASK_TYPE && task.owner_type == "LIBRARY"
+            })
+        else {
+            return Err(PluginServiceError::InvalidConfig);
+        };
+        let schedule_key = task.schedule_config_key.clone();
+        let fields = self.config_fields_for_plugin(plugin).await?;
+        let mut values = merge_default_config_values(
+            &fields,
+            normalize_plugin_config(&plugin_id, self.read_plugin_config(&plugin_id).await?),
+        );
+        values.insert(schedule_key, Value::String(schedule.to_owned()));
+        let values = validate_config_values(&fields, &values)?;
+        validate_dynamic_plugin_config(&plugin_id, &values)?;
+        self.write_plugin_config(&plugin_id, &values).await?;
+        self.sync_manifest_scheduled_tasks().await
     }
 
     pub async fn media_info_settings(&self) -> Result<MediaInfoSettings, PluginServiceError> {

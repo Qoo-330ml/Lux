@@ -11,6 +11,10 @@ pub const DANMAKU_MATCH_TASK_TYPE: &str = "DANMAKU_MATCH";
 pub const DEFAULT_CHAPTER_DETECTION_SCHEDULE: &str = "0 4 * * 0";
 pub const DEFAULT_ONLINE_CHAPTER_DETECTION_SCHEDULE: &str = "0 5 * * *";
 pub const CHAPTER_DETECTION_TASK_TYPE: &str = "CHAPTER_DETECTION";
+/// Weekly by default: a run re-reads every item, because nothing records when an item was last
+/// synced yet, so a daily schedule would re-query the whole library every day.
+pub const DEFAULT_RATINGS_SYNC_SCHEDULE: &str = "0 4 * * 0";
+pub const RATINGS_SYNC_TASK_TYPE: &str = "RATINGS_SYNC";
 const MAX_SCHEDULE_LENGTH: usize = 128;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

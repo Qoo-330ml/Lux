@@ -1111,3 +1111,96 @@ async fn unplanned_task_dispatch_reuses_the_loaded_task_config()
     assert_eq!(job_count, 1);
     Ok(())
 }
+
+#[tokio::test]
+async fn ratings_sync_is_a_supported_library_task_that_needs_its_service()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    let plugin_dir = config_dir.join("plugins/org.lux.trakt-ratings");
+    tokio::fs::create_dir_all(plugin_dir.join("binaries")).await?;
+    fs::write(plugin_dir.join("binaries/plugin"), b"placeholder")?;
+    tokio::fs::write(
+        plugin_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "formatVersion": 1,
+            "id": "org.lux.trakt-ratings",
+            "name": "Trakt ratings",
+            "version": "1.0.0",
+            "apiVersion": 1,
+            "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+            "type": "metadata",
+            "category": "MEDIA",
+            "capabilities": [],
+            "configFields": [
+                {"key": "clientId", "label": "Client id", "type": "text", "required": true},
+                {"key": "libraryIds", "label": "媒体库", "type": "select", "multiple": true,
+                 "optionsSource": "media-libraries", "defaultValue": []},
+                {"key": "schedule", "label": "执行计划", "type": "text", "required": true,
+                 "defaultValue": "0 4 * * 0"}
+            ],
+            "scheduledTasks": [{
+                "taskType": "RATINGS_SYNC",
+                "ownerType": "LIBRARY",
+                "name": "评分同步",
+                "description": "按计划把 Trakt 评分写入已有 NFO 旁车。",
+                "ownerConfigKey": "libraryIds",
+                "scheduleConfigKey": "schedule",
+                "defaultSchedule": "0 4 * * 0",
+                "requiredConfigKeys": ["clientId", "libraryIds"],
+                "resourceLimit": {}
+            }],
+            "permissions": {"network": ["trakt.tv"], "filesystem": []},
+            "files": []
+        }))?,
+    )
+    .await?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    };
+    let database = Database::connect(&config).await?;
+    let library = luxd::application::libraries::LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let plugins = PluginService::new(database.clone(), config_dir);
+    plugins.install("org.lux.trakt-ratings").await?;
+    plugins
+        .update_dynamic_config(
+            "org.lux.trakt-ratings",
+            Map::from_iter([
+                ("clientId".to_owned(), json!("test-client")),
+                ("libraryIds".to_owned(), json!([library.id.to_string()])),
+                ("schedule".to_owned(), json!("* * * * *")),
+            ]),
+        )
+        .await?;
+    let scheduler = ScheduledTaskService::new(
+        database.clone(),
+        plugins.clone(),
+        StrmProbeService::new(database, plugins),
+        None,
+    );
+
+    let error = scheduler
+        .run_task("LIBRARY", &library.id.to_string(), "RATINGS_SYNC")
+        .await
+        .expect_err("without the sync service the task cannot start");
+    assert!(
+        matches!(
+            error,
+            luxd::application::scheduled_tasks::ScheduledTaskError::ServiceUnavailable
+        ),
+        "RATINGS_SYNC must pass the task-type whitelist, got {error:?}"
+    );
+
+    let error = scheduler
+        .run_task("LIBRARY", &library.id.to_string(), "NOT_A_TASK")
+        .await
+        .expect_err("unknown task types must still be rejected");
+    assert!(matches!(
+        error,
+        luxd::application::scheduled_tasks::ScheduledTaskError::UnsupportedTask
+    ));
+    Ok(())
+}

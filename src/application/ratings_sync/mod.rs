@@ -302,6 +302,21 @@ impl RatingsSyncService {
         })
     }
 
+    /// Waits until no run is in flight (tests use this instead of sleeping).
+    #[doc(hidden)]
+    pub async fn wait_for_idle(&self, timeout: Duration) -> bool {
+        let started = Instant::now();
+        loop {
+            if lock_active(&self.active).is_empty() {
+                return true;
+            }
+            if started.elapsed() > timeout {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// Signals every run to stop and waits a bounded time for them.
     pub async fn shutdown(&self) {
         self.shutdown.send_replace(true);

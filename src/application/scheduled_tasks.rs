@@ -24,6 +24,7 @@ use crate::{
         },
         plugins::PluginService,
         probe::MediaProbeService,
+        ratings_sync::{RatingsSyncError, RatingsSyncService},
         reidentify::{
             MetadataDispatchError, MetadataRefreshMode, MetadataReidentifyError,
             MetadataReidentifyJob, MetadataReidentifyService,
@@ -31,7 +32,7 @@ use crate::{
         scanner::{BACKGROUND_SCAN_BATCH_SIZE, ScanJob, ScanJobError, ScanJobService},
         schedule::{
             CHAPTER_DETECTION_TASK_TYPE, CronSchedule, DANMAKU_MATCH_TASK_TYPE,
-            STRM_MEDIA_INFO_TASK_TYPE, parse_cron,
+            RATINGS_SYNC_TASK_TYPE, STRM_MEDIA_INFO_TASK_TYPE, parse_cron,
         },
         strm_probe::{StrmProbeError, StrmProbeJob, StrmProbeService},
         thumbnails::ThumbnailService,
@@ -65,6 +66,7 @@ pub struct ScheduledTaskService {
     thumbnails: Option<ThumbnailService>,
     library_covers: Option<LibraryCoverService>,
     danmaku: Option<DanmakuService>,
+    ratings_sync: Option<RatingsSyncService>,
     cursors: Arc<Mutex<HashMap<String, TaskCursor>>>,
     thumbnail_retry_semaphore: Arc<Semaphore>,
     worker: Arc<tokio::sync::Mutex<Option<super::background_loop::BackgroundLoop>>>,
@@ -97,6 +99,10 @@ pub enum ScheduledTaskRun {
     DanmakuMatch {
         jobs: Vec<DanmakuMatchJob>,
     },
+    RatingsSync {
+        run_id: String,
+        library_id: String,
+    },
 }
 
 impl ScheduledTaskRun {
@@ -108,6 +114,7 @@ impl ScheduledTaskRun {
             Self::ChapterDetection { .. } => CHAPTER_DETECTION_TASK_TYPE,
             Self::AutoLibraryCover { .. } => AUTO_LIBRARY_COVER_TASK_TYPE,
             Self::DanmakuMatch { .. } => DANMAKU_MATCH_TASK_TYPE,
+            Self::RatingsSync { .. } => RATINGS_SYNC_TASK_TYPE,
         }
     }
 }
@@ -126,6 +133,7 @@ pub enum ScheduledTaskError {
     Chapter(ChapterDetectionError),
     Cover(LibraryCoverError),
     Danmaku(DanmakuServiceError),
+    RatingsSync(RatingsSyncError),
     Storage(StorageError),
 }
 
@@ -146,6 +154,7 @@ impl fmt::Display for ScheduledTaskError {
             Self::Chapter(error) => error.fmt(formatter),
             Self::Cover(error) => error.fmt(formatter),
             Self::Danmaku(error) => error.fmt(formatter),
+            Self::RatingsSync(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
         }
     }
@@ -198,6 +207,7 @@ impl ScheduledTaskService {
             thumbnails: None,
             library_covers: None,
             danmaku: None,
+            ratings_sync: None,
             cursors: Arc::new(Mutex::new(HashMap::new())),
             thumbnail_retry_semaphore: Arc::new(Semaphore::new(
                 THUMBNAIL_SCRAPER_RETRY_BATCH_SIZE as usize,
@@ -239,6 +249,11 @@ impl ScheduledTaskService {
         self
     }
 
+    pub fn with_ratings_sync(mut self, ratings_sync: RatingsSyncService) -> Self {
+        self.ratings_sync = Some(ratings_sync);
+        self
+    }
+
     /// Starts the scheduler loop once and records its stop handle.
     pub async fn spawn(&self) {
         let mut worker = self.worker.lock().await;
@@ -267,11 +282,17 @@ impl ScheduledTaskService {
         deletion.drain_pending().await;
     }
 
-    /// Stops the scheduler loop and waits for the current pass.
+    /// Stops the scheduler loop, the in-flight rating syncs and the current pass.
+    ///
+    /// The syncs are stopped before this returns because the caller closes the plugin processes
+    /// and the database right afterwards.
     pub async fn shutdown(&self) {
         let worker = self.worker.lock().await.take();
         if let Some(worker) = worker {
             worker.shutdown().await;
+        }
+        if let Some(ratings_sync) = self.ratings_sync.as_ref() {
+            ratings_sync.shutdown().await;
         }
     }
 
@@ -364,7 +385,8 @@ impl ScheduledTaskService {
                 if let Err(error) = result {
                     match error {
                         ScheduledTaskError::Scan(ScanJobError::AlreadyActive(_))
-                        | ScheduledTaskError::Strm(StrmProbeError::AlreadyActive) => {}
+                        | ScheduledTaskError::Strm(StrmProbeError::AlreadyActive)
+                        | ScheduledTaskError::RatingsSync(RatingsSyncError::AlreadyActive) => {}
                         error => {
                             tracing::warn!(task = %key, %error, "scheduled task did not start")
                         }
@@ -443,7 +465,8 @@ impl ScheduledTaskService {
     fn log_dispatch_error(&self, key: &str, error: ScheduledTaskError) {
         match error {
             ScheduledTaskError::Scan(ScanJobError::AlreadyActive(_))
-            | ScheduledTaskError::Strm(StrmProbeError::AlreadyActive) => {}
+            | ScheduledTaskError::Strm(StrmProbeError::AlreadyActive)
+            | ScheduledTaskError::RatingsSync(RatingsSyncError::AlreadyActive) => {}
             error => tracing::warn!(task = %key, %error, "scheduled task did not start"),
         }
     }
@@ -540,6 +563,10 @@ impl ScheduledTaskService {
             }
             ("LIBRARY", AUTO_LIBRARY_COVER_TASK_TYPE) => {
                 self.run_auto_library_cover(owner_id).await
+            }
+            ("LIBRARY", RATINGS_SYNC_TASK_TYPE) => {
+                self.run_ratings_sync(owner_id, task.plugin_id.as_deref())
+                    .await
             }
             _ => Err(ScheduledTaskError::UnsupportedTask),
         }
@@ -692,6 +719,26 @@ impl ScheduledTaskService {
         Ok(ScheduledTaskRun::ChapterDetection { job })
     }
 
+    async fn run_ratings_sync(
+        &self,
+        library_id: &str,
+        plugin_id: Option<&str>,
+    ) -> Result<ScheduledTaskRun, ScheduledTaskError> {
+        let service = self
+            .ratings_sync
+            .as_ref()
+            .ok_or(ScheduledTaskError::ServiceUnavailable)?;
+        let plugin_id = plugin_id.ok_or(ScheduledTaskError::ServiceUnavailable)?;
+        let run = service
+            .start(library_id, plugin_id)
+            .await
+            .map_err(ScheduledTaskError::RatingsSync)?;
+        Ok(ScheduledTaskRun::RatingsSync {
+            run_id: run.id,
+            library_id: run.library_id,
+        })
+    }
+
     async fn run_auto_library_cover(
         &self,
         library_id: &str,
@@ -754,6 +801,7 @@ fn normalize_scheduled_task_request(
                 | METADATA_TASK_TYPE
                 | CHAPTER_DETECTION_TASK_TYPE
                 | AUTO_LIBRARY_COVER_TASK_TYPE
+                | RATINGS_SYNC_TASK_TYPE
         )
     {
         return Err(ScheduledTaskError::UnsupportedTask);
@@ -946,6 +994,7 @@ fn scheduler_schedule_values(
                 | CHAPTER_DETECTION_TASK_TYPE
                 | AUTO_LIBRARY_COVER_TASK_TYPE
                 | DANMAKU_MATCH_TASK_TYPE
+                | RATINGS_SYNC_TASK_TYPE
         )
     {
         return None;

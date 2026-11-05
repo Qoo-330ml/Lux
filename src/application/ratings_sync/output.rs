@@ -235,7 +235,7 @@ fn optional_votes(value: Option<&Value>) -> Option<Option<i64>> {
 
 fn vote_count(value: &Value) -> Option<i64> {
     let value = value.as_f64()?;
-    if !value.is_finite() || value < 0.0 || value > MAX_VOTES || value.fract() != 0.0 {
+    if !value.is_finite() || !(0.0..=MAX_VOTES).contains(&value) || value.fract() != 0.0 {
         return None;
     }
     Some(value as i64)
