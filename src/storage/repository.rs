@@ -5586,7 +5586,7 @@ pub(crate) struct StoredMediaWritebackContext {
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub(crate) struct StoredRatingsSyncItem {
     pub(crate) id: String,
-    pub(crate) item_type: String,
+    pub(crate) title: String,
     pub(crate) provider_ids_json: Option<String>,
     pub(crate) production_year: Option<i64>,
     pub(crate) season_number: Option<i64>,

@@ -66,6 +66,7 @@ pub mod plugin_store;
 pub mod plugins;
 pub mod probe;
 pub(crate) mod provider_cache;
+pub mod ratings_sync;
 pub mod recommendations;
 pub mod reidentify;
 pub(crate) mod remote_body;

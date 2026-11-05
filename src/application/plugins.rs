@@ -2818,6 +2818,18 @@ impl PluginService {
         Ok((status.is_some(), status == Some(true)))
     }
 
+    /// Whether a background task may call this plugin right now.
+    ///
+    /// A stopped or disabled plugin is not an error for a scheduler, so callers get `false`
+    /// instead of a service error and can report a precondition failure.
+    pub async fn plugin_installed_and_enabled(
+        &self,
+        plugin_id: &str,
+    ) -> Result<bool, PluginServiceError> {
+        let (installed, enabled) = self.plugin_state(plugin_id).await?;
+        Ok(installed && enabled)
+    }
+
     async fn installed_other_ip_location_plugins(&self) -> Result<Vec<String>, PluginServiceError> {
         let mut plugin_ids = Vec::new();
         let catalog = self.catalog_snapshot().await;

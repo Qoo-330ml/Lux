@@ -5980,7 +5980,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<StoredRatingsSyncItem>, StorageError> {
         self.query_as::<StoredRatingsSyncItem>(
-            "SELECT mi.id, mi.item_type, mi.provider_ids_json, mi.production_year,
+            "SELECT mi.id, mi.title, mi.provider_ids_json, mi.production_year,
                     mi.season_number, mi.episode_number, mi.series_id, mi.parent_id
              FROM media_items mi
              WHERE mi.library_id = ? AND mi.item_type = ? AND mi.removed_at IS NULL
@@ -11324,6 +11324,7 @@ mod tests {
             .await?;
         assert_eq!(first_page.len(), 1);
         assert_eq!(first_page[0].id, "a-movie");
+        assert_eq!(first_page[0].title, "A");
         assert_eq!(first_page[0].production_year, Some(2001));
         assert_eq!(
             first_page[0].provider_ids_json.as_deref(),
@@ -11334,7 +11335,10 @@ mod tests {
             .list_ratings_sync_items("ratings-library", "MOVIE", Some("a-movie"), 10)
             .await?;
         assert_eq!(
-            second_page.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+            second_page
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["b-movie"],
             "the removed item and other libraries must not appear"
         );
