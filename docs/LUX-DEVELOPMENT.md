@@ -20074,8 +20074,10 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
 实施结果（2026-11-05，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 验证）：按 TDD 先写失败用例
 （`rescan_between_image_refreshes_keeps_indexes_on_their_own_files` 在修复前报
 `FANART/1 should stay on fanart1.jpg, got …-backdrop1.png`），再实现到全绿。任务编号接 `LUX-885`（并行任务
-取 `LUX-886`，已把 `tspace/keep-existing-disc`（LUX-886）合入本分支；`test` 当时尚未包含该任务，冲突仅在
-文档：两条任务条目并存、TEST-TARGETS 计数按两任务叠加）。
+取 `LUX-886`）。合并基线：起初 `test` 还没有 LUX-886，先合入 `tspace/keep-existing-disc` 并解决文档冲突
+（两条任务条目并存、TEST-TARGETS 计数按两任务叠加）；返工收尾时 `test` 已包含 LUX-886 与 NFO 评分任务，
+再 `git merge test`（`0d529e17` 等 2 个提交，无冲突，仅带入 `nfo`/`ratings` 相关代码），随后复跑受影响的
+分组。
 
 返工（独立审查后，2026-11-05）：
 
@@ -20092,10 +20094,11 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
 
 验证命令与结果（返工后，合并 LUX-886 基线）：
 
-- `cargo test --locked --lib`：1954 通过 / 40 跳过 / 2 条既有偶发失败（`probe` 与 `watch` 各一条，与图片
-  无关，单独重跑均通过；与本任务返工前同一组偶发用例）。
+- `cargo test --locked --lib`（返工后、同步 `test` 前）：1954 通过 / 40 跳过 / 2 条既有偶发失败（`probe` 与
+  `watch` 各一条，与图片无关，单独重跑均通过；与本任务返工前同一组偶发用例）。同步 `test` 后受影响分组复跑
+  通过（下一条）。
 - `cargo test --locked --lib images::` 36/36、`--lib metadata::` 35/35、`--lib candidates::` 45/45
-  （含 LUX-886 的用例，仅确认未被牵连）。
+  （含 LUX-886 的用例，仅确认未被牵连）、`--lib image_repairs::` 1/1、`--lib nfo::` 30/30（同步 `test` 后）。
 - `cargo test --locked --test images` 66/66（新增 1 条同源异文件回归）、`cargo test --locked --test metadata`
   157/157（`metadata_selection` 新增 1 条；总数含 LUX-886 的 6 条）、`cargo test --locked --test strm` 42/42
   （含 STRM 缩略图 `POSTER/0` + `THUMB/0` 同文件用例；返工前该用例因跨类型去重失败为
