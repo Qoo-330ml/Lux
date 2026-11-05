@@ -5966,6 +5966,39 @@ impl Database {
         Ok(contexts)
     }
 
+    /// One page of a library's rating-sync candidates, ordered by item id.
+    ///
+    /// Pagination is keyset based (`after_id`) rather than offset based: a ratings run walks the
+    /// library while metadata refreshes may insert or remove rows, and an offset would then skip
+    /// or repeat items. Removed and merged-away items are excluded because a rating write to a
+    /// duplicate would only update a sidecar nothing reads any more.
+    pub(crate) async fn list_ratings_sync_items(
+        &self,
+        library_id: &str,
+        item_type: &str,
+        after_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<StoredRatingsSyncItem>, StorageError> {
+        self.query_as::<StoredRatingsSyncItem>(
+            "SELECT mi.id, mi.item_type, mi.provider_ids_json, mi.production_year,
+                    mi.season_number, mi.episode_number, mi.series_id, mi.parent_id
+             FROM media_items mi
+             WHERE mi.library_id = ? AND mi.item_type = ? AND mi.removed_at IS NULL
+               AND mi.merged_into_item_id IS NULL
+               AND (? IS NULL OR mi.id > ?)
+             ORDER BY mi.id
+             LIMIT ?",
+        )
+        .bind(library_id)
+        .bind(item_type)
+        .bind(after_id)
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(self.sqlx_err())
+    }
+
     pub(crate) async fn find_movie_nfo_writeback_context(
         &self,
         item_id: &str,
@@ -11234,6 +11267,94 @@ mod tests {
         assert!(query.contains("GROUP BY episode.parent_id"));
         assert!(!query.contains("episode_roots"));
         assert!(!query.contains("MAX(child.added_at)"));
+    }
+
+    #[tokio::test]
+    async fn ratings_sync_items_page_by_library_type_and_keyset()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        database
+            .query(
+                "INSERT INTO libraries (id, name, kind) VALUES
+                     ('ratings-library', 'Movies', 'MOVIE'),
+                     ('other-library', 'Other', 'MOVIE')",
+            )
+            .execute(&database.pool)
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items
+                     (id, library_id, item_type, title, sort_title, provider_ids_json,
+                      production_year, season_number, episode_number, series_id, removed_at,
+                      identification_status)
+                 VALUES
+                     ('a-movie', 'ratings-library', 'MOVIE', 'A', 'a',
+                      '{\"imdb\":\"tt1\",\"tmdb\":2}', 2001, NULL, NULL, NULL, NULL, 'LOCAL_CONFIRMED'),
+                     ('b-movie', 'ratings-library', 'MOVIE', 'B', 'b', NULL, NULL, NULL, NULL, NULL,
+                      NULL, 'LOCAL_CONFIRMED'),
+                     ('c-removed', 'ratings-library', 'MOVIE', 'C', 'c', NULL, NULL, NULL, NULL,
+                      NULL, 10, 'LOCAL_CONFIRMED'),
+                     ('d-series', 'ratings-library', 'SERIES', 'D', 'd', NULL, NULL, NULL, NULL,
+                      NULL, NULL, 'LOCAL_CONFIRMED'),
+                     ('e-episode', 'ratings-library', 'EPISODE', 'E', 'e', NULL, NULL, 1, 2,
+                      'd-series', NULL, 'LOCAL_CONFIRMED'),
+                     ('f-other', 'other-library', 'MOVIE', 'F', 'f', NULL, NULL, NULL, NULL, NULL,
+                      NULL, 'LOCAL_CONFIRMED')",
+            )
+            .execute(&database.pool)
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items
+                     (id, library_id, item_type, title, sort_title, merged_into_item_id,
+                      identification_status)
+                 VALUES ('g-merged', 'ratings-library', 'MOVIE', 'G', 'g', 'a-movie',
+                         'LOCAL_CONFIRMED')",
+            )
+            .execute(&database.pool)
+            .await?;
+
+        let first_page = database
+            .list_ratings_sync_items("ratings-library", "MOVIE", None, 1)
+            .await?;
+        assert_eq!(first_page.len(), 1);
+        assert_eq!(first_page[0].id, "a-movie");
+        assert_eq!(first_page[0].production_year, Some(2001));
+        assert_eq!(
+            first_page[0].provider_ids_json.as_deref(),
+            Some("{\"imdb\":\"tt1\",\"tmdb\":2}")
+        );
+
+        let second_page = database
+            .list_ratings_sync_items("ratings-library", "MOVIE", Some("a-movie"), 10)
+            .await?;
+        assert_eq!(
+            second_page.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+            vec!["b-movie"],
+            "the removed item and other libraries must not appear"
+        );
+
+        let episodes = database
+            .list_ratings_sync_items("ratings-library", "EPISODE", None, 10)
+            .await?;
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].season_number, Some(1));
+        assert_eq!(episodes[0].episode_number, Some(2));
+        assert_eq!(episodes[0].series_id.as_deref(), Some("d-series"));
+
+        assert!(
+            database
+                .list_ratings_sync_items("ratings-library", "SEASON", None, 10)
+                .await?
+                .is_empty(),
+            "seasons are not rating-sync candidates"
+        );
+        Ok(())
     }
 
     #[tokio::test]

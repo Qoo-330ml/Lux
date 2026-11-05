@@ -1420,6 +1420,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn item_has_nfo_reports_existing_sidecars_without_creating_one() {
+        let scanned = scan_movie_library(Some(MOVIE_WITH_EXTRAS)).await;
+        let writer = NfoWriteService::new(scanned.database.clone());
+        let movie_id = item_id(&scanned.database, "MOVIE").await;
+
+        assert!(
+            writer.item_has_nfo(&movie_id).await.expect("has nfo"),
+            "the scanned movie has a sibling NFO"
+        );
+        assert!(
+            !writer.item_has_nfo("missing-item").await.expect("missing"),
+            "an unknown item has no NFO"
+        );
+
+        let without_nfo = scan_movie_library(None).await;
+        let writer = NfoWriteService::new(without_nfo.database.clone());
+        let movie_id = item_id(&without_nfo.database, "MOVIE").await;
+        assert!(
+            !writer.item_has_nfo(&movie_id).await.expect("no nfo"),
+            "a movie without a sidecar must report false"
+        );
+        assert!(
+            !without_nfo.root.join("movie.nfo").exists(),
+            "item_has_nfo must never create the fallback movie.nfo"
+        );
+
+        let episodes = scan_series_library(
+            "<episodedetails>\n  <title>One</title>\n  <season>1</season>\n  <episode>1</episode>\n</episodedetails>\n",
+        )
+        .await;
+        let writer = NfoWriteService::new(episodes.database.clone());
+        assert!(
+            writer
+                .item_has_nfo(&episode_item_id(&episodes.database, 1).await)
+                .await
+                .expect("episode nfo"),
+            "the episode sidecar exists"
+        );
+        assert!(
+            !writer
+                .item_has_nfo(&item_id(&episodes.database, "SERIES").await)
+                .await
+                .expect("series nfo"),
+            "a series without tvshow.nfo reports false"
+        );
+        assert!(
+            !writer
+                .item_has_nfo(&item_id(&episodes.database, "SEASON").await)
+                .await
+                .expect("season nfo"),
+            "a season has no rating-bearing NFO of its own"
+        );
+    }
+
+    #[tokio::test]
     async fn write_item_ratings_skips_item_kinds_without_an_own_nfo() {
         let scanned = scan_movie_library(Some(MOVIE_WITH_EXTRAS)).await;
         let writer = NfoWriteService::new(scanned.database.clone());

@@ -5579,6 +5579,22 @@ pub(crate) struct StoredMediaWritebackContext {
     pub(crate) source: Option<StoredMediaSourcePath>,
 }
 
+/// One candidate of a library-wide ratings sync, with the fields that build the upstream lookup.
+///
+/// The row carries no source path: the ratings writer resolves the sidecar target itself, and the
+/// sync only needs the item identity plus the identifiers Trakt understands.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub(crate) struct StoredRatingsSyncItem {
+    pub(crate) id: String,
+    pub(crate) item_type: String,
+    pub(crate) provider_ids_json: Option<String>,
+    pub(crate) production_year: Option<i64>,
+    pub(crate) season_number: Option<i64>,
+    pub(crate) episode_number: Option<i64>,
+    pub(crate) series_id: Option<String>,
+    pub(crate) parent_id: Option<String>,
+}
+
 #[derive(Debug)]
 pub(crate) struct StoredItemScanPath {
     pub(crate) library_id: String,
