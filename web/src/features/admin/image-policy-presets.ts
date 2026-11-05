@@ -13,26 +13,11 @@ export const countPresets: PolicyPreset[] = [
   { value: "4", label: "4 张" },
 ];
 
-/** Minimum download width tiers, in pixels. */
-export const widthPresets: PolicyPreset[] = [
-  { value: "", label: "继承" },
-  { value: "0", label: "不限" },
-  { value: "360", label: "360 px" },
-  { value: "720", label: "720 px" },
-  { value: "1080", label: "1080 px" },
-  { value: "1280", label: "1280 px" },
-  { value: "1920", label: "1920 px" },
-  { value: "2160", label: "2160 px" },
-  { value: "3840", label: "3840 px" },
-];
-
 const flatCountPresets: PolicyPreset[] = countPresets.filter((preset) => preset.value !== "");
-
-const flatWidthPresets: PolicyPreset[] = widthPresets.filter((preset) => preset.value !== "");
 
 /**
  * Preset list for a stored value. A value that is not one of the tiers (for
- * example an older 640px setting) is kept as its own option so opening the
+ * example an older 7-image setting) is kept as its own option so opening the
  * form never silently rewrites it.
  */
 export function presetsWithCurrent(
@@ -49,8 +34,4 @@ export function presetsWithCurrent(
 
 export function flatCountOptions(value: number): PolicyPreset[] {
   return presetsWithCurrent(flatCountPresets, value, { allowInherit: false });
-}
-
-export function flatWidthOptions(value: number): PolicyPreset[] {
-  return presetsWithCurrent(flatWidthPresets, value, { allowInherit: false });
 }

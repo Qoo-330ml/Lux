@@ -12,9 +12,7 @@ import {
 import {
   countPresets,
   flatCountOptions,
-  flatWidthOptions,
   presetsWithCurrent,
-  widthPresets,
 } from "../src/features/admin/image-policy-presets";
 import type { MediaImageStrategySettings } from "../src/lib/api/types";
 
@@ -33,7 +31,6 @@ const base: MediaImageStrategySettings = {
   wallpaper: false,
   writeToMetadata: false,
   maxBackdropCount: 4,
-  minDownloadWidth: 1280,
 };
 
 describe("image level policy helpers", () => {
@@ -42,7 +39,6 @@ describe("image level policy helpers", () => {
       enabled: false,
       overwrite: "KEEP",
       maxCount: 1,
-      minWidth: 720,
       sources: ["SCRAPER"],
       scraperRoles: ["PRIMARY"],
     });
@@ -51,7 +47,6 @@ describe("image level policy helpers", () => {
       enabled: false,
       overwrite: "KEEP",
       maxCount: 1,
-      minWidth: 720,
       sources: ["SCRAPER"],
       scraperRoles: ["PRIMARY"],
     });
@@ -131,7 +126,7 @@ describe("image level policy editor", () => {
   });
 });
 describe("image policy preset tiers", () => {
-  it("offers wheel-friendly tiers instead of free typing", () => {
+  it("offers wheel-friendly count tiers instead of free typing", () => {
     expect(presetsWithCurrent(countPresets, undefined).map((option) => option.value)).toEqual([
       "",
       "0",
@@ -140,28 +135,16 @@ describe("image policy preset tiers", () => {
       "3",
       "4",
     ]);
-    expect(presetsWithCurrent(widthPresets, undefined).map((option) => option.value)).toEqual([
-      "",
-      "0",
-      "360",
-      "720",
-      "1080",
-      "1280",
-      "1920",
-      "2160",
-      "3840",
-    ]);
   });
 
   it("keeps an existing non-tier value selectable", () => {
-    const options = presetsWithCurrent(widthPresets, 640);
-    expect(options.map((option) => option.value)).toContain("640");
-    expect(options.at(-1)).toEqual({ value: "640", label: "当前 640" });
+    const options = presetsWithCurrent(countPresets, 7);
+    expect(options.map((option) => option.value)).toContain("7");
+    expect(options.at(-1)).toEqual({ value: "7", label: "当前 7" });
   });
 
   it("drops the inherit option for flat settings", () => {
     expect(flatCountOptions(4).map((option) => option.value)).toEqual(["0", "1", "2", "3", "4"]);
-    expect(flatWidthOptions(1280).map((option) => option.value)).not.toContain("");
   });
 });
 
@@ -200,20 +183,12 @@ describe("image level policy editor preset controls", () => {
     expect(latest.levels?.season?.artworks?.poster?.maxCount).toBe(2);
   });
 
-  it("writes the selected width tier", async () => {
-    let latest: MediaImageStrategySettings = base;
-    render(
-      <ImageLevelPolicyEditor
-        images={base}
-        onChange={(next) => {
-          latest = next;
-        }}
-      />,
-    );
+  it("no longer renders a minimum width control", () => {
+    render(<ImageLevelPolicyEditor images={base} onChange={() => {}} />);
 
-    await chooseLuxOptionByValue(container!, "单集背景图最小宽度", "1920");
-
-    expect(latest.levels?.episode?.artworks?.backdrop?.minWidth).toBe(1920);
+    expect(luxCombobox(container!, "单集背景图最小宽度")).toBeNull();
+    expect(luxCombobox(container!, "电影海报最小宽度")).toBeNull();
+    expect(container!.textContent).not.toContain("最小宽度");
   });
 });
 describe("inherit label follows the settings level", () => {
@@ -254,9 +229,6 @@ describe("inherit label follows the settings level", () => {
 
     const count = await luxOptions(container!, "电影海报张数");
     expect(count[0]?.label).toBe("默认");
-
-    const width = await luxOptions(container!, "电影海报最小宽度");
-    expect(width[0]?.label).toBe("默认");
 
     expect(container!.textContent).toContain("全部默认");
     expect(container!.textContent).not.toContain("全部继承");

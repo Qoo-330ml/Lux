@@ -23,7 +23,7 @@ import type { LucideIcon } from "lucide-react";
 import { ChangeEvent, DragEvent, FormEvent, useEffect, useRef, useState } from "react";
 import { LuxSelect } from "../../components/LuxSelect";
 import { ImageLevelPolicyEditor } from "./ImageLevelPolicyEditor";
-import { flatCountOptions, flatWidthOptions } from "./image-policy-presets";
+import { flatCountOptions } from "./image-policy-presets";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { AdminLibrary, AdminLibraryDeletionJob, AdminLibraryDeletionJobsPage, AdminLibraryScraper, AdminPlugin, ChapterSource, LibraryKind, MediaImageVariantCacheSettings, MediaStrategySettings, MetadataRefreshMode } from "../../lib/api/types";
@@ -342,7 +342,6 @@ function GlobalStrategyPanel({
           />
           <div className="lux-library-strategy-form-grid lux-library-strategy-image-limits">
             <label>每项最大背景图数量<LuxSelectField aria-label="每项最大背景图数量" value={String(strategy.images.maxBackdropCount)} onChange={(event) => updateImages("maxBackdropCount", Number(event.target.value))}>{flatCountOptions(strategy.images.maxBackdropCount).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</LuxSelectField><small>0 张表示不下载背景图</small></label>
-            <label>最小下载宽度<LuxSelectField aria-label="最小下载宽度" value={String(strategy.images.minDownloadWidth)} onChange={(event) => updateImages("minDownloadWidth", Number(event.target.value))}>{flatWidthOptions(strategy.images.minDownloadWidth).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</LuxSelectField><small>“不限”表示不限制</small></label>
           </div>
           <div className="lux-setting-divider" />
           <div className="lux-library-strategy-image-variants">
@@ -715,7 +714,6 @@ function LibraryStrategyOverride({ library, globalStrategy, onSave }: { library:
       <div className="lux-library-override-fields">
         <StrategySelect label="元数据语言" value={draft.metadataLanguage} options={[["zh-CN", "简体中文"], ["en-US", "English"], ["ja-JP", "日本語"]]} onChange={(value) => setDraft((current) => ({ ...current, metadataLanguage: value }))} />
         <label>最大背景图数量<LuxSelectField aria-label="媒体库最大背景图数量" value={String(draft.images.maxBackdropCount)} onChange={(event) => updateImages("maxBackdropCount", Number(event.target.value))}>{flatCountOptions(draft.images.maxBackdropCount).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</LuxSelectField></label>
-        <label>最小下载宽度<LuxSelectField aria-label="媒体库最小下载宽度" value={String(draft.images.minDownloadWidth)} onChange={(event) => updateImages("minDownloadWidth", Number(event.target.value))}>{flatWidthOptions(draft.images.minDownloadWidth).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</LuxSelectField></label>
       </div>
       <ImageLevelPolicyEditor
         images={draft.images}
@@ -723,7 +721,7 @@ function LibraryStrategyOverride({ library, globalStrategy, onSave }: { library:
         emptySummary="全部跟随本库"
         onChange={(images) => setDraft((current) => ({ ...current, images }))}
       />
-    </> : <p className="lux-admin-muted lux-library-override-inherit-copy">当前使用全局默认：{globalStrategy.metadataLanguage} · {globalStrategy.images.minDownloadWidth || "不限"} px · {globalStrategy.images.maxBackdropCount} 张背景图。</p>}
+    </> : <p className="lux-admin-muted lux-library-override-inherit-copy">当前使用全局默认：{globalStrategy.metadataLanguage} · {globalStrategy.images.maxBackdropCount} 张背景图。</p>}
     {error ? <p className="lux-error-copy">{error}</p> : null}
     <div className="lux-library-override-actions"><span>{saved ? "策略覆盖已保存" : "覆盖只影响当前媒体库"}</span><button className="lux-library-toolbar-button" type="button" onClick={() => void save()} disabled={saved && mode === "inherit"}><Save size={14} /> {saved ? "已保存" : "保存策略"}</button></div>
   </section>;

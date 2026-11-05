@@ -49,7 +49,6 @@ const SETTINGS: AdminSettings = {
       wallpaper: false,
       writeToMetadata: false,
       maxBackdropCount: 1,
-      minDownloadWidth: 1280,
     },
     subtitles: {
       autoDownload: false,

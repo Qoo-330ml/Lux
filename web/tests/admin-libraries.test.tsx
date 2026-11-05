@@ -124,7 +124,6 @@ describe("AdminLibrariesPage library cards", () => {
           wallpaper: false,
           writeToMetadata: false,
           maxBackdropCount: 1,
-          minDownloadWidth: 1280,
         },
         subtitles: {
           autoDownload: false,
@@ -1003,7 +1002,7 @@ describe("AdminLibrariesPage library cards", () => {
     expect(container.textContent).toContain("图像抓取");
     expect(container.textContent).toContain("光盘封面");
     expect(container.textContent).toContain("壁纸");
-    expect(container.textContent).toContain("最小下载宽度");
+    expect(container.textContent).not.toContain("最小下载宽度");
     expect(container.textContent).toContain("字幕默认值");
     expect(container.textContent).toContain("存储预估");
   });
@@ -1049,7 +1048,6 @@ describe("AdminLibrariesPage library cards", () => {
           wallpaper: false,
           writeToMetadata: false,
           maxBackdropCount: 1,
-          minDownloadWidth: 1280,
         },
         subtitles: { autoDownload: false, languages: ["zh-CN"], forcedOnly: false, hearingImpaired: false },
       },
@@ -1114,7 +1112,7 @@ describe("AdminLibrariesPage library cards", () => {
         region: "CN",
         scraperId: null,
         applyScope: "NEW_CONTENT",
-        images: { poster: true, artwork: true, banner: false, logo: true, thumbnail: true, thumbnailScrapingMode: "SCRAPER_FIRST", disc: false, wallpaper: false, writeToMetadata: false, maxBackdropCount: 1, minDownloadWidth: 1280 },
+        images: { poster: true, artwork: true, banner: false, logo: true, thumbnail: true, thumbnailScrapingMode: "SCRAPER_FIRST", disc: false, wallpaper: false, writeToMetadata: false, maxBackdropCount: 1 },
         subtitles: { autoDownload: false, languages: ["zh-CN"], forcedOnly: false, hearingImpaired: false },
       },
     });
@@ -1199,7 +1197,6 @@ describe("AdminLibrariesPage library cards", () => {
           wallpaper: false,
           writeToMetadata: false,
           maxBackdropCount: 1,
-          minDownloadWidth: 1280,
           variantCache: { enabled: true, maxFiles: 20000, maxBytes: 2147483648, concurrency: 2 },
         },
         subtitles: { autoDownload: false, languages: ["zh-CN"], forcedOnly: false, hearingImpaired: false },

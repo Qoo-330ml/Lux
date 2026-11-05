@@ -1,8 +1,4 @@
-import {
-  countPresets,
-  presetsWithCurrent,
-  widthPresets,
-} from "./image-policy-presets";
+import { countPresets, presetsWithCurrent } from "./image-policy-presets";
 import type {
   MediaArtworkOverwrite,
   MediaArtworkPolicySettings,
@@ -227,7 +223,6 @@ export function ImageLevelPolicyEditor({
                   <th scope="col">来源</th>
                   <th scope="col">覆盖</th>
                   <th scope="col">张数</th>
-                  <th scope="col">最小宽度</th>
                   <th scope="col">刮削器角色</th>
                 </tr>
               </thead>
@@ -328,28 +323,6 @@ export function ImageLevelPolicyEditor({
                           }
                         >
                           {presetsWithCurrent(countPresets, policy.maxCount).map((option) => (
-                            <option key={option.value} value={option.value}>
-                              {optionLabel(option)}
-                            </option>
-                          ))}
-                        </LuxSelectField>
-                      </td>
-                      <td>
-                        <LuxSelectField
-                          aria-label={`${level.label}${type.label}最小宽度`}
-                          value={String(policy.minWidth ?? "")}
-                          onChange={(event) =>
-                            onChange(
-                              updateArtworkPolicy(images, level.key, type.key, {
-                                minWidth:
-                                  event.target.value === ""
-                                    ? undefined
-                                    : Number(event.target.value),
-                              }),
-                            )
-                          }
-                        >
-                          {presetsWithCurrent(widthPresets, policy.minWidth).map((option) => (
                             <option key={option.value} value={option.value}>
                               {optionLabel(option)}
                             </option>

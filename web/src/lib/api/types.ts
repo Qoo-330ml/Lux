@@ -1984,7 +1984,6 @@ export type MediaArtworkPolicySettings = {
   scraperRoles?: MediaScraperRole[];
   overwrite?: MediaArtworkOverwrite;
   maxCount?: number;
-  minWidth?: number;
 };
 
 export type MediaImageLevelSettings = {
@@ -2005,7 +2004,6 @@ export type MediaImageStrategySettings = {
   wallpaper: boolean;
   writeToMetadata: boolean;
   maxBackdropCount: number;
-  minDownloadWidth: number;
   variantCache?: MediaImageVariantCacheSettings;
   levels?: Partial<Record<MediaImageLevelKey, MediaImageLevelSettings>>;
 };
