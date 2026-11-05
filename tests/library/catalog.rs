@@ -2472,3 +2472,119 @@ fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
         })
         .expect("expected cookie")
 }
+
+#[tokio::test]
+async fn emby_clients_receive_the_rating_written_in_an_emby_ratings_container()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Cold War (2012)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Cold.War.2012.mkv"), b"fixture").await?;
+    tokio::fs::write(
+        movie_dir.join("Cold.War.2012.nfo"),
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<movie>
+  <title>寒战</title>
+  <ratings>
+    <rating name="tmdb" max="10">
+      <value>7.6</value>
+      <votes>204</votes>
+    </rating>
+  </ratings>
+  <userrating>7.6</userrating>
+</movie>"#
+            .as_bytes(),
+    )
+    .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    MetadataEnricher::new(database.clone())
+        .with_nfo_store(LocalNfoMetadataStore::new(database.clone()))
+        .enrich_movie_library(library.id)
+        .await?;
+
+    let (item_id, rating, rating_source): (String, Option<f64>, Option<String>) = sqlx::query_as(
+        "SELECT id, rating, rating_source FROM media_items WHERE item_type = 'MOVIE' AND library_id = ?",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(rating, Some(7.6));
+    assert_eq!(rating_source.as_deref(), Some("NFO"));
+
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+    let login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="LuxTest", Device="Mac", DeviceId="rating-device", Version="1""#,
+        )
+        .json(&json!({ "Username": "admin", "Pw": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let token = login.json::<Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing token")?
+        .to_owned();
+    let emby_item_id = emby_public_id(&item_id);
+    let emby_library_id = emby_public_id(&library.id.to_string());
+
+    let detail = client
+        .get(format!(
+            "{base_url}/Users/{}/Items/{emby_item_id}?Fields=CommunityRating",
+            admin.id
+        ))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(detail.status(), reqwest::StatusCode::OK);
+    let detail_body: Value = detail.json().await?;
+    assert_eq!(detail_body["CommunityRating"], 7.6);
+
+    let page = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?ParentId={emby_library_id}&Fields=BasicSyncInfo,CommunityRating",
+            admin.id
+        ))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(page.status(), reqwest::StatusCode::OK);
+    let page_body: Value = page.json().await?;
+    assert_eq!(page_body["Items"][0]["CommunityRating"], 7.6);
+    Ok(())
+}

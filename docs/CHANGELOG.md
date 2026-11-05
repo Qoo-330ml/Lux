@@ -8,7 +8,14 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 
 ## [Unreleased]
 
-（暂无记录；下一个版本从这里开始累积）
+### 修复
+
+- **Emby/Jellyfin 写法的 `<ratings>` 容器现在能读到评分**：旁车 NFO 里的评分此前只认根节点下的平铺
+  `<rating>` / `<votes>`，其他工具写成 `<ratings><rating name="tmdb"><value>7.6</value><votes>204</votes>`
+  这种容器形式的条目会被静默忽略，详情页、NFO 面板和第三方 Emby 客户端的 `CommunityRating` 都拿不到评分。
+  现在容器内按 `default="true"` → TMDb 条目（`tmdb` / `themoviedb`）→ 第一个可读条目的顺序取值，`max`
+  不是 10 时归一到 0-10，票数取同一条目；平铺字段仍然优先，两种写法不会把一家的分值和另一家的票数凑在一起。
+  `<userrating>` 继续不读取（Lux 没有个人评分字段），评分来源仍记为 NFO。
 
 ## [0.7.12] - 2026-11-05
 
