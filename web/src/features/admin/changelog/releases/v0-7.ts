@@ -2,6 +2,18 @@ import type { ChangelogRelease } from "../types";
 
 export const changelogReleases07: ChangelogRelease[] = [
   {
+    version: "0.7.14",
+    date: "2026-11-05",
+    sections: [
+      { kind: "added", items: [
+        "同季不同版本的目录会合并成一个剧集的多个版本：以前 Season 1 DV、Season 1 HDR、Season 2 国语 这种带后缀的季目录会被当成不同的季（或者干脆解析失败），同一季的几个版本散成好几条。现在季号后面允许跟一个不带空格的标签（DV、HDR、国语；带空格的仍然不认），季号相同就归到同一季，标签只当媒体源的版本名（edition），不进条目身份，所以不同标签的目录会合并成同一个剧集的多个版本源。文件名自己写了 edition 的优先用文件名那个。",
+      ] },
+      { kind: "changed", items: [
+        "主程序不再提供「最小下载宽度」：图片宽度筛选改由刮削器插件按图片类型自行设置，Lux 不再按上游报告的宽度丢弃候选图，管理后台的全局策略、媒体库覆盖和分层图片矩阵里都没有这一项了。已保存设置里的 minDownloadWidth / minWidth 仍能正常加载（不报错也不丢整份设置），这两个键会被忽略并在下次保存时自然消失；旧版页面或脚本带这些键提交也不会失败。Emby 的 LibraryOptions.ImageOptions[].MinWidth 为兼容第三方客户端继续输出，值固定为 0。",
+      ] },
+    ],
+  },
+  {
     version: "0.7.13",
     date: "2026-11-05",
     sections: [
