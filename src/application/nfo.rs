@@ -35,6 +35,10 @@ use crate::storage::{
     Database, MediaMetadataUpdate, StorageError, StoredMediaSourcePath, StoredMediaWritebackContext,
 };
 
+mod ratings;
+
+pub use ratings::{NfoRatingEntry, RatingsNfoPatch, RatingsWriteOutcome};
+
 #[derive(Clone, Default)]
 pub(crate) struct LocalNfoProjectionCache {
     entries: Arc<Mutex<HashMap<PathBuf, Arc<OnceCell<CachedNfoProjectionResult>>>>>,
