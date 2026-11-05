@@ -72,6 +72,7 @@ const JOB_TYPE_LABELS: Record<string, string> = {
   STRM_MEDIA_INFO: "STRM 媒体信息扫描",
   CHAPTER_DETECTION: "片头片尾检测",
   DANMAKU_MATCH: "弹幕匹配",
+  RATINGS_SYNC: "评分同步",
 };
 
 const AUDIT_EVENT_LABELS: Record<string, string> = {
@@ -1147,7 +1148,9 @@ function isSchedulableTask(task: AdminScheduledTask) {
 }
 
 function isExternallyScheduledTask(task: AdminScheduledTask) {
-  return ["STRM_MEDIA_INFO", "CHAPTER_DETECTION", "DANMAKU_MATCH"].includes(task.taskType);
+  // These tasks keep their schedule in the owning plugin's configuration, so the page edits the
+  // plugin value instead of writing an enable flag next to it.
+  return ["STRM_MEDIA_INFO", "CHAPTER_DETECTION", "DANMAKU_MATCH", "RATINGS_SYNC"].includes(task.taskType);
 }
 
 async function runRegisteredTask(task: AdminScheduledTask) {
