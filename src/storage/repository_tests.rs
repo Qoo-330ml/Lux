@@ -6637,6 +6637,69 @@ async fn local_item_image_batch_is_bounded_idempotent_and_atomic() {
             .expect("read updated poster path"),
         "/media/first/poster-updated.jpg"
     );
+    // One item never registers two image rows on one path: a path another row owns is skipped
+    // instead of being written a second time under a different index.
+    let owned_path_batch = [ItemImageBatchInsert {
+        item_id: item_ids[0].clone(),
+        images: vec![
+            make_image("FANART", 2, "/media/first/fanart-2.jpg", "first-fanart-v3"),
+            make_image("LOGO", 0, "/media/first/fanart-2.jpg", "first-fanart-v4"),
+        ],
+        clear_poster_fallback: true,
+    }];
+    assert_eq!(
+        database
+            .insert_item_images_batch_at_indices(&owned_path_batch)
+            .await
+            .expect("skip an image path another row owns"),
+        0,
+        "a page cannot register a path another image row already owns"
+    );
+    // Two rows of one page that repeat a new path keep the first registration only.
+    let repeated_path_batch = [ItemImageBatchInsert {
+        item_id: item_ids[0].clone(),
+        images: vec![
+            make_image("FANART", 4, "/media/first/fanart-new.jpg", "duplicate-a"),
+            make_image("FANART", 5, "/media/first/fanart-new.jpg", "duplicate-b"),
+        ],
+        clear_poster_fallback: true,
+    }];
+    assert_eq!(
+        database
+            .insert_item_images_batch_at_indices(&repeated_path_batch)
+            .await
+            .expect("keep one registration per path"),
+        1,
+        "one path is registered once per page"
+    );
+    let fanart_rows: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT image_index, local_path, content_tag FROM item_images
+         WHERE item_id = ? AND image_type = 'FANART' ORDER BY image_index",
+    )
+    .bind(&item_ids[0])
+    .fetch_all(database.pool())
+    .await
+    .expect("read fanart registrations");
+    assert_eq!(
+        fanart_rows,
+        vec![
+            (
+                0,
+                "/media/first/fanart.jpg".to_owned(),
+                "first-fanart-v1".to_owned()
+            ),
+            (
+                1,
+                "/media/first/fanart-2.jpg".to_owned(),
+                "first-fanart-v2".to_owned()
+            ),
+            (
+                4,
+                "/media/first/fanart-new.jpg".to_owned(),
+                "duplicate-a".to_owned()
+            ),
+        ]
+    );
     assert_eq!(
         database
             .insert_item_images_batch_at_indices(&[])

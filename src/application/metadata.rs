@@ -1946,6 +1946,7 @@ impl MetadataEnricher {
         }
 
         let mut inserts_by_item = BTreeMap::<String, ItemImageBatchInsert>::new();
+        let mut assigned_indexes = BTreeMap::<String, BTreeMap<&'static str, BTreeSet<i64>>>::new();
         for (item_id, image) in candidates {
             let indexed = indexed_images
                 .get(&item_id)
@@ -1966,29 +1967,12 @@ impl MetadataEnricher {
                     source: error.error,
                 })?;
             let local_path = prepared.image.path.to_string_lossy().into_owned();
-            let existing = indexed.iter().find(|existing| {
-                existing.source == "LOCAL"
-                    && existing.image_type == image.image_type.as_str()
-                    && existing.local_path == local_path
-            });
-            let image_index = existing.map_or_else(
-                || {
-                    if image.image_type == ImageType::Fanart {
-                        indexed
-                            .iter()
-                            .filter(|existing| {
-                                existing.source == "LOCAL"
-                                    && existing.image_type == image.image_type.as_str()
-                            })
-                            .map(|existing| existing.image_index)
-                            .max()
-                            .unwrap_or(-1)
-                            .saturating_add(1)
-                    } else {
-                        0
-                    }
-                },
-                |existing| existing.image_index,
+            let item_assigned = assigned_indexes.entry(item_id.clone()).or_default();
+            let image_index = next_local_image_index(
+                image.image_type,
+                &prepared.image.path,
+                indexed,
+                item_assigned,
             );
             let insert =
                 inserts_by_item
@@ -2024,12 +2008,26 @@ impl MetadataEnricher {
         directory_cache: &mut DirectoryPathCache,
         report: &mut MetadataReport,
     ) -> Result<(), MetadataError> {
+        let item_ids = sources
+            .iter()
+            .map(|source| source.item_id.clone())
+            .collect::<Vec<_>>();
+        let indexed_images = self.database.list_item_images_by_ids(&item_ids).await?;
         let mut items = Vec::with_capacity(sources.len());
         for source in sources {
             report.items_processed += 1;
-            if let Some((item, skipped_image_count)) =
-                prepare_scan_local_movie_image_batch_item(source, directory_cache, report, true)
-                    .await
+            let indexed = indexed_images
+                .get(&source.item_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if let Some((item, skipped_image_count)) = prepare_scan_local_movie_image_batch_item(
+                source,
+                indexed,
+                directory_cache,
+                report,
+                true,
+            )
+            .await
             {
                 if skipped_image_count > 0 {
                     report.mark_item_image_skipped(&source.item_id);
@@ -2750,11 +2748,34 @@ impl MetadataEnricher {
                 }
             }
 
+            let page_item_ids = source_page
+                .iter()
+                .map(|source| source.item_id.clone())
+                .collect::<Vec<_>>();
+            let page_indexed_images =
+                match self.database.list_item_images_by_ids(&page_item_ids).await {
+                    Ok(images) => images,
+                    Err(error) => {
+                        // Registration still avoids duplicate paths in storage; the allocator just
+                        // cannot keep an already registered index for a recognisable file.
+                        tracing::warn!(
+                            item_count = source_page.len(),
+                            %error,
+                            "local movie image page could not read existing images"
+                        );
+                        HashMap::new()
+                    }
+                };
             let mut image_items = Vec::with_capacity(source_page.len());
             for source in source_page {
+                let indexed = page_indexed_images
+                    .get(&source.item_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
                 if let Some((item, skipped_image_count)) =
                     prepare_scan_local_movie_image_batch_item(
                         source,
+                        indexed,
                         &mut directory_cache,
                         report,
                         background_cpu_budgeted,
@@ -4061,7 +4082,7 @@ async fn prepare_local_image_batch_item(
         })
         .collect::<Vec<_>>();
     let prepared = prepare_local_images(images, background_cpu_budgeted).await;
-    let mut image_indexes = BTreeMap::<&'static str, i64>::new();
+    let mut assigned_indexes = BTreeMap::<&'static str, BTreeSet<i64>>::new();
     let mut records = Vec::new();
     let mut skipped_image_count = 0;
     for result in prepared {
@@ -4078,7 +4099,12 @@ async fn prepare_local_image_batch_item(
                 continue;
             }
         };
-        let image_index = next_local_image_index(&mut image_indexes, prepared.image.image_type);
+        let image_index = next_local_image_index(
+            prepared.image.image_type,
+            &prepared.image.path,
+            indexed_images,
+            &mut assigned_indexes,
+        );
         records.push(ItemImageInsert {
             image_type: prepared.image.image_type.as_str().to_owned(),
             image_index,
@@ -4106,6 +4132,7 @@ async fn prepare_local_image_batch_item(
 
 async fn prepare_scan_local_movie_image_batch_item(
     source: &StoredMediaSourcePath,
+    indexed_images: &[StoredItemImage],
     directory_cache: &mut DirectoryPathCache,
     report: &mut MetadataReport,
     background_cpu_budgeted: bool,
@@ -4148,7 +4175,7 @@ async fn prepare_scan_local_movie_image_batch_item(
     images.extend(extrafanart_local_images(&image_paths, resource_directory));
     images.sort_by(|left, right| left.path.cmp(&right.path));
     let prepared = prepare_local_images(images, background_cpu_budgeted).await;
-    let mut image_indexes = BTreeMap::<&'static str, i64>::new();
+    let mut assigned_indexes = BTreeMap::<&'static str, BTreeSet<i64>>::new();
     let mut records = Vec::new();
     let mut skipped_image_count = 0;
     for result in prepared {
@@ -4165,7 +4192,12 @@ async fn prepare_scan_local_movie_image_batch_item(
                 continue;
             }
         };
-        let image_index = next_local_image_index(&mut image_indexes, prepared.image.image_type);
+        let image_index = next_local_image_index(
+            prepared.image.image_type,
+            &prepared.image.path,
+            indexed_images,
+            &mut assigned_indexes,
+        );
         records.push(ItemImageInsert {
             image_type: prepared.image.image_type.as_str().to_owned(),
             image_index,
@@ -4191,15 +4223,52 @@ async fn prepare_scan_local_movie_image_batch_item(
     ))
 }
 
-fn next_local_image_index(indexes: &mut BTreeMap<&'static str, i64>, image_type: ImageType) -> i64 {
+/// Picks the image index one local image registers under.
+///
+/// Fanart is the only type with several indexes. An index the item already registers for this
+/// exact path is kept, so a rescan never renumbers a file that is already indexed. Any other
+/// registered index of the same type, and every index an earlier image of this pass took, is
+/// avoided: `next_local_image_index` must not hand a new file an index that points at a different
+/// file. Other types keep the single canonical index the scanner assigns.
+fn next_local_image_index(
+    image_type: ImageType,
+    path: &Path,
+    indexed_images: &[StoredItemImage],
+    assigned: &mut BTreeMap<&'static str, BTreeSet<i64>>,
+) -> i64 {
     let key = image_type.as_str();
     if image_type != ImageType::Fanart {
         return 0;
     }
-    let index = indexes.entry(key).or_default();
-    let current = *index;
-    *index = index.saturating_add(1);
-    current
+    let assigned = assigned.entry(key).or_default();
+    let registered_index = indexed_images
+        .iter()
+        .find(|image| {
+            image.image_type.eq_ignore_ascii_case(key) && Path::new(&image.local_path) == path
+        })
+        .map(|image| image.image_index)
+        .filter(|index| *index >= 0 && !assigned.contains(index));
+    if let Some(index) = registered_index {
+        assigned.insert(index);
+        return index;
+    }
+    let mut index = 0_i64;
+    loop {
+        let taken = assigned.contains(&index)
+            || indexed_images.iter().any(|image| {
+                image.image_type.eq_ignore_ascii_case(key)
+                    && image.image_index == index
+                    && Path::new(&image.local_path) != path
+            });
+        if !taken {
+            assigned.insert(index);
+            return index;
+        }
+        match index.checked_add(1) {
+            Some(next) => index = next,
+            None => return 0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -4805,6 +4874,69 @@ mod tests {
         assert_eq!(results, (0..12).map(|value| value * 2).collect::<Vec<_>>());
     }
 
+    #[test]
+    fn local_image_indexes_avoid_registered_and_assigned_indexes() {
+        let indexed_image =
+            |image_type: &str, image_index: i64, local_path: &str| StoredItemImage {
+                id: format!("{image_type}-{image_index}"),
+                item_id: "item".to_owned(),
+                image_type: image_type.to_owned(),
+                image_index,
+                local_path: local_path.to_owned(),
+                file_size: None,
+                content_tag: None,
+                source: "LOCAL".to_owned(),
+                root_path: None,
+            };
+        let indexed = vec![
+            indexed_image("FANART", 0, "/media/fanart.jpg"),
+            indexed_image("FANART", 1, "/media/fanart1.jpg"),
+            indexed_image("FANART", 2, "/media/fanart2.jpg"),
+            indexed_image("FANART", 3, "/media/fanart3.jpg"),
+        ];
+        let mut assigned = BTreeMap::<&'static str, BTreeSet<i64>>::new();
+
+        // A file that is already registered keeps its index across a rescan.
+        assert_eq!(
+            next_local_image_index(
+                ImageType::Fanart,
+                Path::new("/media/fanart2.jpg"),
+                &indexed,
+                &mut assigned,
+            ),
+            2
+        );
+        // A new file never takes an index that points at another file.
+        assert_eq!(
+            next_local_image_index(
+                ImageType::Fanart,
+                Path::new("/media/new.jpg"),
+                &indexed,
+                &mut assigned,
+            ),
+            4
+        );
+        assert_eq!(
+            next_local_image_index(
+                ImageType::Fanart,
+                Path::new("/media/another.jpg"),
+                &indexed,
+                &mut assigned,
+            ),
+            5
+        );
+        // Other types keep the single canonical index the scanner assigns.
+        assert_eq!(
+            next_local_image_index(
+                ImageType::Poster,
+                Path::new("/media/poster.jpg"),
+                &indexed,
+                &mut assigned,
+            ),
+            0
+        );
+    }
+
     #[tokio::test]
     async fn movie_library_image_registration_batches_multiple_items()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -4854,8 +4986,9 @@ mod tests {
         assert_eq!(report.images_found, 2);
         assert_eq!(
             database.query_count(),
-            2,
-            "one source page query and one shared image insert should cover both movies"
+            3,
+            "one source page query, one registered-image read for stable indexes, and one shared \
+             image insert should cover both movies"
         );
         let images: Vec<(String, String)> = sqlx::query_as(
             "SELECT media_items.title, item_images.image_type

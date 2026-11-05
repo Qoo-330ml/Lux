@@ -9927,8 +9927,18 @@ impl Database {
         }
 
         let mut image_rows = Vec::with_capacity(image_count);
+        let mut registered_paths = std::collections::HashSet::with_capacity(image_count);
         for item in items {
-            image_rows.extend(item.images.iter().map(|image| (&item.item_id, image)));
+            for image in &item.images {
+                // Two images of one item never share a registration path. The scanner allocates a
+                // free index per file, so a page that repeats a path is stale (a moved file whose
+                // previous row was not pruned); keep the first registration instead of writing
+                // the same file twice under two indexes.
+                if !registered_paths.insert((item.item_id.as_str(), image.local_path.as_str())) {
+                    continue;
+                }
+                image_rows.push((&item.item_id, image));
+            }
         }
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
@@ -9938,10 +9948,26 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
-                "INSERT INTO item_images (
+                "WITH page(
                     id, item_id, image_type, image_index, local_path, width, height,
                     file_size, content_tag, source, source_url
-                ) VALUES {values}
+                ) AS (VALUES {values})
+                INSERT INTO item_images (
+                    id, item_id, image_type, image_index, local_path, width, height,
+                    file_size, content_tag, source, source_url
+                )
+                SELECT id, item_id, image_type, image_index, local_path, width, height,
+                       file_size, content_tag, source, source_url
+                FROM page
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM item_images existing
+                    WHERE existing.item_id = page.item_id
+                      AND existing.local_path = page.local_path
+                      AND NOT (
+                          existing.image_type = page.image_type
+                          AND existing.image_index = page.image_index
+                      )
+                )
                 ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET
                     id = excluded.id,
                     local_path = excluded.local_path,
