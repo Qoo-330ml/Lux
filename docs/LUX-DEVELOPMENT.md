@@ -260,6 +260,9 @@ Lux 的核心价值不是功能数量，而是：
 - 张数上限只作用于背景图、艺术图和壁纸；上限为 4 张，0 表示该类型不下载。补充来源追加时按
   剩余名额截断。
 - 最小宽度不再由 Lux 主程序设置或过滤：候选入库前只按类型归并，不读取上游宽度；宽度筛选由刮削器插件负责（LUX-884）。
+- 海报候选（`Primary`/`Poster`）在没有独立光盘图时也用于填充 `DISC`；条目已经有光盘图（本地文件、
+  已登记图片或写入目录）时，刷新不会用海报覆盖它，上游明确给出的 `Disc` 候选仍按覆盖策略处理
+  （LUX-886）。
 - 刮削器角色过滤只在配置了具体角色时查询一次条目所属媒体库的角色；来源角色未知时保持原有放行
   行为。本地图始终优先，因此不提供“不使用本地图”的开关。
 - 单集图片三选一：`SCRAPER_STILL` 使用在线剧照（写入 FANART），`LOCAL_SCREENSHOT` 使用 ffmpeg
@@ -19914,6 +19917,90 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
   只记 warn，内存清理仍生效，但若紧接着重启进程，磁盘上可能仍是旧文件，旧条目会被读回，需要等下一次
   成功持久化。
 - 本机只验证了 stub 插件与 resolver 装配；未在真实 TMDb 插件上复测语言/最小宽度变更后的即时生效。
+
+#### LUX-886：已有光盘图时海报候选不再覆盖 DISC
+
+背景：`candidate_image_targets` 把 `Primary`/`Poster` 类型的刮削图同时映射到本地 `POSTER` 和
+`DISC`（`src/application/candidates.rs`）。这条映射本身是“没有光盘图时用海报兜底”的设计，但写入
+路径分不清“兜底”和“显式光盘候选”：`write_selected_images` 把候选 JSON 里 `DISC` 桶的 URL 按普通
+类型处理，`FULL_REFRESH` 时 `replace=true`，`images.rs` 的 `image_target` 又会复用媒体目录里同名的
+`disc.jpg`，于是海报字节覆盖了已有光盘图，POSTER 与 DISC 变成同一张。
+
+实现（只改 `src/application/candidates.rs`，未动 `src/application/images.rs`、
+`src/application/metadata.rs`、`src/storage/catalog.rs`）：
+
+- 新增 `candidate_disc_urls`：把候选 `DISC` 桶拆成 `explicit` 与 `poster_fallback`。同时出现在
+  `POSTER` 桶里的 URL 是海报派生兜底，其余是上游显式给出的光盘候选；两组 URL 都保留，显式候选先写，
+  兜底只在显式候选全部失败时才有机会使用。
+- `write_selected_images` 的类型循环只写显式 `DISC`（原有覆盖语义不变）；全部图片任务结束后再做最后
+  一次兜底尝试：仅当 `DISC` 在策略里启用、允许刮削来源、未命中截图回退、本次没有写出 `DISC`，且
+  `disc_artwork_present(item_id)` 为 false 时，才用海报 URL 以“仅补缺”方式写入 `DISC`。该探测覆盖
+  `item_images` 记录与文件、`/config/metadata` 旁车和媒体目录；探测出错（例如符号链接）按“已有光盘图”
+  处理，只记一条不含路径/URL 的 warn 并跳过兜底，不向上抛错。
+- `explicitly_unavailable_image_types` 逻辑不变，只更新注释：海报 URL 仍覆盖 `POSTER`/`DISC`
+  （`DISC` 仅作为没有光盘图时的兜底），不新增“误判为不可用”。
+- 候选 JSON 形状、图片策略、数据库 schema、插件协议均未改变；升级前入库的候选按同一规则处理。
+
+验收：
+
+- [x] 条目已有 `disc.jpg`：`FULL_REFRESH` 选海报候选后 `disc.jpg` 字节不变，`POSTER` 写入候选海报，
+      `report.image_types` 只有 `POSTER`。修复前该用例失败（`["POSTER", "DISC"]`）。
+- [x] 条目没有光盘图：同一候选刷新后仍生成 `disc.png`，`item_images.source_url` 为海报 URL。
+- [x] 上游显式提供 `Disc` 候选（与海报 URL 不同）：`FULL_REFRESH` 仍按覆盖语义替换已有 `disc.jpg`，
+      `item_images.source_url` 为该候选 URL。
+- [x] 显式 `Disc` URL 全部失败、条目没有光盘图：仍由海报兜底写入 `DISC`；显式成功时不追加海报写入。
+- [x] 已有光盘图探测出错（`disc.jpg` 为符号链接）：整次选择仍成功，NFO 与 `POSTER` 正常写回，
+      符号链接保持原样。
+- [x] `explicitly_unavailable_image_types` 现有用例保持通过。
+- [x] `candidates.rs` 单测覆盖拆分规则（海报派生、显式候选保留兜底、空映射）。
+
+预计文件：`src/application/candidates.rs`、`tests/metadata/metadata_selection.rs`、
+`docs/LUX-DEVELOPMENT.md`、`docs/CHANGELOG.md`、`docs/COMPATIBILITY.md`、`docs/TEST-TARGETS.md`。
+
+实施结果（2026-11-05，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 验证）：按 TDD 先加失败
+测试再实现，分两个提交（测试、实现+文档）。任务编号接 `LUX-885`。
+
+验证命令与结果：
+
+- `cargo test --locked --test metadata metadata_selection::full_refresh_` 8/8（含 5 条新增）。
+- `cargo test --locked --test metadata metadata_selection::` 45/45。
+- `cargo test --locked --lib candidates::` 45/45（改写拆分单测，并扩展既有低宽度用例）。
+- `cargo test --locked --test images image_writer::` 20/20、`cargo test --locked --test reidentify`
+  25/25（完整刷新路径回归）。
+- `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+  `python3 scripts/check-backend-branches.py` 通过。
+- `docs/TEST-TARGETS.md` 的 `metadata_selection`（38→45）、`metadata` 分组（143→156）与第 2 节合计
+  按实际 `cargo test -- --list` 重测更新；同组 `nfo_writer`（27→33）的基线漂移一并修正。
+
+限制与剩余风险：
+
+- 判定依赖“海报 URL 同时出现在 `POSTER` 和 `DISC` 桶”这一现有映射事实；若某个上游把显式光盘图和
+  海报给成完全相同的 URL，会被保守当成兜底，已有光盘图时不覆盖（不会丢图）。
+- 兜底尝试在本次所有图片任务结束后执行，需要一次 `has_local_image`（图片记录查询 + 文件检查）；只在
+  `DISC` 启用、存在海报派生 DISC、本次没有写出 `DISC` 时执行。探测出错只记 warn 并跳过兜底。
+- 未改 `images.rs` 的目标路径选择，已有 `disc.jpg` 被复用的行为保持原样；本任务只保证不复用海报字节
+  覆盖它。
+- 未在真实 Emby 客户端/网盘媒体库上复测光盘图显示。
+
+返工（独立审查后，2026-11-05）：
+
+- 显式 `Disc` 失败时兜底被丢掉：`candidate_disc_urls` 之前在 `explicit` 非空时清空
+  `poster_fallback`，对“条目没有光盘图、显式 `Disc` URL 全部 404/超限”的条目，基线会继续用海报
+  填一张，返工前一张都不写。现在两组 URL 都保留：显式候选照旧先写；兜底改为全部任务结束后的最后
+  尝试，只有本次没有写出 `DISC`、且 `disc_artwork_present` 为 false 时才用海报 URL 以“仅补缺”
+  方式写入（`try_download_item_image_if_missing_from_scraper_at_index`），显式成功时不会多写一次。
+  单测 `explicit_disc_candidates_keep_their_urls_and_suppress_the_poster_fallback` 改写为
+  `explicit_disc_candidates_keep_the_poster_fallback_for_a_later_attempt`；新增集成用例
+  `full_refresh_falls_back_to_the_poster_when_the_explicit_disc_candidate_fails`（返工前失败）和
+  `full_refresh_does_not_add_a_poster_disc_when_the_explicit_disc_succeeds`。
+- 预检查报错让整次选择失败：`has_local_image(DISC).await?` 遇到符号链接或不可读路径会返回
+  `SymlinkTarget` 等错误，媒体目录里 `disc.jpg` 是符号链接的条目因此从“能刷新”变成失败。现在改为
+  `disc_artwork_present`：出错按“已有光盘图”处理（跳过兜底）并记一条不含路径/URL 的 warn，不向
+  调用方抛错。新增 `full_refresh_survives_a_symlinked_disc_artwork_probe`（返工前返回
+  `Image(SymlinkTarget(...))`，返工后刷新成功、NFO 与 `POSTER` 正常写回、符号链接原样保留）。
+- 复跑：`--lib candidates::` 45/45、`--test metadata metadata_selection::` 45/45、
+  `--test images image_writer::` 20/20、`--test reidentify` 25/25、fmt / clippy /
+  `check-backend-branches.py` 通过。
 
 #### LUX-887：图片写入的路径冲突检测与索引一致性（同类型多索引不再共用一个文件）
 

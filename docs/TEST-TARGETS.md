@@ -14,13 +14,13 @@
 | `--test emby` | Emby 兼容层（认证、系统信息、增量刷新、发现、多段播放、检索、下载） | 11 | 39 |
 | `--test scanner` | 媒体库扫描、增量/混合扫描、计划任务、作业事件与关停 | 7 | 151 |
 | `--test library` | 媒体库生命周期、合并/拆分、集合、目录与系列 API | 12 | 50 |
-| `--test metadata` | 元数据抓取与选择、NFO 回写、扫描后剧集元数据、人物、字幕 | 14 | 151 |
+| `--test metadata` | 元数据抓取与选择、NFO 回写、扫描后剧集元数据、人物、字幕 | 14 | 157 |
 | `--test images` | 图片变体、写回、缩略图与图片 API | 6 | 66 |
 | `--test playback` | 播放、播放令牌/历史/续播、观看状态归档、章节与片头片尾检测 | 10 | 35 |
 | `--test storage` | SQLite/PostgreSQL 存储、迁移、WAL、数据库维护与启动守卫 | 9 | 116 |
 | `--test plugins` | 插件协议与运行时、弹幕、IP 属地、媒体信息插件配置 | 11 | 120 |
 | `--test strm` | STRM 目标解析/探测/播放与 ffprobe | 9 | 42 |
-| 合计（12 组） |  | 126 | 923 |
+| 合计（12 组） |  | 126 | 929 |
 
 另有 8 个 binary 因为进程级共享状态或外部服务依赖保持独立，见第 4 节：`--test background_work_budget`、`--test filmly_image_diag`、`--test image_variants_perf`、`--test performance`、`--test postgres_database`、`--test reidentify`、`--test scanned_metadata`、`--test shutdown`。合计 12 + 8 = 20 个集成测试 target。
 
@@ -113,7 +113,7 @@ cargo test --locked --test <新 target> <旧名>::
 | `metadata_cancel` | 3 | `cargo test --locked --test metadata metadata_cancel::` |
 | `metadata_objects` | 4 | `cargo test --locked --test metadata metadata_objects::` |
 | `metadata_paths` | 8 | `cargo test --locked --test metadata metadata_paths::` |
-| `metadata_selection` | 40 | `cargo test --locked --test metadata metadata_selection::` |
+| `metadata_selection` | 46 | `cargo test --locked --test metadata metadata_selection::` |
 | `nfo_writer` | 33 | `cargo test --locked --test metadata nfo_writer::` |
 | `people_api` | 10 | `cargo test --locked --test metadata people_api::` |
 | `scanned_series_metadata` | 3 | `cargo test --locked --test metadata scanned_series_metadata::` |
@@ -173,7 +173,7 @@ cargo test --locked --test <新 target> <旧名>::
 | `scanned_metadata` | 23 | `cargo test --locked --test scanned_metadata`（本来就没有合并） |
 | `shutdown` | 2 | `cargo test --locked --test shutdown`（本来就没有合并） |
 | `filmly_image_diag` | 1 | `cargo test --locked --test filmly_image_diag`（本来就没有合并） |
-| **合计** | **1038** |  |
+| **合计** | **1044** |  |
 
 ## 3. 只跑某一个原文件的测试
 
@@ -236,8 +236,8 @@ cargo test --locked --test scanner
 ### 5.1 逐组测试数对照（合并时一致；第四列按当前 `--list` 更新）
 
 合并当时的校验标准是“合并前同名文件测试数之和 == 合并后 `--test <group> -- --list`”。合并之后各任务
-继续新增用例，因此下表保留合并前的数字，第三列改为当前值，第四列标出差异来源；第 1、2 节的数字与
-当前值一致。
+继续新增用例，因此下表保留合并前的数字，第三列改为当前值，第四列标出差异来源；第 1、2 节的合计分别
+等于表内 12 个分组行之和与表内全部行之和。
 
 | 新 target | 合并前同名文件测试数之和 | 当前 `--test <group> -- --list` | 结果 |
 |---|---|---|---|
@@ -247,14 +247,14 @@ cargo test --locked --test scanner
 | `emby` | 38 | 39 | 新增 1 例（后续任务） |
 | `scanner` | 137 | 151 | 新增 14 例（后续任务） |
 | `library` | 49 | 50 | 新增 1 例（后续任务） |
-| `metadata` | 143 | 151 | 新增 8 例（LUX-887 1 例，其余为先前任务） |
+| `metadata` | 143 | 157 | 新增 14 例（LUX-886 6 例、LUX-887 1 例，其余为先前任务） |
 | `images` | 52 | 66 | 新增 14 例（LUX-887 1 例，其余为先前任务） |
 | `playback` | 34 | 35 | 新增 1 例（后续任务） |
 | `storage` | 112 | 115 | 新增 3 例（后续任务） |
 | `plugins` | 84 | 117 | 新增 33 例（后续任务） |
 | `strm` | 42 | 42 | 一致 |
 | 独立 binary 合计 | 112 | 114 | 新增 2 例（后续任务） |
-| **合计** | **934** | **1037** | 差异均为合并后新增用例 |
+| **合计** | **934** | **1039** | 差异均为合并后新增用例 |
 
 ### 5.2 单个用例稳定性复核
 
