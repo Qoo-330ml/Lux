@@ -818,12 +818,12 @@ export class LuxApiClient {
     });
   }
 
-  startItemMetadataRefresh(itemId: string) {
+  startItemMetadataRefresh(itemId: string, mode: MetadataRefreshMode) {
     return this.request<AdminMetadataReidentifyStart>(
       `/api/v1/admin/items/${encodeURIComponent(itemId)}/metadata/refresh`,
       {
-      method: "POST",
-        body: JSON.stringify({ mode: "FILL_MISSING" }),
+        method: "POST",
+        body: JSON.stringify({ mode }),
       },
     );
   }

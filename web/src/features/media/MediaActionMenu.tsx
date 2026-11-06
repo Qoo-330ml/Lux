@@ -1,7 +1,7 @@
 import { Download, Ellipsis, FileDown, Image as ImageIcon, Lock, Pencil, RefreshCw, ScanLine, ScanSearch, Subtitles, Trash2, Unlock, X } from "lucide-react";
 import { createPortal } from "react-dom";
 import { useRef, useState } from "react";
-import type { MediaItem } from "../../lib/api/types";
+import type { MediaItem, MetadataRefreshMode } from "../../lib/api/types";
 import { usePopoverPosition } from "./usePopoverPosition";
 
 type MediaActionMenuProps = {
@@ -14,6 +14,7 @@ type MediaActionMenuProps = {
   onLockMetadata?: () => void;
   onUnlockMetadata?: () => void;
   onRefreshMetadata?: () => void;
+  refreshMode?: MetadataRefreshMode;
   onScanFolder?: () => void;
   className?: string;
   sourceId?: string;
@@ -57,7 +58,7 @@ function canDeleteMediaSource(item: MediaItem) {
   return !NON_MEDIA_ITEM_TYPES.has(item.itemType ?? "");
 }
 
-export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubtitles, onDelete, onIdentify, onLockMetadata, onUnlockMetadata, onRefreshMetadata, onScanFolder, className = "", sourceId, showLabel = false }: MediaActionMenuProps) {
+export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubtitles, onDelete, onIdentify, onLockMetadata, onUnlockMetadata, onRefreshMetadata, refreshMode, onScanFolder, className = "", sourceId, showLabel = false }: MediaActionMenuProps) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -80,6 +81,16 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubt
     ? `/api/v1/items/${encodeURIComponent(item.id)}/images/poster`
     : undefined;
   const downloadUrl = mediaDownloadUrl(item, sourceId);
+  const refreshLabel = refreshMode === "FULL_REFRESH"
+    ? "全量刷新元数据"
+    : refreshMode === "FILL_MISSING"
+      ? "补全缺失元数据"
+      : "刷新元数据";
+  const refreshTitle = refreshMode === "FULL_REFRESH"
+    ? "重新获取并覆盖未锁定的元数据和图片"
+    : refreshMode === "FILL_MISSING"
+      ? "只补全缺失的元数据和图片"
+      : undefined;
 
   if (isFolder) return null;
 
@@ -195,13 +206,14 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubt
               data-action="refresh-metadata"
               type="button"
               role="menuitem"
+              title={refreshTitle}
               onClick={() => {
                 setOpen(false);
                 onRefreshMetadata();
               }}
             >
               <RefreshCw size={17} aria-hidden="true" />
-              <span>刷新元数据</span>
+              <span>{refreshLabel}</span>
             </button>
           ) : null}
           {onScanFolder ? (

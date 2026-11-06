@@ -4,8 +4,9 @@ import { ArrowLeft, Check, Heart, Play, Radio } from "lucide-react";
 import { Link, useNavigate } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
-import type { MediaItem } from "../../lib/api/types";
+import type { MediaItem, MetadataRefreshMode } from "../../lib/api/types";
 import { MediaActionMenu } from "../media/MediaActionMenu";
+import { useItemMetadataRefreshMode } from "../media/useItemMetadataRefreshMode";
 import { MediaEditorBoundary } from "../media/MediaEditorBoundary";
 import { useMediaSource } from "./MediaSourcePanel";
 import { MediaEpisodePlayButton } from "./MediaEpisodesSection";
@@ -37,6 +38,7 @@ type ActionContextValue = {
   setEditor: (editor: EditorKind) => void;
   openDelete: () => void;
   refreshMetadata: () => void;
+  metadataRefreshMode?: MetadataRefreshMode;
   scanLibrary: () => void;
   setMetadataLock: (locked: boolean) => void;
   confirmMetadata: () => void;
@@ -66,6 +68,7 @@ export function MediaDetailActions({ item, pendingReview, children }: {
     queryFn: () => api.libraryItems(item.libraryId ?? "", 1, undefined, { metadataStatus: "PENDING", pageSize: 100 }),
     enabled: pendingReview && Boolean(item.libraryId),
   });
+  const metadataRefreshMode = useItemMetadataRefreshMode(item);
   const [editor, setEditor] = useState<EditorKind>();
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [error, setError] = useState<string>();
@@ -98,7 +101,7 @@ export function MediaDetailActions({ item, pendingReview, children }: {
     setError(undefined);
     setNotice(undefined);
     try {
-      await api.startItemMetadataRefresh(item.id);
+      await api.startItemMetadataRefresh(item.id, metadataRefreshMode ?? "FILL_MISSING");
       setNotice("元数据刷新任务已提交，可在管理任务中查看进度。");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "元数据刷新任务提交失败，请重试。");
@@ -178,6 +181,7 @@ export function MediaDetailActions({ item, pendingReview, children }: {
     setEditor,
     openDelete: () => setDeleteOpen(true),
     refreshMetadata: () => void refreshMetadata(),
+    metadataRefreshMode,
     scanLibrary: () => void scanLibrary(),
     setMetadataLock: (locked) => void setMetadataLock(locked),
     confirmMetadata: () => void confirmMetadata(),
@@ -243,6 +247,7 @@ export const MediaDetailActionMenu = memo(function MediaDetailActionMenu({ class
     onDelete={actions.openDelete}
     onIdentify={() => actions.setEditor("identify")}
     onRefreshMetadata={actions.refreshMetadata}
+    refreshMode={actions.metadataRefreshMode}
     onScanFolder={actions.scanLibrary}
     onLockMetadata={() => actions.setMetadataLock(true)}
     onUnlockMetadata={() => actions.setMetadataLock(false)}

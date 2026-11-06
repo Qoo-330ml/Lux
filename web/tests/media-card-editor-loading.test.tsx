@@ -2,6 +2,7 @@
 
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -36,12 +37,15 @@ describe("MediaCard editor loading", () => {
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
     act(() => {
       root.render(
-        <MemoryRouter>
-          <MediaCard item={{ id: "item-1", title: "二毛", itemType: "MOVIE" }} />
-        </MemoryRouter>,
+        <QueryClientProvider client={client}>
+          <MemoryRouter>
+            <MediaCard item={{ id: "item-1", title: "二毛", itemType: "MOVIE" }} />
+          </MemoryRouter>
+        </QueryClientProvider>,
       );
     });
 

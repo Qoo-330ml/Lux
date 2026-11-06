@@ -1403,22 +1403,25 @@ describe("LuxApiClient", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("starts item metadata refresh and library scan jobs through the admin API", async () => {
+  it("starts item metadata refresh with the requested mode and library scan jobs through the admin API", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);
       expect(init?.method).toBe("POST");
       if (path === "/api/v1/admin/items/item-1/metadata/refresh") {
-        expect(JSON.parse(String(init?.body))).toEqual({ mode: "FILL_MISSING" });
-        return new Response(JSON.stringify({ mode: "FILL_MISSING", totalCount: 1, job: { id: "metadata-job-1" } }), { status: 202 });
+        const body = JSON.parse(String(init?.body)) as { mode: string };
+        return new Response(JSON.stringify({ mode: body.mode, totalCount: 1, job: { id: "metadata-job-1" } }), { status: 202 });
       }
       expect(path).toBe("/api/v1/admin/items/item-1/scan");
       return new Response(JSON.stringify({ job: { id: "scan-job-1" } }), { status: 202 });
     });
 
     const client = new LuxApiClient();
-    await expect(client.startItemMetadataRefresh("item-1")).resolves.toEqual({ mode: "FILL_MISSING", totalCount: 1, job: { id: "metadata-job-1" } });
+    await expect(client.startItemMetadataRefresh("item-1", "FILL_MISSING")).resolves.toEqual({ mode: "FILL_MISSING", totalCount: 1, job: { id: "metadata-job-1" } });
+    await expect(client.startItemMetadataRefresh("item-1", "FULL_REFRESH")).resolves.toEqual({ mode: "FULL_REFRESH", totalCount: 1, job: { id: "metadata-job-1" } });
     await expect(client.startItemFolderScan("item-1")).resolves.toEqual({ job: { id: "scan-job-1" } });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls.slice(0, 2).map(([, init]) => JSON.parse(String(init?.body))))
+      .toEqual([{ mode: "FILL_MISSING" }, { mode: "FULL_REFRESH" }]);
   });
 
   it("starts a whole-library metadata reidentification batch", async () => {

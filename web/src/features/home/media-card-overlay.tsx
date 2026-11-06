@@ -1,5 +1,5 @@
 import { memo, type ReactNode } from "react";
-import type { MediaItem } from "../../lib/api/types";
+import type { MediaItem, MetadataRefreshMode } from "../../lib/api/types";
 import { MediaActionMenu } from "../media/MediaActionMenu";
 import type { MediaCardEditor } from "./media-card-editors";
 import { mediaTitle } from "./media-display";
@@ -14,6 +14,7 @@ type MediaCardOverlayProps = {
   onEditorChange: (editor: MediaCardEditor) => void;
   onDelete: () => void;
   onRefreshMetadata: () => void;
+  refreshMode?: MetadataRefreshMode;
   onScanFolder: () => void;
   onLockMetadata: () => void;
   onUnlockMetadata: () => void;

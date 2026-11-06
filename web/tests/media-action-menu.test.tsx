@@ -104,6 +104,83 @@ describe("MediaActionMenu", () => {
     expect(onDelete).toHaveBeenCalledOnce();
   });
 
+  it("labels the refresh action from the resolved scrape mode", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <MediaActionMenu
+            item={{ id: "item-1", title: "二毛" }}
+            onEditMetadata={() => undefined}
+            onEditImages={() => undefined}
+            onRefreshMetadata={() => undefined}
+            refreshMode="FULL_REFRESH"
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    await act(async () => container.querySelector<HTMLButtonElement>(".lux-media-actions-trigger")?.click());
+
+    const action = document.body.querySelector<HTMLButtonElement>("[data-action=refresh-metadata]");
+    expect(action?.textContent?.replace(/\s+/g, " ").trim()).toBe("全量刷新元数据");
+    expect(action?.getAttribute("title")).toBe("重新获取并覆盖未锁定的元数据和图片");
+  });
+
+  it("labels a fill-missing refresh", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <MediaActionMenu
+            item={{ id: "item-1", title: "二毛" }}
+            onEditMetadata={() => undefined}
+            onEditImages={() => undefined}
+            onRefreshMetadata={() => undefined}
+            refreshMode="FILL_MISSING"
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    await act(async () => container.querySelector<HTMLButtonElement>(".lux-media-actions-trigger")?.click());
+
+    const action = document.body.querySelector<HTMLButtonElement>("[data-action=refresh-metadata]");
+    expect(action?.textContent?.replace(/\s+/g, " ").trim()).toBe("补全缺失元数据");
+    expect(action?.getAttribute("title")).toBe("只补全缺失的元数据和图片");
+  });
+
+  it("keeps the neutral label when no mode is resolved", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <MediaActionMenu
+            item={{ id: "item-1", title: "二毛" }}
+            onEditMetadata={() => undefined}
+            onEditImages={() => undefined}
+            onRefreshMetadata={() => undefined}
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    await act(async () => container.querySelector<HTMLButtonElement>(".lux-media-actions-trigger")?.click());
+
+    const action = document.body.querySelector<HTMLButtonElement>("[data-action=refresh-metadata]");
+    expect(action?.textContent?.replace(/\s+/g, " ").trim()).toBe("刷新元数据");
+    expect(action?.getAttribute("title")).toBeNull();
+  });
+
   it("offers deletion for series items", async () => {
     container = document.createElement("div");
     document.body.append(container);

@@ -10,12 +10,14 @@ import { MediaCardEditors } from "./media-card-editors";
 import { MediaCardVisual, MediaCardCopy } from "./media-card-visual";
 import { useImageVariants } from "./image-variants";
 import { MediaCardOverlay } from "./media-card-overlay";
+import { useItemMetadataRefreshMode } from "../media/useItemMetadataRefreshMode";
 import { usePopoverPosition } from "../media/usePopoverPosition";
 import type { MediaCardEditor } from "./media-card-editors";
 import { EpisodeCount, MediaPlaceholder, episodeTitle, imageUrl, mediaTitle, mediaTypeLabel, playbackProgress, playbackPositionTicks, remainingRuntimeLabel } from "./media-display";
 export { EpisodeCount, Rating, episodeTitle, imageUrl, mediaTitle, mediaTypeLabel, playbackPositionTicks, playbackProgress, posterUrlWithFallback, remainingRuntimeLabel, runtimeLabel } from "./media-display";
 
 export const MediaCard = memo(function MediaCard({ item, landscape = false, metadataAttention = false, detailSearch, selectionMode = false, selected = false, folderHref, detailHref: detailHrefOverride, readOnly = false, onSelectionChange }: { item: MediaItem; landscape?: boolean; metadataAttention?: boolean; detailSearch?: string; selectionMode?: boolean; selected?: boolean; folderHref?: string; detailHref?: string; readOnly?: boolean; onSelectionChange?: (itemId: string, selected: boolean) => void }) {
+  const metadataRefreshMode = useItemMetadataRefreshMode(item, !readOnly);
   const [editor, setEditor] = useState<"metadata" | "images" | "subtitles" | "identify">();
   const [actionError, setActionError] = useState<string>();
   const [actionNotice, setActionNotice] = useState<string>();
@@ -36,12 +38,12 @@ export const MediaCard = memo(function MediaCard({ item, landscape = false, meta
     setActionError(undefined);
     setActionNotice(undefined);
     try {
-      await api.startItemMetadataRefresh(item.id);
+      await api.startItemMetadataRefresh(item.id, metadataRefreshMode ?? "FILL_MISSING");
       setActionNotice("刷新任务已提交");
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "元数据刷新任务提交失败，请重试。");
     }
-  }, [item.id]);
+  }, [item.id, metadataRefreshMode]);
 
   const scanLibrary = useCallback(async () => {
     setActionError(undefined);
@@ -70,7 +72,7 @@ export const MediaCard = memo(function MediaCard({ item, landscape = false, meta
   return (
     <>
       <article className={[landscape ? "lux-media-card lux-media-card-landscape" : "lux-media-card", selected ? "is-selected" : ""].filter(Boolean).join(" ")}>
-        <MediaCardOverlay item={item} selectionMode={selectionMode} selected={selected} readOnly={readOnly} onSelectionChange={onSelectionChange} onEditorChange={openEditor} onDelete={openDeleteDialog} onRefreshMetadata={refresh} onScanFolder={scan} onLockMetadata={lockMetadata} onUnlockMetadata={unlockMetadata}>
+        <MediaCardOverlay item={item} selectionMode={selectionMode} selected={selected} readOnly={readOnly} onSelectionChange={onSelectionChange} onEditorChange={openEditor} onDelete={openDeleteDialog} onRefreshMetadata={refresh} refreshMode={metadataRefreshMode} onScanFolder={scan} onLockMetadata={lockMetadata} onUnlockMetadata={unlockMetadata}>
           {visual}
         </MediaCardOverlay>
         <MediaCardCopy item={item} metadataAttention={metadataAttention} href={item.itemType === "FOLDER" ? folderHref : detailHref} />

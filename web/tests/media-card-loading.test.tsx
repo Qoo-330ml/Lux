@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
 import { MediaCard } from "../src/features/home/media";
@@ -40,10 +41,11 @@ it("loads only the requested editor, unmounts on close, and deletes the default 
   document.body.append(container);
   root = createRoot(container);
   const deletion = vi.spyOn(api, "deleteItem").mockResolvedValue(undefined);
-  await act(async () => root?.render(<MemoryRouter><MediaCard item={{
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  await act(async () => root?.render(<QueryClientProvider client={client}><MemoryRouter><MediaCard item={{
     id: "movie", title: "示例电影", itemType: "MOVIE",
     mediaSources: [{ id: "other", name: "other" }, { id: "default", name: "default", isDefault: true }],
-  }} /></MemoryRouter>));
+  }} /></MemoryRouter></QueryClientProvider>));
   expect(loaded).toEqual([]);
   expect(container.querySelector('[role="dialog"]')).toBeNull();
 
