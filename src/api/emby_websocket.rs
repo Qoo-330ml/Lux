@@ -43,7 +43,8 @@ impl CoreState {
     }
 
     pub(crate) fn emby_websocket_shutdown(&self) -> &WebsocketShutdown {
-        &self.emby_websocket_shutdown
+        // The Emby endpoint and `/api/v1/ws` share one shutdown signal (ADR-054 D10).
+        &self.websocket_shutdown
     }
 }
 

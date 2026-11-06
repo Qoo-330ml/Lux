@@ -145,6 +145,8 @@ fn ready_router(state: ReadyAppState) -> Router {
         .merge(users::api_routes())
         .merge(admin::api_routes())
         .merge(lux_api::api_routes())
+        // `GET /api/v1/ws` is a Lux API route; it never enters the Emby router builder (ADR-054 D1).
+        .merge(lux_websocket::api_routes())
         .merge(emby_routes.clone())
         .nest("/emby", emby_routes)
         .fallback_service(spa_service())

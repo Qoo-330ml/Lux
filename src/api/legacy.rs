@@ -155,6 +155,10 @@ use playback::*;
 mod emby_websocket;
 pub use emby_websocket::EmbyWebsocketLimits;
 use emby_websocket::*;
+#[path = "lux_websocket.rs"]
+mod lux_websocket;
+pub use lux_websocket::LuxWebsocketLimits;
+use lux_websocket::*;
 #[path = "media.rs"]
 mod media;
 use media::*;
@@ -218,8 +222,11 @@ pub struct CoreState {
     sse_permits: SseConnectionBudget,
     /// Bounds the number of concurrent Emby WebSocket connections (global and per user).
     emby_websocket_connections: WebsocketConnections,
-    /// Trips every open Emby WebSocket connection when the process starts shutting down.
-    emby_websocket_shutdown: WebsocketShutdown,
+    /// Bounds the concurrent Lux WebSocket connections: one budget per channel (ADR-054 D8).
+    lux_websocket_connections: LuxWebsocketConnections,
+    /// Trips every open realtime WebSocket connection (`/embywebsocket` and `/api/v1/ws`) when the
+    /// process starts shutting down. Both endpoints watch the same signal (ADR-054 D10).
+    websocket_shutdown: WebsocketShutdown,
 }
 
 /// Delay between the `setup/complete` response and the restart request.
@@ -766,15 +773,43 @@ impl AppState {
         self
     }
 
-    /// Asks every open Emby WebSocket connection to send its close frame and exit.
+    /// Overrides the `/api/v1/ws` resource limits (tests shrink them so a budget or a timer is
+    /// observable without waiting for the production values).
+    pub fn with_lux_websocket_limits(mut self, limits: LuxWebsocketLimits) -> Self {
+        self.core.lux_websocket_connections = LuxWebsocketConnections::new(limits);
+        self
+    }
+
+    /// Asks every open realtime connection (`/embywebsocket` and `/api/v1/ws`) to send its close
+    /// frame and exit. Both endpoints watch the same signal (ADR-054 D10).
+    pub fn signal_websocket_shutdown(&self) {
+        self.core.websocket_shutdown.signal();
+    }
+
+    /// The Emby endpoint's historical name for [`Self::signal_websocket_shutdown`]; it trips the
+    /// shared signal, so the Lux connections are told to close as well.
     pub fn signal_emby_websocket_shutdown(&self) {
-        self.core.emby_websocket_shutdown.signal();
+        self.signal_websocket_shutdown();
+    }
+
+    /// Signals every open realtime connection to close and waits up to the production drain
+    /// timeout for all of them to exit. Answers `false` when a connection outlived it.
+    pub async fn shutdown_websocket_connections(&self) -> bool {
+        self.signal_websocket_shutdown();
+        let timeout = EMBY_WEBSOCKET_SHUTDOWN_DRAIN_TIMEOUT;
+        let (emby, lux) = tokio::join!(
+            self.core
+                .emby_websocket_connections
+                .wait_until_idle(timeout),
+            self.core.lux_websocket_connections.wait_until_idle(timeout),
+        );
+        emby && lux
     }
 
     /// Signals every open Emby WebSocket connection to close and waits up to the production
     /// drain timeout for them to exit. Answers `false` when a connection outlived it.
     pub async fn shutdown_emby_websocket_connections(&self) -> bool {
-        self.signal_emby_websocket_shutdown();
+        self.signal_websocket_shutdown();
         self.drain_emby_websocket_connections(EMBY_WEBSOCKET_SHUTDOWN_DRAIN_TIMEOUT)
             .await
     }
@@ -784,6 +819,15 @@ impl AppState {
     pub async fn drain_emby_websocket_connections(&self, timeout: std::time::Duration) -> bool {
         self.core
             .emby_websocket_connections
+            .wait_until_idle(timeout)
+            .await
+    }
+
+    /// Waits up to `timeout` for every open Lux WebSocket connection to release its slot.
+    /// Answers `false` when a connection outlived the timeout.
+    pub async fn drain_lux_websocket_connections(&self, timeout: std::time::Duration) -> bool {
+        self.core
+            .lux_websocket_connections
             .wait_until_idle(timeout)
             .await
     }
@@ -1050,7 +1094,8 @@ impl AppState {
             danmaku_search_rate_limiter: crate::security::DanmakuSearchRateLimiter::default(),
             sse_permits: SseConnectionBudget::default(),
             emby_websocket_connections: WebsocketConnections::default(),
-            emby_websocket_shutdown: WebsocketShutdown::default(),
+            lux_websocket_connections: LuxWebsocketConnections::default(),
+            websocket_shutdown: WebsocketShutdown::default(),
         };
         // Built here (not in `start_realtime_watchers`) so the shutdown can reach its stop handle.
         let library_watch = LibraryWatchService::with_scan_jobs_and_metadata(

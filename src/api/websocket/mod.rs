@@ -21,6 +21,30 @@ use std::time::Duration;
 
 use tokio::sync::Semaphore;
 
+/// ADR-054 D8: connection budget of the Lux `user` channel. 8 accounts x 4 tabs x 2 (reconnect
+/// overlap) = 64, doubled for scripts, tests and devices the estimate does not cover.
+pub(crate) const LUX_WEBSOCKET_DEFAULT_USER_MAX_CONNECTIONS: usize = 128;
+/// ADR-054 D8: per-account budget of the Lux `user` channel: 4 tabs x 2 devices x 2 overlap.
+pub(crate) const LUX_WEBSOCKET_DEFAULT_USER_MAX_CONNECTIONS_PER_USER: usize = 16;
+/// ADR-054 D8: connection budget of the Lux `admin` channel. 3 administrators x 4 tabs x 2 = 24,
+/// rounded up to about 2.7 times that.
+pub(crate) const LUX_WEBSOCKET_DEFAULT_ADMIN_MAX_CONNECTIONS: usize = 64;
+/// ADR-054 D8: per-account budget of the Lux `admin` channel: 4 desktop tabs x 2 overlap.
+pub(crate) const LUX_WEBSOCKET_DEFAULT_ADMIN_MAX_CONNECTIONS_PER_USER: usize = 8;
+/// ADR-054 D4: largest inbound message `/api/v1/ws` accepts. The only legitimate client frame is
+/// `{"type":"ping"}` (15 bytes), so 4 KiB leaves about 270 times the room while staying half of the
+/// Emby channel's 8 KiB limit.
+pub(crate) const LUX_WEBSOCKET_DEFAULT_MAX_MESSAGE_BYTES: usize = 4 * 1024;
+/// Transport ceiling of one inbound message on `/api/v1/ws`.
+///
+/// The contract limit ([`LUX_WEBSOCKET_DEFAULT_MAX_MESSAGE_BYTES`]) is enforced by the handler so an
+/// oversized frame is answered with a `1009` close; tungstenite can only report the size after it
+/// buffered the message, so the transport limit must sit above the contract limit or no close frame
+/// could ever be written for an oversized message. 64 KiB keeps the per-connection buffer bounded
+/// (192 connections x 64 KiB = 12 MiB worst case, far below the 768 MiB write-buffer bound) and
+/// anything above it is a protocol violation that ends the socket without a close frame.
+pub(crate) const LUX_WEBSOCKET_FRAME_BUFFER_LIMIT: usize = 64 * 1024;
+
 /// Default upper bound on concurrently open connections of one budget instance for the whole
 /// process.
 pub(crate) const WEBSOCKET_DEFAULT_MAX_CONNECTIONS: usize = 32;

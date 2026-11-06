@@ -331,11 +331,12 @@ async fn serve(
     let _ = discovery_task.await;
     mail_worker.shutdown().await;
     // An upgraded WebSocket connection is detached from the HTTP connection, so `axum::serve`
-    // does not wait for it. Close them here, before any worker or the database goes away, and do
-    // it whether or not `serve` returned an error: an error must not leave a connection pushing
-    // against a database that is about to close.
-    if !shutdown_state.shutdown_emby_websocket_connections().await {
-        warn!("emby websocket connections outlived the shutdown drain timeout");
+    // does not wait for it. Close both realtime endpoints here (`/embywebsocket` and
+    // `/api/v1/ws`), before any worker or the database goes away, and do it whether or not
+    // `serve` returned an error: an error must not leave a connection pushing against a database
+    // that is about to close.
+    if !shutdown_state.shutdown_websocket_connections().await {
+        warn!("websocket connections outlived the shutdown drain timeout");
     }
     serve_result?;
     let shutdown_reason = *control_tx.borrow();
@@ -413,10 +414,10 @@ async fn shutdown_signal(
         }
     }
 
-    // Long-lived responses (Emby WebSocket) do not end on their own, so they are told to close
-    // before the graceful drain starts waiting for in-flight requests. Background workers are
-    // drained once, after `serve` returns, by the caller below.
-    state.signal_emby_websocket_shutdown();
+    // Long-lived responses (`/embywebsocket` and `/api/v1/ws`) do not end on their own, so they
+    // are told to close before the graceful drain starts waiting for in-flight requests.
+    // Background workers are drained once, after `serve` returns, by the caller below.
+    state.signal_websocket_shutdown();
     // Only signal the HTTP server to stop here. Workers are drained once, after `serve` returns
     // and no further requests can start work, by the caller below.
     let _ = shutdown.send(true);
