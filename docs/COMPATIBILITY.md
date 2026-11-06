@@ -9,14 +9,15 @@ Emby 客户端上复测；`Items[]` 的 `Name`/`Id` 形状按 Emby `NameIdPair` 
 固定服务端合同。Yamby 本次抓包未观察到这两个请求。
 
 - `GET /OfficialRatings`：从 `media_content_restriction_index.certification_code` 聚合当前用户可见范围内
-  去重后的分级，按分级代码升序返回；Emby `OfficialRating` 字段本来就渲染同一列。`ParentId`（媒体库）、
-  `IncludeItemTypes`、`StartIndex`/`Limit` 与服务端上限与其他 facet 端点一致，`ParentId` 是不可见媒体库
-  时返回 404。响应信封与 `/Genres` 相同：
+  去重后的**归一化分级码子集**（内容限制索引识别的 MPA/TVPG/BBFC 码），按分级代码升序返回。
+  `ParentId`（媒体库）、`IncludeItemTypes`、`StartIndex`/`Limit` 与服务端上限与其他 facet 端点一致，
+  `ParentId` 是不可见媒体库时返回 404。响应信封与 `/Genres` 相同：
   `{"Items":[{"Name":"PG-13","Id":"PG-13","ServerId":…}],"TotalRecordCount":n,"StartIndex":n}`；`Id` 就是
   分级值。
-- 分级的取值范围：只有 NFO `<certification>` 被既有投影归一成 MPA/TVPG/BBFC 之一的值才会出现在列表里。
-  无法识别的分级字符串、以及没有 NFO 分级的条目不会贡献 facet；这与 `OfficialRating` 字段本身的输出
-  范围一致，不是本任务新增的过滤。
+- 与 `OfficialRating` 字段的关系：**不是同一份值**。条目 `OfficialRating` 输出 NFO 原文（可能是
+  `Rated R`、`FSK 16`、`US:PG-13`），而这个列表只包含被内容限制索引识别的归一化码：无法识别的分级不
+  出现，识别出的分级也可能与原文写法不同（例如 NFO 的 `Rated R` 在这里是 `R`）。没有 NFO 分级的条目
+  不会贡献 facet。这不是本任务新增的过滤，是既有投影的取值范围的直接结果。
 - 内容限制：非管理员用户的分级列表与 `/Items` 使用同一条内容限制谓词，超出 `maximum_rating` 的条目连同
   其分级一起被排除；管理员不受内容限制（与既有列表一致）。库 ACL 与内容限制同时生效。
 - `GET /Tags`：**目前恒返回 200 与 `{"Items":[],"TotalRecordCount":0}`**，不再是 404，筛选面板显示空
@@ -27,13 +28,17 @@ Emby 客户端上复测；`Items[]` 的 `Name`/`Id` 形状按 Emby `NameIdPair` 
 - 鉴权与路径：两个端点都要求 Emby token/API key（未鉴权 401），同时支持根路径与 `/emby` 前缀；路由走
   既有 `EmbyRouteBuilder`，因此 `/emby` 前缀与路径大小写不敏感的行为自动一致
   （`/EMBY/officialratings` 有测试覆盖）。
-- 分页：`Limit` 默认 50、服务端上限 1000（与 `/Genres` 相同），`StartIndex<0` 或 `Limit>1000` 返回 400；
-  空的 `StartIndex=`/`Limit=` 按未提供处理（Hills 的筛选面板会带空 `Limit=`），空的 `ParentId=` 按
-  “不限媒体库”处理。
+- 分页：`Limit` 默认 50（`Limit<=0` 也按默认 50 处理，与 `/Genres` 一致）、服务端上限 1000；
+  `Limit>1000` 或 `StartIndex<0` 返回 400；空的 `StartIndex=`/`Limit=` 按未提供处理（Hills 的筛选面板
+  会带空 `Limit=`），空的 `ParentId=` 按“不限媒体库”处理。
+- `IncludeItemTypes`：与 `/Items` 使用同一份解析规则。整组都无法识别时返回空列表（200 空信封），不会
+  退化成“不过滤”的全量结果；混合有效与无效类型时只按有效类型过滤。
 - `Recursive` 被接受但不改变结果：与其他 facet 端点一样，分级聚合始终覆盖所选库/类型的全部可见条目。
+- **剩余缺口**：分级目前只能列出，不能用于 `/Items` 筛选——`/Items` 不接受 `OfficialRatings=` 参数，
+  所以在筛选面板里选中某个分级不会改变列表。对应后续任务待立项，本任务没有改 `/Items` 过滤。
 - 自动化：`cargo test --locked --test emby emby_filter_metadata::`（3 例）覆盖去重、库 ACL、内容限制、
-  `ParentId`、`IncludeItemTypes`、分页与上限、空 `Limit=`、未鉴权 401、根路径/`/emby`/大小写混用与
-  `Tags` 空信封。
+  `ParentId`、`IncludeItemTypes`（有效/全无效/混合）、分页与上限、空 `Limit=` 与 `Limit=0`、未鉴权 401、
+  根路径/`/emby`/大小写混用与 `Tags` 空信封。
 
 ## LUX-888 Emby 查询端点容忍空的可选数值/布尔参数（2026-11-06）
 
@@ -203,7 +208,7 @@ Lux 侧改动（`src/api/emby_catalog.rs`、`src/application/probe.rs`，无迁�
 
 - 新增 `GET /Genres`、`/Studios`、`/Years`（同样挂在 `/emby` 前缀下，路径大小写不敏感）。需要 Emby token，按用户的媒体库权限和内容限制收窄；支持 `UserId`、`ParentId`（仅媒体库 ID，未授权或未知返回 404）、`IncludeItemTypes`、`StartIndex`、`Limit`（上限与 `/Persons` 相同，超限 400）。返回 `{ Items, TotalRecordCount, StartIndex }`，每项含 `Name`、不透明的 `Id`、`Type`（`Genre`/`Studio`/`Year`）和 `ChildCount`（可见条目数）；`Genres`、`Studios` 按名称排序，`Years` 由新到旧。
 - `GET /Items`、`/Users/{id}/Items` 新增 `Genres`、`Studios` 筛选，值用 `|` 分隔、任一命中即匹配，大小写不敏感，最多 32 个值。`Years` 参数原本就支持。
-- **未实现**：`/Tags`（NFO 缓存里没有 tags 数据，未新增解析）；`GenreIds`、`StudioIds` 按 ID 筛选（`Id` 仅是稳定的不透明值，客户端请用 `Genres`/`Studios` 名称筛选）；Genres/Studios 的图片。
+- **后续修订（LUX-890）**：`/Tags` 返回 200 空列表（无数据源，待后续投影填充）；`/OfficialRatings` 已实现（归一化分级码子集）。仍**未实现**：`GenreIds`、`StudioIds` 按 ID 筛选（`Id` 仅是稳定的不透明值，客户端请用 `Genres`/`Studios` 名称筛选）；Genres/Studios 的图片。
 - 数据来源：迁移 `0245`/`0247` 新增 `media_item_facets(item_id, kind, name_key, name)`，由内容限制索引 worker 从同一份 NFO 快照写入，NFO 变化后经既有队列重建。请求路径只读该表，不解析 NFO、不扫库。升级时迁移会把所有存量条目重新入队，回填在后台分批完成；回填完成前 `/Genres`、`/Studios` 与 `Genres`/`Studios` 筛选只覆盖已索引的条目。回填会重写内容限制索引行，并触发一次 catalog outbox 更新。
 - 验证：`cargo test --locked --test emby emby_facets::`；`cargo test --locked --lib content_restriction_index`。
 

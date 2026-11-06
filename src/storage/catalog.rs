@@ -3858,9 +3858,11 @@ impl Database {
         ))
     }
 
-    /// Distinct official rating codes of the items the filter can see, with how many visible items
-    /// carry each (sorted by code). Reads the `media_content_restriction_index` projection, the
-    /// same column the Emby `OfficialRating` field is rendered from, so it never parses NFO JSON;
+    /// Distinct normalized certification codes of the items the filter can see, with how many
+    /// visible items carry each (sorted by code). Reads the `media_content_restriction_index`
+    /// projection and never parses NFO JSON. This is a subset of the values the Emby
+    /// `OfficialRating` field shows: that field renders the raw NFO certification, so an
+    /// unrecognized rating is absent here and a recognized one may be spelled differently.
     /// `limit` is clamped by the caller.
     pub(crate) async fn list_catalog_certifications(
         &self,

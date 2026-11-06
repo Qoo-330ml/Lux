@@ -315,6 +315,27 @@ async fn official_ratings_apply_parent_id_item_types_and_pagination()
     assert_eq!(status, reqwest::StatusCode::OK);
     assert_eq!(names(&series), ["TV-14"]);
 
+    // An entirely unrecognized type list must not degrade into "no type filter" (`/Items` uses the
+    // same rule), while a mixed list keeps only the types it recognizes.
+    let (status, unknown_type) = fixture
+        .get(
+            "/OfficialRatings?IncludeItemTypes=Photo",
+            &fixture.admin_token,
+        )
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert!(names(&unknown_type).is_empty());
+    assert_eq!(unknown_type["TotalRecordCount"], 0);
+
+    let (status, mixed_types) = fixture
+        .get(
+            "/OfficialRatings?IncludeItemTypes=Photo,Series",
+            &fixture.admin_token,
+        )
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(names(&mixed_types), ["TV-14"]);
+
     let (status, page) = fixture
         .get(
             "/OfficialRatings?StartIndex=1&Limit=1",
@@ -331,6 +352,14 @@ async fn official_ratings_apply_parent_id_item_types_and_pagination()
     assert_eq!(status, reqwest::StatusCode::OK);
     assert_eq!(empty_limit["TotalRecordCount"], 4);
     assert_eq!(names(&empty_limit).len(), 4);
+
+    // `Limit<=0` keeps the `/Genres` behavior: the default page size applies.
+    let (status, zero_limit) = fixture
+        .get("/OfficialRatings?Limit=0", &fixture.admin_token)
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(zero_limit["TotalRecordCount"], 4);
+    assert_eq!(names(&zero_limit).len(), 4);
 
     let (status, _) = fixture
         .get("/OfficialRatings?Limit=1001", &fixture.admin_token)

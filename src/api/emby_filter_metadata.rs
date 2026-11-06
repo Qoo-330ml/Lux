@@ -4,12 +4,14 @@
 //! as `/Genres` (`UserId`, `ParentId`, `Recursive`, `IncludeItemTypes`, `StartIndex`, `Limit`) and
 //! the same `{"Items": [...], "TotalRecordCount": n}` envelope.
 //!
-//! `OfficialRatings` aggregates the normalized certification codes that the Emby
-//! `OfficialRating` field already renders, so it reads the existing content-restriction index and
-//! never parses NFO JSON in a request. `Tags` has no stored data source yet: item tags are not
-//! parsed from NFO and there is no `TAG` facet kind, so the endpoint answers an empty envelope
-//! instead of `404` (an empty filter list rather than a failed request). It stays empty until a
-//! later task adds a tag projection.
+//! `OfficialRatings` lists the subset of rating codes the content-restriction index recognized
+//! (normalized MPA/TVPG/BBFC codes). The index is filled from NFO metadata in the background, so a
+//! request never parses NFO JSON. These values are **not** the raw NFO certification the Emby
+//! `OfficialRating` field renders: an unrecognized rating does not appear at all, and a recognized
+//! one may be spelled differently (an NFO `Rated R` is listed as `R`). `Tags` has no stored data
+//! source yet: item tags are not parsed from NFO and there is no `TAG` facet kind, so the endpoint
+//! answers an empty envelope instead of `404` (an empty filter list rather than a failed request).
+//! It stays empty until a later task adds a tag projection.
 
 use super::*;
 
@@ -71,17 +73,6 @@ fn emby_filter_metadata_page(query: &EmbyFilterMetadataQuery) -> Result<(i64, i6
     Ok((offset, limit))
 }
 
-fn emby_filter_metadata_item_types(value: Option<&str>) -> Vec<String> {
-    value
-        .map(|values| {
-            values
-                .split(',')
-                .filter_map(|item_type| normalize_emby_item_type(item_type.trim()))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// `ParentId=` (Hills sends an empty value on some filter-panel requests) means "no library
 /// filter", not "the empty id".
 fn emby_filter_metadata_parent_id(value: Option<&str>) -> Option<String> {
@@ -112,7 +103,9 @@ pub(super) async fn emby_official_ratings(
         Ok(page) => page,
         Err(status) => return status.into_response(),
     };
-    let item_types = emby_filter_metadata_item_types(query.include_item_types.as_deref());
+    // Reuses the `/Items` rule: an entirely unrecognized list matches nothing instead of
+    // silently dropping the restriction.
+    let item_types = emby_item_types_from_value(query.include_item_types.as_deref());
     let parent_id = emby_filter_metadata_parent_id(query.parent_id.as_deref());
     let result = state
         .catalog()

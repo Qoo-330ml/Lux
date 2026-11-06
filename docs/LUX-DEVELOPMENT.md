@@ -1559,7 +1559,7 @@ COMPATIBILITY.md 是唯一兼容性事实来源。不能因为实现了官方 Sw
 #### P2：体验完善
 
 - DisplayPreferences 相关端点。
-- Years、Genres、Tags 等筛选辅助端点。（Years、Genres、Studios 已实现，见 `docs/COMPATIBILITY.md`；Tags 因 NFO 缓存无该数据而未实现。）
+- Years、Genres、Tags 等筛选辅助端点。（Years、Genres、Studios、OfficialRatings 已实现，见 `docs/COMPATIBILITY.md`；Tags 返回 200 空列表，无数据源，待后续投影填充。）
 - Collections 与合集成员。
 - 多版本选择所需的 AlternateSources 等端点。
 - Sessions WebSocket 或实时消息，仅在目标客户端确有依赖时实现。
@@ -20190,29 +20190,34 @@ rebase 后的 `--list` 一致。
 调查结论（先查存储，再决定实现范围）：
 
 - 分级：`media_content_restriction_index.certification_code` 已按条目存有归一化后的分级（大写，MPA/TVPG/
-  BBFC 之一），并带 `(certification_code, item_id)` 索引；Emby `OfficialRating` 字段本来就渲染这一列。
-  因此 `/OfficialRatings` 可以在 `storage` 里做一次分组聚合，不需要迁移，不需要在请求里解析 NFO 或扫全库。
+  BBFC 之一），并带 `(certification_code, item_id)` 索引。注意它与条目 `OfficialRating` 字段**不是同一份
+  值**：字段输出 NFO 原文，索引只保留归一化后能识别的码，所以列表是原文的子集/改写（无法识别的分级不
+  出现，`Rated R` 会变成 `R`）。因此 `/OfficialRatings` 可以在 `storage` 里做一次分组聚合，不需要迁移，
+  不需要在请求里解析 NFO 或扫全库。
 - tags：没有数据源。`LocalNfoDetails` 没有条目级 tags，`media_item_facets.kind` 只允许 `GENRE`/`STUDIO`，
   `media_content_restriction_tags` 是 genre 的小写投影（家长控制用），不能当 Emby tags 返回。按任务约定
   返回 200 空信封，不新增迁移、不改扫描器，也不在请求里解析 NFO。
 
 实现（新增 `src/api/emby_filter_metadata.rs`；改 `src/api/legacy.rs`、`src/api/emby.rs`、
-`src/api/emby_catalog.rs`（仅把 `EMBY_MAX_PAGE_LIMIT` 改为 `pub(super)`）、`src/application/catalog.rs`、
+`src/api/emby_catalog.rs`（把 `EMBY_MAX_PAGE_LIMIT` 改为 `pub(super)`，并把 `IncludeItemTypes` 的解析
+抽成 `emby_item_types_from_value` 供 `/Items` 与新端点共用）、`src/application/catalog.rs`、
 `src/storage/catalog.rs`、`src/storage/mod.rs`；无迁移、不改 `/api/v1` DTO 与 `web/`）：
 
 - `GET /OfficialRatings`：新增 `CatalogService::list_official_ratings` 与
   `Database::list_catalog_certifications`。后者复用 `catalog_filter_where_clause`（库 ACL、内容限制、
   可见性、`IncludeItemTypes` 都在同一个谓词里），按 `certification_code` 分组计数、按代码升序分页；
   `TotalRecordCount` 是去重后的分级个数。`ParentId` 的解析与 `/Genres` 相同（数字 id 经
-  `emby_internal_id` 还原，不可见库返回 404）。
+  `emby_internal_id` 还原，不可见库返回 404）。`IncludeItemTypes` 复用 `emby_item_types_from_value`：
+  整组都无法识别时得到 `__NO_MATCH__`（与 `/Items` 一致，返回空列表而不是全量），混合有效/无效值只按
+  有效类型过滤。
 - 响应：与 `/Genres` 相同的信封，条目为 `{"Name": <code>, "Id": <code>, "ServerId": …}`；Emby
   `NameIdPair` 里 `Id` 就是分级值，因此不另造合成 id。
 - `GET /Tags`：鉴权、目标用户校验与分页校验与 `/OfficialRatings` 相同，然后返回
   `{"Items":[],"TotalRecordCount":0}`。它不读数据库，因为没有 tags 数据；媒体库 ACL 对它没有可观察的
   作用面（响应本来就没有内容），已在 COMPATIBILITY 记录中写明。
 - 查询解析：新端点用自己的 `EmbyFilterMetadataQuery`，空的 `StartIndex=`/`Limit=` 按未提供处理（Hills 的
-  筛选面板会带空 `Limit=`），空的 `ParentId=` 按“不限媒体库”处理；非法值仍是 400。没有改动
-  `EmbyFacetsQuery`，避免与并行任务冲突。
+  筛选面板会带空 `Limit=`），空的 `ParentId=` 按“不限媒体库”处理。`Limit<=0` 与 `/Genres` 一样按默认
+  50 处理，`Limit>1000` 或 `StartIndex<0` 返回 400。没有改动 `EmbyFacetsQuery`，避免与并行任务冲突。
 - 路由：在 `EmbyRouteBuilder` 里追加 `/OfficialRatings`、`/Tags` 两行；根路径、`/emby` 前缀与路径大小写
   不敏感由既有 builder 与请求路径归一化覆盖（`/EMBY/officialratings` 有测试）。
 
@@ -20223,8 +20228,10 @@ rebase 后的 `--list` 一致。
       `ParentId` 返回 404。
 - [x] 内容限制生效：MPA PG-13 的用户在同一媒体库里看不到 R 分级。
 - [x] `ParentId` 只返回该库的分级；`IncludeItemTypes=Series` 只返回剧集的分级。
-- [x] 分页：`StartIndex`/`Limit` 生效且总数不受分页影响；`Limit=`（空）按未提供处理；`Limit>1000` 与
-      `StartIndex<0` 返回 400。
+- [x] `IncludeItemTypes` 与 `/Items` 对齐：`Photo`（全无效）返回 200 空列表，`Photo,Series` 只按
+      `SERIES` 过滤。
+- [x] 分页：`StartIndex`/`Limit` 生效且总数不受分页影响；`Limit=`（空）按未提供处理；`Limit=0` 按默认
+      50；`Limit>1000` 与 `StartIndex<0` 返回 400。
 - [x] `/Tags` 返回 200 与 `{"Items":[],"TotalRecordCount":0}`（根路径、`/emby` 前缀与空参数）。
 - [x] 未鉴权两个端点都返回 401；`/EMBY/officialratings` 大小写混用可用。
 - [x] 最窄测试、fmt、clippy、`check-backend-branches.py` 通过。
@@ -20251,13 +20258,33 @@ Hills 或任何第三方客户端上复测。
   `cargo clippy --locked --test emby -- -D warnings` 单独确认新增测试目标无警告。
 - `python3 scripts/check-backend-branches.py` 通过（28 个文件、266 处，未新增 `DatabaseBackend::` 分支）。
 
+返工（独立审查后，2026-11-06）：
+
+- 措辞纠正：分级列表是内容限制索引识别出的**归一化分级码子集**，不是 `OfficialRating` 字段的同一份值。
+  `src/storage/catalog.rs` 的 `list_catalog_certifications` 文档、`src/api/emby_filter_metadata.rs` 的模块
+  文档，以及 COMPATIBILITY / CHANGELOG / 本文的说法全部改成准确表述；返回的值不变（仍是归一化码，没有
+  改成扫 NFO 原文）。
+- `IncludeItemTypes` 与 `/Items` 对齐：把既有 `catalog_filter_from_values` 里的解析抽成
+  `emby_item_types_from_value`，`/Items` 与新端点共用。整组无法识别时得到 `__NO_MATCH__`，返回 200 空
+  列表而不是退化成全量；混合有效/无效值只按有效类型过滤。返工前 `IncludeItemTypes=Photo` 返回全部分级
+  （测试失败），返工后为空。
+- 补测试与文档：`Limit=0` 固定为 200 且按默认页大小；空 `Limit=`、`Limit>1000`、`StartIndex<0` 的语义
+  分别写清楚（“`Limit<=0` 按默认 50，`Limit>1000`/`StartIndex<0` 返回 400”）。`/Items` 暂不支持
+  `OfficialRatings=` 筛选的缺口写进 COMPATIBILITY 与本文的剩余风险，另立后续任务。
+- 就地修订两处与新行为矛盾的旧文本：`docs/COMPATIBILITY.md`
+  “Emby 筛选辅助端点：Genres、Studios、Years”一节的未实现列表，以及本文 P2 清单里的
+  “Tags 因 NFO 缓存无该数据而未实现”。
+
 限制与剩余风险：
 
 - `/Tags` 恒空是**有意**的：Lux 没有条目级 tags 数据源。要把筛选面板的标签填上，需要先在扫描/索引侧
   投影 tags（新迁移或扫描器改动），属于后续任务；本任务按约束没有做。
-- `/OfficialRatings` 只列出被既有投影识别为 MPA/TVPG/BBFC 的分级。NFO 里无法识别的分级字符串既不会
-  出现在 `OfficialRating` 字段，也不会出现在这个列表里；如果客户端期望列出原始字符串，需要另开任务改
-  归一化范围（会影响家长控制语义）。
+- `/OfficialRatings` 只列出被既有投影识别为 MPA/TVPG/BBFC 的**归一化分级码子集**，与条目
+  `OfficialRating` 字段的 NFO 原文可能不同：无法识别的原文（`FSK 16` 之类）仍会出现在 `OfficialRating`
+  字段，但不会出现在这个列表里；能识别的原文也可能被改写（`Rated R` → `R`）。如果客户端期望列出原始
+  字符串，需要另开任务改归一化范围（会影响家长控制语义）。
+- 分级目前只能列出，**不能用于 `/Items` 筛选**：`/Items` 不接受 `OfficialRatings=` 参数，筛选面板里
+  选中分级不会改变列表；对应后续任务待立项，本任务没有改 `/Items` 过滤。
 - 大媒体库上这是一次 `GROUP BY certification_code` 聚合查询，走 `idx_media_content_restriction_index_certification`
   的索引列，但结果集大小取决于不同分级值的数量；`Limit` 上限 1000，远大于真实分级数。
 - 响应条目形态按 Emby `NameIdPair` 推断（`Name`/`Id` 都是分级值，另带 `ServerId`），没有对照真实
