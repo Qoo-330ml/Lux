@@ -9,6 +9,7 @@ mod emby_global_collection_playback;
 mod emby_incremental_refresh;
 mod emby_item_filters;
 mod emby_multi_part_playback;
+mod emby_similar;
 mod emby_system;
 mod mixed_library_api;
 mod search;
