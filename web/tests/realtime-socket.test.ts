@@ -332,6 +332,23 @@ describe("realtime close codes", () => {
     harness.socket.stop();
   });
 
+  it.each([1003, 1009])("retries after %i, a code this client can never provoke", (code) => {
+    // 1003 (binary) and 1009 (>4 KiB text) are the server's reactions to inbound frames the Web
+    // client never sends: it only writes `{"type":"ping"}`. Treating them like any other retryable
+    // close keeps the contract single-sourced - only 1008 ends the session (ADR-054 D11).
+    vi.mocked(Math.random).mockReturnValue(0.5);
+    const harness = createHarness();
+    harness.socket.start();
+    connect(harness).close(code);
+
+    expect(harness.options.onSessionEnded).not.toHaveBeenCalled();
+    act(() => vi.advanceTimersByTime(499));
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    act(() => vi.advanceTimersByTime(1));
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    harness.socket.stop();
+  });
+
   it("does not count a clean session reset as an abnormal close", () => {
     const harness = createHarness();
     harness.socket.start();

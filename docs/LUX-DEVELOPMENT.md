@@ -21132,9 +21132,8 @@ pong）即关闭，4 个 ping 仍在窗口内留满余量，同时与服务端�
 `lux-shell.test.tsx` 18 例、`library-page.test.ts` 19 例、`login-page.test.tsx` 15 例（新增 1 例：
 shell 已挂载时 `/auth/me` 返回 401 回到登录页）。
 
-未验证项：没有对接真实后端（LUX-894 的 `/api/v1/ws` 尚未合入本基线），也没有在真实浏览器或真实反向代理
-上验证握手、协议级 ping/pong 与 `1006` 的实际表现；本任务的全部结论来自注入假 WebSocket 的单元/组件
-测试。
+未验证项（当时）：没有对接真实后端，也没有在真实浏览器上验证；结论来自注入假 WebSocket 的单元/组件
+测试。LUX-894 合并后已补做真实 luxd 实跑，见下方返工记录 3/3。
 
 返工记录（2026-11-06，独立审查 1/3）：
 
@@ -21185,6 +21184,43 @@ tsc --noEmit` 通过；`pnpm --dir web test` 连跑两次均为 167 个 `node --
 1562 例全绿。新增用例：socket 级"每次可重试失败都上报（含从未 ready 的首次尝试）、1008 不上报"；hook 级
 "首次尝试失败 → 重连 → `ready` 必须做一次 `home` 全量失效"；hub 级"会话结束后新订阅者拿到新连接"与
 "连接在线时会话结束仍向订阅者广播 `disconnected`"（`web/tests/realtime-client.test.ts`）。
+
+rebase 与实跑（2026-11-06，3/3：LUX-894 与 LUX-896 合并后）：
+
+- **rebase 到 `test`（`dfe40b5a`）**：冲突只有两处追加型文档——`docs/CHANGELOG.md` 的 Unreleased「新增」
+  与 `docs/LUX-DEVELOPMENT.md` 的任务条目，均保留双方：LUX-894 的端点条目在前、本任务的 Web 客户端条目
+  在后；LUX-895/896 的标题以 `test` 侧为准。`web/` 与 `src/` 没有重叠改动。
+- **对照已合并契约逐条核对，未发现前端偏差**：`docs/API.md` 的 `/api/v1/ws` 一节与 ADR-054（含 LUX-894
+  的修订单条）比对——信封（`ready` / `invalidate` + `channel` + 可选 `itemId` ≤256 字符）、服务端从不发送
+  `libraryId`、降级帧 `home`/`all`、只识别 `{"type":"ping"}` 且不回 pong、`1008` 不重连、`1001`/`1000`
+  至少 5 s、`426`/`401`/`400`/`429` 在浏览器侧一律是 `1006` 因而按退避重试、45 s 重校验与"降权只停 admin
+  帧"（客户端无感）——实现与契约一致。
+- **唯一补充**：`1003`/`1009` 原先没有用例，新增 `it.each([1003, 1009])` 断言两者按普通失败退避重试；
+  它们是服务端对客户端二进制/超大文本的反应，而客户端只发 15 字节的 ping，永远触发不了，因此与
+  "只有 `1008` 终止"的单一来源保持一致。
+- **真实 luxd 实跑**（本机 arm64）：`cargo build --locked` 后以
+  `LUX_CONFIG_DIR=.tmp/e2e-ws/config`、`LUX_HTTP_ADDR=127.0.0.1:18097` 启动，用
+  `setup/database/select`（SQLITE）+ `setup/complete` + `auth/login` 建立管理员会话：
+  - 裸 WebSocket 客户端（Node `http` upgrade，带 `Origin` 与 `Cookie`）：`101`、`Sec-WebSocket-Accept`
+    正确、首帧 `{"type":"ready","version":1}`；另一次登录写入审计事件后收到
+    `{"type":"invalidate","channel":"admin","scope":"dashboard"}`；发出 `{"type":"ping"}` 后连接保持。
+    7/7 通过。
+  - 拒绝路径与契约一致：普通 GET `426`（带 `Upgrade: websocket`）、有 cookie 但缺 `Origin` `401`、跨源
+    `400`、无 cookie `401`。
+  - **前端真实客户端代码**（`web/src/lib/realtime/socket.ts`，经 `vite-node` + `ws` 适配器运行，不是测试
+    替身）：连上 → `ready` → 收到上面那条 `dashboard` 失效帧 → 25 s 后发出 `{"type":"ping"}` → `stop()`
+    后不再重连。7/7 通过。
+  - **`1008` 端到端**：连接建立后 `POST /api/v1/auth/logout`（204），45 s 重校验周期到达时服务端以 `1008`
+    关闭；真实客户端 `onSessionEnded` 恰好 1 次、状态转 `disconnected`、随后不再重连。5/5 通过。
+  - **开发代理**：`vite --port 5173`（`LUX_API_ORIGIN=http://127.0.0.1:18097`）下经 `127.0.0.1:5173` 的
+    同源握手同样拿到 `101` + `ready` + 失效帧，7/7 通过——`ws: true` 与"不改写 `Host`"这对配置实测可用。
+- **仍未实跑**：真实浏览器（本机没有 Playwright/浏览器自动化，任务约束不允许安装），所以"登录后页面上的
+  React 组件随失效帧刷新"这一层仍只有 jsdom 组件测试覆盖；真实 nginx/TLS 反代属 LUX-896（其条目已记录
+  未实跑）。上述实跑全部在 `127.0.0.1` 直连与 vite 代理两种明文链路上。
+
+rebase 后复验（2026-11-06，3/3）：`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web build`、`npx
+tsc --noEmit` 通过；`pnpm --dir web test` 连跑两次均为 167 个 `node --test` 用例 + 168 个 vitest 文件 /
+1564 例全绿。
 
 #### LUX-896：反代配置与部署文档（样例与文档已完成，真实握手未运行）
 
