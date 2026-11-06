@@ -4,6 +4,7 @@ mod emby_auth;
 mod emby_counts;
 mod emby_empty_numeric_params;
 mod emby_facets;
+mod emby_filter_metadata;
 mod emby_global_collection_playback;
 mod emby_incremental_refresh;
 mod emby_item_filters;
