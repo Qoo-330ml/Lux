@@ -1,5 +1,7 @@
 import { useQueryClient, type QueryClient, type QueryKey } from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
+import { queryKeys } from "../../lib/api/query-keys";
+import { subscribeRealtime } from "../../lib/realtime/client";
 
 type AdminEventScope =
   | "all"
@@ -84,7 +86,6 @@ export function useAdminEvents() {
   const flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    const source = new EventSource("/api/v1/admin/events");
     const flush = () => {
       flushTimer.current = null;
       const keys = [...pendingKeys.current.values()];
@@ -100,19 +101,22 @@ export function useAdminEvents() {
         flushTimer.current = setTimeout(flush, 250);
       }
     };
-    const handleOpen = () => invalidate("all");
-    const handleInvalidate = (event: Event) => {
-      const data = (event as MessageEvent<string>).data;
-      const scope = parseScope(data);
-      if (scope) invalidate(scope);
-    };
 
-    source.addEventListener("open", handleOpen);
-    source.addEventListener("invalidate", handleInvalidate);
+    const unsubscribe = subscribeRealtime({
+      // ADR-054 D15②: the admin channel refreshes everything on every open, including the
+      // first one, because the console has no cached "ready" state to trust after a gap.
+      onReady: () => invalidate("all"),
+      onInvalidate: (frame) => {
+        if (frame.channel !== "admin") return;
+        const scope = parseScope(frame.scope);
+        if (scope) invalidate(scope);
+      },
+      onSessionEnded: () => {
+        void queryClient.invalidateQueries({ queryKey: queryKeys.me });
+      },
+    });
     return () => {
-      source.removeEventListener("open", handleOpen);
-      source.removeEventListener("invalidate", handleInvalidate);
-      source.close();
+      unsubscribe();
       if (flushTimer.current !== null) clearTimeout(flushTimer.current);
       flushTimer.current = null;
       pendingKeys.current.clear();
@@ -120,15 +124,8 @@ export function useAdminEvents() {
   }, [queryClient]);
 }
 
-function parseScope(data: string): AdminEventScope | null {
-  try {
-    const payload: unknown = JSON.parse(data);
-    if (!payload || typeof payload !== "object" || !("scope" in payload)) return null;
-    const scope = payload.scope;
-    return isAdminEventScope(scope) ? scope : null;
-  } catch {
-    return null;
-  }
+function parseScope(scope: string): AdminEventScope | null {
+  return isAdminEventScope(scope) ? scope : null;
 }
 
 function isAdminEventScope(value: unknown): value is AdminEventScope {
