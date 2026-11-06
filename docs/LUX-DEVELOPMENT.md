@@ -20347,13 +20347,15 @@ Hills 或任何第三方客户端上复测。
 - DTO：`{"Items":[...],"TotalRecordCount":n}`，条目由现有列表投影生成，`Fields` 与列表端点同义；
   `EnableUserData=false` 去掉 `UserData`，`EnableImageTypes`/`ImageTypeLimit` 过滤图片 tag。
 - 相似规则：新增 `CatalogService::list_similar_items` 与存储层 `list_similar_catalog_rows`。候选必须是
-  同类型（MOVIE/SERIES）、与源条目至少共享一个 `media_item_facets(kind='GENRE')` 键，按共享数量降序、
-  再按 `LOWER(title)`、`id` 升序，排除自身。ACL、可见性与内容限制复用
-  `catalog_filter_where_clause`，因此被排除的库或条目不进入 `Items` 或 `TotalRecordCount`。
-- 查询形状：`shared` CTE 从源条目的 genre 行（主键）出发，经 `idx_media_item_facets_lookup`
-  按 `(kind, name_key)` 关联并物化，再 join `media_items` 做 ACL 与分页，避免计划器把它退化为
-  `media_items` 扫描；列表查询带 `LIMIT ? OFFSET ?`，总数查询是同一 `shared` 集合上的
-  `COUNT(DISTINCT mi.id)`。
+  同类型（MOVIE/SERIES）、与源条目至少共享一个 `media_item_facets(kind='GENRE')` 键。**候选池先设硬
+  上限再排序**：源条目的 Genre 按 `name_key` 取前 10 个，每个 Genre 的候选分支最多取 200 个通过 ACL、
+  可见性、内容限制、同类型和排除自身谓词的条目；只在这个 ≤10×200 的并集上按共享数量降序、再按
+  `LOWER(title)`、`id` 升序排序。被排除的库或条目不会进入 `Items` 或候选池计数。
+- 查询形状：源 Genre 用 `media_item_facets` 主键查询（`name_key` 排序、`LIMIT 10`）；每个 Genre 一个
+  分支，`ORDER BY facet.item_id` 命中 `idx_media_item_facets_lookup(kind, name_key, item_id)` 的索引
+  顺序并 `LIMIT 200`，不会先收集整个 Genre 再排序。分支的 `UNION ALL` 只包住有界并集，外层聚合/排序
+  与 `COUNT(DISTINCT item_id)` 都只处理这个并集；`TotalRecordCount` 因此是候选池内的去重数量，不是
+  全库相似条目总数。
 - 错误与分页：条目不存在或不可见 404（与 `/Items/{id}` 一致），未鉴权 401；`Limit` 默认 50、上限 1000，
   空值按未提供（本端点自己的 Query 结构体处理，不依赖 LUX-888），负数、非整数或超上限 400；无相似条目
   200 空列表。响应不返回 `StartIndex`（规格只要求 `Items`/`TotalRecordCount`）。
@@ -20363,9 +20365,11 @@ Hills 或任何第三方客户端上复测。
 - [x] 同类型且共享 Genre 的条目按共享数量降序返回，不含自身、不同类型或不同 Genre 的条目。
 - [x] 电影与剧集均覆盖；根路径与 `/emby` 前缀一致。
 - [x] 被用户媒体库 ACL 排除的条目不出现在 `Items` 或 `TotalRecordCount`。
-- [x] `Limit` 生效且 `TotalRecordCount` 是相似条目总数；空值按未提供，非法值 400。
+- [x] `Limit` 生效且 `TotalRecordCount` 是候选池内的相似条目总数；空值按未提供，非法值 400。
 - [x] 无相似条目 200 空列表；不存在的 ID 404；未鉴权 401。
-- [x] 存储层测试断言查询带 `LIMIT`、计划使用 `idx_media_item_facets_lookup` 且不扫描 `media_items`。
+- [x] 存储层测试插入 ≥ 2×K 个同 Genre 条目，断言计划按索引读且没有候选排序/`media_items` 扫描、返回
+      条数 ≤ Limit、`TotalRecordCount` ≤ 候选池上限、共享 Genre 更多的排前、两次请求结果一致；另有一例
+      覆盖源 Genre 数量上限（12 个 Genre 只取前 10 个）。
 - [x] `Fields`、`EnableUserData`、`ImageTypeLimit`、`EnableImageTypes` 生效。
 
 预计文件：`src/api/emby_similar.rs`、`src/api/legacy.rs`、`src/api/emby.rs`、`src/application/catalog.rs`、
@@ -20376,21 +20380,35 @@ Hills 或任何第三方客户端上复测。
 实施结果（2026-11-06，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 或修复后的客户端上复测）：
 
 - `cargo test --locked --test emby emby_similar::` 6/6 通过（新增；实现前先以 404/401 失败复现）。
-- `cargo test --locked --lib similar_catalog` 1/1 通过；查询计划为 `MATERIALIZE shared` →
-  `SEARCH source_genre`（facet 主键）→ `SEARCH facet USING COVERING INDEX
-  idx_media_item_facets_lookup (kind=? AND name_key=?)`，列表与总数语句都没有 `SCAN media_items`。
+- `cargo test --locked --lib similar_catalog` 2/2 通过；单 Genre 分支计划为
+  `SEARCH facet USING COVERING INDEX idx_media_item_facets_lookup (kind=? AND name_key=?)`，没有
+  `USE TEMP B-TREE FOR ORDER BY` 或 `SCAN media_items`；列表与总数语句只在有界并集上聚合。
 - `cargo fmt --all -- --check` 通过。
 - `cargo test --locked --test emby -- --list` 在本分支为 49 例（基线 43 + 本任务 6）。
 
+返工（2026-11-06，独立审查后）：
+
+- 原实现把“所有共享至少一个 Genre 的条目”整体 `GROUP BY`/`ORDER BY` 后再 `LIMIT`，并单独跑一次全量
+  `COUNT(DISTINCT mi.id)`；`LIMIT` 只限制返回页，排序前仍枚举全部候选，热门 Genre 下请求成本与库大小
+  成正比。现改为每个源 Genre 先取至多 200 个可见候选（`ORDER BY facet.item_id` 命中索引尾部后
+  `LIMIT`），源 Genre 最多 10 个，聚合、排序与 `TotalRecordCount` 都只作用于 ≤2000 行的并集；不再有
+  全库计数查询。
+- 新增测试：插入 2×(K+50) 条同 Genre 条目，断言页 ≤ Limit、总数 = 2K-1（两个 Genre 共用同一个条目）、
+  第 200 个之后的条目不在池内、两次请求结果一致，以及单分支计划使用 `idx_media_item_facets_lookup`、
+  无 `USE TEMP B-TREE FOR ORDER BY`、无 `SCAN media_items`；另一用例验证 12 个源 Genre 只取前 10 个。
+- 复跑：`cargo test --locked --test emby emby_similar::` 6/6、`cargo test --locked --lib similar_catalog`
+  2/2、fmt、clippy、`check-backend-branches.py` 通过。
+
 限制与剩余风险：
 
-- 相似度只按 Genre 交集计数，不是 Emby 的完整推荐算法；没有 NFO/facet 的条目、没有 Genre 的源条目
-  都只能得到空推荐。客户端 UI 是否重新显示推荐区没有在修复后的实例上验证。
-- 候选集合按源条目的 genre 关联行展开后再做 ACL 过滤；热门 Genre（例如 Drama）在 60k 条目库上仍会
-  枚举数万条 facet 行，这是“按共享数量排序”的固有成本。`LIMIT` 只限制返回页，排序前无法提前截断；
-  但查询只读 facet 索引与条目主键，不扫描 `media_items`。
-- 没有 `StartIndex` 分页（抓包未见客户端使用）；`TotalRecordCount` 总是计算，未按
-  `EnableTotalRecordCount=false` 省略。
+- 相似度只按 Genre 交集计数，不是 Emby 的完整推荐算法；候选池是“每个 Genre 按 item_id 顺序的前 200 个
+  可见条目”，不是全库全部同 Genre 条目：一个更相似但排在索引第 200 之后的条目不会出现。没有 NFO/facet
+  的条目、没有 Genre 的源条目只能得到空推荐。客户端 UI 是否重新显示推荐区没有在修复后的实例上验证。
+- 请求成本有上界（≤10 个源 Genre × 200 条候选），但每个分支仍需沿该 Genre 的 facet 索引向前扫描直到
+  凑够 200 个可见候选；热门 Genre 下这部分工作随 Genre 规模增长，到达上限后停止。没有 `media_items`
+  全表扫描、没有候选全集排序、没有新增索引或迁移；证据仅为本机 SQLite `arm64`。
+- `TotalRecordCount` 是候选池内去重数量，可能小于库内实际同 Genre 条目数；没有 `StartIndex` 分页
+  （抓包未见客户端使用）；`EnableTotalRecordCount=false` 被忽略。
 - `EnableImageTypes`/`ImageTypeLimit` 的语义按 Emby/Jellyfin 文档推断，未真机逐项比对；其他列表端点
   仍不实现这两个参数。
 - 本机多 agent 并行编译，单次 `cargo test` 墙钟明显偏长（10–26 分钟）；上述结果只说明测试通过，不代表
