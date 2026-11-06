@@ -1,16 +1,17 @@
 use super::*;
 
 /// Similar-items page size when the caller does not send `Limit`, matching the other Emby item
-/// list endpoints.
+/// list endpoints. The page cap is the shared `EMBY_MAX_PAGE_LIMIT`.
 const EMBY_SIMILAR_DEFAULT_LIMIT: i64 = 50;
-/// Server-side page cap, kept in step with `EMBY_MAX_PAGE_LIMIT` in `emby_catalog.rs`.
-const EMBY_SIMILAR_MAX_PAGE_LIMIT: i64 = 1_000;
 
 /// Query parameters of `GET /Items/{id}/Similar`.
 ///
 /// The captured Hills and Yamby requests send `UserId`, `Fields`, `Limit`, `ImageTypeLimit` and
 /// `EnableImageTypes`. An empty `Limit`/`ImageTypeLimit` (query string `Limit=`) is treated as an
-/// absent parameter here, independently of the shared `EmbyItemsQuery` handling.
+/// absent parameter by the shared `deserialize_optional_i64`, the same blank-value rule LUX-888
+/// applies to the other Emby query values. An explicitly empty `EnableImageTypes=` is likewise
+/// treated as absent: `parse_emby_image_types` yields no requested types, so the response keeps
+/// every image tag instead of hiding them.
 #[derive(Deserialize, Default)]
 pub(super) struct EmbySimilarQuery {
     #[serde(
@@ -31,7 +32,7 @@ pub(super) struct EmbySimilarQuery {
     #[serde(
         rename = "Limit",
         default,
-        deserialize_with = "deserialize_optional_similar_integer"
+        deserialize_with = "deserialize_optional_i64"
     )]
     pub(super) limit: Option<i64>,
     #[serde(
@@ -44,22 +45,11 @@ pub(super) struct EmbySimilarQuery {
     #[serde(
         rename = "ImageTypeLimit",
         default,
-        deserialize_with = "deserialize_optional_similar_integer"
+        deserialize_with = "deserialize_optional_i64"
     )]
     pub(super) image_type_limit: Option<i64>,
     #[serde(rename = "EnableImageTypes", default)]
     pub(super) enable_image_types: Option<String>,
-}
-
-fn deserialize_optional_similar_integer<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<String>::deserialize(deserializer)?;
-    match value.as_deref().map(str::trim) {
-        None | Some("") => Ok(None),
-        Some(value) => value.parse().map(Some).map_err(serde::de::Error::custom),
-    }
 }
 
 fn emby_similar_limit(limit: Option<i64>) -> Result<i64, StatusCode> {
@@ -68,7 +58,7 @@ fn emby_similar_limit(limit: Option<i64>) -> Result<i64, StatusCode> {
         Some(value) if value < 0 => return Err(StatusCode::BAD_REQUEST),
         Some(value) => value,
     };
-    if limit > EMBY_SIMILAR_MAX_PAGE_LIMIT {
+    if limit > EMBY_MAX_PAGE_LIMIT {
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok(limit)
