@@ -1534,8 +1534,11 @@ impl CatalogService {
     ///
     /// Returns `None` when the item does not exist or the principal cannot see it, matching the
     /// item detail endpoint's 404. The caller must already have validated `limit`; the storage
-    /// query applies it before loading the page. Only the `media_item_facets` projection is read,
-    /// so a request never parses NFO JSON or scans the catalog.
+    /// query caps the candidate pool before ranking (ten source genres, at most 200 visible
+    /// candidates each) and applies `limit` to the ranked result. `page.total` is therefore the
+    /// number of distinct items in that bounded pool, not the catalog-wide number of similar
+    /// items. Only the `media_item_facets` projection is read, so a request never parses NFO JSON
+    /// or scans the catalog.
     pub(crate) async fn list_similar_items(
         &self,
         principal: AccessPrincipal,
