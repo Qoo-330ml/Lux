@@ -54,6 +54,24 @@ pub(crate) const EMBY_WEBSOCKET_MAX_WRITE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 /// misconfigured override must not allocate a huge buffer per connection up front, and it must
 /// stay below the hard cap by at least one byte (tungstenite asserts a strict inequality).
 pub(crate) const EMBY_WEBSOCKET_WRITE_BUFFER_BYTES_LIMIT: usize = 1024 * 1024;
+/// Bytes reserved for the WebSocket framing of one outbound message.
+///
+/// tungstenite charges `frame.len()` (payload **plus** header) against
+/// `max_write_buffer_size`, and a control frame (a pong answered by the runtime, or a ping we just
+/// queued) can occupy the same buffer. A server-to-client frame uses 2 header bytes up to 125
+/// payload bytes, 4 up to 65535 and 10 beyond that; 16 covers the largest header plus a small
+/// control frame, so a payload that passes [`payload_fits`] can never make `start_send` fail with
+/// `WriteBufferFull` and close the connection.
+pub(crate) const EMBY_WEBSOCKET_FRAME_HEADER_BYTES: usize = 16;
+/// Hard ceiling of the configurable connection budget. The default is 32; a thousand connections
+/// already exceed any realistic deployment's descriptor and buffer budget, and
+/// `Semaphore::MAX_PERMITS` (2^61-1) is not a limit an operator should be able to request.
+pub(crate) const EMBY_WEBSOCKET_MAX_CONNECTIONS_LIMIT: usize = 1024;
+/// Hard ceiling of every configurable duration. `Instant::now() + Duration` panics when the sum
+/// leaves the platform's `Instant` range, and that arithmetic runs inside the connection task, so
+/// an override must stay far below the limit; 24 h is already longer than any state this endpoint
+/// keeps (the idle timeout is 120 s).
+pub(crate) const EMBY_WEBSOCKET_MAX_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 /// A single send that cannot complete within this bound closes the connection. It is far below
 /// the idle timeout so a stalled reader is reaped before the idle deadline would fire.
 pub(crate) const EMBY_WEBSOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -132,6 +150,37 @@ impl EmbyWebsocketLimits {
         self.heartbeat_interval = self.heartbeat_interval.max(Duration::from_millis(10));
         self.idle_timeout = self.idle_timeout.max(self.heartbeat_interval);
         self.max_message_bytes = self.max_message_bytes.max(1024);
+        // Every override is public API, so an extreme value must be normalised instead of panicking
+        // inside the connection task: `Semaphore::new` panics above `MAX_PERMITS`, and
+        // `Instant::now() + duration` panics for a duration near the platform maximum.
+        self.max_connections = self
+            .max_connections
+            .min(EMBY_WEBSOCKET_MAX_CONNECTIONS_LIMIT)
+            .min(Semaphore::MAX_PERMITS);
+        self.max_connections_per_user = self
+            .max_connections_per_user
+            .min(EMBY_WEBSOCKET_MAX_CONNECTIONS_LIMIT);
+        self.min_interval = self
+            .min_interval
+            .clamp(Duration::from_millis(10), EMBY_WEBSOCKET_MAX_DURATION);
+        self.max_interval = self
+            .max_interval
+            .clamp(self.min_interval, EMBY_WEBSOCKET_MAX_DURATION);
+        self.heartbeat_interval = self
+            .heartbeat_interval
+            .clamp(Duration::from_millis(10), EMBY_WEBSOCKET_MAX_DURATION);
+        self.idle_timeout = self
+            .idle_timeout
+            .clamp(self.heartbeat_interval, EMBY_WEBSOCKET_MAX_DURATION);
+        self.send_timeout = self
+            .send_timeout
+            .clamp(Duration::from_millis(10), EMBY_WEBSOCKET_MAX_DURATION);
+        self.revalidate_interval = self
+            .revalidate_interval
+            .clamp(Duration::from_millis(10), EMBY_WEBSOCKET_MAX_DURATION);
+        self.auth_warn_interval = self
+            .auth_warn_interval
+            .clamp(Duration::from_millis(10), EMBY_WEBSOCKET_MAX_DURATION);
         // tungstenite asserts `max_write_buffer_size > write_buffer_size` right after the upgrade
         // (`WebSocketConfig::assert_valid`), and that assert runs inside the connection task: an
         // equal or smaller cap would panic there instead of failing the handshake. The initial
@@ -479,7 +528,12 @@ async fn send_bounded(socket: &mut WebSocket, message: Message, timeout: Duratio
 /// force the connection to close, so the push is skipped instead: the peer keeps its connection
 /// and the next schedule retries with a document that may have shrunk.
 fn payload_fits(payload: &str, limits: &EmbyWebsocketLimits) -> bool {
-    payload.len() < limits.max_write_buffer_bytes
+    // The frame header and any buffered control frame count against the same cap in tungstenite,
+    // so the comparison reserves that margin instead of assuming an empty buffer.
+    payload
+        .len()
+        .saturating_add(EMBY_WEBSOCKET_FRAME_HEADER_BYTES)
+        < limits.max_write_buffer_bytes
 }
 
 /// Logs an oversized document at most once per `auth_warn_interval`; never includes the payload
@@ -981,9 +1035,63 @@ mod tests {
             ..EmbyWebsocketLimits::default()
         }
         .normalized();
-        assert!(payload_fits(&"x".repeat(4095), &limits));
-        assert!(!payload_fits(&"x".repeat(4096), &limits));
+        let max = limits.max_write_buffer_bytes;
+        // The frame header (and a possible buffered control frame) is reserved: one byte below the
+        // margin still fits, the boundary itself is skipped, and anything larger is skipped too.
+        assert!(payload_fits(
+            &"x".repeat(max - EMBY_WEBSOCKET_FRAME_HEADER_BYTES - 1),
+            &limits
+        ));
+        assert!(!payload_fits(
+            &"x".repeat(max - EMBY_WEBSOCKET_FRAME_HEADER_BYTES),
+            &limits
+        ));
+        assert!(!payload_fits(&"x".repeat(max - 1), &limits));
+        assert!(!payload_fits(&"x".repeat(max), &limits));
         assert!(!payload_fits(&"x".repeat(64 * 1024), &limits));
+    }
+
+    #[test]
+    fn extreme_overrides_are_clamped_before_they_can_panic() {
+        let extreme = EmbyWebsocketLimits {
+            max_connections: usize::MAX,
+            max_connections_per_user: usize::MAX,
+            min_interval: Duration::MAX,
+            max_interval: Duration::MAX,
+            max_message_bytes: usize::MAX,
+            idle_timeout: Duration::MAX,
+            heartbeat_interval: Duration::MAX,
+            write_buffer_bytes: usize::MAX,
+            max_write_buffer_bytes: usize::MAX,
+            send_timeout: Duration::MAX,
+            revalidate_interval: Duration::MAX,
+            auth_warn_interval: Duration::MAX,
+        }
+        .normalized();
+        assert!(extreme.max_connections <= EMBY_WEBSOCKET_MAX_CONNECTIONS_LIMIT);
+        assert!(extreme.max_connections <= Semaphore::MAX_PERMITS);
+        assert!(extreme.max_connections_per_user <= EMBY_WEBSOCKET_MAX_CONNECTIONS_LIMIT);
+        for value in [
+            extreme.min_interval,
+            extreme.max_interval,
+            extreme.idle_timeout,
+            extreme.heartbeat_interval,
+            extreme.send_timeout,
+            extreme.revalidate_interval,
+            extreme.auth_warn_interval,
+        ] {
+            assert!(value <= EMBY_WEBSOCKET_MAX_DURATION);
+        }
+        // Neither the budget nor any deadline computation may panic after normalisation.
+        let connections = EmbyWebsocketConnections::new(extreme.clone());
+        let _ = connections.try_acquire("user");
+        let now = Instant::now();
+        let _ = now + extreme.idle_timeout;
+        let _ = now + extreme.heartbeat_interval;
+        let _ = now + extreme.revalidate_interval;
+        let _ = now + extreme.min_interval;
+        let _ = now + extreme.max_interval;
+        let _ = now + extreme.send_timeout;
     }
 
     #[test]

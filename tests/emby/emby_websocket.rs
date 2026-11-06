@@ -897,8 +897,10 @@ async fn emby_websocket_keeps_timers_running_under_an_inbound_flood()
         }
         Ok::<(), WsError>(())
     });
-    // The scheduled push must still arrive while the flood is running.
-    let received = collect_messages(&mut reader, Duration::from_millis(900)).await?;
+    // The scheduled push must still arrive while the flood is running. The window covers three
+    // intervals (the clamp is 400 ms here) plus a generous margin, so a slow scheduler does not
+    // turn a healthy connection into a failure.
+    let received = collect_messages(&mut reader, Duration::from_millis(1800)).await?;
     let pushes = received
         .iter()
         .filter(|(message, _)| message["MessageType"] == "Sessions")
@@ -924,6 +926,40 @@ async fn emby_websocket_keeps_timers_running_under_an_inbound_flood()
         "a revoked token must close a flooded connection"
     );
     let _ = flood.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_websocket_accepts_extreme_limit_overrides() -> Result<(), Box<dyn std::error::Error>>
+{
+    // The limits are public API. `usize::MAX` connections would panic in `Semaphore::new`,
+    // `Duration::MAX` would panic in `Instant::now() + duration` inside the connection task, and
+    // an unclamped initial write buffer would panic in tungstenite's `assert_valid`. All of them
+    // must be normalised into a working connection instead.
+    let server = spawn_server(EmbyWebsocketLimits {
+        max_connections: usize::MAX,
+        max_connections_per_user: usize::MAX,
+        min_interval: Duration::MAX,
+        max_interval: Duration::MAX,
+        idle_timeout: Duration::MAX,
+        heartbeat_interval: Duration::MAX,
+        send_timeout: Duration::MAX,
+        revalidate_interval: Duration::MAX,
+        auth_warn_interval: Duration::MAX,
+        write_buffer_bytes: usize::MAX,
+        max_write_buffer_bytes: usize::MAX,
+        ..limits()
+    })
+    .await?;
+    let mut socket = server
+        .connect("/embywebsocket", &server.admin_token)
+        .await?;
+    send(&mut socket, json!({"MessageType": "KeepAlive"})).await?;
+    assert_eq!(
+        next_json(&mut socket).await?["MessageType"],
+        "KeepAlive",
+        "extreme overrides must yield a working connection"
+    );
     Ok(())
 }
 
