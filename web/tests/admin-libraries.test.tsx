@@ -602,7 +602,14 @@ describe("AdminLibrariesPage library cards", () => {
     });
   });
 
-  it("starts metadata refresh from the library actions menu", async () => {
+  const refreshActionLabels = ["补全缺失元数据", "全量刷新元数据"];
+
+  function metadataRefreshMenuActions() {
+    return [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
+      .filter((button) => refreshActionLabels.includes(button.textContent?.trim() ?? ""));
+  }
+
+  async function openLibraryMenuAndStartRefresh(expectedLabel: string) {
     const refresh = vi.spyOn(api, "startLibraryMetadataRefresh").mockResolvedValue({
       totalCount: 1,
       mode: "FILL_MISSING",
@@ -613,15 +620,65 @@ describe("AdminLibrariesPage library cards", () => {
     await act(async () => {
       container.querySelector<HTMLButtonElement>("[aria-label='打开 01每日更新 操作菜单']")?.click();
     });
-    const refreshAction = [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
-      .find((button) => button.textContent?.includes("刷新元数据"));
-    expect(refreshAction).toBeTruthy();
-    expect(refreshAction?.disabled).toBe(false);
+    const actions = metadataRefreshMenuActions();
+    expect(actions).toHaveLength(1);
+    const refreshAction = actions[0];
+    expect(refreshAction.textContent?.trim()).toBe(expectedLabel);
+    expect(refreshAction.disabled).toBe(false);
 
     await act(async () => {
-      refreshAction?.click();
+      refreshAction.click();
       await Promise.resolve();
     });
+    return refresh;
+  }
+
+  async function globalMediaStrategy() {
+    return (await api.adminSettings()).mediaStrategy;
+  }
+
+  it("labels the library refresh action 补全缺失元数据 and fills missing by default", async () => {
+    const refresh = await openLibraryMenuAndStartRefresh("补全缺失元数据");
+
+    expect(refresh).toHaveBeenCalledWith("library-1", "FILL_MISSING");
+  });
+
+  it("labels the library refresh action 全量刷新元数据 when the library strategy is a full refresh", async () => {
+    const strategy = await globalMediaStrategy();
+    vi.mocked(api.adminLibraries).mockResolvedValue({
+      libraries: [{ ...library, mediaStrategy: { ...strategy, metadataRefreshMode: "FULL_REFRESH" } }],
+    });
+
+    const refresh = await openLibraryMenuAndStartRefresh("全量刷新元数据");
+
+    expect(refresh).toHaveBeenCalledWith("library-1", "FULL_REFRESH");
+  });
+
+  it("follows the global strategy when the library has no override", async () => {
+    const strategy = await globalMediaStrategy();
+    vi.mocked(api.adminSettings).mockResolvedValue({
+      resumePlayedPercent: 90,
+      resumeMinTicks: 1_200_000_000,
+      mediaStrategy: { ...strategy, metadataRefreshMode: "FULL_REFRESH" },
+    });
+
+    const refresh = await openLibraryMenuAndStartRefresh("全量刷新元数据");
+
+    expect(refresh).toHaveBeenCalledWith("library-1", "FULL_REFRESH");
+  });
+
+  it("lets a fill-missing library override a full-refresh global strategy", async () => {
+    const strategy = await globalMediaStrategy();
+    vi.mocked(api.adminSettings).mockResolvedValue({
+      resumePlayedPercent: 90,
+      resumeMinTicks: 1_200_000_000,
+      mediaStrategy: { ...strategy, metadataRefreshMode: "FULL_REFRESH" },
+    });
+    vi.mocked(api.adminLibraries).mockResolvedValue({
+      libraries: [{ ...library, mediaStrategy: { ...strategy, metadataRefreshMode: "FILL_MISSING" } }],
+    });
+
+    const refresh = await openLibraryMenuAndStartRefresh("补全缺失元数据");
 
     expect(refresh).toHaveBeenCalledWith("library-1", "FILL_MISSING");
   });

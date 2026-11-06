@@ -470,8 +470,9 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy, on
   const addRoot = useMutation({ mutationFn: (path: string) => api.addAdminLibraryRoot(library.id, path.trim()), onSuccess: () => { setRootPath(""); setRootError(""); setDirectoryPickerOpen(false); void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraries }); }, onError: (error) => setRootError(error.message) });
   const removeRoot = useMutation({ mutationFn: (rootId: string) => api.deleteAdminLibraryRoot(library.id, rootId), onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraries }) });
   const scan = useMutation({ mutationFn: () => api.startAdminScan(library.id), onSuccess: () => { void queryClient.invalidateQueries({ queryKey: queryKeys.adminHealth }); void queryClient.invalidateQueries({ queryKey: queryKeys.adminJobs() }); } });
+  const refreshMode: MetadataRefreshMode = library.mediaStrategy?.metadataRefreshMode ?? globalStrategy?.metadataRefreshMode ?? "FILL_MISSING";
   const refresh = useMutation({
-    mutationFn: () => api.startLibraryMetadataRefresh(library.id, library.mediaStrategy?.metadataRefreshMode ?? globalStrategy?.metadataRefreshMode ?? "FILL_MISSING"),
+    mutationFn: () => api.startLibraryMetadataRefresh(library.id, refreshMode),
     onSuccess: () => { void queryClient.invalidateQueries({ queryKey: queryKeys.adminJobs() }); },
   });
   const remove = useMutation({
@@ -588,7 +589,7 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy, on
       </div>
       <div className="lux-admin-library-copy"><strong>{library.name}</strong><span>{libraryKindLabel(library.kind)}</span><small>{library.roots.length > 1 ? `${library.roots.length}个文件夹` : library.roots[0]?.displayPath ?? "尚未配置根路径"}</small></div>
       {removeError && !deleteOpen ? <p className="lux-error-copy" role="alert">{removeError}</p> : null}
-      {menuOpen ? <LibraryActionMenu library={library} onEdit={openEdit} onRefresh={() => { setMenuOpen(false); refresh.mutate(); }} refreshing={refresh.isPending} onScan={() => { setMenuOpen(false); scan.mutate(); }} onRemove={deleteLibrary} /> : null}
+      {menuOpen ? <LibraryActionMenu library={library} onEdit={openEdit} onRefresh={() => { setMenuOpen(false); refresh.mutate(); }} refreshMode={refreshMode} refreshing={refresh.isPending} onScan={() => { setMenuOpen(false); scan.mutate(); }} onRemove={deleteLibrary} /> : null}
       {editOpen ? <div className="lux-library-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setEditOpen(false); }} onKeyDown={(event) => { if (event.key === "Escape") setEditOpen(false); }}>
         <div className="lux-library-dialog" role="dialog" aria-modal="true" aria-labelledby={`edit-library-title-${library.id}`}>
           <div className="lux-library-dialog-header"><div><h2 id={`edit-library-title-${library.id}`}>{library.name}</h2></div><button ref={dialogCloseRef} className="lux-library-dialog-close" type="button" aria-label={`关闭 ${library.name} 编辑弹窗`} onClick={() => setEditOpen(false)}><X size={20} /></button></div>
@@ -731,13 +732,13 @@ function cloneStrategy(strategy: MediaStrategySettings): MediaStrategySettings {
   return { ...strategy, images: { ...strategy.images }, subtitles: { ...strategy.subtitles, languages: [...strategy.subtitles.languages] } };
 }
 
-function LibraryActionMenu({ library, onEdit, onRefresh, refreshing, onScan, onRemove }: { library: AdminLibrary; onEdit: () => void; onRefresh: () => void; refreshing: boolean; onScan: () => void; onRemove: () => void }) {
+function LibraryActionMenu({ library, onEdit, onRefresh, refreshMode, refreshing, onScan, onRemove }: { library: AdminLibrary; onEdit: () => void; onRefresh: () => void; refreshMode: MetadataRefreshMode; refreshing: boolean; onScan: () => void; onRemove: () => void }) {
   const actions: Array<{ label: string; icon: LucideIcon; onClick?: () => void; disabled?: boolean; title?: string }> = [
     { label: "添加到“合集”", icon: ListPlus, disabled: true, title: "合集功能将在后续版本提供" },
     { label: "更改内容类型", icon: Folder, onClick: onEdit },
     { label: "编辑", icon: Pencil, onClick: onEdit },
     { label: "编辑图像", icon: Image, onClick: onEdit },
-    { label: "刷新元数据", icon: RefreshCw, onClick: onRefresh, disabled: refreshing, title: refreshing ? "元数据刷新任务提交中" : undefined },
+    { label: refreshMode === "FULL_REFRESH" ? "全量刷新元数据" : "补全缺失元数据", icon: RefreshCw, onClick: onRefresh, disabled: refreshing, title: refreshing ? "元数据刷新任务提交中" : refreshMode === "FULL_REFRESH" ? "重新获取并覆盖未锁定的元数据和图片" : "只补全缺失的元数据和图片" },
     { label: "扫描媒体库文件", icon: RefreshCw, onClick: onScan },
     { label: "移除", icon: MinusCircle, onClick: onRemove },
     { label: "重命名", icon: Pencil, onClick: onEdit },
