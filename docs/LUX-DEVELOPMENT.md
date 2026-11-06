@@ -21165,6 +21165,27 @@ shell 已挂载时 `/auth/me` 返回 401 回到登录页）。
 --noEmit` 通过；rebase 到本地 `test`（`05abd0f9`，含条目刷新模式那一批 Web 改动）后 `pnpm --dir web test`
 为 167 个 `node --test` 用例 + 167 个 vitest 文件 / 1557 例全绿。
 
+返工记录（2026-11-06，独立审查 2/3）：
+
+- **首次连接失败后重连成功不再补做 `home` 全量失效**。`hadConnectionError` 原来只在
+  `onStateChange("disconnected")` 置位，而 `RealtimeSocket` 的初始状态就是 `disconnected` 且 `setState`
+  对相同状态直接返回——"首次握手失败 → 重试 → `ready`"整条路径没有任何状态变化，`onReady` 看到的
+  `reconnecting` 恒为 `false`。基线 SSE 对每次 `error` 都会置位（D15① 要求保留）。现在
+  `RealtimeSocket` 对**每一次可重试的失败**（握手被拒、连接断开、`ready` 超时）都回调
+  `onConnectionFailure`，hub 转发给订阅者，用户侧 hook 用它置位、`onStateChange` 只负责 React 状态。
+  `1008` 走会话结束分支、不再重试，因此不算"连接失败"、不触发该回调。
+- **会话结束后留下已 stop 的 socket，后续订阅者永远没有连接**。`endSession()` 原来只 `socket.stop()`
+  而不清模块级引用，`subscribeRealtime` 仅在 `socket === null` 时新建，而 `start()` 对已 stop 的实例直接
+  返回——管理端/重新挂载的 shell 会挂在一个再也连不上的实例上。现在 `endSession()` 先置空引用再 stop，
+  并经由唯一的写入口 `setConnectionState()` 向订阅者广播 `disconnected`（不再直接改模块变量）；不变式是
+  "有订阅者就有可用连接，或已明确告知通道不可用"，之后到达的订阅者会拿到一条新连接。
+
+返工后复验（2026-11-06，2/3）：`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web build`、`npx
+tsc --noEmit` 通过；`pnpm --dir web test` 连跑两次均为 167 个 `node --test` 用例 + 168 个 vitest 文件 /
+1562 例全绿。新增用例：socket 级"每次可重试失败都上报（含从未 ready 的首次尝试）、1008 不上报"；hook 级
+"首次尝试失败 → 重连 → `ready` 必须做一次 `home` 全量失效"；hub 级"会话结束后新订阅者拿到新连接"与
+"连接在线时会话结束仍向订阅者广播 `disconnected`"（`web/tests/realtime-client.test.ts`）。
+
 #### LUX-896：反代配置与部署文档（样例与文档已完成，真实握手未运行）
 
 状态：文档与样例已完成（2026-11-06）；LUX-894 已合并到 `test`，本分支已 rebase 到 `a8c7928a`，并补齐
