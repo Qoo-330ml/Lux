@@ -214,7 +214,7 @@ PostgreSQL 管理员如需启用 SQL 聚合统计，应在服务端 `shared_prel
 - `GET /api/v1/admin/metadata/reidentify/{jobId}`：管理员读取批量元数据匹配任务及逐条状态、候选数量和稳定错误代码；前端可按任务 ID 轮询。
 - `POST /api/v1/admin/metadata/reidentify/{jobId}/cancel`：管理员请求取消 `QUEUED` 或 `RUNNING` 的元数据任务，需要 `X-CSRF-Token`，返回 202；worker 在当前批次完成后停止领取新条目并将任务标记为 `CANCELLED`。
 - `POST /api/v1/admin/metadata/reidentify/{jobId}`：管理员对 `FAILED` 或 `CANCELLED` 任务重新排队未完成条目，保留已经成功的条目，需要 `X-CSRF-Token`；其他状态返回冲突。
-- `POST /api/v1/admin/items/{itemId}/metadata/refresh`：管理员发送 `{ "mode": "FILL_MISSING" | "FULL_REFRESH" }` 刷新一个条目的元数据；创建一个持久化后台任务并立即返回。Web 端“刷新元数据”使用 `FILL_MISSING`：电影或单集刷新自身，季刷新该季及其单集，剧集刷新该剧、所有季和所有单集，因此会补写缺失的季海报和单集横向剧照，同时保留已有本地字段和图片。
+- `POST /api/v1/admin/items/{itemId}/metadata/refresh`：管理员发送 `{ "mode": "FILL_MISSING" | "FULL_REFRESH" }` 刷新一个条目的元数据；创建一个持久化后台任务并立即返回。Web 端按条目所在媒体库生效的“元数据刮削模式”（媒体库自己的策略优先，其次全局策略，默认 `FILL_MISSING`）提交：菜单显示“补全缺失元数据”时发送 `FILL_MISSING`，显示“全量刷新元数据”时发送 `FULL_REFRESH`；模式尚未解析出来时显示“刷新元数据”并按 `FILL_MISSING` 提交。电影或单集刷新自身，季刷新该季及其单集，剧集刷新该剧、所有季和所有单集；`FILL_MISSING` 会补写缺失的季海报和单集横向剧照，同时保留已有本地字段和图片，`FULL_REFRESH` 则刷新未锁定的字段并替换已有图片。
 - `POST /api/v1/admin/libraries/{libraryId}/reidentify`：管理员从媒体库入口发起整库元数据匹配；服务端创建一个持久化后台任务并立即返回 `{ "totalCount": 125, "job": { ... } }`。任务使用条目所属媒体库的刮削器，以 `FILL_MISSING` 自动选择高置信度最佳候选；SQLite 默认最多 4 路、PostgreSQL 默认最多 8 路，进程硬上限为 16 路并按前台/CPU/内存压力降档；按媒体库图像策略下载图片并写回 NFO/图片，低置信度条目保留 pending 候选供后台处理。
 - `POST /api/v1/admin/libraries/{libraryId}/metadata/refresh`：管理员发送 `{ "mode": "FILL_MISSING" }` 或 `{ "mode": "FULL_REFRESH" }`，每次媒体库操作创建一个持久化后台任务并立即返回。前者只补缺失的未锁定 NFO 字段和图片，后者刷新未锁定 NFO 字段并替换已有图片；锁定的 NFO 字段始终保留。任务使用 SQLite 默认 4 路、PostgreSQL 默认 8 路、进程硬上限 16 路的有界并发策略，并按压力降档；未配置刮削器时不发起在线请求并保留本地元数据。
 
