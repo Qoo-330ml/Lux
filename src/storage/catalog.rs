@@ -3926,6 +3926,100 @@ impl Database {
         ))
     }
 
+    /// Similar same-type items of `source_item_id`, ranked by how many stored genres they share
+    /// with it.
+    ///
+    /// Reads only `media_item_facets` and `media_items` through the existing
+    /// `idx_media_item_facets_lookup` index and stops after `filter.limit` rows: a request never
+    /// parses NFO JSON and never scans the catalog. `filter.item_types` must hold the source
+    /// item's type; the ACL, visibility and content-restriction predicates are the shared ones
+    /// every catalog list already uses, so an excluded library or rating cannot leak in. Ties are
+    /// broken by title and id so the order is stable across requests.
+    pub(crate) async fn list_similar_catalog_rows(
+        &self,
+        filter: &CatalogFilterQuery<'_>,
+        source_item_id: &str,
+    ) -> Result<(Vec<StoredCatalogRow>, i64), StorageError> {
+        if filter.library_ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let (selected_sql, list_binds) = similar_catalog_selected_query(filter, source_item_id);
+        let list_sql = catalog_list_query_from_selected(
+            &selected_sql,
+            SIMILAR_CATALOG_ITEM_ORDER,
+            CatalogRowProjection::Full,
+        );
+        let (count_sql, count_binds) = similar_catalog_count_query(filter, source_item_id);
+        let rows_future = self.fetch_catalog_rows(&list_sql, &list_binds);
+        let total_future = async {
+            let mut statement = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_sql));
+            for bind in &count_binds {
+                statement = match bind {
+                    CatalogBind::Text(value) => statement.bind(*value),
+                    CatalogBind::Integer(value) => statement.bind(*value),
+                    CatalogBind::Real(value) => statement.bind(*value),
+                };
+            }
+            statement
+                .fetch_one(&self.pool)
+                .await
+                .map_err(self.sqlx_err())
+        };
+        let (rows, total) = tokio::try_join!(rows_future, total_future)?;
+        Ok((rows, total))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn explain_similar_catalog_rows(
+        &self,
+        filter: &CatalogFilterQuery<'_>,
+        source_item_id: &str,
+    ) -> Result<(Vec<String>, Vec<String>), StorageError> {
+        let (selected_sql, list_binds) = similar_catalog_selected_query(filter, source_item_id);
+        let list_sql = catalog_list_query_from_selected(
+            &selected_sql,
+            SIMILAR_CATALOG_ITEM_ORDER,
+            CatalogRowProjection::Full,
+        );
+        let (count_sql, count_binds) = similar_catalog_count_query(filter, source_item_id);
+        let list_plan = self.explain_plan(&list_sql, &list_binds).await?;
+        let count_plan = self.explain_plan(&count_sql, &count_binds).await?;
+        Ok((list_plan, count_plan))
+    }
+
+    #[cfg(test)]
+    async fn explain_plan(
+        &self,
+        query: &str,
+        binds: &[CatalogBind<'_>],
+    ) -> Result<Vec<String>, StorageError> {
+        let explain = format!("EXPLAIN QUERY PLAN {query}");
+        let mut statement = self.query(sqlx::AssertSqlSafe(explain));
+        for bind in binds {
+            statement = match bind {
+                CatalogBind::Text(value) => statement.bind(*value),
+                CatalogBind::Integer(value) => statement.bind(*value),
+                CatalogBind::Real(value) => statement.bind(*value),
+            };
+        }
+        let rows = statement
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        rows.into_iter()
+            .map(|row| {
+                row.try_get::<String, _>("detail")
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     pub(crate) async fn explain_filtered_catalog_rows(
         &self,
@@ -11074,6 +11168,77 @@ fn catalog_list_query_from_selected(
     )
 }
 
+/// Stable order of a similar-items page: shared genres first, then title and id.
+const SIMILAR_CATALOG_ITEM_ORDER: &str =
+    "selected.shared_genres DESC, LOWER(mi.title) ASC, mi.id ASC";
+
+/// Materialized genre-neighbourhood aggregate of a similar-items query.
+///
+/// It starts at the source item's genre rows (primary-key lookup) and probes
+/// `media_item_facets` through `idx_media_item_facets_lookup` by `(kind, name_key)`. Keeping it
+/// separate from the item filters stops the planner from turning the query into a walk over
+/// `media_items`.
+const SIMILAR_CATALOG_SHARED_CTE: &str = "WITH shared AS MATERIALIZED (
+         SELECT facet.item_id AS item_id, COUNT(*) AS shared_genres
+         FROM media_item_facets source_genre
+         JOIN media_item_facets facet
+           ON facet.kind = 'GENRE' AND facet.name_key = source_genre.name_key
+         WHERE source_genre.item_id = ? AND source_genre.kind = 'GENRE'
+         GROUP BY facet.item_id
+     )";
+
+/// `FROM`/`WHERE` remainder plus binds for a similar-items query: the catalog filter values and
+/// the source item id used by the self-exclusion. Callers prepend the source item id consumed by
+/// [`SIMILAR_CATALOG_SHARED_CTE`], which appears first in the statement text.
+///
+/// The shared catalog predicate clause supplies the library scope, the visibility rules and the
+/// content restrictions, so this query cannot see an item the list endpoints would hide.
+fn similar_catalog_from_clause<'a>(
+    filter: &CatalogFilterQuery<'a>,
+    source_item_id: &'a str,
+) -> (String, Vec<CatalogBind<'a>>) {
+    let (where_clause, mut binds) = catalog_filter_where_clause(filter);
+    let from = format!(
+        "FROM shared
+         JOIN media_items mi ON mi.id = shared.item_id
+         JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+         {where_clause}
+           AND mi.id <> ?"
+    );
+    binds.push(CatalogBind::Text(source_item_id));
+    (from, binds)
+}
+
+fn similar_catalog_selected_query<'a>(
+    filter: &CatalogFilterQuery<'a>,
+    source_item_id: &'a str,
+) -> (String, Vec<CatalogBind<'a>>) {
+    let (from, mut binds) = similar_catalog_from_clause(filter, source_item_id);
+    let selected = format!(
+        "{SIMILAR_CATALOG_SHARED_CTE}
+         SELECT mi.id AS id, shared.shared_genres AS shared_genres
+         {from}
+         ORDER BY shared.shared_genres DESC, LOWER(mi.title) ASC, mi.id ASC
+         LIMIT ? OFFSET ?"
+    );
+    binds.insert(0, CatalogBind::Text(source_item_id));
+    binds.push(CatalogBind::Integer(filter.limit));
+    binds.push(CatalogBind::Integer(filter.offset));
+    (selected, binds)
+}
+
+fn similar_catalog_count_query<'a>(
+    filter: &CatalogFilterQuery<'a>,
+    source_item_id: &'a str,
+) -> (String, Vec<CatalogBind<'a>>) {
+    let (from, mut binds) = similar_catalog_from_clause(filter, source_item_id);
+    binds.insert(0, CatalogBind::Text(source_item_id));
+    (
+        format!("{SIMILAR_CATALOG_SHARED_CTE} SELECT COUNT(DISTINCT mi.id) {from}"),
+        binds,
+    )
+}
+
 /// For the default "recently added" view over multiple libraries, each library
 /// contributes at most `offset + limit` rows to the global page. Querying each
 /// library separately keeps the existing per-library sort index usable and
@@ -13691,6 +13856,110 @@ mod media_chapter_row_decoding_tests {
                 "unexpected decode error: {error}"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn similar_catalog_query_uses_the_facet_index_and_stops_at_the_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        database
+            .query(
+                "INSERT INTO libraries (id, name, kind) VALUES ('sim-lib', 'Similar', 'MOVIE');
+                 INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     has_available_source
+                 ) VALUES
+                     ('sim-source', 'sim-lib', 'MOVIE', 'Source', 'source',
+                      'LOCAL_CONFIRMED', 1),
+                     ('sim-alpha', 'sim-lib', 'MOVIE', 'Alpha', 'alpha',
+                      'LOCAL_CONFIRMED', 1),
+                     ('sim-beta', 'sim-lib', 'MOVIE', 'Beta', 'beta',
+                      'LOCAL_CONFIRMED', 1),
+                     ('sim-gamma', 'sim-lib', 'MOVIE', 'Gamma', 'gamma',
+                      'LOCAL_CONFIRMED', 1),
+                     ('sim-delta', 'sim-lib', 'MOVIE', 'Delta', 'delta',
+                      'LOCAL_CONFIRMED', 1);
+                 INSERT INTO media_item_facets (item_id, kind, name_key, name) VALUES
+                     ('sim-source', 'GENRE', 'drama', 'Drama'),
+                     ('sim-source', 'GENRE', 'sci-fi', 'Sci-Fi'),
+                     ('sim-source', 'GENRE', 'thriller', 'Thriller'),
+                     ('sim-alpha', 'GENRE', 'drama', 'Drama'),
+                     ('sim-alpha', 'GENRE', 'sci-fi', 'Sci-Fi'),
+                     ('sim-alpha', 'GENRE', 'thriller', 'Thriller'),
+                     ('sim-beta', 'GENRE', 'drama', 'Drama'),
+                     ('sim-gamma', 'GENRE', 'drama', 'Drama'),
+                     ('sim-gamma', 'GENRE', 'sci-fi', 'Sci-Fi'),
+                     ('sim-delta', 'GENRE', 'comedy', 'Comedy')",
+            )
+            .execute(database.pool())
+            .await?;
+
+        let library_ids = vec!["sim-lib".to_owned()];
+        let item_types = vec!["MOVIE".to_owned()];
+        let filter = CatalogFilterQuery {
+            library_ids: &library_ids,
+            user_id: "sim-user",
+            item_types: &item_types,
+            excluded_item_types: &[],
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            provider_id_equals: None,
+            years: &[],
+            genre_keys: &[],
+            studio_keys: &[],
+            is_played: None,
+            is_favorite: None,
+            is_resumable: None,
+            min_date_last_saved: None,
+            metadata_pending: false,
+            parent_id_scope: None,
+            content_restrictions: None,
+            sort_by: CatalogSort::Name,
+            descending: false,
+            offset: 0,
+            limit: 2,
+            include_total: true,
+        };
+
+        let (rows, total) = database
+            .list_similar_catalog_rows(&filter, "sim-source")
+            .await?;
+        assert_eq!(total, 3, "Alpha, Gamma and Beta share a genre");
+        assert_eq!(rows.len(), 2, "LIMIT 2 must stop the page");
+        assert_eq!(rows[0].item_id, "sim-alpha", "three shared genres rank first");
+        assert!(rows.iter().all(|row| row.item_id != "sim-source"));
+        assert!(rows.iter().all(|row| row.item_id != "sim-delta"));
+
+        // The statement itself stops at the page boundary; the plan must not walk media_items.
+        let (selected_sql, _) = super::similar_catalog_selected_query(&filter, "sim-source");
+        assert!(selected_sql.contains("WITH shared AS MATERIALIZED"));
+        assert!(selected_sql.contains("GROUP BY facet.item_id"));
+        assert!(selected_sql.contains("LIMIT ? OFFSET ?"));
+        let (list_plan, count_plan) = database
+            .explain_similar_catalog_rows(&filter, "sim-source")
+            .await?;
+        assert!(
+            list_plan
+                .iter()
+                .any(|line| line.contains("idx_media_item_facets_lookup")),
+            "the genre lookup must use the facet index: {list_plan:?}"
+        );
+        assert!(
+            !list_plan
+                .iter()
+                .any(|line| line.contains("SCAN media_items")),
+            "the page must not scan media_items: {list_plan:?}"
+        );
+        assert!(
+            !count_plan
+                .iter()
+                .any(|line| line.contains("SCAN media_items")),
+            "the total must not scan media_items: {count_plan:?}"
+        );
+
+        database.close().await;
         Ok(())
     }
 }
