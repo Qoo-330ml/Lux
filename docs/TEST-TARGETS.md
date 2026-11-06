@@ -11,7 +11,7 @@
 | `--test admin` | 管理后台、日志导出、可观测性与运维事件 | 14 | 25 |
 | `--test api_web` | HTTP 契约（错误/限流/压缩/健康/远程策略）、Web 会话、Webhook | 13 | 57 |
 | `--test auth_users` | 认证、会话、登录背景、用户与用户设置、设备配对、界面偏好迁移 | 10 | 73 |
-| `--test emby` | Emby 兼容层（认证、系统信息、增量刷新、发现、多段播放、检索、下载、WebSocket） | 16 | 77 |
+| `--test emby` | Emby 兼容层（认证、系统信息、增量刷新、发现、多段播放、检索、下载、WebSocket） | 16 | 81 |
 | `--test scanner` | 媒体库扫描、增量/混合扫描、计划任务、作业事件与关停 | 7 | 152 |
 | `--test library` | 媒体库生命周期、合并/拆分、集合、目录与系列 API | 12 | 51 |
 | `--test metadata` | 元数据抓取与选择、NFO 回写、扫描后剧集元数据、人物、字幕 | 14 | 157 |
@@ -20,7 +20,7 @@
 | `--test storage` | SQLite/PostgreSQL 存储、迁移、WAL、数据库维护与启动守卫 | 9 | 117 |
 | `--test plugins` | 插件协议与运行时、弹幕、IP 属地、媒体信息插件配置 | 11 | 128 |
 | `--test strm` | STRM 目标解析/探测/播放与 ffprobe | 9 | 42 |
-| 合计（12 组） |  | 131 | 980 |
+| 合计（12 组） |  | 131 | 984 |
 
 另有 8 个 binary 因为进程级共享状态或外部服务依赖保持独立，见第 4 节：`--test background_work_budget`、`--test filmly_image_diag`、`--test image_variants_perf`、`--test performance`、`--test postgres_database`、`--test reidentify`、`--test scanned_metadata`、`--test shutdown`。合计 12 + 8 = 20 个集成测试 target。
 
@@ -91,7 +91,7 @@ cargo test --locked --test <新 target> <旧名>::
 | † `emby_empty_numeric_params` | 7 | `cargo test --locked --test emby emby_empty_numeric_params::` |
 | † `emby_filter_metadata` | 3 | `cargo test --locked --test emby emby_filter_metadata::` |
 | † `emby_similar` | 6 | `cargo test --locked --test emby emby_similar::` |
-| † `emby_websocket` | 18 | `cargo test --locked --test emby emby_websocket::` |
+| † `emby_websocket` | 22 | `cargo test --locked --test emby emby_websocket::` |
 | `job_events_api` | 2 | `cargo test --locked --test scanner job_events_api::` |
 | `mixed_scanner` | 1 | `cargo test --locked --test scanner mixed_scanner::` |
 | `scanner` | 18 | `cargo test --locked --test scanner scanner::` |
@@ -250,7 +250,7 @@ cargo test --locked --test scanner
 | `admin` | 22 | 25 | 新增 3 例（后续任务） |
 | `api_web` | 39 | 57 | 新增 18 例（后续任务） |
 | `auth_users` | 70 | 73 | 新增 3 例（后续任务） |
-| `emby` | 38 | 77 | 新增 39 例（后续任务） |
+| `emby` | 38 | 81 | 新增 43 例（后续任务） |
 | `scanner` | 137 | 152 | 新增 15 例（后续任务） |
 | `library` | 49 | 51 | 新增 2 例（后续任务） |
 | `metadata` | 143 | 157 | 新增 14 例（LUX-886 6 例、LUX-887 1 例，其余为先前任务） |
@@ -260,7 +260,7 @@ cargo test --locked --test scanner
 | `plugins` | 84 | 128 | 新增 44 例（后续任务） |
 | `strm` | 42 | 42 | 一致 |
 | 独立 binary 合计 | 112 | 117 | 新增 5 例（后续任务） |
-| **合计** | **934** | **1097** | 差异均为合并后新增用例 |
+| **合计** | **934** | **1101** | 差异均为合并后新增用例 |
 
 ### 5.2 单个用例稳定性复核
 
@@ -309,6 +309,6 @@ cargo test --locked --test scanner
 `cargo test --locked --test emby` 为 59 passed、0 failed。第 1、2、5.1 节的数字保留基线/合并时的口径，
 不在本任务中改写；后续并行任务的 `emby` 新增模块合并后，需要再以合并后的 `--list` 核对本节的 59。
 
-LUX-891 合并后已按合并后的实测核对：`cargo test --locked --test emby -- --list` 为 **77** 例 / 16 个
-模块（上述 59 例 + `emby_websocket` 18 例，返工补齐了推送限频、写超时与周期重校验的用例），第 1、2、5.1
-节的 `emby` 行与合计同时更新。
+LUX-891 合并后已按合并后的实测核对：`cargo test --locked --test emby -- --list` 为 **81** 例 / 16 个
+模块（上述 59 例 + `emby_websocket` 22 例，两轮返工补齐了推送限频、写超时、周期重校验、大文档完整推送、
+超大文档跳过、写缓冲严格大小关系等用例），第 1、2、5.1 节的 `emby` 行与合计同时更新。

@@ -20605,9 +20605,12 @@ LUX-890 合并后的去重与 P3 修正（2026-11-06）：
   且 `Stop`/`Start` 不丢 `last_attempt`。`record_attempt` 在每次尝试（成功发送或因临时错误跳过）后把
   `next_push` 推到 `now + interval`（interval 已被钳制到 ≥ `min_interval`）。因此一个 `Data="0,…"` 的
   小帧无法让服务端立即重建文档。
-- 写边界（返工后）：`WebSocketUpgrade` 设置 `write_buffer_size`（16 KiB）与 `max_write_buffer_size`
-  （64 KiB），所有发送（`KeepAlive` 应答、心跳、数据帧、关闭帧）都经 `send_bounded`/`bounded` 包在
-  10 s 硬超时里；发送超时或失败立即结束循环并释放槽位。
+- 写边界（第 2 轮返工后）：`WebSocketUpgrade` 设置 `write_buffer_size`（16 KiB，仅容量提示）与
+  `max_write_buffer_size`（4 MiB），所有发送（`KeepAlive` 应答、心跳、数据帧、关闭帧）都经
+  `send_bounded`/`bounded` 包在 10 s 硬超时里；发送超时或失败立即结束循环并释放槽位。4 MiB 的依据：
+  `MAX_LISTED_PLAYBACK_SESSIONS = 500`，实测单条会话条目约 1.3–1.5 KiB，最坏文档约 750 KiB，留五倍余量；
+  序列化后达到或超过上限的文档会被 `payload_fits` 拦下（跳过本次推送 + 限频 warn），不再依赖 tungstenite
+  的 `WriteBufferFull` 去断连。
 - 重校验（返工后）：`revalidated_principal` 透传 `StatusCode`，`revalidation_outcome` 把
   `401`/`403` 归为关闭（`1008`）、其余（`5xx`/`503`）归为临时失败：跳过本次推送、保留连接、下次计划
   到期再试，并用每条连接 60 s 限频的 warn 记录（不含 token）。另有与推送无关的 45 s 周期重校验，使
@@ -20644,10 +20647,10 @@ LUX-890 合并后的去重与 P3 修正（2026-11-06）：
 
 验证命令与结果：
 
-- `cargo test --locked --test emby emby_websocket::` 18/18（新增模块，返工后）。
-- `cargo test --locked --lib emby_websocket::` 6/6（新增单元测试）。
-- `cargo test --locked --test emby` 77/77（16 个模块，返工后实测）。
-- `cargo test --locked --test emby -- --list`：77 tests / 16 模块（`docs/TEST-TARGETS.md` 按此更新）。
+- `cargo test --locked --test emby emby_websocket::` 22/22（新增模块，第 2 轮返工后）。
+- `cargo test --locked --lib emby_websocket::` 9/9（新增单元测试）。
+- `cargo test --locked --test emby` 81/81（16 个模块，第 2 轮返工后实测）。
+- `cargo test --locked --test emby -- --list`：81 tests / 16 模块（`docs/TEST-TARGETS.md` 按此更新）。
 - `cargo fmt --all -- --check` 通过。
 - `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。
 - `python3 scripts/check-backend-branches.py` 通过（28 个文件、266 处，未新增 `DatabaseBackend::` 分支）。
@@ -20738,6 +20741,51 @@ emby_websocket::` 6/6、`cargo test --locked --test emby` 77/77、
 返工后仍存在的限制：推送限频约束的是“尝试”，所以临时错误（5xx）下客户端连发 `…Start` 也只能按
 `min_interval` 重试；写超时只有在写缓冲或套接字真正阻塞时才会触发，健康连接不会因此被关闭；空转连接
 （无推送计划）每 45 s 产生一次 token 校验查询，属于有意的成本/安全权衡。
+
+### 第 2 轮返工（独立审查后，2026-11-06）
+
+审查结论 1 个 P1、3 个 P3 全部成立，逐条先写失败测试再修。
+
+1. **P1 写缓冲上限小于合法文档**：`MAX_LISTED_PLAYBACK_SESSIONS = 500`、单条约 1.3–1.5 KiB，最坏
+   `Sessions` 文档约 750 KiB，而上一轮的上限只有 64 KiB。tungstenite 按“整帧长度 + 已缓冲字节 >
+   `max_write_buffer_size`”判定，所以这不是读端背压而是**单条消息过大必然失败**；失败后连 Close 帧都发不
+   出去，Yamby 无退避重连，且任意登录用户都能用不同 `PlaySessionId` 抬高会话数，稳定打断管理员的通道。
+   - (a) 上限提到 4 MiB（约五倍余量），初始容量仍是 16 KiB，并把理由写进常量注释与文档；
+   - (b) 不变量：100 条会话（约 130 KiB，约为最坏情况的 1/5）在生产默认限制下必须完整推送（红测试：
+     把上限改回 64 KiB 时该用例失败 `received 0 sessions`/连接被重置），断言数组长度 100 且连接仍可用；
+   - (c) 序列化后 `payload.len() >= max_write_buffer_bytes` 时跳过本次推送并限频 warn（不含凭据），连接
+     保留；红测试：上限 4 KiB + 10 条会话时旧实现直接 `WriteBufferFull` 断连，修复后连接保持可用且不推
+     送半截文档；
+   - (d) 重写“停读客户端”用例：文档（约 13 KiB）远小于 4 MiB 上限，所以尺寸检查不可能触发；客户端用
+     `TcpSocket::set_recv_buffer_size(1024)` 缩小接收窗口且不读，断言 100 ms 时槽位仍被占用（说明不是首帧
+     就被尺寸检查打断）、随后在 `send_timeout`（300 ms）后释放槽位。该用例在上一轮实现上同样通过（上一轮
+     已有发送超时），它现在证明的是**超时**而不是尺寸；尺寸路径由 (b)(c) 覆盖。
+2. **P3 播放票据用例假阳性**：旧断言用的 `luxPlaybackSignature=deadbeef` 不是播放票据，`is_playback_token`
+   只认前缀 `luxpb_`，那个 401 来自“未知 token”。改为用 `EmbyAuthService::issue_playback_token` **真实
+   签发**的 `luxpb_{item}_{random}`，并先断言该票据在播放白名单路由 `GET /emby/Items/{id}` 上返回 200
+   （证明它是真实且按路由限定的凭据），再断言 `/embywebsocket` 握手 401。`docs/API.md` 与
+   `docs/COMPATIBILITY.md` 里写成 `luxPlayback…` 的描述同步改成 `luxpb_…`。
+3. **P3 `biased` select 让入站帧饿死定时分支**：旧实现在 `select!` 里把 `socket.recv()` 排在
+   `sleep_until` 之前，只要入站帧持续就绪，定时分支就永远不被轮询，推送、心跳和周期重校验全部停摆，
+   被撤销的 token 在该连接上一直有效。现在心跳、空闲检查、周期重校验和两路推送都在**每轮循环顶部**先
+   处理，`select!` 只负责等待事件（`Wake::Timer` 只是回到循环顶部），入站帧不再影响定时工作。
+   测试：客户端每 5 ms 发一个 `KeepAlive` 持续 1 s，同时要求按计划收到 ≥3 条 `Sessions`，并在撤销 token
+   后以 `1008` 关闭。**诚实说明**：该用例在修复前的实现上也能通过——回环上 `recv()` 很难长期保持就绪，
+   无法稳定复现“永远不被选中”，因此它的作用是守住要求的结果（洪水下推送与撤销仍生效），而修复的依据是
+   代码结构（定时工作已完全不依赖 `select!` 的选择顺序）。
+4. **P3 `max_write_buffer_bytes == write_buffer_bytes` 会在升级任务里 panic**：tungstenite 的
+   `WebSocketConfig::assert_valid` 要求严格大于，`false` 时在 `101` 之后的连接任务里 `assert!`。由于
+   `EmbyWebsocketLimits` 与 `with_emby_websocket_limits` 是 `pub`，这属于可达的 panic。现在
+   `normalized()` 把初始容量钳到 `[1 KiB, 1 MiB]`，再令 `max = max(max, write.saturating_add(1))`，
+   所以相等、更小和 `usize::MAX` 三种输入都满足严格不等式（单元测试覆盖三种组合）。端到端用例用相等
+   （1024/1024）的配置完成握手并做一次 `KeepAlive` 往返；修复前该用例在升级任务里 panic（红测试观察到
+   `max_write_buffer_size must be greater than write_buffer_size`）。
+
+第 2 轮返工后复跑：`cargo test --locked --test emby emby_websocket::` 22/22、`cargo test --locked --lib
+emby_websocket::` 9/9、`cargo test --locked --test emby` 81/81、
+`LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test shutdown` 2/2、
+`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+`python3 scripts/check-backend-branches.py`、`cargo build --locked` 全部通过。
 
 #### LUX-892：ADR-054 —— Lux Web 实时通道从 SSE 迁移到 WebSocket（只写文档）
 
