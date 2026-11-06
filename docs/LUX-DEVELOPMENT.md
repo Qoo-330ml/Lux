@@ -20570,6 +20570,219 @@ LUX-890 合并后的去重与 P3 修正（2026-11-06）：
 - 本机多 agent 并行编译，单次 `cargo test` 墙钟明显偏长（10–26 分钟）；上述结果只说明测试通过，不代表
   性能。
 
+#### LUX-892：ADR-054 —— Lux Web 实时通道从 SSE 迁移到 WebSocket（只写文档）
+
+背景：`GET /api/v1/events` 与 `GET /api/v1/admin/events` 共用 64 条连接预算（`src/api/legacy.rs:1369`），
+管理页每标签页占 2 条，约 32 个管理标签页即可让所有用户 `429` 并静默回落到 30 秒轮询；管理端从不暴露
+连接状态，兜底轮询从未关闭（`docs/WEB-POLLING-AUDIT.md:27,115`）。盘点与逐条处理见
+`docs/reviews/2026-11-06-sse-to-websocket-review.md`。项目所有者于 2026-11-06 决定全面迁移到 WebSocket、
+单端点 `GET /api/v1/ws`、硬切删除两条 SSE、不新增 `LUX_ALLOWED_ORIGINS`、`/embywebsocket` 保留并与新
+端点共用连接基础设施。
+
+范围：只更新文档。新增 `docs/decisions/054-web-realtime-websocket.md`，冻结端点、信封、Origin 策略、
+握手认证、预算、关停与重连、反代要求、与 `/embywebsocket` 的关系、任务拆分与回退；对 ADR-030、ADR-049、
+ADR-017 中受影响的三处加“已被 ADR-054 部分取代”的状态标注（正文不动）；追加本任务与后续 LUX-893–898
+的条目。不改 `src/`、`web/`、`tests/`、`Cargo.*`，`docs/API.md` 不写成“已实现”（WS 契约由 LUX-894 写入），
+`docs/CHANGELOG.md` 不写条目（本任务不改行为）。
+
+验收：
+
+- [x] 所有者六条决定在 ADR 中原样列出并逐条展开为可实施合同（D1–D15），未被改写或弱化。
+- [x] Origin 策略写死“只比较 `Origin` 的 host[:port] 与 `Host`，不比较 scheme”，并说明
+      `X-Forwarded-Proto` 等转发头不参与该判断；盘点报告里“scheme 取 `X-Forwarded-Proto`”的建议明确作废。
+- [x] ADR 中每个数值（连接预算、每用户上限、帧上限、心跳/空闲/重校验间隔、退避区间）都给出代码或文档
+      来源，派生值标注推导过程，估算值标注“待 LUX-894 实测调整”。
+- [x] 已评估并否决的替代方案覆盖：保留 SSE 仅删除轮询兜底、两端点、同路径按 Upgrade 分流、双轨、
+      `LUX_ALLOWED_ORIGINS` 白名单，另记客户端订阅消息、query 凭据、断线续传、共享 API Key 四条。
+- [x] `docs/LUX-DEVELOPMENT.md` 追加 LUX-893–898（范围、依赖、验收、预计改动文件），LUX-898 标注为
+      独立任务。
+- [x] `git diff` 只含 `docs/` 下的文件；`git diff --check` 通过。
+
+预计文件：`docs/decisions/054-web-realtime-websocket.md`（新）、`docs/decisions/030-domain-module-boundaries.md`、
+`docs/decisions/049-response-revalidation-and-compression.md`、`docs/decisions/017-webhook-notification-delivery.md`、
+`docs/LUX-DEVELOPMENT.md`。
+
+验证：人工核对 ADR 与六条所有者决定的逐条对应、三个标注的指向（ADR-054 D1/D2/D9）、以及所有数字的来源
+（`src/api/legacy.rs:1369`、`src/api/admin/admin_logs_events.rs:426,438,499,521`、`web/src/app/App.tsx:141`、
+`LuxShell.tsx:48`、`AdminLayout.tsx:32`、`useAdminEvents.ts:99-103`、`useUserEvents.ts:96-133`、
+`src/api/routes.rs:26,103-120`、`src/api/users.rs:2813,3096-3114`、`src/api/admin/admin_common.rs:281-296`）；
+`grep -n "X-Forwarded-Proto" docs/decisions/054-*.md` 只有“禁止使用”的表述；`git diff --check` 通过。
+
+实施结果（2026-11-06）：ADR-054 已写入，状态“已采纳（项目所有者 2026-11-06 决定）”，所有者六条决定原样
+保留；`GET /api/v1/ws` 的计划契约、信封示例、Origin 闸门、握手认证、双预算（用户 128 / 管理 64，每用户
+16 / 8）、关停与重连约束、nginx `Upgrade`/`Connection` 要求、与 `/embywebsocket` 的共享边界、任务拆分与
+回退均已记录。ADR-030（英文状态注记）、ADR-049、ADR-017 各加一处最小标注，指向 ADR-054 的具体条款，正文
+未改。本任务只改文档，未运行 Rust 或 Web 测试；`cargo`、`pnpm` 均未执行，提交内容为 `docs/` 五个文件。
+
+#### LUX-893：抽取共享 WebSocket 基础设施（未开始）
+
+状态：未开始（计划）。依赖：LUX-891 合并到 `test`。
+
+范围：把 LUX-891 在 `src/api/emby_websocket.rs` 中已经打磨过的通用部分抽到
+`src/api/websocket/{mod,budget,shutdown,send}.rs`：全局与每用户连接计数（`EmbyWebsocketConnections` /
+`Permit`）、关停 `watch` 与有界排空（`EmbyWebsocketShutdown` / `wait_until_idle`）、有界写与 close 帧构造
+（`bounded` / `send_bounded` / `payload_fits` / `utf8_close` 与 close code）、周期重校验的节奏常量、
+可注入的 limits 结构（`EmbyWebsocketLimits` 通用化，测试可缩小上限）。
+`emby_websocket.rs` 改为引用共享模块，只保留 Emby 专有的 `StreamState` 唤醒、`revalidated_principal`、
+`handle_client_message` 与消息处理。纯 move，零行为变更：不新增端点、不改协议、不改配置、不改关停顺序。
+
+依赖：LUX-891 已合并。先合并再抽取，可避免在 `src/api/legacy.rs` 的 `CoreState` 字段与 builder、
+`src/api/mod.rs` 的 `pub use`、`src/main.rs` 的两处关停调用、`Cargo.toml` 的同一区域反复冲突；LUX-891 的
+测试同时成为纯 move 的回归网。
+
+验收：
+
+- [ ] LUX-891 的集成与单测全部保持通过（合并后按实际计数记录；盘点时为 `--test emby emby_websocket::`
+      22 例、`--lib emby_websocket::` 9 例），测试断言不改。
+- [ ] `cargo clippy --locked --all-targets --all-features -- -D warnings`、`cargo fmt --all -- --check`
+      通过；`cargo build --locked` 通过。
+- [ ] 仓库中不存在第二份计数/关停/写边界实现：`grep -rn "wait_until_idle\|payload_fits\|close_code" src/`
+      只命中 `src/api/websocket/*` 与其调用点。
+- [ ] 关停顺序、close code 取值、预算计数语义与 LUX-891 逐项相同；`/embywebsocket` 行为无变化，
+      Emby 仍是 32 全局 / 4 每用户，`1000`/`1001`/`1008` 常量随模块移动。
+
+预计改动文件：新增 `src/api/websocket/mod.rs`、`budget.rs`、`shutdown.rs`、`send.rs`；修改
+`src/api/emby_websocket.rs`、`src/api/mod.rs`、`src/api/legacy.rs`、`src/main.rs`、`Cargo.toml`（如需调整
+feature）、`docs/TEST-TARGETS.md`（若测试过滤路径变化）。
+
+#### LUX-894：后端 `GET /api/v1/ws`（未开始）
+
+状态：未开始（计划）。依赖：LUX-893。必须与 LUX-896 同批合入。
+
+范围：新增 `src/api/lux_websocket.rs`，注册 `GET /api/v1/ws`：Upgrade 之前的 Origin 闸门（ADR-054 D5：
+只比较 `Origin` 的 host[:port] 与 `Host`、不比较 scheme、`Sec-Fetch-Site: cross-site` 拒绝、缺失 `Origin`
+时 cookie 拒绝而客户端令牌放行）；握手前认证（复用 `require_web_user` / `require_admin(.., false)`，
+禁止 query 凭据，不要求也不接受 CSRF）；按主体给出 `user` 与 `admin` 频道，客户端不发订阅消息；用户 128 /
+管理 64 两个预算实例与每用户 16 / 8 上限，超限在 Upgrade 前 `429` + `Retry-After: 30`；关停 `1001` 与
+5 s 有界排空（`EMBY_WEBSOCKET_SHUTDOWN_DRAIN_TIMEOUT`）；25 s 协议级 ping / 120 s 空闲、4 KiB 上限、
+二进制 `1003`、超限 `1009`、未知 `type` 忽略；45 s 周期重校验，降权只停投 admin 帧、会话撤销 `1008`。同步把 WS 契约写入 `docs/API.md`（含 Origin/CSRF 说明），并按实测
+结果回填 ADR-054 预算段与心跳段。
+
+依赖：LUX-893（共享预算/关停/写边界/重校验）。LUX-895 可并行开发，但发布必须同版本。
+
+验收：
+
+- [ ] 新增 `tests/admin/lux_websocket.rs`（并入 `--test admin`）：未认证 401；无管理权限时只投 `user`
+      帧；跨源 400；`Origin` 缺失 + cookie 401；`Origin` 缺失 + 客户端令牌通过；`Sec-Fetch-Site:
+      cross-site` 拒绝；预算超限 429 + `Retry-After: 30`；关停 1001；会话撤销 1008；>4 KiB 1009；二进制
+      1003；未知 `type` 忽略且不关连接。
+- [ ] 降权用例：admin 帧停止、user 帧继续、连接不关闭；恢复权限后 admin 帧恢复。
+- [ ] 真实浏览器验证：协议级 pong 会重置 120 s 空闲计时（否则每条连接都会被误杀）；JS 客户端不依赖
+      应用层 ping 判活。
+- [ ] 记录一次真实部署的并发观测（峰值连接数、每用户峰值、429 次数），写入 ADR-054「资源与预算」；
+      实测与假设偏差超过 2 倍时按同一推导重算。
+- [ ] `cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets
+      --all-features -- -D warnings`、`cargo test --locked --test admin` 通过。
+
+预计改动文件：新增 `src/api/lux_websocket.rs`、`tests/admin/lux_websocket.rs`；修改 `src/api/legacy.rs`
+（`CoreState` 的预算与关停字段、builder）、`src/api/mod.rs`、`src/api/routes.rs`、`src/main.rs`、
+`tests/admin/main.rs`、`docs/API.md`、`docs/decisions/054-web-realtime-websocket.md`（回填实测值）、
+`docs/TEST-TARGETS.md`、`docs/CHANGELOG.md`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-895：前端实时客户端（未开始）
+
+状态：未开始（计划）。依赖：ADR-054 的协议冻结（不等 LUX-894 完成即可开发）；发布需与 LUX-894 同版本。
+
+范围：新增 `web/src/lib/realtime/{socket.ts,types.ts}`（URL 由 `location` 推导、不带凭据、退避、可见性、
+离线、close code 分支），`useUserEvents` / `useAdminEvents` 只换传输层，失效逻辑逐字保留；类型改名
+`SseConnectionState` → `RealtimeConnectionState`、`useSseConnectionState` →
+`useRealtimeConnectionState`（7 个调用点机械替换，`homeRefetchInterval` 签名不变）；按 ADR-054 D14 删除
+`libraryId` 死分支；新增 `web/tests/support/fake-websocket.ts`，一次替掉四份手写 `FakeEventSource`。
+
+依赖：ADR-054（信封与 close code 语义）。后端可并行开发；发布时两个方向必须同版本（硬切）。
+
+验收：
+
+- [ ] 退避为 `min(30 s, 500 ms × 2^n)` 加 ±20% 抖动，只有收到首帧 `ready` 才把 `n` 归零（假计时器断言
+      上界与抖动区间）。
+- [ ] `1008` 不重连并失效 `queryKeys.me`（回到登录页）；`1001`/`1000` 至少等 5 s；连续 5 次 `1006`
+      触发一次 `api.me()`，401 按会话失效处理。
+- [ ] `document.hidden` 与 `offline` 暂停重连，`visibilitychange` 转可见与 `online` 立即重试一次。
+- [ ] 三个易碎行为各有断言：用户侧首次 open 不全量失效；管理侧每次 open 做 `all` 失效；管理侧 250 ms
+      合并窗。
+- [ ] `pnpm --dir web test`、`pnpm --dir web build` 通过；`grep -rn "EventSource" web/src` 为空。
+
+预计改动文件：新增 `web/src/lib/realtime/socket.ts`、`web/src/lib/realtime/types.ts`、
+`web/tests/support/fake-websocket.ts`；修改 `web/src/features/activity/useUserEvents.ts`、
+`web/src/features/admin/useAdminEvents.ts`、`web/src/features/home/HomePage.tsx`、
+`web/src/features/detail/MediaDetailPage.tsx`、`web/src/features/detail/useMediaEpisodes.ts`、
+`web/src/features/detail/MediaDetailActions.tsx`、`web/src/features/detail/MediaDetailSections.tsx`、
+`web/src/features/detail/MediaDetailHero.tsx`、`web/tests/user-events.test.tsx`、
+`web/tests/admin-events.test.tsx`、`web/tests/lux-shell.test.tsx`、`web/tests/library-page.test.ts`。
+
+#### LUX-896：反代配置与部署文档（未开始）
+
+状态：未开始（计划）。依赖：LUX-894。**必须与 LUX-894 同批合入**，不得后置。
+
+范围：`docs/DEPLOYMENT.md` 的 nginx 样例补 `proxy_set_header Upgrade $http_upgrade;` 与
+`proxy_set_header Connection "upgrade";`，并把 `Host` 明确为 `$http_host`（保留非默认端口，否则
+ADR-054 D5 会拒绝握手）；`scripts/proxy-smoke.nginx.conf` 同步；用 `scripts/proxy-smoke.sh` 跑一次真实
+`101` 握手；`docs/COMPATIBILITY.md` 记录结论（含缺头时 `1006`/`400` 的表现与“与 401 无法区分”的说明，
+Caddy 链路仍标注未实机验证）。
+
+依赖：LUX-894（需要真实端点）。缺头时代理会剥掉 `Upgrade`，请求以普通 GET 到达，`WebSocketUpgrade`
+提取器返回 400，浏览器只看到 `close 1006`；前端随后落到 30 秒轮询，负载高于断线基线而 UI 显示“正常”。
+
+验收：
+
+- [ ] `scripts/proxy-smoke.sh` 在真实 nginx 容器里完成 `101` 握手并收到 `{"type":"ready","version":1}`。
+- [ ] 故意删掉 `Upgrade`/`Connection` 头时，实测表现与文档描述一致（`1006`），且文档写明前端会落到轮询。
+- [ ] 非默认端口部署（`Host` 带端口）的说明与 ADR-054 D5 一致；`$host` 造成端口丢失的后果被写出。
+- [ ] `docs/COMPATIBILITY.md` 记录验证日期、nginx 版本与未验证项（Caddy/Hills 链路）。
+
+预计改动文件：`docs/DEPLOYMENT.md`、`scripts/proxy-smoke.nginx.conf`、`scripts/proxy-smoke.sh`（如需
+增加握手断言）、`docs/COMPATIBILITY.md`、`docs/CHANGELOG.md`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-897：删除两条 SSE 路由与旧测试（未开始）
+
+状态：未开始（计划）。依赖：LUX-894 与 LUX-895。必须与它们同属一个发布版本（硬切）。
+
+范围：删除 `GET /api/v1/events` 与 `GET /api/v1/admin/events` 的路由、handler、`pump_user_events`、
+`event_stream_response`、`sse_capacity_response` 与 `SseConnectionBudget` / `MAX_SSE_CONNECTIONS`（WS
+预算已独立后）；删除只针对 SSE 帧渲染与流预算的测试，保留仍对广播 hub 有效的用例（改为直接订阅 hub 或
+经 WS 验证）；删除 `docs/API.md` 的两段 SSE 契约、更新 `docs/WEB-POLLING-AUDIT.md` 的 SSE 描述与
+`docs/TEST-TARGETS.md` 的用例计数。
+
+依赖：LUX-894（WS 端点可用）与 LUX-895（前端已切走）。同一发布版本内完成，不留双轨。
+
+验收：
+
+- [ ] 两条旧端点返回 404；`grep -rn "api/v1/events\|api/v1/admin/events" src/ web/src docs/API.md` 为空
+      （仅允许出现在历史任务记录与 ADR 里）。
+- [ ] `grep -rn "text/event-stream\|EventSource" src/ web/src` 为空。
+- [ ] `cargo test --locked --test admin` 剩余用例全绿（记录删除与保留的用例数）；`python3
+      scripts/check-backend-branches.py` 通过。
+- [ ] `pnpm --dir web test`、`pnpm --dir web build` 通过；`docs/API.md` 不再描述 SSE。
+
+预计改动文件：`src/api/admin/admin_logs_events.rs`、`src/api/admin/mod.rs`、`src/api/legacy.rs`、
+`tests/admin/admin_events.rs`、`tests/admin/main.rs`、`docs/API.md`、`docs/WEB-POLLING-AUDIT.md`、
+`docs/TEST-TARGETS.md`、`docs/CHANGELOG.md`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-898：管理端实时连接状态与关闭兜底轮询（未开始，独立任务）
+
+状态：未开始（计划）。依赖：无（不依赖 SSE → WebSocket 迁移，可单独发布）。
+
+范围：让管理端拿到实时连接状态（`useAdminEvents` 暴露状态，或复用 `useRealtimeConnectionState` 的管理版），
+管理页按“已连接”关闭兜底轮询：仪表盘 15 s、任务活动弹层 5 s、运行记录四类任务列表各 5 s；断线或握手
+失败时恢复原间隔。不改后端事件 scope，因此转码会话 2 s、Emby 迁移作业、媒体库删除任务、内容索引状态四类
+仍无 scope 覆盖的查询保持轮询并在文档中记录（`docs/WEB-POLLING-AUDIT.md:115-121`）。
+
+依赖：无。若 LUX-895 已落地，直接复用其连接状态类型；否则先导出管理端状态即可，事件语义不变。
+
+验收：
+
+- [ ] 已连接时 `adminDashboard`、`adminTaskActivity` 与四类 jobs 查询的 `refetchInterval` 为 `false`，
+      断线后恢复原间隔（两态各有测试）。
+- [ ] 转码 2 s、`admin/emby-migrations*`、`admin/library-deletion-jobs`、
+      `admin/content-restriction-index` 的轮询行为不变，原因写进 `docs/WEB-POLLING-AUDIT.md`。
+- [ ] `pnpm --dir web test`、`pnpm --dir web build` 通过；`docs/WEB-POLLING-AUDIT.md` 第 27、115 行附近
+      的描述已更新为当前事实。
+
+预计改动文件：`web/src/features/admin/useAdminEvents.ts`、`web/src/features/admin/AdminLayout.tsx`、
+`web/src/features/admin/AdminDashboardPage.tsx`、`web/src/features/activity/ScanActivityPopover.tsx`、
+`web/src/features/admin/AdminOperationsPage.tsx`、`web/tests/admin-events.test.tsx`、
+`web/tests/admin-dashboard.test.tsx`、`docs/WEB-POLLING-AUDIT.md`、`docs/LUX-DEVELOPMENT.md`。
+
 ## 31. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

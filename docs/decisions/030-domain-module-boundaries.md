@@ -48,6 +48,11 @@ Use thin facade modules with explicit domain children:
   API layer. Application use cases accept domain inputs and explicit service dependencies; they do
   not accept Axum types or `AppState`.
 
+> Status note: the "SSE protocol loops" wording above is partly superseded by ADR-054 (D1, D9,
+> 2026-11-06). Lux's own Web realtime channel moves from SSE to one WebSocket endpoint
+> (`GET /api/v1/ws`). The boundary this clause protects is unchanged: the realtime protocol loop
+> still lives in the API layer, and the shared connection infrastructure is `src/api/websocket/*`.
+
 Children may use private shared helpers through explicit `pub(super)` or `pub(crate)` boundaries.
 No `include!`-based textual partitioning is used: each child is a real Rust module with a named
 responsibility. The migration is purely organizational, so route paths, DTO serialization, error
