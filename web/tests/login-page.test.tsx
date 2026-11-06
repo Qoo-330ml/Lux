@@ -566,4 +566,47 @@ describe("LoginPage session state", () => {
       await vi.waitFor(() => expect(container.querySelector("[data-testid=loaded-library-route]")).not.toBeNull());
     });
   });
+
+  it("returns to the login page when a 401 arrives while the shell is already mounted", async () => {
+    const user = { id: "user-1", usernameNormalized: "admin", canManageServer: false };
+    vi.spyOn(api, "setupStatus").mockResolvedValue({ initialized: true });
+    let meCalls = 0;
+    vi.spyOn(api, "me").mockImplementation(async () => {
+      meCalls += 1;
+      if (meCalls === 1) return { user, serverName: "客厅 Lux" };
+      throw new ApiError("需要登录", { status: 401 });
+    });
+    vi.spyOn(api, "homeCarousel").mockResolvedValue({ recommended: [] });
+    vi.spyOn(api, "homeLibraries").mockResolvedValue({ libraries: [] });
+    vi.spyOn(api, "homeContinueWatching").mockResolvedValue({ items: [], total: 0 });
+    vi.spyOn(api, "homeLibrariesLatest").mockResolvedValue({ libraries: [] });
+    // The realtime channel is not what this test exercises; keep it on the polling fallback.
+    vi.stubGlobal("WebSocket", undefined);
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/"]}>
+            <App />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await vi.waitFor(() => expect(container.querySelector(".lux-home"), container.innerHTML).not.toBeNull());
+
+    // This is exactly what the realtime client does on a 1008 close (ADR-054 D11).
+    await act(async () => { await queryClient.invalidateQueries({ queryKey: queryKeys.me }); });
+
+    await act(async () => {
+      await vi.waitFor(() => {
+        expect(container.querySelector("input[autocomplete='username']"), container.innerHTML).not.toBeNull();
+      });
+    });
+    expect(container.querySelector(".lux-home")).toBeNull();
+  });
 });

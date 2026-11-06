@@ -98,10 +98,14 @@ function SessionRoutes({ me }: { me: UseQueryResult<Awaited<ReturnType<typeof ap
   const location = useLocation();
 
   if (me.isPending) return <LoadingScreen label="正在恢复会话" />;
-  if (me.error && !(me.error instanceof ApiError && me.error.status === 401)) {
+  const unauthorized = me.error instanceof ApiError && me.error.status === 401;
+  if (me.error && !unauthorized) {
     return <ErrorScreen error={me.error} />;
   }
-  if (!me.data) {
+  // A revoked session can surface while the shell is already mounted: the realtime client
+  // invalidates queryKeys.me on a 1008 close (ADR-054 D11) and the refetch answers 401, but the
+  // cached session stays in `data`. That 401 means "no session", so it lands on the login page.
+  if (!me.data || unauthorized) {
     return (
       <Routes location={location}>
         <Route path="*" element={<LoginPage />} />
