@@ -1,5 +1,40 @@
 # Lux 客户端兼容性矩阵
 
+## LUX-890 Emby `GET /Tags` 与 `GET /OfficialRatings`（2026-11-06）
+
+证据等级：**请求形态为真机抓包确认，响应形态为静态推断**。Hills 1.11.0 打开媒体库筛选面板时实抓
+`GET /Tags`、`GET /OfficialRatings`，当时 Lux 对两者都返回 404 空响应，筛选列表为空
+（`docs/reviews/2026-11-06-hills-yamby-capture.md`）。本次修复后的响应**没有**在 Hills 或任何第三方
+Emby 客户端上复测；`Items[]` 的 `Name`/`Id` 形状按 Emby `NameIdPair` 约定推断，Lux 侧只用自动化测试
+固定服务端合同。Yamby 本次抓包未观察到这两个请求。
+
+- `GET /OfficialRatings`：从 `media_content_restriction_index.certification_code` 聚合当前用户可见范围内
+  去重后的分级，按分级代码升序返回；Emby `OfficialRating` 字段本来就渲染同一列。`ParentId`（媒体库）、
+  `IncludeItemTypes`、`StartIndex`/`Limit` 与服务端上限与其他 facet 端点一致，`ParentId` 是不可见媒体库
+  时返回 404。响应信封与 `/Genres` 相同：
+  `{"Items":[{"Name":"PG-13","Id":"PG-13","ServerId":…}],"TotalRecordCount":n,"StartIndex":n}`；`Id` 就是
+  分级值。
+- 分级的取值范围：只有 NFO `<certification>` 被既有投影归一成 MPA/TVPG/BBFC 之一的值才会出现在列表里。
+  无法识别的分级字符串、以及没有 NFO 分级的条目不会贡献 facet；这与 `OfficialRating` 字段本身的输出
+  范围一致，不是本任务新增的过滤。
+- 内容限制：非管理员用户的分级列表与 `/Items` 使用同一条内容限制谓词，超出 `maximum_rating` 的条目连同
+  其分级一起被排除；管理员不受内容限制（与既有列表一致）。库 ACL 与内容限制同时生效。
+- `GET /Tags`：**目前恒返回 200 与 `{"Items":[],"TotalRecordCount":0}`**，不再是 404，筛选面板显示空
+  列表而不是请求失败。**Tags 目前恒空，原因是无数据源，仍待后续任务填充**：NFO 解析结果里没有条目级
+  `<tag>`，`media_item_facets` 只有 `GENRE`/`STUDIO` 两种 kind，`media_content_restriction_tags` 存的是
+  **小写 genre**（家长控制用的投影），不能当作 Emby tags 返回。按任务约束没有新增迁移、没有扫描器改动、
+  也没有在请求里解析 NFO；`Fields=TagItems` 的现有行为不变。
+- 鉴权与路径：两个端点都要求 Emby token/API key（未鉴权 401），同时支持根路径与 `/emby` 前缀；路由走
+  既有 `EmbyRouteBuilder`，因此 `/emby` 前缀与路径大小写不敏感的行为自动一致
+  （`/EMBY/officialratings` 有测试覆盖）。
+- 分页：`Limit` 默认 50、服务端上限 1000（与 `/Genres` 相同），`StartIndex<0` 或 `Limit>1000` 返回 400；
+  空的 `StartIndex=`/`Limit=` 按未提供处理（Hills 的筛选面板会带空 `Limit=`），空的 `ParentId=` 按
+  “不限媒体库”处理。
+- `Recursive` 被接受但不改变结果：与其他 facet 端点一样，分级聚合始终覆盖所选库/类型的全部可见条目。
+- 自动化：`cargo test --locked --test emby emby_filter_metadata::`（3 例）覆盖去重、库 ACL、内容限制、
+  `ParentId`、`IncludeItemTypes`、分页与上限、空 `Limit=`、未鉴权 401、根路径/`/emby`/大小写混用与
+  `Tags` 空信封。
+
 ## LUX-888 Emby 查询端点容忍空的可选数值/布尔参数（2026-11-06）
 
 分级：**真机抓包确认（仅“空 `Limit=` 会 400”这一条）+ 其余静态推断**。

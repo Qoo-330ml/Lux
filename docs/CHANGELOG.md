@@ -20,6 +20,13 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
   `TRAKT_NOT_CONFIGURED` 会中止整次运行，单条写盘失败只影响该条目。运行没有独立作业记录和界面进度，
   结束时在日志里输出一行 `scanned/queried/written/unchanged/skipped_*/failed` 汇总；每次都是全量重查
   （还没有“条目上次同步时间”标记）。
+- **Emby 筛选面板有了官方分级列表**：新增 `GET /OfficialRatings`（根路径与 `/emby` 前缀），返回当前用户
+  可见范围内的去重分级值，`Items[]` 用 `Name`/`Id` 表示分级本身，`TotalRecordCount` 是分级个数。数据来自
+  条目已入库的分级（Emby `OfficialRating` 字段渲染的同一列），不在请求里解析 NFO，也没有新增迁移；支持
+  `ParentId`、`IncludeItemTypes`、`Recursive`、`StartIndex`/`Limit`（默认 50、上限 1000，空的 `Limit=`
+  按未提供处理），媒体库权限和内容限制与普通列表一致。同一批请求的 `GET /Tags` 也从 404 改为返回 200 与
+  空列表：Lux 还没有标签数据源（NFO 缓存里没有条目级 tags），筛选面板因此显示空标签而不是请求失败，
+  等后续任务补充。
 
 ### 修复
 
