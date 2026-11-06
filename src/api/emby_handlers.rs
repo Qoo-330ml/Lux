@@ -1491,7 +1491,12 @@ pub(super) struct EmbyUpdateUserPasswordRequest {
 pub(super) struct EmbyUserImageQuery {
     #[serde(flatten)]
     auth: EmbyTokenQuery,
-    #[serde(rename = "Index", alias = "index")]
+    #[serde(
+        rename = "Index",
+        alias = "index",
+        default,
+        deserialize_with = "deserialize_optional_i32"
+    )]
     index: Option<i32>,
 }
 

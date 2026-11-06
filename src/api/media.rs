@@ -571,9 +571,19 @@ pub(super) struct EmbySearchQuery {
     api_key: Option<String>,
     #[serde(rename = "SearchTerm", alias = "searchTerm")]
     search_term: Option<String>,
-    #[serde(rename = "StartIndex", alias = "startIndex")]
+    #[serde(
+        rename = "StartIndex",
+        alias = "startIndex",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     start_index: Option<i64>,
-    #[serde(rename = "Limit", alias = "limit")]
+    #[serde(
+        rename = "Limit",
+        alias = "limit",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     limit: Option<i64>,
 }
 

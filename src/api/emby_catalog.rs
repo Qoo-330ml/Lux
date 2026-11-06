@@ -130,9 +130,14 @@ pub(super) struct EmbyItemCountsQuery {
     pub(super) is_favorite: Option<bool>,
 }
 
-pub(super) fn deserialize_optional_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+/// Shared body of the blank-tolerant query helpers: an empty or whitespace-only value means the
+/// client sent no value at all, so it deserializes to `None`. Any other value must parse, and a
+/// parse failure stays a deserialization error (which the `Query` extractor answers with `400`).
+fn blank_optional_value<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
 {
     let value = Option::<String>::deserialize(deserializer)?;
     match value.as_deref().map(str::trim) {
@@ -141,22 +146,34 @@ where
     }
 }
 
+/// Reads an optional boolean query value, treating an empty or whitespace-only value as absent.
+pub(super) fn deserialize_optional_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    blank_optional_value(deserializer)
+}
+
 /// Reads an optional `i64` query value, treating an empty or whitespace-only value as absent.
 ///
 /// Emby clients spell "no explicit value" as `Limit=`/`StartIndex=` when a filter panel is opened
 /// without a paging choice; rejecting that with `400` emptied the Hills media library filter panel
 /// (see `docs/reviews/2026-11-06-hills-yamby-capture.md`). A non-empty value must still parse, so
 /// `Limit=abc`, `Limit=1.5` and negative offsets keep answering `400` exactly as before. This is
-/// the numeric counterpart of [`deserialize_optional_bool`].
+/// the numeric counterpart of [`deserialize_optional_bool`] and shares its rule.
 pub(super) fn deserialize_optional_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let value = Option::<String>::deserialize(deserializer)?;
-    match value.as_deref().map(str::trim) {
-        None | Some("") => Ok(None),
-        Some(value) => value.parse().map(Some).map_err(serde::de::Error::custom),
-    }
+    blank_optional_value(deserializer)
+}
+
+/// `i32` variant of [`deserialize_optional_i64`], for `Index`-style query values.
+pub(super) fn deserialize_optional_i32<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    blank_optional_value(deserializer)
 }
 
 fn deserialize_optional_emby_timestamp<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
