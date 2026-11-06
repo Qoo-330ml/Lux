@@ -10,6 +10,14 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 
 ### 新增
 
+- **Emby 详情页的“相似推荐”返回真实数据**：Hills 与 Yamby 每次进入电影/剧集详情都会请求
+  `GET /emby/Items/{id}/Similar`，Lux 此前返回 404 空响应，推荐区整块缺失（页面不报错）。现在根路径与
+  `/emby` 前缀都提供该端点，返回 `Items`/`TotalRecordCount`：只包含同类型且至少共享一个 Genre 的条目，
+  共享数量多的排前面，再按标题和 id 稳定排序；排除条目自身、用户无权访问的媒体库以及被内容限制屏蔽的
+  条目。条目复用现有 Emby 列表投影，`Fields`、`EnableUserData`、`ImageTypeLimit`、`EnableImageTypes`
+  按请求生效。`Limit` 默认 50、上限 1000，空值按未提供，非法值返回 400；条目不存在或不可见返回 404，
+  没有相似条目返回 200 空列表。查询只读 `media_item_facets` 与 `media_items` 的现有索引，不解析 NFO、
+  不扫描媒体库，也不需要迁移。
 - **Trakt 评分可以按计划写回旁车 NFO**：`org.lux.trakt-ratings` 插件声明的媒体库级 `RATINGS_SYNC`
   任务现在能真正执行（此前调度器会以“不支持的任务类型”拒绝）。任务默认按 UTC 每周日 04:00 运行；
   每次执行在后台分页遍历该媒体库，只对已有 NFO 旁车的电影、剧集和分集向插件批量查询评分，把可信结果

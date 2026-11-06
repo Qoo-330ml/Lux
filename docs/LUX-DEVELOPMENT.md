@@ -20329,6 +20329,73 @@ Hills 或任何第三方客户端上复测。
   不限媒体库），代价是空列表请求也会做一次媒体库访问查询；它仍然没有任何 tags 数据源。
 - 本机为 ARM64 宿主，不外推到 NAS/x86_64 的性能结论。
 
+#### LUX-889：Emby `GET /Items/{id}/Similar`
+
+背景：真机抓包（2026-11-06）确认 Hills 1.11.0 与 Yamby 2.1.0.11 每次进入电影/剧集详情页都会请求
+`/emby/Items/<id>/Similar`（Hills 带 `UserId`、`Fields`、`Limit`、`ImageTypeLimit`；Yamby 另带
+`EnableTotalRecordCount=false`），Lux 返回 404 空响应，详情页的相似/推荐区整块缺失且页面不报错
+（`docs/reviews/2026-11-06-hills-yamby-capture.md` 问题 3）。静态分析
+（`docs/reviews/2026-11-06-hills-yamby-static-analysis.md` §9.1）确认 Yamby 的详情页与播放器“推荐”
+两处调用点都对该端点做 `catch (Throwable)` 静默降级。
+
+实现（`src/api/emby_similar.rs`（新）、`src/api/legacy.rs`、`src/api/emby.rs`、
+`src/application/catalog.rs`、`src/storage/catalog.rs`；无迁移、不改 `/api/v1` DTO 与 `web/`）：
+
+- 路由：`GET /Items/{id}/Similar`，沿用 `EmbyRouteBuilder`，因此根路径与 `/emby` 前缀、大小写不敏感
+  和现有鉴权/播放令牌中间件一致。抓包只出现根 `Items` 形态，没有新增
+  `/Users/{userId}/Items/{id}/Similar`。
+- DTO：`{"Items":[...],"TotalRecordCount":n}`，条目由现有列表投影生成，`Fields` 与列表端点同义；
+  `EnableUserData=false` 去掉 `UserData`，`EnableImageTypes`/`ImageTypeLimit` 过滤图片 tag。
+- 相似规则：新增 `CatalogService::list_similar_items` 与存储层 `list_similar_catalog_rows`。候选必须是
+  同类型（MOVIE/SERIES）、与源条目至少共享一个 `media_item_facets(kind='GENRE')` 键，按共享数量降序、
+  再按 `LOWER(title)`、`id` 升序，排除自身。ACL、可见性与内容限制复用
+  `catalog_filter_where_clause`，因此被排除的库或条目不进入 `Items` 或 `TotalRecordCount`。
+- 查询形状：`shared` CTE 从源条目的 genre 行（主键）出发，经 `idx_media_item_facets_lookup`
+  按 `(kind, name_key)` 关联并物化，再 join `media_items` 做 ACL 与分页，避免计划器把它退化为
+  `media_items` 扫描；列表查询带 `LIMIT ? OFFSET ?`，总数查询是同一 `shared` 集合上的
+  `COUNT(DISTINCT mi.id)`。
+- 错误与分页：条目不存在或不可见 404（与 `/Items/{id}` 一致），未鉴权 401；`Limit` 默认 50、上限 1000，
+  空值按未提供（本端点自己的 Query 结构体处理，不依赖 LUX-888），负数、非整数或超上限 400；无相似条目
+  200 空列表。响应不返回 `StartIndex`（规格只要求 `Items`/`TotalRecordCount`）。
+
+验收：
+
+- [x] 同类型且共享 Genre 的条目按共享数量降序返回，不含自身、不同类型或不同 Genre 的条目。
+- [x] 电影与剧集均覆盖；根路径与 `/emby` 前缀一致。
+- [x] 被用户媒体库 ACL 排除的条目不出现在 `Items` 或 `TotalRecordCount`。
+- [x] `Limit` 生效且 `TotalRecordCount` 是相似条目总数；空值按未提供，非法值 400。
+- [x] 无相似条目 200 空列表；不存在的 ID 404；未鉴权 401。
+- [x] 存储层测试断言查询带 `LIMIT`、计划使用 `idx_media_item_facets_lookup` 且不扫描 `media_items`。
+- [x] `Fields`、`EnableUserData`、`ImageTypeLimit`、`EnableImageTypes` 生效。
+
+预计文件：`src/api/emby_similar.rs`、`src/api/legacy.rs`、`src/api/emby.rs`、`src/application/catalog.rs`、
+`src/storage/catalog.rs`、`tests/emby/emby_similar.rs`、`tests/emby/main.rs`、`docs/COMPATIBILITY.md`、
+`docs/CHANGELOG.md`、`docs/LUX-DEVELOPMENT.md`、`docs/TEST-TARGETS.md`。rebase 到 `a7c3cdc5` 时上述文件与
+`test` 无冲突；`test` 上的 STRM 媒体源 id 改动不影响本端点。
+
+实施结果（2026-11-06，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 或修复后的客户端上复测）：
+
+- `cargo test --locked --test emby emby_similar::` 6/6 通过（新增；实现前先以 404/401 失败复现）。
+- `cargo test --locked --lib similar_catalog` 1/1 通过；查询计划为 `MATERIALIZE shared` →
+  `SEARCH source_genre`（facet 主键）→ `SEARCH facet USING COVERING INDEX
+  idx_media_item_facets_lookup (kind=? AND name_key=?)`，列表与总数语句都没有 `SCAN media_items`。
+- `cargo fmt --all -- --check` 通过。
+- `cargo test --locked --test emby -- --list` 在本分支为 49 例（基线 43 + 本任务 6）。
+
+限制与剩余风险：
+
+- 相似度只按 Genre 交集计数，不是 Emby 的完整推荐算法；没有 NFO/facet 的条目、没有 Genre 的源条目
+  都只能得到空推荐。客户端 UI 是否重新显示推荐区没有在修复后的实例上验证。
+- 候选集合按源条目的 genre 关联行展开后再做 ACL 过滤；热门 Genre（例如 Drama）在 60k 条目库上仍会
+  枚举数万条 facet 行，这是“按共享数量排序”的固有成本。`LIMIT` 只限制返回页，排序前无法提前截断；
+  但查询只读 facet 索引与条目主键，不扫描 `media_items`。
+- 没有 `StartIndex` 分页（抓包未见客户端使用）；`TotalRecordCount` 总是计算，未按
+  `EnableTotalRecordCount=false` 省略。
+- `EnableImageTypes`/`ImageTypeLimit` 的语义按 Emby/Jellyfin 文档推断，未真机逐项比对；其他列表端点
+  仍不实现这两个参数。
+- 本机多 agent 并行编译，单次 `cargo test` 墙钟明显偏长（10–26 分钟）；上述结果只说明测试通过，不代表
+  性能。
+
 ## 31. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
