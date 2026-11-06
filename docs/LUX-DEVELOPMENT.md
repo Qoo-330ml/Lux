@@ -20180,6 +20180,87 @@ rebase 后的 `--list` 一致。
 - 返工后只剩 Lux 自己签发的票据参数（`luxPlaybackExpires`）与 `ImageTypeLimit` 这类不存在的键不在
   显式处理范围内：前者解析失败落成 `None`、走既有鉴权失败分支，后者 Lux 根本不声明，都不会产生 `400`。
   若将来新增 Emby 查询结构体，需要按同一规则接入共享 helper；这一点只体现在代码约定里，没有编译期约束。
+#### LUX-890：Emby `GET /Tags` 与 `GET /OfficialRatings`（筛选面板元数据）
+
+背景：Hills 1.11.0 打开媒体库筛选面板时实抓 `GET /Tags`、`GET /OfficialRatings`，Lux 对两者都是 404，
+筛选列表为空（`docs/reviews/2026-11-06-hills-yamby-capture.md`）。`/Tags` 此前在 `docs/COMPATIBILITY.md`
+被记为“有意未实现”，因为 NFO 缓存里没有 tags 数据；`/Genres`、`/Studios`、`/Years` 已实现，是本次的
+路由/DTO/ACL/分页/`ParentId`/`Recursive`/`IncludeItemTypes` 样板。
+
+调查结论（先查存储，再决定实现范围）：
+
+- 分级：`media_content_restriction_index.certification_code` 已按条目存有归一化后的分级（大写，MPA/TVPG/
+  BBFC 之一），并带 `(certification_code, item_id)` 索引；Emby `OfficialRating` 字段本来就渲染这一列。
+  因此 `/OfficialRatings` 可以在 `storage` 里做一次分组聚合，不需要迁移，不需要在请求里解析 NFO 或扫全库。
+- tags：没有数据源。`LocalNfoDetails` 没有条目级 tags，`media_item_facets.kind` 只允许 `GENRE`/`STUDIO`，
+  `media_content_restriction_tags` 是 genre 的小写投影（家长控制用），不能当 Emby tags 返回。按任务约定
+  返回 200 空信封，不新增迁移、不改扫描器，也不在请求里解析 NFO。
+
+实现（新增 `src/api/emby_filter_metadata.rs`；改 `src/api/legacy.rs`、`src/api/emby.rs`、
+`src/api/emby_catalog.rs`（仅把 `EMBY_MAX_PAGE_LIMIT` 改为 `pub(super)`）、`src/application/catalog.rs`、
+`src/storage/catalog.rs`、`src/storage/mod.rs`；无迁移、不改 `/api/v1` DTO 与 `web/`）：
+
+- `GET /OfficialRatings`：新增 `CatalogService::list_official_ratings` 与
+  `Database::list_catalog_certifications`。后者复用 `catalog_filter_where_clause`（库 ACL、内容限制、
+  可见性、`IncludeItemTypes` 都在同一个谓词里），按 `certification_code` 分组计数、按代码升序分页；
+  `TotalRecordCount` 是去重后的分级个数。`ParentId` 的解析与 `/Genres` 相同（数字 id 经
+  `emby_internal_id` 还原，不可见库返回 404）。
+- 响应：与 `/Genres` 相同的信封，条目为 `{"Name": <code>, "Id": <code>, "ServerId": …}`；Emby
+  `NameIdPair` 里 `Id` 就是分级值，因此不另造合成 id。
+- `GET /Tags`：鉴权、目标用户校验与分页校验与 `/OfficialRatings` 相同，然后返回
+  `{"Items":[],"TotalRecordCount":0}`。它不读数据库，因为没有 tags 数据；媒体库 ACL 对它没有可观察的
+  作用面（响应本来就没有内容），已在 COMPATIBILITY 记录中写明。
+- 查询解析：新端点用自己的 `EmbyFilterMetadataQuery`，空的 `StartIndex=`/`Limit=` 按未提供处理（Hills 的
+  筛选面板会带空 `Limit=`），空的 `ParentId=` 按“不限媒体库”处理；非法值仍是 400。没有改动
+  `EmbyFacetsQuery`，避免与并行任务冲突。
+- 路由：在 `EmbyRouteBuilder` 里追加 `/OfficialRatings`、`/Tags` 两行；根路径、`/emby` 前缀与路径大小写
+  不敏感由既有 builder 与请求路径归一化覆盖（`/EMBY/officialratings` 有测试）。
+
+验收：
+
+- [x] `/OfficialRatings` 对同一分级去重（两条 PG-13 条目只返回一条），`TotalRecordCount` 是分级数。
+- [x] 用户看不到被限制媒体库里的分级（viewer 只看得到 Movies，不返回 Private 的 NC-17）；不可见媒体库的
+      `ParentId` 返回 404。
+- [x] 内容限制生效：MPA PG-13 的用户在同一媒体库里看不到 R 分级。
+- [x] `ParentId` 只返回该库的分级；`IncludeItemTypes=Series` 只返回剧集的分级。
+- [x] 分页：`StartIndex`/`Limit` 生效且总数不受分页影响；`Limit=`（空）按未提供处理；`Limit>1000` 与
+      `StartIndex<0` 返回 400。
+- [x] `/Tags` 返回 200 与 `{"Items":[],"TotalRecordCount":0}`（根路径、`/emby` 前缀与空参数）。
+- [x] 未鉴权两个端点都返回 401；`/EMBY/officialratings` 大小写混用可用。
+- [x] 最窄测试、fmt、clippy、`check-backend-branches.py` 通过。
+
+预计文件：`src/api/emby_filter_metadata.rs`、`src/api/legacy.rs`、`src/api/emby.rs`、
+`src/api/emby_catalog.rs`、`src/application/catalog.rs`、`src/storage/catalog.rs`、`src/storage/mod.rs`、
+`tests/emby/emby_filter_metadata.rs`、`tests/emby/main.rs`、`docs/COMPATIBILITY.md`、`docs/CHANGELOG.md`、
+`docs/LUX-DEVELOPMENT.md`、`docs/TEST-TARGETS.md`。
+
+实施结果（2026-11-06，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 验证）：按 TDD 先提交失败的
+集成测试（两个端点都是 404，断言 200/401 失败），再实现使其通过；最后 rebase 到最新的本地 `test`
+（`feb8834d`、`a7c3cdc5`）后重跑相关检查。真机抓包只确认了请求形态与旧的 404，修复后的响应没有在
+Hills 或任何第三方客户端上复测。
+
+验证命令与结果：
+
+- `cargo test --locked --test emby emby_filter_metadata::` 3/3（新增）。
+- `cargo test --locked --test emby -- --list`：46 tests / 13 个模块（本任务新增 `emby_filter_metadata`
+  3 例；`docs/TEST-TARGETS.md` 的 `--test emby` 与模块计数按此更新）。
+- `cargo fmt --all -- --check` 通过；`python3 scripts/check-backend-branches.py` 通过
+  （28 个文件、266 处，未新增 `DatabaseBackend::` 分支）。
+
+限制与剩余风险：
+
+- `/Tags` 恒空是**有意**的：Lux 没有条目级 tags 数据源。要把筛选面板的标签填上，需要先在扫描/索引侧
+  投影 tags（新迁移或扫描器改动），属于后续任务；本任务按约束没有做。
+- `/OfficialRatings` 只列出被既有投影识别为 MPA/TVPG/BBFC 的分级。NFO 里无法识别的分级字符串既不会
+  出现在 `OfficialRating` 字段，也不会出现在这个列表里；如果客户端期望列出原始字符串，需要另开任务改
+  归一化范围（会影响家长控制语义）。
+- 大媒体库上这是一次 `GROUP BY certification_code` 聚合查询，走 `idx_media_content_restriction_index_certification`
+  的索引列，但结果集大小取决于不同分级值的数量；`Limit` 上限 1000，远大于真实分级数。
+- 响应条目形态按 Emby `NameIdPair` 推断（`Name`/`Id` 都是分级值，另带 `ServerId`），没有对照真实
+  Emby 服务器的响应对拍；Hills 只读其中的名字时不受影响，若某个客户端依赖 GUID 形态的 `Id` 则需要再确认。
+- `Tags` 对不可见媒体库的 `ParentId` 不做 404（响应本来就是空的），与 `/OfficialRatings` 的 ACL 行为
+  不同；这是为了让空列表端点不额外查库，已在 COMPATIBILITY 写明。
+- 本机为 ARM64 宿主，不外推到 NAS/x86_64 的性能结论。
 
 ## 31. 参考资料
 
