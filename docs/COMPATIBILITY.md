@@ -1600,3 +1600,48 @@ Safari 的 4K HEVC 与 Edge 的 720p VP9、480p AV1、4K HEVC、10-bit H.264（a
 
 未覆盖：Firefox、iOS Safari、真实 GPU 硬件转码、长时间 HLS 稳定性、B 帧 HEVC 在 remux 模式下的时间戳回序（remux
 把 Matroska PTS 同时当 dts/cts）。测试实例对“同时播放数”有上限（超出返回 429 `RateLimited`），自动化脚本异常退出后会话需等待过期。
+
+## Emby 媒体源 id：STRM 源改发 32 位十六进制（QMediaSync / Emby302 兼容，2026-11-02）
+
+背景：QMediaSync 的 Emby302 反代（`emby302/service/emby/media.go` 的 `resolveMediaSourceId`）用
+`len(MediaSourceId) <= 32` 判定“源服务器原始 id”，否则按 `[[_]]` 解析转码合成 id，两条都不命中就报
+`MediaSourceId 格式错误`。Lux 的 `media_sources.id` 是 36 字符 UUID，因此该反代在扫码解析阶段就失败，
+并按 `proxy-error-strategy: origin` 静默回源：视频能播，但 115 直链 302 失效、媒体字节全部经反代主机中转。
+本次只改 Lux，不改第三方：把 `MediaSources[].Id` 的**线上表示**收敛到 Emby 原生的 32 位小写十六进制。
+
+### 规则
+
+- **STRM 源**（`source_kind = 'STRM_URL'`，URL/Path 型目标都算）下发 `Uuid::simple()`：内部 UUID 去横线，
+  32 位小写十六进制，与内部 UUID 互为双射，不建映射表、不迁移数据库。
+- **LOCAL_FILE 源保持内部 UUID**：它们的 id 只流经 Lux 自己的 HLS/转码路径，改形态没有收益。
+- 所有客户端输入边界统一解码回存储 UUID，两种形态都接受：`PlaybackInfo` 的 query 与 body、
+  `?MediaSourceId=`、`/Videos/{item}/{source}/stream[.ext]`、字幕 `.../Subtitles/...` 路径参数、
+  `/Items?Ids=`、`/Items/{id}` 的媒体源回查、`/Sessions/Playing` 进度回调、插件 `POST /Items/SyncMediaInfo`。
+- 签名票据仍以**内部 UUID** 计算 HMAC，只在 URL 上写公有 id：升级前签发、仍在 12 小时 TTL 内的 URL 继续有效。
+- `/Sessions` 的 `MediaSourceId` 仍是内部 UUID（只读展示，不参与任何反查；客户端若回传也会被解码）。
+
+### 风险与验收（逐条必须验证）
+
+1. **漏改入口即 404，不会静默降级。** `emby_ordered_playback_sources` 用 `?` 取匹配结果，任何未解码的入口都会让
+   PlaybackInfo 直接 404。新增/修改媒体源 id 相关代码时，必须同时改“下发”和“解析”两侧。
+2. **旧 UUID 形态必须继续可用。** 覆盖：带 UUID 的 `MediaSourceId` 查询、`/Items?Ids=<UUID>`、
+   `/Items/<UUID>` 媒体源回查、升级前签发的 `DirectStreamUrl`、`/Sessions` 回传的 UUID。
+3. **混合条目会出现两种 id 形态。** 同一部片子同时有本地版与网盘版时，`MediaSources[]` 里 32 位十六进制与 UUID
+   并存；消费方必须把 id 当不透明字符串（Emby 契约本就如此），不能按长度分支。
+4. **十进制 item id 与 32 位全数字公有 id 的歧义。** `/Items?Ids=` 同时承载 item id 与媒体源 id：十进制串优先按
+   item id 解析，媒体源查找另有原始候选兜底；32 位全数字串与某个媒体源 UUID 完全相等的概率可忽略，测试已覆盖
+   “十进制 item id 原样返回”。
+5. **HLS / 转码 / 管理 API 不变。** `/Videos/{item}/master.m3u8`、`/Videos/{item}/transcoding/...` 与
+   admin 的 `mediaSourceId` 仍使用内部 UUID，LOCAL_FILE 行为零变化。
+
+### 验证
+
+- 单元测试：`emby_public_source_id`/`emby_internal_source_id` 双射与直传兼容、STRM 与 LOCAL 的 `Id` 形态、
+  `DirectStreamUrl` 与字幕 `DeliveryUrl` 使用公有 id（`cargo test --locked --lib emby_catalog::`，48 项通过）。
+- 集成测试：`--test strm`（42 项，含用公有 id 请求 PlaybackInfo/stream/`Ids=` 以及 UUID 回归）、`--test playback`
+  （33 项）、`--test emby`（43 项）、`--test api_web`（55 项通过）。
+- 已知与本改动无关的基线失败：`api_web::remote::forwarded_headers_are_only_honoured_for_trusted_proxies`、
+  `api_web::web_playback::broken_hardware_encoder_falls_back_to_software_transcoding`、
+  `plugins::danmaku::…`、`plugins::media_info_config_api::…`（在本机未改动的基线上同样失败）。
+- 真机交接（未在本机执行）：把 Emby302 的 `proxy-error-strategy` 置为 `reject` 后播放 115 STRM，日志中不应再出现
+  `解析 MediaSource 失败 … MediaSourceId 格式错误`，反代主机网卡不应出现媒体字节流量。
