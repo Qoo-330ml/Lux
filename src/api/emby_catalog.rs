@@ -4,7 +4,7 @@ use tokio::{sync::Semaphore, task::JoinSet};
 
 const EMBY_ITEM_EXTRA_CONCURRENCY: usize = 8;
 const EMBY_SHOW_EPISODE_DEFAULT_LIMIT: i64 = EMBY_MAX_PAGE_LIMIT;
-const EMBY_MAX_PAGE_LIMIT: i64 = 1_000;
+pub(super) const EMBY_MAX_PAGE_LIMIT: i64 = 1_000;
 
 use crate::application::catalog::CatalogItemCounts;
 use crate::storage::{GLOBAL_COLLECTION_LIBRARY_ID, MediaFacetKind};
@@ -309,6 +309,32 @@ pub(super) fn normalize_emby_item_type(value: &str) -> Option<String> {
     }
 }
 
+/// Parses an Emby `IncludeItemTypes` value into normalized item types.
+///
+/// An absent or empty value means "every type". A non-empty value where nothing is recognized
+/// becomes `__NO_MATCH__`, so the filter matches no rows instead of silently dropping the
+/// restriction; a mixed value keeps only the recognized types. `/Items` and the filter-metadata
+/// endpoints share this rule so they cannot disagree.
+pub(super) fn emby_item_types_from_value(value: Option<&str>) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let raw_values = value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let normalized = raw_values
+        .iter()
+        .filter_map(|value| normalize_emby_item_type(value))
+        .collect::<Vec<_>>();
+    if raw_values.is_empty() || !normalized.is_empty() {
+        normalized
+    } else {
+        vec!["__NO_MATCH__".to_owned()]
+    }
+}
+
 pub(super) fn catalog_filter_from_values(
     item_types: Option<&str>,
     years: Option<&str>,
@@ -318,24 +344,7 @@ pub(super) fn catalog_filter_from_values(
     sort_order: Option<&str>,
     metadata_pending: bool,
 ) -> CatalogFilter {
-    let item_types = item_types
-        .map(|values| {
-            let raw_values = values
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .collect::<Vec<_>>();
-            let normalized = raw_values
-                .iter()
-                .filter_map(|value| normalize_emby_item_type(value))
-                .collect::<Vec<_>>();
-            if raw_values.is_empty() || !normalized.is_empty() {
-                normalized
-            } else {
-                vec!["__NO_MATCH__".to_owned()]
-            }
-        })
-        .unwrap_or_default();
+    let item_types = emby_item_types_from_value(item_types);
     let years = years
         .map(|values| {
             values

@@ -90,6 +90,8 @@ pub(super) fn api_routes() -> (Router<ReadyAppState>, Vec<String>) {
         .route("/Genres", get(emby_genres))
         .route("/Studios", get(emby_studios))
         .route("/Years", get(emby_years))
+        .route("/OfficialRatings", get(emby_official_ratings))
+        .route("/Tags", get(emby_tags))
         .route("/Persons/{person_id}", get(emby_person))
         .route(
             "/Users/{user_id}",

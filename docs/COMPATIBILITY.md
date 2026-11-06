@@ -1,5 +1,51 @@
 # Lux 客户端兼容性矩阵
 
+## LUX-890 Emby `GET /Tags` 与 `GET /OfficialRatings`（2026-11-06）
+
+证据等级：**请求形态为真机抓包确认，响应形态为静态推断**。Hills 1.11.0 打开媒体库筛选面板时实抓
+`GET /Tags`、`GET /OfficialRatings`，当时 Lux 对两者都返回 404 空响应，筛选列表为空
+（`docs/reviews/2026-11-06-hills-yamby-capture.md`）。本次修复后的响应**没有**在 Hills 或任何第三方
+Emby 客户端上复测；`Items[]` 的 `Name`/`Id` 形状按 Emby `NameIdPair` 约定推断，Lux 侧只用自动化测试
+固定服务端合同。Yamby 本次抓包未观察到这两个请求。
+
+- `GET /OfficialRatings`：从 `media_content_restriction_index.certification_code` 聚合当前用户可见范围内
+  去重后的**归一化分级码子集**（内容限制索引识别的 MPA/TVPG/BBFC 码），按分级代码升序返回。
+  `ParentId`（媒体库）、`StartIndex`/`Limit` 与服务端上限与其他 facet 端点一致，`ParentId` 是不可见
+  媒体库时返回 404。`IncludeItemTypes` 与其他 facet 端点**不同**：本端点整组无法识别时返回空列表（与
+  `/Items` 一致），而 `/Genres`、`/Studios`、`/Years` 仍用旧的内联解析、全无效时会退化成“不过滤”，
+  待后续任务对齐。响应信封与 `/Genres` 相同：
+  `{"Items":[{"Name":"PG-13","Id":"PG-13","ServerId":…}],"TotalRecordCount":n,"StartIndex":n}`；`Id` 就是
+  分级值。
+- 与 `OfficialRating` 字段的关系：**不是同一份值**。条目 `OfficialRating` 输出 NFO 原文（可能是
+  `Rated R`、`FSK 16`、`US:PG-13`），而这个列表只包含被内容限制索引识别的归一化码：无法识别的分级不
+  出现，识别出的分级也可能与原文写法不同（例如 NFO 的 `Rated R` 在这里是 `R`）。没有 NFO 分级的条目
+  不会贡献 facet。这不是本任务新增的过滤，是既有投影的取值范围的直接结果。
+- 内容限制：非管理员用户的分级列表与 `/Items` 使用同一条内容限制谓词，超出 `maximum_rating` 的条目连同
+  其分级一起被排除；管理员不受内容限制（与既有列表一致）。库 ACL 与内容限制同时生效。
+- `GET /Tags`：**目前恒返回 200 与 `{"Items":[],"TotalRecordCount":0}`**，不再是 404，筛选面板显示空
+  列表而不是请求失败。`ParentId` 的库权限与 `/OfficialRatings` 一样校验：非空 `ParentId` 指向未知或用户
+  不可见的媒体库时返回 404，空 `ParentId=` 按“不限媒体库”处理；以后给 Tags 填数据源时不会留下越权入口。
+  **Tags 目前恒空，原因是无数据源，仍待后续任务填充**：NFO 解析结果里没有条目级
+  `<tag>`，`media_item_facets` 只有 `GENRE`/`STUDIO` 两种 kind，`media_content_restriction_tags` 存的是
+  **小写 genre**（家长控制用的投影），不能当作 Emby tags 返回。按任务约束没有新增迁移、没有扫描器改动、
+  也没有在请求里解析 NFO；`Fields=TagItems` 的现有行为不变。
+- 鉴权与路径：两个端点都要求 Emby token/API key（未鉴权 401），同时支持根路径与 `/emby` 前缀；路由走
+  既有 `EmbyRouteBuilder`，因此 `/emby` 前缀与路径大小写不敏感的行为自动一致
+  （`/EMBY/officialratings` 有测试覆盖）。
+- 分页：`Limit` 默认 50（`Limit<=0` 也按默认 50 处理，与 `/Genres` 一致）、服务端上限 1000；
+  `Limit>1000` 或 `StartIndex<0` 返回 400；空的 `StartIndex=`/`Limit=` 按未提供处理（Hills 的筛选面板
+  会带空 `Limit=`；与 LUX-888 的共享 `deserialize_optional_i64` 同一实现），空的 `ParentId=` 按
+  “不限媒体库”处理。
+- `IncludeItemTypes`：与 `/Items` 使用同一份解析规则（`emby_item_types_from_value`）。整组都无法识别时
+  返回空列表（200 空信封），不会退化成“不过滤”的全量结果；混合有效与无效类型时只按有效类型过滤。
+  `/Genres`、`/Studios`、`/Years` 仍是旧的内联解析，全无效时会退化成不过滤，待后续任务对齐。
+- `Recursive` 被接受但不改变结果：与其他 facet 端点一样，分级聚合始终覆盖所选库/类型的全部可见条目。
+- **剩余缺口**：分级目前只能列出，不能用于 `/Items` 筛选——`/Items` 不接受 `OfficialRatings=` 参数，
+  所以在筛选面板里选中某个分级不会改变列表。对应后续任务待立项，本任务没有改 `/Items` 过滤。
+- 自动化：`cargo test --locked --test emby emby_filter_metadata::`（3 例）覆盖去重、库 ACL、内容限制、
+  `ParentId`、`IncludeItemTypes`（有效/全无效/混合）、分页与上限、空 `Limit=` 与 `Limit=0`、未鉴权 401、
+  根路径/`/emby`/大小写混用与 `Tags` 空信封。
+
 ## LUX-888 Emby 查询端点容忍空的可选数值/布尔参数（2026-11-06）
 
 分级：**真机抓包确认（仅“空 `Limit=` 会 400”这一条）+ 其余静态推断**。
@@ -168,7 +214,7 @@ Lux 侧改动（`src/api/emby_catalog.rs`、`src/application/probe.rs`，无迁�
 
 - 新增 `GET /Genres`、`/Studios`、`/Years`（同样挂在 `/emby` 前缀下，路径大小写不敏感）。需要 Emby token，按用户的媒体库权限和内容限制收窄；支持 `UserId`、`ParentId`（仅媒体库 ID，未授权或未知返回 404）、`IncludeItemTypes`、`StartIndex`、`Limit`（上限与 `/Persons` 相同，超限 400）。返回 `{ Items, TotalRecordCount, StartIndex }`，每项含 `Name`、不透明的 `Id`、`Type`（`Genre`/`Studio`/`Year`）和 `ChildCount`（可见条目数）；`Genres`、`Studios` 按名称排序，`Years` 由新到旧。
 - `GET /Items`、`/Users/{id}/Items` 新增 `Genres`、`Studios` 筛选，值用 `|` 分隔、任一命中即匹配，大小写不敏感，最多 32 个值。`Years` 参数原本就支持。
-- **未实现**：`/Tags`（NFO 缓存里没有 tags 数据，未新增解析）；`GenreIds`、`StudioIds` 按 ID 筛选（`Id` 仅是稳定的不透明值，客户端请用 `Genres`/`Studios` 名称筛选）；Genres/Studios 的图片。
+- **后续修订（LUX-890）**：`/Tags` 返回 200 空列表（无数据源，待后续投影填充）；`/OfficialRatings` 已实现（归一化分级码子集）。仍**未实现**：`GenreIds`、`StudioIds` 按 ID 筛选（`Id` 仅是稳定的不透明值，客户端请用 `Genres`/`Studios` 名称筛选）；Genres/Studios 的图片。
 - 数据来源：迁移 `0245`/`0247` 新增 `media_item_facets(item_id, kind, name_key, name)`，由内容限制索引 worker 从同一份 NFO 快照写入，NFO 变化后经既有队列重建。请求路径只读该表，不解析 NFO、不扫库。升级时迁移会把所有存量条目重新入队，回填在后台分批完成；回填完成前 `/Genres`、`/Studios` 与 `Genres`/`Studios` 筛选只覆盖已索引的条目。回填会重写内容限制索引行，并触发一次 catalog outbox 更新。
 - 验证：`cargo test --locked --test emby emby_facets::`；`cargo test --locked --lib content_restriction_index`。
 

@@ -23,8 +23,8 @@ use crate::{
         CatalogFilterQuery, CatalogSearchQuery, CatalogSort as StorageCatalogSort, Database,
         GLOBAL_COLLECTION_LIBRARY_ID, MediaFacetKind, RecentByLibraryReadModelQuery,
         RecentReadModelQuery, ResumeItemsQuery, ResumePointerQuery, ResumeThresholds, StorageError,
-        StoredCatalogDetail, StoredCatalogRow, StoredMediaChapter, StoredMediaFacet,
-        UserContentRestrictions, WatchHistoryQuery,
+        StoredCatalogDetail, StoredCatalogRow, StoredMediaCertification, StoredMediaChapter,
+        StoredMediaFacet, UserContentRestrictions, WatchHistoryQuery,
     },
 };
 
@@ -1395,8 +1395,30 @@ impl CatalogService {
         }
     }
 
-    /// Distinct genres or studios (`kind`) or production years (`None`) visible to `principal`, optionally narrowed to one library and
-    /// to item types. Served from the `media_item_facets` projection.
+    /// Resolves an optional library scope for a request.
+    ///
+    /// `None` means every library `principal` can open; a `Some(id)` that is unknown or not
+    /// accessible is answered as not found, so callers cannot use a filter parameter to reach a
+    /// library the user cannot see. Shared by the facet, year and official-rating reads and by the
+    /// `/Tags` route, which has no data yet but must not become an ACL shortcut once it does.
+    pub(crate) async fn library_scope_for_principal(
+        &self,
+        principal: AccessPrincipal,
+        library_id: Option<&str>,
+    ) -> Result<Vec<String>, CatalogError> {
+        let accessible = self.access.accessible_library_ids(principal).await?;
+        match library_id {
+            Some(library_id) if accessible.iter().any(|id| id == library_id) => {
+                Ok(vec![library_id.to_owned()])
+            }
+            Some(_) => Err(CatalogError::LibraryNotFound),
+            None => Ok(accessible),
+        }
+    }
+
+    /// Distinct genres or studios (`kind`) or production years (`None`) visible to `principal`,
+    /// optionally narrowed to one library and to item types. Served from the `media_item_facets`
+    /// projection.
     pub(crate) async fn list_facets(
         &self,
         principal: AccessPrincipal,
@@ -1406,14 +1428,9 @@ impl CatalogService {
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<StoredMediaFacet>, i64), CatalogError> {
-        let accessible = self.access.accessible_library_ids(principal).await?;
-        let library_ids = match library_id {
-            Some(library_id) if accessible.iter().any(|id| id == library_id) => {
-                vec![library_id.to_owned()]
-            }
-            Some(_) => return Err(CatalogError::LibraryNotFound),
-            None => accessible,
-        };
+        let library_ids = self
+            .library_scope_for_principal(principal, library_id)
+            .await?;
         let user_id = principal.user_id_string();
         let content_restrictions = if principal.is_admin {
             None
@@ -1458,6 +1475,58 @@ impl CatalogService {
                     .await?
             }
         })
+    }
+
+    /// Distinct official rating codes visible to `principal`, optionally narrowed to one library
+    /// and to item types. Served from the content restriction index, which already stores the
+    /// normalized certification code of each item.
+    pub(crate) async fn list_official_ratings(
+        &self,
+        principal: AccessPrincipal,
+        library_id: Option<&str>,
+        item_types: &[String],
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredMediaCertification>, i64), CatalogError> {
+        let library_ids = self
+            .library_scope_for_principal(principal, library_id)
+            .await?;
+        let user_id = principal.user_id_string();
+        let content_restrictions = if principal.is_admin {
+            None
+        } else {
+            self.database.user_content_restrictions(&user_id).await?
+        };
+        let no_values: [String; 0] = [];
+        let query = CatalogFilterQuery {
+            library_ids: &library_ids,
+            user_id: &user_id,
+            item_types,
+            excluded_item_types: &no_values,
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            provider_id_equals: None,
+            years: &[],
+            genre_keys: &no_values,
+            studio_keys: &no_values,
+            is_played: None,
+            is_favorite: None,
+            is_resumable: None,
+            min_date_last_saved: None,
+            metadata_pending: false,
+            parent_id_scope: None,
+            content_restrictions: content_restrictions.as_ref(),
+            sort_by: StorageCatalogSort::Name,
+            descending: false,
+            offset,
+            limit,
+            include_total: true,
+        };
+        Ok(self
+            .database
+            .list_catalog_certifications(&query, offset, limit)
+            .await?)
     }
 
     pub async fn list_all_items_filtered(

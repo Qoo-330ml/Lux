@@ -1,0 +1,166 @@
+//! Emby filter-panel metadata: `GET /OfficialRatings` and `GET /Tags`.
+//!
+//! Hills requests both endpoints when it opens a library filter panel, with the same query shape
+//! as `/Genres` (`UserId`, `ParentId`, `Recursive`, `IncludeItemTypes`, `StartIndex`, `Limit`) and
+//! the same `{"Items": [...], "TotalRecordCount": n}` envelope.
+//!
+//! `OfficialRatings` lists the subset of rating codes the content-restriction index recognized
+//! (normalized MPA/TVPG/BBFC codes). The index is filled from NFO metadata in the background, so a
+//! request never parses NFO JSON. These values are **not** the raw NFO certification the Emby
+//! `OfficialRating` field renders: an unrecognized rating does not appear at all, and a recognized
+//! one may be spelled differently (an NFO `Rated R` is listed as `R`). `Tags` has no stored data
+//! source yet: item tags are not parsed from NFO and there is no `TAG` facet kind, so the endpoint
+//! answers an empty envelope instead of `404` (an empty filter list rather than a failed request).
+//! It stays empty until a later task adds a tag projection.
+
+use super::*;
+
+/// Query of the Emby filter-panel metadata endpoints.
+///
+/// `StartIndex=`/`Limit=` reuse the shared `deserialize_optional_i64`, so an empty or
+/// whitespace-only value counts as absent (Hills sends `Limit=` on filter-panel requests) while a
+/// malformed non-empty value still answers `400`.
+#[derive(Deserialize, Default)]
+pub(super) struct EmbyFilterMetadataQuery {
+    #[serde(flatten)]
+    pub(super) auth: EmbyTokenQuery,
+    #[serde(rename = "UserId", alias = "userId", alias = "userid", default)]
+    pub(super) user_id: Option<String>,
+    #[serde(rename = "ParentId", alias = "parentId", default)]
+    pub(super) parent_id: Option<String>,
+    #[serde(rename = "IncludeItemTypes", alias = "includeItemTypes", default)]
+    pub(super) include_item_types: Option<String>,
+    #[serde(
+        rename = "StartIndex",
+        alias = "startIndex",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
+    pub(super) start_index: Option<i64>,
+    #[serde(
+        rename = "Limit",
+        alias = "limit",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
+    pub(super) limit: Option<i64>,
+}
+
+/// The page window both endpoints share; `EMBY_MAX_PAGE_LIMIT` is the server-side upper bound.
+fn emby_filter_metadata_page(query: &EmbyFilterMetadataQuery) -> Result<(i64, i64), StatusCode> {
+    let offset = query.start_index.unwrap_or(0);
+    let limit = match query.limit {
+        Some(value) if value > 0 => value,
+        _ => 50,
+    };
+    if offset < 0 || !(1..=EMBY_MAX_PAGE_LIMIT).contains(&limit) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok((offset, limit))
+}
+
+/// `ParentId=` (Hills sends an empty value on some filter-panel requests) means "no library
+/// filter", not "the empty id".
+fn emby_filter_metadata_parent_id(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(emby_internal_id)
+}
+
+pub(super) async fn emby_official_ratings(
+    headers: HeaderMap,
+    Query(query): Query<EmbyFilterMetadataQuery>,
+    State(state): State<ReadyAppState>,
+) -> Response {
+    let auth_principal =
+        match require_emby_principal_with_query(&headers, &state, &query.auth).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, query.user_id.as_deref())
+            .await
+        {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let (offset, limit) = match emby_filter_metadata_page(&query) {
+        Ok(page) => page,
+        Err(status) => return status.into_response(),
+    };
+    // Reuses the `/Items` rule: an entirely unrecognized list matches nothing instead of
+    // silently dropping the restriction.
+    let item_types = emby_item_types_from_value(query.include_item_types.as_deref());
+    let parent_id = emby_filter_metadata_parent_id(query.parent_id.as_deref());
+    let result = state
+        .catalog()
+        .list_official_ratings(principal, parent_id.as_deref(), &item_types, offset, limit)
+        .await;
+    let (ratings, total) = match result {
+        Ok(result) => result,
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(CatalogError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    Json(json!({
+        "Items": ratings
+            .into_iter()
+            .map(|rating| {
+                json!({
+                    "Name": rating.certification_code,
+                    "Id": rating.certification_code,
+                    "ServerId": state.server_id,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "TotalRecordCount": total,
+        "StartIndex": offset,
+    }))
+    .into_response()
+}
+
+pub(super) async fn emby_tags(
+    headers: HeaderMap,
+    Query(query): Query<EmbyFilterMetadataQuery>,
+    State(state): State<ReadyAppState>,
+) -> Response {
+    let auth_principal =
+        match require_emby_principal_with_query(&headers, &state, &query.auth).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, query.user_id.as_deref())
+            .await
+        {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let (offset, _limit) = match emby_filter_metadata_page(&query) {
+        Ok(page) => page,
+        Err(status) => return status.into_response(),
+    };
+    // `Tags` has no data source yet, but a non-empty `ParentId` is still resolved exactly like
+    // `/OfficialRatings`: an unknown or inaccessible library answers 404. Filling this endpoint
+    // later must not turn the empty answer into an ACL shortcut.
+    let parent_id = emby_filter_metadata_parent_id(query.parent_id.as_deref());
+    match state
+        .catalog()
+        .library_scope_for_principal(principal, parent_id.as_deref())
+        .await
+    {
+        Ok(_) => {}
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(CatalogError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+    Json(json!({
+        "Items": Vec::<Value>::new(),
+        "TotalRecordCount": 0,
+        "StartIndex": offset,
+    }))
+    .into_response()
+}
