@@ -20242,10 +20242,14 @@ Hills 或任何第三方客户端上复测。
 验证命令与结果：
 
 - `cargo test --locked --test emby emby_filter_metadata::` 3/3（新增）。
+- `cargo test --locked --test emby emby_facets::` 1/1；rebase 后 `cargo test --locked --test emby`
+  整个分组 46/46 通过。
 - `cargo test --locked --test emby -- --list`：46 tests / 13 个模块（本任务新增 `emby_filter_metadata`
   3 例；`docs/TEST-TARGETS.md` 的 `--test emby` 与模块计数按此更新）。
-- `cargo fmt --all -- --check` 通过；`python3 scripts/check-backend-branches.py` 通过
-  （28 个文件、266 处，未新增 `DatabaseBackend::` 分支）。
+- `cargo fmt --all -- --check` 通过。
+- `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过（0 警告），并对
+  `cargo clippy --locked --test emby -- -D warnings` 单独确认新增测试目标无警告。
+- `python3 scripts/check-backend-branches.py` 通过（28 个文件、266 处，未新增 `DatabaseBackend::` 分支）。
 
 限制与剩余风险：
 
