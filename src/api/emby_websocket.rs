@@ -14,318 +14,35 @@
 
 use super::*;
 
-use std::collections::HashMap;
+use crate::api::websocket::{
+    CLOSE_GOING_AWAY, CLOSE_NORMAL, CLOSE_POLICY_VIOLATION, WebsocketConnections, WebsocketPermit,
+    WebsocketShutdown, payload_fits, send_bounded, utf8_close,
+};
 
-use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
-use tokio::sync::{Semaphore, watch};
+use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
+use tokio::sync::watch;
 use tokio::time::Instant;
 
-/// Upper bound on concurrently open `/embywebsocket` connections for the whole process.
-pub(crate) const MAX_EMBY_WEBSOCKET_CONNECTIONS: usize = 32;
-/// Upper bound on concurrently open `/embywebsocket` connections for a single account.
-pub(crate) const MAX_EMBY_WEBSOCKET_CONNECTIONS_PER_USER: usize = 4;
-/// Largest inbound frame accepted. Emby clients only send small JSON control messages.
-pub(crate) const MAX_EMBY_WEBSOCKET_MESSAGE_BYTES: usize = 8 * 1024;
-/// Lower bound a client-requested poll interval is clamped to.
-pub(crate) const MIN_EMBY_WEBSOCKET_INTERVAL: Duration = Duration::from_secs(1);
-/// Upper bound a client-requested poll interval is clamped to.
-pub(crate) const MAX_EMBY_WEBSOCKET_INTERVAL: Duration = Duration::from_secs(60);
-/// A connection that sends nothing (not even a pong) for this long is closed.
-pub(crate) const EMBY_WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-/// Interval of the server-side ping that makes the idle timeout observable.
-pub(crate) const EMBY_WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 /// How long a graceful shutdown waits for the open connections to finish closing.
 pub(crate) const EMBY_WEBSOCKET_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-/// Initial capacity of a connection's write buffer. It is only a capacity hint: a single message
-/// larger than this is buffered up to [`EMBY_WEBSOCKET_MAX_WRITE_BUFFER_BYTES`] before it is
-/// flushed, so this value must never be used as a document limit.
-pub(crate) const EMBY_WEBSOCKET_WRITE_BUFFER_BYTES: usize = 16 * 1024;
-/// Hard cap of a connection's write buffer, and therefore the largest document one push may have.
-///
-/// A `Sessions` document grows with the listed sessions
-/// (`MAX_LISTED_PLAYBACK_SESSIONS = 500` in `src/storage/sessions.rs`). One session entry measures
-/// about 1.3-1.5 KiB with `NowPlayingItem`, `PlayState` and `TranscodingInfo`, so the worst case is
-/// roughly 500 x 1.5 KiB = 750 KiB. 4 MiB leaves more than five times that headroom, so a busy
-/// server never hits the cap, while a peer that stops reading still cannot grow the buffer past a
-/// few MiB. Anything larger than the cap is skipped (see `payload_fits`) instead of closing the
-/// connection, because Yamby reconnects without backoff.
-pub(crate) const EMBY_WEBSOCKET_MAX_WRITE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
-/// Upper bound of the configurable initial write-buffer capacity. It is only a hint, so a
-/// misconfigured override must not allocate a huge buffer per connection up front, and it must
-/// stay below the hard cap by at least one byte (tungstenite asserts a strict inequality).
-pub(crate) const EMBY_WEBSOCKET_WRITE_BUFFER_BYTES_LIMIT: usize = 1024 * 1024;
-/// Bytes reserved for the WebSocket framing of one outbound message.
-///
-/// tungstenite charges `frame.len()` (payload **plus** header) against
-/// `max_write_buffer_size`, and a control frame (a pong answered by the runtime, or a ping we just
-/// queued) can occupy the same buffer. A server-to-client frame uses 2 header bytes up to 125
-/// payload bytes, 4 up to 65535 and 10 beyond that; 16 covers the largest header plus a small
-/// control frame, so a payload that passes [`payload_fits`] can never make `start_send` fail with
-/// `WriteBufferFull` and close the connection.
-pub(crate) const EMBY_WEBSOCKET_FRAME_HEADER_BYTES: usize = 16;
-/// Hard ceiling of the configurable connection budget. The default is 32; a thousand connections
-/// already exceed any realistic deployment's descriptor and buffer budget, and
-/// `Semaphore::MAX_PERMITS` (2^61-1) is not a limit an operator should be able to request.
-pub(crate) const EMBY_WEBSOCKET_MAX_CONNECTIONS_LIMIT: usize = 1024;
-/// Hard ceiling of every configurable duration. `Instant::now() + Duration` panics when the sum
-/// leaves the platform's `Instant` range, and that arithmetic runs inside the connection task, so
-/// an override must stay far below the limit; 24 h is already longer than any state this endpoint
-/// keeps (the idle timeout is 120 s).
-pub(crate) const EMBY_WEBSOCKET_MAX_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
-/// A single send that cannot complete within this bound closes the connection. It is far below
-/// the idle timeout so a stalled reader is reaped before the idle deadline would fire.
-pub(crate) const EMBY_WEBSOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(10);
-/// Token revalidation that runs even when no push stream is active, so `SessionsStop` cannot keep
-/// a revoked token (or a disabled remote-access policy) alive.
-pub(crate) const EMBY_WEBSOCKET_REVALIDATE_INTERVAL: Duration = Duration::from_secs(45);
-/// Minimum spacing of the "revalidation unavailable" warnings of one connection.
-pub(crate) const EMBY_WEBSOCKET_AUTH_WARN_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Close code of a WebSocket policy violation (RFC 6455 §7.4.1).
-const CLOSE_POLICY_VIOLATION: u16 = 1008;
-/// Close code of an endpoint that is going away.
-const CLOSE_GOING_AWAY: u16 = 1001;
-/// Close code of a normal closure.
-const CLOSE_NORMAL: u16 = 1000;
 
 /// The reply to `KeepAlive`.
 const KEEP_ALIVE_REPLY: &str = r#"{"MessageType":"KeepAlive"}"#;
 
-/// Resource limits of the endpoint. The tests shrink them so a limit is observable in production
-/// time; the defaults are the constants above.
-#[derive(Clone, Debug)]
-pub struct EmbyWebsocketLimits {
-    /// Concurrent connections for the whole process.
-    pub max_connections: usize,
-    /// Concurrent connections for one account.
-    pub max_connections_per_user: usize,
-    /// Lower bound of the poll interval a client may request.
-    pub min_interval: Duration,
-    /// Upper bound of the poll interval a client may request.
-    pub max_interval: Duration,
-    /// Largest inbound frame accepted.
-    pub max_message_bytes: usize,
-    /// A connection without any inbound frame for this long is closed.
-    pub idle_timeout: Duration,
-    /// Server-side ping interval.
-    pub heartbeat_interval: Duration,
-    /// Initial capacity of the WebSocket write buffer.
-    pub write_buffer_bytes: usize,
-    /// Hard cap of the WebSocket write buffer; a send that would exceed it fails.
-    pub max_write_buffer_bytes: usize,
-    /// A single send that cannot complete within this bound closes the connection.
-    pub send_timeout: Duration,
-    /// Token revalidation that does not depend on an active push stream.
-    pub revalidate_interval: Duration,
-    /// Minimum spacing of the revalidation warnings of one connection.
-    pub auth_warn_interval: Duration,
-}
-
-impl Default for EmbyWebsocketLimits {
-    fn default() -> Self {
-        Self {
-            max_connections: MAX_EMBY_WEBSOCKET_CONNECTIONS,
-            max_connections_per_user: MAX_EMBY_WEBSOCKET_CONNECTIONS_PER_USER,
-            min_interval: MIN_EMBY_WEBSOCKET_INTERVAL,
-            max_interval: MAX_EMBY_WEBSOCKET_INTERVAL,
-            max_message_bytes: MAX_EMBY_WEBSOCKET_MESSAGE_BYTES,
-            idle_timeout: EMBY_WEBSOCKET_IDLE_TIMEOUT,
-            heartbeat_interval: EMBY_WEBSOCKET_HEARTBEAT_INTERVAL,
-            write_buffer_bytes: EMBY_WEBSOCKET_WRITE_BUFFER_BYTES,
-            max_write_buffer_bytes: EMBY_WEBSOCKET_MAX_WRITE_BUFFER_BYTES,
-            send_timeout: EMBY_WEBSOCKET_SEND_TIMEOUT,
-            revalidate_interval: EMBY_WEBSOCKET_REVALIDATE_INTERVAL,
-            auth_warn_interval: EMBY_WEBSOCKET_AUTH_WARN_INTERVAL,
-        }
-    }
-}
-
-impl EmbyWebsocketLimits {
-    /// Keeps an override from creating an unusable schedule (no `min > max`, no zero-duration
-    /// wake-up loop). A zero `max_connections` stays zero: it is a legal "refuse everything"
-    /// configuration.
-    fn normalized(mut self) -> Self {
-        self.min_interval = self.min_interval.max(Duration::from_millis(10));
-        self.max_interval = self.max_interval.max(self.min_interval);
-        self.heartbeat_interval = self.heartbeat_interval.max(Duration::from_millis(10));
-        self.idle_timeout = self.idle_timeout.max(self.heartbeat_interval);
-        self.max_message_bytes = self.max_message_bytes.max(1024);
-        // Every override is public API, so an extreme value must be normalised instead of panicking
-        // inside the connection task: `Semaphore::new` panics above `MAX_PERMITS`, and
-        // `Instant::now() + duration` panics for a duration near the platform maximum.
-        self.max_connections = self
-            .max_connections
-            .min(EMBY_WEBSOCKET_MAX_CONNECTIONS_LIMIT)
-            .min(Semaphore::MAX_PERMITS);
-        self.max_connections_per_user = self
-            .max_connections_per_user
-            .min(EMBY_WEBSOCKET_MAX_CONNECTIONS_LIMIT);
-        self.min_interval = self
-            .min_interval
-            .clamp(Duration::from_millis(10), EMBY_WEBSOCKET_MAX_DURATION);
-        self.max_interval = self
-            .max_interval
-            .clamp(self.min_interval, EMBY_WEBSOCKET_MAX_DURATION);
-        self.heartbeat_interval = self
-            .heartbeat_interval
-            .clamp(Duration::from_millis(10), EMBY_WEBSOCKET_MAX_DURATION);
-        self.idle_timeout = self
-            .idle_timeout
-            .clamp(self.heartbeat_interval, EMBY_WEBSOCKET_MAX_DURATION);
-        self.send_timeout = self
-            .send_timeout
-            .clamp(Duration::from_millis(10), EMBY_WEBSOCKET_MAX_DURATION);
-        self.revalidate_interval = self
-            .revalidate_interval
-            .clamp(Duration::from_millis(10), EMBY_WEBSOCKET_MAX_DURATION);
-        self.auth_warn_interval = self
-            .auth_warn_interval
-            .clamp(Duration::from_millis(10), EMBY_WEBSOCKET_MAX_DURATION);
-        // tungstenite asserts `max_write_buffer_size > write_buffer_size` right after the upgrade
-        // (`WebSocketConfig::assert_valid`), and that assert runs inside the connection task: an
-        // equal or smaller cap would panic there instead of failing the handshake. The initial
-        // capacity is clamped so the strict inequality is always reachable, including for
-        // `usize::MAX` overrides (saturating add keeps the arithmetic defined).
-        self.write_buffer_bytes = self
-            .write_buffer_bytes
-            .clamp(1024, EMBY_WEBSOCKET_WRITE_BUFFER_BYTES_LIMIT);
-        self.max_write_buffer_bytes = self
-            .max_write_buffer_bytes
-            .max(self.write_buffer_bytes.saturating_add(1));
-        self.send_timeout = self.send_timeout.max(Duration::from_millis(10));
-        self.revalidate_interval = self.revalidate_interval.max(Duration::from_millis(10));
-        self.auth_warn_interval = self.auth_warn_interval.max(Duration::from_millis(10));
-        self
-    }
-}
-
-/// The connection budget: one global semaphore plus a per-account counter.
-#[derive(Clone)]
-pub(crate) struct EmbyWebsocketConnections {
-    inner: Arc<EmbyWebsocketConnectionState>,
-}
-
-struct EmbyWebsocketConnectionState {
-    limits: EmbyWebsocketLimits,
-    total: Arc<Semaphore>,
-    per_user: std::sync::Mutex<HashMap<String, usize>>,
-}
-
-impl Default for EmbyWebsocketConnections {
-    fn default() -> Self {
-        Self::new(EmbyWebsocketLimits::default())
-    }
-}
-
-impl EmbyWebsocketConnections {
-    pub(crate) fn new(limits: EmbyWebsocketLimits) -> Self {
-        let limits = limits.normalized();
-        let total = Arc::new(Semaphore::new(limits.max_connections));
-        Self {
-            inner: Arc::new(EmbyWebsocketConnectionState {
-                limits,
-                total,
-                per_user: std::sync::Mutex::new(HashMap::new()),
-            }),
-        }
-    }
-
-    pub(crate) fn limits(&self) -> &EmbyWebsocketLimits {
-        &self.inner.limits
-    }
-
-    /// Takes one connection slot or answers `None` when a limit is reached. Both limits are
-    /// checked before the handshake completes, so a rejected client never sees a `101`.
-    pub(crate) fn try_acquire(&self, user_key: &str) -> Option<EmbyWebsocketPermit> {
-        let total = self.inner.total.clone().try_acquire_owned().ok()?;
-        let mut per_user = self
-            .inner
-            .per_user
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let count = per_user.entry(user_key.to_owned()).or_insert(0);
-        if *count >= self.inner.limits.max_connections_per_user {
-            return None;
-        }
-        *count += 1;
-        drop(per_user);
-        Some(EmbyWebsocketPermit {
-            _total: total,
-            connections: self.clone(),
-            user_key: user_key.to_owned(),
-        })
-    }
-
-    /// Waits until every connection released its slot. The graceful shutdown uses it so the
-    /// database is not closed under a connection that is still building a payload.
-    pub(crate) async fn wait_until_idle(&self, timeout: Duration) -> bool {
-        let Ok(capacity) = u32::try_from(self.inner.limits.max_connections) else {
-            return false;
-        };
-        if capacity == 0 {
-            return true;
-        }
-        tokio::time::timeout(timeout, self.inner.total.acquire_many(capacity))
-            .await
-            .is_ok()
-    }
-}
-
-/// Holds one connection slot; the per-account count is decremented when it is dropped, which is
-/// what keeps an abandoned connection from leaking capacity.
-pub(crate) struct EmbyWebsocketPermit {
-    _total: tokio::sync::OwnedSemaphorePermit,
-    connections: EmbyWebsocketConnections,
-    user_key: String,
-}
-
-impl Drop for EmbyWebsocketPermit {
-    fn drop(&mut self) {
-        let mut per_user = self
-            .connections
-            .inner
-            .per_user
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(count) = per_user.get_mut(&self.user_key) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                per_user.remove(&self.user_key);
-            }
-        }
-    }
-}
-
-/// The shutdown broadcast every open connection watches.
-#[derive(Clone)]
-pub(crate) struct EmbyWebsocketShutdown {
-    sender: watch::Sender<bool>,
-}
-
-impl Default for EmbyWebsocketShutdown {
-    fn default() -> Self {
-        Self {
-            sender: watch::channel(false).0,
-        }
-    }
-}
-
-impl EmbyWebsocketShutdown {
-    pub(crate) fn signal(&self) {
-        self.sender.send_replace(true);
-    }
-
-    pub(crate) fn subscribe(&self) -> watch::Receiver<bool> {
-        self.sender.subscribe()
-    }
-}
+/// Resource limits of the endpoint, taken from the shared `WebsocketLimits` (ADR-054 D9).
+///
+/// `EmbyWebsocketLimits` is the name LUX-891 published, so every caller and the tests keep using
+/// it; the type itself is shared with the other realtime channels, which reuse the same clamping
+/// rules. The defaults are the Emby deployment values (32 connections / 4 per user) unless an
+/// endpoint injects its own limits.
+pub use crate::api::websocket::WebsocketLimits as EmbyWebsocketLimits;
 
 impl CoreState {
-    pub(crate) fn emby_websocket_connections(&self) -> &EmbyWebsocketConnections {
+    pub(crate) fn emby_websocket_connections(&self) -> &WebsocketConnections {
         &self.emby_websocket_connections
     }
 
-    pub(crate) fn emby_websocket_shutdown(&self) -> &EmbyWebsocketShutdown {
+    pub(crate) fn emby_websocket_shutdown(&self) -> &WebsocketShutdown {
         &self.emby_websocket_shutdown
     }
 }
@@ -393,7 +110,7 @@ struct ConnectionContext {
     can_manage_server: bool,
     limits: EmbyWebsocketLimits,
     shutdown: watch::Receiver<bool>,
-    permit: EmbyWebsocketPermit,
+    permit: WebsocketPermit,
 }
 
 /// One active push plan: the next push and the interval between pushes.
@@ -507,33 +224,6 @@ fn warn_revalidation_unavailable(
         status = status.as_u16(),
         "emby websocket token revalidation is unavailable; keeping the connection"
     );
-}
-
-/// Runs one send under a hard time bound. Returns `false` when the peer is too slow (or the
-/// socket is broken), which is the caller's signal to close the connection.
-async fn bounded<F>(send: F, timeout: Duration) -> bool
-where
-    F: std::future::Future<Output = Result<(), axum::Error>>,
-{
-    matches!(tokio::time::timeout(timeout, send).await, Ok(Ok(())))
-}
-
-async fn send_bounded(socket: &mut WebSocket, message: Message, timeout: Duration) -> bool {
-    bounded(socket.send(message), timeout).await
-}
-
-/// Whether one serialized document fits into the write buffer.
-///
-/// A document at or above the cap would make tungstenite reject the frame (`WriteBufferFull`) and
-/// force the connection to close, so the push is skipped instead: the peer keeps its connection
-/// and the next schedule retries with a document that may have shrunk.
-fn payload_fits(payload: &str, limits: &EmbyWebsocketLimits) -> bool {
-    // The frame header and any buffered control frame count against the same cap in tungstenite,
-    // so the comparison reserves that margin instead of assuming an empty buffer.
-    payload
-        .len()
-        .saturating_add(EMBY_WEBSOCKET_FRAME_HEADER_BYTES)
-        < limits.max_write_buffer_bytes
 }
 
 /// Logs an oversized document at most once per `auth_warn_interval`; never includes the payload
@@ -815,13 +505,6 @@ async fn revalidated_principal(
     require_emby_principal_with_query(headers, state, query).await
 }
 
-fn utf8_close(code: u16, reason: &str) -> CloseFrame {
-    CloseFrame {
-        code,
-        reason: Utf8Bytes::from(reason),
-    }
-}
-
 /// Routes one inbound text frame. Unknown message types and unparsable JSON are ignored on
 /// purpose: Emby clients send messages this endpoint does not implement, and dropping the
 /// connection would only make them reconnect.
@@ -934,24 +617,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn bounded_send_gives_up_on_a_stalled_write() {
-        let started = Instant::now();
-        let delivered = bounded(
-            std::future::pending::<Result<(), axum::Error>>(),
-            Duration::from_millis(20),
-        )
-        .await;
-        assert!(!delivered);
-        assert!(started.elapsed() >= Duration::from_millis(15));
-        assert!(started.elapsed() < Duration::from_secs(1));
-    }
-
-    #[tokio::test]
-    async fn bounded_send_reports_a_delivered_frame() {
-        assert!(bounded(std::future::ready(Ok(())), Duration::from_secs(1)).await);
-    }
-
     #[test]
     fn repeated_start_frames_cannot_push_before_the_minimum_interval() {
         let limits = test_limits();
@@ -987,111 +652,6 @@ mod tests {
         );
         assert!(!stream.due(start + Duration::from_millis(150)));
         assert!(stream.due(start + Duration::from_millis(210)));
-    }
-
-    #[test]
-    fn write_buffer_cap_is_always_strictly_greater_than_the_initial_capacity() {
-        let equal = EmbyWebsocketLimits {
-            write_buffer_bytes: 4096,
-            max_write_buffer_bytes: 4096,
-            ..EmbyWebsocketLimits::default()
-        }
-        .normalized();
-        assert!(equal.max_write_buffer_bytes > equal.write_buffer_bytes);
-
-        let smaller = EmbyWebsocketLimits {
-            write_buffer_bytes: 4096,
-            max_write_buffer_bytes: 1024,
-            ..EmbyWebsocketLimits::default()
-        }
-        .normalized();
-        assert!(smaller.max_write_buffer_bytes > smaller.write_buffer_bytes);
-
-        let maxed = EmbyWebsocketLimits {
-            write_buffer_bytes: usize::MAX,
-            max_write_buffer_bytes: usize::MAX,
-            ..EmbyWebsocketLimits::default()
-        }
-        .normalized();
-        assert!(maxed.write_buffer_bytes <= EMBY_WEBSOCKET_WRITE_BUFFER_BYTES_LIMIT);
-        assert!(maxed.max_write_buffer_bytes > maxed.write_buffer_bytes);
-    }
-
-    #[test]
-    fn the_default_cap_leaves_room_for_the_largest_session_document() {
-        let limits = EmbyWebsocketLimits::default();
-        // 500 listed sessions at ~1.5 KiB each is the documented worst case (~750 KiB).
-        let worst_case_document = 500 * 1536;
-        assert!(worst_case_document < limits.max_write_buffer_bytes);
-        // The initial capacity is a hint and must stay well below the cap.
-        assert!(limits.write_buffer_bytes < limits.max_write_buffer_bytes / 4);
-    }
-
-    #[test]
-    fn a_document_at_or_above_the_cap_is_not_sent() {
-        let limits = EmbyWebsocketLimits {
-            write_buffer_bytes: 1024,
-            max_write_buffer_bytes: 4096,
-            ..EmbyWebsocketLimits::default()
-        }
-        .normalized();
-        let max = limits.max_write_buffer_bytes;
-        // The frame header (and a possible buffered control frame) is reserved: one byte below the
-        // margin still fits, the boundary itself is skipped, and anything larger is skipped too.
-        assert!(payload_fits(
-            &"x".repeat(max - EMBY_WEBSOCKET_FRAME_HEADER_BYTES - 1),
-            &limits
-        ));
-        assert!(!payload_fits(
-            &"x".repeat(max - EMBY_WEBSOCKET_FRAME_HEADER_BYTES),
-            &limits
-        ));
-        assert!(!payload_fits(&"x".repeat(max - 1), &limits));
-        assert!(!payload_fits(&"x".repeat(max), &limits));
-        assert!(!payload_fits(&"x".repeat(64 * 1024), &limits));
-    }
-
-    #[test]
-    fn extreme_overrides_are_clamped_before_they_can_panic() {
-        let extreme = EmbyWebsocketLimits {
-            max_connections: usize::MAX,
-            max_connections_per_user: usize::MAX,
-            min_interval: Duration::MAX,
-            max_interval: Duration::MAX,
-            max_message_bytes: usize::MAX,
-            idle_timeout: Duration::MAX,
-            heartbeat_interval: Duration::MAX,
-            write_buffer_bytes: usize::MAX,
-            max_write_buffer_bytes: usize::MAX,
-            send_timeout: Duration::MAX,
-            revalidate_interval: Duration::MAX,
-            auth_warn_interval: Duration::MAX,
-        }
-        .normalized();
-        assert!(extreme.max_connections <= EMBY_WEBSOCKET_MAX_CONNECTIONS_LIMIT);
-        assert!(extreme.max_connections <= Semaphore::MAX_PERMITS);
-        assert!(extreme.max_connections_per_user <= EMBY_WEBSOCKET_MAX_CONNECTIONS_LIMIT);
-        for value in [
-            extreme.min_interval,
-            extreme.max_interval,
-            extreme.idle_timeout,
-            extreme.heartbeat_interval,
-            extreme.send_timeout,
-            extreme.revalidate_interval,
-            extreme.auth_warn_interval,
-        ] {
-            assert!(value <= EMBY_WEBSOCKET_MAX_DURATION);
-        }
-        // Neither the budget nor any deadline computation may panic after normalisation.
-        let connections = EmbyWebsocketConnections::new(extreme.clone());
-        let _ = connections.try_acquire("user");
-        let now = Instant::now();
-        let _ = now + extreme.idle_timeout;
-        let _ = now + extreme.heartbeat_interval;
-        let _ = now + extreme.revalidate_interval;
-        let _ = now + extreme.min_interval;
-        let _ = now + extreme.max_interval;
-        let _ = now + extreme.send_timeout;
     }
 
     #[test]

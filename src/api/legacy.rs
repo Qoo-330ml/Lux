@@ -30,6 +30,7 @@ use tower_http::{
 use uuid::Uuid;
 
 use crate::api::lux;
+use crate::api::websocket::{WebsocketConnections, WebsocketShutdown};
 use crate::{
     COMMIT, VERSION,
     application::admin_health::{AdminHealthProbeCache, admin_health_report},
@@ -216,9 +217,9 @@ pub struct CoreState {
     /// Bounds the number of concurrent server-sent-event streams.
     sse_permits: SseConnectionBudget,
     /// Bounds the number of concurrent Emby WebSocket connections (global and per user).
-    emby_websocket_connections: EmbyWebsocketConnections,
+    emby_websocket_connections: WebsocketConnections,
     /// Trips every open Emby WebSocket connection when the process starts shutting down.
-    emby_websocket_shutdown: EmbyWebsocketShutdown,
+    emby_websocket_shutdown: WebsocketShutdown,
 }
 
 /// Delay between the `setup/complete` response and the restart request.
@@ -761,7 +762,7 @@ impl AppState {
     /// Overrides the `/embywebsocket` resource limits (tests shrink them so a limit is observable
     /// without waiting for the production values).
     pub fn with_emby_websocket_limits(mut self, limits: EmbyWebsocketLimits) -> Self {
-        self.core.emby_websocket_connections = EmbyWebsocketConnections::new(limits);
+        self.core.emby_websocket_connections = WebsocketConnections::new(limits);
         self
     }
 
@@ -1048,8 +1049,8 @@ impl AppState {
             request_rate_limiter: crate::security::RequestRateLimiter::default(),
             danmaku_search_rate_limiter: crate::security::DanmakuSearchRateLimiter::default(),
             sse_permits: SseConnectionBudget::default(),
-            emby_websocket_connections: EmbyWebsocketConnections::default(),
-            emby_websocket_shutdown: EmbyWebsocketShutdown::default(),
+            emby_websocket_connections: WebsocketConnections::default(),
+            emby_websocket_shutdown: WebsocketShutdown::default(),
         };
         // Built here (not in `start_realtime_watchers`) so the shutdown can reach its stop handle.
         let library_watch = LibraryWatchService::with_scan_jobs_and_metadata(

@@ -60,6 +60,7 @@ macro_rules! require_ready {
 pub mod lux;
 
 mod legacy;
+mod websocket;
 
 pub use legacy::{
     AppState, CoreState, EmbyWebsocketLimits, ReadyServices, app, app_with_state,
