@@ -221,6 +221,57 @@ describe("admin realtime events", () => {
     expect(FakeWebSocket.instances).toHaveLength(1);
   });
 
+  it("sweeps every admin query when the console mounts on an already-ready connection", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue();
+
+    const renderTree = (showAdmin: boolean) => act(() => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/admin"]}>
+            <Routes>
+              <Route element={<LuxShell user={{ id: "operator", usernameNormalized: "operator" }} />}>
+                <Route path="/admin" element={showAdmin ? <AdminLayout /> : null}>
+                  <Route index element={<SubscribedAdminQueries />} />
+                </Route>
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+
+    // The shell (user channel) opens the connection first; this is the home -> /admin path.
+    renderTree(false);
+    await act(async () => await Promise.resolve());
+    act(() => socket().ready());
+    await act(async () => await Promise.resolve());
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    invalidate.mockClear();
+
+    // Joining an already-ready connection must still refresh everything the console shows.
+    renderTree(true);
+    await act(async () => await Promise.resolve());
+    act(() => vi.advanceTimersByTime(250));
+    expect(invalidate.mock.calls.map(([options]) => options)).toEqual([
+      { queryKey: ["admin", "metadata-jobs", "all", "base"], exact: true },
+      { queryKey: ["admin", "logs"], exact: true },
+    ]);
+
+    // Leaving the console and coming back sweeps again: frames that arrived while it was
+    // unmounted were dropped.
+    invalidate.mockClear();
+    renderTree(false);
+    await act(async () => await Promise.resolve());
+    renderTree(true);
+    await act(async () => await Promise.resolve());
+    act(() => vi.advanceTimersByTime(250));
+    expect(invalidate).toHaveBeenCalledTimes(2);
+  });
+
   it("prefetches a target page when its navigation link is activated", () => {
     const queryClient = renderAdminLayout(false);
     const prefetch = vi.spyOn(queryClient, "prefetchQuery").mockResolvedValue(undefined);

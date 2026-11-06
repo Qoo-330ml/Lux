@@ -7,6 +7,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { LuxShell } from "../src/components/layout/LuxShell";
 import { useRealtimeConnectionState } from "../src/features/activity/useUserEvents";
+import { useAdminEvents } from "../src/features/admin/useAdminEvents";
 import { api, ApiError } from "../src/lib/api/client";
 import { queryKeys } from "../src/lib/api/query-keys";
 import { FakeWebSocket, installFakeWebSocket } from "./support/fake-websocket";
@@ -15,6 +16,12 @@ import { FakeWebSocket, installFakeWebSocket } from "./support/fake-websocket";
 
 function ConnectionProbe() {
   return <output>{useRealtimeConnectionState()}</output>;
+}
+
+/** Keeps the shared connection up without the user channel, like an admin-only viewer. */
+function AdminChannelProbe() {
+  useAdminEvents();
+  return null;
 }
 
 let container: HTMLDivElement;
@@ -97,6 +104,39 @@ it("opens one shared websocket and reports the connection only after the ready f
 
   act(() => root.unmount());
   expect(socket().closeCalls).toHaveLength(1);
+});
+
+it("does not force a home sweep when the user channel joins an already-ready connection", async () => {
+  client.setQueryData(["home", "carousel"], { value: "fresh" });
+  const renderTree = (withShell: boolean) => act(() => {
+    root.render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <AdminChannelProbe />
+          {withShell ? (
+            <Routes>
+              <Route element={<LuxShell user={{ id: "viewer", usernameNormalized: "viewer" }} />}>
+                <Route index element={<ConnectionProbe />} />
+              </Route>
+            </Routes>
+          ) : null}
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+  });
+
+  // Another channel owns the connection first, so the shell joins an already-ready one.
+  renderTree(false);
+  act(() => socket().ready());
+  await act(async () => { await Promise.resolve(); });
+
+  const invalidate = vi.spyOn(client, "invalidateQueries");
+  renderTree(true);
+  await act(async () => { await Promise.resolve(); });
+
+  expect(client.getQueryState(["home", "carousel"])?.isInvalidated).toBe(false);
+  expect(invalidate).not.toHaveBeenCalled();
+  expect(connectionText()).toBe("connected");
 });
 
 it("keeps the polling fallback when WebSocket is unavailable", () => {

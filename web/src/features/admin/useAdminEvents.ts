@@ -1,6 +1,6 @@
 import { useQueryClient, type QueryClient, type QueryKey } from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
-import { subscribeRealtime } from "../../lib/realtime/client";
+import { realtimeConnectionState, subscribeRealtime } from "../../lib/realtime/client";
 
 type AdminEventScope =
   | "all"
@@ -111,6 +111,13 @@ export function useAdminEvents() {
         if (scope) invalidate(scope);
       },
     });
+    // ADR-054 D15②: `onReady` fires once per connection, but the console mounts long after the
+    // connection is up whenever the user walks from the home page into /admin, and admin frames
+    // that arrived while it was unmounted were dropped. Sweeping on mount covers both. This is
+    // deliberately local to the admin hook rather than a `ready` replay in the hub: a replay
+    // would also reach the user channel, whose "only after a drop" rule (D15①) must stay
+    // unambiguous.
+    if (realtimeConnectionState() === "connected") invalidate("all");
     return () => {
       unsubscribe();
       if (flushTimer.current !== null) clearTimeout(flushTimer.current);
