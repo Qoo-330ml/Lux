@@ -24,4 +24,10 @@ impl WebsocketShutdown {
     pub(crate) fn subscribe(&self) -> watch::Receiver<bool> {
         self.sender.subscribe()
     }
+
+    /// Whether the process already entered its shutdown, so a handshake must answer `503` instead
+    /// of upgrading into a connection that is about to be closed.
+    pub(crate) fn is_signalled(&self) -> bool {
+        *self.sender.borrow()
+    }
 }

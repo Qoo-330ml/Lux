@@ -245,6 +245,12 @@ pub(super) async fn lux_websocket(
             .insert("connection", HeaderValue::from_static("upgrade"));
         return response;
     }
+    // A shutting-down process refuses new handshakes instead of upgrading into a connection that
+    // is closed on the next tick (ADR-054 D10).
+    if state.websocket_shutdown().is_signalled() {
+        log_handshake_rejected("shutting-down", StatusCode::SERVICE_UNAVAILABLE);
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     match check_origin(&parts.headers, &parts.uri) {
         OriginCheck::Allowed => {}
         OriginCheck::Missing => {
@@ -459,7 +465,7 @@ fn request_authority(headers: &HeaderMap, uri: &Uri) -> Option<String> {
         Some(host) => normalize_authority(&host, &[80, 443]),
         None => uri
             .authority()
-            .and_then(|authority| normalize_authority(&authority.to_string(), &[80, 443])),
+            .and_then(|authority| normalize_authority(authority.as_str(), &[80, 443])),
     }
 }
 
