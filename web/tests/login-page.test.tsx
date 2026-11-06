@@ -613,6 +613,110 @@ describe("LoginPage session state", () => {
     expect(container.querySelector(".lux-home")).toBeNull();
   });
 
+  it("drops the previous account's pages when /auth/me answers 401 without a realtime close", async () => {
+    const userA = { id: "user-a", usernameNormalized: "a", canManageServer: false };
+    const userB = { id: "user-b", usernameNormalized: "b", canManageServer: false };
+    let signedInAs: "a" | "b" = "a";
+    let revoked = false;
+    const unauthorized = () => new ApiError("需要登录", { status: 401 });
+
+    vi.spyOn(api, "setupStatus").mockResolvedValue({ initialized: true });
+    vi.spyOn(api, "me").mockImplementation(async () => {
+      if (revoked) throw unauthorized();
+      return { user: signedInAs === "a" ? userA : userB, serverName: "客厅 Lux" };
+    });
+    vi.spyOn(api, "login").mockImplementation(async () => {
+      revoked = false;
+      signedInAs = "b";
+      return userB;
+    });
+    vi.spyOn(api, "homeCarousel").mockImplementation(async () => {
+      if (revoked) throw unauthorized();
+      return { recommended: [] };
+    });
+    vi.spyOn(api, "homeLibraries").mockImplementation(async () => {
+      if (revoked) throw unauthorized();
+      return { libraries: [] };
+    });
+    vi.spyOn(api, "homeLibrariesLatest").mockImplementation(async () => {
+      if (revoked) throw unauthorized();
+      return { libraries: [] };
+    });
+    vi.spyOn(api, "homeContinueWatching").mockImplementation(async () => {
+      if (revoked) throw unauthorized();
+      return {
+        items: [{
+          id: signedInAs === "a" ? "resume-a" : "resume-b",
+          title: signedInAs === "a" ? "A 的继续观看" : "B 的继续观看",
+          itemType: "MOVIE",
+          runtimeTicks: 3_600_000_000,
+          userData: { positionTicks: 1_800_000_000 },
+        }],
+        total: 1,
+      };
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 60_000, refetchOnWindowFocus: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/"]}>
+            <App />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent, container.innerHTML).toContain("A 的继续观看"));
+    });
+
+    // Pages the previous account visited, cached under keys without a user dimension.
+    queryClient.setQueryData(queryKeys.favorites, { items: ["A 的收藏"] });
+    queryClient.setQueryData(queryKeys.watchHistory, { items: ["A 的历史"] });
+
+    // No realtime close: this is refetchOnReconnect, or the explicit `me` invalidation the admin
+    // pages perform, finding out that the session was revoked while the tab was away.
+    revoked = true;
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.me });
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => {
+        expect(container.querySelector("input[autocomplete='username']"), container.innerHTML).not.toBeNull();
+      });
+    });
+    expect(queryClient.getQueryData(queryKeys.favorites)).toBeUndefined();
+    expect(queryClient.getQueryData(queryKeys.watchHistory)).toBeUndefined();
+    // Server state that predates the session must survive, or the app would flash "正在启动 Lux".
+    expect(queryClient.getQueryData(queryKeys.setup)).toBeDefined();
+
+    const setInputValue = (input: HTMLInputElement, value: string) => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(input, value);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    };
+    act(() => {
+      setInputValue(container.querySelector<HTMLInputElement>("input[autocomplete='username']")!, "b");
+      setInputValue(container.querySelector<HTMLInputElement>("input[autocomplete='current-password']")!, "password");
+    });
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("button[type='submit']")?.click();
+      await vi.waitFor(() => expect(api.login).toHaveBeenCalledWith("b", "password"));
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent, container.innerHTML).toContain("B 的继续观看"));
+    });
+    expect(container.textContent).not.toContain("A 的继续观看");
+  });
+
   it("drops the previous account's data when the realtime session is revoked", async () => {
     const userA = { id: "user-a", usernameNormalized: "a", canManageServer: false };
     const userB = { id: "user-b", usernameNormalized: "b", canManageServer: false };
