@@ -118,8 +118,21 @@ it("does not invalidate loaded media caches on the first ready and does it once 
 
   act(() => socket().serverClose(1006));
   await advance(500);
+  const invalidate = vi.spyOn(client, "invalidateQueries");
   markReady();
   for (const key of mediaKeys) expect(client.getQueryState(key)?.isInvalidated).toBe(true);
+
+  // `refreshQueries(["home"])` walks the cached home queries, so the carousel proves the sweep ran
+  // exactly once instead of once per ready frame.
+  const sweeps = invalidate.mock.calls.filter(
+    ([options]) => JSON.stringify((options as { queryKey: unknown }).queryKey) === '["home","carousel"]',
+  );
+  expect(sweeps).toHaveLength(1);
+
+  // A repeated ready frame on the same connection is not another open.
+  const callsAfterReconnect = invalidate.mock.calls.length;
+  act(() => socket().message({ type: "ready", version: 1 }));
+  expect(invalidate.mock.calls).toHaveLength(callsAfterReconnect);
 });
 
 it.each(["home", "item", "library", "favorites"])("refreshes media caches for a %s event without touching player sessions", (scope) => {
