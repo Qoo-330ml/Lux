@@ -20076,6 +20076,77 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
 - 没有在 Hills、SenPlayer、VidHub、Infuse 等真实客户端上验证该过滤参数的 UI 结果；Hills 只确认到
   二进制字符串存在。
 
+#### LUX-888：Emby 列表端点容忍空的可选数值参数
+
+背景：Hills 打开媒体库筛选面板时会向 `/Genres`、`/Years`、`/Studios` 发送**空的** `Limit=`，Lux 的
+`Option<i64>` 查询反序列化把它当成非法整数并返回 400
+（`Failed to deserialize query string: Limit: cannot parse integer from empty string`），筛选面板因此
+为空（`docs/reviews/2026-11-06-hills-yamby-capture.md` §2 问题 3）。此前空的 `IsFavorite=` 出过同类问题，
+已按“空值按未提供处理”修好（`deserialize_optional_bool`），本次沿用同一做法补上数值版本。
+
+实现（`src/api/emby_catalog.rs`、`src/api/emby_handlers.rs`；无迁移、无新路由、不改 `/api/v1` DTO 与
+`web/`）：
+
+- 新增共享辅助函数 `deserialize_optional_i64`（`src/api/emby_catalog.rs`，紧邻既有的
+  `deserialize_optional_bool`）：把查询值按字符串读取，`trim()` 后为空（含纯空白）返回 `None`，否则按
+  `i64` 解析；解析失败仍是反序列化错误，由 axum 映射成 400。六个 Query 结构体共用这一份实现，没有各写
+  一份。
+- 接入字段：`EmbyItemsQuery`、`EmbyMediaFoldersQuery`、`EmbyFacetsQuery`、`EmbyPersonsQuery`、
+  `EmbyUsersQuery` 的 `StartIndex`/`Limit`（含已声明的 `startIndex`/`limit` 别名），以及 `EmbyTokenQuery`
+  的 `ActiveWithinSeconds`（`Sessions` 使用）。
+- 这些结构体由路由共用，因此覆盖到 `/Items`、`/Users/{userId}/Items` 及其 `Resume`/`Latest`/`NextUp`/
+  `FavoriteItems` 子路径、`Shows/NextUp`、`Shows/{seriesId}/Seasons`、`Shows/{seriesId}/Episodes`、
+  `Persons`、`Genres`/`Studios`/`Years`、`Library/MediaFolders`、`Users/Query` 与 `Sessions`；根路径与
+  `/emby` 前缀挂载同一棵路由树。
+- 校验与上限不变：`Limit=abc`、`Limit=1.5`、`StartIndex=abc` 仍在反序列化阶段 400；`StartIndex=-1` 仍因
+  负偏移 400；`Limit` 超上限（列表 1000、`Users/Query` 100）仍 400；`Sessions` 的 `ActiveWithinSeconds`
+  仍限制在 1..=2592000；`Limit=0` 的既有规则未改。
+- 有意未改：`/Users/{userId}/Images/{imageType}?Index=`（`Option<i32>`，不是列表端点）；`/Items` 的
+  `Limit`/`StartIndex` 仍然不声明 camelCase 别名（既有行为，与本次空值问题无关）。
+
+验收：
+
+- [x] `Genres`/`Years`/`Studios`：`Limit=`、`StartIndex=`、两者同时为空、纯空白值 → 200，且响应体与
+      不传该参数完全一致。
+- [x] 同上：`Limit=abc`、`Limit=1.5`、`StartIndex=abc` → 400；`Limit=1001` → 400；`StartIndex=-1` → 400。
+- [x] `Items`、`Users/{id}/Items`、`Items/Resume`、`Items/Latest`、`Items/NextUp`、`FavoriteItems`、
+      `Shows/NextUp`、`Shows/{id}/Seasons`、`Shows/{id}/Episodes` 的空 `Limit`/`StartIndex` → 200 且等价
+      未传，非法值与超上限仍 400。
+- [x] `Persons`、`Library/MediaFolders`、`Users/Query` 同上；`Users/Query` 的 100 上限单独覆盖。
+- [x] `Sessions` 的 `ActiveWithinSeconds` 空值 → 200 且等价未传；`abc`、`0`、`2592001` 仍 400。
+- [x] 根路径与 `/emby` 前缀都覆盖。
+- [x] `cargo test --locked --test emby` 47/47；`cargo fmt --all -- --check`、`cargo clippy --locked
+      --all-targets --all-features -- -D warnings`、`python3 scripts/check-backend-branches.py` 通过。
+
+预计文件：`src/api/emby_catalog.rs`、`src/api/emby_handlers.rs`、`tests/emby/emby_empty_numeric_params.rs`、
+`tests/emby/main.rs`、`docs/COMPATIBILITY.md`、`docs/CHANGELOG.md`、`docs/LUX-DEVELOPMENT.md`、
+`docs/TEST-TARGETS.md`。任务编号用 `LUX-888`：基线上 `LUX-887` 已被 `Filters=IsResumable`/`IsFavorite`
+占用。
+
+实施结果（2026-11-06，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 验证）：按 TDD 先提交失败的集成
+测试（空 `Limit=` 时 4 条用例全部以 400 复现），再实现使其通过。抓包只确认了 `/Genres`、`/Years`、
+`/Studios` 的空 `Limit=`；空 `StartIndex=` 与其它端点是静态推断，修复后**没有**在 Hills/Yamby 真机上复测
+筛选面板。
+
+验证命令与结果：
+
+- `cargo test --locked --test emby emby_empty_numeric_params::` 4/4（新增）。
+- `cargo test --locked --test emby` 47/47（整组，含 `emby_facets`、`emby_item_filters`、`emby_auth`、
+  `emby_incremental_refresh`、`mixed_library_api` 等既有用例）。
+- `cargo fmt --all -- --check` 通过；`cargo clippy --locked --all-targets --all-features -- -D warnings`
+  通过（0 警告）；`python3 scripts/check-backend-branches.py` 通过（28 files，266 branches）。
+
+限制与剩余风险：
+
+- 抓包报告没有保留完整查询串，所以“客户端是否也发空 `StartIndex=`”“除这三个端点外是否还有空值”没有
+  直接证据；本修复按同类反序列化覆盖全部 Emby 列表端点，属于预防性而非逐条实抓的修复。
+- 空值按未提供处理之后，`Limit=` 与“没有 `Limit` 参数”完全等价；它与 `Limit=0` 仍是不同语义（`Items`
+  在请求总数时把 `Limit=0` 当纯计数请求），两者都保留原有行为。
+- 修复未部署，Hills/Yamby 筛选面板在真机上的最终表现（列表是否有内容、分页是否正确）待部署后复测；
+  本次没有声称真机验证通过。
+- `/Users/{userId}/Images/{imageType}?Index=` 仍是严格解析：客户端若发空 `Index=` 会 400，本任务按范围
+  未改动。
+
 ## 31. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

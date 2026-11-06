@@ -23,6 +23,14 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 
 ### 修复
 
+- **Emby 列表不再因为空的可选数值参数返回 400**：Hills 打开媒体库筛选面板时会对 `/Genres`、`/Years`、
+  `/Studios` 发送空的 `Limit=`，服务端此前以 `Limit: cannot parse integer from empty string` 返回 400，
+  筛选面板因此为空。`Limit`、`StartIndex` 和 `Sessions` 的 `ActiveWithinSeconds`（含已声明的大小写别名）
+  现在把空串或纯空白按“未提供”处理，与 2026-08-23 对空 `IsFavorite=` 的做法一致；非空值的校验和服务端
+  上限都没变，`Limit=abc`、`StartIndex=-1`、超过 1000 的 `Limit` 仍是 400，`Limit=0` 规则不变。覆盖
+  `/Items`、`/Users/{userId}/Items` 及其 `Resume`/`Latest`/`NextUp`/`FavoriteItems`、`Shows/*`、
+  `Persons`、`Genres`/`Studios`/`Years`、`Library/MediaFolders`、`Users/Query` 与 `Sessions`，根路径与
+  `/emby` 前缀行为一致。修复尚未部署，真实客户端的筛选面板效果待复测。
 - **Emby 列表的 `Filters=IsResumable` / `Filters=IsFavorite` 现在生效**：Emby 列表接口的 `Filters`
   参数此前只识别 `IsPlayed`/`IsUnplayed`，`Filters=IsResumable` 被静默忽略、返回完整列表，
   `Filters` 里的 `IsFavorite` 也不生效（只有单独的 `IsFavorite=true` 参数有效）。现在
