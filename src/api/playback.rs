@@ -2391,11 +2391,6 @@ pub(super) async fn emby_sessions(
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    let database = state.database();
-    let user_id = auth_principal
-        .user_id()
-        .map(|user_id| user_id.to_string())
-        .unwrap_or_default();
     let active_within_seconds = match query.active_within_seconds {
         Some(seconds) if (1..=MAX_PLAYBACK_SESSION_WINDOW_SECONDS).contains(&seconds) => {
             Some(seconds)
@@ -2403,41 +2398,58 @@ pub(super) async fn emby_sessions(
         Some(_) => return StatusCode::BAD_REQUEST.into_response(),
         None => None,
     };
-    let sessions = match state
+    match emby_session_entries(&state, &auth_principal, active_within_seconds).await {
+        Ok(entries) => Json(entries).into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+
+/// Builds the `Data` array of `GET /Sessions`, shared with the `/embywebsocket` `Sessions`
+/// message.
+///
+/// Keeping the one builder is what makes a pushed session identical to a polled one: the
+/// authorization scope (an administrator sees every session, everyone else only their own) and
+/// the `NowPlayingItem`/`PlayState` projection come from the same code path, so the WebSocket can
+/// never widen what the HTTP endpoint exposes.
+pub(super) async fn emby_session_entries(
+    state: &ReadyAppState,
+    auth_principal: &crate::auth::users::AuthenticationPrincipal,
+    active_within_seconds: Option<i64>,
+) -> Result<Vec<Value>, StatusCode> {
+    let database = state.database();
+    let user_id = auth_principal
+        .user_id()
+        .map(|user_id| user_id.to_string())
+        .unwrap_or_default();
+    let sessions = state
         .playback_progress()
         .list_sessions(
             (!auth_principal.is_admin()).then_some(user_id.as_str()),
             active_within_seconds,
         )
         .await
-    {
-        Ok(sessions) => sessions,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let emby_play_session_ids = sessions
         .iter()
         .filter(|session| session.play_session_id.starts_with("lux-emby:"))
         .map(|session| session.play_session_id.clone())
         .collect::<Vec<_>>();
-    let web_sessions = match database
+    let web_sessions = database
         .find_web_playback_sessions_for_playbacks(&emby_play_session_ids)
         .await
-    {
-        Ok(sessions) => sessions
-            .into_iter()
-            .map(|session| (session.play_session_id.clone(), session))
-            .collect::<std::collections::HashMap<_, _>>(),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .into_iter()
+        .map(|session| (session.play_session_id.clone(), session))
+        .collect::<std::collections::HashMap<_, _>>();
     let user_names = if auth_principal.is_admin() {
         let session_user_ids = sessions
             .iter()
             .map(|session| session.user_id.clone())
             .collect::<Vec<_>>();
-        match database.find_user_display_names(&session_user_ids).await {
-            Ok(user_names) => user_names,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        }
+        database
+            .find_user_display_names(&session_user_ids)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
     } else {
         auth_principal
             .user()
@@ -2454,29 +2466,23 @@ pub(super) async fn emby_sessions(
             .map(|session| session.item_id.clone())
             .collect::<Vec<_>>();
         let catalog = state.catalog();
-        let access_principal = match emby_access_principal(&auth_principal, None) {
-            Ok(principal) => principal,
-            Err(status) => return status.into_response(),
-        };
-        match catalog.find_items(access_principal, &item_ids).await {
-            Ok(items) => items,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        }
+        let access_principal = emby_access_principal(auth_principal, None)?;
+        catalog
+            .find_items(access_principal, &item_ids)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
     };
-    Json(
-        sessions
-            .iter()
-            .map(|session| {
-                emby_session_json(
-                    session,
-                    catalog_items.get(&session.item_id),
-                    web_sessions.get(&session.play_session_id),
-                    user_names.get(&session.user_id).map(String::as_str),
-                )
-            })
-            .collect::<Vec<_>>(),
-    )
-    .into_response()
+    Ok(sessions
+        .iter()
+        .map(|session| {
+            emby_session_json(
+                session,
+                catalog_items.get(&session.item_id),
+                web_sessions.get(&session.play_session_id),
+                user_names.get(&session.user_id).map(String::as_str),
+            )
+        })
+        .collect::<Vec<_>>())
 }
 
 pub(super) async fn emby_stop_session(

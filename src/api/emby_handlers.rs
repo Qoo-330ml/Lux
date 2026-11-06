@@ -701,13 +701,28 @@ pub(super) async fn emby_scheduled_tasks(
     if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
+    match emby_scheduled_task_entries(&state).await {
+        Ok(entries) => Json(entries).into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+
+/// Builds the `Data` array of `GET /ScheduledTasks`, shared with the `/embywebsocket`
+/// `ScheduledTasksInfo` message.
+///
+/// The caller keeps the authorization decision (`can_manage_server`): the WebSocket only answers
+/// `ScheduledTasksInfoStart` for an administrator, so a non-administrator can never observe the
+/// scan state through the push channel either.
+pub(super) async fn emby_scheduled_task_entries(
+    state: &ReadyAppState,
+) -> Result<Vec<Value>, StatusCode> {
     let database = state.database();
     let mut active_full_scan = None;
     for status in ["PENDING", "RUNNING"] {
-        let jobs = match database.list_scan_jobs(Some(status), 0, 10_000).await {
-            Ok(jobs) => jobs,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
+        let jobs = database
+            .list_scan_jobs(Some(status), 0, 10_000)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         if let Some(job) = jobs
             .into_iter()
             .find(|job| job.job_type != "INCREMENTAL_SCAN")
@@ -716,7 +731,7 @@ pub(super) async fn emby_scheduled_tasks(
             break;
         }
     }
-    let state = active_full_scan.as_ref().map_or("Idle", |_| "Running");
+    let scan_state = active_full_scan.as_ref().map_or("Idle", |_| "Running");
     let progress = active_full_scan
         .as_ref()
         .filter(|job| job.total_count > 0)
@@ -724,7 +739,7 @@ pub(super) async fn emby_scheduled_tasks(
             ((job.processed_count.max(0) as f64 / job.total_count as f64) * 100.0).clamp(0.0, 100.0)
         })
         .unwrap_or(0.0);
-    Json(json!([{
+    Ok(vec![json!({
         "Id": "lux-refresh-media-library",
         "Name": "Scan media library",
         "Key": "RefreshMediaLibrary",
@@ -732,12 +747,11 @@ pub(super) async fn emby_scheduled_tasks(
         "Category": "Library",
         "IsHidden": false,
         "IsEnabled": true,
-        "State": state,
+        "State": scan_state,
         "CurrentProgressPercentage": progress,
         "LastExecutionResult": Value::Null,
         "Triggers": [],
-    }]))
-    .into_response()
+    })])
 }
 
 fn emby_update_change_kind(update_type: &str) -> crate::application::watch::ChangeKind {
