@@ -25,6 +25,18 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
   ACL/可见性/内容限制的候选，之后才聚合排序；`TotalRecordCount` 是这个候选池内的去重数量，不是全库
   相似条目总数。查询只读 `media_item_facets` 与 `media_items` 的现有索引，不解析 NFO、不扫描媒体库，
   也不需要迁移。
+- **Emby 实时通道 `GET /embywebsocket`**：Yamby 的"服务器状态/日志"页会连接
+  `ws(s)://{host}/embywebsocket?api_key=…&deviceId=…` 并发送 `SessionsStart`、
+  `ScheduledTasksInfoStart`；Lux 此前对该路径返回 404，而客户端失败后没有退避地立刻重连，会形成紧凑的
+  重连循环。现在根路径与 `/emby/embywebsocket`（大小写不敏感）都完成握手：凭证与其它 Emby 端点相同，
+  无效 token 在握手阶段返回 401（不会先升级再关闭），播放票据 token 被拒绝，非管理员可以连接但
+  `ScheduledTasksInfoStart` 被静默忽略。服务端按客户端在 `Data` 里给出的间隔（钳制到 1–60 秒）推送
+  `Sessions`、`ScheduledTasksInfo` 两类消息，`Data` 与同凭证下 `GET /Sessions`、`GET /ScheduledTasks`
+  的响应完全一致（会话 ACL 相同，计划任务仅管理员可见）；`Stop` 停止、`KeepAlive` 应答、未知消息与
+  非法 JSON 被忽略且不断开。连接有全局限额与每用户限额（超限在握手前返回 503）、8 KiB 入站帧上限、
+  心跳与空闲超时，每次推送前重新校验 token（登出/撤销即关闭连接）；关停时会主动发 Close 并退出，
+  不再让长连接拖住优雅停机。该端点只轮询既有应用服务，没有引入事件总线，也没有改数据库 schema。
+
 - **Trakt 评分可以按计划写回旁车 NFO**：`org.lux.trakt-ratings` 插件声明的媒体库级 `RATINGS_SYNC`
   任务现在能真正执行（此前调度器会以“不支持的任务类型”拒绝）。任务默认按 UTC 每周日 04:00 运行；
   每次执行在后台分页遍历该媒体库，只对已有 NFO 旁车的电影、剧集和分集向插件批量查询评分，把可信结果

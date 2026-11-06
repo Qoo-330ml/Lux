@@ -1562,7 +1562,7 @@ COMPATIBILITY.md 是唯一兼容性事实来源。不能因为实现了官方 Sw
 - Years、Genres、Tags 等筛选辅助端点。（Years、Genres、Studios、OfficialRatings 已实现，见 `docs/COMPATIBILITY.md`；Tags 返回 200 空列表，无数据源，待后续投影填充。）
 - Collections 与合集成员。
 - 多版本选择所需的 AlternateSources 等端点。
-- Sessions WebSocket 或实时消息，仅在目标客户端确有依赖时实现。
+- Sessions WebSocket 或实时消息，仅在目标客户端确有依赖时实现。（**已因 Yamby 实现**：Yamby 2.1.0.11 的「服务器状态」页固定连接 `/embywebsocket` 并依赖 `Sessions`/`ScheduledTasksInfo` 推送，失败后无退避重连，见 `docs/COMPATIBILITY.md` 的 LUX-891 一节与 `docs/reviews/2026-11-06-hills-yamby-static-analysis.md` §9.6。其余实时消息类型仍按"仅在有依赖时实现"处理。）
 - 图片变体、尺寸和索引端点。
 
 #### 明确不实现
@@ -20569,6 +20569,86 @@ LUX-890 合并后的去重与 P3 修正（2026-11-06）：
   仍不实现这两个参数。
 - 本机多 agent 并行编译，单次 `cargo test` 墙钟明显偏长（10–26 分钟）；上述结果只说明测试通过，不代表
   性能。
+
+#### LUX-891：Emby `GET /embywebsocket`（Yamby 的实时会话与计划任务面板）
+
+背景：Yamby 2.1.0.11 / 2.0.5.5 的「服务器状态/日志」页连接
+`ws(s)://{host}/embywebsocket?api_key={token}&deviceId={deviceId}`，路径固定且**不带** `/emby` 前缀，
+连上后发送 `SessionsStart`（`Data="0,1500,0,true,true"`）与 `ScheduledTasksInfoStart`
+（`Data="1000,1000"`），只处理 `Sessions` 与 `ScheduledTasksInfo` 两类服务端消息。Lux 此前对该路径返回
+404，而客户端的 `onClosed`/`onFailure` 会**无退避立即重连**、没有任何用户提示，于是该页面会形成紧凑的
+重连循环（`docs/reviews/2026-11-06-hills-yamby-static-analysis.md` §9.6）。项目所有者因此明确要求实现
+它，`docs/LUX-DEVELOPMENT.md` §15.3 的 P2 条目"仅在目标客户端确有依赖时实现"就此满足条件。
+
+实现（新增 `src/api/emby_websocket.rs`；改 `src/api/emby.rs`、`src/api/legacy.rs`、`src/api/mod.rs`、
+`src/api/playback.rs`、`src/api/emby_handlers.rs`、`src/main.rs`、`tests/emby/emby_websocket.rs`、
+`tests/emby/main.rs`；依赖只加 axum 的 `ws` 特性与测试用 dev-dependency；无迁移、不改 `/api/v1` 与 `web/`）：
+
+- 路由：在 `EmbyRouteBuilder` 追加 `/embywebsocket`，因此根路径与 `/emby` 前缀同时可用，大小写不敏感由
+  既有请求路径归一化覆盖（`/EmbyWebSocket`、`/EMBY/EmbyWebSocket` 都有测试）；凭据规范化中间件照旧
+  处理 query `api_key` 与标准 Emby token 头。
+- 鉴权顺序：`require_emby_principal` 在调用 `WebSocketUpgrade::on_upgrade` **之前**执行，所以无效/缺失
+  token 与播放票据 token 都在握手阶段得到 `401`，不会先完成 `101` 再关闭。非管理员可以连接，但
+  `ScheduledTasksInfoStart` 被静默忽略。
+- 复用而不是复制：`emby_sessions` 与 `emby_scheduled_tasks` 里构建单条 JSON 的逻辑抽成
+  `emby_session_entries`（`src/api/playback.rs`）与 `emby_scheduled_task_entries`
+  （`src/api/emby_handlers.rs`），HTTP handler 与 WebSocket 共用同一函数，所以推送的 `Data` 与同凭证下
+  `GET /Sessions`、`GET /ScheduledTasks` 的响应逐字节一致，ACL 也只有一份实现。handler 里没有 SQL。
+- 推送循环：每条连接一个任务，`tokio::select!` 同时等待入站帧、下一次推送、心跳与空闲截止时间，
+  不额外 spawn 推送任务。收到 `SessionsStart`/`ScheduledTasksInfoStart` 后解析
+  `Data="初始延迟,间隔,…"`，`Stop` 停止，`KeepAlive` 用同样的消息应答，未知类型与非法 JSON 忽略且不断开。
+- 边界：全局 32 条、每用户 4 条并发连接（`Semaphore` + 每用户计数，超限握手返回 `503` 且不升级）；
+  间隔钳制到 1000–60000 ms（初始延迟 0–60000 ms）；入站帧上限 8 KiB（`max_message_size`/`max_frame_size`，
+  超限由 tungstenite 关闭连接）；25 s 心跳 ping、120 s 无入站帧关闭；每次推送前用
+  `require_emby_principal_with_query` 重新校验 token，撤销/登出时以 `1008` 关闭。
+- 关停：`CoreState` 新增 `EmbyWebsocketShutdown`（`watch` 通道）与连接预算；`src/main.rs` 的
+  `shutdown_signal` 在请求 axum 停机前排空（先发 Close），`serve` 返回后再做一次
+  `shutdown_emby_websocket_connections()`（5 s 有界排空），这样升级后的连接不会在数据库关闭后继续推送。
+- 日志：只记录连接计数与用户 id，不记录 `api_key`、完整 query 或 token。
+
+验收：
+
+- [x] 握手成功并收到 `Sessions` 推送，`Data` 与同凭证 `GET /Sessions` 完全一致，条目含 `NowPlayingItem`
+      与 `PlayState`。
+- [x] 管理员收到 `ScheduledTasksInfo` 且 `Data` 与 `GET /ScheduledTasks` 一致；非管理员发送
+      `ScheduledTasksInfoStart` 后 1.6 s 内收不到任何推送，连接仍可用（随后 `KeepAlive` 有应答）。
+- [x] 无效 token 握手 401；播放票据 token 401；根路径、`/emby` 前缀与大小写混用都能握手。
+- [x] `SessionsStop` 之后停止推送；未知消息类型与非法 JSON 被忽略且不断开。
+- [x] 间隔钳制：请求 1 ms 时按 200 ms 下限推送（测试把下限调小以便观测），请求 100000 ms 时按上限推送。
+- [x] 连接上限：每用户上限与全局上限都在升级前返回 503，且客户端断开后槽位被释放。
+- [x] token 被 `/Sessions/Logout` 撤销后连接以 `1008` 关闭。
+- [x] 空闲超时关闭（`1001`）；64 KiB 入站帧在 8 KiB 上限下被拒绝且服务端继续服务其它连接。
+- [x] 已打开的连接不阻塞优雅关停（服务端 3 s 内停止，连接槽位在排空时释放）。
+- [x] 现有 HTTP 行为不变：`--test emby` 整组 68/68 通过（含原有的 `GET /Sessions`、
+      `GET /ScheduledTasks` 用例）。
+
+实施结果（2026-11-06，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 验证）：先按 TDD 写集成测试，
+在临时移除路由后确认 15 条用例全部失败（`404` / 握手失败），恢复路由后全部通过。
+
+验证命令与结果：
+
+- `cargo test --locked --test emby emby_websocket::` 15/15（新增模块）。
+- `cargo test --locked --test emby` 68/68（15 个模块）。
+- `cargo test --locked --test emby -- --list`：68 tests / 15 模块（`docs/TEST-TARGETS.md` 按此更新）。
+- `cargo fmt --all -- --check` 通过。
+- `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。
+- `python3 scripts/check-backend-branches.py` 通过（28 个文件、266 处，未新增 `DatabaseBackend::` 分支）。
+- `cargo build --locked` 通过（依赖只增加 axum 的 `ws` 特性；`cargo tree -i tokio-tungstenite` 显示它只被
+  axum 与 dev-dependency 引用，未引入第二套 WebSocket 实现）。
+
+限制与剩余风险：
+
+- **未做真机验证**：静态分析确认了请求形态、两条客户端消息与"失败即无退避重连"，响应形状按 Emby 约定
+  推断；抓包任务里 Yamby 没有进入该页面，本次也没有在手机上复测。部署后需在 Yamby「服务器状态」页
+  确认握手、面板数据、离开页面后的断开与无重连风暴。
+- 只实现 `Sessions` 与 `ScheduledTasksInfo` 两类推送；`ForceKeepAlive`、`UserDataChanged`、
+  `LibraryChanged` 等不推送（客户端对这些类型本就忽略）。若将来某个客户端依赖它们，需要另开任务。
+- 推送是"按客户端要求的间隔轮询现有应用服务"，不是事件驱动：最小间隔 1 s，因此最多 1 s 的额外延迟；
+  每次推送还会做一次 token 校验（一次或两次数据库读），在 32 条连接、1 s 间隔的上限下属于可接受量级。
+- `ScheduledTasksInfo` 只有一个 `RefreshMediaLibrary` 任务项（与 HTTP 端点一致），不是 Emby 的完整任务
+  列表；`Sessions` 条目来自 Lux 的现有投影，没有为 WebSocket 增加字段。
+- 空闲超时依赖客户端回应心跳 ping（Yamby 用 OkHttp，读取线程会自动回 pong）；如果某个客户端完全不读
+  连接，120 s 后会被关闭——这是有意的资源保护。
 
 #### LUX-892：ADR-054 —— Lux Web 实时通道从 SSE 迁移到 WebSocket（只写文档）
 

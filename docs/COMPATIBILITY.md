@@ -1791,3 +1791,57 @@ Lux 当时返回 404 空响应，客户端页面不报错、推荐区整块缺�
   不含自身与不同类型、ACL 排除、`Limit`/`TotalRecordCount`、空列表、404/401、根路径与 `/emby` 前缀、
   `EnableUserData`/图片类型选择、空值与非法 `Limit`。该记录只证明 Lux 服务端合同，不代表客户端已确认
   推荐区恢复。
+
+## LUX-891：Emby `/embywebsocket`（Yamby 实时会话与计划任务）
+
+目标客户端：Yamby 2.1.0.11（versionCode 20010012）与 2.0.5.5。入口是「服务器状态/日志」页，
+不是 App 级常驻连接。
+
+### 证据等级
+
+| 项 | 证据 | 等级 |
+|---|---|---|
+| 连接 URL 形态 | `Y11/mc/C4000.java:86-99` 把 base URL 的 `https://`→`wss://`、`http://`→`ws://`，拼 `"{base}/embywebsocket?api_key={token}&deviceId={deviceId}"`；路径固定，不按 Emby/Jellyfin 协议加 `/emby` 前缀 | **确认**（静态分析） |
+| 握手失败后的行为 | `Y11/r8/C5326.java:543-580` 的 `onClosed`/`onFailure` 在页面存活期间**立即重连**，没有退避与次数上限；`Y11/a0/C0004.java:251-253` 的 `mo66(Exception)` 方法体为空，没有任何提示 | **确认**（静态分析） |
+| 客户端消息 | 连上后先发 `{"MessageType":"ScheduledTasksInfoStart","Data":"1000,1000"}` 与 `{"MessageType":"SessionsStart","Data":"0,1500,0,true,true"}`（`Y11/a0/C0004.java:241-247`） | **确认**（静态分析） |
+| 客户端处理的服务端消息 | 只处理 `Sessions` 与 `ScheduledTasksInfo`（`Y11/a0/C0004.java:1377-1420`）；`Sessions` 条目缺 `NowPlayingItem` 或 `PlayState` 会被丢弃；其余类型忽略 | **确认**（静态分析） |
+| `Data` 语义与响应形状 | `Data` 为 `初始延迟毫秒,轮询间隔毫秒,…`，`Data` 是会话/任务 DTO 数组；按 Emby 约定推断（其反编译代码只做 JSON 解析，未包含服务端形状定义） | **推断** |
+| 真机 | 抓包任务（`docs/reviews/2026-11-06-hills-yamby-capture.md`）中 Yamby **没有**发起 `/embywebsocket`，Lux 对普通 GET 与 Upgrade 握手都返回 404；本次实现**未做真机验证**（未在手机上复测握手、面板数据与重连行为） | **未验证** |
+
+### 已实现的契约
+
+- 路由：`GET /embywebsocket` 与 `GET /emby/embywebsocket`，路径大小写不敏感，沿用 Emby 路由构建器与
+  凭据规范化中间件；握手凭证接受 query `api_key` 与标准 Emby token 头。
+- 鉴权：无效/缺失 token 在**握手阶段**返回 `401`（不会完成 `101` 后再关闭）；播放票据 token
+  （`luxPlayback…`）被拒绝（`401`）；非管理员可以连接。
+- 客户端消息：`SessionsStart`/`SessionsStop`、`ScheduledTasksInfoStart`/`ScheduledTasksInfoStop`
+  启停对应推送；`KeepAlive` 以同样的 `{"MessageType":"KeepAlive"}` 应答；未知类型与非法 JSON 被忽略，
+  连接保持。`ScheduledTasksInfoStart` 对非管理员静默忽略（不推送、不报错）。
+- 服务端消息：`{"MessageType":"Sessions","Data":[…]}` 与
+  `{"MessageType":"ScheduledTasksInfo","Data":[…]}`；`Data` 与同凭证下 `GET /Sessions`、
+  `GET /ScheduledTasks` 的响应**逐字节相同**（共用同一个构建函数，ACL 也相同：非管理员只看自己的会话，
+  计划任务仅管理员）。
+- 资源边界：全局 32 条、每用户 4 条并发连接（超限握手返回 `503`，不升级）；轮询间隔钳制到
+  1000–60000 ms（初始延迟钳制到 0–60000 ms）；入站帧上限 8 KiB；心跳 25 s、空闲 120 s 关闭；
+  每次推送前重新校验 token，被登出/撤销时以 `1008` 关闭。
+- 关停：进程开始优雅停机时向所有连接发 `1001` Close 并退出，随后有 5 s 的有界排空，长连接不再拖住
+  `axum::serve` 的停机等待。
+
+### 与官方的差异
+
+- 只实现 `Sessions` 与 `ScheduledTasksInfo` 两类推送；`ForceKeepAlive`、`UserDataChanged`、
+  `LibraryChanged` 等其它 Emby WebSocket 消息一律不推送（客户端对这些类型本就忽略）。
+- `Sessions` 的条目来自 Lux 现有的 `GET /Sessions` 投影（`NowPlayingItem`/`PlayState` 完整），没有为了
+  WebSocket 增加额外字段；`ScheduledTasksInfo` 复用 `GET /ScheduledTasks` 的单一 `RefreshMediaLibrary`
+  任务项。
+- 推送是"按客户端要求的间隔轮询现有应用服务"，不是事件驱动；两个客户端请求的 1.5 s / 1 s 间隔都在
+  钳制范围内，因此行为与 Emby 原生推送在观感上一致，但延迟上限由间隔决定。
+
+### 验证
+
+- `cargo test --locked --test emby emby_websocket::`：15/15（握手 401/播放票据拒绝、根路径与 `/emby`
+  前缀及大小写、`Sessions` 与 `GET /Sessions` 一致且含 `NowPlayingItem`/`PlayState`、管理员收到
+  `ScheduledTasksInfo` 而非管理员收不到、`SessionsStop` 停止、未知/非法消息忽略、间隔上下钳制、全局与
+  每用户连接上限、token 撤销后关闭、空闲关闭、超大帧拒绝、关停不被打开的连接阻塞）。
+- 真机：**未真机验证**。静态分析确认了请求形态与"失败即无退避重连"的行为，响应形状按 Emby 约定推断；
+  部署后需要在 Yamby 的「服务器状态」页复测握手、面板数据、离开页面后的断开与无重连风暴。
