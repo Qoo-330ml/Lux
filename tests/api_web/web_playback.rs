@@ -814,7 +814,10 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
     assert_eq!(strm_direct_body["plan"]["type"], "DIRECT");
     assert_eq!(
         strm_direct_body["plan"]["proxyUrl"],
-        format!("/Videos/{emby_strm_item_id}/stream?MediaSourceId={strm_source_id}")
+        format!(
+            "/Videos/{emby_strm_item_id}/stream?MediaSourceId={}",
+            public_source_id(&strm_source_id)
+        )
     );
     assert!(strm_direct_body["sessionId"].is_string());
     let strm_kinds: Vec<&str> = strm_direct_body["plan"]["candidates"]
@@ -1035,7 +1038,10 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
     let proxy_body = proxy_create.json::<Value>().await?;
     assert_eq!(
         proxy_body["plan"]["proxyUrl"],
-        format!("/Videos/{emby_proxy_item_id}/stream?MediaSourceId={proxy_source_id}")
+        format!(
+            "/Videos/{emby_proxy_item_id}/stream?MediaSourceId={}",
+            public_source_id(&proxy_source_id)
+        )
     );
 
     // Direct plans also carry the ordered candidate ladder. A path-type STRM has no origin URL.
@@ -1053,7 +1059,8 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
         .ok_or("missing proxy candidate url")?;
     assert!(
         proxy_candidate.starts_with(&format!(
-            "/Videos/{emby_proxy_item_id}/stream?MediaSourceId={proxy_source_id}&"
+            "/Videos/{emby_proxy_item_id}/stream?MediaSourceId={}&",
+            public_source_id(&proxy_source_id)
         )),
         "{proxy_candidate}"
     );
@@ -3322,4 +3329,12 @@ async fn web_playback_derives_the_bitrate_from_the_administrator_capped_height()
     fixture.stop_session(&session_id).await?;
     fixture.server.abort();
     Ok(())
+}
+
+/// Emby media source ids are 32 lowercase hex characters; STRM sources publish the stored UUID
+/// without hyphens so external 302 proxies can parse them.
+fn public_source_id(id: &str) -> String {
+    uuid::Uuid::parse_str(id)
+        .map(|uuid| uuid.simple().to_string())
+        .unwrap_or_else(|_| id.to_owned())
 }

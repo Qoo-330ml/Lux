@@ -2590,6 +2590,7 @@ pub(super) async fn emby_subtitle_with_source(
         return StatusCode::BAD_REQUEST.into_response();
     };
     let item_id = emby_internal_id(&item_id);
+    let media_source_id = emby_internal_source_id(&media_source_id);
     serve_subtitle(
         &state,
         principal,
@@ -2712,6 +2713,12 @@ pub(super) fn emby_stream_query_from_raw(raw_query: RawQuery) -> EmbyStreamQuery
         }
     }
 
+    // External proxies echo whatever id PlaybackInfo returned. Resolve it once here so every
+    // downstream lookup (authorization, signed-ticket verification, subtitle routes) sees the
+    // stored identifier, while UUIDs from older clients and cached payloads keep working.
+    query.media_source_id = query
+        .media_source_id
+        .map(|source_id| emby_internal_source_id(&source_id));
     query
 }
 
@@ -2950,6 +2957,7 @@ pub(super) async fn emby_stream_with_source(
 ) -> Response {
     let query = emby_stream_query_from_raw(raw_query);
     let item_id = emby_internal_id(&item_id);
+    let media_source_id = emby_internal_source_id(&media_source_id);
     let principal =
         match emby_stream_principal(&headers, &state, &query, &item_id, Some(&media_source_id))
             .await
@@ -2980,6 +2988,7 @@ pub(super) async fn emby_stream_with_source_and_container(
     let query = emby_stream_query_from_raw(raw_query);
     let (container, query) = emby_stream_query_from_path(query, &container);
     let item_id = emby_internal_id(&item_id);
+    let media_source_id = emby_internal_source_id(&media_source_id);
     let principal =
         match emby_stream_principal(&headers, &state, &query, &item_id, Some(&media_source_id))
             .await

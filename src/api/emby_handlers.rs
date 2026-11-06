@@ -177,8 +177,10 @@ async fn resolve_media_info_target(
         .as_deref()
         .or(target.item_id.as_deref())
     {
+        // The id may be a 32 hex public media source id, a decimal Emby item id or a UUID.
+        let id = emby_internal_id(&emby_internal_source_id(id));
         database
-            .find_strm_source_by_emby_id(&emby_internal_id(id))
+            .find_strm_source_by_emby_id(&id)
             .await
             .map_err(|_| ())?
     } else {
