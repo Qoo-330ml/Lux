@@ -20988,7 +20988,7 @@ rustfmt 按新标识符长度重排（`payload_fits` 合并为一行），无逻
 `docs/TEST-TARGETS.md`、`docs/CHANGELOG.md`、`docs/LUX-DEVELOPMENT.md`。
 
 实施结果（2026-11-06）：新增 `src/api/lux_websocket.rs`（约 1100 行含单测）与 `tests/admin/lux_websocket.rs`
-（28 例）；`src/api/websocket/mod.rs` 增 5 个 Lux 常量（用户 128/16、管理 64/8、4 KiB 契约上限）与 64 KiB
+（30 例）；`src/api/websocket/mod.rs` 增 5 个 Lux 常量（用户 128/16、管理 64/8、4 KiB 契约上限）与 64 KiB
 传输上限；`src/api/websocket/shutdown.rs` 增 `is_signalled()`；`src/api/legacy.rs` 增
 `lux_websocket_connections` 与共享的（改名后）`websocket_shutdown` 字段、`with_lux_websocket_limits`、
 `shutdown_websocket_connections`、`drain_lux_websocket_connections`；`src/api/mod.rs` 导出
@@ -21096,19 +21096,20 @@ load average 200~290 时连续 3 次 30/30；同一压力下整组 `cargo test -
 
 #### LUX-896：反代配置与部署文档（样例与文档已完成，真实握手未运行）
 
-状态：部分完成（2026-11-06）。依赖：LUX-894。**必须与 LUX-894 同批合入**，不得后置。文档与两份 nginx
-样例已改完并通过静态检查；真实 nginx 的 `101` 握手**未运行**（本机没有 nginx，任务约束禁止 Docker 构建
-与安装软件，当前分支也还没有 `/api/v1/ws`），因此合并前必须在含 LUX-894 的镜像上补跑
-`scripts/proxy-smoke.sh`。
+状态：文档与样例已完成（2026-11-06）；LUX-894 已合并到 `test`，本分支已 rebase 到 `a8c7928a`，并补齐
+894 审查遗留的三个 P3。真实 nginx 的 `101` 握手**仍未实跑**（本机没有 nginx，任务约束禁止 Docker 构建
+与安装软件），因此合并前必须在有 Docker 的机器上补跑 `scripts/proxy-smoke.sh`；它必须与 LUX-894 同批发布
+（同一发布列车），不得单独滞后。
 
 范围：`docs/DEPLOYMENT.md` 的 nginx 样例补 `proxy_set_header Upgrade $http_upgrade;` 与
 `proxy_set_header Connection "upgrade";`，并把 `Host` 明确为 `$http_host`（保留非默认端口，否则
 ADR-054 D5 会拒绝握手）；`scripts/proxy-smoke.nginx.conf` 同步；用 `scripts/proxy-smoke.sh` 跑一次真实
-`101` 握手；`docs/COMPATIBILITY.md` 记录结论（含缺头时 `1006`/`400` 的表现与“与 401 无法区分”的说明，
+`101` 握手；`docs/COMPATIBILITY.md` 记录结论（含缺头时 `1006`/`426` 的表现与“与 401 无法区分”的说明，
 Caddy 链路仍标注未实机验证）。
 
-依赖：LUX-894（需要真实端点）。缺头时代理会剥掉 `Upgrade`，请求以普通 GET 到达，`WebSocketUpgrade`
-提取器返回 400，浏览器只看到 `close 1006`；前端随后落到 30 秒轮询，负载高于断线基线而 UI 显示“正常”。
+依赖：LUX-894（需要真实端点）。缺头时代理会剥掉 `Upgrade`，请求以普通 GET 到达，handler 显式返回
+`426 Upgrade Required`（不依赖框架提取器默认的 400），浏览器只看到 `close 1006`；前端随后落到 30 秒
+轮询，负载高于断线基线而 UI 显示“正常”。
 
 验收：
 
@@ -21144,28 +21145,45 @@ Caddy 链路仍标注未实机验证）。
   是 `Host $http_host` 的回归测试。
 - `docs/COMPATIBILITY.md` 追加 LUX-896 记录（静态结论、未验证项、探针自测）；`docs/CHANGELOG.md`
   Unreleased 追加「变更」条目。
+- 本轮（rebase 到 `a8c7928a`，LUX-894 已合并）补齐审查遗留的三个 P3：
+  ① `src/api/lux_websocket.rs` 的 `parse_origin_authority` 原先只丢弃 Origin 自身 scheme 的默认端口，与
+  `request_authority` 丢弃 80/443 不对称；现在两侧都用 `&[80, 443]`，`Host: nas:443` +
+  `Origin: http://nas:443` 这类同源请求不再被误拒。先写失败单测
+  `origin_normalization_drops_both_default_ports_on_either_side`（http:443、https:80 与 `Host` 的四种
+  组合；红态是 `Some("nas:443")` vs `Some("nas")`），再改实现；`--lib lux_websocket::` 由 14 例变 15 例。
+  ② `docs/API.md` 的 `GET /api/v1/ws` 上行段补传输层 64 KiB 上限（超出直接断开、无 close 帧）与“超过
+  4 KiB 的二进制消息先得到 `1003` 而不是 `1009`”；同源校验段改为“80 与 443 一律视为无端口”；“LUX-896
+  落地后的 `docs/DEPLOYMENT.md`”改为直接指向 `docs/DEPLOYMENT.md`。③ `docs/LUX-DEVELOPMENT.md` 的
+  LUX-894 实施结果由 28 例改为 30 例（与验收记录、`docs/TEST-TARGETS.md` 的实测一致）。另按实际行为
+  最小修订 ADR-054：缺失 `Upgrade` 的「反向代理要求」由提取器默认 `400` 改为 handler 显式 `426`，
+  「Origin 校验」规则 2/3 改为两侧都把 80/443 视为默认端口；六条所有者决定未改。
 
 验收状态（与上面的验收清单逐项对应）：
 
 - [x] 两份 nginx 样例都带 `Upgrade`/`Connection` 与 `Host $http_host`，由
       `scripts/check-proxy-config.sh` 静态断言（`nginx -t` 未运行：本机没有 nginx）。
 - [ ] `scripts/proxy-smoke.sh` 在真实 nginx 容器里完成 `101` 握手并收到
-      `{"type":"ready","version":1}`：**未运行**（需要含 LUX-894 的镜像与 Docker 构建，本任务禁止）。
-      断言已写好，探针本身用本机 TLS 桩验证过。
-- [ ] 故意删掉 `Upgrade`/`Connection` 头时的实测表现：**未运行**；文档按 ADR-054 写成“普通 GET →
-      `400`/`426` → 浏览器 `1006` → 前端落到轮询”，并标注 ADR 内部 `400`（提取器默认）与 `426`
-      （端点合同）的措辞冲突，以端点合同为准；冒烟对普通 GET 只断言 4xx 并记录实际码。
+      `{"type":"ready","version":1}`：**未运行**（需要 Docker 构建，本任务禁止）。断言已写好，探针本身
+      用本机 TLS 桩验证过；服务端的 `101`/`426` 由 LUX-894 的真实 socket 集成测试覆盖，但不经过 nginx。
+- [ ] 故意删掉 `Upgrade`/`Connection` 头时的实测表现：**未运行**。文档写明“普通 GET → `426` → 浏览器
+      `1006` → 前端落到轮询”，`426` 由 `a_plain_get_answers_426_upgrade_required` 覆盖；ADR-054 的
+      `400` 措辞已按实现修订；冒烟对普通 GET 只断言 4xx 并记录实际码。
 - [x] 非默认端口说明与 ADR-054 D5 一致（`$host` 丢端口 → 每次握手 `400`）；冒烟端口 `18611` 让这条成为
       可执行断言，但该断言尚未实机运行。
 - [x] `docs/COMPATIBILITY.md` 记录日期与未验证项（真实 nginx、缺头实测、Caddy/Tailscale Serve）。
       未记录 nginx 版本：本机没有 nginx，冒烟未运行（脚本默认镜像 `nginx:1.27-alpine`）。
 
-验证：`bash -n scripts/*.sh`、`bash -n scripts/lib/*.sh` 通过；`scripts/check-proxy-config.sh` 通过
-（输出 “nginx samples carry Upgrade/Connection, Host $http_host, HTTP/1.1 and no buffering”）；冒烟探针
-用本机自签名证书的 TLS socket 桩（`.tmp/` 内、已删除）验证：`curl` 取到 `101` 且
-`Sec-WebSocket-Accept` 匹配、`openssl s_client` 读到首帧、桩的 `400`/`426` 分支被正确识别——这只证明探针
-可用，不证明 nginx。`scripts/proxy-smoke.sh` **未运行**（本机无 nginx、禁止 Docker 构建、当前分支没有
-`/api/v1/ws`）。本次没有 `src/`、`web/` 改动，未跑 Rust/Web 测试。
+验证：`cargo test --locked --test admin lux_websocket::` 30/30；`cargo test --locked --lib
+lux_websocket::` 15/15（含新增 P3 单测，先红后绿）；`cargo test --locked --lib websocket::` 25/25；
+`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+`python3 scripts/check-backend-branches.py`（`backend branches ok: 28 files, 266 branches`）、
+`scripts/check-proxy-config.sh`（“nginx samples carry Upgrade/Connection, Host $http_host, HTTP/1.1 and no
+buffering”）、`bash -n scripts/*.sh`、`bash -n scripts/lib/*.sh` 全部通过。冒烟探针用本机自签名证书的
+TLS socket 桩（`.tmp/` 内、已删除）验证过 `101` + `Sec-WebSocket-Accept`、首帧、`400`/`426` 分支——只
+证明探针可用，不证明 nginx。`scripts/proxy-smoke.sh` **未运行**：本机没有 nginx/OpenResty，脚本需要构建
+`lux:arm64-local` 镜像，而任务禁止 Docker 构建（Docker daemon 虽可用，没有镜像就没有可测的
+`/api/v1/ws`）。服务端行为由 LUX-894 的真实 socket 集成测试覆盖，但不等于反向代理验证。本次没有 `web/`
+改动，未跑 Web 测试。
 
 #### LUX-897：删除两条 SSE 路由与旧测试（未开始）
 

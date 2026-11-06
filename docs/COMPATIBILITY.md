@@ -1883,11 +1883,17 @@ Lux 当时返回 404 空响应，客户端页面不报错、推荐区整块缺�
 
 ## LUX-896 WebSocket 反向代理配置与部署文档（2026-11-06）
 
-证据等级：**样例与文档只做了静态检查，真实反向代理握手未运行**。本任务只改 `docs/` 与 `scripts/`；
-`scripts/proxy-smoke.sh` 新增的 `101` 断言需要包含 LUX-894 `/api/v1/ws` 的镜像，并用 Docker 构建
-`lux:arm64-local`（本任务约束禁止 Docker 构建与安装软件），本机也没有 nginx。下面把“静态一致”与“实机
-验证”分开记录：
+证据等级：**样例与文档为静态检查；服务端行为由 LUX-894 的真实 socket 集成测试覆盖；真实反向代理
+握手未运行**。本分支已 rebase 到含 LUX-894 的 `test`（`a8c7928a`），但本机没有 nginx，任务禁止 Docker
+构建与安装软件，所以 `scripts/proxy-smoke.sh` 未执行。下面把“已由测试覆盖”“只有静态一致”“未验证”
+分开记录：
 
+- 服务端行为（LUX-894 已合并）：普通 GET（无 `Upgrade`）返回 `426 Upgrade Required`（集成测试
+  `a_plain_get_answers_426_upgrade_required`）；`Origin` 与 `Host` 只比较 host[:port]，80/443 在两侧
+  都视为无端口（P3 修复，见下），不比较 scheme、不读转发头；跨源 `400`、缺 `Origin` 的 cookie 握手
+  `401`、预算超限 `429`。这些是进程内真实 socket 的测试，不经过 nginx。
+- ADR-054 措辞已按实现最小修订：缺失 `Upgrade` 的「反向代理要求」由“提取器默认 `400`”改为 handler
+  显式返回 `426`；「Origin 校验」规则 2 改为 80/443 两侧都视为无端口。六条所有者决定未改。
 - nginx 样例（`docs/DEPLOYMENT.md` 的 `## Nginx 反向代理`、`scripts/proxy-smoke.nginx.conf`）：都补了
   `proxy_set_header Upgrade $http_upgrade;` 与 `proxy_set_header Connection "upgrade";`，`Host` 由 `$host`
   改为 `$http_host`，保留 `proxy_http_version 1.1;`、`proxy_buffering off;` 与 1 小时的
@@ -1901,21 +1907,27 @@ Lux 当时返回 404 空响应，客户端页面不报错、推荐区整块缺�
   前端静默落到轮询（用户面 30 s，管理面 2 s/5 s/15 s）”，并给出服务端日志的拒绝分类
   （`origin-missing`/`origin-mismatch`/`sec-fetch-site`/`unauthenticated`/`budget`）与
   `502/504 → 400/426 → 401 → 101` 的读法。
-- 状态码措辞冲突：ADR-054 的端点合同要求缺 `Upgrade` 时显式返回 `426`，同一 ADR 的「反向代理要求」一节
-  仍写着 Axum 提取器默认的 `400`。部署文档按端点合同写 `426` 并标注该冲突；冒烟对普通 GET 只断言 4xx 并把
-  实际值写进结果 JSON，避免把 LUX-894 的实现细节固定成契约。ADR 正文未修改。
 - `Host` 改写：文档写明“反代改写 `Host` 会让所有握手被 Origin 校验拒绝，修正在反代侧，不是放宽校验”；
   明确 Lux 没有 `LUX_ALLOWED_ORIGINS`，也不读取 `X-Forwarded-Proto`/`Forwarded`/`X-Forwarded-Host`。
 - Caddy：按 Caddy 文档，`reverse_proxy` 默认透传 `Upgrade`/`Connection` 并保留原始 `Host`；仓库里没有
-  Caddy 配置，该链路**未实机验证**（与 ADR-054 的结论一致，本任务不改这一结论）。
+  Caddy 配置，该链路**未实机验证**（与 ADR-054 的结论一致）。
+- P3 修复（LUX-896 分支，LUX-894 审查遗留项）：① `parse_origin_authority` 原先只丢弃 Origin 自身
+  scheme 的默认端口，与 `request_authority` 丢弃 80/443 不对称，`Host: nas:443` +
+  `Origin: http://nas:443` 会被误拒；现在两侧都用 `&[80, 443]`，新增单测
+  `origin_normalization_drops_both_default_ports_on_either_side`（http:443 / https:80 与 `Host` 的组合）。
+  ② `docs/API.md` 补写传输层 64 KiB 上限（超出直接断开、无 close 帧）与“超过 4 KiB 的二进制消息先得
+  `1003` 而不是 `1009`”。③ `docs/LUX-DEVELOPMENT.md` 的 LUX-894 实施结果由 28 例改为 30 例（与验收记录、
+  `docs/TEST-TARGETS.md` 的实测一致）。
 - 冒烟探针自测（**不代表反向代理**）：用本机自签名证书的本地 TLS socket 桩（建在 `.tmp/` 内、已删除）
-  验证了两处新逻辑——`curl --http1.1 --max-time` 能取到 `101` 状态与握手头，`Sec-WebSocket-Accept` 与
+  验证了两处逻辑——`curl --http1.1 --max-time` 能取到 `101` 状态与握手头，`Sec-WebSocket-Accept` 与
   客户端 key 匹配；`openssl s_client` 能在有界轮询内读到 `{"type":"ready","version":1}` 首帧。桩同时
   覆盖 `400`（跨源、缺 `Origin`）与 `426`（普通 GET）。这只证明探针本身可用，不证明 nginx 行为。
-- **未验证项**：真实 nginx 的 `101` 与首帧、缺头时的实测状态码（`400`/`426`）、非默认端口实测、`$host`
-  回归实测、Caddy/Tailscale Serve 链路、含 LUX-894 的镜像本身。合并 LUX-894 后应在有 Docker 的机器执行
+- **未验证项**：真实 nginx 的 `101` 与首帧、缺头时的实测状态码、非默认端口实测、`$host` 回归实测、
+  Caddy/Tailscale Serve 链路。应在有 Docker 的机器执行
   ``LUX_IMAGE=<含 /api/v1/ws 的镜像> ./scripts/proxy-smoke.sh`` 补跑，并把结果回填到本节。
 
-本次实际执行：`bash -n scripts/*.sh`、`bash -n scripts/lib/*.sh`、`scripts/check-proxy-config.sh`（均
-通过）；`scripts/proxy-smoke.sh` **未运行**（本机无 nginx、任务禁止 Docker 构建、当前分支还没有
-`/api/v1/ws`）。
+本次实际执行：`cargo test --locked --test admin lux_websocket::` 30/30、`cargo test --locked --lib
+lux_websocket::` 15/15、`cargo test --locked --lib websocket::` 25/25、`cargo fmt --all -- --check`、
+`cargo clippy --locked --all-targets --all-features -- -D warnings`、`python3
+scripts/check-backend-branches.py`、`scripts/check-proxy-config.sh`、`bash -n scripts/*.sh` 全部通过；
+`scripts/proxy-smoke.sh` **未运行**（本机无 nginx，脚本需要 Docker 构建 `lux:arm64-local`，任务禁止）。

@@ -260,7 +260,7 @@ Lux 的 Web 实时通道是单端点 `GET /api/v1/ws`，Emby 兼容的 `/embyweb
 
 ### 缺头、改写 Host 与排查
 
-- **缺 `Upgrade`/`Connection`**：握手被当作普通 `GET` 转发，`/api/v1/ws` 不会升级（ADR-054 的端点合同要求显式返回 `426 Upgrade Required`；同一 ADR 的「反向代理要求」一节仍写着 Axum 提取器默认的 `400`，该默认行为已被端点合同明确排除，以 `426` 为准）。浏览器侧两种情况都只看到 `close 1006`——**与 401 完全无法区分**。前端随后静默落到既有轮询（用户面 30 秒，管理面 2 s/5 s/15 s），页面看起来“功能正常”，管理页负载反而高于断线基线。这是本次迁移最可能的失败点。
+- **缺 `Upgrade`/`Connection`**：握手被当作普通 `GET` 转发，`/api/v1/ws` 不会升级，handler 显式返回 `426 Upgrade Required`（响应带 `Upgrade: websocket`；不依赖框架提取器默认的 `400`，实现与 `docs/API.md` 一致，集成测试 `a_plain_get_answers_426_upgrade_required` 覆盖）。浏览器侧只看到 `close 1006`——**与 401 完全无法区分**。前端随后静默落到既有轮询（用户面 30 秒，管理面 2 s/5 s/15 s），页面看起来“功能正常”，管理页负载反而高于断线基线。这是本次迁移最可能的失败点。
 - **服务端日志的拒绝分类**：握手被拒时 Lux 只记录原因分类（`origin-missing` / `origin-mismatch` / `sec-fetch-site` / `unauthenticated` / `budget`），不记录头原值。看到 `origin-missing`/`origin-mismatch` 说明请求已经是升级请求但来源校验没过；看不到任何握手拒绝分类、只看到该路径的普通 `GET`（部署开启请求日志时），说明升级头没到 Lux。`Origin` 只在 `debug` 级记录。
 - **反代改写了 `Host`**（例如改成上游 `127.0.0.1:8097`）：`Origin` 与 `Host` 不再一致，**所有握手都会被 `400` 拒绝**，前端落到轮询。修正在反代侧（`proxy_set_header Host $http_host;`），不是放宽校验：Lux 没有 `LUX_ALLOWED_ORIGINS` 之类的来源白名单，也不会用 `X-Forwarded-Proto`、`Forwarded`、`X-Forwarded-Host` 判断来源。
 - **反代补了 `Sec-Fetch-Site: cross-site`**（或中间层 WAF 会改写该头）：Lux 一律拒绝握手，这属于中间层行为，不在 Lux 配置里放宽。

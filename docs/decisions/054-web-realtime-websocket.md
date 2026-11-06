@@ -8,6 +8,11 @@
 运行。实现顺序见「任务拆分与顺序」，`docs/API.md` 由 LUX-894 改写、由 LUX-897 删除 SSE 段落，
 本任务不改动它。
 
+修订单条（2026-11-06，LUX-894 落地与审查后）：缺失 `Upgrade` 的实际响应是 handler 显式返回的
+`426 Upgrade Required`，不是框架提取器默认的 `400`；`Origin` 与 `Host` 两侧都把 80/443 视为默认端口
+（原「Origin 校验」规则 2 只按 scheme 丢弃默认端口，与“不比较 scheme”自相矛盾）。六条所有者决定与
+其余条款未变，`docs/API.md` 是端点契约的最终表述。
+
 ## 日期
 
 2026-11-06
@@ -246,9 +251,10 @@ Sec-WebSocket-Version: 13
 
 1. 解析 `Origin`：只接受形如 `http://host[:port]` / `https://host[:port]` 的单一序列化源；带路径、
    带多个值、语法非法、或值为字面量 `null` 一律按“缺失”处理。
-2. 规范化：host 转小写；端口为 scheme 默认端口（http 80、https 443）时视为不存在，其余端口保留。
-   得到 `origin_authority`。
-3. 解析请求的 `Host` 头（若缺失则回退到 URI authority），同样转小写、保留非默认端口，得到
+2. 规范化：host 转小写；端口为 80 或 443 时视为不存在（`Host` 头不带 scheme，比较也不比较 scheme，
+   两侧必须用同一组默认端口，否则 `Host: nas:443` + `Origin: http://nas:443` 这类同源请求会被误拒），
+   其余端口保留。得到 `origin_authority`。
+3. 解析请求的 `Host` 头（若缺失则回退到 URI authority），同样转小写、按同一组默认端口归一化，得到
    `host_authority`。
 4. `origin_authority == host_authority` 才放行；不等 → `400`，不 Upgrade。
 5. `Sec-Fetch-Site` 存在且等于 `cross-site` → 一律拒绝（廉价信号，不当作唯一控制）。缺失时不因此
@@ -474,10 +480,11 @@ JS 看不见协议级 ping，客户端不能据此判活；判活只依赖 `clos
 
   以及保留 `proxy_http_version 1.1;`、`proxy_set_header Host $http_host;`（见下）、关闭响应缓冲
   （`proxy_buffering off;`，样例已有）。
-- **缺失时的表现**：`Upgrade` 头被剥掉后请求以普通 GET 到达，Axum 的 `WebSocketUpgrade` 提取器直接
-  `400`，浏览器侧只看到 `close 1006`——**与 401 完全无法区分**。前端随后落到既有轮询（用户面 30 秒，
-  管理面 2 s/5 s/15 s），管理页负载反而高于断线基线，而 UI 表现为“功能正常”。这是本次迁移最可能的
-  失败点，也是 LUX-896 必须与 LUX-894 **同批合入**的原因。
+- **缺失时的表现**：`Upgrade` 头被剥掉后请求以普通 GET 到达，handler 显式返回 `426 Upgrade Required`
+  （不依赖框架提取器的默认 `400`，与 `docs/API.md` 的端点契约一致），浏览器侧只看到 `close 1006`——
+  **与 401 完全无法区分**。前端随后落到既有轮询（用户面 30 秒，管理面 2 s/5 s/15 s），管理页负载反而
+  高于断线基线，而 UI 表现为“功能正常”。这是本次迁移最可能的失败点，也是 LUX-896 必须与 LUX-894
+  **同批合入**的原因。
 - `Host` 必须是浏览器看到的主机名（`$http_host` 保留端口；`$host` 会丢掉非默认端口）。写成
   `$host` 时，非默认端口部署一律握手失败。
 - `proxy_read_timeout` 必须大于心跳间隔（样例的 1 h 远大于 25 s，足够）；nginx 的 `http2 on` 只影响
