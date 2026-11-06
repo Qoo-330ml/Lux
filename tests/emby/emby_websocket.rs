@@ -161,6 +161,15 @@ impl TestServer {
 
     /// Records one Emby playback session so `/Sessions` has a `NowPlayingItem`/`PlayState` entry.
     async fn start_playback(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.start_playback_sessions(1).await
+    }
+
+    /// Records `count` distinct playback sessions, which makes one `Sessions` document big enough
+    /// to overflow a deliberately small write buffer.
+    async fn start_playback_sessions(
+        &self,
+        count: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
             .fetch_one(self.database.pool())
             .await?;
@@ -169,24 +178,27 @@ impl TestServer {
                 .bind(&item_id)
                 .fetch_optional(self.database.pool())
                 .await?;
-        let mut body = json!({
-            "ItemId": uuid_to_emby_id(&item_id),
-            "PlaySessionId": "websocket-contract-session",
-            "PositionTicks": 120_000_000_i64,
-            "RunTimeTicks": 600_000_000_i64,
-            "CanSeek": true,
-        });
-        if let Some(source_id) = source_id {
-            body["MediaSourceId"] = json!(source_id);
+        for index in 0..count {
+            let mut body = json!({
+                "ItemId": uuid_to_emby_id(&item_id),
+                "PlaySessionId": format!("websocket-contract-session-{index}"),
+                "PositionTicks": 120_000_000_i64,
+                "RunTimeTicks": 600_000_000_i64,
+                "CanSeek": true,
+                "DeviceName": format!("Device {index}"),
+            });
+            if let Some(source_id) = source_id.as_deref() {
+                body["MediaSourceId"] = json!(source_id);
+            }
+            let response = self
+                .client
+                .post(format!("{}/Sessions/Playing", self.base_url))
+                .header("X-Emby-Token", &self.admin_token)
+                .json(&body)
+                .send()
+                .await?;
+            assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
         }
-        let response = self
-            .client
-            .post(format!("{}/Sessions/Playing", self.base_url))
-            .header("X-Emby-Token", &self.admin_token)
-            .json(&body)
-            .send()
-            .await?;
-        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
         Ok(())
     }
 
@@ -510,19 +522,216 @@ async fn emby_websocket_clamps_the_requested_poll_interval()
         "a 1 ms interval must be clamped to the 200 ms floor, measured {clamped_floor:?}"
     );
 
-    // A ~100 s poll is clamped down to the 400 ms ceiling.
+    // A ~100 s poll is clamped down to the 400 ms ceiling. The gap is measured between two
+    // *consecutive pushes*: the schedule reset only decides when the first of them is allowed, so
+    // measuring from the Start frame would prove nothing.
     send(
         &mut socket,
         json!({"MessageType": "SessionsStart", "Data": "0,100000"}),
     )
     .await?;
+    let after_reset = next_json(&mut socket).await?;
+    assert_eq!(after_reset["MessageType"], "Sessions");
     let started = Instant::now();
-    let third = next_json(&mut socket).await?;
+    let following = next_json(&mut socket).await?;
     let clamped_ceiling = started.elapsed();
-    assert_eq!(third["MessageType"], "Sessions");
+    assert_eq!(following["MessageType"], "Sessions");
+    assert!(
+        clamped_ceiling >= Duration::from_millis(300),
+        "the ceiling must delay the following push, measured {clamped_ceiling:?}"
+    );
     assert!(
         clamped_ceiling <= Duration::from_millis(900),
         "a 100 s interval must be clamped to the 400 ms ceiling, measured {clamped_ceiling:?}"
+    );
+    Ok(())
+}
+
+/// Reads every text frame until `window` elapses, remembering when each one arrived.
+///
+/// Reading must happen while the client sends: a frame that sat in the socket buffer would be
+/// timestamped at read time, which would make any interval measurement meaningless.
+async fn collect_messages<S>(
+    stream: &mut S,
+    window: Duration,
+) -> Result<Vec<(Value, Instant)>, Box<dyn std::error::Error>>
+where
+    S: futures_util::Stream<Item = Result<Message, WsError>> + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + window;
+    let mut received = Vec::new();
+    loop {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Err(_) => return Ok(received),
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let received_at = Instant::now();
+                received.push((serde_json::from_str(text.as_ref())?, received_at));
+            }
+            Ok(Some(Ok(
+                Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_),
+            ))) => {}
+            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => return Ok(received),
+            Ok(Some(Err(error))) => return Err(format!("websocket error: {error}").into()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn emby_websocket_rate_limits_repeated_start_frames() -> Result<(), Box<dyn std::error::Error>>
+{
+    let server = spawn_server(EmbyWebsocketLimits {
+        min_interval: Duration::from_millis(200),
+        max_interval: Duration::from_millis(400),
+        ..limits()
+    })
+    .await?;
+    let socket = server
+        .connect("/embywebsocket", &server.admin_token)
+        .await?;
+    let (mut writer, mut reader) = socket.split();
+    // Ten `SessionsStart` frames, each asking to push immediately and then every second. Every one
+    // of them used to reset the plan to "now", which let a tiny frame trigger a full rebuild. The
+    // client keeps reading while it sends, so the measured gaps are arrival times.
+    let producer = tokio::spawn(async move {
+        for _ in 0..10 {
+            writer
+                .send(Message::Text(
+                    json!({"MessageType": "SessionsStart", "Data": "0,1000"})
+                        .to_string()
+                        .into(),
+                ))
+                .await?;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // The two streams are limited independently: a flood of session pushes must not delay the
+        // first scheduled-task push, which has no earlier attempt of its own.
+        writer
+            .send(Message::Text(
+                json!({"MessageType": "ScheduledTasksInfoStart", "Data": "0,1000"})
+                    .to_string()
+                    .into(),
+            ))
+            .await?;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        Ok::<(), WsError>(())
+    });
+    let received = collect_messages(&mut reader, Duration::from_millis(1200)).await?;
+    producer.await??;
+    let pushes = received
+        .iter()
+        .filter(|(message, _)| message["MessageType"] == "Sessions")
+        .collect::<Vec<_>>();
+    assert!(
+        pushes.len() >= 2,
+        "the stream has to keep pushing, received {} pushes",
+        pushes.len()
+    );
+    for pair in pushes.windows(2) {
+        let gap = pair[1].1.duration_since(pair[0].1);
+        assert!(
+            gap >= Duration::from_millis(150),
+            "two pushes must stay at least min_interval (200 ms) apart, measured {gap:?}"
+        );
+    }
+    assert!(
+        pushes.len() <= 8,
+        "1.2 s of a 200 ms floor must not yield more than 8 pushes, received {}",
+        pushes.len()
+    );
+
+    assert!(
+        received
+            .iter()
+            .any(|(message, _)| message["MessageType"] == "ScheduledTasksInfo"),
+        "the scheduled-task stream must keep its own schedule"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_websocket_closes_a_stalled_reader() -> Result<(), Box<dyn std::error::Error>> {
+    let server = spawn_server(EmbyWebsocketLimits {
+        min_interval: Duration::from_millis(50),
+        max_interval: Duration::from_millis(100),
+        // A deliberately tiny write buffer: one `Sessions` document (~13 KiB with 10 sessions)
+        // cannot be buffered, so the send fails instead of growing memory without bound.
+        write_buffer_bytes: 1024,
+        max_write_buffer_bytes: 4096,
+        send_timeout: Duration::from_millis(200),
+        idle_timeout: Duration::from_secs(30),
+        heartbeat_interval: Duration::from_secs(10),
+        max_connections: 1,
+        max_connections_per_user: 1,
+        ..limits()
+    })
+    .await?;
+    server.start_playback_sessions(10).await?;
+    let mut socket = server
+        .connect("/embywebsocket", &server.admin_token)
+        .await?;
+    send(
+        &mut socket,
+        json!({"MessageType": "SessionsStart", "Data": "0,50"}),
+    )
+    .await?;
+    // From here on the client never reads. The server must close the connection and release the
+    // slot within a bounded time, otherwise one stalled peer would pin capacity forever.
+    let mut released = false;
+    for _ in 0..60 {
+        if server
+            .handshake_status("/embywebsocket", &server.admin_token)
+            .await?
+            == 101
+        {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        released,
+        "a stalled reader must be closed and its connection slot released"
+    );
+    let _ = next_close(&mut socket).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_websocket_revalidates_connections_without_a_push_plan()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = spawn_server(EmbyWebsocketLimits {
+        revalidate_interval: Duration::from_millis(200),
+        ..limits()
+    })
+    .await?;
+    let token = emby_login(
+        &server.client,
+        &server.base_url,
+        "Admin",
+        "correct password",
+        "ws-idle-revalidate",
+    )
+    .await?;
+    let mut socket = server.connect("/embywebsocket", &token).await?;
+    // Deliberately no SessionsStart/ScheduledTasksInfoStart: nothing in the push loop would
+    // revalidate the token, so `SessionsStop` used to keep a revoked token alive forever.
+    send(&mut socket, json!({"MessageType": "SessionsStop"})).await?;
+    send(&mut socket, json!({"MessageType": "KeepAlive"})).await?;
+    assert_eq!(next_json(&mut socket).await?["MessageType"], "KeepAlive");
+
+    let logout = server
+        .client
+        .post(format!("{}/Sessions/Logout", server.base_url))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(logout.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let code = next_close(&mut socket).await?;
+    assert_eq!(
+        code,
+        Some(1008),
+        "a revoked token must close a connection without a push plan too"
     );
     Ok(())
 }
@@ -643,6 +852,8 @@ async fn emby_websocket_closes_an_idle_connection() -> Result<(), Box<dyn std::e
     let server = spawn_server(EmbyWebsocketLimits {
         idle_timeout: Duration::from_millis(300),
         heartbeat_interval: Duration::from_millis(100),
+        max_connections: 1,
+        max_connections_per_user: 1,
         ..limits()
     })
     .await?;
@@ -652,11 +863,31 @@ async fn emby_websocket_closes_an_idle_connection() -> Result<(), Box<dyn std::e
         .connect("/embywebsocket", &server.admin_token)
         .await?;
     tokio::time::sleep(Duration::from_millis(1200)).await;
-    let code = next_close(&mut socket).await?;
-    assert_eq!(
-        code,
-        Some(1001),
-        "an idle connection must be closed with 1001 (going away)"
+    // Under parallel test load the peer can observe a transport-level end instead of the close
+    // frame (the server drops the socket right after sending it), so the hard guarantee is that
+    // the connection ends and its slot is released; when a close frame does arrive it must be the
+    // "going away" code.
+    if let Some(code) = next_close(&mut socket).await? {
+        assert_eq!(
+            code, 1001,
+            "an idle connection closes with 1001 (going away)"
+        );
+    }
+    let mut released = false;
+    for _ in 0..30 {
+        if server
+            .handshake_status("/embywebsocket", &server.admin_token)
+            .await?
+            == 101
+        {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        released,
+        "an idle connection must be closed and its slot released"
     );
     Ok(())
 }

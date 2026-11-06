@@ -36,6 +36,20 @@ pub(crate) const EMBY_WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(120
 pub(crate) const EMBY_WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 /// How long a graceful shutdown waits for the open connections to finish closing.
 pub(crate) const EMBY_WEBSOCKET_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Initial capacity of a connection's write buffer.
+pub(crate) const EMBY_WEBSOCKET_WRITE_BUFFER_BYTES: usize = 16 * 1024;
+/// Hard cap of a connection's write buffer. One `Sessions` document for the 500 sessions the
+/// store lists stays well below it; a peer that stops reading makes the send fail instead of
+/// growing the buffer without bound.
+pub(crate) const EMBY_WEBSOCKET_MAX_WRITE_BUFFER_BYTES: usize = 64 * 1024;
+/// A single send that cannot complete within this bound closes the connection. It is far below
+/// the idle timeout so a stalled reader is reaped before the idle deadline would fire.
+pub(crate) const EMBY_WEBSOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// Token revalidation that runs even when no push stream is active, so `SessionsStop` cannot keep
+/// a revoked token (or a disabled remote-access policy) alive.
+pub(crate) const EMBY_WEBSOCKET_REVALIDATE_INTERVAL: Duration = Duration::from_secs(45);
+/// Minimum spacing of the "revalidation unavailable" warnings of one connection.
+pub(crate) const EMBY_WEBSOCKET_AUTH_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Close code of a WebSocket policy violation (RFC 6455 §7.4.1).
 const CLOSE_POLICY_VIOLATION: u16 = 1008;
@@ -65,6 +79,16 @@ pub struct EmbyWebsocketLimits {
     pub idle_timeout: Duration,
     /// Server-side ping interval.
     pub heartbeat_interval: Duration,
+    /// Initial capacity of the WebSocket write buffer.
+    pub write_buffer_bytes: usize,
+    /// Hard cap of the WebSocket write buffer; a send that would exceed it fails.
+    pub max_write_buffer_bytes: usize,
+    /// A single send that cannot complete within this bound closes the connection.
+    pub send_timeout: Duration,
+    /// Token revalidation that does not depend on an active push stream.
+    pub revalidate_interval: Duration,
+    /// Minimum spacing of the revalidation warnings of one connection.
+    pub auth_warn_interval: Duration,
 }
 
 impl Default for EmbyWebsocketLimits {
@@ -77,6 +101,11 @@ impl Default for EmbyWebsocketLimits {
             max_message_bytes: MAX_EMBY_WEBSOCKET_MESSAGE_BYTES,
             idle_timeout: EMBY_WEBSOCKET_IDLE_TIMEOUT,
             heartbeat_interval: EMBY_WEBSOCKET_HEARTBEAT_INTERVAL,
+            write_buffer_bytes: EMBY_WEBSOCKET_WRITE_BUFFER_BYTES,
+            max_write_buffer_bytes: EMBY_WEBSOCKET_MAX_WRITE_BUFFER_BYTES,
+            send_timeout: EMBY_WEBSOCKET_SEND_TIMEOUT,
+            revalidate_interval: EMBY_WEBSOCKET_REVALIDATE_INTERVAL,
+            auth_warn_interval: EMBY_WEBSOCKET_AUTH_WARN_INTERVAL,
         }
     }
 }
@@ -91,6 +120,11 @@ impl EmbyWebsocketLimits {
         self.heartbeat_interval = self.heartbeat_interval.max(Duration::from_millis(10));
         self.idle_timeout = self.idle_timeout.max(self.heartbeat_interval);
         self.max_message_bytes = self.max_message_bytes.max(1024);
+        self.write_buffer_bytes = self.write_buffer_bytes.max(1024);
+        self.max_write_buffer_bytes = self.max_write_buffer_bytes.max(self.write_buffer_bytes);
+        self.send_timeout = self.send_timeout.max(Duration::from_millis(10));
+        self.revalidate_interval = self.revalidate_interval.max(Duration::from_millis(10));
+        self.auth_warn_interval = self.auth_warn_interval.max(Duration::from_millis(10));
         self
     }
 }
@@ -272,6 +306,11 @@ pub(super) async fn emby_websocket(
     tracing::debug!(user = %user_key, "emby websocket connection accepted");
     ws.max_message_size(limits.max_message_bytes)
         .max_frame_size(limits.max_message_bytes)
+        // A peer that stops reading must not be able to grow the write buffer without bound: the
+        // initial capacity is small and the hard cap turns a stalled send into an error instead of
+        // unbounded memory use (every send also has a time bound, see `send_bounded`).
+        .write_buffer_size(limits.write_buffer_bytes)
+        .max_write_buffer_size(limits.max_write_buffer_bytes)
         .on_upgrade(move |socket| run_connection(socket, context))
         .into_response()
 }
@@ -287,10 +326,67 @@ struct ConnectionContext {
     permit: EmbyWebsocketPermit,
 }
 
-/// One periodic push stream: the first message is due at `next_push`, then every `interval`.
-struct StreamSchedule {
+/// One active push plan: the next push and the interval between pushes.
+struct StreamPlan {
     next_push: Instant,
     interval: Duration,
+}
+
+/// The schedule of one push stream (`Sessions` or `ScheduledTasksInfo`).
+///
+/// `last_attempt` survives `Stop`/`Start`, so the minimum interval belongs to the connection and
+/// not to the current plan: a burst of `…Start` frames cannot move the next push before one
+/// minimum interval after the previous attempt, which is what keeps a tiny client frame from
+/// forcing repeated document rebuilds.
+struct StreamState {
+    min_interval: Duration,
+    plan: Option<StreamPlan>,
+    last_attempt: Option<Instant>,
+}
+
+impl StreamState {
+    fn new(min_interval: Duration) -> Self {
+        Self {
+            min_interval,
+            plan: None,
+            last_attempt: None,
+        }
+    }
+
+    /// Applies a `…Start` frame. It only decides when the first push of the new plan may run; the
+    /// plan never starts earlier than one minimum interval after the previous attempt.
+    fn start(&mut self, now: Instant, timing: StreamTiming) {
+        let floor = self
+            .last_attempt
+            .map(|last| last + self.min_interval)
+            .unwrap_or(now)
+            .max(now);
+        self.plan = Some(StreamPlan {
+            next_push: (now + timing.initial).max(floor),
+            interval: timing.interval.max(self.min_interval),
+        });
+    }
+
+    fn stop(&mut self) {
+        self.plan = None;
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.plan.as_ref().is_some_and(|plan| now >= plan.next_push)
+    }
+
+    fn next_push(&self) -> Option<Instant> {
+        self.plan.as_ref().map(|plan| plan.next_push)
+    }
+
+    /// Records one push *attempt* (whether it produced a frame or was skipped) and schedules the
+    /// following one.
+    fn record_attempt(&mut self, now: Instant) {
+        self.last_attempt = Some(now);
+        if let Some(plan) = self.plan.as_mut() {
+            plan.next_push = now + plan.interval.max(self.min_interval);
+        }
+    }
 }
 
 enum Wake {
@@ -304,6 +400,58 @@ enum ClientAction {
     Reply(&'static str),
 }
 
+/// What a token revalidation means for the connection.
+#[derive(Debug, Eq, PartialEq)]
+enum RevalidationOutcome {
+    /// The credential is still valid.
+    Authorized,
+    /// The token was revoked or the account/policy forbids the request: close the connection.
+    Closed,
+    /// The answer is temporary (database or access-rule trouble): keep the connection and retry on
+    /// the next scheduled attempt.
+    Retry,
+}
+
+fn revalidation_outcome(status: StatusCode) -> RevalidationOutcome {
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => RevalidationOutcome::Closed,
+        _ => RevalidationOutcome::Retry,
+    }
+}
+
+/// Logs a transient revalidation failure at most once per `auth_warn_interval`, so a flapping
+/// database cannot turn one connection into a log flood. Never includes the credential.
+fn warn_revalidation_unavailable(
+    last_warning: &mut Option<Instant>,
+    now: Instant,
+    limits: &EmbyWebsocketLimits,
+    status: StatusCode,
+) {
+    let due = last_warning
+        .is_none_or(|last| now.saturating_duration_since(last) >= limits.auth_warn_interval);
+    if !due {
+        return;
+    }
+    *last_warning = Some(now);
+    tracing::warn!(
+        status = status.as_u16(),
+        "emby websocket token revalidation is unavailable; keeping the connection"
+    );
+}
+
+/// Runs one send under a hard time bound. Returns `false` when the peer is too slow (or the
+/// socket is broken), which is the caller's signal to close the connection.
+async fn bounded<F>(send: F, timeout: Duration) -> bool
+where
+    F: std::future::Future<Output = Result<(), axum::Error>>,
+{
+    matches!(tokio::time::timeout(timeout, send).await, Ok(Ok(())))
+}
+
+async fn send_bounded(socket: &mut WebSocket, message: Message, timeout: Duration) -> bool {
+    bounded(socket.send(message), timeout).await
+}
+
 async fn run_connection(mut socket: WebSocket, context: ConnectionContext) {
     let ConnectionContext {
         state,
@@ -314,15 +462,23 @@ async fn run_connection(mut socket: WebSocket, context: ConnectionContext) {
         mut shutdown,
         permit,
     } = context;
-    let mut sessions: Option<StreamSchedule> = None;
-    let mut tasks: Option<StreamSchedule> = None;
+    let mut sessions = StreamState::new(limits.min_interval);
+    let mut tasks = StreamState::new(limits.min_interval);
     let mut idle_deadline = Instant::now() + limits.idle_timeout;
     let mut next_heartbeat = Instant::now() + limits.heartbeat_interval;
+    let mut next_revalidate = Instant::now() + limits.revalidate_interval;
+    let mut last_revalidation_warning: Option<Instant> = None;
     let close = loop {
         if *shutdown.borrow() {
             break Some(utf8_close(CLOSE_GOING_AWAY, "server shutting down"));
         }
-        let next_wake = next_wake(&sessions, &tasks, idle_deadline, next_heartbeat);
+        let next_wake = next_wake(
+            &sessions,
+            &tasks,
+            idle_deadline,
+            next_heartbeat,
+            next_revalidate,
+        );
         let wake = tokio::select! {
             biased;
             changed = shutdown.changed() => {
@@ -354,10 +510,12 @@ async fn run_connection(mut socket: WebSocket, context: ConnectionContext) {
                         ) {
                             ClientAction::None => {}
                             ClientAction::Reply(payload) => {
-                                if socket
-                                    .send(Message::Text(Utf8Bytes::from(payload)))
-                                    .await
-                                    .is_err()
+                                if !send_bounded(
+                                    &mut socket,
+                                    Message::Text(Utf8Bytes::from(payload)),
+                                    limits.send_timeout,
+                                )
+                                .await
                                 {
                                     break None;
                                 }
@@ -376,19 +534,54 @@ async fn run_connection(mut socket: WebSocket, context: ConnectionContext) {
                     break Some(utf8_close(CLOSE_GOING_AWAY, "idle timeout"));
                 }
                 if now >= next_heartbeat {
-                    if socket.send(Message::Ping(Bytes::new())).await.is_err() {
+                    if !send_bounded(
+                        &mut socket,
+                        Message::Ping(Bytes::new()),
+                        limits.send_timeout,
+                    )
+                    .await
+                    {
                         break None;
                     }
                     next_heartbeat = now + limits.heartbeat_interval;
                 }
-                if push_due(&sessions) {
+                // A connection without an active push plan would otherwise never revalidate, so a
+                // revoked token (or a disabled policy) would keep `SessionsStop` connections open.
+                if now >= next_revalidate {
+                    let outcome = match revalidated_principal(&state, &headers, &query).await {
+                        Ok(_) => RevalidationOutcome::Authorized,
+                        Err(status) => {
+                            let outcome = revalidation_outcome(status);
+                            if outcome == RevalidationOutcome::Retry {
+                                warn_revalidation_unavailable(
+                                    &mut last_revalidation_warning,
+                                    now,
+                                    &limits,
+                                    status,
+                                );
+                            }
+                            outcome
+                        }
+                    };
+                    if outcome == RevalidationOutcome::Closed {
+                        break Some(utf8_close(CLOSE_POLICY_VIOLATION, "token revoked"));
+                    }
+                    next_revalidate = now + limits.revalidate_interval;
+                }
+                if sessions.due(now) {
                     match revalidated_principal(&state, &headers, &query).await {
                         Ok(principal) => match emby_session_entries(&state, &principal, None).await
                         {
                             Ok(entries) => {
                                 let payload =
                                     json!({"MessageType": "Sessions", "Data": entries}).to_string();
-                                if socket.send(Message::Text(payload.into())).await.is_err() {
+                                if !send_bounded(
+                                    &mut socket,
+                                    Message::Text(payload.into()),
+                                    limits.send_timeout,
+                                )
+                                .await
+                                {
                                     break None;
                                 }
                             }
@@ -397,11 +590,23 @@ async fn run_connection(mut socket: WebSocket, context: ConnectionContext) {
                                 "skipped an emby websocket session push"
                             ),
                         },
-                        Err(()) => break Some(utf8_close(CLOSE_POLICY_VIOLATION, "token revoked")),
+                        Err(status)
+                            if revalidation_outcome(status) == RevalidationOutcome::Closed =>
+                        {
+                            break Some(utf8_close(CLOSE_POLICY_VIOLATION, "token revoked"));
+                        }
+                        // A temporary failure must not drop the connection: the next scheduled
+                        // attempt retries, and the warning is rate limited.
+                        Err(status) => warn_revalidation_unavailable(
+                            &mut last_revalidation_warning,
+                            now,
+                            &limits,
+                            status,
+                        ),
                     }
-                    advance(&mut sessions);
+                    sessions.record_attempt(Instant::now());
                 }
-                if push_due(&tasks) {
+                if tasks.due(now) {
                     match revalidated_principal(&state, &headers, &query).await {
                         Ok(principal) if principal.can_manage_server() => {
                             match emby_scheduled_task_entries(&state).await {
@@ -411,7 +616,13 @@ async fn run_connection(mut socket: WebSocket, context: ConnectionContext) {
                                         "Data": entries,
                                     })
                                     .to_string();
-                                    if socket.send(Message::Text(payload.into())).await.is_err() {
+                                    if !send_bounded(
+                                        &mut socket,
+                                        Message::Text(payload.into()),
+                                        limits.send_timeout,
+                                    )
+                                    .await
+                                    {
                                         break None;
                                     }
                                 }
@@ -423,60 +634,63 @@ async fn run_connection(mut socket: WebSocket, context: ConnectionContext) {
                         }
                         // A demoted administrator stops observing the scan state; the stream is
                         // dropped instead of failing the whole connection.
-                        Ok(_) => tasks = None,
-                        Err(()) => break Some(utf8_close(CLOSE_POLICY_VIOLATION, "token revoked")),
+                        Ok(_) => tasks.stop(),
+                        Err(status)
+                            if revalidation_outcome(status) == RevalidationOutcome::Closed =>
+                        {
+                            break Some(utf8_close(CLOSE_POLICY_VIOLATION, "token revoked"));
+                        }
+                        Err(status) => warn_revalidation_unavailable(
+                            &mut last_revalidation_warning,
+                            now,
+                            &limits,
+                            status,
+                        ),
                     }
-                    advance(&mut tasks);
+                    tasks.record_attempt(Instant::now());
                 }
             }
         }
     };
     if let Some(frame) = close {
-        let _ = socket.send(Message::Close(Some(frame))).await;
+        let _ = send_bounded(
+            &mut socket,
+            Message::Close(Some(frame)),
+            limits.send_timeout,
+        )
+        .await;
     }
     // Releases the connection budget; must happen after the close frame was written.
     drop(permit);
     tracing::debug!("emby websocket connection closed");
 }
 
-/// The next wake-up of the loop: the earliest push, heartbeat and idle deadline.
+/// The next wake-up of the loop: the earliest push, heartbeat, revalidation and idle deadline.
 fn next_wake(
-    sessions: &Option<StreamSchedule>,
-    tasks: &Option<StreamSchedule>,
+    sessions: &StreamState,
+    tasks: &StreamState,
     idle_deadline: Instant,
     next_heartbeat: Instant,
+    next_revalidate: Instant,
 ) -> Instant {
-    let mut next = idle_deadline.min(next_heartbeat);
-    for schedule in [sessions, tasks].into_iter().flatten() {
-        next = next.min(schedule.next_push);
+    let mut next = idle_deadline.min(next_heartbeat).min(next_revalidate);
+    for schedule in [sessions.next_push(), tasks.next_push()]
+        .into_iter()
+        .flatten()
+    {
+        next = next.min(schedule);
     }
     next
 }
 
-fn push_due(schedule: &Option<StreamSchedule>) -> bool {
-    schedule
-        .as_ref()
-        .is_some_and(|schedule| Instant::now() >= schedule.next_push)
-}
-
-/// Schedules the next push after the current one was attempted, keeping the loop moving even when
-/// a push was skipped.
-fn advance(schedule: &mut Option<StreamSchedule>) {
-    if let Some(schedule) = schedule.as_mut() {
-        schedule.next_push = Instant::now() + schedule.interval;
-    }
-}
-
-/// Revalidates the connection credential. A revoked token (logout, deleted user, revoked admin
-/// key) closes the connection instead of continuing to push data.
+/// Revalidates the connection credential. The status code is preserved so the caller can tell a
+/// revoked token (401/403) from a temporary failure (5xx), which keeps the connection.
 async fn revalidated_principal(
     state: &ReadyAppState,
     headers: &HeaderMap,
     query: &EmbyTokenQuery,
-) -> Result<crate::auth::users::AuthenticationPrincipal, ()> {
-    require_emby_principal_with_query(headers, state, query)
-        .await
-        .map_err(|_| ())
+) -> Result<crate::auth::users::AuthenticationPrincipal, StatusCode> {
+    require_emby_principal_with_query(headers, state, query).await
 }
 
 fn utf8_close(code: u16, reason: &str) -> CloseFrame {
@@ -491,8 +705,8 @@ fn utf8_close(code: u16, reason: &str) -> CloseFrame {
 /// connection would only make them reconnect.
 fn handle_client_message(
     text: &str,
-    sessions: &mut Option<StreamSchedule>,
-    tasks: &mut Option<StreamSchedule>,
+    sessions: &mut StreamState,
+    tasks: &mut StreamState,
     can_manage_server: bool,
     limits: &EmbyWebsocketLimits,
 ) -> ClientAction {
@@ -505,31 +719,23 @@ fn handle_client_message(
     let data = message.get("Data");
     match message_type.trim().to_ascii_lowercase().as_str() {
         "sessionsstart" => {
-            let timing = stream_timing(data, 1500, limits);
-            *sessions = Some(StreamSchedule {
-                next_push: Instant::now() + timing.initial,
-                interval: timing.interval,
-            });
+            sessions.start(Instant::now(), stream_timing(data, 1500, limits));
             ClientAction::None
         }
         "sessionsstop" => {
-            *sessions = None;
+            sessions.stop();
             ClientAction::None
         }
         // A non-administrator can open the channel but must never learn the scan state, so the
         // message is ignored silently: no push, no error, and the connection stays open.
         "scheduledtasksinfostart" => {
             if can_manage_server {
-                let timing = stream_timing(data, 1000, limits);
-                *tasks = Some(StreamSchedule {
-                    next_push: Instant::now() + timing.initial,
-                    interval: timing.interval,
-                });
+                tasks.start(Instant::now(), stream_timing(data, 1000, limits));
             }
             ClientAction::None
         }
         "scheduledtasksinfostop" => {
-            *tasks = None;
+            tasks.stop();
             ClientAction::None
         }
         "keepalive" => ClientAction::Reply(KEEP_ALIVE_REPLY),
@@ -573,4 +779,106 @@ fn parse_millis(value: &str) -> Option<u64> {
 
 fn clamp_millis(value_ms: u64, min: Duration, max: Duration) -> Duration {
     Duration::from_millis(value_ms).clamp(min, max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_limits() -> EmbyWebsocketLimits {
+        EmbyWebsocketLimits {
+            min_interval: Duration::from_millis(200),
+            ..EmbyWebsocketLimits::default()
+        }
+    }
+
+    #[test]
+    fn revalidation_classifies_revocation_and_transient_failures() {
+        assert_eq!(
+            revalidation_outcome(StatusCode::UNAUTHORIZED),
+            RevalidationOutcome::Closed
+        );
+        assert_eq!(
+            revalidation_outcome(StatusCode::FORBIDDEN),
+            RevalidationOutcome::Closed
+        );
+        assert_eq!(
+            revalidation_outcome(StatusCode::INTERNAL_SERVER_ERROR),
+            RevalidationOutcome::Retry
+        );
+        assert_eq!(
+            revalidation_outcome(StatusCode::SERVICE_UNAVAILABLE),
+            RevalidationOutcome::Retry
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_send_gives_up_on_a_stalled_write() {
+        let started = Instant::now();
+        let delivered = bounded(
+            std::future::pending::<Result<(), axum::Error>>(),
+            Duration::from_millis(20),
+        )
+        .await;
+        assert!(!delivered);
+        assert!(started.elapsed() >= Duration::from_millis(15));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn bounded_send_reports_a_delivered_frame() {
+        assert!(bounded(std::future::ready(Ok(())), Duration::from_secs(1)).await);
+    }
+
+    #[test]
+    fn repeated_start_frames_cannot_push_before_the_minimum_interval() {
+        let limits = test_limits();
+        let mut stream = StreamState::new(limits.min_interval);
+        let start = Instant::now();
+        stream.start(
+            start,
+            stream_timing(Some(&json!("0,100000")), 1500, &limits),
+        );
+        assert!(stream.due(start), "the first push has no earlier attempt");
+
+        stream.record_attempt(start);
+        // A Start frame right after the push cannot schedule an earlier one.
+        stream.start(
+            start + Duration::from_millis(5),
+            stream_timing(Some(&json!("0,1")), 1500, &limits),
+        );
+        assert!(!stream.due(start + Duration::from_millis(150)));
+        assert!(stream.due(start + Duration::from_millis(205)));
+    }
+
+    #[test]
+    fn a_stopped_stream_still_respects_the_minimum_interval_after_a_restart() {
+        let limits = test_limits();
+        let mut stream = StreamState::new(limits.min_interval);
+        let start = Instant::now();
+        stream.start(start, stream_timing(Some(&json!("0,1000")), 1500, &limits));
+        stream.record_attempt(start);
+        stream.stop();
+        stream.start(
+            start + Duration::from_millis(10),
+            stream_timing(Some(&json!("0,1000")), 1500, &limits),
+        );
+        assert!(!stream.due(start + Duration::from_millis(150)));
+        assert!(stream.due(start + Duration::from_millis(210)));
+    }
+
+    #[test]
+    fn stream_timing_clamps_both_values() {
+        let limits = test_limits();
+        let fast = stream_timing(Some(&json!("0,1")), 1500, &limits);
+        assert_eq!(fast.initial, Duration::ZERO);
+        assert_eq!(fast.interval, Duration::from_millis(200));
+
+        let slow = stream_timing(Some(&json!("0,100000")), 1500, &limits);
+        assert_eq!(slow.interval, limits.max_interval);
+
+        let missing = stream_timing(None, 1500, &limits);
+        assert_eq!(missing.initial, Duration::ZERO);
+        assert_eq!(missing.interval, Duration::from_millis(1500));
+    }
 }

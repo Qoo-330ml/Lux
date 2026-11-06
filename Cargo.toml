@@ -74,9 +74,10 @@ tempfile = "3"
 # The test client for `/embywebsocket`. Same version axum's `ws` feature already builds, so the
 # dependency graph gains no second WebSocket stack.
 tokio-tungstenite = "0.29"
-# `StreamExt::next`/`SinkExt::send` to drive that client. `futures-util` is already in the lock
-# through axum and tokio-tungstenite (same 0.3.x version), so this adds no crate to the graph.
-futures-util = "0.3"
+# `StreamExt::next`/`split` and `SinkExt::send` to drive that client. `futures-util` is already in
+# the lock through axum and tokio-tungstenite (same 0.3.x version), so this adds no crate to the
+# graph; `sink` is what tokio-tungstenite itself enables for its own send half.
+futures-util = { version = "0.3", features = ["sink"] }
 
 [lib]
 name = "luxd"

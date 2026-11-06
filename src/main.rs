@@ -330,12 +330,14 @@ async fn serve(
     let _ = shutdown_tx.send(true);
     let _ = discovery_task.await;
     mail_worker.shutdown().await;
-    serve_result?;
     // An upgraded WebSocket connection is detached from the HTTP connection, so `axum::serve`
-    // does not wait for it. Close them here, before any worker or the database goes away.
+    // does not wait for it. Close them here, before any worker or the database goes away, and do
+    // it whether or not `serve` returned an error: an error must not leave a connection pushing
+    // against a database that is about to close.
     if !shutdown_state.shutdown_emby_websocket_connections().await {
         warn!("emby websocket connections outlived the shutdown drain timeout");
     }
+    serve_result?;
     let shutdown_reason = *control_tx.borrow();
     if let Err(error) = shutdown_state.shutdown_background_workers_checked().await {
         return Err(std::io::Error::other(error).into());
