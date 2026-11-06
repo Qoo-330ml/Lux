@@ -26,26 +26,27 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 /// Query suffixes whose value is absent-or-blank and therefore must behave like a missing key.
-const BLANK_SUFFIXES: [&str; 6] = [
+const BLANK_SUFFIXES: [&str; 4] = [
     "?Limit=",
     "?StartIndex=",
     "?Limit=&StartIndex=",
     "?Limit=%20%20&StartIndex=%20",
-    // The aliases are declared separately on the same fields, so they need the same treatment.
-    "?limit=",
-    "?startIndex=",
 ];
 
 /// Query suffixes that carry a value and must keep failing for list endpoints capped at 1000.
-const INVALID_SUFFIXES: [&str; 7] = [
+const INVALID_SUFFIXES: [&str; 5] = [
     "?Limit=abc",
     "?Limit=1.5",
     "?Limit=1001",
     "?StartIndex=abc",
     "?StartIndex=-1",
-    "?limit=abc",
-    "?startIndex=abc",
 ];
+
+/// `Genres`, `Years`, `Studios`, `Persons`, `Library/MediaFolders` and `Users/Query` also declare
+/// the camelCase aliases, so a blank alias needs the same treatment there. `/Items` does not
+/// declare them (that is existing behaviour, not part of this regression).
+const BLANK_ALIAS_SUFFIXES: [&str; 2] = ["?limit=", "?startIndex="];
+const INVALID_ALIAS_SUFFIXES: [&str; 2] = ["?limit=abc", "?startIndex=abc"];
 
 struct TestServer {
     base_url: String,
@@ -240,6 +241,32 @@ async fn assert_invalid_values_are_rejected(
     Ok(())
 }
 
+/// Endpoints that also declare the camelCase aliases must treat a blank alias like a missing key.
+async fn assert_blank_aliases_match_absent(
+    server: &TestServer,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (baseline_status, baseline) = server.get(path).await?;
+    assert_eq!(
+        baseline_status,
+        reqwest::StatusCode::OK,
+        "`{path}` baseline must stay 200"
+    );
+    for suffix in BLANK_ALIAS_SUFFIXES {
+        let (status, body) = server.get(&format!("{path}{suffix}")).await?;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "`{path}{suffix}` must treat the blank alias as absent"
+        );
+        assert_eq!(
+            body, baseline,
+            "`{path}{suffix}` must return the same body as `{path}`"
+        );
+    }
+    assert_invalid_values_are_rejected(server, path, &INVALID_ALIAS_SUFFIXES).await
+}
+
 #[tokio::test]
 async fn emby_facets_treat_blank_limit_and_start_index_as_absent()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -251,6 +278,7 @@ async fn emby_facets_treat_blank_limit_and_start_index_as_absent()
             let path = format!("{prefix}{endpoint}");
             assert_blank_values_match_absent(&server, &path).await?;
             assert_invalid_values_are_rejected(&server, &path, &INVALID_SUFFIXES).await?;
+            assert_blank_aliases_match_absent(&server, &path).await?;
         }
     }
     // A non-empty value still works and is not silently dropped.
@@ -296,6 +324,7 @@ async fn emby_person_folder_and_user_lists_treat_blank_paging_parameters_as_abse
             let path = format!("{prefix}{path}");
             assert_blank_values_match_absent(&server, &path).await?;
             assert_invalid_values_are_rejected(&server, &path, &INVALID_SUFFIXES).await?;
+            assert_blank_aliases_match_absent(&server, &path).await?;
         }
     }
     // `Users/Query` shares the same paging fields but caps `Limit` at 100.
@@ -312,6 +341,7 @@ async fn emby_person_folder_and_user_lists_treat_blank_paging_parameters_as_abse
             ],
         )
         .await?;
+        assert_blank_aliases_match_absent(&server, path).await?;
     }
     Ok(())
 }

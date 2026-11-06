@@ -40,9 +40,17 @@ pub(super) struct EmbyItemsQuery {
     pub(super) season_id: Option<String>,
     #[serde(rename = "SearchTerm", alias = "searchTerm", default)]
     pub(super) search_term: Option<String>,
-    #[serde(rename = "StartIndex", default)]
+    #[serde(
+        rename = "StartIndex",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) start_index: Option<i64>,
-    #[serde(rename = "Limit", default)]
+    #[serde(
+        rename = "Limit",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) limit: Option<i64>,
     #[serde(
         rename = "IsPlayed",
@@ -123,6 +131,24 @@ pub(super) struct EmbyItemCountsQuery {
 }
 
 pub(super) fn deserialize_optional_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    match value.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(value) => value.parse().map(Some).map_err(serde::de::Error::custom),
+    }
+}
+
+/// Reads an optional `i64` query value, treating an empty or whitespace-only value as absent.
+///
+/// Emby clients spell "no explicit value" as `Limit=`/`StartIndex=` when a filter panel is opened
+/// without a paging choice; rejecting that with `400` emptied the Hills media library filter panel
+/// (see `docs/reviews/2026-11-06-hills-yamby-capture.md`). A non-empty value must still parse, so
+/// `Limit=abc`, `Limit=1.5` and negative offsets keep answering `400` exactly as before. This is
+/// the numeric counterpart of [`deserialize_optional_bool`].
+pub(super) fn deserialize_optional_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -735,9 +761,19 @@ pub(super) struct EmbyMediaFoldersQuery {
     pub(super) library_id: Option<String>,
     #[serde(rename = "ParentId", alias = "parentId", default)]
     pub(super) parent_id: Option<String>,
-    #[serde(rename = "StartIndex", alias = "startIndex", default)]
+    #[serde(
+        rename = "StartIndex",
+        alias = "startIndex",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) start_index: Option<i64>,
-    #[serde(rename = "Limit", alias = "limit", default)]
+    #[serde(
+        rename = "Limit",
+        alias = "limit",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) limit: Option<i64>,
 }
 
@@ -852,9 +888,19 @@ pub(super) struct EmbyFacetsQuery {
     pub(super) parent_id: Option<String>,
     #[serde(rename = "IncludeItemTypes", alias = "includeItemTypes", default)]
     pub(super) include_item_types: Option<String>,
-    #[serde(rename = "StartIndex", alias = "startIndex", default)]
+    #[serde(
+        rename = "StartIndex",
+        alias = "startIndex",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) start_index: Option<i64>,
-    #[serde(rename = "Limit", alias = "limit", default)]
+    #[serde(
+        rename = "Limit",
+        alias = "limit",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) limit: Option<i64>,
 }
 

@@ -929,9 +929,19 @@ pub(super) struct EmbyUsersQuery {
         deserialize_with = "deserialize_optional_bool"
     )]
     is_disabled: Option<bool>,
-    #[serde(rename = "StartIndex", alias = "startIndex", default)]
+    #[serde(
+        rename = "StartIndex",
+        alias = "startIndex",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     start_index: Option<i64>,
-    #[serde(rename = "Limit", alias = "limit", default)]
+    #[serde(
+        rename = "Limit",
+        alias = "limit",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     limit: Option<i64>,
     #[serde(
         rename = "NameStartsWithOrGreater",
@@ -2423,7 +2433,12 @@ pub(super) struct EmbyTokenQuery {
     pub(super) tag: Option<String>,
     #[serde(rename = "Fields", default)]
     pub(super) fields: Option<String>,
-    #[serde(rename = "ActiveWithinSeconds", alias = "activeWithinSeconds", default)]
+    #[serde(
+        rename = "ActiveWithinSeconds",
+        alias = "activeWithinSeconds",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) active_within_seconds: Option<i64>,
 }
 
@@ -2586,9 +2601,19 @@ pub(super) struct EmbyPersonsQuery {
     pub(super) parent_id: Option<String>,
     #[serde(rename = "PersonTypes", alias = "personTypes", default)]
     pub(super) person_types: Option<String>,
-    #[serde(rename = "StartIndex", alias = "startIndex", default)]
+    #[serde(
+        rename = "StartIndex",
+        alias = "startIndex",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) start_index: Option<i64>,
-    #[serde(rename = "Limit", alias = "limit", default)]
+    #[serde(
+        rename = "Limit",
+        alias = "limit",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) limit: Option<i64>,
     #[serde(
         rename = "Recursive",
