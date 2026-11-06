@@ -368,12 +368,23 @@ async fn movie_similar_ranks_shared_genres_excludes_self_and_other_types()
         ]
     );
     assert_eq!(body["TotalRecordCount"], 4);
+    // "Mystery Movie" exists and is visible to this user but shares no genre with the source, so
+    // its absence below proves the genre filter instead of a missing fixture.
+    let mystery: Value = harness
+        .client
+        .get(format!("{}/emby/Items/sim-movie-mystery", harness.base_url))
+        .header("X-Emby-Token", &harness.admin_token)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(mystery["Name"], "Mystery Movie");
     // The source item is never part of its own recommendation list, and neither are items of
     // another type or without a shared genre.
     assert!(!names(&body).contains(&"Source Movie"));
     assert!(!names(&body).contains(&"Similar Series"));
     assert!(!names(&body).contains(&"Other Genre"));
-    assert!(!names(&body).contains(&"Drama Mystery Movie"));
+    assert!(!names(&body).contains(&"Mystery Movie"));
     // The list projection keeps user data unless the caller opts out.
     assert!(body["Items"][0].get("UserData").is_some());
     assert_eq!(body["Items"][0]["Id"], "sim-movie-alpha");
@@ -571,6 +582,19 @@ async fn similar_honours_user_data_and_image_type_selection()
         unrestricted["Items"][0]["BackdropImageTags"],
         json!(["sim-alpha-fanart"])
     );
+
+    // An explicitly empty EnableImageTypes= is treated as absent (the same blank-value rule
+    // LUX-888 applies elsewhere): the item is identical to the request without the parameter.
+    let (status, empty_types) = harness
+        .similar(
+            "/emby",
+            "sim-movie-source",
+            "?Limit=1&Fields=ProductionYear&EnableImageTypes=",
+            &harness.admin_token,
+        )
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(empty_types["Items"][0], unrestricted["Items"][0]);
 
     harness.server.abort();
     Ok(())
