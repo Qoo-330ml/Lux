@@ -177,8 +177,10 @@ async fn resolve_media_info_target(
         .as_deref()
         .or(target.item_id.as_deref())
     {
+        // The id may be a 32 hex public media source id, a decimal Emby item id or a UUID.
+        let id = emby_internal_id(&emby_internal_source_id(id));
         database
-            .find_strm_source_by_emby_id(&emby_internal_id(id))
+            .find_strm_source_by_emby_id(&id)
             .await
             .map_err(|_| ())?
     } else {
@@ -927,9 +929,19 @@ pub(super) struct EmbyUsersQuery {
         deserialize_with = "deserialize_optional_bool"
     )]
     is_disabled: Option<bool>,
-    #[serde(rename = "StartIndex", alias = "startIndex", default)]
+    #[serde(
+        rename = "StartIndex",
+        alias = "startIndex",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     start_index: Option<i64>,
-    #[serde(rename = "Limit", alias = "limit", default)]
+    #[serde(
+        rename = "Limit",
+        alias = "limit",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     limit: Option<i64>,
     #[serde(
         rename = "NameStartsWithOrGreater",
@@ -1479,7 +1491,12 @@ pub(super) struct EmbyUpdateUserPasswordRequest {
 pub(super) struct EmbyUserImageQuery {
     #[serde(flatten)]
     auth: EmbyTokenQuery,
-    #[serde(rename = "Index", alias = "index")]
+    #[serde(
+        rename = "Index",
+        alias = "index",
+        default,
+        deserialize_with = "deserialize_optional_i32"
+    )]
     index: Option<i32>,
 }
 
@@ -2421,7 +2438,12 @@ pub(super) struct EmbyTokenQuery {
     pub(super) tag: Option<String>,
     #[serde(rename = "Fields", default)]
     pub(super) fields: Option<String>,
-    #[serde(rename = "ActiveWithinSeconds", alias = "activeWithinSeconds", default)]
+    #[serde(
+        rename = "ActiveWithinSeconds",
+        alias = "activeWithinSeconds",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) active_within_seconds: Option<i64>,
 }
 
@@ -2584,9 +2606,19 @@ pub(super) struct EmbyPersonsQuery {
     pub(super) parent_id: Option<String>,
     #[serde(rename = "PersonTypes", alias = "personTypes", default)]
     pub(super) person_types: Option<String>,
-    #[serde(rename = "StartIndex", alias = "startIndex", default)]
+    #[serde(
+        rename = "StartIndex",
+        alias = "startIndex",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) start_index: Option<i64>,
-    #[serde(rename = "Limit", alias = "limit", default)]
+    #[serde(
+        rename = "Limit",
+        alias = "limit",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) limit: Option<i64>,
     #[serde(
         rename = "Recursive",

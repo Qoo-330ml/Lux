@@ -140,6 +140,9 @@ fi
         let emby_item_id = uuid::Uuid::parse_str(&item_id)
             .map(|uuid| uuid.as_u128().to_string())
             .unwrap_or_else(|_| item_id.clone());
+        let public_source_id = uuid::Uuid::parse_str(&source_id)
+            .map(|uuid| uuid.simple().to_string())
+            .unwrap_or_else(|_| source_id.clone());
         let playback = client
             .get(format!(
                 "http://{address}/Items/{emby_item_id}/PlaybackInfo"
@@ -153,7 +156,7 @@ fi
             .as_str()
             .ok_or("missing signed direct stream URL")?;
         assert!(direct_url.starts_with(&format!(
-            "/Videos/{emby_item_id}/stream?MediaSourceId={source_id}&"
+            "/Videos/{emby_item_id}/stream?MediaSourceId={public_source_id}&"
         )));
         assert!(direct_url.contains("&UserId="));
         assert!(direct_url.contains("&luxPlayback"));

@@ -1102,7 +1102,25 @@ fn parse_emby_playback_info_request(body: &Bytes) -> Result<EmbyPlaybackInfoRequ
     if body.is_empty() || body.iter().all(u8::is_ascii_whitespace) {
         return Ok(EmbyPlaybackInfoRequest::default());
     }
-    serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)
+    let mut request: EmbyPlaybackInfoRequest =
+        serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    // Clients echo the id PlaybackInfo returned; STRM sources hand out a 32 hex public id, so the
+    // stored identifier has to be restored before any source lookup.
+    request.media_source_id = request
+        .media_source_id
+        .as_deref()
+        .map(emby_internal_source_id);
+    Ok(request)
+}
+
+fn deserialize_emby_optional_media_source_id<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    Ok(value.as_deref().map(emby_internal_source_id))
 }
 
 fn deserialize_emby_optional_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
@@ -1371,6 +1389,8 @@ pub(super) struct PlaybackEventRequest {
     #[serde(rename = "ItemId", alias = "itemId", alias = "mediaServerItemId")]
     item_id: String,
     #[serde(
+        default,
+        deserialize_with = "deserialize_emby_optional_media_source_id",
         rename = "MediaSourceId",
         alias = "mediaSourceId",
         alias = "mediaServerMediaSourceId"

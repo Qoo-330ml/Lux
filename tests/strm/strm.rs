@@ -118,6 +118,10 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
             .bind(&path_item_id)
             .fetch_one(database.pool())
             .await?;
+    // STRM sources expose the internal UUID without hyphens: external playback proxies
+    // (QMediaSync/Emby302, NextEmby, Qmby) only accept ids up to 32 characters.
+    let remote_public_source_id = public_source_id(&remote_source_id);
+    let path_public_source_id = public_source_id(&path_source_id);
     let expected_remote_item_path = tokio::fs::canonicalize(root.join("Remote.Movie.2024.strm"))
         .await?
         .to_string_lossy()
@@ -279,7 +283,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     );
     assert_eq!(
         popcorn_detail_body["MediaSources"][0]["Id"],
-        remote_source_id
+        remote_public_source_id
     );
     assert_eq!(popcorn_detail_body["Path"], expected_remote_item_path);
 
@@ -365,7 +369,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     let popcorn_playback_body = popcorn_playback.json::<Value>().await?;
     assert_eq!(
         popcorn_playback_body["MediaSources"][0]["Id"],
-        remote_source_id
+        remote_public_source_id
     );
     assert_eq!(
         popcorn_playback_body["MediaSources"][0]["SupportsDirectPlay"],
@@ -375,7 +379,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         .as_str()
         .ok_or("missing proxy-compatible popcorn direct stream URL")?;
     assert!(popcorn_direct_url.starts_with(&format!("/Videos/{remote_public_item_id}/stream")));
-    assert!(popcorn_direct_url.contains(&format!("MediaSourceId={remote_source_id}")));
+    assert!(popcorn_direct_url.contains(&format!("MediaSourceId={remote_public_source_id}")));
     assert!(popcorn_direct_url.contains("luxPlayback"));
     assert!(popcorn_direct_url.contains(&format!("&api_key={}", token)));
     assert!(!popcorn_direct_url.contains("192.168.10.50"));
@@ -408,7 +412,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         .as_str()
         .ok_or("missing profiled direct stream URL")?;
     assert!(profiled_direct_url.starts_with(&format!("/Videos/{remote_public_item_id}/stream")));
-    assert!(profiled_direct_url.contains(&format!("MediaSourceId={remote_source_id}")));
+    assert!(profiled_direct_url.contains(&format!("MediaSourceId={remote_public_source_id}")));
     assert!(profiled_direct_url.contains(&format!("&api_key={token}")));
     assert!(profiled_direct_url.contains("&UserId=admin"));
     assert!(profiled_direct_url.contains("luxPlayback"));
@@ -438,7 +442,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         .as_str()
         .ok_or("missing proxy-compatible remote direct stream URL")?;
     assert!(remote_direct_url.starts_with(&format!("/Videos/{remote_public_item_id}/stream")));
-    assert!(remote_direct_url.contains(&format!("MediaSourceId={remote_source_id}")));
+    assert!(remote_direct_url.contains(&format!("MediaSourceId={remote_public_source_id}")));
     assert!(remote_direct_url.contains("&PlaySessionId="));
     assert!(remote_direct_url.contains("&static=true"));
     assert!(remote_direct_url.contains("&UserId=admin"));
@@ -483,7 +487,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         .as_str()
         .ok_or("missing proxy-compatible path direct stream URL")?;
     assert!(path_direct_url.starts_with(&format!("/Videos/{path_public_item_id}/stream")));
-    assert!(path_direct_url.contains(&format!("MediaSourceId={path_source_id}")));
+    assert!(path_direct_url.contains(&format!("MediaSourceId={path_public_source_id}")));
     assert!(path_direct_url.contains("luxPlayback"));
     assert!(path_direct_url.contains(&format!("&api_key={}", token)));
     assert!(!path_direct_url.contains("targets/movie"));
@@ -570,6 +574,50 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     );
     assert_eq!(
         numeric_senplayer_stream.headers()[reqwest::header::LOCATION],
+        expected_remote_location.as_str()
+    );
+
+    // QMediaSync's Emby302 resolves a stream request by re-reading PlaybackInfo with the
+    // MediaSourceId the client echoed, and it only accepts ids up to 32 characters.
+    let public_source_playback = no_redirect_client
+        .post(format!(
+            "http://{address}/Items/{remote_public_item_id}/PlaybackInfo"
+        ))
+        .query(&[
+            ("MediaSourceId", remote_public_source_id.as_str()),
+            ("IsPlayback", "false"),
+            ("reqformat", "json"),
+        ])
+        .header("X-Emby-Authorization", format!("Emby Token=\"{token}\""))
+        .json(&json!({"DeviceProfile": {}}))
+        .send()
+        .await?;
+    assert_eq!(public_source_playback.status(), reqwest::StatusCode::OK);
+    let public_source_playback_body = public_source_playback.json::<Value>().await?;
+    assert_eq!(
+        public_source_playback_body["MediaSources"][0]["Id"],
+        remote_public_source_id
+    );
+    assert_eq!(
+        public_source_playback_body["MediaSources"][0]["Path"],
+        remote_target
+    );
+    assert_eq!(remote_public_source_id.len(), 32);
+
+    let public_source_stream = no_redirect_client
+        .get(format!(
+            "http://{address}/Videos/{remote_public_item_id}/stream"
+        ))
+        .query(&[
+            ("MediaSourceId", remote_public_source_id.as_str()),
+            ("api_key", token.as_str()),
+        ])
+        .header(reqwest::header::USER_AGENT, player_user_agent)
+        .send()
+        .await?;
+    assert_eq!(public_source_stream.status(), reqwest::StatusCode::FOUND);
+    assert_eq!(
+        public_source_stream.headers()[reqwest::header::LOCATION],
         expected_remote_location.as_str()
     );
 
@@ -689,7 +737,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     assert_eq!(source_id_body["Items"][0]["Id"], remote_public_item_id);
     assert_eq!(
         source_id_body["Items"][0]["MediaSources"][0]["Id"],
-        remote_source_id
+        remote_public_source_id
     );
     assert_eq!(
         source_id_body["Items"][0]["MediaSources"][0]["Path"],
@@ -705,12 +753,30 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     assert_eq!(source_id_detail_body["Id"], remote_public_item_id);
     assert_eq!(
         source_id_detail_body["MediaSources"][0]["Id"],
-        remote_source_id
+        remote_public_source_id
     );
     assert_eq!(
         source_id_detail_body["MediaSources"][0]["Path"],
         remote_target
     );
+    let public_source_id_items = no_redirect_client
+        .get(format!("http://{address}/Items"))
+        .query(&[
+            ("Ids", remote_public_source_id.as_str()),
+            ("Fields", "Path,MediaSources"),
+            ("Limit", "1"),
+            ("api_key", token.as_str()),
+        ])
+        .send()
+        .await?;
+    assert_eq!(public_source_id_items.status(), reqwest::StatusCode::OK);
+    let public_source_id_items_body = public_source_id_items.json::<Value>().await?;
+    assert_eq!(public_source_id_items_body["TotalRecordCount"], 1);
+    assert_eq!(
+        public_source_id_items_body["Items"][0]["Id"],
+        remote_public_item_id
+    );
+
     assert!(
         source_id_detail_body.get("People").is_none(),
         "media-source ID compatibility lookups should not build the heavy cast payload"
@@ -754,4 +820,12 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     server.abort();
     proxy_server.abort();
     Ok(())
+}
+
+/// Emby media source ids are 32 lowercase hex characters; STRM sources publish the stored UUID
+/// without hyphens, which is what external 302 proxies require.
+fn public_source_id(id: &str) -> String {
+    uuid::Uuid::parse_str(id)
+        .map(|uuid| uuid.simple().to_string())
+        .unwrap_or_else(|_| id.to_owned())
 }

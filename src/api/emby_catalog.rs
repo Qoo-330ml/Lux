@@ -40,9 +40,17 @@ pub(super) struct EmbyItemsQuery {
     pub(super) season_id: Option<String>,
     #[serde(rename = "SearchTerm", alias = "searchTerm", default)]
     pub(super) search_term: Option<String>,
-    #[serde(rename = "StartIndex", default)]
+    #[serde(
+        rename = "StartIndex",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) start_index: Option<i64>,
-    #[serde(rename = "Limit", default)]
+    #[serde(
+        rename = "Limit",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) limit: Option<i64>,
     #[serde(
         rename = "IsPlayed",
@@ -122,15 +130,50 @@ pub(super) struct EmbyItemCountsQuery {
     pub(super) is_favorite: Option<bool>,
 }
 
-pub(super) fn deserialize_optional_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+/// Shared body of the blank-tolerant query helpers: an empty or whitespace-only value means the
+/// client sent no value at all, so it deserializes to `None`. Any other value must parse, and a
+/// parse failure stays a deserialization error (which the `Query` extractor answers with `400`).
+fn blank_optional_value<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
 {
     let value = Option::<String>::deserialize(deserializer)?;
     match value.as_deref().map(str::trim) {
         None | Some("") => Ok(None),
         Some(value) => value.parse().map(Some).map_err(serde::de::Error::custom),
     }
+}
+
+/// Reads an optional boolean query value, treating an empty or whitespace-only value as absent.
+pub(super) fn deserialize_optional_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    blank_optional_value(deserializer)
+}
+
+/// Reads an optional `i64` query value, treating an empty or whitespace-only value as absent.
+///
+/// Emby clients spell "no explicit value" as `Limit=`/`StartIndex=` when a filter panel is opened
+/// without a paging choice; rejecting that with `400` emptied the Hills media library filter panel
+/// (see `docs/reviews/2026-11-06-hills-yamby-capture.md`). A non-empty value must still parse, so
+/// `Limit=abc`, `Limit=1.5` and negative offsets keep answering `400` exactly as before. This is
+/// the numeric counterpart of [`deserialize_optional_bool`] and shares its rule.
+pub(super) fn deserialize_optional_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    blank_optional_value(deserializer)
+}
+
+/// `i32` variant of [`deserialize_optional_i64`], for `Index`-style query values.
+pub(super) fn deserialize_optional_i32<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    blank_optional_value(deserializer)
 }
 
 fn deserialize_optional_emby_timestamp<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
@@ -170,6 +213,36 @@ pub(super) fn emby_internal_id(id: &str) -> String {
         && let Ok(value) = id.parse::<u128>()
     {
         return Uuid::from_u128(value).to_string();
+    }
+    id.to_owned()
+}
+
+/// Emby media source ids are 32 lowercase hex characters. External playback proxies
+/// (QMediaSync's Emby302, NextEmby, Qmby, emby2Alist) validate that shape and reject longer ids, so
+/// STRM sources expose the internal UUID without hyphens. The mapping is a reversible bijection, so
+/// no lookup table is needed and a UUID keeps resolving after the switch. Local files keep the
+/// internal UUID: their identifiers only ever reach Lux's own HLS/transcoding code, and leaving
+/// them untouched keeps that surface stable.
+pub(super) fn emby_public_source_id(id: &str, source_kind: &str) -> String {
+    let id = id.trim();
+    if !source_kind.eq_ignore_ascii_case("STRM_URL") {
+        return id.to_owned();
+    }
+    id.parse::<Uuid>()
+        .map(|uuid| uuid.simple().to_string())
+        .unwrap_or_else(|_| id.to_owned())
+}
+
+/// Resolves an Emby media source id back to the stored identifier. The 32 hex public form and the
+/// historical UUID both resolve, so signed URLs issued before an upgrade, cached PlaybackInfo
+/// payloads and clients that got a UUID from `/Sessions` stay valid.
+pub(super) fn emby_internal_source_id(id: &str) -> String {
+    let id = id.trim();
+    if id.len() == 32
+        && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && let Ok(uuid) = Uuid::parse_str(id)
+    {
+        return uuid.to_string();
     }
     id.to_owned()
 }
@@ -399,9 +472,11 @@ pub(super) fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter 
         .as_ref()
         .map(|ids| ids.iter().map(|id| emby_internal_id(id)).collect());
     // MediaSourceId is a separate Emby identifier and is intentionally not
-    // encoded as a numeric item id. Keeping the raw candidates here preserves
-    // the existing `GET /Items?Ids=<MediaSourceId>` compatibility lookup.
-    filter.media_source_ids = ids;
+    // encoded as a numeric item id, so the candidates are resolved back to the
+    // stored identifier before the `GET /Items?Ids=<MediaSourceId>` lookup.
+    filter.media_source_ids = ids
+        .as_ref()
+        .map(|ids| ids.iter().map(|id| emby_internal_source_id(id)).collect());
     filter.provider_id_equals = query
         .any_provider_id_equals
         .as_deref()
@@ -442,8 +517,13 @@ pub(super) fn emby_compat_media_source_id<'a>(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .find(|id| {
+            let requested = emby_internal_source_id(id);
             page.items.iter().any(|item| {
-                item.id != *id && item.media_sources.iter().any(|source| source.id == *id)
+                item.id != requested
+                    && item
+                        .media_sources
+                        .iter()
+                        .any(|source| source.id == requested)
             })
         })
 }
@@ -698,9 +778,19 @@ pub(super) struct EmbyMediaFoldersQuery {
     pub(super) library_id: Option<String>,
     #[serde(rename = "ParentId", alias = "parentId", default)]
     pub(super) parent_id: Option<String>,
-    #[serde(rename = "StartIndex", alias = "startIndex", default)]
+    #[serde(
+        rename = "StartIndex",
+        alias = "startIndex",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) start_index: Option<i64>,
-    #[serde(rename = "Limit", alias = "limit", default)]
+    #[serde(
+        rename = "Limit",
+        alias = "limit",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) limit: Option<i64>,
 }
 
@@ -815,9 +905,19 @@ pub(super) struct EmbyFacetsQuery {
     pub(super) parent_id: Option<String>,
     #[serde(rename = "IncludeItemTypes", alias = "includeItemTypes", default)]
     pub(super) include_item_types: Option<String>,
-    #[serde(rename = "StartIndex", alias = "startIndex", default)]
+    #[serde(
+        rename = "StartIndex",
+        alias = "startIndex",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) start_index: Option<i64>,
-    #[serde(rename = "Limit", alias = "limit", default)]
+    #[serde(
+        rename = "Limit",
+        alias = "limit",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) limit: Option<i64>,
 }
 
@@ -2356,14 +2456,17 @@ pub(super) async fn emby_single_id_lookup_response(
 ) -> Option<Response> {
     let requested_id = emby_single_id_lookup(query)?;
     let internal_item_id = emby_internal_id(requested_id);
+    // `Ids` may name the media source instead of the item; the stored identifier is what the
+    // catalog and the preferred-source ordering compare against.
+    let requested_source_id = emby_internal_source_id(requested_id);
     let catalog = state.catalog();
     let (item, preferred_source_id) = match catalog.find_item(principal, &internal_item_id).await {
         Ok(Some(item)) => (Some(item), None),
         Ok(None) => match catalog
-            .find_item_by_media_source_id(principal, requested_id)
+            .find_item_by_media_source_id(principal, &requested_source_id)
             .await
         {
-            Ok(item) => (item, Some(requested_id)),
+            Ok(item) => (item, Some(requested_source_id.clone())),
             Err(CatalogError::Storage(_)) => {
                 return Some(StatusCode::SERVICE_UNAVAILABLE.into_response());
             }
@@ -2430,9 +2533,14 @@ pub(super) async fn emby_single_id_lookup_response(
     );
     if let Some(source_id) = preferred_source_id
         && let Some(Value::Array(sources)) = item_json.get_mut("MediaSources")
-        && let Some(index) = sources
-            .iter()
-            .position(|source| source.get("Id").and_then(Value::as_str) == Some(source_id))
+        && let Some(index) = sources.iter().position(|source| {
+            // The DTO may carry the 32 hex public id for STRM sources while the request named the
+            // stored UUID (or the other way around), so compare on the stored identifier.
+            source
+                .get("Id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id == source_id || emby_internal_source_id(id) == source_id)
+        })
     {
         let source = sources.remove(index);
         sources.insert(0, source);
@@ -2960,7 +3068,7 @@ pub(super) async fn emby_item_response(
         match catalog.find_item(principal, &internal_item_id).await {
             Ok(Some(item)) => (Some(item), false),
             Ok(None) => match catalog
-                .find_item_by_media_source_id(principal, item_id)
+                .find_item_by_media_source_id(principal, &emby_internal_source_id(item_id))
                 .await
             {
                 Ok(item) => (item, true),
@@ -4702,7 +4810,7 @@ pub(super) fn emby_media_source_json_with_resolver_and_chapters(
         })
         .unwrap_or("Default");
     let mut value = json!({
-        "Id": source.id,
+        "Id": emby_public_source_id(&source.id, &source.source_kind),
         "ItemId": public_item_id,
         "Name": media_source_name,
         "Edition": source.edition_name,
@@ -4809,6 +4917,7 @@ pub(super) fn emby_media_source_stream_url_parts(
         })
         .map(|container| format!(".{container}"))
         .unwrap_or_default();
+    let source_id = emby_public_source_id(source_id, source_kind);
     format!("/Videos/{item_id}/stream{stream_suffix}?MediaSourceId={source_id}")
 }
 
@@ -5017,7 +5126,7 @@ fn emby_insert_subtitle_delivery(
     value["DeliveryUrl"] = Value::String(format!(
         "/Videos/{}/{}/Subtitles/{}/Stream{suffix}",
         percent_encode_filename(&emby_public_id(item_id)),
-        percent_encode_filename(&source.id),
+        percent_encode_filename(&emby_public_source_id(&source.id, &source.source_kind)),
         stream.index,
     ));
 }
@@ -6411,6 +6520,71 @@ mod tests {
                 assert!(stream.get(key).is_none(), "{index} {key}");
             }
         }
+    }
+
+    #[test]
+    fn strm_media_source_ids_are_32_hex_so_external_proxies_can_parse_them() {
+        let mut source = catalog_source(None, Vec::new());
+        source.id = "0195f0a2-7c3b-7d21-9e44-0a1b2c3d4e5f".to_owned();
+        source.source_kind = "STRM_URL".to_owned();
+        source.external_url = Some("http://example.invalid/115/url/movie.mkv".to_owned());
+        let json = emby_media_source_json_with_resolver("item-1", &source, false, false);
+        let public_id = json["Id"].as_str().unwrap_or("");
+        assert_eq!(public_id.len(), 32, "{public_id}");
+        assert!(
+            public_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "{public_id}"
+        );
+        assert_eq!(super::emby_internal_source_id(public_id), source.id);
+    }
+
+    #[test]
+    fn local_media_source_ids_stay_internal_uuids() {
+        let mut source = catalog_source(None, Vec::new());
+        source.id = "0195f0a2-7c3b-7d21-9e44-0a1b2c3d4e5f".to_owned();
+        let json = emby_media_source_json_with_resolver("item-1", &source, false, false);
+        assert_eq!(json["Id"], source.id);
+    }
+
+    #[test]
+    fn internal_source_id_accepts_public_hex_uuid_and_foreign_identifiers() {
+        let uuid = "0195f0a2-7c3b-7d21-9e44-0a1b2c3d4e5f";
+        let public = super::emby_public_source_id(uuid, "STRM_URL");
+        assert_eq!(public.len(), 32);
+        assert_eq!(super::emby_internal_source_id(&public), uuid);
+        // Historical UUID ids and synthetic test ids must keep resolving unchanged.
+        assert_eq!(super::emby_internal_source_id(uuid), uuid);
+        assert_eq!(super::emby_internal_source_id("source-1"), "source-1");
+        assert_eq!(
+            super::emby_internal_source_id("src id/with?odd"),
+            "src id/with?odd"
+        );
+        // A decimal item id is not a media source id and must survive untouched.
+        assert_eq!(
+            super::emby_internal_source_id("123456789012345678901234567890123456"),
+            "123456789012345678901234567890123456"
+        );
+    }
+
+    #[test]
+    fn strm_direct_stream_and_subtitle_urls_use_the_32_hex_source_id() {
+        let mut source = catalog_source(None, vec![subtitle_stream(1, Some("srt"), true)]);
+        source.id = "0195f0a2-7c3b-7d21-9e44-0a1b2c3d4e5f".to_owned();
+        source.source_kind = "STRM_URL".to_owned();
+        source.external_url = Some("http://example.invalid/movie.mkv".to_owned());
+        let json = emby_media_source_json_with_resolver("item-1", &source, true, false);
+        let direct_url = json["DirectStreamUrl"].as_str().unwrap_or("");
+        let public_id = json["Id"].as_str().unwrap_or("");
+        assert!(
+            direct_url.contains(&format!("MediaSourceId={public_id}")),
+            "{direct_url}"
+        );
+        assert!(!direct_url.contains("0195f0a2-7c3b"), "{direct_url}");
+        let delivery_url = json["MediaStreams"][0]["DeliveryUrl"]
+            .as_str()
+            .unwrap_or("");
+        assert!(delivery_url.contains(public_id), "{delivery_url}");
+        assert!(!delivery_url.contains("0195f0a2-7c3b"), "{delivery_url}");
     }
 
     #[test]

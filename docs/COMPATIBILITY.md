@@ -1,5 +1,58 @@
 # Lux 客户端兼容性矩阵
 
+## LUX-888 Emby 查询端点容忍空的可选数值/布尔参数（2026-11-06）
+
+分级：**真机抓包确认（仅“空 `Limit=` 会 400”这一条）+ 其余静态推断**。
+
+真机依据只有一条：Hills 打开媒体库筛选面板时对 `/Genres`、`/Years`、`/Studios` 发送了**空的 `Limit=`**，
+Lux 返回 `400`（`Failed to deserialize query string: Limit: cannot parse integer from empty string`），把
+`Limit=` 去掉后 `/Genres` 返回 `200`（`docs/reviews/2026-11-06-hills-yamby-capture.md` §2 问题 3）。该报告
+没有保留完整查询串（原始 `.tmp/capture/proxy.log` 未提交），因此**空的 `StartIndex=` 与其它端点是否也发
+空值没有实抓证据**，属于静态推断：它们与 `Limit` 走同一套 `Option<i64>` 查询反序列化，客户端只要按同一
+模板拼参数就会同样 400。**本修复尚未部署，也没有在 Hills/Yamby 真机上复测修复后的筛选面板。**
+
+- 规则：Emby 查询端点里可选数值/布尔参数，**空串或纯空白按“未提供”处理**；这与 2026-08-23 AfuseKt 空的
+  `IsFavorite=` 条目是同一套做法。实现上只有一份判定逻辑：私有 `blank_optional_value<T>` 供
+  `deserialize_optional_bool`、`deserialize_optional_i64`、`deserialize_optional_i32` 三个适配器共用，
+  没有按结构体各写一份。
+- 非空值的校验基本不变：`Limit=abc`、`Limit=1.5`、`StartIndex=abc`、`Index=abc`、`Hide=abc` 仍在反序列化
+  阶段 `400`；`StartIndex=-1` 仍因负偏移 `400`；超过服务端上限仍 `400`（列表端点 `Limit` 上限 1000、
+  `Users/Query` 为 100、`Sessions` 的 `ActiveWithinSeconds` 为 30 天即 2592000 秒）；各端点对 `Limit=0` 的
+  既有规则**逐端点保持原样**（例如 `/Library/MediaFolders` 的 `Limit=0` 仍是 `400`，其他端点各按自己的默认值
+  或纯计数语义）；`Hide` 空值只表示“没提供”，查询与 JSON body 都没给出时仍然是 `400`。
+- 唯一的放宽之外的小差异：共享判定先 `trim()` 再解析，所以带前后空白的数值（如 `Limit=%2010`、
+  `StartIndex=%201`、`Hide=%20true`）此前会 `400`，现在按去空白后的值解析并生效。这是本次引入的行为变化，
+  与“空值按未提供”出自同一处实现；该放宽没有专门的回归测试，也未评估其对其他客户端的影响。
+
+### 穷尽检查清单：Emby 路由用到的查询类型
+
+逐个核对 `src/api/` 下所有 Emby 查询类型（包含 `flatten` 的共享鉴权结构体）的可选数值/布尔字段：
+
+| 查询类型 | 覆盖路由 | 可选数值/布尔参数 | 处理 |
+|---|---|---|---|
+| `EmbyItemsQuery` | `/Items`、`/Users/{userId}/Items` 及其 `Resume`/`Latest`/`NextUp`/`FavoriteItems`、`Shows/NextUp`、`Shows/{seriesId}/Seasons`、`Shows/{seriesId}/Episodes`、`Items/{itemId}/Children` | `StartIndex`、`Limit` | **改**：空值等价未传 |
+| `EmbyMediaFoldersQuery` | `/Library/MediaFolders` | `StartIndex`、`Limit` | **改** |
+| `EmbyFacetsQuery` | `/Genres`、`/Studios`、`/Years` | `StartIndex`、`Limit` | **改**（真机证据所在端点） |
+| `EmbyPersonsQuery` | `/Persons` | `StartIndex`、`Limit` | **改** |
+| `EmbyUsersQuery` | `/Users/Query` | `StartIndex`、`Limit` | **改** |
+| `EmbyTokenQuery` | `/Sessions` 以及所有 `flatten` 它的 Emby 查询 | `ActiveWithinSeconds` | **改** |
+| `EmbySearchQuery` | `/Search/Hints` | `StartIndex`、`Limit` | **改**（返工补：字段原先没有 `default`，已补上并用测试证明不传参数仍 `200`） |
+| `EmbyUserImageQuery` | `/Users/{userId}/Images/{imageType}`（GET/HEAD/POST/DELETE）与带索引变体 | `Index` | **改**（返工补：新增 `deserialize_optional_i32`） |
+| `ResumeVisibilityQuery` | `POST /Users/{userId}/Items/{itemId}/HideFromResume` | `Hide` | **改**（返工补：改用共享的 `deserialize_optional_bool`，不再手写解析） |
+| `EmbyImageDisplayQuery` | 条目/人物/用户图片路由 | `maxWidth`、`maxHeight`、`width`、`height`、`quality` | **不改**：这些参数由 `RawQuery` 手写解析，非数字、空值与 `0` 本来就按“未提供”处理，从不返回 `400` |
+| `EmbyStreamQuery` | `/Videos/.../stream*`、`original.strm` | `luxPlaybackExpires`（签名票据里的过期时间） | **不改**：`value.parse().ok()`，空值/非法值都落成 `None`；票据缺失或不匹配走既有的鉴权失败分支，不是 `400` |
+| `EmbyTranscodingQuery` | `/Videos/{itemId}/master.m3u8`、`/Videos/{itemId}/transcoding/{sessionId}/{asset}` | `luxPlaybackExpires` | **不改**：同上，`parse().ok()` |
+| `EmbyPlaybackInfoRequest` 的查询合并 | `GET`/`POST /Items/{itemId}/PlaybackInfo` 上的查询参数 | `MaxStreamingBitrate`、`StartTimeTicks`、`EnableDirectPlay`、`EnableDirectStream`、`EnableTranscoding`、`AllowVideoStreamCopy`、`AllowAudioStreamCopy` | **不改**：`apply_query_parameters` 用 `if let Ok(value) = value.parse::<i64>()` 与 `parse_emby_bool` 逐个判断，空值直接被忽略 |
+| `EmbyItemCountsQuery`、`EmbyDeleteItemQuery`、`EmbyPersonQuery`、`EmbyRefreshQuery`、`EmbyDisplayPreferencesQuery`、`EmbyCreateUserQuery`、`EmbyCollectionMutationQuery`、`DanmakuQuery` | 各自路由 | 没有自己的可选数值字段 | **不改**：无该问题；`flatten` 进来的 `ActiveWithinSeconds` 随 `EmbyTokenQuery` 一起容错 |
+| （未声明） | 任意 Emby 路由 | `ImageTypeLimit` | **不改**：Lux 的 Emby 查询类型根本没有声明这个键，`Query` 反序列化会忽略未知参数，因此空值与非空值都不会 `400` |
+
+边界：本次只改 Emby 兼容层；Lux `/api/v1` 的 `LuxPageQuery`/`LuxSearchQuery` 等查询类型保持原有严格解析。
+`/Items` 的 `Limit`/`StartIndex` 依旧不声明 camelCase 别名（既有行为，与本次空值问题无关）。
+
+- 自动化：`cargo test --locked --test emby emby_empty_numeric_params::` 7/7，逐端点覆盖“不传参数仍 200”
+  “空值等价未传”“非法值仍 400”“超过上限仍 400”，根路径与 `/emby` 前缀各一遍。该测试只证明 Lux 服务端
+  合同，不代表任何真实客户端已确认。
+
 ## LUX-887 Emby `Filters=IsResumable` / `Filters=IsFavorite`（2026-11-06）
 
 分级：**推断**。依据只有两条：Hills 1.8.0 的二进制里存在 `IsResumable` 字符串，以及标准 Emby 的
@@ -1600,3 +1653,48 @@ Safari 的 4K HEVC 与 Edge 的 720p VP9、480p AV1、4K HEVC、10-bit H.264（a
 
 未覆盖：Firefox、iOS Safari、真实 GPU 硬件转码、长时间 HLS 稳定性、B 帧 HEVC 在 remux 模式下的时间戳回序（remux
 把 Matroska PTS 同时当 dts/cts）。测试实例对“同时播放数”有上限（超出返回 429 `RateLimited`），自动化脚本异常退出后会话需等待过期。
+
+## Emby 媒体源 id：STRM 源改发 32 位十六进制（QMediaSync / Emby302 兼容，2026-11-02）
+
+背景：QMediaSync 的 Emby302 反代（`emby302/service/emby/media.go` 的 `resolveMediaSourceId`）用
+`len(MediaSourceId) <= 32` 判定“源服务器原始 id”，否则按 `[[_]]` 解析转码合成 id，两条都不命中就报
+`MediaSourceId 格式错误`。Lux 的 `media_sources.id` 是 36 字符 UUID，因此该反代在扫码解析阶段就失败，
+并按 `proxy-error-strategy: origin` 静默回源：视频能播，但 115 直链 302 失效、媒体字节全部经反代主机中转。
+本次只改 Lux，不改第三方：把 `MediaSources[].Id` 的**线上表示**收敛到 Emby 原生的 32 位小写十六进制。
+
+### 规则
+
+- **STRM 源**（`source_kind = 'STRM_URL'`，URL/Path 型目标都算）下发 `Uuid::simple()`：内部 UUID 去横线，
+  32 位小写十六进制，与内部 UUID 互为双射，不建映射表、不迁移数据库。
+- **LOCAL_FILE 源保持内部 UUID**：它们的 id 只流经 Lux 自己的 HLS/转码路径，改形态没有收益。
+- 所有客户端输入边界统一解码回存储 UUID，两种形态都接受：`PlaybackInfo` 的 query 与 body、
+  `?MediaSourceId=`、`/Videos/{item}/{source}/stream[.ext]`、字幕 `.../Subtitles/...` 路径参数、
+  `/Items?Ids=`、`/Items/{id}` 的媒体源回查、`/Sessions/Playing` 进度回调、插件 `POST /Items/SyncMediaInfo`。
+- 签名票据仍以**内部 UUID** 计算 HMAC，只在 URL 上写公有 id：升级前签发、仍在 12 小时 TTL 内的 URL 继续有效。
+- `/Sessions` 的 `MediaSourceId` 仍是内部 UUID（只读展示，不参与任何反查；客户端若回传也会被解码）。
+
+### 风险与验收（逐条必须验证）
+
+1. **漏改入口即 404，不会静默降级。** `emby_ordered_playback_sources` 用 `?` 取匹配结果，任何未解码的入口都会让
+   PlaybackInfo 直接 404。新增/修改媒体源 id 相关代码时，必须同时改“下发”和“解析”两侧。
+2. **旧 UUID 形态必须继续可用。** 覆盖：带 UUID 的 `MediaSourceId` 查询、`/Items?Ids=<UUID>`、
+   `/Items/<UUID>` 媒体源回查、升级前签发的 `DirectStreamUrl`、`/Sessions` 回传的 UUID。
+3. **混合条目会出现两种 id 形态。** 同一部片子同时有本地版与网盘版时，`MediaSources[]` 里 32 位十六进制与 UUID
+   并存；消费方必须把 id 当不透明字符串（Emby 契约本就如此），不能按长度分支。
+4. **十进制 item id 与 32 位全数字公有 id 的歧义。** `/Items?Ids=` 同时承载 item id 与媒体源 id：十进制串优先按
+   item id 解析，媒体源查找另有原始候选兜底；32 位全数字串与某个媒体源 UUID 完全相等的概率可忽略，测试已覆盖
+   “十进制 item id 原样返回”。
+5. **HLS / 转码 / 管理 API 不变。** `/Videos/{item}/master.m3u8`、`/Videos/{item}/transcoding/...` 与
+   admin 的 `mediaSourceId` 仍使用内部 UUID，LOCAL_FILE 行为零变化。
+
+### 验证
+
+- 单元测试：`emby_public_source_id`/`emby_internal_source_id` 双射与直传兼容、STRM 与 LOCAL 的 `Id` 形态、
+  `DirectStreamUrl` 与字幕 `DeliveryUrl` 使用公有 id（`cargo test --locked --lib emby_catalog::`，48 项通过）。
+- 集成测试：`--test strm`（42 项，含用公有 id 请求 PlaybackInfo/stream/`Ids=` 以及 UUID 回归）、`--test playback`
+  （33 项）、`--test emby`（43 项）、`--test api_web`（55 项通过）。
+- 已知与本改动无关的基线失败：`api_web::remote::forwarded_headers_are_only_honoured_for_trusted_proxies`、
+  `api_web::web_playback::broken_hardware_encoder_falls_back_to_software_transcoding`、
+  `plugins::danmaku::…`、`plugins::media_info_config_api::…`（在本机未改动的基线上同样失败）。
+- 真机交接（未在本机执行）：把 Emby302 的 `proxy-error-strategy` 置为 `reject` 后播放 115 STRM，日志中不应再出现
+  `解析 MediaSource 失败 … MediaSourceId 格式错误`，反代主机网卡不应出现媒体字节流量。
