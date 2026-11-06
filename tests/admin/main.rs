@@ -9,6 +9,7 @@ mod admin_performance_metrics;
 mod admin_settings;
 mod admin_user_invitations;
 mod log_export;
+mod lux_websocket;
 mod observability;
 mod user_event_scoping;
 mod user_query_events;
