@@ -16,7 +16,9 @@ ts-bindings = ["dep:ts-rs"]
 [dependencies]
 argon2 = "0.5.3"
 ab_glyph = "0.2"
-axum = "0.8"
+# `ws` backs the Emby `/embywebsocket` endpoint (LUX-891). It only adds
+# `tokio-tungstenite` (already axum's own WebSocket dependency), not a separate stack.
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 httpdate = "1"
@@ -69,6 +71,12 @@ tikv-jemallocator = "0.6"
 
 [dev-dependencies]
 tempfile = "3"
+# The test client for `/embywebsocket`. Same version axum's `ws` feature already builds, so the
+# dependency graph gains no second WebSocket stack.
+tokio-tungstenite = "0.29"
+# `StreamExt::next`/`SinkExt::send` to drive that client. `futures-util` is already in the lock
+# through axum and tokio-tungstenite (same 0.3.x version), so this adds no crate to the graph.
+futures-util = "0.3"
 
 [lib]
 name = "luxd"
