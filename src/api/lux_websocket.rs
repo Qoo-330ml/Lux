@@ -451,12 +451,13 @@ fn parse_origin_authority(value: &str) -> Option<String> {
         return None;
     }
     let (scheme, rest) = value.split_once("://")?;
-    let default_port = match scheme.to_ascii_lowercase().as_str() {
-        "http" => 80,
-        "https" => 443,
-        _ => return None,
-    };
-    normalize_authority(rest, &[default_port])
+    // `Host` carries no scheme and the comparison ignores the scheme, so both 80 and 443 are
+    // "default" on either side; only the scheme name itself is validated here. Dropping just the
+    // origin's own default port would reject `Host: nas:443` + `Origin: http://nas:443`.
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return None;
+    }
+    normalize_authority(rest, &[80, 443])
 }
 
 /// The request authority: `Host` when present, otherwise the URI authority. A malformed or repeated
@@ -963,6 +964,34 @@ mod tests {
                 parse_origin_authority(value),
                 None,
                 "`{value}` is not a single serialized http(s) origin"
+            );
+        }
+    }
+
+    #[test]
+    fn origin_normalization_drops_both_default_ports_on_either_side() {
+        // `Host` carries no scheme and the comparison ignores the scheme, so both sides must treat
+        // 80 and 443 as "no port". Otherwise `Host: nas:443` + `Origin: http://nas:443` is rejected
+        // even though it is same-origin.
+        assert_eq!(
+            parse_origin_authority("http://nas:443").as_deref(),
+            Some("nas")
+        );
+        assert_eq!(
+            parse_origin_authority("https://nas:80").as_deref(),
+            Some("nas")
+        );
+        for (origin_value, host) in [
+            ("http://nas:443", "nas:443"),
+            ("https://nas:80", "nas:80"),
+            ("http://nas:443", "nas"),
+            ("https://nas:80", "nas"),
+        ] {
+            let request = headers(&[("origin", origin_value), ("host", host)]);
+            assert_eq!(
+                origin(&request),
+                OriginCheck::Allowed,
+                "`{origin_value}` must match host `{host}`"
             );
         }
     }

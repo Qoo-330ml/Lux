@@ -326,11 +326,13 @@ LUX-891 合并后已按合并后的实测核对：`cargo test --locked --test em
 重校验 5xx 不断连；另外两例来自审查返工：45 s 重校验不写 `user_devices`、`drain_lux_websocket_connections`
 在连接超出排空时间时返回 `false`。
 
-同一分支的单元测试在 `src/api/lux_websocket.rs`：`cargo test --locked --lib lux_websocket::` 共 **14** 例
+同一分支的单元测试在 `src/api/lux_websocket.rs`：`cargo test --locked --lib lux_websocket::` 共 **15** 例
 （Origin 解析与归一化、信封逐字渲染、`itemId` 256 字符边界、`{"type":"ping"}` 识别、升级 token 判定、
 ADR-054 的预算与定时器默认值（用户 128/16、管理 64/8、4 KiB、25 s/120 s/45 s/10 s，以及 Emby 仍是
-32/4 与 8 KiB），以及用真实 hub 制造 `Lagged` 后降级为 `home` / `all` 的映射）。`cargo test --locked
---lib websocket::` 随之从 10 例变为 **24** 例（10 例共享基础设施 + 本任务 14 例）。
+32/4 与 8 KiB），以及用真实 hub 制造 `Lagged` 后降级为 `home` / `all` 的映射；第 15 例是 LUX-896 分支的
+P3 修复新增的 `origin_normalization_drops_both_default_ports_on_either_side`，锁定 `Origin` 与 `Host` 两侧
+都把 80/443 视为默认端口）。`cargo test --locked --lib websocket::` 随之从 10 例变为 **25** 例（10 例共享
+基础设施 + 本任务 15 例）。
 
 模块内的等待方式（返工后）：所有依赖时间的断言都轮询到条件成立或 `CONDITION_DEADLINE`（20 s），例如空闲关闭
 轮询连接预算空位后再读 close 码、协议 ping 保活数到足够的 ping 且超过 1.6 个空闲窗后再断言仍可通信；只有负向
