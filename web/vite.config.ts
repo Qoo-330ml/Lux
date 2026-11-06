@@ -59,7 +59,16 @@ export default defineConfig({
     host: "127.0.0.1",
     port: 5173,
     proxy: {
-      "/api": process.env.LUX_API_ORIGIN ?? "http://127.0.0.1:8097",
+      // `ws: true` forwards the `GET /api/v1/ws` upgrade (ADR-054); without it the dev server
+      // answers the handshake itself and the realtime client silently falls back to polling.
+      // Keep `changeOrigin` off (the default): the browser's Origin is this dev server, and the
+      // upstream must receive the same Host header or the strict same-origin handshake check
+      // rejects the upgrade. Turning it on rewrites Host to the API address and every connection
+      // fails. The production proxy keeps `Host $http_host` for the same reason (LUX-896).
+      "/api": {
+        target: process.env.LUX_API_ORIGIN ?? "http://127.0.0.1:8097",
+        ws: true,
+      },
       "/health": process.env.LUX_API_ORIGIN ?? "http://127.0.0.1:8097",
     },
   },
