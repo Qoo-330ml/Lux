@@ -20619,7 +20619,7 @@ LUX-890 合并后的去重与 P3 修正（2026-11-06）：
 - [x] token 被 `/Sessions/Logout` 撤销后连接以 `1008` 关闭。
 - [x] 空闲超时关闭（`1001`）；64 KiB 入站帧在 8 KiB 上限下被拒绝且服务端继续服务其它连接。
 - [x] 已打开的连接不阻塞优雅关停（服务端 3 s 内停止，连接槽位在排空时释放）。
-- [x] 现有 HTTP 行为不变：`--test emby` 整组 68/68 通过（含原有的 `GET /Sessions`、
+- [x] 现有 HTTP 行为不变：`--test emby` 整组 74/74 通过（含原有的 `GET /Sessions`、
       `GET /ScheduledTasks` 用例）。
 
 实施结果（2026-11-06，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 验证）：先按 TDD 写集成测试，
@@ -20628,13 +20628,45 @@ LUX-890 合并后的去重与 P3 修正（2026-11-06）：
 验证命令与结果：
 
 - `cargo test --locked --test emby emby_websocket::` 15/15（新增模块）。
-- `cargo test --locked --test emby` 68/68（15 个模块）。
-- `cargo test --locked --test emby -- --list`：68 tests / 15 模块（`docs/TEST-TARGETS.md` 按此更新）。
+- `cargo test --locked --test emby` 74/74（16 个模块，rebase 后实测）。
+- `cargo test --locked --test emby -- --list`：74 tests / 16 模块（`docs/TEST-TARGETS.md` 按此更新）。
 - `cargo fmt --all -- --check` 通过。
 - `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。
 - `python3 scripts/check-backend-branches.py` 通过（28 个文件、266 处，未新增 `DatabaseBackend::` 分支）。
 - `cargo build --locked` 通过（依赖只增加 axum 的 `ws` 特性；`cargo tree -i tokio-tungstenite` 显示它只被
   axum 与 dev-dependency 引用，未引入第二套 WebSocket 实现）。
+
+合并 LUX-889（本地 `test` 头 `ee6f61f2`）后：
+
+- rebase 到最新 `test`；`docs/CHANGELOG.md`、`docs/COMPATIBILITY.md`、`docs/LUX-DEVELOPMENT.md`、
+  `docs/TEST-TARGETS.md` 的冲突按“保留双方内容、文档只追加”解决：LUX-889 的 Similar 记录/任务条目在前，
+  LUX-891 的记录/任务条目紧随其后；`src/api/emby.rs` 与 `src/api/legacy.rs` 的两条路由/模块声明并存
+  （`/Items/{id}/Similar` 与 `/embywebsocket`，无重复注册）。
+- `docs/TEST-TARGETS.md` 按 rebase 后的 `--list` 重新核对：`--test emby` 为 74 例 / 16 个模块
+  （LUX-889 后的 59 例 + 本任务 15 例），第 1、2、5.1 节的 `emby` 行与合计同步更新；同时补上 LUX-889
+  没有单独列出的 `emby_similar`（6 例）一行。
+- 复跑：`cargo test --locked --test emby` 74/74；`cargo fmt --all -- --check` 通过；
+  `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过；
+  `python3 scripts/check-backend-branches.py` 通过；`cargo build --locked` 通过。
+- 整组第一次运行时 `emby_incremental_refresh::emby_media_updated_queues_incremental_scan_for_absolute_path`
+  失败一次（与本任务代码无关的既有用例，`/Library/Media/Updated` 路径）；单独运行与随后整组复跑都通过，
+  判定为高负载下的偶发抖动，未改动该用例。
+
+真机尝试（2026-11-06，未完成，结论仍是“未真机验证”）：
+
+- 按抓包任务 §1 的做法，在本 worktree 起独立实例（`LUX_CONFIG_DIR=.tmp/device-lux/config`，
+  `LUX_HTTP_ADDR=127.0.0.1:8097`，独立 SQLite 与媒体目录），用 `adb reverse tcp:8097 tcp:8097` 让手机
+  访问；在 Yamby 2.1.0.11 里临时新增该服务器、用临时账号登录并进入媒体库，确认实例可达（登录、库列表、
+  条目都正常）。
+- 打开「管理服务器 → 系统日志」时，客户端只请求了 `/emby/System/Logs/embyserver.txt/Lines`（Lux 没有
+  该端点），**没有**发起 `/embywebsocket`：以 `RUST_LOG=info,luxd=debug` 复跑的日志里没有任何
+  `embywebsocket` 请求或握手，也没有新的长连接。说明 WebSocket 不在日志页启动。
+- 创建它的「服务器状态」Compose 页面（静态分析里的 `hc/AbstractC2788.m6033`）在 Yamby 2.1.0.11 的
+  UI 里没有在时间预算内找到入口（服务器卡菜单只有显示名称/编辑/自定义图标/用户名/上次播放时间/备选
+  地址/修改密码/删除，「管理服务器」页只有重启与系统日志），因此**握手没有被客户端实际发起过**。
+- 清理：删除临时服务器条目（服务器列表恢复为原来的一条）、`adb reverse --remove tcp:8097`、停止实例并
+  删除 `.tmp/device-lux`；未清应用数据、未安装/卸载、未 root、未装证书、未改系统设置，结束状态与开始时
+  一致（锁屏 `mWakefulness=Dozing`）。临时账号只存在于已删除的实例里，凭据没有写入任何文件或提交。
 
 限制与剩余风险：
 
