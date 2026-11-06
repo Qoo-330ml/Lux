@@ -88,7 +88,7 @@ export function useUserEvents() {
       for (const key of keys) refreshQueries(key);
     };
 
-    const unsubscribe = subscribeRealtime({
+    const unsubscribe = subscribeRealtime(queryClient, {
       // ADR-054 D15①: a first connection has nothing to catch up on. Only a connection that
       // had dropped (and therefore may have missed invalidations) forces one full home refresh.
       onReady: () => {
@@ -103,10 +103,6 @@ export function useUserEvents() {
       onStateChange: (state) => {
         if (state === "disconnected") hadConnectionError.current = true;
         setConnectionState(state);
-      },
-      // A revoked session must land on the login page; `App` derives that from queryKeys.me.
-      onSessionEnded: () => {
-        void queryClient.invalidateQueries({ queryKey: queryKeys.me });
       },
     });
     // A sibling subscriber may already own a connected socket when this hook mounts.

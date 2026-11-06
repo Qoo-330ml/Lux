@@ -17,6 +17,7 @@ import {
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ApiError, api } from "../../lib/api/client";
+import { clearSessionCaches } from "../../lib/api/session";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { AccountPreferences, AccountPreferencesUpdate, AuthSession, Library, LuxUser } from "../../lib/api/types";
 import { LuxSelect } from "../../components/LuxSelect";
@@ -212,7 +213,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
   const logout = useMutation({
     mutationFn: () => api.logout(),
     onSuccess: () => {
-      queryClient.clear();
+      clearSessionCaches(queryClient);
       navigate("/login", { replace: true });
     },
   });

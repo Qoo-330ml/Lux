@@ -1,6 +1,5 @@
 import { useQueryClient, type QueryClient, type QueryKey } from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
-import { queryKeys } from "../../lib/api/query-keys";
 import { subscribeRealtime } from "../../lib/realtime/client";
 
 type AdminEventScope =
@@ -102,7 +101,7 @@ export function useAdminEvents() {
       }
     };
 
-    const unsubscribe = subscribeRealtime({
+    const unsubscribe = subscribeRealtime(queryClient, {
       // ADR-054 D15②: the admin channel refreshes everything on every open, including the
       // first one, because the console has no cached "ready" state to trust after a gap.
       onReady: () => invalidate("all"),
@@ -110,9 +109,6 @@ export function useAdminEvents() {
         if (frame.channel !== "admin") return;
         const scope = parseScope(frame.scope);
         if (scope) invalidate(scope);
-      },
-      onSessionEnded: () => {
-        void queryClient.invalidateQueries({ queryKey: queryKeys.me });
       },
     });
     return () => {

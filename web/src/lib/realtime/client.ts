@@ -1,4 +1,6 @@
+import type { QueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "../api/client";
+import { clearSessionCaches } from "../api/session";
 import { RealtimeSocket } from "./socket";
 import type { InvalidateFrame, RealtimeConnectionState } from "./types";
 
@@ -17,12 +19,12 @@ export type RealtimeHandlers = {
   onReady: () => void;
   onInvalidate: (frame: InvalidateFrame) => void;
   onStateChange?: (state: RealtimeConnectionState) => void;
-  /** 1008, or a 1006 streak plus a `401` from `GET /api/v1/auth/me`. */
-  onSessionEnded?: () => void;
 };
 
 let socket: RealtimeSocket | null = null;
 let connectionState: RealtimeConnectionState = "disconnected";
+/** The page-wide cache the subscribers share; cleared once when the session ends. */
+let sessionQueryClient: QueryClient | null = null;
 const subscribers = new Set<RealtimeHandlers>();
 
 /** Current state, for a hook that mounts while a connection already exists. */
@@ -67,18 +69,25 @@ async function probeSession() {
   }
 }
 
+/**
+ * The session is gone: stop pushing, and drop every cached query the way an explicit logout does.
+ * The `me` query is re-created by its observer in `App` and answers 401, which lands on the login
+ * page; without the clear a second account on the same tab would still read the first account's
+ * home/favorites/history entries for the rest of their `staleTime`.
+ */
 function endSession() {
   socket?.stop();
   connectionState = "disconnected";
-  for (const subscriber of [...subscribers]) subscriber.onSessionEnded?.();
+  if (sessionQueryClient) clearSessionCaches(sessionQueryClient);
 }
 
 /**
  * Registers a listener for the shared connection and returns the unsubscribe function.
  * The socket is opened by the first subscriber and closed by the last one.
  */
-export function subscribeRealtime(handlers: RealtimeHandlers): () => void {
+export function subscribeRealtime(queryClient: QueryClient, handlers: RealtimeHandlers): () => void {
   subscribers.add(handlers);
+  sessionQueryClient = queryClient;
   if (!socket) {
     socket = createSocket();
     socket.start();

@@ -225,19 +225,34 @@ it("keeps progress without an item id on the playback prefix instead of the medi
   }
 });
 
-it("stops reconnecting after 1008 and expires the session query", async () => {
-  const invalidate = vi.spyOn(client, "invalidateQueries");
+it("stops reconnecting after 1008 and drops every cached query", async () => {
+  // Every one of these keys is user-scoped data under a page-wide QueryClient.
+  client.setQueryData(queryKeys.homeContinueWatching, { items: ["previous-account"] });
+  client.setQueryData(queryKeys.favorites, { items: ["previous-account"] });
+  client.setQueryData(queryKeys.watchHistory, { items: ["previous-account"] });
+  client.setQueryData(queryKeys.playback("item-1"), { sessionId: "previous-account" });
+  client.setQueryData(["admin", "logs"], { entries: ["previous-account"] });
   renderShell();
   markReady();
+
   act(() => socket().serverClose(1008));
+  await act(async () => { await Promise.resolve(); });
+
+  expect(client.getQueryData(queryKeys.homeContinueWatching)).toBeUndefined();
+  expect(client.getQueryData(queryKeys.favorites)).toBeUndefined();
+  expect(client.getQueryData(queryKeys.watchHistory)).toBeUndefined();
+  expect(client.getQueryData(queryKeys.playback("item-1"))).toBeUndefined();
+  expect(client.getQueryData(["admin", "logs"])).toBeUndefined();
+  expect(client.getQueryCache().getAll()).toHaveLength(0);
+
   await advance(5 * 60_000);
   expect(FakeWebSocket.instances).toHaveLength(1);
-  expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.me });
 });
 
 it("checks the session once after five consecutive abnormal closes", async () => {
   const me = vi.spyOn(api, "me").mockRejectedValue(new ApiError("未登录", { status: 401 }));
   const invalidate = vi.spyOn(client, "invalidateQueries");
+  client.setQueryData(queryKeys.favorites, { items: ["previous-account"] });
   renderShell();
 
   for (let attempt = 0; attempt < 4; attempt += 1) {
@@ -251,8 +266,14 @@ it("checks the session once after five consecutive abnormal closes", async () =>
   act(() => socket().serverClose(1006));
   await advance(500);
   expect(me).toHaveBeenCalledTimes(1);
-  // A 401 means the cookie is gone: the session is treated like a 1008 and `me` is re-read.
-  expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.me });
+  // A 401 means the cookie is gone: the session is treated like a 1008, so the caches of the
+  // previous account are dropped just like an explicit logout.
+  expect(client.getQueryData(queryKeys.favorites)).toBeUndefined();
+  // The reconnect sweeps invalidate media keys; the session query is invalidated exactly once,
+  // by the session-ended path.
+  expect(invalidate.mock.calls.filter(
+    ([options]) => JSON.stringify((options as { queryKey: unknown }).queryKey) === '["me"]',
+  )).toHaveLength(1);
   await advance(5 * 60_000);
   expect(FakeWebSocket.instances).toHaveLength(5);
 });
