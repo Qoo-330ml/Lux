@@ -20599,11 +20599,23 @@ LUX-890 合并后的去重与 P3 修正（2026-11-06）：
   `Data="初始延迟,间隔,…"`，`Stop` 停止，`KeepAlive` 用同样的消息应答，未知类型与非法 JSON 忽略且不断开。
 - 边界：全局 32 条、每用户 4 条并发连接（`Semaphore` + 每用户计数，超限握手返回 `503` 且不升级）；
   间隔钳制到 1000–60000 ms（初始延迟 0–60000 ms）；入站帧上限 8 KiB（`max_message_size`/`max_frame_size`，
-  超限由 tungstenite 关闭连接）；25 s 心跳 ping、120 s 无入站帧关闭；每次推送前用
-  `require_emby_principal_with_query` 重新校验 token，撤销/登出时以 `1008` 关闭。
+  超限由 tungstenite 关闭连接）；25 s 心跳 ping、120 s 无入站帧关闭。
+- 推送限频（返工后）：`StreamState` 为每一路推送（`Sessions`、`ScheduledTasksInfo` 各自独立）保留
+  `last_attempt`，`…Start` 只重置计划，新的 `next_push` 取 `max(now + 初始延迟, last_attempt + min_interval)`，
+  且 `Stop`/`Start` 不丢 `last_attempt`。`record_attempt` 在每次尝试（成功发送或因临时错误跳过）后把
+  `next_push` 推到 `now + interval`（interval 已被钳制到 ≥ `min_interval`）。因此一个 `Data="0,…"` 的
+  小帧无法让服务端立即重建文档。
+- 写边界（返工后）：`WebSocketUpgrade` 设置 `write_buffer_size`（16 KiB）与 `max_write_buffer_size`
+  （64 KiB），所有发送（`KeepAlive` 应答、心跳、数据帧、关闭帧）都经 `send_bounded`/`bounded` 包在
+  10 s 硬超时里；发送超时或失败立即结束循环并释放槽位。
+- 重校验（返工后）：`revalidated_principal` 透传 `StatusCode`，`revalidation_outcome` 把
+  `401`/`403` 归为关闭（`1008`）、其余（`5xx`/`503`）归为临时失败：跳过本次推送、保留连接、下次计划
+  到期再试，并用每条连接 60 s 限频的 warn 记录（不含 token）。另有与推送无关的 45 s 周期重校验，使
+  没有活动计划（未 `Start` 或已 `…Stop`）的连接也能在被撤销后关闭。
 - 关停：`CoreState` 新增 `EmbyWebsocketShutdown`（`watch` 通道）与连接预算；`src/main.rs` 的
   `shutdown_signal` 在请求 axum 停机前排空（先发 Close），`serve` 返回后再做一次
-  `shutdown_emby_websocket_connections()`（5 s 有界排空），这样升级后的连接不会在数据库关闭后继续推送。
+  `shutdown_emby_websocket_connections()`（5 s 有界排空），且这一步在 `serve_result?` **之前**执行，
+  所以 `serve` 出错时同样先排空连接再返回错误。
 - 日志：只记录连接计数与用户 id，不记录 `api_key`、完整 query 或 token。
 
 验收：
@@ -20619,7 +20631,12 @@ LUX-890 合并后的去重与 P3 修正（2026-11-06）：
 - [x] token 被 `/Sessions/Logout` 撤销后连接以 `1008` 关闭。
 - [x] 空闲超时关闭（`1001`）；64 KiB 入站帧在 8 KiB 上限下被拒绝且服务端继续服务其它连接。
 - [x] 已打开的连接不阻塞优雅关停（服务端 3 s 内停止，连接槽位在排空时释放）。
-- [x] 现有 HTTP 行为不变：`--test emby` 整组 74/74 通过（含原有的 `GET /Sessions`、
+- [x] 连续 `…Start` 帧不能突破推送最小间隔：1.2 s 观察窗内相邻推送 ≥ 200 ms（测试下限），条数有上界，
+      且两条流互不影响。
+- [x] 读端停止消费时，写缓冲上限让发送在有界时间内失败，连接被关闭且槽位被释放。
+- [x] 重校验状态码分类：401/403 关闭、500/503 只跳过本次推送并保留连接（单元测试直接覆盖四种状态）。
+- [x] 没有活动推送计划的连接仍会周期重校验，`SessionsStop` 后撤销 token 也会在有界时间内关闭。
+- [x] 现有 HTTP 行为不变：`--test emby` 整组 77/77 通过（含原有的 `GET /Sessions`、
       `GET /ScheduledTasks` 用例）。
 
 实施结果（2026-11-06，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 验证）：先按 TDD 写集成测试，
@@ -20627,9 +20644,10 @@ LUX-890 合并后的去重与 P3 修正（2026-11-06）：
 
 验证命令与结果：
 
-- `cargo test --locked --test emby emby_websocket::` 15/15（新增模块）。
-- `cargo test --locked --test emby` 74/74（16 个模块，rebase 后实测）。
-- `cargo test --locked --test emby -- --list`：74 tests / 16 模块（`docs/TEST-TARGETS.md` 按此更新）。
+- `cargo test --locked --test emby emby_websocket::` 18/18（新增模块，返工后）。
+- `cargo test --locked --lib emby_websocket::` 6/6（新增单元测试）。
+- `cargo test --locked --test emby` 77/77（16 个模块，返工后实测）。
+- `cargo test --locked --test emby -- --list`：77 tests / 16 模块（`docs/TEST-TARGETS.md` 按此更新）。
 - `cargo fmt --all -- --check` 通过。
 - `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。
 - `python3 scripts/check-backend-branches.py` 通过（28 个文件、266 处，未新增 `DatabaseBackend::` 分支）。
@@ -20681,6 +20699,45 @@ LUX-890 合并后的去重与 P3 修正（2026-11-06）：
   列表；`Sessions` 条目来自 Lux 的现有投影，没有为 WebSocket 增加字段。
 - 空闲超时依赖客户端回应心跳 ping（Yamby 用 OkHttp，读取线程会自动回 pong）；如果某个客户端完全不读
   连接，120 s 后会被关闭——这是有意的资源保护。
+
+返工（独立审查后，2026-11-06）：
+
+审查结论 1 个 P1、2 个 P2、2 个 P3 全部成立，逐条先写失败测试再修（返工前的失败记录：P1 相邻推送间隔
+实测 7 µs、P2 读端停读后连接一直不关、P3 无推送计划时撤销 token 后 5 s 仍未关闭）。
+
+1. **P1 重复 `…Start` 绕过最小推送间隔**：`StreamSchedule` 换成 `StreamState`（`plan` + 持久化的
+   `last_attempt`），`start()` 取 `max(now + initial, last_attempt + min_interval)`，`record_attempt()`
+   在每次尝试后按 `now + interval` 重排；`Stop`/`Start` 保留 `last_attempt`。两条流各自独立。测试改成
+   客户端边发边读（否则缓冲帧的“到达时间”被记成读取时间，测量无意义），连发 10 个 `Data="0,1000"` 的
+   `SessionsStart`，断言相邻推送 ≥ 150 ms（下限 200 ms 留抖动余量）、1.2 s 内 ≤ 8 条，并断言
+   `ScheduledTasksInfo` 首次推送不受会话流影响。原先“从 Start 起测量”的上限断言已改为测量两次**连续
+   推送**之间的间隔。
+2. **P2 写阻塞使心跳/空闲超时失效**：`WebSocketUpgrade` 设置 `write_buffer_size` 16 KiB 与
+   `max_write_buffer_size` 64 KiB（选这两个值：一帧 `Sessions` 文档最大约 500 条会话、远小于 64 KiB，
+   而读端停读时 64 KiB 上限把积压压到几十 KB 量级就会失败）；所有发送（`KeepAlive` 应答、心跳、数据帧、
+   关闭帧）改走 `send_bounded`/`bounded`，硬超时 10 s（远小于 120 s 空闲超时）。测试用 10 个播放会话
+   造出约 13 KiB 的 `Sessions` 文档，把写缓冲压到 4 KiB，客户端刻意不读，断言连接在有界时间内被关闭且
+   槽位释放；超时包装本身另有单元测试（挂起的发送在 20 ms 后返回失败）。
+3. **P2 重校验失败一律当作 token 撤销**：`revalidated_principal` 改为透传 `StatusCode`，
+   `revalidation_outcome` 把 401/403 归为关闭（`1008`）、其余归为临时失败（跳过本次推送、保留连接、
+   下次计划再试），并用每条连接 60 s 限频的 warn 记录（不含 token）。单元测试覆盖 401/403/500/503；
+   推送路径与周期重校验共用同一分类，避免两处判断分叉。
+4. **P3 无推送计划的连接永不重校验**：新增与推送无关的 `revalidate_interval`（默认 45 s），复用同一个
+   循环与心跳时钟；失败分类同上。测试在 `SessionsStop` 后撤销 token，断言连接在约 1 s 内以 `1008` 关闭。
+5. **P3 `serve` 返回错误时跳过 WebSocket 排空**：把 `shutdown_emby_websocket_connections()` 移到
+   `serve_result?` **之前**，正常路径的 worker/数据库关闭顺序不变。该顺序属于 `main.rs` 的启动/停机
+   流程，没有直接的单测：验证方式是代码审阅（3 行顺序调整）+ 既有的 `--test shutdown`（SIGTERM 后进程
+   在超时内退出）+ 本模块的关停集成测试（打开连接时服务端 3 s 内停止且槽位排空）。
+
+返工后复跑：`cargo test --locked --test emby emby_websocket::` 18/18、`cargo test --locked --lib
+emby_websocket::` 6/6、`cargo test --locked --test emby` 77/77、
+`LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test shutdown` 2/2、
+`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+`python3 scripts/check-backend-branches.py` 均通过。
+
+返工后仍存在的限制：推送限频约束的是“尝试”，所以临时错误（5xx）下客户端连发 `…Start` 也只能按
+`min_interval` 重试；写超时只有在写缓冲或套接字真正阻塞时才会触发，健康连接不会因此被关闭；空转连接
+（无推送计划）每 45 s 产生一次 token 校验查询，属于有意的成本/安全权衡。
 
 #### LUX-892：ADR-054 —— Lux Web 实时通道从 SSE 迁移到 WebSocket（只写文档）
 
