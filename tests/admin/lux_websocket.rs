@@ -47,13 +47,17 @@ struct Account {
 
 impl Account {
     fn session_cookie(&self) -> String {
-        self.cookies
-            .split(';')
-            .map(str::trim)
-            .find(|pair| pair.starts_with("lux_session="))
-            .unwrap_or_default()
-            .to_owned()
+        session_cookie_from(&self.cookies)
     }
+}
+
+fn session_cookie_from(cookies: &str) -> String {
+    cookies
+        .split(';')
+        .map(str::trim)
+        .find(|pair| pair.starts_with("lux_session="))
+        .unwrap_or_default()
+        .to_owned()
 }
 
 struct TestServer {
@@ -98,11 +102,33 @@ async fn login(
     username: &str,
     password: &str,
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
-    let response = client
+    login_with_device_id(client, base, username, password, None).await
+}
+
+async fn login_with_device(
+    client: &reqwest::Client,
+    base: &str,
+    username: &str,
+    password: &str,
+    device_id: &str,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    login_with_device_id(client, base, username, password, Some(device_id)).await
+}
+
+async fn login_with_device_id(
+    client: &reqwest::Client,
+    base: &str,
+    username: &str,
+    password: &str,
+    device_id: Option<&str>,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let mut request = client
         .post(format!("{base}/api/v1/auth/login"))
-        .json(&json!({ "username": username, "password": password }))
-        .send()
-        .await?;
+        .json(&json!({ "username": username, "password": password }));
+    if let Some(device_id) = device_id {
+        request = request.header("x-lux-device-id", device_id);
+    }
+    let response = request.send().await?;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let cookies = format!(
         "lux_session={}; lux_csrf={}",
@@ -678,6 +704,21 @@ async fn observe_protocol_pings(
             Ok(Some(Err(error))) => return Err(format!("websocket error: {error}")),
         }
     }
+}
+
+/// `last_seen_at` of one device row, or `None` when the row does not exist.
+async fn user_device_last_seen(
+    server: &TestServer,
+    user_id: &str,
+    device_id: &str,
+) -> Result<Option<i64>, Box<dyn std::error::Error>> {
+    Ok(sqlx::query_scalar(
+        "SELECT last_seen_at FROM user_devices WHERE user_id = ? AND device_id = ?",
+    )
+    .bind(user_id)
+    .bind(device_id)
+    .fetch_optional(server.database.pool())
+    .await?)
 }
 
 fn is_channel(frame: &Value, channel: &str) -> bool {
@@ -1326,23 +1367,20 @@ async fn the_admin_and_user_budgets_are_separate_and_classified()
 // Revalidation: demotion, revocation, transient failure
 // ---------------------------------------------------------------------------------------------
 
-#[tokio::test]
-async fn a_demotion_stops_admin_frames_without_closing_the_connection()
--> Result<(), Box<dyn std::error::Error>> {
-    let server = spawn_server(fast_timers()).await?;
-    let mut operator = server.connect_account(&server.operator).await?;
-
-    server
-        .set_can_manage_server(&server.admin, &server.operator, false)
-        .await?;
+/// Polls until the operator connection demonstrably lost the admin channel: it publishes settings
+/// invalidations and requires two publishes in a row that reached the user channel but not the
+/// admin channel. Answers the last batch of frames seen.
+///
+/// The caller must have demoted the account first. Observing the demotion proves that at least one
+/// revalidation ran with the still-valid session, which is what the device-inventory test needs.
+async fn wait_until_demoted(
+    server: &TestServer,
+    operator: &mut ClientSocket,
+) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
     // The permission change is itself an admin event (`users`) plus a user `home`; drain whatever
     // it published so the observation starts from a clean slate (bounded, not an assertion).
-    let _ = collect_frames(&mut operator, QUIET_WINDOW).await;
+    let _ = collect_frames(operator, QUIET_WINDOW).await;
 
-    // Poll until a published settings invalidation reaches the user channel but no longer the admin
-    // channel. Each attempt publishes one event, waits for its user frame and then looks for the
-    // admin frame of the same publish in a short quiet window; two clean attempts in a row are
-    // required, so one delayed admin frame cannot be mistaken for the demotion.
     let deadline = Instant::now() + CONDITION_DEADLINE;
     let mut clean_attempts = 0;
     let mut last_frames: Vec<Value> = Vec::new();
@@ -1350,11 +1388,11 @@ async fn a_demotion_stops_admin_frames_without_closing_the_connection()
         server
             .patch_settings(&server.admin, "After Demotion")
             .await?;
-        let mut frames = wait_for_frames(&mut operator, Duration::from_secs(5), |frames| {
+        let mut frames = wait_for_frames(operator, Duration::from_secs(5), |frames| {
             frames.iter().any(|frame| is_scope(frame, "user", "home"))
         })
         .await?;
-        frames.extend(collect_frames(&mut operator, QUIET_WINDOW).await);
+        frames.extend(collect_frames(operator, QUIET_WINDOW).await);
         let saw_user = frames.iter().any(|frame| is_scope(frame, "user", "home"));
         let has_admin = frames
             .iter()
@@ -1368,12 +1406,28 @@ async fn a_demotion_stops_admin_frames_without_closing_the_connection()
         };
         last_frames = frames;
         if clean_attempts >= 2 {
-            break;
+            return Ok(last_frames);
         }
     }
-    assert!(
-        clean_attempts >= 2,
+    Err(format!(
         "a demoted connection must stop receiving admin frames; last frames {last_frames:?}"
+    )
+    .into())
+}
+
+#[tokio::test]
+async fn a_demotion_stops_admin_frames_without_closing_the_connection()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = spawn_server(fast_timers()).await?;
+    let mut operator = server.connect_account(&server.operator).await?;
+
+    server
+        .set_can_manage_server(&server.admin, &server.operator, false)
+        .await?;
+    let frames = wait_until_demoted(&server, &mut operator).await?;
+    assert!(
+        frames.iter().any(|frame| is_scope(frame, "user", "home")),
+        "the user channel must keep working after a demotion, got {frames:?}"
     );
 
     // Regaining the permission resumes the admin channel; the connection was never closed.
@@ -1527,6 +1581,89 @@ async fn shutdown_closes_with_1001_without_blocking_and_refuses_new_handshakes()
             ))
             .await?,
         503
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn revalidation_does_not_write_the_device_inventory() -> Result<(), Box<dyn std::error::Error>>
+{
+    // A session with a device id: the login stores it, so every *full* authentication (the 45 s
+    // revalidation included) used to upsert `user_devices` and turn the inventory into a heartbeat.
+    let server = spawn_server(fast_timers()).await?;
+    let device_id = uuid::Uuid::new_v4().to_string();
+    let (cookies, _csrf) = login_with_device(
+        &server.client,
+        &format!("http://{}", server.address),
+        "operator",
+        "operator password",
+        &device_id,
+    )
+    .await?;
+    let mut socket = server
+        .connect(with_cookie(
+            server.request(),
+            &session_cookie_from(&cookies),
+        ))
+        .await?;
+
+    // The handshake is a full authentication and must record the device row.
+    assert!(
+        user_device_last_seen(&server, &server.operator.id, &device_id)
+            .await?
+            .is_some(),
+        "the handshake must record the device inventory row"
+    );
+    // Freeze the row: any later write moves `last_seen_at` to the current second.
+    sqlx::query("UPDATE user_devices SET last_seen_at = 1 WHERE user_id = ? AND device_id = ?")
+        .bind(&server.operator.id)
+        .bind(&device_id)
+        .execute(server.database.pool())
+        .await?;
+
+    // A demotion is only noticed by the revalidation, so observing it proves that a revalidation
+    // ran with the still-valid session after the row was frozen.
+    server
+        .set_can_manage_server(&server.admin, &server.operator, false)
+        .await?;
+    let _ = wait_until_demoted(&server, &mut socket).await?;
+
+    assert_eq!(
+        user_device_last_seen(&server, &server.operator.id, &device_id).await?,
+        Some(1),
+        "the periodic revalidation must not write the device inventory"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_bounded_drain_reports_a_connection_that_outlives_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = spawn_server(limits()).await?;
+    let _socket = server.connect_account(&server.viewer).await?;
+    // `drain_lux_websocket_connections` is what the shutdown chain drains with; an open connection
+    // must make it answer `false` instead of blocking past the bound.
+    let started = Instant::now();
+    assert!(
+        !server
+            .state
+            .drain_lux_websocket_connections(Duration::from_millis(100))
+            .await,
+        "a still-open connection must make the bounded drain answer false"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the bounded drain must respect its timeout, took {:?}",
+        started.elapsed()
+    );
+    // Once the shutdown signal reaches the connection, the same drain succeeds.
+    server.state.signal_websocket_shutdown();
+    assert!(
+        server
+            .state
+            .drain_lux_websocket_connections(CONDITION_DEADLINE)
+            .await,
+        "after the signal every connection must release its slot"
     );
     Ok(())
 }

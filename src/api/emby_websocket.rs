@@ -53,6 +53,12 @@ pub(super) async fn emby_websocket(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
+    // A shutting-down process must not complete a new handshake, exactly like `/api/v1/ws`: the
+    // signal is shared, and a `101` here would hand the client a connection that is closed on the
+    // next tick (ADR-054 D10).
+    if state.emby_websocket_shutdown().is_signalled() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     // Authentication happens before the upgrade on purpose: an invalid or revoked token must
     // answer 401 to the handshake request instead of completing a 101 and closing afterwards, so
     // the client cannot mistake the failure for a live connection.

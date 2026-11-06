@@ -23,9 +23,10 @@
 //! The channel qualification is revalidated on the shared `revalidate_interval` timer (45 s), which
 //! is the one deliberate difference from `/embywebsocket`'s per-push revalidation (ADR-054: Lux's
 //! invalidation rate follows business events, so a per-frame session lookup would bind database
-//! queries to the event rate). A `401`/`403` closes the connection with `1008`; a temporary `5xx`
-//! keeps it and is warned about at most once per `auth_warn_interval`. A demotion
-//! (`can_manage_server` becomes false) only stops the `admin` channel.
+//! queries to the event rate). The revalidation uses [`require_web_user_read_only`], so it does not
+//! record a `user_devices` observation every cycle. A `401`/`403` closes the connection with
+//! `1008`; a temporary `5xx` keeps it and is warned about at most once per `auth_warn_interval`.
+//! A demotion (`can_manage_server` becomes false) only stops the `admin` channel.
 
 use super::*;
 
@@ -589,7 +590,10 @@ async fn run_connection(mut socket: WebSocket, context: LuxConnectionContext) {
                 next_heartbeat = now + limits.heartbeat_interval;
             }
             if now >= next_revalidate {
-                match require_web_user(&headers, &state).await {
+                // The read-only variant performs the same lookups and permission checks but skips
+                // the `user_devices` upsert a full request does: a connection revalidating every
+                // 45 s must not turn the device inventory into a heartbeat.
+                match require_web_user_read_only(&headers, &state).await {
                     Ok(principal) => {
                         // A different account on the same connection cannot happen, but closing
                         // is the safe answer if it ever does.

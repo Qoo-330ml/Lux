@@ -1239,3 +1239,28 @@ async fn emby_websocket_does_not_block_the_graceful_shutdown()
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn emby_websocket_refuses_new_handshakes_once_shutdown_started()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = spawn_server(limits()).await?;
+    let mut socket = server
+        .connect("/embywebsocket", &server.admin_token)
+        .await?;
+    send(&mut socket, json!({"MessageType": "KeepAlive"})).await?;
+    assert_eq!(next_json(&mut socket).await?["MessageType"], "KeepAlive");
+
+    // `src/main.rs` signals the shared shutdown before the graceful drain; both realtime endpoints
+    // must stop accepting new handshakes from that moment (ADR-054 D10).
+    server.state.signal_websocket_shutdown();
+    assert_eq!(
+        server
+            .handshake_status("/embywebsocket", &server.viewer_token)
+            .await?,
+        503,
+        "a shutting-down process must not complete a new handshake"
+    );
+    // The connection that was already open is still told to go away.
+    assert_eq!(next_close(&mut socket).await?, Some(1001));
+    Ok(())
+}

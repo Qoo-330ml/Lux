@@ -797,11 +797,15 @@ impl AppState {
     pub async fn shutdown_websocket_connections(&self) -> bool {
         self.signal_websocket_shutdown();
         let timeout = EMBY_WEBSOCKET_SHUTDOWN_DRAIN_TIMEOUT;
+        // Both budgets are drained in parallel under the same bound.
+        // `drain_lux_websocket_connections` is the Lux half of this path (and answers `false` when
+        // one connection outlives `timeout`), so the shutdown chain and the test that pins the
+        // timeout run the same code.
         let (emby, lux) = tokio::join!(
             self.core
                 .emby_websocket_connections
                 .wait_until_idle(timeout),
-            self.core.lux_websocket_connections.wait_until_idle(timeout),
+            self.drain_lux_websocket_connections(timeout),
         );
         emby && lux
     }
@@ -1436,6 +1440,15 @@ async fn require_web_user(
     state: &ReadyAppState,
 ) -> Result<UserRecord, Response> {
     users::require_web_user(headers, state).await
+}
+
+/// The same authentication without the `user_devices` observation write; a long-lived connection
+/// revalidates with it so the device inventory is not updated every cycle.
+async fn require_web_user_read_only(
+    headers: &HeaderMap,
+    state: &ReadyAppState,
+) -> Result<UserRecord, Response> {
+    users::require_web_user_read_only(headers, state).await
 }
 
 async fn require_web_principal(
