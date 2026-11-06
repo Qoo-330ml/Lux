@@ -20092,12 +20092,18 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
   `i64` 解析；解析失败仍是反序列化错误，由 axum 映射成 400。六个 Query 结构体共用这一份实现，没有各写
   一份。
 - 接入字段：`EmbyItemsQuery`、`EmbyMediaFoldersQuery`、`EmbyFacetsQuery`、`EmbyPersonsQuery`、
-  `EmbyUsersQuery` 的 `StartIndex`/`Limit`（含已声明的 `startIndex`/`limit` 别名），以及 `EmbyTokenQuery`
-  的 `ActiveWithinSeconds`（`Sessions` 使用）。
+  `EmbyUsersQuery`、`EmbySearchQuery` 的 `StartIndex`/`Limit`（含已声明的 `startIndex`/`limit` 别名）、
+  `EmbyTokenQuery` 的 `ActiveWithinSeconds`（`Sessions` 使用）、`EmbyUserImageQuery` 的 `Index`
+  （`i32`，返工补）以及 `ResumeVisibilityQuery` 的 `Hide`（返工补，改用共享的布尔 helper）。
 - 这些结构体由路由共用，因此覆盖到 `/Items`、`/Users/{userId}/Items` 及其 `Resume`/`Latest`/`NextUp`/
   `FavoriteItems` 子路径、`Shows/NextUp`、`Shows/{seriesId}/Seasons`、`Shows/{seriesId}/Episodes`、
-  `Persons`、`Genres`/`Studios`/`Years`、`Library/MediaFolders`、`Users/Query` 与 `Sessions`；根路径与
-  `/emby` 前缀挂载同一棵路由树。
+  `Persons`、`Genres`/`Studios`/`Years`、`Library/MediaFolders`、`Users/Query`、`Sessions`、
+  `Search/Hints`、`Users/{userId}/Images/{imageType}` 与 `POST .../HideFromResume`；根路径与 `/emby` 前缀
+  挂载同一棵路由树。
+- 穷尽检查：`src/api/` 下所有 Emby 查询类型的可选数值/布尔字段逐个核对，逐条决定写进
+  `docs/COMPATIBILITY.md` 的检查清单。`EmbyImageDisplayQuery`、`EmbyStreamQuery`、`EmbyTranscodingQuery`
+  与 `PlaybackInfo` 的查询合并本来就用手写解析（`parse().ok()` / `if let Ok(..)`），空值与非数字从不 `400`，
+  因此不改；`ImageTypeLimit` 在 Lux 的 Emby 查询类型里根本没有声明，未知参数被忽略，也不会 `400`。
 - 校验与上限不变：`Limit=abc`、`Limit=1.5`、`StartIndex=abc` 仍在反序列化阶段 400；`StartIndex=-1` 仍因
   负偏移 400；`Limit` 超上限（列表 1000、`Users/Query` 100）仍 400；`Sessions` 的 `ActiveWithinSeconds`
   仍限制在 1..=2592000；`Limit=0` 的既有规则未改。
@@ -20114,13 +20120,20 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
       未传，非法值与超上限仍 400。
 - [x] `Persons`、`Library/MediaFolders`、`Users/Query` 同上；`Users/Query` 的 100 上限单独覆盖。
 - [x] `Sessions` 的 `ActiveWithinSeconds` 空值 → 200 且等价未传；`abc`、`0`、`2592001` 仍 400。
+- [x] `Search/Hints` 的 `Limit`/`StartIndex` 空值 → 200 且与“完全不传分页参数”的响应一致（同时证明接入
+      `deserialize_with` 后字段没有变成必填，为此补了 `default`）；`abc`、`1.5`、`1001`、`-1` 仍 400。
+- [x] `Users/{userId}/Images/Primary?Index=`（含 `index` 别名与纯空白）与不传 `Index` 的响应一致；
+      `Index=abc`、`Index=-1` 仍 400。
+- [x] `HideFromResume?Hide=` 空值等价未传（由 JSON body 决定）；空值且 body 也没给仍是 400；
+      `Hide=abc` 即使 body 给了值也仍是 400。
 - [x] 根路径与 `/emby` 前缀都覆盖。
-- [x] `cargo test --locked --test emby` 47/47；`cargo fmt --all -- --check`、`cargo clippy --locked
+- [x] `cargo test --locked --test emby` 50/50；`cargo fmt --all -- --check`、`cargo clippy --locked
       --all-targets --all-features -- -D warnings`、`python3 scripts/check-backend-branches.py` 通过。
 
-预计文件：`src/api/emby_catalog.rs`、`src/api/emby_handlers.rs`、`tests/emby/emby_empty_numeric_params.rs`、
-`tests/emby/main.rs`、`docs/COMPATIBILITY.md`、`docs/CHANGELOG.md`、`docs/LUX-DEVELOPMENT.md`、
-`docs/TEST-TARGETS.md`。任务编号用 `LUX-888`：基线上 `LUX-887` 已被 `Filters=IsResumable`/`IsFavorite`
+预计文件：`src/api/emby_catalog.rs`、`src/api/emby_handlers.rs`、`src/api/media.rs`、
+`src/api/emby_resume_visibility.rs`、`tests/emby/emby_empty_numeric_params.rs`、`tests/emby/main.rs`、
+`docs/COMPATIBILITY.md`、`docs/CHANGELOG.md`、`docs/LUX-DEVELOPMENT.md`、`docs/TEST-TARGETS.md`。
+任务编号用 `LUX-888`：基线上 `LUX-887` 已被 `Filters=IsResumable`/`IsFavorite`
 占用。
 
 实施结果（2026-11-06，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 验证）：按 TDD 先提交失败的集成
@@ -20128,17 +20141,29 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
 `/Studios` 的空 `Limit=`；空 `StartIndex=` 与其它端点是静态推断，修复后**没有**在 Hills/Yamby 真机上复测
 筛选面板。
 
+返工（同日，按审查意见）：首轮只改了 `emby_catalog.rs`/`emby_handlers.rs` 里的结构体，漏掉
+`src/api/media.rs` 的 `EmbySearchQuery`（`/Search/Hints`）。返工做三件事：
+
+1. 穷尽检查 `src/api/` 下所有 Emby 查询类型，结论表写进 `docs/COMPATIBILITY.md`；本轮补了三个结构体：
+   `EmbySearchQuery`（`StartIndex`/`Limit`，同时补上缺失的 `default`）、`EmbyUserImageQuery.Index`
+   （新增 `deserialize_optional_i32`）、`ResumeVisibilityQuery.Hide`（改用共享布尔 helper，删除手写解析）。
+2. 把判定逻辑收敛成一份：私有 `blank_optional_value<T>` 同时支撑 `deserialize_optional_bool`、
+   `deserialize_optional_i64`、`deserialize_optional_i32`，`#[serde(deserialize_with)]` 只做类型适配。
+   既有布尔 helper 的对外行为不变（原函数体就是这套逻辑，改后委托给同一份实现）。
+3. 新增 3 条回归（`/Search/Hints`、头像 `Index`、`HideFromResume` 的 `Hide`），先跑红：分别是 `400 vs 200`、
+   `400 vs 404`（无头像的基线）、`400 vs 200`，实现后转绿。
+
 验证命令与结果：
 
-- `cargo test --locked --test emby emby_empty_numeric_params::` 4/4（新增）。
-- `cargo test --locked --test emby` 47/47（整组，含 `emby_facets`、`emby_item_filters`、`emby_auth`、
+- `cargo test --locked --test emby emby_empty_numeric_params::` 7/7（新增；首轮 4 条 + 返工 3 条）。
+- `cargo test --locked --test emby` 50/50（整组，含 `emby_facets`、`emby_item_filters`、`emby_auth`、
   `emby_incremental_refresh`、`mixed_library_api` 等既有用例）。
 - `cargo fmt --all -- --check` 通过；`cargo clippy --locked --all-targets --all-features -- -D warnings`
   通过（0 警告）；`python3 scripts/check-backend-branches.py` 通过（28 files，266 branches）。
 
 rebase 复核：合并前本地 `test` 前进到 `a7c3cdc5`（含 `feb8834d` STRM 媒体源 ID 改为 32 位十六进制、
 `a7c3cdc5` 的兼容记录），已 rebase 且无冲突（两条文档记录分别位于文件不同位置，双方内容都保留）。
-rebase 后重跑：`cargo test --locked --test emby` 47/47（`-- --list` 仍是 47，本模块 4 条）、
+rebase 后重跑：`cargo test --locked --test emby` 50/50（`-- --list` 为 50，本模块 7 条）、
 `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
 `python3 scripts/check-backend-branches.py` 全部通过；`docs/TEST-TARGETS.md` 的 `--test emby` 计数与
 rebase 后的 `--list` 一致。
@@ -20151,8 +20176,9 @@ rebase 后的 `--list` 一致。
   在请求总数时把 `Limit=0` 当纯计数请求），两者都保留原有行为。
 - 修复未部署，Hills/Yamby 筛选面板在真机上的最终表现（列表是否有内容、分页是否正确）待部署后复测；
   本次没有声称真机验证通过。
-- `/Users/{userId}/Images/{imageType}?Index=` 仍是严格解析：客户端若发空 `Index=` 会 400，本任务按范围
-  未改动。
+- 返工后只剩 Lux 自己签发的票据参数（`luxPlaybackExpires`）与 `ImageTypeLimit` 这类不存在的键不在
+  显式处理范围内：前者解析失败落成 `None`、走既有鉴权失败分支，后者 Lux 根本不声明，都不会产生 `400`。
+  若将来新增 Emby 查询结构体，需要按同一规则接入共享 helper；这一点只体现在代码约定里，没有编译期约束。
 
 ## 31. 参考资料
 

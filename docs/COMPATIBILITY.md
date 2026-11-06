@@ -1,6 +1,6 @@
 # Lux 客户端兼容性矩阵
 
-## LUX-888 Emby 列表端点容忍空的可选数值参数（2026-11-06）
+## LUX-888 Emby 查询端点容忍空的可选数值/布尔参数（2026-11-06）
 
 分级：**真机抓包确认（仅“空 `Limit=` 会 400”这一条）+ 其余静态推断**。
 
@@ -11,23 +11,44 @@ Lux 返回 `400`（`Failed to deserialize query string: Limit: cannot parse inte
 空值没有实抓证据**，属于静态推断：它们与 `Limit` 走同一套 `Option<i64>` 查询反序列化，客户端只要按同一
 模板拼参数就会同样 400。**本修复尚未部署，也没有在 Hills/Yamby 真机上复测修复后的筛选面板。**
 
-- 规则：Emby 列表端点的可选数值查询参数，**空串或纯空白按“未提供”处理**；这与 2026-08-23 AfuseKt 空的
-  `IsFavorite=` 条目（`deserialize_optional_bool`）是同一套做法，现在补上了数值版本
-  `deserialize_optional_i64`，六个 Query 结构体共用同一份实现，不各写一份。
-- 覆盖参数：`Limit`、`StartIndex`（PascalCase 与已声明的 `limit`/`startIndex` 别名），以及 `Sessions` 的
-  `ActiveWithinSeconds`（`activeWithinSeconds`）。
-- 覆盖端点：`/Items`、`/Users/{userId}/Items` 及其 `Resume`、`Latest`、`NextUp`、`FavoriteItems` 子路径，
-  `Shows/NextUp`、`Shows/{seriesId}/Seasons`、`Shows/{seriesId}/Episodes`、`Persons`、`Genres`、`Studios`、
-  `Years`、`Library/MediaFolders`、`Users/Query`、`Sessions`。根路径与 `/emby` 前缀挂载同一棵路由树，
-  行为一致。
-- 非空值的校验完全不变：`Limit=abc`、`Limit=1.5`、`StartIndex=abc` 仍在反序列化阶段 `400`；
-  `StartIndex=-1` 仍因负偏移 `400`；超过服务端上限仍 `400`（列表端点 `Limit` 上限 1000、`Users/Query`
-  为 100、`Sessions` 的 `ActiveWithinSeconds` 为 30 天即 2592000 秒）；`Limit=0` 的既有规则不变
-  （请求总数时是纯计数请求，否则按端点默认值）。
-- 未改动：`/Users/{userId}/Images/{imageType}?Index=`（`Option<i32>`，不是列表端点）仍按原样校验；
-  `/Items` 的 `Limit`/`StartIndex` 依旧不声明 camelCase 别名（既有行为，不属于本次空值问题）。
-- 自动化：`cargo test --locked --test emby emby_empty_numeric_params::` 4/4 覆盖上述端点在两种路径下的
-  “空值等价未传”“非法值仍 400”“超过上限仍 400”。该测试只证明 Lux 服务端合同，不代表任何真实客户端已确认。
+- 规则：Emby 查询端点里可选数值/布尔参数，**空串或纯空白按“未提供”处理**；这与 2026-08-23 AfuseKt 空的
+  `IsFavorite=` 条目是同一套做法。实现上只有一份判定逻辑：私有 `blank_optional_value<T>` 供
+  `deserialize_optional_bool`、`deserialize_optional_i64`、`deserialize_optional_i32` 三个适配器共用，
+  没有按结构体各写一份。
+- 非空值的校验完全不变：`Limit=abc`、`Limit=1.5`、`StartIndex=abc`、`Index=abc`、`Hide=abc` 仍在反序列化
+  阶段 `400`；`StartIndex=-1` 仍因负偏移 `400`；超过服务端上限仍 `400`（列表端点 `Limit` 上限 1000、
+  `Users/Query` 为 100、`Sessions` 的 `ActiveWithinSeconds` 为 30 天即 2592000 秒）；`Limit=0` 的既有规则
+  不变（请求总数时是纯计数请求，否则按端点默认值）；`Hide` 空值只表示“没提供”，查询与 JSON body 都没给出
+  时仍然是 `400`。
+
+### 穷尽检查清单：Emby 路由用到的查询类型
+
+逐个核对 `src/api/` 下所有 Emby 查询类型（包含 `flatten` 的共享鉴权结构体）的可选数值/布尔字段：
+
+| 查询类型 | 覆盖路由 | 可选数值/布尔参数 | 处理 |
+|---|---|---|---|
+| `EmbyItemsQuery` | `/Items`、`/Users/{userId}/Items` 及其 `Resume`/`Latest`/`NextUp`/`FavoriteItems`、`Shows/NextUp`、`Shows/{seriesId}/Seasons`、`Shows/{seriesId}/Episodes`、`Items/{itemId}/Children` | `StartIndex`、`Limit` | **改**：空值等价未传 |
+| `EmbyMediaFoldersQuery` | `/Library/MediaFolders` | `StartIndex`、`Limit` | **改** |
+| `EmbyFacetsQuery` | `/Genres`、`/Studios`、`/Years` | `StartIndex`、`Limit` | **改**（真机证据所在端点） |
+| `EmbyPersonsQuery` | `/Persons` | `StartIndex`、`Limit` | **改** |
+| `EmbyUsersQuery` | `/Users/Query` | `StartIndex`、`Limit` | **改** |
+| `EmbyTokenQuery` | `/Sessions` 以及所有 `flatten` 它的 Emby 查询 | `ActiveWithinSeconds` | **改** |
+| `EmbySearchQuery` | `/Search/Hints` | `StartIndex`、`Limit` | **改**（返工补：字段原先没有 `default`，已补上并用测试证明不传参数仍 `200`） |
+| `EmbyUserImageQuery` | `/Users/{userId}/Images/{imageType}`（GET/HEAD/POST/DELETE）与带索引变体 | `Index` | **改**（返工补：新增 `deserialize_optional_i32`） |
+| `ResumeVisibilityQuery` | `POST /Users/{userId}/Items/{itemId}/HideFromResume` | `Hide` | **改**（返工补：改用共享的 `deserialize_optional_bool`，不再手写解析） |
+| `EmbyImageDisplayQuery` | 条目/人物/用户图片路由 | `maxWidth`、`maxHeight`、`width`、`height`、`quality` | **不改**：这些参数由 `RawQuery` 手写解析，非数字、空值与 `0` 本来就按“未提供”处理，从不返回 `400` |
+| `EmbyStreamQuery` | `/Videos/.../stream*`、`original.strm` | `luxPlaybackExpires`（签名票据里的过期时间） | **不改**：`value.parse().ok()`，空值/非法值都落成 `None`；票据缺失或不匹配走既有的鉴权失败分支，不是 `400` |
+| `EmbyTranscodingQuery` | `/Videos/{itemId}/master.m3u8`、`/Videos/{itemId}/transcoding/{sessionId}/{asset}` | `luxPlaybackExpires` | **不改**：同上，`parse().ok()` |
+| `EmbyPlaybackInfoRequest` 的查询合并 | `GET`/`POST /Items/{itemId}/PlaybackInfo` 上的查询参数 | `MaxStreamingBitrate`、`StartTimeTicks`、`EnableDirectPlay`、`EnableDirectStream`、`EnableTranscoding`、`AllowVideoStreamCopy`、`AllowAudioStreamCopy` | **不改**：`apply_query_parameters` 用 `if let Ok(value) = value.parse::<i64>()` 与 `parse_emby_bool` 逐个判断，空值直接被忽略 |
+| `EmbyItemCountsQuery`、`EmbyDeleteItemQuery`、`EmbyPersonQuery`、`EmbyRefreshQuery`、`EmbyDisplayPreferencesQuery`、`EmbyCreateUserQuery`、`EmbyCollectionMutationQuery`、`DanmakuQuery` | 各自路由 | 没有自己的可选数值字段 | **不改**：无该问题；`flatten` 进来的 `ActiveWithinSeconds` 随 `EmbyTokenQuery` 一起容错 |
+| （未声明） | 任意 Emby 路由 | `ImageTypeLimit` | **不改**：Lux 的 Emby 查询类型根本没有声明这个键，`Query` 反序列化会忽略未知参数，因此空值与非空值都不会 `400` |
+
+边界：本次只改 Emby 兼容层；Lux `/api/v1` 的 `LuxPageQuery`/`LuxSearchQuery` 等查询类型保持原有严格解析。
+`/Items` 的 `Limit`/`StartIndex` 依旧不声明 camelCase 别名（既有行为，与本次空值问题无关）。
+
+- 自动化：`cargo test --locked --test emby emby_empty_numeric_params::` 7/7，逐端点覆盖“不传参数仍 200”
+  “空值等价未传”“非法值仍 400”“超过上限仍 400”，根路径与 `/emby` 前缀各一遍。该测试只证明 Lux 服务端
+  合同，不代表任何真实客户端已确认。
 
 ## LUX-887 Emby `Filters=IsResumable` / `Filters=IsFavorite`（2026-11-06）
 
