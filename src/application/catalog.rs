@@ -1529,6 +1529,70 @@ impl CatalogService {
             .await?)
     }
 
+    /// Same-type items that share at least one stored genre with `item_id`, most shared genres
+    /// first and then by title.
+    ///
+    /// Returns `None` when the item does not exist or the principal cannot see it, matching the
+    /// item detail endpoint's 404. The caller must already have validated `limit`; the storage
+    /// query caps the candidate pool before ranking (ten source genres, at most 200 visible
+    /// candidates each) and applies `limit` to the ranked result. `page.total` is therefore the
+    /// number of distinct items in that bounded pool, not the catalog-wide number of similar
+    /// items. Only the `media_item_facets` projection is read, so a request never parses NFO JSON
+    /// or scans the catalog.
+    pub(crate) async fn list_similar_items(
+        &self,
+        principal: AccessPrincipal,
+        item_id: &str,
+        limit: i64,
+    ) -> Result<Option<CatalogPage>, CatalogError> {
+        let Some(source_item) = self.find_item(principal, item_id).await? else {
+            return Ok(None);
+        };
+        // Emby's Similar endpoint is a movie/series recommendation surface. Any other type has no
+        // meaningful same-type genre neighbourhood, so it answers with an empty page.
+        if !matches!(source_item.item_type.as_str(), "MOVIE" | "SERIES") {
+            return Ok(Some(CatalogPage::new(Vec::new(), 0, 0, limit)));
+        }
+        let library_ids = self.access.accessible_library_ids(principal).await?;
+        let user_id = principal.user_id_string();
+        let content_restrictions = self.content_restrictions_for_principal(principal).await?;
+        let item_types = vec![source_item.item_type.clone()];
+        let no_values: [String; 0] = [];
+        let query = CatalogFilterQuery {
+            library_ids: &library_ids,
+            user_id: &user_id,
+            item_types: &item_types,
+            excluded_item_types: &no_values,
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            provider_id_equals: None,
+            years: &[],
+            genre_keys: &no_values,
+            studio_keys: &no_values,
+            is_played: None,
+            is_favorite: None,
+            is_resumable: None,
+            min_date_last_saved: None,
+            metadata_pending: false,
+            parent_id_scope: None,
+            content_restrictions: content_restrictions.as_ref(),
+            sort_by: StorageCatalogSort::Name,
+            descending: false,
+            offset: 0,
+            limit,
+            include_total: true,
+        };
+        let (rows, total) = self
+            .database
+            .list_similar_catalog_rows(&query, &source_item.id)
+            .await?;
+        let mut items = assemble_items(rows);
+        self.populate_item_details_and_episode_counts(&mut items, content_restrictions.as_ref())
+            .await?;
+        Ok(Some(CatalogPage::new(items, total, 0, limit)))
+    }
+
     pub async fn list_all_items_filtered(
         &self,
         principal: AccessPrincipal,

@@ -1744,3 +1744,50 @@ Safari 的 4K HEVC 与 Edge 的 720p VP9、480p AV1、4K HEVC、10-bit H.264（a
   `plugins::danmaku::…`、`plugins::media_info_config_api::…`（在本机未改动的基线上同样失败）。
 - 真机交接（未在本机执行）：把 Emby302 的 `proxy-error-strategy` 置为 `reject` 后播放 115 STRM，日志中不应再出现
   `解析 MediaSource 失败 … MediaSourceId 格式错误`，反代主机网卡不应出现媒体字节流量。
+
+## LUX-889 Emby `GET /Items/{id}/Similar`（2026-11-06）
+
+证据等级：端点形态为**真机抓包确认**；相似排序与参数语义为**静态推断**。Hills 1.11.0 与 Yamby 2.1.0.11
+在电影、剧集详情页都实际请求了 `/emby/Items/<id>/Similar`（Hills 带 `UserId`、`Fields`、`Limit`、
+`ImageTypeLimit`；Yamby 带 `Limit`、`UserId`、`ImageTypeLimit`、`Fields`、`EnableTotalRecordCount=false`），
+Lux 当时返回 404 空响应，客户端页面不报错、推荐区整块缺失
+（`docs/reviews/2026-11-06-hills-yamby-capture.md` 问题 3）。本任务只在 Lux 服务端实现该端点并用自动化
+测试覆盖，**没有在修复后的实例上复测客户端 UI**；“推荐区会重新出现”仍是推断，未经验证。
+
+- 路由：`GET /Items/{id}/Similar`，沿用现有 Emby 路由构建器，因此根路径与 `/emby` 前缀、大小写不敏感、
+  鉴权与播放令牌中间件都与其他 Emby item 路由一致。抓包没有出现 `/Users/{userId}/Items/{id}/Similar`，
+  所以没有新增该形态。
+- 响应：`{"Items":[...],"TotalRecordCount":n}`（不返回 `StartIndex`）。条目复用现有 Emby 列表投影，
+  `Fields` 与 `/Items` 同义，默认仍带 `UserData` 等列表字段。
+- `EnableUserData=false` 移除 `UserData`。`EnableImageTypes`（逗号或 `|` 分隔、大小写不敏感）只保留
+  请求的 `ImageTags` 键，未请求 `Backdrop` 时清空 `BackdropImageTags`；`ImageTypeLimit=0` 清空全部图片
+  tag，正数把 `BackdropImageTags` 截断到该数量，负数按“不限制”处理。显式空的 `EnableImageTypes=`
+  （以及空的 `ImageTypeLimit=`）按未提供处理，与 LUX-888 的空值规则一致：响应保留全部图片 tag，而不是
+  清空。这些参数的语义来自 Emby/Jellyfin 文档与客户端请求形态，属静态推断，没有逐项真机比对。
+- 相似规则：同类型（`Movie`/`Series`）且至少共享一个已入库 Genre；**候选池有硬上限**：最多 10 个源
+  Genre（按 `name_key` 取前 10 个），每个 Genre 最多 200 个通过 ACL、可见性与内容限制的候选；在这两个
+  上限内按共享数量降序，再按 `LOWER(title)`、条目 id 升序稳定排序，并排除自身。数据只来自
+  `media_item_facets` 的 `GENRE` 投影，不解析 NFO、不扫描媒体库、不调用 TMDb。每个 Genre 按
+  `item_id` 索引顺序取前 200 个可见条目，因此一个更相似但排在该 Genre 索引第 200 个之后的条目不会
+  出现。没有 NFO/facet 的条目不参与推荐；源条目没有 Genre 时返回 200 空列表。
+- `TotalRecordCount` 是**上述有界候选池内去重后的条目数**，不是库内所有“相似条目”的总数；客户端不应
+  把它当作全库推荐数量。Yamby 发送的 `EnableTotalRecordCount=false` 仍被忽略，响应总带该字段。
+- ACL：候选限定为请求用户可访问的已启用媒体库（管理员为全部已启用媒体库），并复用列表端点的可见性
+  谓词（已删除、已合并、无可用源）和内容限制（评级与标签策略）。被排除的库或条目不会出现在 `Items`
+  或 `TotalRecordCount` 中。
+- 错误与分页：条目不存在或对当前用户不可见都返回 404（与 `/Items/{id}` 一致）；未鉴权 401；
+  `Limit` 默认 50、上限 1000（与其他 Emby 列表一致），空值按未提供，负数、非整数或超上限 400；
+  无相似条目 200 空列表且 `TotalRecordCount=0`。
+- 性能边界：每个 Genre 的候选分支从源 Genre 的 `media_item_facets` 索引出发，`ORDER BY facet.item_id`
+  正是 `idx_media_item_facets_lookup(kind, name_key, item_id)` 的尾部，因此查询计划按索引顺序读取并在
+  `LIMIT 200` 处停止，不会先收集该 Genre 的全部条目再排序；ACL、可见性、内容限制、同类型与排除自身
+  都在分支内、`LIMIT` 之前生效，被隐藏条目不会占用候选名额。聚合与排序只处理 ≤ 10×200 行的并集，
+  `TotalRecordCount` 也只在该并集上 `COUNT(DISTINCT)`，不再对全库计数。存储测试
+  （`cargo test --locked --lib similar_catalog`）断言单个 Genre 分支的计划使用 facet 索引、没有
+  `USE TEMP B-TREE FOR ORDER BY`、没有 `SCAN media_items`，并验证候选池上限与同一请求两次结果一致。
+  热门 Genre 的请求成本仍有上界，但会随“前 200 个可见候选在该 Genre 索引中的位置”变化；没有全表
+  扫描，也没有新增索引或迁移。证据仅为本机 SQLite `arm64`，不代表 NAS/x86_64 性能。
+- 自动化：`cargo test --locked --test emby emby_similar::` 6 例覆盖电影/剧集、共享 Genre 排序、
+  不含自身与不同类型、ACL 排除、`Limit`/`TotalRecordCount`、空列表、404/401、根路径与 `/emby` 前缀、
+  `EnableUserData`/图片类型选择、空值与非法 `Limit`。该记录只证明 Lux 服务端合同，不代表客户端已确认
+  推荐区恢复。
