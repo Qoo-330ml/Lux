@@ -12,7 +12,7 @@ import { useMediaSource } from "./MediaSourcePanel";
 import { MediaEpisodePlayButton } from "./MediaEpisodesSection";
 import { streamsOfType } from "./media-source";
 import { LuxLogo } from "../../components/LuxLogo";
-import { useSseConnectionState } from "../activity/useUserEvents";
+import { useRealtimeConnectionState } from "../activity/useUserEvents";
 import { LuxButton , luxButtonClass } from "../../components/ui";
 
 const LazyMetadataEditor = lazy(() => import("../media/MediaMetadataEditor").then((module) => ({ default: module.MediaMetadataEditor })));
@@ -54,8 +54,8 @@ export function MediaDetailActions({ item, pendingReview, children }: {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { source, selectedAudioStreamIndex, selectedSubtitleStreamIndex } = useMediaSource();
-  const sseState = useSseConnectionState();
-  const refetchInterval = sseState === "connected" ? false : queryRefreshIntervals.mediaSurface;
+  const realtimeState = useRealtimeConnectionState();
+  const refetchInterval = realtimeState === "connected" ? false : queryRefreshIntervals.mediaSurface;
   const playback = useQuery({
     queryKey: queryKeys.playback(item.id),
     queryFn: () => api.playback(item.id),

@@ -16,7 +16,7 @@ import { api } from "../../lib/api/client";
 import type { LuxUser } from "../../lib/api/types";
 import { applyAccountAccent, applyAccountTheme, readAccountSettings } from "../../features/account/account-settings";
 import { ScanActivityPopover } from "../../features/activity/ScanActivityPopover";
-import { SseConnectionContext, useUserEvents } from "../../features/activity/useUserEvents";
+import { RealtimeConnectionContext, useUserEvents } from "../../features/activity/useUserEvents";
 import { LuxLogo } from "../LuxLogo";
 import { LuxIconButton } from "../ui";
 
@@ -45,7 +45,7 @@ export function useAvatar(): AvatarContextValue {
 }
 
 export function LuxShell({ user, serverName }: LuxShellProps) {
-  const sseConnectionState = useUserEvents();
+  const realtimeConnectionState = useUserEvents();
   const navigate = useNavigate();
   const location = useLocation();
   const queryClient = useQueryClient();
@@ -91,7 +91,7 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
   }, [isDetail, serverName]);
 
   return (
-    <SseConnectionContext.Provider value={sseConnectionState}>
+    <RealtimeConnectionContext.Provider value={realtimeConnectionState}>
     <AvatarContext.Provider value={{ avatarUrl, setAvatarUrl }}>
       <div className={isHome ? "lux-app is-home-route" : "lux-app"}>
         <header className="lux-header">
@@ -193,7 +193,7 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
         </main>
       </div>
     </AvatarContext.Provider>
-    </SseConnectionContext.Provider>
+    </RealtimeConnectionContext.Provider>
   );
 }
 

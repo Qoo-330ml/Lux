@@ -19,7 +19,7 @@ import { useImageVariants } from "./image-variants";
 import { nextCarouselIndex, useDocumentHidden, useHeroCarouselAutoplay } from "./hero-carousel-autoplay";
 import { heroBackdropUrl, useHeroBackdropPreload } from "./hero-preload";
 import { ContinueWatchingRail, imageUrl, LibraryCard, MediaRail, mediaTitle, mediaTypeLabel, playbackPositionTicks, runtimeLabel } from "./media";
-import { useSseConnectionState, type SseConnectionState } from "../activity/useUserEvents";
+import { useRealtimeConnectionState, type RealtimeConnectionState } from "../activity/useUserEvents";
 import { prefetchLibraryPage } from "../library/prefetchLibrary";
 import { LuxButton , luxButtonClass } from "../../components/ui";
 
@@ -28,7 +28,7 @@ const EMPTY_MEDIA_ITEMS: MediaItem[] = [];
 
 export function HomePage({ user }: { user: LuxUser }) {
   const queryClient = useQueryClient();
-  const sseState = useSseConnectionState();
+  const realtimeState = useRealtimeConnectionState();
   const accountSettings = useMemo(() => readAccountSettings(user.id), [user.id]);
   const cachedCarousel = useMemo(() => readHomeCarouselCache(user.id), [user.id]);
   const carousel = useQuery({
@@ -38,7 +38,7 @@ export function HomePage({ user }: { user: LuxUser }) {
     initialDataUpdatedAt: cachedCarousel?.savedAt,
     staleTime: 30_000,
     retry: false,
-    refetchInterval: (query) => homeRefetchInterval(query.state.data, sseState),
+    refetchInterval: (query) => homeRefetchInterval(query.state.data, realtimeState),
     refetchIntervalInBackground: false,
   });
   const librariesQuery = useQuery({
@@ -46,7 +46,7 @@ export function HomePage({ user }: { user: LuxUser }) {
     queryFn: ({ signal }) => api.homeLibraries(signal),
     staleTime: 30_000,
     retry: false,
-    refetchInterval: (query) => homeRefetchInterval(query.state.data, sseState),
+    refetchInterval: (query) => homeRefetchInterval(query.state.data, realtimeState),
     refetchIntervalInBackground: false,
   });
   const continueWatchingQuery = useQuery({
@@ -54,7 +54,7 @@ export function HomePage({ user }: { user: LuxUser }) {
     queryFn: ({ signal }) => api.homeContinueWatching(signal),
     staleTime: 30_000,
     retry: false,
-    refetchInterval: (query) => homeRefetchInterval(query.state.data, sseState),
+    refetchInterval: (query) => homeRefetchInterval(query.state.data, realtimeState),
     refetchIntervalInBackground: false,
   });
   const libraries = librariesQuery.data?.libraries ?? EMPTY_LIBRARIES;
@@ -65,7 +65,7 @@ export function HomePage({ user }: { user: LuxUser }) {
     enabled: libraryIds.length > 0,
     staleTime: 30_000,
     retry: false,
-    refetchInterval: (query) => homeRefetchInterval(query.state.data, sseState),
+    refetchInterval: (query) => homeRefetchInterval(query.state.data, realtimeState),
     refetchIntervalInBackground: false,
   });
   const latestItemsByLibraryId = useMemo(() => {
@@ -154,8 +154,8 @@ export function HomePage({ user }: { user: LuxUser }) {
   );
 }
 
-export function homeRefetchInterval(data: unknown, sseState: SseConnectionState = "disconnected"): number | false {
-  return data === undefined || sseState === "connected" ? false : queryRefreshIntervals.mediaSurface;
+export function homeRefetchInterval(data: unknown, realtimeState: RealtimeConnectionState = "disconnected"): number | false {
+  return data === undefined || realtimeState === "connected" ? false : queryRefreshIntervals.mediaSurface;
 }
 
 function HomeLatestRail({

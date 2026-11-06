@@ -11,12 +11,12 @@ import { mediaTitle } from "../home/media-display";
 import { MediaDetailActions, MediaDetailActionControls, MediaDetailMobileHeader } from "./MediaDetailActions";
 import { MediaEpisodesProvider, MediaEpisodesSection } from "./MediaEpisodesSection";
 import { MediaDetailArtwork, MediaDetailHero, MediaSeriesProvider } from "./MediaDetailHero";
-import { useSseConnectionState } from "../activity/useUserEvents";
+import { useRealtimeConnectionState } from "../activity/useUserEvents";
 
 export function MediaDetailPage() {
   const { itemId = "" } = useParams();
-  const sseState = useSseConnectionState();
-  const refetchInterval = sseState === "connected" ? false : queryRefreshIntervals.mediaSurface;
+  const realtimeState = useRealtimeConnectionState();
+  const refetchInterval = realtimeState === "connected" ? false : queryRefreshIntervals.mediaSurface;
   const [routeParams] = useSearchParams();
   const item = useQuery({
     queryKey: queryKeys.item(itemId),

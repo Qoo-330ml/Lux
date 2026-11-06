@@ -10,6 +10,7 @@ import { LuxShell, useAvatar } from "../src/components/layout/LuxShell";
 import { HomePage } from "../src/features/home/HomePage";
 import { api } from "../src/lib/api/client";
 import { queryKeys } from "../src/lib/api/query-keys";
+import { FakeWebSocket, installFakeWebSocket } from "./support/fake-websocket";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -23,35 +24,11 @@ function LocationFixture() {
   return <output data-testid="location">{useLocation().pathname}</output>;
 }
 
-type EventListener = (event: Event) => void;
-
-class FakeEventSource {
-  static instances: FakeEventSource[] = [];
-  readonly listeners = new Map<string, Set<EventListener>>();
-  closed = false;
-
-  constructor(readonly url: string) {
-    FakeEventSource.instances.push(this);
-  }
-
-  addEventListener(type: string, listener: EventListener) {
-    const listeners = this.listeners.get(type) ?? new Set<EventListener>();
-    listeners.add(listener);
-    this.listeners.set(type, listeners);
-  }
-
-  removeEventListener(type: string, listener: EventListener) {
-    this.listeners.get(type)?.delete(listener);
-  }
-
-  close() {
-    this.closed = true;
-  }
-
-  emit(type: string, data?: string) {
-    const event = new MessageEvent(type, { data });
-    for (const listener of this.listeners.get(type) ?? []) listener(event);
-  }
+/** The single realtime socket the shell owns. */
+function lastSocket(): FakeWebSocket {
+  const socket = FakeWebSocket.last();
+  if (!socket) throw new Error("no realtime socket was created");
+  return socket;
 }
 
 function renderWithProviders(root: Root, children: ReactNode) {
@@ -373,7 +350,7 @@ describe("LuxShell user control", () => {
   });
 
   it("invalidates home and library queries when user events announce new content", () => {
-    vi.stubGlobal("EventSource", FakeEventSource);
+    installFakeWebSocket();
     sessionStorage.setItem("lux.home-carousel.v2:user-1", JSON.stringify({ version: 2, data: { recommended: [] } }));
     container = document.createElement("div");
     document.body.append(container);
@@ -394,8 +371,8 @@ describe("LuxShell user control", () => {
     });
     const invalidate = vi.spyOn(queryClient!, "invalidateQueries").mockResolvedValue();
 
-    expect(FakeEventSource.instances[0]?.url).toBe("/api/v1/events");
-    act(() => FakeEventSource.instances[0]?.emit("invalidate", JSON.stringify({ scope: "home" })));
+    expect(lastSocket().url).toBe("ws://localhost:3000/api/v1/ws");
+    act(() => lastSocket().message({ type: "invalidate", channel: "user", scope: "home" }));
 
     expect(sessionStorage.getItem("lux.home-carousel.v2:user-1")).toBeNull();
     expect(invalidate.mock.calls.map(([options]) => options)).toEqual(expect.arrayContaining([
@@ -406,9 +383,9 @@ describe("LuxShell user control", () => {
   });
 
   it("renders the first catalog batch and poster URL after invalidating an empty home page", async () => {
-    FakeEventSource.instances = [];
+    FakeWebSocket.reset();
     sessionStorage.clear();
-    vi.stubGlobal("EventSource", FakeEventSource);
+    installFakeWebSocket();
     vi.spyOn(api, "homeCarousel").mockResolvedValue({ recommended: [] });
     vi.spyOn(api, "homeLibraries").mockResolvedValue({
       libraries: [{ id: "library-1", name: "电影库", kind: "MOVIE" }],
@@ -446,7 +423,7 @@ describe("LuxShell user control", () => {
 
     // Supply the first mock batch through the home invalidation used by scans.
     fixture.indexed = true;
-    act(() => FakeEventSource.instances[0]?.emit("invalidate", JSON.stringify({ scope: "home" })));
+    act(() => lastSocket().message({ type: "invalidate", channel: "user", scope: "home" }));
     await vi.waitFor(() => expect(latest).toHaveBeenCalledTimes(2));
     await vi.waitFor(() => expect(container.querySelector<HTMLImageElement>(
       '[aria-label="最新电影库"] .lux-media-card img',
@@ -455,9 +432,9 @@ describe("LuxShell user control", () => {
   });
 
   it("refreshes the library poster tags after a scraper home event", async () => {
-    FakeEventSource.instances = [];
+    FakeWebSocket.reset();
     sessionStorage.clear();
-    vi.stubGlobal("EventSource", FakeEventSource);
+    installFakeWebSocket();
     vi.spyOn(api, "homeCarousel").mockResolvedValue({ recommended: [] });
     vi.spyOn(api, "homeLibraries").mockResolvedValue({
       libraries: [{ id: "library-1", name: "电影库", kind: "MOVIE" }],
@@ -501,7 +478,7 @@ describe("LuxShell user control", () => {
     await vi.waitFor(() => expect(container.querySelector<HTMLImageElement>(
       '[aria-label="最新电影库"] .lux-media-card img',
     )?.src).toContain("tag=poster-v1"));
-    act(() => FakeEventSource.instances[0]?.emit("invalidate", JSON.stringify({ scope: "home" })));
+    act(() => lastSocket().message({ type: "invalidate", channel: "user", scope: "home" }));
     await vi.waitFor(() => expect(latest).toHaveBeenCalledTimes(2));
     await vi.waitFor(() => expect(container.querySelector<HTMLImageElement>(
       '[aria-label="最新电影库"] .lux-media-card img',
@@ -509,9 +486,9 @@ describe("LuxShell user control", () => {
   });
 
   it("does not cancel a cached-home refresh when scan events arrive", async () => {
-    FakeEventSource.instances = [];
+    FakeWebSocket.reset();
     sessionStorage.clear();
-    vi.stubGlobal("EventSource", FakeEventSource);
+    installFakeWebSocket();
     const response = { recommended: [] };
     let resolveFirstRequest: ((value: typeof response) => void) | undefined;
     let firstSignal: AbortSignal | undefined;
@@ -548,7 +525,7 @@ describe("LuxShell user control", () => {
 
     expect(homeRequest).toHaveBeenCalledTimes(1);
     await act(async () => {
-      FakeEventSource.instances[0]?.emit("invalidate", JSON.stringify({ scope: "home" }));
+      lastSocket().message({ type: "invalidate", channel: "user", scope: "home" });
       await Promise.resolve();
     });
 
@@ -566,9 +543,9 @@ describe("LuxShell user control", () => {
   });
 
   it("does not restart a failed first home load for each scan event", async () => {
-    FakeEventSource.instances = [];
+    FakeWebSocket.reset();
     sessionStorage.clear();
-    vi.stubGlobal("EventSource", FakeEventSource);
+    installFakeWebSocket();
     const homeRequest = vi.spyOn(api, "homeCarousel").mockRejectedValue(new Error("首页请求超时，请重试"));
     vi.spyOn(api, "homeLibraries").mockResolvedValue({ libraries: [] });
     vi.spyOn(api, "homeContinueWatching").mockResolvedValue({ items: [], total: 0 });
@@ -600,7 +577,7 @@ describe("LuxShell user control", () => {
     expect(container.querySelector('[role="status"]')?.textContent).toContain("精选轮播加载失败");
 
     await act(async () => {
-      FakeEventSource.instances[0]?.emit("invalidate", JSON.stringify({ scope: "home" }));
+      lastSocket().message({ type: "invalidate", channel: "user", scope: "home" });
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
