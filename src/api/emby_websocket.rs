@@ -36,12 +36,24 @@ pub(crate) const EMBY_WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(120
 pub(crate) const EMBY_WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 /// How long a graceful shutdown waits for the open connections to finish closing.
 pub(crate) const EMBY_WEBSOCKET_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-/// Initial capacity of a connection's write buffer.
+/// Initial capacity of a connection's write buffer. It is only a capacity hint: a single message
+/// larger than this is buffered up to [`EMBY_WEBSOCKET_MAX_WRITE_BUFFER_BYTES`] before it is
+/// flushed, so this value must never be used as a document limit.
 pub(crate) const EMBY_WEBSOCKET_WRITE_BUFFER_BYTES: usize = 16 * 1024;
-/// Hard cap of a connection's write buffer. One `Sessions` document for the 500 sessions the
-/// store lists stays well below it; a peer that stops reading makes the send fail instead of
-/// growing the buffer without bound.
-pub(crate) const EMBY_WEBSOCKET_MAX_WRITE_BUFFER_BYTES: usize = 64 * 1024;
+/// Hard cap of a connection's write buffer, and therefore the largest document one push may have.
+///
+/// A `Sessions` document grows with the listed sessions
+/// (`MAX_LISTED_PLAYBACK_SESSIONS = 500` in `src/storage/sessions.rs`). One session entry measures
+/// about 1.3-1.5 KiB with `NowPlayingItem`, `PlayState` and `TranscodingInfo`, so the worst case is
+/// roughly 500 x 1.5 KiB = 750 KiB. 4 MiB leaves more than five times that headroom, so a busy
+/// server never hits the cap, while a peer that stops reading still cannot grow the buffer past a
+/// few MiB. Anything larger than the cap is skipped (see `payload_fits`) instead of closing the
+/// connection, because Yamby reconnects without backoff.
+pub(crate) const EMBY_WEBSOCKET_MAX_WRITE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+/// Upper bound of the configurable initial write-buffer capacity. It is only a hint, so a
+/// misconfigured override must not allocate a huge buffer per connection up front, and it must
+/// stay below the hard cap by at least one byte (tungstenite asserts a strict inequality).
+pub(crate) const EMBY_WEBSOCKET_WRITE_BUFFER_BYTES_LIMIT: usize = 1024 * 1024;
 /// A single send that cannot complete within this bound closes the connection. It is far below
 /// the idle timeout so a stalled reader is reaped before the idle deadline would fire.
 pub(crate) const EMBY_WEBSOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -120,8 +132,17 @@ impl EmbyWebsocketLimits {
         self.heartbeat_interval = self.heartbeat_interval.max(Duration::from_millis(10));
         self.idle_timeout = self.idle_timeout.max(self.heartbeat_interval);
         self.max_message_bytes = self.max_message_bytes.max(1024);
-        self.write_buffer_bytes = self.write_buffer_bytes.max(1024);
-        self.max_write_buffer_bytes = self.max_write_buffer_bytes.max(self.write_buffer_bytes);
+        // tungstenite asserts `max_write_buffer_size > write_buffer_size` right after the upgrade
+        // (`WebSocketConfig::assert_valid`), and that assert runs inside the connection task: an
+        // equal or smaller cap would panic there instead of failing the handshake. The initial
+        // capacity is clamped so the strict inequality is always reachable, including for
+        // `usize::MAX` overrides (saturating add keeps the arithmetic defined).
+        self.write_buffer_bytes = self
+            .write_buffer_bytes
+            .clamp(1024, EMBY_WEBSOCKET_WRITE_BUFFER_BYTES_LIMIT);
+        self.max_write_buffer_bytes = self
+            .max_write_buffer_bytes
+            .max(self.write_buffer_bytes.saturating_add(1));
         self.send_timeout = self.send_timeout.max(Duration::from_millis(10));
         self.revalidate_interval = self.revalidate_interval.max(Duration::from_millis(10));
         self.auth_warn_interval = self.auth_warn_interval.max(Duration::from_millis(10));
@@ -452,6 +473,36 @@ async fn send_bounded(socket: &mut WebSocket, message: Message, timeout: Duratio
     bounded(socket.send(message), timeout).await
 }
 
+/// Whether one serialized document fits into the write buffer.
+///
+/// A document at or above the cap would make tungstenite reject the frame (`WriteBufferFull`) and
+/// force the connection to close, so the push is skipped instead: the peer keeps its connection
+/// and the next schedule retries with a document that may have shrunk.
+fn payload_fits(payload: &str, limits: &EmbyWebsocketLimits) -> bool {
+    payload.len() < limits.max_write_buffer_bytes
+}
+
+/// Logs an oversized document at most once per `auth_warn_interval`; never includes the payload
+/// or any credential.
+fn warn_document_too_large(
+    last_warning: &mut Option<Instant>,
+    now: Instant,
+    limits: &EmbyWebsocketLimits,
+    payload_len: usize,
+) {
+    let due = last_warning
+        .is_none_or(|last| now.saturating_duration_since(last) >= limits.auth_warn_interval);
+    if !due {
+        return;
+    }
+    *last_warning = Some(now);
+    tracing::warn!(
+        payload_bytes = payload_len,
+        limit_bytes = limits.max_write_buffer_bytes,
+        "skipped an emby websocket push larger than the write buffer"
+    );
+}
+
 async fn run_connection(mut socket: WebSocket, context: ConnectionContext) {
     let ConnectionContext {
         state,
@@ -468,9 +519,146 @@ async fn run_connection(mut socket: WebSocket, context: ConnectionContext) {
     let mut next_heartbeat = Instant::now() + limits.heartbeat_interval;
     let mut next_revalidate = Instant::now() + limits.revalidate_interval;
     let mut last_revalidation_warning: Option<Instant> = None;
+    let mut last_document_warning: Option<Instant> = None;
     let close = loop {
         if *shutdown.borrow() {
             break Some(utf8_close(CLOSE_GOING_AWAY, "server shutting down"));
+        }
+        // Timer work runs at the top of every iteration, *before* the loop waits for an inbound
+        // frame: a client that never stops sending must not be able to starve pushes, heartbeats
+        // or the periodic revalidation (and with them, a revoked token).
+        let now = Instant::now();
+        if now >= idle_deadline {
+            break Some(utf8_close(CLOSE_GOING_AWAY, "idle timeout"));
+        }
+        if now >= next_heartbeat {
+            if !send_bounded(
+                &mut socket,
+                Message::Ping(Bytes::new()),
+                limits.send_timeout,
+            )
+            .await
+            {
+                break None;
+            }
+            next_heartbeat = now + limits.heartbeat_interval;
+        }
+        // A connection without an active push plan would otherwise never revalidate, so a revoked
+        // token (or a disabled policy) would keep `SessionsStop` connections open.
+        if now >= next_revalidate {
+            let outcome = match revalidated_principal(&state, &headers, &query).await {
+                Ok(_) => RevalidationOutcome::Authorized,
+                Err(status) => {
+                    let outcome = revalidation_outcome(status);
+                    if outcome == RevalidationOutcome::Retry {
+                        warn_revalidation_unavailable(
+                            &mut last_revalidation_warning,
+                            now,
+                            &limits,
+                            status,
+                        );
+                    }
+                    outcome
+                }
+            };
+            if outcome == RevalidationOutcome::Closed {
+                break Some(utf8_close(CLOSE_POLICY_VIOLATION, "token revoked"));
+            }
+            next_revalidate = now + limits.revalidate_interval;
+        }
+        if sessions.due(now) {
+            match revalidated_principal(&state, &headers, &query).await {
+                Ok(principal) => match emby_session_entries(&state, &principal, None).await {
+                    Ok(entries) => {
+                        let payload =
+                            json!({"MessageType": "Sessions", "Data": entries}).to_string();
+                        if payload_fits(&payload, &limits) {
+                            if !send_bounded(
+                                &mut socket,
+                                Message::Text(payload.into()),
+                                limits.send_timeout,
+                            )
+                            .await
+                            {
+                                break None;
+                            }
+                        } else {
+                            warn_document_too_large(
+                                &mut last_document_warning,
+                                now,
+                                &limits,
+                                payload.len(),
+                            );
+                        }
+                    }
+                    Err(status) => tracing::debug!(
+                        status = status.as_u16(),
+                        "skipped an emby websocket session push"
+                    ),
+                },
+                Err(status) if revalidation_outcome(status) == RevalidationOutcome::Closed => {
+                    break Some(utf8_close(CLOSE_POLICY_VIOLATION, "token revoked"));
+                }
+                // A temporary failure must not drop the connection: the next scheduled attempt
+                // retries, and the warning is rate limited.
+                Err(status) => warn_revalidation_unavailable(
+                    &mut last_revalidation_warning,
+                    now,
+                    &limits,
+                    status,
+                ),
+            }
+            sessions.record_attempt(Instant::now());
+        }
+        if tasks.due(now) {
+            match revalidated_principal(&state, &headers, &query).await {
+                Ok(principal) if principal.can_manage_server() => {
+                    match emby_scheduled_task_entries(&state).await {
+                        Ok(entries) => {
+                            let payload = json!({
+                                "MessageType": "ScheduledTasksInfo",
+                                "Data": entries,
+                            })
+                            .to_string();
+                            if payload_fits(&payload, &limits) {
+                                if !send_bounded(
+                                    &mut socket,
+                                    Message::Text(payload.into()),
+                                    limits.send_timeout,
+                                )
+                                .await
+                                {
+                                    break None;
+                                }
+                            } else {
+                                warn_document_too_large(
+                                    &mut last_document_warning,
+                                    now,
+                                    &limits,
+                                    payload.len(),
+                                );
+                            }
+                        }
+                        Err(status) => tracing::debug!(
+                            status = status.as_u16(),
+                            "skipped an emby websocket scheduled-task push"
+                        ),
+                    }
+                }
+                // A demoted administrator stops observing the scan state; the stream is dropped
+                // instead of failing the whole connection.
+                Ok(_) => tasks.stop(),
+                Err(status) if revalidation_outcome(status) == RevalidationOutcome::Closed => {
+                    break Some(utf8_close(CLOSE_POLICY_VIOLATION, "token revoked"));
+                }
+                Err(status) => warn_revalidation_unavailable(
+                    &mut last_revalidation_warning,
+                    now,
+                    &limits,
+                    status,
+                ),
+            }
+            tasks.record_attempt(Instant::now());
         }
         let next_wake = next_wake(
             &sessions,
@@ -528,128 +716,8 @@ async fn run_connection(mut socket: WebSocket, context: ConnectionContext) {
                     Message::Ping(_) | Message::Pong(_) | Message::Binary(_) => {}
                 }
             }
-            Wake::Timer => {
-                let now = Instant::now();
-                if now >= idle_deadline {
-                    break Some(utf8_close(CLOSE_GOING_AWAY, "idle timeout"));
-                }
-                if now >= next_heartbeat {
-                    if !send_bounded(
-                        &mut socket,
-                        Message::Ping(Bytes::new()),
-                        limits.send_timeout,
-                    )
-                    .await
-                    {
-                        break None;
-                    }
-                    next_heartbeat = now + limits.heartbeat_interval;
-                }
-                // A connection without an active push plan would otherwise never revalidate, so a
-                // revoked token (or a disabled policy) would keep `SessionsStop` connections open.
-                if now >= next_revalidate {
-                    let outcome = match revalidated_principal(&state, &headers, &query).await {
-                        Ok(_) => RevalidationOutcome::Authorized,
-                        Err(status) => {
-                            let outcome = revalidation_outcome(status);
-                            if outcome == RevalidationOutcome::Retry {
-                                warn_revalidation_unavailable(
-                                    &mut last_revalidation_warning,
-                                    now,
-                                    &limits,
-                                    status,
-                                );
-                            }
-                            outcome
-                        }
-                    };
-                    if outcome == RevalidationOutcome::Closed {
-                        break Some(utf8_close(CLOSE_POLICY_VIOLATION, "token revoked"));
-                    }
-                    next_revalidate = now + limits.revalidate_interval;
-                }
-                if sessions.due(now) {
-                    match revalidated_principal(&state, &headers, &query).await {
-                        Ok(principal) => match emby_session_entries(&state, &principal, None).await
-                        {
-                            Ok(entries) => {
-                                let payload =
-                                    json!({"MessageType": "Sessions", "Data": entries}).to_string();
-                                if !send_bounded(
-                                    &mut socket,
-                                    Message::Text(payload.into()),
-                                    limits.send_timeout,
-                                )
-                                .await
-                                {
-                                    break None;
-                                }
-                            }
-                            Err(status) => tracing::debug!(
-                                status = status.as_u16(),
-                                "skipped an emby websocket session push"
-                            ),
-                        },
-                        Err(status)
-                            if revalidation_outcome(status) == RevalidationOutcome::Closed =>
-                        {
-                            break Some(utf8_close(CLOSE_POLICY_VIOLATION, "token revoked"));
-                        }
-                        // A temporary failure must not drop the connection: the next scheduled
-                        // attempt retries, and the warning is rate limited.
-                        Err(status) => warn_revalidation_unavailable(
-                            &mut last_revalidation_warning,
-                            now,
-                            &limits,
-                            status,
-                        ),
-                    }
-                    sessions.record_attempt(Instant::now());
-                }
-                if tasks.due(now) {
-                    match revalidated_principal(&state, &headers, &query).await {
-                        Ok(principal) if principal.can_manage_server() => {
-                            match emby_scheduled_task_entries(&state).await {
-                                Ok(entries) => {
-                                    let payload = json!({
-                                        "MessageType": "ScheduledTasksInfo",
-                                        "Data": entries,
-                                    })
-                                    .to_string();
-                                    if !send_bounded(
-                                        &mut socket,
-                                        Message::Text(payload.into()),
-                                        limits.send_timeout,
-                                    )
-                                    .await
-                                    {
-                                        break None;
-                                    }
-                                }
-                                Err(status) => tracing::debug!(
-                                    status = status.as_u16(),
-                                    "skipped an emby websocket scheduled-task push"
-                                ),
-                            }
-                        }
-                        // A demoted administrator stops observing the scan state; the stream is
-                        // dropped instead of failing the whole connection.
-                        Ok(_) => tasks.stop(),
-                        Err(status)
-                            if revalidation_outcome(status) == RevalidationOutcome::Closed =>
-                        {
-                            break Some(utf8_close(CLOSE_POLICY_VIOLATION, "token revoked"));
-                        }
-                        Err(status) => warn_revalidation_unavailable(
-                            &mut last_revalidation_warning,
-                            now,
-                            &limits,
-                            status,
-                        ),
-                    }
-                    tasks.record_attempt(Instant::now());
-                }
-            }
+            // The timer pass at the top of the loop already did the work; just iterate again.
+            Wake::Timer => {}
         }
     };
     if let Some(frame) = close {
@@ -865,6 +933,57 @@ mod tests {
         );
         assert!(!stream.due(start + Duration::from_millis(150)));
         assert!(stream.due(start + Duration::from_millis(210)));
+    }
+
+    #[test]
+    fn write_buffer_cap_is_always_strictly_greater_than_the_initial_capacity() {
+        let equal = EmbyWebsocketLimits {
+            write_buffer_bytes: 4096,
+            max_write_buffer_bytes: 4096,
+            ..EmbyWebsocketLimits::default()
+        }
+        .normalized();
+        assert!(equal.max_write_buffer_bytes > equal.write_buffer_bytes);
+
+        let smaller = EmbyWebsocketLimits {
+            write_buffer_bytes: 4096,
+            max_write_buffer_bytes: 1024,
+            ..EmbyWebsocketLimits::default()
+        }
+        .normalized();
+        assert!(smaller.max_write_buffer_bytes > smaller.write_buffer_bytes);
+
+        let maxed = EmbyWebsocketLimits {
+            write_buffer_bytes: usize::MAX,
+            max_write_buffer_bytes: usize::MAX,
+            ..EmbyWebsocketLimits::default()
+        }
+        .normalized();
+        assert!(maxed.write_buffer_bytes <= EMBY_WEBSOCKET_WRITE_BUFFER_BYTES_LIMIT);
+        assert!(maxed.max_write_buffer_bytes > maxed.write_buffer_bytes);
+    }
+
+    #[test]
+    fn the_default_cap_leaves_room_for_the_largest_session_document() {
+        let limits = EmbyWebsocketLimits::default();
+        // 500 listed sessions at ~1.5 KiB each is the documented worst case (~750 KiB).
+        let worst_case_document = 500 * 1536;
+        assert!(worst_case_document < limits.max_write_buffer_bytes);
+        // The initial capacity is a hint and must stay well below the cap.
+        assert!(limits.write_buffer_bytes < limits.max_write_buffer_bytes / 4);
+    }
+
+    #[test]
+    fn a_document_at_or_above_the_cap_is_not_sent() {
+        let limits = EmbyWebsocketLimits {
+            write_buffer_bytes: 1024,
+            max_write_buffer_bytes: 4096,
+            ..EmbyWebsocketLimits::default()
+        }
+        .normalized();
+        assert!(payload_fits(&"x".repeat(4095), &limits));
+        assert!(!payload_fits(&"x".repeat(4096), &limits));
+        assert!(!payload_fits(&"x".repeat(64 * 1024), &limits));
     }
 
     #[test]

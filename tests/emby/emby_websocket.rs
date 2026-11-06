@@ -14,6 +14,7 @@ use futures_util::{SinkExt, StreamExt};
 use luxd::{
     api::{AppState, EmbyWebsocketLimits, app_with_state},
     application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
+    auth::emby::EmbyDeviceInfo,
     auth::{emby::EmbyAuthService, sessions::WebAuthService, users::UserStore},
     config::Config,
     library::LibraryKind,
@@ -24,7 +25,7 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
-    tungstenite::{Error as WsError, Message},
+    tungstenite::{Error as WsError, Message, client::IntoClientRequest},
 };
 
 type ClientSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -32,6 +33,7 @@ type ClientSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 struct TestServer {
     base_url: String,
     ws_url: String,
+    address: std::net::SocketAddr,
     client: reqwest::Client,
     admin_token: String,
     viewer_token: String,
@@ -132,6 +134,7 @@ async fn spawn_server(
     Ok(TestServer {
         base_url,
         ws_url,
+        address,
         client,
         admin_token,
         viewer_token,
@@ -202,6 +205,44 @@ impl TestServer {
         Ok(())
     }
 
+    /// Issues a real playback ticket (`luxpb_{item}_{random}`) through the same service the
+    /// playback routes use, so the rejection test cannot pass on the "unknown token" path.
+    async fn issue_playback_ticket(&self) -> Result<(String, String), Box<dyn std::error::Error>> {
+        let auth = EmbyAuthService::new(self.database.clone())?;
+        let device = EmbyDeviceInfo {
+            client: "WebSocketTest".to_owned(),
+            device: "Mac".to_owned(),
+            device_id: "ws-playback-ticket".to_owned(),
+            version: "1".to_owned(),
+            user_id: None,
+        };
+        let login = auth
+            .authenticate("Admin", "correct password", &device)
+            .await?
+            .ok_or("login failed while issuing a playback ticket")?;
+        let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
+            .fetch_one(self.database.pool())
+            .await?;
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs() as i64)
+            .unwrap_or_default()
+            + 600;
+        let item_public_id = uuid_to_emby_id(&item_id);
+        let ticket = auth
+            .issue_playback_token(
+                &login.user,
+                &item_public_id,
+                "websocket-playback-ticket",
+                &device,
+                expires_at,
+                None,
+            )
+            .await?
+            .ok_or_else(|| "playback ticket was not issued".to_owned())?;
+        Ok((ticket, item_public_id))
+    }
+
     /// Opens the WebSocket the way Yamby does: `api_key` in the query, `deviceId` alongside it.
     async fn connect(
         &self,
@@ -214,6 +255,27 @@ impl TestServer {
             self.ws_url
         );
         let (socket, response) = tokio_tungstenite::connect_async(url.as_str()).await?;
+        assert_eq!(response.status().as_u16(), 101);
+        Ok(socket)
+    }
+
+    /// Opens the WebSocket over a TCP socket whose receive buffer is tiny, so a few pushes fill
+    /// the peer window and the server's writes really block (the only way to exercise the send
+    /// timeout instead of the message size check).
+    async fn connect_with_small_receive_buffer(
+        &self,
+        token: &str,
+    ) -> Result<ClientSocket, Box<dyn std::error::Error>> {
+        let url = format!(
+            "{}/embywebsocket?api_key={token}&deviceId=ws-test-device",
+            self.ws_url
+        );
+        let socket = tokio::net::TcpSocket::new_v4()?;
+        socket.set_recv_buffer_size(1024)?;
+        let stream = socket.connect(self.address).await?;
+        let request = url.as_str().into_client_request()?;
+        let (socket, response) =
+            tokio_tungstenite::client_async(request, MaybeTlsStream::Plain(stream)).await?;
         assert_eq!(response.status().as_u16(), 101);
         Ok(socket)
     }
@@ -287,7 +349,10 @@ async fn next_text(stream: &mut ClientSocket) -> Result<String, Box<dyn std::err
 
 /// Waits for the server's close frame and returns its code, or `None` when the transport ended
 /// without one.
-async fn next_close(stream: &mut ClientSocket) -> Result<Option<u16>, Box<dyn std::error::Error>> {
+async fn next_close<S>(stream: &mut S) -> Result<Option<u16>, Box<dyn std::error::Error>>
+where
+    S: futures_util::Stream<Item = Result<Message, WsError>> + Unpin,
+{
     loop {
         let message = tokio::time::timeout(Duration::from_secs(5), stream.next())
             .await
@@ -418,14 +483,31 @@ async fn emby_websocket_rejects_an_invalid_token_before_upgrading()
 }
 
 #[tokio::test]
-async fn emby_websocket_rejects_playback_tokens() -> Result<(), Box<dyn std::error::Error>> {
+async fn emby_websocket_rejects_playback_tickets() -> Result<(), Box<dyn std::error::Error>> {
     let server = spawn_server(limits()).await?;
-    let status = server
-        .handshake_status("/embywebsocket", "luxPlaybackSignature=deadbeef")
+    // A real ticket as the playback routes issue them (`luxpb_{item}_{random}`); a made-up
+    // `luxPlaybackSignature=...` string would only exercise the "unknown token" path.
+    let (ticket, item_id) = server.issue_playback_ticket().await?;
+    assert!(ticket.starts_with("luxpb_"), "unexpected ticket shape");
+    // The ticket is real and route scoped: it authenticates the item it was issued for, which is
+    // on the playback allow-list, and only there.
+    let allowed = server
+        .client
+        .get(format!(
+            "{}/emby/Items/{}?api_key={}",
+            server.base_url, item_id, ticket
+        ))
+        .send()
         .await?;
     assert_eq!(
-        status, 401,
-        "a playback-only token must not open the realtime channel"
+        allowed.status(),
+        reqwest::StatusCode::OK,
+        "the issued ticket must authenticate on the playback allow-list"
+    );
+    assert_eq!(
+        server.handshake_status("/embywebsocket", &ticket).await?,
+        401,
+        "a playback-only ticket must not open the realtime channel"
     );
     Ok(())
 }
@@ -649,19 +731,49 @@ async fn emby_websocket_rate_limits_repeated_start_frames() -> Result<(), Box<dy
 }
 
 #[tokio::test]
-async fn emby_websocket_closes_a_stalled_reader() -> Result<(), Box<dyn std::error::Error>> {
+async fn emby_websocket_pushes_documents_larger_than_the_initial_write_buffer()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The initial write buffer is only a capacity hint, not a document limit: a `Sessions`
+    // document grows with the number of listed sessions (the store lists up to 500), so it is far
+    // larger than the buffer. This uses the production limits on purpose: 100 sessions are about
+    // 130 KiB, i.e. one fifth of the documented worst case (~750 KiB), and must fit under the
+    // production cap with the same ratio.
+    let server = spawn_server(EmbyWebsocketLimits::default()).await?;
+    server.start_playback_sessions(100).await?;
+    let mut socket = server
+        .connect("/embywebsocket", &server.admin_token)
+        .await?;
+    send(
+        &mut socket,
+        json!({"MessageType": "SessionsStart", "Data": "0,1500"}),
+    )
+    .await?;
+    let message = next_json(&mut socket).await?;
+    assert_eq!(message["MessageType"], "Sessions");
+    let sessions = message["Data"]
+        .as_array()
+        .ok_or("Sessions Data must be an array")?;
+    assert_eq!(
+        sessions.len(),
+        100,
+        "a document larger than the initial write buffer must be delivered in full"
+    );
+    // The connection is still usable afterwards, i.e. the oversized document did not close it.
+    send(&mut socket, json!({"MessageType": "KeepAlive"})).await?;
+    assert_eq!(next_json(&mut socket).await?["MessageType"], "KeepAlive");
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_websocket_skips_a_document_beyond_the_write_buffer_cap()
+-> Result<(), Box<dyn std::error::Error>> {
+    // A cap below one document (~13 KiB with 10 sessions) must not disconnect: the push is
+    // skipped with a rate-limited warning and the connection stays usable.
     let server = spawn_server(EmbyWebsocketLimits {
-        min_interval: Duration::from_millis(50),
-        max_interval: Duration::from_millis(100),
-        // A deliberately tiny write buffer: one `Sessions` document (~13 KiB with 10 sessions)
-        // cannot be buffered, so the send fails instead of growing memory without bound.
         write_buffer_bytes: 1024,
         max_write_buffer_bytes: 4096,
-        send_timeout: Duration::from_millis(200),
-        idle_timeout: Duration::from_secs(30),
-        heartbeat_interval: Duration::from_secs(10),
-        max_connections: 1,
-        max_connections_per_user: 1,
+        min_interval: Duration::from_millis(100),
+        max_interval: Duration::from_millis(200),
         ..limits()
     })
     .await?;
@@ -671,13 +783,62 @@ async fn emby_websocket_closes_a_stalled_reader() -> Result<(), Box<dyn std::err
         .await?;
     send(
         &mut socket,
-        json!({"MessageType": "SessionsStart", "Data": "0,50"}),
+        json!({"MessageType": "SessionsStart", "Data": "0,100"}),
     )
     .await?;
-    // From here on the client never reads. The server must close the connection and release the
-    // slot within a bounded time, otherwise one stalled peer would pin capacity forever.
+    // Nothing may be pushed: a partial or truncated document would be worse than no document.
+    expect_no_message(&mut socket, Duration::from_millis(400)).await?;
+    send(&mut socket, json!({"MessageType": "KeepAlive"})).await?;
+    assert_eq!(
+        next_json(&mut socket).await?["MessageType"],
+        "KeepAlive",
+        "an oversized document must not close the connection"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_websocket_closes_a_stalled_reader_after_the_send_timeout()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The document (~13 KiB with 10 sessions) is far below the 4 MiB cap, so the size check is
+    // not what closes this connection: the peer's receive buffer is 1 KiB and it never reads, so
+    // the writes block and only the send timeout can end the connection.
+    let server = spawn_server(EmbyWebsocketLimits {
+        min_interval: Duration::from_millis(20),
+        max_interval: Duration::from_millis(50),
+        write_buffer_bytes: 16 * 1024,
+        max_write_buffer_bytes: 4 * 1024 * 1024,
+        send_timeout: Duration::from_millis(300),
+        idle_timeout: Duration::from_secs(30),
+        heartbeat_interval: Duration::from_secs(10),
+        max_connections: 1,
+        max_connections_per_user: 1,
+        ..limits()
+    })
+    .await?;
+    server.start_playback_sessions(10).await?;
+    let mut socket = server
+        .connect_with_small_receive_buffer(&server.admin_token)
+        .await?;
+    send(
+        &mut socket,
+        json!({"MessageType": "SessionsStart", "Data": "0,20"}),
+    )
+    .await?;
+    // The document is far below the cap, so a size failure is impossible: the connection has to
+    // survive the first pushes and only the stalled write may end it. A hundred milliseconds in,
+    // before the 300 ms send timeout can have fired, the slot must still be taken.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        server
+            .handshake_status("/embywebsocket", &server.admin_token)
+            .await?,
+        503,
+        "the stalled connection must still be open before send_timeout elapses"
+    );
+    // From here on the client never reads; the server must give up and release the slot.
     let mut released = false;
-    for _ in 0..60 {
+    for _ in 0..80 {
         if server
             .handshake_status("/embywebsocket", &server.admin_token)
             .await?
@@ -690,9 +851,102 @@ async fn emby_websocket_closes_a_stalled_reader() -> Result<(), Box<dyn std::err
     }
     assert!(
         released,
-        "a stalled reader must be closed and its connection slot released"
+        "a send that cannot complete within send_timeout must close the connection"
     );
     let _ = next_close(&mut socket).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_websocket_keeps_timers_running_under_an_inbound_flood()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = spawn_server(EmbyWebsocketLimits {
+        min_interval: Duration::from_millis(200),
+        max_interval: Duration::from_millis(400),
+        revalidate_interval: Duration::from_millis(200),
+        ..limits()
+    })
+    .await?;
+    let token = emby_login(
+        &server.client,
+        &server.base_url,
+        "Admin",
+        "correct password",
+        "ws-flooded",
+    )
+    .await?;
+    let socket = server.connect("/embywebsocket", &token).await?;
+    let (mut writer, mut reader) = socket.split();
+    // A client that never stops sending: with a biased select the timer branch would never run
+    // again, starving pushes, heartbeats and the periodic revalidation.
+    let flood = tokio::spawn(async move {
+        writer
+            .send(Message::Text(
+                json!({"MessageType": "SessionsStart", "Data": "0,1000"})
+                    .to_string()
+                    .into(),
+            ))
+            .await?;
+        for _ in 0..200 {
+            writer
+                .send(Message::Text(
+                    json!({"MessageType": "KeepAlive"}).to_string().into(),
+                ))
+                .await?;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok::<(), WsError>(())
+    });
+    // The scheduled push must still arrive while the flood is running.
+    let received = collect_messages(&mut reader, Duration::from_millis(900)).await?;
+    let pushes = received
+        .iter()
+        .filter(|(message, _)| message["MessageType"] == "Sessions")
+        .collect::<Vec<_>>();
+    assert!(
+        pushes.len() >= 3,
+        "pushes must keep running while the client floods inbound frames, got {}",
+        pushes.len()
+    );
+    // Revoking the token must still close the connection: the periodic revalidation is a timer
+    // and must not be starved either.
+    let logout = server
+        .client
+        .post(format!("{}/Sessions/Logout", server.base_url))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(logout.status(), reqwest::StatusCode::NO_CONTENT);
+    let code = next_close(&mut reader).await?;
+    assert_eq!(
+        code,
+        Some(1008),
+        "a revoked token must close a flooded connection"
+    );
+    let _ = flood.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_websocket_accepts_equal_write_buffer_limits() -> Result<(), Box<dyn std::error::Error>>
+{
+    // tungstenite asserts `max_write_buffer_size > write_buffer_size` after the upgrade; an equal
+    // pair must be normalised instead of panicking inside the connection task.
+    let server = spawn_server(EmbyWebsocketLimits {
+        write_buffer_bytes: 1024,
+        max_write_buffer_bytes: 1024,
+        ..limits()
+    })
+    .await?;
+    let mut socket = server
+        .connect("/embywebsocket", &server.admin_token)
+        .await?;
+    send(&mut socket, json!({"MessageType": "KeepAlive"})).await?;
+    assert_eq!(
+        next_json(&mut socket).await?["MessageType"],
+        "KeepAlive",
+        "equal write-buffer limits must not kill the connection"
+    );
     Ok(())
 }
 
