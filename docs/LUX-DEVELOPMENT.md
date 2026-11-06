@@ -20376,8 +20376,9 @@ Hills 或任何第三方客户端上复测。
 预计文件：`src/api/emby_similar.rs`、`src/api/legacy.rs`、`src/api/emby.rs`、`src/application/catalog.rs`、
 `src/storage/catalog.rs`、`tests/emby/emby_similar.rs`、`tests/emby/main.rs`、`docs/COMPATIBILITY.md`、
 `docs/CHANGELOG.md`、`docs/LUX-DEVELOPMENT.md`、`docs/TEST-TARGETS.md`。rebase 到 `8ca9b0aa`（含
-LUX-888 与 STRM 媒体源 id 改动）时只有 `docs/LUX-DEVELOPMENT.md` 的两段任务记录落在同一插入点，按
-“双方内容都保留”解决（LUX-888 在前、LUX-889 在后）；源码无冲突。
+LUX-888 与 STRM 媒体源 id 改动）时只有 `docs/LUX-DEVELOPMENT.md` 的两段任务记录落在同一插入点；再
+rebase 到 `a3c0709b`（含 LUX-890）时 `src/storage/catalog.rs`、`src/application/catalog.rs` 的插入点
+又和 LUX-890 的方法重叠。两次都在解决时保留双方内容（任务记录两边都在，代码里两套方法都在）。
 
 实施结果（2026-11-06，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 或修复后的客户端上复测）：
 
@@ -20401,6 +20402,27 @@ LUX-888 与 STRM 媒体源 id 改动）时只有 `docs/LUX-DEVELOPMENT.md` 的�
   无 `USE TEMP B-TREE FOR ORDER BY`、无 `SCAN media_items`；另一用例验证 12 个源 Genre 只取前 10 个。
 - 复跑：`cargo test --locked --test emby emby_similar::` 6/6；rebase 到 `8ca9b0aa` 后整组
   `cargo test --locked --test emby` 56/56、`cargo test --locked --lib similar_catalog` 2/2、fmt、clippy、
+  `check-backend-branches.py` 通过。
+
+LUX-890 合并后的去重与 P3 修正（2026-11-06）：
+
+- 去重：删除 `src/api/emby_similar.rs` 里的 `deserialize_optional_similar_integer`，`Limit`/`ImageTypeLimit`
+  改用 `src/api/emby_catalog.rs` 的共享 `deserialize_optional_i64`；删除镜像常量
+  `EMBY_SIMILAR_MAX_PAGE_LIMIT`，改用共享的 `EMBY_MAX_PAGE_LIMIT`（LUX-890 已改为 `pub(super)`）。
+  默认值（50）与上限（1000）行为不变。
+- P3 测试有效性：电影 Similar 用例此前断言 `"Drama Mystery Movie"` 不在结果里，但该标题从未入库，断言
+  恒真。现在改为真实种子标题 `"Mystery Movie"`，并先请求 `/emby/Items/sim-movie-mystery` 确认条目存在
+  且可见，再断言它因不与源条目共享 Genre 而被排除。
+- P3 空 `EnableImageTypes=`：保持“显式空值按未提供、返回全部图片 tag”的行为（与 LUX-888 的空值规则
+  一致），在 `EmbySimilarQuery` 注释与 `docs/COMPATIBILITY.md` 写明，并新增“`EnableImageTypes=` 空值
+  与不传该参数的响应逐项相同”的断言。
+- rebase：第二次 rebase 到 `a3c0709b`（含 LUX-890）时，`src/storage/catalog.rs` 与
+  `src/application/catalog.rs` 的插入点与 LUX-890 的 OfficialRatings/Tags 方法重叠，按“两边方法都保留”
+  解决；文档冲突同样保留双方内容。
+- 复跑：`cargo test --locked --test emby emby_similar::` 6/6、`cargo test --locked --lib similar` 2/2、
+  `cargo test --locked --test emby emby_filter_metadata::` 3/3、
+  `cargo test --locked --test emby emby_empty_numeric_params::` 7/7、整组 `cargo test --locked --test emby`
+  59/59（`-- --list` 为 59：43 基线 + LUX-888 7 + LUX-890 3 + 本任务 6）、fmt、clippy、
   `check-backend-branches.py` 通过。
 
 限制与剩余风险：

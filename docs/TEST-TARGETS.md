@@ -300,8 +300,8 @@ cargo test --locked --test scanner
 不同类型、ACL 排除、`Limit` 与 `TotalRecordCount`、空列表、404/401、根路径与 `/emby` 前缀、
 `EnableUserData`/图片类型选择、空值与非法 `Limit`。
 
-本分支 rebase 到 `8ca9b0aa`（已含 LUX-888）后 `cargo test --locked --test emby -- --list` 为 **56**
-例（43 例基线 + LUX-888 的 `emby_empty_numeric_params` 7 例 + 本任务 6 例），整组
-`cargo test --locked --test emby` 为 56 passed、0 failed。第 1、2、5.1 节的数字保留基线/合并时的口径，
-不在本任务中改写；LUX-890 等并行任务的 `emby` 新增模块合并后，需要以合并后的 `--list` 重新核对本节的
-56。
+本分支 rebase 到 `a3c0709b`（已含 LUX-888 与 LUX-890）后
+`cargo test --locked --test emby -- --list` 为 **59** 例（43 例基线 + LUX-888 的
+`emby_empty_numeric_params` 7 例 + LUX-890 的 `emby_filter_metadata` 3 例 + 本任务 6 例），整组
+`cargo test --locked --test emby` 为 59 passed、0 failed。第 1、2、5.1 节的数字保留基线/合并时的口径，
+不在本任务中改写；后续并行任务的 `emby` 新增模块合并后，需要再以合并后的 `--list` 核对本节的 59。
