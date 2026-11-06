@@ -10,8 +10,10 @@ Emby 客户端上复测；`Items[]` 的 `Name`/`Id` 形状按 Emby `NameIdPair` 
 
 - `GET /OfficialRatings`：从 `media_content_restriction_index.certification_code` 聚合当前用户可见范围内
   去重后的**归一化分级码子集**（内容限制索引识别的 MPA/TVPG/BBFC 码），按分级代码升序返回。
-  `ParentId`（媒体库）、`IncludeItemTypes`、`StartIndex`/`Limit` 与服务端上限与其他 facet 端点一致，
-  `ParentId` 是不可见媒体库时返回 404。响应信封与 `/Genres` 相同：
+  `ParentId`（媒体库）、`StartIndex`/`Limit` 与服务端上限与其他 facet 端点一致，`ParentId` 是不可见
+  媒体库时返回 404。`IncludeItemTypes` 与其他 facet 端点**不同**：本端点整组无法识别时返回空列表（与
+  `/Items` 一致），而 `/Genres`、`/Studios`、`/Years` 仍用旧的内联解析、全无效时会退化成“不过滤”，
+  待后续任务对齐。响应信封与 `/Genres` 相同：
   `{"Items":[{"Name":"PG-13","Id":"PG-13","ServerId":…}],"TotalRecordCount":n,"StartIndex":n}`；`Id` 就是
   分级值。
 - 与 `OfficialRating` 字段的关系：**不是同一份值**。条目 `OfficialRating` 输出 NFO 原文（可能是
@@ -21,7 +23,9 @@ Emby 客户端上复测；`Items[]` 的 `Name`/`Id` 形状按 Emby `NameIdPair` 
 - 内容限制：非管理员用户的分级列表与 `/Items` 使用同一条内容限制谓词，超出 `maximum_rating` 的条目连同
   其分级一起被排除；管理员不受内容限制（与既有列表一致）。库 ACL 与内容限制同时生效。
 - `GET /Tags`：**目前恒返回 200 与 `{"Items":[],"TotalRecordCount":0}`**，不再是 404，筛选面板显示空
-  列表而不是请求失败。**Tags 目前恒空，原因是无数据源，仍待后续任务填充**：NFO 解析结果里没有条目级
+  列表而不是请求失败。`ParentId` 的库权限与 `/OfficialRatings` 一样校验：非空 `ParentId` 指向未知或用户
+  不可见的媒体库时返回 404，空 `ParentId=` 按“不限媒体库”处理；以后给 Tags 填数据源时不会留下越权入口。
+  **Tags 目前恒空，原因是无数据源，仍待后续任务填充**：NFO 解析结果里没有条目级
   `<tag>`，`media_item_facets` 只有 `GENRE`/`STUDIO` 两种 kind，`media_content_restriction_tags` 存的是
   **小写 genre**（家长控制用的投影），不能当作 Emby tags 返回。按任务约束没有新增迁移、没有扫描器改动、
   也没有在请求里解析 NFO；`Fields=TagItems` 的现有行为不变。
@@ -32,8 +36,9 @@ Emby 客户端上复测；`Items[]` 的 `Name`/`Id` 形状按 Emby `NameIdPair` 
   `Limit>1000` 或 `StartIndex<0` 返回 400；空的 `StartIndex=`/`Limit=` 按未提供处理（Hills 的筛选面板
   会带空 `Limit=`；与 LUX-888 的共享 `deserialize_optional_i64` 同一实现），空的 `ParentId=` 按
   “不限媒体库”处理。
-- `IncludeItemTypes`：与 `/Items` 使用同一份解析规则。整组都无法识别时返回空列表（200 空信封），不会
-  退化成“不过滤”的全量结果；混合有效与无效类型时只按有效类型过滤。
+- `IncludeItemTypes`：与 `/Items` 使用同一份解析规则（`emby_item_types_from_value`）。整组都无法识别时
+  返回空列表（200 空信封），不会退化成“不过滤”的全量结果；混合有效与无效类型时只按有效类型过滤。
+  `/Genres`、`/Studios`、`/Years` 仍是旧的内联解析，全无效时会退化成不过滤，待后续任务对齐。
 - `Recursive` 被接受但不改变结果：与其他 facet 端点一样，分级聚合始终覆盖所选库/类型的全部可见条目。
 - **剩余缺口**：分级目前只能列出，不能用于 `/Items` 筛选——`/Items` 不接受 `OfficialRatings=` 参数，
   所以在筛选面板里选中某个分级不会改变列表。对应后续任务待立项，本任务没有改 `/Items` 过滤。

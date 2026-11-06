@@ -388,7 +388,8 @@ async fn official_ratings_apply_parent_id_item_types_and_pagination()
 }
 
 #[tokio::test]
-async fn tags_answer_an_empty_envelope_on_both_paths() -> Result<(), Box<dyn std::error::Error>> {
+async fn tags_answer_an_empty_envelope_and_scope_the_parent_library()
+-> Result<(), Box<dyn std::error::Error>> {
     let fixture = Fixture::start().await?;
 
     let unauthorised = fixture
@@ -409,6 +410,36 @@ async fn tags_answer_an_empty_envelope_on_both_paths() -> Result<(), Box<dyn std
         assert_eq!(body["Items"], json!([]), "path {path}");
         assert_eq!(body["TotalRecordCount"], 0, "path {path}");
     }
+
+    // The library scope is enforced even though the list is empty: a future tag projection must
+    // not inherit an ACL shortcut just because today's answer has no rows.
+    let (status, body) = fixture
+        .get(
+            &format!("/Tags?ParentId={}", fixture.movies),
+            &fixture.viewer_token,
+        )
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(body["Items"], json!([]));
+    assert_eq!(body["TotalRecordCount"], 0);
+
+    for path in [
+        format!("/Tags?ParentId={}", fixture.private),
+        "/Tags?ParentId=00000000-0000-0000-0000-000000000000".to_owned(),
+    ] {
+        let (status, _) = fixture.get(&path, &fixture.viewer_token).await?;
+        assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "path {path}");
+    }
+
+    // The admin can open every library, so the same scoped request still succeeds.
+    let (status, body) = fixture
+        .get(
+            &format!("/Tags?ParentId={}", fixture.private),
+            &fixture.admin_token,
+        )
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(body["TotalRecordCount"], 0);
 
     Ok(())
 }

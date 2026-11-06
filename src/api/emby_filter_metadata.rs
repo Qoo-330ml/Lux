@@ -131,17 +131,32 @@ pub(super) async fn emby_tags(
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    // Resolve the target user (and reject unknown ones) even though the answer is empty, so the
-    // endpoint authenticates and authorizes like every other library-scoped list.
-    if let Err(status) =
-        emby_access_principal_for_target(&state, &auth_principal, query.user_id.as_deref()).await
-    {
-        return status.into_response();
-    }
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, query.user_id.as_deref())
+            .await
+        {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
     let (offset, _limit) = match emby_filter_metadata_page(&query) {
         Ok(page) => page,
         Err(status) => return status.into_response(),
     };
+    // `Tags` has no data source yet, but a non-empty `ParentId` is still resolved exactly like
+    // `/OfficialRatings`: an unknown or inaccessible library answers 404. Filling this endpoint
+    // later must not turn the empty answer into an ACL shortcut.
+    let parent_id = emby_filter_metadata_parent_id(query.parent_id.as_deref());
+    match state
+        .catalog()
+        .library_scope_for_principal(principal, parent_id.as_deref())
+        .await
+    {
+        Ok(_) => {}
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(CatalogError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
     Json(json!({
         "Items": Vec::<Value>::new(),
         "TotalRecordCount": 0,

@@ -20212,9 +20212,10 @@ rebase 后的 `--list` 一致。
   有效类型过滤。
 - 响应：与 `/Genres` 相同的信封，条目为 `{"Name": <code>, "Id": <code>, "ServerId": …}`；Emby
   `NameIdPair` 里 `Id` 就是分级值，因此不另造合成 id。
-- `GET /Tags`：鉴权、目标用户校验与分页校验与 `/OfficialRatings` 相同，然后返回
-  `{"Items":[],"TotalRecordCount":0}`。它不读数据库，因为没有 tags 数据；媒体库 ACL 对它没有可观察的
-  作用面（响应本来就没有内容），已在 COMPATIBILITY 记录中写明。
+- `GET /Tags`：鉴权、目标用户校验、`ParentId` 库权限与分页校验都与 `/OfficialRatings` 相同，然后返回
+  `{"Items":[],"TotalRecordCount":0}`。它不读 tags 数据（没有任何 tags 表或投影），但会用
+  `library_scope_for_principal` 校验非空 `ParentId` 的库权限（未知/不可见库 404），这样以后填数据源时
+  不会留下越权捷径。
 - 查询解析：新端点用 `EmbyFilterMetadataQuery`，空的 `StartIndex=`/`Limit=` 复用 LUX-888 合并后的共享
   `deserialize_optional_i64`（同样是先 `trim()` 再解析；本任务原先的私有 `empty_query_number` 已删除，
   不保留两份实现），空的 `ParentId=` 按“不限媒体库”处理。`Limit<=0` 与 `/Genres` 一样按默认 50 处理，
@@ -20234,6 +20235,8 @@ rebase 后的 `--list` 一致。
 - [x] 分页：`StartIndex`/`Limit` 生效且总数不受分页影响；`Limit=`（空）按未提供处理；`Limit=0` 按默认
       50；`Limit>1000` 与 `StartIndex<0` 返回 400。
 - [x] `/Tags` 返回 200 与 `{"Items":[],"TotalRecordCount":0}`（根路径、`/emby` 前缀与空参数）。
+- [x] `/Tags` 的 `ParentId` 库权限与 `/OfficialRatings` 一致：不可见库与未知 id 返回 404，可见库与空
+      `ParentId=` 返回 200 空信封。
 - [x] 未鉴权两个端点都返回 401；`/EMBY/officialratings` 大小写混用可用。
 - [x] 最窄测试、fmt、clippy、`check-backend-branches.py` 通过。
 
@@ -20280,13 +20283,32 @@ Hills 或任何第三方客户端上复测。
 
 - rebase 到最新 `test`，`docs/COMPATIBILITY.md` 与 `docs/TEST-TARGETS.md` 的冲突按“保留双方内容”解决：
   LUX-888 与 LUX-890 两个兼容记录都在，`TEST-TARGETS.md` 同时保留 `emby_empty_numeric_params`（7 例）与
-  `emby_filter_metadata`（3 例）两行；`--test emby` 计数按 rebase 后实测更新为 13 个模块 / 53 个测试。
+  `emby_filter_metadata`（3 例）两行；`--test emby` 计数按 rebase 后实测更新为 14 个模块 / 53 个测试。
 - 删除私有 `empty_query_number`，`EmbyFilterMetadataQuery` 的 `StartIndex`/`Limit` 改用
   `deserialize_optional_i64`；空值与空白值语义不变（先 `trim()` 再解析），仍只有一份实现。
-- 复跑：`cargo test --locked --test emby -- --list` 53 tests / 13 模块；
+- 复跑：`cargo test --locked --test emby -- --list` 53 tests / 14 模块；
   `cargo test --locked --test emby emby_filter_metadata::` 3/3；
   `cargo test --locked --test emby emby_empty_numeric_params::` 7/7；`cargo fmt --all -- --check` 通过；
   `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过；
+  `python3 scripts/check-backend-branches.py` 通过（28 个文件、266 处）。
+
+返工（第二轮审查后，2026-11-06）：
+
+- `/Tags` 现在与 `/OfficialRatings` 一样校验 `ParentId` 的库权限：把两侧重复的判断抽成
+  `CatalogService::library_scope_for_principal`（`src/application/catalog.rs`），`list_facets`、
+  `list_official_ratings` 与 `/Tags` 共用同一份实现；非空 `ParentId` 指向未知或不可见库返回 404，空
+  `ParentId=` 仍按“不限媒体库”。测试覆盖不可见库、未知 id、可见库与空值四种情况。处理器注释不再声称空
+  响应可以省略授权检查，COMPATIBILITY 同步改写。
+- COMPATIBILITY 明确 `IncludeItemTypes` 与其他 facet 端点不同：只有 `/OfficialRatings` 与 `/Items` 用
+  `__NO_MATCH__`；`/Genres`、`/Studios`、`/Years` 仍是旧的内联解析，全无效时退化成不过滤，待后续任务
+  对齐（本任务未改这三个端点）。
+- 模块数纠正：`tests/emby/main.rs` 实际声明 14 个模块（53 个测试），本任务条目与 `TEST-TARGETS.md` 的
+  文件数由 13 改为 14（合计 128 → 129）。
+- 复跑：`cargo test --locked --test emby -- --list` 53 tests / 14 模块；
+  `cargo test --locked --test emby emby_filter_metadata::` 3/3；
+  `cargo test --locked --test emby emby_facets::` 1/1；`cargo fmt --all -- --check` 通过；
+  `cargo clippy --locked --all-targets --all-features -- -D warnings` 与
+  `cargo clippy --locked --test emby -- -D warnings` 通过；
   `python3 scripts/check-backend-branches.py` 通过（28 个文件、266 处）。
 
 限制与剩余风险：
@@ -20303,8 +20325,8 @@ Hills 或任何第三方客户端上复测。
   的索引列，但结果集大小取决于不同分级值的数量；`Limit` 上限 1000，远大于真实分级数。
 - 响应条目形态按 Emby `NameIdPair` 推断（`Name`/`Id` 都是分级值，另带 `ServerId`），没有对照真实
   Emby 服务器的响应对拍；Hills 只读其中的名字时不受影响，若某个客户端依赖 GUID 形态的 `Id` 则需要再确认。
-- `Tags` 对不可见媒体库的 `ParentId` 不做 404（响应本来就是空的），与 `/OfficialRatings` 的 ACL 行为
-  不同；这是为了让空列表端点不额外查库，已在 COMPATIBILITY 写明。
+- `Tags` 与 `/OfficialRatings` 一样校验 `ParentId` 的库权限（不可见库/未知 id → 404，空 `ParentId=` →
+  不限媒体库），代价是空列表请求也会做一次媒体库访问查询；它仍然没有任何 tags 数据源。
 - 本机为 ARM64 宿主，不外推到 NAS/x86_64 的性能结论。
 
 ## 31. 参考资料

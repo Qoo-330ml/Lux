@@ -11,7 +11,7 @@
 | `--test admin` | 管理后台、日志导出、可观测性与运维事件 | 14 | 25 |
 | `--test api_web` | HTTP 契约（错误/限流/压缩/健康/远程策略）、Web 会话、Webhook | 13 | 57 |
 | `--test auth_users` | 认证、会话、登录背景、用户与用户设置、设备配对、界面偏好迁移 | 10 | 71 |
-| `--test emby` | Emby 兼容层（认证、系统信息、增量刷新、发现、多段播放、检索、下载） | 13 | 53 |
+| `--test emby` | Emby 兼容层（认证、系统信息、增量刷新、发现、多段播放、检索、下载） | 14 | 53 |
 | `--test scanner` | 媒体库扫描、增量/混合扫描、计划任务、作业事件与关停 | 7 | 151 |
 | `--test library` | 媒体库生命周期、合并/拆分、集合、目录与系列 API | 12 | 50 |
 | `--test metadata` | 元数据抓取与选择、NFO 回写、扫描后剧集元数据、人物、字幕 | 14 | 156 |
@@ -20,7 +20,7 @@
 | `--test storage` | SQLite/PostgreSQL 存储、迁移、WAL、数据库维护与启动守卫 | 9 | 116 |
 | `--test plugins` | 插件协议与运行时、弹幕、IP 属地、媒体信息插件配置 | 11 | 120 |
 | `--test strm` | STRM 目标解析/探测/播放与 ffprobe | 9 | 42 |
-| 合计（12 组） |  | 128 | 941 |
+| 合计（12 组） |  | 129 | 941 |
 
 另有 8 个 binary 因为进程级共享状态或外部服务依赖保持独立，见第 4 节：`--test background_work_budget`、`--test filmly_image_diag`、`--test image_variants_perf`、`--test performance`、`--test postgres_database`、`--test reidentify`、`--test scanned_metadata`、`--test shutdown`。合计 12 + 8 = 20 个集成测试 target。
 
