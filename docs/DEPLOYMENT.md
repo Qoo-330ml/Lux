@@ -204,7 +204,7 @@ GPU 转码会占用宿主机 CPU 做解封装/音频编码；只开启 GPU 编�
 
 IP 归属地解析使用内置的 Hiofd 协议字段，不需要额外配置；字段不会写入日志、数据库或 API。Hiofd 不可用时管理员仪表盘仍显示客户端 IP，但归属地为空。
 
-反向代理应向 Lux 传递 `X-Forwarded-For` 和 `X-Forwarded-Proto`；Lux 会优先使用这些头部中的客户端 IP 和协议。
+反向代理应向 Lux 传递 `X-Forwarded-For` 和 `X-Forwarded-Proto`；Lux 会优先使用这些头部中的客户端 IP 和协议。这两个头只用于展示与访问诊断：`X-Forwarded-Proto` 不参与认证、授权或 ACL，WebSocket 的同源校验也只比较 `Origin` 与 `Host`，不读取任何转发头。
 
 ## Nginx 反向代理
 
@@ -223,10 +223,16 @@ server {
     location / {
         proxy_pass http://127.0.0.1:8097;
         proxy_http_version 1.1;
-        proxy_set_header Host $host;
+        # 保留浏览器实际使用的 host[:port]。WebSocket 握手只比较 Origin 的 host[:port] 与这个头，
+        # 写成 $host 会丢掉非默认端口，所有握手都会被 400 拒绝。
+        proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+
+        # WebSocket 升级（ADR-054 D12）：两行缺一不可。
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
 
         proxy_set_header Range $http_range;
         proxy_set_header If-Range $http_if_range;
@@ -242,6 +248,49 @@ Lux 已为 `web/dist` 下的 JS/CSS/SVG/HTML 生成并直接服务 `.gz` 预压�
 
 代理应保留 `206`、`Content-Range`、`Content-Length`、`Accept-Ranges` 和 `ETag`。不能把媒体流改成缓存整文件的代理模式。
 
+### WebSocket 升级（`/api/v1/ws` 与 `/embywebsocket`）
+
+Lux 的 Web 实时通道是单端点 `GET /api/v1/ws`，Emby 兼容的 `/embywebsocket` 保留；两条路径共用同一套升级与连接管理，`location /` 里的两行升级头对它们同时生效，不需要单独开 location。反代侧必须满足：
+
+- `proxy_http_version 1.1;` 必须保留。`http2 on` 只影响浏览器到 nginx 的一段，nginx 到 `luxd` 仍是经典 HTTP/1.1 Upgrade，不需要 RFC 8441。
+- `proxy_set_header Upgrade $http_upgrade;` 与 `proxy_set_header Connection "upgrade";` 缺一不可（ADR-054 D12）。nginx 默认不转发这两类逐跳头，缺了它们握手会以普通 `GET` 到达 Lux。
+- `Host` 必须是 `$http_host`，**不是** `$host`。Lux 只比较 `Origin` 的 host[:port] 与 `Host` 头，不比较 scheme，也不读取任何转发头；`$host` 会丢掉非默认端口（`https://lux.example.internal:8443` 变成 `lux.example.internal`），于是每次握手都被 `400` 拒绝。非默认端口的部署尤其要检查这一行。
+- `proxy_buffering off;` 保留，帧才能即时下发；`proxy_read_timeout` 必须明显大于 25 秒的服务端心跳（样例的 1 小时足够）。
+- WS 握手是 `GET`，**不要求也不接受** CSRF 令牌；等价防护是会话 cookie 的 `SameSite=Lax` 加服务端的同源校验。因此不要把 nginx 配置成改写或补上 `Origin`。
+
+### 缺头、改写 Host 与排查
+
+- **缺 `Upgrade`/`Connection`**：握手被当作普通 `GET` 转发，`/api/v1/ws` 不会升级（ADR-054 的端点合同要求显式返回 `426 Upgrade Required`；同一 ADR 的「反向代理要求」一节仍写着 Axum 提取器默认的 `400`，该默认行为已被端点合同明确排除，以 `426` 为准）。浏览器侧两种情况都只看到 `close 1006`——**与 401 完全无法区分**。前端随后静默落到既有轮询（用户面 30 秒，管理面 2 s/5 s/15 s），页面看起来“功能正常”，管理页负载反而高于断线基线。这是本次迁移最可能的失败点。
+- **服务端日志的拒绝分类**：握手被拒时 Lux 只记录原因分类（`origin-missing` / `origin-mismatch` / `sec-fetch-site` / `unauthenticated` / `budget`），不记录头原值。看到 `origin-missing`/`origin-mismatch` 说明请求已经是升级请求但来源校验没过；看不到任何握手拒绝分类、只看到该路径的普通 `GET`（部署开启请求日志时），说明升级头没到 Lux。`Origin` 只在 `debug` 级记录。
+- **反代改写了 `Host`**（例如改成上游 `127.0.0.1:8097`）：`Origin` 与 `Host` 不再一致，**所有握手都会被 `400` 拒绝**，前端落到轮询。修正在反代侧（`proxy_set_header Host $http_host;`），不是放宽校验：Lux 没有 `LUX_ALLOWED_ORIGINS` 之类的来源白名单，也不会用 `X-Forwarded-Proto`、`Forwarded`、`X-Forwarded-Host` 判断来源。
+- **反代补了 `Sec-Fetch-Site: cross-site`**（或中间层 WAF 会改写该头）：Lux 一律拒绝握手，这属于中间层行为，不在 Lux 配置里放宽。
+- **`101` 之后收不到帧**：检查 `proxy_buffering off;` 是否被别的配置覆盖，以及 `proxy_read_timeout` 是否短于 25 秒心跳。
+
+手工复现握手时，先直连上游、再经反代，两次对比（`curl` 在 `101` 之后会一直等数据，`--max-time` 结束属正常）：
+
+```bash
+# ① 直连 luxd（绕过反代）：期望 HTTP/1.1 101
+curl -i --http1.1 --max-time 3 http://127.0.0.1:8097/api/v1/ws \
+  -H 'Host: lux.example.internal' \
+  -H 'Origin: https://lux.example.internal' \
+  -H 'Cookie: lux_session=<浏览器里的会话 cookie>' \
+  -H 'Upgrade: websocket' -H 'Connection: Upgrade' \
+  -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=='
+
+# ② 经反代：同上换地址与 Host；得到 101 说明升级已被正确转发
+curl -i --http1.1 --max-time 3 https://lux.example.internal/api/v1/ws \
+  -H 'Origin: https://lux.example.internal' \
+  -H 'Cookie: lux_session=<浏览器里的会话 cookie>' \
+  -H 'Upgrade: websocket' -H 'Connection: Upgrade' \
+  -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=='
+```
+
+读结果的方式（两条命令都带真实 cookie，鉴权不会掩盖升级判断）：`502`/`504` 是反代到上游不通；`400`/`426` 说明请求没有以合法升级到达 Lux（先查两行升级头与 `Host`）；`401` 是凭据缺失或无效（cookie 过期、没带上），不带真实 cookie 时它不能证明升级是否被转发；`101` 才是升级成功。缺少 `Origin` 的 cookie 握手同样会被拒绝，具体码取决于实现（`400` 或 `401`），属于来源校验而不是反代故障。浏览器里永远只看到 `1006`，所以判断必须落在服务端与反代两侧。不要为了排障把会话 cookie 写进日志或工单。
+
+### Caddy 与其它反向代理
+
+仓库里没有 Caddy 配置，该链路**未实机验证**。按 Caddy 文档，`reverse_proxy` 默认透传 `Upgrade`/`Connection` 并保留原始 `Host`，通常不需要额外指令；仍需确认没有 `header_up Host {upstream_hostport}` 之类的改写，并按上面的 `101` 对照步骤实测。Tailscale Serve 等隧道工具同理：必须保留原始 `Host` 与 `Upgrade`，不要让中间层补写 `Origin`。
+
 ## Tailscale
 
 Tailscale Serve 或同类 HTTPS 转发应只把本机 Lux HTTP listener 映射到 tailnet 内部，不要使用公开 Funnel，除非额外配置身份访问策略。转发目标为：
@@ -255,8 +304,8 @@ http://127.0.0.1:8097
 1. HTTPS 证书和浏览器安全锁正常。
 2. 初始化完成后登录、退出和 CSRF 请求正常。
 3. MP4 `GET` 返回 `206`，Range、`Content-Range` 和 `Content-Length` 保留。
-4. WebSocket/长播放请求不被短超时切断（当前 Lux 首版播放为 HTTP 流，不提供转码）。
-5. 反代转发的客户端 IP 和 HTTPS 协议头被 Lux 正确识别。
+4. WebSocket 升级与长连接正常：`/api/v1/ws` 与 Emby 客户端的 `/embywebsocket` 都能完成 `101` 握手，且不因反代的短超时被切断（本条是检查项，不是结论；Serve 类转发是否透传 `Upgrade` 与原始 `Host` 必须在目标设备上按「缺头、改写 Host 与排查」的步骤实测）。
+5. 反代转发的客户端 IP 和 HTTPS 协议头被 Lux 正确识别（这两个值只用于展示与访问诊断，不参与认证、授权、ACL 或 WebSocket 同源校验）。
 
 ## 升级与回滚边界
 
@@ -350,7 +399,7 @@ LUX_IMAGE=lux:arm64-local ./scripts/mount-loss-smoke.sh
 LUX_IMAGE=lux:arm64-local ./scripts/proxy-smoke.sh
 ```
 
-该脚本验证转发公网地址和 `206`、`Content-Range`、`Content-Length`、`Accept-Ranges`、`ETag` 的保留；自签名证书和本机 Docker 网络不替代真实 Tailscale/HTTPS 实机验证。
+该脚本验证转发公网地址和 `206`、`Content-Range`、`Content-Length`、`Accept-Ranges`、`ETag` 的保留，并额外断言 `/api/v1/ws` 经 nginx 的升级链路：带 cookie 的同源握手返回 `101` 与首帧 `{"type":"ready","version":1}`，缺少 `Origin` 的 cookie 握手与跨源握手被拒，普通 `GET` 不升级。这个端口是非默认端口，所以它同时是 `Host: $http_host` 的回归测试（写成 `$host` 时握手会因端口丢失被 `400` 拒绝）。运行前脚本先跑 `scripts/check-proxy-config.sh` 做不依赖 nginx/docker 的静态检查；冒烟本身需要构建里已经包含 LUX-894 的 `/api/v1/ws`。自签名证书和本机 Docker 网络不替代真实 Tailscale/HTTPS 实机验证。
 
 扫描完成后可以用 ARM64 容器端到端验证媒体探测和 Emby 播放信息：
 
