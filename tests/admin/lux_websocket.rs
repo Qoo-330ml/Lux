@@ -316,8 +316,11 @@ impl TestServer {
             attempt.status
         );
         let mut socket = attempt.socket.ok_or("a 101 response without a socket")?;
+        let ready = wait_for_frame(&mut socket, CONDITION_DEADLINE, |_| true)
+            .await?
+            .ok_or("the server sent no ready frame")?;
         assert_eq!(
-            next_json(&mut socket).await?,
+            ready,
             json!({"type": "ready", "version": 1}),
             "the first frame is the frozen ready frame"
         );
@@ -403,6 +406,37 @@ impl TestServer {
         Ok((item_id, source_id))
     }
 
+    /// Polls a fresh handshake until the connection budget has a free slot, or the deadline passes.
+    ///
+    /// This is how a test observes "the previous connection is gone": the slot is only returned
+    /// after the connection task wrote its close frame, so the success is a positive signal that
+    /// does not depend on how long the close happened to take.
+    async fn wait_for_capacity(&self, account: &Account, deadline: Duration) -> Result<(), String> {
+        let until = tokio::time::Instant::now() + deadline;
+        loop {
+            let attempt = self
+                .handshake(with_cookie(self.request(), &account.session_cookie()))
+                .await
+                .map_err(|error| error.to_string())?;
+            match attempt.status {
+                // The probe socket is dropped immediately, which returns the slot again.
+                101 => return Ok(()),
+                429 => {}
+                status => {
+                    return Err(format!(
+                        "unexpected handshake status {status} while waiting for a free slot"
+                    ));
+                }
+            }
+            if tokio::time::Instant::now() >= until {
+                return Err(format!(
+                    "the connection slot was still taken after {deadline:?}"
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Signals both realtime endpoints and waits for the bounded drain, exactly like `src/main.rs`.
     async fn shutdown_websocket_connections(&self) -> bool {
         tokio::time::timeout(
@@ -455,83 +489,193 @@ async fn send_text(
         .map_err(Into::into)
 }
 
-async fn next_json(socket: &mut ClientSocket) -> Result<Value, Box<dyn std::error::Error>> {
-    let text = next_text(socket).await?;
-    Ok(serde_json::from_str(&text)?)
+/// Every positive wait in this module polls against this deadline instead of a fixed window, so a
+/// loaded machine only makes a test slower. It is far above anything a passing test can need: the
+/// longest legitimate wait is one idle timeout plus a frame round trip, and even the server's own
+/// send bound is 10 s.
+const CONDITION_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Window of a negative assertion ("nothing must arrive"). Kept deliberately short: the absence is
+/// checked right after the positive frame of the same publish, and a longer window would only make
+/// a passing test slower without making the observation stronger.
+const QUIET_WINDOW: Duration = Duration::from_millis(400);
+
+/// What the client saw when the server closed the connection.
+struct CloseInfo {
+    code: Option<u16>,
+    reason: Option<String>,
 }
 
-async fn next_text(socket: &mut ClientSocket) -> Result<String, Box<dyn std::error::Error>> {
-    loop {
-        let message = tokio::time::timeout(Duration::from_secs(10), socket.next())
-            .await
-            .map_err(|_| "timed out waiting for a websocket message")?;
-        match message {
-            Some(Ok(Message::Text(text))) => return Ok(text.to_string()),
-            Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => continue,
-            Some(Ok(Message::Close(frame))) => {
-                return Err(format!("websocket closed before a text frame: {frame:?}").into());
-            }
-            Some(Ok(other)) => return Err(format!("unexpected websocket frame: {other:?}").into()),
-            Some(Err(error)) => return Err(format!("websocket error: {error}").into()),
-            None => return Err("websocket stream ended".into()),
+impl CloseInfo {
+    fn describe(&self, expected: &str) -> String {
+        match self.code {
+            Some(code) => format!(
+                "connection closed with {code} ({:?}) while waiting for {expected}",
+                self.reason
+            ),
+            None => format!("transport ended without a close frame while waiting for {expected}"),
         }
     }
 }
 
-/// The server's close code, or `None` when the transport ended without a close frame.
-async fn next_close(socket: &mut ClientSocket) -> Result<Option<u16>, Box<dyn std::error::Error>> {
+/// One inbound event, or `None` once the deadline passed.
+enum Inbound {
+    Frame(Value),
+    Closed(CloseInfo),
+}
+
+/// Reads the next inbound event without assuming the clock: every call carries the shared deadline,
+/// so a slow machine delays a test instead of changing its outcome.
+async fn next_inbound(
+    socket: &mut ClientSocket,
+    until: tokio::time::Instant,
+) -> Result<Option<Inbound>, String> {
     loop {
-        let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
-            .await
-            .map_err(|_| "timed out waiting for the server to close the websocket")?;
-        match message {
-            Some(Ok(Message::Close(frame))) => return Ok(frame.map(|frame| u16::from(frame.code))),
-            Some(Ok(_)) => continue,
-            Some(Err(WsError::ConnectionClosed | WsError::Protocol(_) | WsError::Io(_))) | None => {
-                return Ok(None);
+        let remaining = until.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        match tokio::time::timeout(remaining, socket.next()).await {
+            Err(_) => return Ok(None),
+            Ok(None) => return Ok(Some(Inbound::Closed(close_without_frame()))),
+            Ok(Some(Ok(Message::Text(text)))) => {
+                return match serde_json::from_str::<Value>(text.as_ref()) {
+                    Ok(frame) => Ok(Some(Inbound::Frame(frame))),
+                    Err(error) => Err(format!("server sent a non-JSON text frame: {error}")),
+                };
             }
-            Some(Err(error)) => return Err(format!("websocket error: {error}").into()),
+            Ok(Some(Ok(
+                Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_),
+            ))) => {}
+            Ok(Some(Ok(Message::Close(frame)))) => {
+                return Ok(Some(Inbound::Closed(CloseInfo {
+                    code: frame.as_ref().map(|frame| u16::from(frame.code)),
+                    reason: frame.as_ref().map(|frame| frame.reason.as_str().to_owned()),
+                })));
+            }
+            Ok(Some(Err(WsError::ConnectionClosed | WsError::Protocol(_) | WsError::Io(_)))) => {
+                return Ok(Some(Inbound::Closed(close_without_frame())));
+            }
+            Ok(Some(Err(error))) => return Err(format!("websocket error: {error}")),
         }
     }
 }
 
-/// Every text frame received inside `window`, parsed.
-async fn collect_frames(socket: &mut ClientSocket, window: Duration) -> Vec<Value> {
-    let deadline = tokio::time::Instant::now() + window;
+fn close_without_frame() -> CloseInfo {
+    CloseInfo {
+        code: None,
+        reason: None,
+    }
+}
+
+/// Polls until one frame satisfies `predicate`. `Ok(None)` means the deadline passed without the
+/// frame (the caller's assertion then fails with its own message); a close is an error, because no
+/// later frame can arrive.
+async fn wait_for_frame(
+    socket: &mut ClientSocket,
+    deadline: Duration,
+    mut predicate: impl FnMut(&Value) -> bool,
+) -> Result<Option<Value>, String> {
+    let until = tokio::time::Instant::now() + deadline;
+    loop {
+        match next_inbound(socket, until).await? {
+            Some(Inbound::Frame(frame)) if predicate(&frame) => return Ok(Some(frame)),
+            Some(Inbound::Frame(_)) => continue,
+            Some(Inbound::Closed(close)) => {
+                return Err(close.describe("a matching invalidation frame"));
+            }
+            None => return Ok(None),
+        }
+    }
+}
+
+/// Polls until `done` accepts the frames collected so far, and answers them either way so the
+/// caller's assertion can print what actually arrived. A close before that is an error.
+async fn wait_for_frames(
+    socket: &mut ClientSocket,
+    deadline: Duration,
+    mut done: impl FnMut(&[Value]) -> bool,
+) -> Result<Vec<Value>, String> {
+    let until = tokio::time::Instant::now() + deadline;
     let mut frames = Vec::new();
     loop {
-        match tokio::time::timeout_at(deadline, socket.next()).await {
-            Err(_) => return frames,
-            Ok(Some(Ok(Message::Text(text)))) => {
-                if let Ok(frame) = serde_json::from_str::<Value>(text.as_ref()) {
-                    frames.push(frame);
-                }
+        if done(&frames) {
+            return Ok(frames);
+        }
+        match next_inbound(socket, until).await? {
+            Some(Inbound::Frame(frame)) => frames.push(frame),
+            Some(Inbound::Closed(close)) => {
+                return Err(close.describe("the expected invalidation frames"));
             }
-            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)))) => {}
-            Ok(Some(Ok(Message::Binary(_)))) => {}
-            Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => return frames,
+            None => return Ok(frames),
         }
     }
 }
 
-/// The next frame matching `predicate`, skipping unrelated invalidations.
-async fn next_matching(
-    socket: &mut ClientSocket,
-    window: Duration,
-    predicate: impl Fn(&Value) -> bool,
-) -> Option<Value> {
-    let deadline = tokio::time::Instant::now() + window;
+/// The server's close frame, waiting until it arrives or the deadline passes.
+async fn next_close(socket: &mut ClientSocket, deadline: Duration) -> Result<CloseInfo, String> {
+    let until = tokio::time::Instant::now() + deadline;
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return None;
+        match next_inbound(socket, until).await? {
+            Some(Inbound::Closed(close)) => return Ok(close),
+            Some(Inbound::Frame(_)) => continue,
+            None => {
+                return Err(format!(
+                    "timed out after {deadline:?} waiting for the server to close the websocket"
+                ));
+            }
         }
-        let frame = match tokio::time::timeout(remaining, next_json(socket)).await {
-            Ok(Ok(frame)) => frame,
-            _ => return None,
-        };
-        if predicate(&frame) {
-            return Some(frame);
+    }
+}
+
+/// Text frames received inside `window` (bounded, no assertion). Used for short quiet windows and
+/// for draining the invalidations a setup step publishes.
+async fn collect_frames(socket: &mut ClientSocket, window: Duration) -> Vec<Value> {
+    let until = tokio::time::Instant::now() + window;
+    let mut frames = Vec::new();
+    while let Ok(Some(event)) = next_inbound(socket, until).await {
+        match event {
+            Inbound::Frame(frame) => frames.push(frame),
+            Inbound::Closed(_) => break,
+        }
+    }
+    frames
+}
+
+/// Counts the protocol pings the server sends while this task keeps reading (which is what makes
+/// tungstenite answer them with a pong), and only stops once `min_pings` arrived *and* `min_elapsed`
+/// passed. A close is an error: the connection was supposed to stay alive.
+async fn observe_protocol_pings(
+    socket: &mut ClientSocket,
+    deadline: Duration,
+    min_elapsed: Duration,
+    min_pings: usize,
+) -> Result<usize, String> {
+    let started = tokio::time::Instant::now();
+    let until = started + deadline;
+    let mut pings = 0;
+    loop {
+        if pings >= min_pings && started.elapsed() >= min_elapsed {
+            return Ok(pings);
+        }
+        let remaining = until.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(pings);
+        }
+        match tokio::time::timeout(remaining, socket.next()).await {
+            Err(_) => return Ok(pings),
+            Ok(None) => return Err("transport ended while observing a live connection".to_owned()),
+            Ok(Some(Ok(Message::Ping(_)))) => pings += 1,
+            Ok(Some(Ok(
+                Message::Pong(_) | Message::Text(_) | Message::Binary(_) | Message::Frame(_),
+            ))) => {}
+            Ok(Some(Ok(Message::Close(frame)))) => {
+                return Err(format!(
+                    "connection closed (code {:?}) while observing a live connection",
+                    frame.map(|frame| u16::from(frame.code))
+                ));
+            }
+            Ok(Some(Err(error))) => return Err(format!("websocket error: {error}")),
         }
     }
 }
@@ -588,10 +732,10 @@ async fn a_same_origin_cookie_handshake_upgrades() -> Result<(), Box<dyn std::er
     let mut socket = server.connect_account(&server.viewer).await?;
     // The connection really works: one user invalidation must arrive.
     server.patch_settings(&server.admin, "Same Origin").await?;
-    let frame = next_matching(&mut socket, Duration::from_secs(5), |frame| {
+    let frame = wait_for_frame(&mut socket, CONDITION_DEADLINE, |frame| {
         is_scope(frame, "user", "home")
     })
-    .await
+    .await?
     .ok_or("a same-origin cookie connection must receive user frames")?;
     assert_eq!(frame["scope"], "home");
     Ok(())
@@ -766,10 +910,10 @@ async fn a_client_token_authenticates_the_handshake() -> Result<(), Box<dyn std:
     server
         .patch_settings(&server.admin, "Token Channel")
         .await?;
-    let frame = next_matching(&mut socket, Duration::from_secs(5), |frame| {
+    let frame = wait_for_frame(&mut socket, CONDITION_DEADLINE, |frame| {
         is_scope(frame, "user", "home")
     })
-    .await
+    .await?
     .ok_or("a token connection must receive user frames")?;
     assert_eq!(frame["channel"], "user");
     Ok(())
@@ -807,8 +951,14 @@ async fn an_administrator_receives_both_channels_a_viewer_only_the_user_channel(
     server.patch_settings(&server.admin, "Two Channels").await?;
 
     // The administrator's one connection carries both channels; their relative order is not part
-    // of the contract, so both are collected in one window.
-    let frames = collect_frames(&mut operator, Duration::from_millis(1500)).await;
+    // of the contract, so the test polls until both arrived instead of assuming an order.
+    let frames = wait_for_frames(&mut operator, CONDITION_DEADLINE, |frames| {
+        frames
+            .iter()
+            .any(|frame| is_scope(frame, "admin", "settings"))
+            && frames.iter().any(|frame| is_scope(frame, "user", "home"))
+    })
+    .await?;
     assert!(
         frames
             .iter()
@@ -828,15 +978,23 @@ async fn an_administrator_receives_both_channels_a_viewer_only_the_user_channel(
         "the admin channel only carries invalidations"
     );
 
-    // A regular user never sees the admin channel.
-    let frames = collect_frames(&mut viewer, Duration::from_millis(1200)).await;
+    // A regular user never sees the admin channel: wait for the positive user frame first, then
+    // look for an admin frame only in a short quiet window (a longer one would not be stronger).
+    let frames = wait_for_frames(&mut viewer, CONDITION_DEADLINE, |frames| {
+        frames.iter().any(|frame| is_scope(frame, "user", "home"))
+    })
+    .await?;
     assert!(
         frames.iter().any(|frame| is_scope(frame, "user", "home")),
         "a viewer must receive the broadcast user invalidation, got {frames:?}"
     );
+    let extra = collect_frames(&mut viewer, QUIET_WINDOW).await;
     assert!(
-        !frames.iter().any(|frame| is_channel(frame, "admin")),
-        "a viewer must never receive admin frames, got {frames:?}"
+        !frames
+            .iter()
+            .chain(extra.iter())
+            .any(|frame| is_channel(frame, "admin")),
+        "a viewer must never receive admin frames, got {frames:?} {extra:?}"
     );
     // The envelope never carries a library id (ADR-054 D14) or any business payload.
     assert!(
@@ -896,10 +1054,10 @@ async fn a_progress_event_carries_the_item_id() -> Result<(), Box<dyn std::error
         .await?;
     assert_eq!(reported.status(), reqwest::StatusCode::OK);
 
-    let frame = next_matching(&mut operator, Duration::from_secs(3), |frame| {
+    let frame = wait_for_frame(&mut operator, CONDITION_DEADLINE, |frame| {
         is_scope(frame, "user", "progress")
     })
-    .await
+    .await?
     .ok_or("a playback progress tick must produce a progress invalidation")?;
     assert_eq!(frame["itemId"], item_id);
     assert_eq!(frame["channel"], "user");
@@ -917,7 +1075,8 @@ async fn a_binary_frame_closes_with_1003() -> Result<(), Box<dyn std::error::Err
     socket
         .send(Message::Binary(vec![1_u8, 2, 3].into()))
         .await?;
-    assert_eq!(next_close(&mut socket).await?, Some(1003));
+    let close = next_close(&mut socket, CONDITION_DEADLINE).await?;
+    assert_eq!(close.code, Some(1003), "{}", close.describe("1003"));
     Ok(())
 }
 
@@ -928,7 +1087,8 @@ async fn a_message_above_4_kib_closes_with_1009() -> Result<(), Box<dyn std::err
     // 4097 bytes: one over the documented contract limit (the transport buffer is larger on
     // purpose, so the handler can write the close frame itself).
     send_text(&mut socket, &"x".repeat(4 * 1024 + 1)).await?;
-    assert_eq!(next_close(&mut socket).await?, Some(1009));
+    let close = next_close(&mut socket, CONDITION_DEADLINE).await?;
+    assert_eq!(close.code, Some(1009), "{}", close.describe("1009"));
     Ok(())
 }
 
@@ -950,10 +1110,10 @@ async fn unknown_message_types_are_ignored_and_do_not_close_the_connection()
     server
         .patch_settings(&server.admin, "Unknown Types")
         .await?;
-    let frame = next_matching(&mut socket, Duration::from_secs(5), |frame| {
+    let frame = wait_for_frame(&mut socket, CONDITION_DEADLINE, |frame| {
         is_scope(frame, "user", "home")
     })
-    .await
+    .await?
     .ok_or("the connection must stay usable after unknown inbound frames")?;
     assert_eq!(frame["channel"], "user");
     Ok(())
@@ -965,7 +1125,8 @@ async fn the_application_ping_is_never_answered_with_a_pong()
     let server = spawn_server(limits()).await?;
     let mut socket = server.connect_account(&server.viewer).await?;
     send_text(&mut socket, r#"{"type":"ping"}"#).await?;
-    let frames = collect_frames(&mut socket, Duration::from_millis(400)).await;
+    // Negative assertion, so the window stays short (a longer one would not be stronger).
+    let frames = collect_frames(&mut socket, QUIET_WINDOW).await;
     assert!(
         frames.is_empty(),
         "the envelope has no pong frame, received {frames:?}"
@@ -975,12 +1136,13 @@ async fn the_application_ping_is_never_answered_with_a_pong()
 
 #[tokio::test]
 async fn protocol_pings_keep_a_silent_connection_alive() -> Result<(), Box<dyn std::error::Error>> {
-    // Ten heartbeats of headroom around the idle deadline: a loaded test machine can delay either
-    // side by a scheduling quantum without turning the assertion into a timing test.
+    // Ratio of the two clocks: the idle window (2.5 s) is 10x the ping interval (250 ms) and the
+    // interval is 50x a typical 5 ms scheduling delay, so a preemption cannot turn a live
+    // connection into an idle one. The observation below then lasts 1.6 idle windows.
     let server = spawn_server(LuxWebsocketLimits {
         protocol: WebsocketLimits {
-            heartbeat_interval: Duration::from_millis(100),
-            idle_timeout: Duration::from_millis(1000),
+            heartbeat_interval: Duration::from_millis(250),
+            idle_timeout: Duration::from_millis(2500),
             ..WebsocketLimits::default()
         },
         ..LuxWebsocketLimits::default()
@@ -988,19 +1150,28 @@ async fn protocol_pings_keep_a_silent_connection_alive() -> Result<(), Box<dyn s
     .await?;
     let mut socket = server.connect_account(&server.viewer).await?;
     // Reading is what answers the protocol pings with a pong, which is the only proof of life a
-    // browser sends while the user does nothing. Two idle periods pass here.
-    let frames = collect_frames(&mut socket, Duration::from_millis(2200)).await;
+    // browser sends while the user does nothing. Counting the pings is the positive form of "the
+    // server kept the heartbeat running".
+    let pings = observe_protocol_pings(
+        &mut socket,
+        CONDITION_DEADLINE,
+        Duration::from_millis(4000),
+        4,
+    )
+    .await?;
     assert!(
-        frames.is_empty(),
-        "no invalidation was published, so only control frames may arrive: {frames:?}"
+        pings >= 4,
+        "a silent connection must keep receiving protocol pings, saw {pings}"
     );
+    // The positive assertion: after more than one idle window of ponging only, the connection
+    // still delivers a frame.
     server
         .patch_settings(&server.admin, "Ping Keeps Alive")
         .await?;
-    let frame = next_matching(&mut socket, Duration::from_secs(5), |frame| {
+    let frame = wait_for_frame(&mut socket, CONDITION_DEADLINE, |frame| {
         is_scope(frame, "user", "home")
     })
-    .await
+    .await?
     .ok_or("a connection that answered the protocol pings must still be open")?;
     assert_eq!(frame["channel"], "user");
     Ok(())
@@ -1009,44 +1180,43 @@ async fn protocol_pings_keep_a_silent_connection_alive() -> Result<(), Box<dyn s
 #[tokio::test]
 async fn an_idle_connection_is_closed_with_1001_and_the_slot_is_released()
 -> Result<(), Box<dyn std::error::Error>> {
+    // The idle window (1 s) is 200x a typical 5 ms scheduling delay, and the heartbeat is set to
+    // the same value on purpose: `normalized()` keeps idle >= heartbeat and the loop checks the
+    // idle deadline first, so this connection is closed before any ping is sent. A ping would be
+    // queued in the test client, which answers it while reading after the server already dropped
+    // the socket; that write can reset the connection and hide the close frame. The ping/idle
+    // ratio is the subject of `protocol_pings_keep_a_silent_connection_alive` (250 ms / 2.5 s).
     let server = spawn_server(LuxWebsocketLimits {
         user_max_connections: 1,
         user_max_connections_per_user: 1,
         protocol: WebsocketLimits {
-            heartbeat_interval: Duration::from_millis(100),
-            idle_timeout: Duration::from_millis(300),
+            heartbeat_interval: Duration::from_millis(1000),
+            idle_timeout: Duration::from_millis(1000),
             ..WebsocketLimits::default()
         },
         ..LuxWebsocketLimits::default()
     })
     .await?;
     let mut socket = server.connect_account(&server.viewer).await?;
-    // Do not read: tungstenite only answers a ping while the stream is polled, so no pong is sent
-    // and the 300 ms idle deadline fires.
-    tokio::time::sleep(Duration::from_millis(700)).await;
+    // This socket is deliberately never polled again, so no inbound frame can ever arrive and the
+    // idle deadline fires. Instead of sleeping, poll the budget: the slot is returned only after
+    // the connection task wrote its close frame, so a free slot is a positive signal that the close
+    // already happened and reading it cannot block.
+    server
+        .wait_for_capacity(&server.viewer_two, CONDITION_DEADLINE)
+        .await?;
+    let close = next_close(&mut socket, CONDITION_DEADLINE).await?;
     assert_eq!(
-        next_close(&mut socket).await?,
+        close.code,
         Some(1001),
-        "an idle connection must be closed with 1001"
+        "{}",
+        close.describe("an idle close")
     );
-    // The close frame reaches the client just before the connection task drops its permit, so a
-    // handshake can race the release; poll briefly instead of assuming the order.
-    let mut released = false;
-    for _ in 0..60 {
-        if server
-            .refusal(with_cookie(
-                server.request(),
-                &server.viewer_two.session_cookie(),
-            ))
-            .await?
-            == 101
-        {
-            released = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(released, "the idle connection must have released its slot");
+    assert_eq!(
+        close.reason.as_deref(),
+        Some("idle timeout"),
+        "the close must come from the idle timer, not from another path"
+    );
     Ok(())
 }
 
@@ -1105,23 +1275,11 @@ async fn the_global_budget_answers_429_and_releases_the_slot()
         429
     );
     drop(first);
-    // The server may need a moment to notice the disconnect.
-    let mut released = false;
-    for _ in 0..40 {
-        if server
-            .refusal(with_cookie(
-                server.request(),
-                &server.viewer_two.session_cookie(),
-            ))
-            .await?
-            == 101
-        {
-            released = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(released, "closing a connection must release its slot");
+    // Poll the budget instead of waiting a fixed time: the server may need a moment to notice the
+    // disconnect, and a loaded machine may need more than a short window.
+    server
+        .wait_for_capacity(&server.viewer_two, CONDITION_DEADLINE)
+        .await?;
     Ok(())
 }
 
@@ -1177,39 +1335,72 @@ async fn a_demotion_stops_admin_frames_without_closing_the_connection()
     server
         .set_can_manage_server(&server.admin, &server.operator, false)
         .await?;
-    // The permission change is itself an admin event (`users`) plus a user `home`; drain it so the
-    // assertion below only sees frames published after the demotion.
-    let _ = collect_frames(&mut operator, Duration::from_millis(600)).await;
-    // Ten revalidation intervals, so the demotion is observed even on a loaded machine.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    server
-        .patch_settings(&server.admin, "After Demotion")
+    // The permission change is itself an admin event (`users`) plus a user `home`; drain whatever
+    // it published so the observation starts from a clean slate (bounded, not an assertion).
+    let _ = collect_frames(&mut operator, QUIET_WINDOW).await;
+
+    // Poll until a published settings invalidation reaches the user channel but no longer the admin
+    // channel. Each attempt publishes one event, waits for its user frame and then looks for the
+    // admin frame of the same publish in a short quiet window; two clean attempts in a row are
+    // required, so one delayed admin frame cannot be mistaken for the demotion.
+    let deadline = Instant::now() + CONDITION_DEADLINE;
+    let mut clean_attempts = 0;
+    let mut last_frames: Vec<Value> = Vec::new();
+    while Instant::now() < deadline {
+        server
+            .patch_settings(&server.admin, "After Demotion")
+            .await?;
+        let mut frames = wait_for_frames(&mut operator, Duration::from_secs(5), |frames| {
+            frames.iter().any(|frame| is_scope(frame, "user", "home"))
+        })
         .await?;
-    let frames = collect_frames(&mut operator, Duration::from_millis(1200)).await;
+        frames.extend(collect_frames(&mut operator, QUIET_WINDOW).await);
+        let saw_user = frames.iter().any(|frame| is_scope(frame, "user", "home"));
+        let has_admin = frames
+            .iter()
+            .any(|frame| is_scope(frame, "admin", "settings"));
+        // A clean attempt means "this publish reached the user channel but not the admin channel";
+        // a publish that produced no user frame proves nothing and restarts the count.
+        clean_attempts = if saw_user && !has_admin {
+            clean_attempts + 1
+        } else {
+            0
+        };
+        last_frames = frames;
+        if clean_attempts >= 2 {
+            break;
+        }
+    }
     assert!(
-        frames.iter().any(|frame| is_scope(frame, "user", "home")),
-        "the user channel must keep working after a demotion, got {frames:?}"
-    );
-    assert!(
-        !frames.iter().any(|frame| is_channel(frame, "admin")),
-        "a demoted connection must stop receiving admin frames, got {frames:?}"
+        clean_attempts >= 2,
+        "a demoted connection must stop receiving admin frames; last frames {last_frames:?}"
     );
 
     // Regaining the permission resumes the admin channel; the connection was never closed.
     server
         .set_can_manage_server(&server.admin, &server.operator, true)
         .await?;
-    let _ = collect_frames(&mut operator, Duration::from_millis(600)).await;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    server
-        .patch_settings(&server.admin, "After Promotion")
-        .await?;
-    let frame = next_matching(&mut operator, Duration::from_secs(3), |frame| {
-        is_scope(frame, "admin", "settings")
-    })
-    .await
-    .ok_or("the admin channel must resume after the permission is restored")?;
-    assert_eq!(frame["channel"], "admin");
+    let _ = collect_frames(&mut operator, QUIET_WINDOW).await;
+    let mut resumed = false;
+    let deadline = Instant::now() + CONDITION_DEADLINE;
+    while Instant::now() < deadline {
+        server
+            .patch_settings(&server.admin, "After Promotion")
+            .await?;
+        if let Some(frame) = wait_for_frame(&mut operator, Duration::from_secs(5), |frame| {
+            is_scope(frame, "admin", "settings")
+        })
+        .await?
+        {
+            assert_eq!(frame["channel"], "admin");
+            resumed = true;
+            break;
+        }
+    }
+    assert!(
+        resumed,
+        "the admin channel must resume after the permission is restored"
+    );
     Ok(())
 }
 
@@ -1225,7 +1416,8 @@ async fn a_revoked_session_closes_with_1008() -> Result<(), Box<dyn std::error::
         .send()
         .await?;
     assert_eq!(logout.status(), reqwest::StatusCode::NO_CONTENT);
-    assert_eq!(next_close(&mut viewer).await?, Some(1008));
+    let close = next_close(&mut viewer, CONDITION_DEADLINE).await?;
+    assert_eq!(close.code, Some(1008), "{}", close.describe("1008"));
     Ok(())
 }
 
@@ -1259,18 +1451,31 @@ async fn a_transient_revalidation_failure_keeps_the_connection()
         .execute(server.database.pool())
         .await?;
     }
-    // Several revalidation intervals: the connection must survive all of them.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    send_text(&mut viewer, r#"{"type":"ping"}"#).await?;
-    server
-        .patch_settings(&server.admin, "Transient Failure")
-        .await?;
-    let frames = collect_frames(&mut viewer, Duration::from_secs(3)).await;
-    let frame = frames
-        .iter()
-        .find(|frame| is_scope(frame, "user", "home"))
-        .ok_or("a 5xx revalidation must keep the connection open")?;
-    assert_eq!(frame["channel"], "user");
+    // Poll: publish one invalidation at a time and wait for its user frame, until at least four
+    // revalidation intervals (4 x 800 ms) elapsed while the connection stayed usable. A passing run
+    // stops as soon as both conditions hold; only a failing one waits for the deadline.
+    let started = tokio::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + CONDITION_DEADLINE;
+    let mut rounds = 0;
+    while tokio::time::Instant::now() < deadline
+        && (rounds < 3 || started.elapsed() < Duration::from_millis(3200))
+    {
+        server
+            .patch_settings(&server.admin, "Transient Failure")
+            .await?;
+        if let Some(frame) = wait_for_frame(&mut viewer, Duration::from_secs(5), |frame| {
+            is_scope(frame, "user", "home")
+        })
+        .await?
+        {
+            assert_eq!(frame["channel"], "user");
+            rounds += 1;
+        }
+    }
+    assert!(
+        rounds >= 3,
+        "the connection must survive several failed revalidations, saw {rounds}"
+    );
     Ok(())
 }
 
@@ -1286,17 +1491,32 @@ async fn shutdown_closes_with_1001_without_blocking_and_refuses_new_handshakes()
     let mut viewer = server.connect_account(&server.viewer).await?;
 
     let started = Instant::now();
+    // The meaningful bound is the 5 s drain timeout inside `shutdown_websocket_connections`: it
+    // answered `true`, so no connection outlived it. The wall clock gets a generous cap only so a
+    // loaded machine cannot turn the scheduling delay into a failure.
     assert!(
         server.shutdown_websocket_connections().await,
         "every connection must release its slot inside the drain timeout"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(30),
         "an open connection must not block the shutdown chain, took {:?}",
         started.elapsed()
     );
-    assert_eq!(next_close(&mut operator).await?, Some(1001));
-    assert_eq!(next_close(&mut viewer).await?, Some(1001));
+    let operator_close = next_close(&mut operator, CONDITION_DEADLINE).await?;
+    assert_eq!(
+        operator_close.code,
+        Some(1001),
+        "{}",
+        operator_close.describe("1001")
+    );
+    let viewer_close = next_close(&mut viewer, CONDITION_DEADLINE).await?;
+    assert_eq!(
+        viewer_close.code,
+        Some(1001),
+        "{}",
+        viewer_close.describe("1001")
+    );
 
     // After the signal a new handshake is refused instead of upgrading into a dead connection.
     assert_eq!(
