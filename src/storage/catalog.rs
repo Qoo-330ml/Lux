@@ -13765,6 +13765,113 @@ mod catalog_count_row_decoding_tests {
         }
         Ok(())
     }
+
+    #[tokio::test]
+    async fn similar_catalog_query_uses_the_facet_index_and_stops_at_the_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        database
+            .query(
+                "INSERT INTO libraries (id, name, kind) VALUES ('sim-lib', 'Similar', 'MOVIE');
+                 INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     has_available_source
+                 ) VALUES
+                     ('sim-source', 'sim-lib', 'MOVIE', 'Source', 'source',
+                      'LOCAL_CONFIRMED', 1),
+                     ('sim-alpha', 'sim-lib', 'MOVIE', 'Alpha', 'alpha',
+                      'LOCAL_CONFIRMED', 1),
+                     ('sim-beta', 'sim-lib', 'MOVIE', 'Beta', 'beta',
+                      'LOCAL_CONFIRMED', 1),
+                     ('sim-gamma', 'sim-lib', 'MOVIE', 'Gamma', 'gamma',
+                      'LOCAL_CONFIRMED', 1),
+                     ('sim-delta', 'sim-lib', 'MOVIE', 'Delta', 'delta',
+                      'LOCAL_CONFIRMED', 1);
+                 INSERT INTO media_item_facets (item_id, kind, name_key, name) VALUES
+                     ('sim-source', 'GENRE', 'drama', 'Drama'),
+                     ('sim-source', 'GENRE', 'sci-fi', 'Sci-Fi'),
+                     ('sim-source', 'GENRE', 'thriller', 'Thriller'),
+                     ('sim-alpha', 'GENRE', 'drama', 'Drama'),
+                     ('sim-alpha', 'GENRE', 'sci-fi', 'Sci-Fi'),
+                     ('sim-alpha', 'GENRE', 'thriller', 'Thriller'),
+                     ('sim-beta', 'GENRE', 'drama', 'Drama'),
+                     ('sim-gamma', 'GENRE', 'drama', 'Drama'),
+                     ('sim-gamma', 'GENRE', 'sci-fi', 'Sci-Fi'),
+                     ('sim-delta', 'GENRE', 'comedy', 'Comedy')",
+            )
+            .execute(database.pool())
+            .await?;
+
+        let library_ids = vec!["sim-lib".to_owned()];
+        let item_types = vec!["MOVIE".to_owned()];
+        let filter = CatalogFilterQuery {
+            library_ids: &library_ids,
+            user_id: "sim-user",
+            item_types: &item_types,
+            excluded_item_types: &[],
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            provider_id_equals: None,
+            years: &[],
+            genre_keys: &[],
+            studio_keys: &[],
+            is_played: None,
+            is_favorite: None,
+            is_resumable: None,
+            min_date_last_saved: None,
+            metadata_pending: false,
+            parent_id_scope: None,
+            content_restrictions: None,
+            sort_by: CatalogSort::Name,
+            descending: false,
+            offset: 0,
+            limit: 2,
+            include_total: true,
+        };
+
+        let (rows, total) = database
+            .list_similar_catalog_rows(&filter, "sim-source")
+            .await?;
+        assert_eq!(total, 3, "Alpha, Gamma and Beta share a genre");
+        assert_eq!(rows.len(), 2, "LIMIT 2 must stop the page");
+        assert_eq!(
+            rows[0].item_id, "sim-alpha",
+            "three shared genres rank first"
+        );
+        assert!(rows.iter().all(|row| row.item_id != "sim-source"));
+        assert!(rows.iter().all(|row| row.item_id != "sim-delta"));
+
+        // The statement itself stops at the page boundary; the plan must not walk media_items.
+        let (selected_sql, _) = super::similar_catalog_selected_query(&filter, "sim-source");
+        assert!(selected_sql.contains("WITH shared AS MATERIALIZED"));
+        assert!(selected_sql.contains("GROUP BY facet.item_id"));
+        assert!(selected_sql.contains("LIMIT ? OFFSET ?"));
+        let (list_plan, count_plan) = database
+            .explain_similar_catalog_rows(&filter, "sim-source")
+            .await?;
+        assert!(
+            list_plan
+                .iter()
+                .any(|line| line.contains("idx_media_item_facets_lookup")),
+            "the genre lookup must use the facet index: {list_plan:?}"
+        );
+        assert!(
+            !list_plan
+                .iter()
+                .any(|line| line.contains("SCAN media_items")),
+            "the page must not scan media_items: {list_plan:?}"
+        );
+        assert!(
+            !count_plan
+                .iter()
+                .any(|line| line.contains("SCAN media_items")),
+            "the total must not scan media_items: {count_plan:?}"
+        );
+
+        database.close().await;
+        Ok(())
+    }
 }
 
 /// Decoding tests for the two chapter projections of `list_media_chapters_by_source_ids`.
@@ -13856,110 +13963,6 @@ mod media_chapter_row_decoding_tests {
                 "unexpected decode error: {error}"
             );
         }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn similar_catalog_query_uses_the_facet_index_and_stops_at_the_limit()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (_temp_dir, database) = crate::storage::test_database().await?;
-        database
-            .query(
-                "INSERT INTO libraries (id, name, kind) VALUES ('sim-lib', 'Similar', 'MOVIE');
-                 INSERT INTO media_items (
-                     id, library_id, item_type, title, sort_title, identification_status,
-                     has_available_source
-                 ) VALUES
-                     ('sim-source', 'sim-lib', 'MOVIE', 'Source', 'source',
-                      'LOCAL_CONFIRMED', 1),
-                     ('sim-alpha', 'sim-lib', 'MOVIE', 'Alpha', 'alpha',
-                      'LOCAL_CONFIRMED', 1),
-                     ('sim-beta', 'sim-lib', 'MOVIE', 'Beta', 'beta',
-                      'LOCAL_CONFIRMED', 1),
-                     ('sim-gamma', 'sim-lib', 'MOVIE', 'Gamma', 'gamma',
-                      'LOCAL_CONFIRMED', 1),
-                     ('sim-delta', 'sim-lib', 'MOVIE', 'Delta', 'delta',
-                      'LOCAL_CONFIRMED', 1);
-                 INSERT INTO media_item_facets (item_id, kind, name_key, name) VALUES
-                     ('sim-source', 'GENRE', 'drama', 'Drama'),
-                     ('sim-source', 'GENRE', 'sci-fi', 'Sci-Fi'),
-                     ('sim-source', 'GENRE', 'thriller', 'Thriller'),
-                     ('sim-alpha', 'GENRE', 'drama', 'Drama'),
-                     ('sim-alpha', 'GENRE', 'sci-fi', 'Sci-Fi'),
-                     ('sim-alpha', 'GENRE', 'thriller', 'Thriller'),
-                     ('sim-beta', 'GENRE', 'drama', 'Drama'),
-                     ('sim-gamma', 'GENRE', 'drama', 'Drama'),
-                     ('sim-gamma', 'GENRE', 'sci-fi', 'Sci-Fi'),
-                     ('sim-delta', 'GENRE', 'comedy', 'Comedy')",
-            )
-            .execute(database.pool())
-            .await?;
-
-        let library_ids = vec!["sim-lib".to_owned()];
-        let item_types = vec!["MOVIE".to_owned()];
-        let filter = CatalogFilterQuery {
-            library_ids: &library_ids,
-            user_id: "sim-user",
-            item_types: &item_types,
-            excluded_item_types: &[],
-            item_ids: None,
-            person_id: None,
-            media_source_ids: None,
-            provider_id_equals: None,
-            years: &[],
-            genre_keys: &[],
-            studio_keys: &[],
-            is_played: None,
-            is_favorite: None,
-            is_resumable: None,
-            min_date_last_saved: None,
-            metadata_pending: false,
-            parent_id_scope: None,
-            content_restrictions: None,
-            sort_by: CatalogSort::Name,
-            descending: false,
-            offset: 0,
-            limit: 2,
-            include_total: true,
-        };
-
-        let (rows, total) = database
-            .list_similar_catalog_rows(&filter, "sim-source")
-            .await?;
-        assert_eq!(total, 3, "Alpha, Gamma and Beta share a genre");
-        assert_eq!(rows.len(), 2, "LIMIT 2 must stop the page");
-        assert_eq!(rows[0].item_id, "sim-alpha", "three shared genres rank first");
-        assert!(rows.iter().all(|row| row.item_id != "sim-source"));
-        assert!(rows.iter().all(|row| row.item_id != "sim-delta"));
-
-        // The statement itself stops at the page boundary; the plan must not walk media_items.
-        let (selected_sql, _) = super::similar_catalog_selected_query(&filter, "sim-source");
-        assert!(selected_sql.contains("WITH shared AS MATERIALIZED"));
-        assert!(selected_sql.contains("GROUP BY facet.item_id"));
-        assert!(selected_sql.contains("LIMIT ? OFFSET ?"));
-        let (list_plan, count_plan) = database
-            .explain_similar_catalog_rows(&filter, "sim-source")
-            .await?;
-        assert!(
-            list_plan
-                .iter()
-                .any(|line| line.contains("idx_media_item_facets_lookup")),
-            "the genre lookup must use the facet index: {list_plan:?}"
-        );
-        assert!(
-            !list_plan
-                .iter()
-                .any(|line| line.contains("SCAN media_items")),
-            "the page must not scan media_items: {list_plan:?}"
-        );
-        assert!(
-            !count_plan
-                .iter()
-                .any(|line| line.contains("SCAN media_items")),
-            "the total must not scan media_items: {count_plan:?}"
-        );
-
-        database.close().await;
         Ok(())
     }
 }
