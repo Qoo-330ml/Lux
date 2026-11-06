@@ -74,6 +74,27 @@ impl TestServer {
         let body = response.text().await?;
         Ok((status, serde_json::from_str(&body).unwrap_or(Value::Null)))
     }
+
+    /// Performs one authenticated POST; `body` is sent as JSON when present.
+    async fn post(
+        &self,
+        path: &str,
+        body: Option<&str>,
+    ) -> Result<(reqwest::StatusCode, Value), Box<dyn std::error::Error>> {
+        let mut request = self
+            .client
+            .post(format!("{}{path}", self.base_url))
+            .header("X-Emby-Token", &self.admin_token);
+        if let Some(body) = body {
+            request = request
+                .header("Content-Type", "application/json")
+                .body(body.to_owned());
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let body = response.text().await?;
+        Ok((status, serde_json::from_str(&body).unwrap_or(Value::Null)))
+    }
 }
 
 async fn emby_login(
@@ -194,34 +215,73 @@ async fn spawn_server() -> Result<TestServer, Box<dyn std::error::Error>> {
     })
 }
 
-/// A blank numeric value must answer exactly what the parameter-less request answers.
+/// A blank numeric value must answer exactly what the same request without it answers.
+async fn assert_blank_suffixes_match_absent(
+    server: &TestServer,
+    baseline_path: &str,
+    suffixes: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (baseline_status, baseline) = server.get(baseline_path).await?;
+    assert_eq!(
+        baseline_status,
+        reqwest::StatusCode::OK,
+        "`{baseline_path}` baseline must stay 200"
+    );
+    assert!(
+        baseline != Value::Null,
+        "`{baseline_path}` baseline must be a JSON body"
+    );
+    for suffix in suffixes {
+        let path = format!("{baseline_path}{suffix}");
+        let (status, body) = server.get(&path).await?;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "`{path}` must treat the blank value as absent"
+        );
+        assert_eq!(
+            body, baseline,
+            "`{path}` must return the same body as `{baseline_path}`"
+        );
+    }
+    Ok(())
+}
+
+/// Like [`assert_blank_suffixes_match_absent`], but for endpoints whose parameter-less answer is
+/// not `200` (the user avatar route answers `404` when no avatar is stored). The blank value must
+/// still answer exactly like the omitted one instead of failing query deserialization.
+async fn assert_blank_suffixes_match_baseline(
+    server: &TestServer,
+    baseline_path: &str,
+    suffixes: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (baseline_status, baseline) = server.get(baseline_path).await?;
+    assert_ne!(
+        baseline_status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "`{baseline_path}` baseline must not be a query error"
+    );
+    for suffix in suffixes {
+        let path = format!("{baseline_path}{suffix}");
+        let (status, body) = server.get(&path).await?;
+        assert_eq!(
+            status, baseline_status,
+            "`{path}` must answer like `{baseline_path}`"
+        );
+        assert_eq!(
+            body, baseline,
+            "`{path}` must return the same body as `{baseline_path}`"
+        );
+    }
+    Ok(())
+}
+
+/// A blank optional numeric value must answer exactly what the parameter-less request answers.
 async fn assert_blank_values_match_absent(
     server: &TestServer,
     path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (baseline_status, baseline) = server.get(path).await?;
-    assert_eq!(
-        baseline_status,
-        reqwest::StatusCode::OK,
-        "`{path}` baseline must stay 200"
-    );
-    assert!(
-        baseline != Value::Null,
-        "`{path}` baseline must be a JSON body"
-    );
-    for suffix in BLANK_SUFFIXES {
-        let (status, body) = server.get(&format!("{path}{suffix}")).await?;
-        assert_eq!(
-            status,
-            reqwest::StatusCode::OK,
-            "`{path}{suffix}` must treat the blank value as absent"
-        );
-        assert_eq!(
-            body, baseline,
-            "`{path}{suffix}` must return the same body as `{path}`"
-        );
-    }
-    Ok(())
+    assert_blank_suffixes_match_absent(server, path, &BLANK_SUFFIXES).await
 }
 
 /// A present but invalid value keeps answering `400`.
@@ -384,5 +444,107 @@ async fn emby_sessions_treat_blank_active_within_seconds_as_absent()
         }
         assert_invalid_values_are_rejected(&server, path, &INVALID).await?;
     }
+    Ok(())
+}
+
+/// `GET /Search/Hints` is an Emby list endpoint too, and its `StartIndex`/`Limit` used to be plain
+/// `Option<i64>` fields that rejected a blank value. The fields must stay optional: the baseline
+/// request below carries no paging parameter at all.
+#[tokio::test]
+async fn emby_search_hints_treat_blank_paging_parameters_as_absent()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = spawn_server().await?;
+    for prefix in ["", "/emby"] {
+        let baseline = format!("{prefix}/Search/Hints?SearchTerm=Empty");
+        assert_blank_suffixes_match_absent(
+            &server,
+            &baseline,
+            &[
+                "&Limit=",
+                "&StartIndex=",
+                "&Limit=&StartIndex=",
+                "&Limit=%20%20&StartIndex=%20",
+            ],
+        )
+        .await?;
+        assert_invalid_values_are_rejected(
+            &server,
+            &baseline,
+            &[
+                "&Limit=abc",
+                "&Limit=1.5",
+                "&Limit=1001",
+                "&StartIndex=abc",
+                "&StartIndex=-1",
+            ],
+        )
+        .await?;
+    }
+    // A real search still answers with the hint envelope instead of an error.
+    let (status, body) = server
+        .get("/emby/Search/Hints?SearchTerm=Empty&Limit=1")
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert!(body["SearchHints"].is_array());
+    Ok(())
+}
+
+/// The user avatar endpoint takes an optional numeric `Index`; a blank value means "no index".
+#[tokio::test]
+async fn emby_user_avatar_treats_blank_index_as_absent() -> Result<(), Box<dyn std::error::Error>> {
+    let server = spawn_server().await?;
+    for prefix in ["", "/emby"] {
+        let baseline = format!("{prefix}/Users/{}/Images/Primary", server.admin_id);
+        // No avatar is stored, so the absent-parameter answer is a 404; the point is that the
+        // blank value must not be a 400 from query deserialization.
+        assert_blank_suffixes_match_baseline(
+            &server,
+            &baseline,
+            &["?Index=", "?index=", "?Index=%20"],
+        )
+        .await?;
+        assert_invalid_values_are_rejected(
+            &server,
+            &baseline,
+            &["?Index=abc", "?index=abc", "?Index=-1"],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// `HideFromResume` reads `Hide` from the query or the JSON body. A blank query value must behave
+/// like an omitted one, so the body still decides; a blank value alone stays a 400.
+#[tokio::test]
+async fn emby_hide_from_resume_treats_blank_hide_as_absent()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = spawn_server().await?;
+    let path = format!(
+        "/Users/{}/Items/empty-num-movie-1/HideFromResume",
+        server.admin_id
+    );
+    let (baseline_status, baseline) = server.post(&format!("{path}?Hide=true"), None).await?;
+    assert_eq!(baseline_status, reqwest::StatusCode::OK);
+    assert_eq!(baseline["HideFromResume"], true);
+
+    // The blank query value is absent, so the JSON body supplies the answer.
+    let (status, body) = server
+        .post(&format!("{path}?Hide="), Some(r#"{"Hide":true}"#))
+        .await?;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "`Hide=` must be treated as an omitted query value"
+    );
+    assert_eq!(body["HideFromResume"], true);
+
+    // A blank value is not the same as `Hide=false`, so nothing decides and the request fails.
+    let (status, _) = server.post(&format!("{path}?Hide="), None).await?;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    // A non-empty invalid value keeps failing even when the body agrees.
+    let (status, _) = server
+        .post(&format!("{path}?Hide=abc"), Some(r#"{"Hide":true}"#))
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
     Ok(())
 }
