@@ -82,6 +82,15 @@ export type RealtimeSocketOptions = {
   onReady: () => void;
   onInvalidate: (frame: InvalidateFrame) => void;
   onStateChange: (state: RealtimeConnectionState) => void;
+  /**
+   * A retryable attempt failed (refused handshake, dropped connection, missing `ready`).
+   *
+   * `onStateChange` alone cannot report this: the state starts as `disconnected`, so an attempt
+   * that fails before the first `ready` never produces a transition. Consumers that have to know
+   * "the channel was down at some point" (the user channel's post-reconnect sweep, ADR-054 D15①)
+   * listen here. A `1008` ends the session instead of retrying and is not reported.
+   */
+  onConnectionFailure?: () => void;
   /** A `1006` streak reached the probe threshold; the caller checks `GET /auth/me`. */
   onSessionCheck: () => void;
   /** `1008`: the session is gone, do not reconnect. */
@@ -268,6 +277,7 @@ export class RealtimeSocket {
       this.options.onSessionEnded();
       return;
     }
+    this.options.onConnectionFailure?.();
     if (code === REALTIME_CLOSE_ABNORMAL) {
       this.abnormalStreak += 1;
       if (this.abnormalStreak >= ABNORMAL_CLOSE_PROBE_THRESHOLD) {

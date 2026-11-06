@@ -19,6 +19,8 @@ export type RealtimeHandlers = {
   onReady: () => void;
   onInvalidate: (frame: InvalidateFrame) => void;
   onStateChange?: (state: RealtimeConnectionState) => void;
+  /** A retryable attempt failed; unlike `onStateChange` this also fires for the first attempt. */
+  onConnectionFailure?: () => void;
 };
 
 let socket: RealtimeSocket | null = null;
@@ -32,6 +34,16 @@ export function realtimeConnectionState(): RealtimeConnectionState {
   return connectionState;
 }
 
+/**
+ * The only writer of `connectionState`: every change (from the socket or from the hub itself)
+ * reaches the subscribers through the same path.
+ */
+function setConnectionState(next: RealtimeConnectionState) {
+  if (connectionState === next) return;
+  connectionState = next;
+  for (const subscriber of [...subscribers]) subscriber.onStateChange?.(next);
+}
+
 function createSocket(): RealtimeSocket {
   return new RealtimeSocket({
     onReady: () => {
@@ -40,9 +52,9 @@ function createSocket(): RealtimeSocket {
     onInvalidate: (frame) => {
       for (const subscriber of [...subscribers]) subscriber.onInvalidate(frame);
     },
-    onStateChange: (state) => {
-      connectionState = state;
-      for (const subscriber of [...subscribers]) subscriber.onStateChange?.(state);
+    onStateChange: setConnectionState,
+    onConnectionFailure: () => {
+      for (const subscriber of [...subscribers]) subscriber.onConnectionFailure?.();
     },
     onSessionCheck: () => {
       void probeSession();
@@ -70,14 +82,25 @@ async function probeSession() {
 }
 
 /**
- * The session is gone: stop pushing, and drop every cached query the way an explicit logout does.
- * The `me` query is re-created by its observer in `App` and answers 401, which lands on the login
- * page; without the clear a second account on the same tab would still read the first account's
- * home/favorites/history entries for the rest of their `staleTime`.
+ * The session is gone: stop pushing, tell every subscriber, and drop the caches the way an
+ * explicit logout does.
+ *
+ * The stopped socket is dropped here rather than parked: `start()` on a stopped socket returns
+ * immediately, so keeping it would leave the next subscriber (a re-mounted shell, a second tab's
+ * admin layout) attached to a connection that can never come back. The invariant is "a subscriber
+ * always has a live socket, or the hub has told it the channel is down"; the state broadcast below
+ * is what makes the second half true, and a later subscriber gets a fresh socket.
+ *
+ * The caches are cleared because the `me` query is re-created by its observer in `App` and answers
+ * 401 (which is what lands on the login page); without the clear a second account on the same tab
+ * would still read the first account's home/favorites/history entries for the rest of their
+ * `staleTime`.
  */
 function endSession() {
-  socket?.stop();
-  connectionState = "disconnected";
+  const ending = socket;
+  socket = null;
+  ending?.stop();
+  setConnectionState("disconnected");
   if (sessionQueryClient) clearSessionCaches(sessionQueryClient);
 }
 
@@ -97,6 +120,6 @@ export function subscribeRealtime(queryClient: QueryClient, handlers: RealtimeHa
     if (subscribers.size > 0) return;
     socket?.stop();
     socket = null;
-    connectionState = "disconnected";
+    setConnectionState("disconnected");
   };
 }

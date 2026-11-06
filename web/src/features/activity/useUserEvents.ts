@@ -100,10 +100,13 @@ export function useUserEvents() {
         const payload = parseUserEvent(frame);
         if (payload) invalidate(payload);
       },
-      onStateChange: (state) => {
-        if (state === "disconnected") hadConnectionError.current = true;
-        setConnectionState(state);
+      // A failed attempt before the first `ready` never changes the connection state, so the
+      // "we were down, the next ready has catching up to do" flag is driven by the failure
+      // signal instead (ADR-054 D15①).
+      onConnectionFailure: () => {
+        hadConnectionError.current = true;
       },
+      onStateChange: setConnectionState,
     });
     // A sibling subscriber may already own a connected socket when this hook mounts.
     setConnectionState(realtimeConnectionState());

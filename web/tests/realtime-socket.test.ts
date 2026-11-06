@@ -26,16 +26,22 @@ type Harness = {
   states: string[];
 };
 
+/** Every socket a test started, so a failing assertion cannot leak window listeners. */
+const startedSockets: RealtimeSocket[] = [];
+
 function createHarness(): Harness {
   const states: string[] = [];
   const options = {
     onReady: vi.fn(),
     onInvalidate: vi.fn(),
     onStateChange: vi.fn((state: string) => states.push(state)),
+    onConnectionFailure: vi.fn(),
     onSessionCheck: vi.fn(),
     onSessionEnded: vi.fn(),
   };
-  return { socket: new RealtimeSocket(options), options, states };
+  const socket = new RealtimeSocket(options);
+  startedSockets.push(socket);
+  return { socket, options, states };
 }
 
 /** Lets the client create a socket, complete the handshake and receive `ready`. */
@@ -56,6 +62,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // A test that fails before its own `stop()` must not leave a socket listening to the window.
+  for (const socket of startedSockets.splice(0)) socket.stop();
   vi.useRealTimers();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -173,6 +181,38 @@ describe("realtime backoff", () => {
     expect(FakeWebSocket.instances).toHaveLength(5);
     act(() => vi.advanceTimersByTime(1));
     expect(FakeWebSocket.instances).toHaveLength(6);
+  });
+});
+
+describe("realtime failure reporting", () => {
+  it("reports every retryable failure, including one that never reached ready", () => {
+    const harness = createHarness();
+    harness.socket.start();
+
+    // The very first attempt is refused before the handshake completes. The connection state was
+    // already "disconnected", so no state transition reports this on its own.
+    FakeWebSocket.last()?.serverClose(1006);
+    expect(harness.options.onConnectionFailure).toHaveBeenCalledTimes(1);
+    expect(harness.states).toEqual([]);
+
+    act(() => vi.advanceTimersByTime(500));
+    // An attempt that opens but never says `ready` is a failure too.
+    FakeWebSocket.last()?.open();
+    act(() => vi.advanceTimersByTime(READY_TIMEOUT_MS));
+    expect(harness.options.onConnectionFailure).toHaveBeenCalledTimes(2);
+
+    // A 1008 ends the session instead of retrying, so it is not a "connection failure".
+    act(() => vi.advanceTimersByTime(60_000));
+    connect(harness).close(1008);
+    expect(harness.options.onConnectionFailure).toHaveBeenCalledTimes(2);
+    expect(harness.options.onSessionEnded).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not report a failure for a connection that never opened and was stopped", () => {
+    const harness = createHarness();
+    harness.socket.start();
+    harness.socket.stop();
+    expect(harness.options.onConnectionFailure).not.toHaveBeenCalled();
   });
 });
 

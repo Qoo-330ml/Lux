@@ -175,6 +175,24 @@ it("does not invalidate loaded media caches on the first ready and does it once 
   expect(invalidate.mock.calls).toHaveLength(callsAfterReconnect);
 });
 
+it("sweeps home when the first attempt fails and the retry connects", async () => {
+  client.setQueryData(["home", "carousel"], { value: "fresh" });
+  renderShell();
+  expect(FakeWebSocket.instances).toHaveLength(1);
+
+  // The very first attempt is refused before any ready frame. The connection state was already
+  // "disconnected", so no state transition reports this on its own (ADR-054 D15① needs it).
+  act(() => socket().serverClose(1006));
+  expect(connectionText()).toBe("disconnected");
+  await advance(500);
+  expect(FakeWebSocket.instances).toHaveLength(2);
+  expect(client.getQueryState(["home", "carousel"])?.isInvalidated).toBe(false);
+
+  // The retry connects, so the frames missed while the channel was down are covered by one sweep.
+  markReady();
+  expect(client.getQueryState(["home", "carousel"])?.isInvalidated).toBe(true);
+});
+
 it.each(["home", "item", "library", "favorites"])("refreshes media caches for a %s event without touching player sessions", (scope) => {
   for (const key of mediaKeys) client.setQueryData(key, { value: "old" });
   const playerKey = ["web-playback-session", "item-1"];
