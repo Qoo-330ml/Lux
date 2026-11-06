@@ -21136,6 +21136,35 @@ shell 已挂载时 `/auth/me` 返回 401 回到登录页）。
 上验证握手、协议级 ping/pong 与 `1006` 的实际表现；本任务的全部结论来自注入假 WebSocket 的单元/组件
 测试。
 
+返工记录（2026-11-06，独立审查 1/3）：
+
+- **P1 会话失效只失效 `me`、不清缓存**。`QueryClient` 是 `web/src/main.tsx` 的页级单例、跨登录存活，
+  而 `home/*`、`favorites`、`watch-history`、`playback`、`admin/*` 等键都不带用户维度；在 `staleTime 60 s`
+  + `refetchOnWindowFocus: false` 下，同一标签页换账号会读到上一个账号的数据（显式退出登录走
+  `queryClient.clear()`，这条新路径没有等价处理）。现在会话失效路径与退出登录共用
+  `web/src/lib/api/session.ts` 的 `clearSessionCaches()`：清掉除 `me` 以外的全部查询，再失效 `me`。
+  `me` 必须保留——React Query 不会通知被 remove 的查询的观察者，删掉它 `App` 会继续渲染已缓存的用户；
+  保留后重新请求 `/auth/me` 得到 401，界面才切到登录页，下一次登录再覆盖它。hub 每个失效会话只清一次
+  （不是每个订阅者一次），并照旧 `socket.stop()`。用例：`1008` 与 `1006×5 + 401` 各断言
+  `home/favorites/watch-history/playback/admin` 缓存被清空；`login-page.test.tsx` 端到端跑一遍"1008 →
+  登录页 → 用另一个账号登录"，断言显示的是新账号的继续观看、旧账号标题不再出现（该用例在修复前失败）。
+- **P2 管理端"每次 open 都 `all` 失效"在晚挂载时丢失**。`onReady` 只随连接的 `ready` 帧触发一次，而
+  `/admin` 是在连接已经 ready 之后才挂载的（首页 → 控制台），卸载期间到达的 admin 帧也直接丢弃。现在
+  `useAdminEvents` 在挂载时若连接已 ready 就补一次 `all` 失效。选择"hook 内补"而不是"hub 向新订阅者
+  重放 `ready`"：重放会同时打到用户频道，D15① 的"只有断线过才做全量"就变得难以判定；另有一条用例
+  钉住"用户频道加入已 ready 的连接不做 `home` 全量失效"。管理端用例覆盖"已 ready 后挂载 → 一次 `all`"
+  与"卸载再挂载 → 再失效一次"。
+- **P3 开发代理不转发升级**。`web/vite.config.ts` 的 `/api` 原来是一条裸 target 字符串，`pnpm --dir web
+  dev` 下 `ws://127.0.0.1:5173/api/v1/ws` 永远拿不到 `ready`，静默回落轮询。现在是带 `ws: true` 的对象
+  形式（target 不变），旁边写明**不要开 `changeOrigin`**：浏览器 Origin 是 dev server，上游必须看到同一个
+  `Host`，开了会把 Host 改写成后端地址、被严格同源校验拒绝——与生产反代保留 `Host $http_host` 同一个
+  理由。`web/tests/dev-ws-proxy.test.mjs`（`node --test`）断言 `ws: true` 且没有 `changeOrigin: true`；
+  没有可用的后端，**开发代理的真实握手未验证**。
+
+返工后复验（2026-11-06）：`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web build`、`npx tsc
+--noEmit` 通过；rebase 到本地 `test`（`05abd0f9`，含条目刷新模式那一批 Web 改动）后 `pnpm --dir web test`
+为 167 个 `node --test` 用例 + 167 个 vitest 文件 / 1557 例全绿。
+
 #### LUX-896：反代配置与部署文档（样例与文档已完成，真实握手未运行）
 
 状态：文档与样例已完成（2026-11-06）；LUX-894 已合并到 `test`，本分支已 rebase 到 `a8c7928a`，并补齐
