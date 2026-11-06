@@ -141,6 +141,9 @@ mod emby_catalog;
 mod emby_image_diag;
 #[allow(unused_imports)]
 use emby_catalog::*;
+#[path = "emby_filter_metadata.rs"]
+mod emby_filter_metadata;
+use emby_filter_metadata::*;
 #[path = "playback.rs"]
 mod playback;
 use playback::*;

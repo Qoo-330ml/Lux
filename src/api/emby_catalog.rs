@@ -4,7 +4,7 @@ use tokio::{sync::Semaphore, task::JoinSet};
 
 const EMBY_ITEM_EXTRA_CONCURRENCY: usize = 8;
 const EMBY_SHOW_EPISODE_DEFAULT_LIMIT: i64 = EMBY_MAX_PAGE_LIMIT;
-const EMBY_MAX_PAGE_LIMIT: i64 = 1_000;
+pub(super) const EMBY_MAX_PAGE_LIMIT: i64 = 1_000;
 
 use crate::application::catalog::CatalogItemCounts;
 use crate::storage::{GLOBAL_COLLECTION_LIBRARY_ID, MediaFacetKind};

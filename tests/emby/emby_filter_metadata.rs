@@ -91,6 +91,7 @@ fn names(body: &Value) -> Vec<&str> {
 }
 
 struct Fixture {
+    database: Database,
     admin_token: String,
     viewer_token: String,
     viewer_id: String,
@@ -156,7 +157,11 @@ impl Fixture {
         let web_auth = WebAuthService::new(database.clone())?;
         let emby_auth = EmbyAuthService::new(database.clone())?;
         let app = app_with_state(AppState::ready(
-            config, database, setup, web_auth, emby_auth,
+            config,
+            database.clone(),
+            setup,
+            web_auth,
+            emby_auth,
         ));
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
@@ -166,6 +171,7 @@ impl Fixture {
         let admin_token = emby_login(&client, &base_url, "admin", "correct password").await?;
         let viewer_token = emby_login(&client, &base_url, "viewer", "viewer password").await?;
         Ok(Self {
+            database,
             admin_token,
             viewer_token,
             viewer_id: viewer.id.to_string(),
@@ -196,6 +202,24 @@ impl Fixture {
             Value::Null
         };
         Ok((status, body))
+    }
+
+    async fn restrict_viewer_to_max_rating(
+        &self,
+        rating_system: &str,
+        maximum_rating: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO user_content_restrictions
+             (user_id, rating_system, maximum_rating, allow_unrated)
+             VALUES (?, ?, ?, 0)",
+        )
+        .bind(&self.viewer_id)
+        .bind(rating_system)
+        .bind(maximum_rating)
+        .execute(self.database.pool())
+        .await
+        .map(|_| ())
     }
 }
 
@@ -239,6 +263,21 @@ async fn official_ratings_are_distinct_and_scoped_to_the_visible_libraries()
     assert_eq!(status, reqwest::StatusCode::OK);
     assert_eq!(names(&viewer), ["PG-13", "R"]);
     assert_eq!(viewer["TotalRecordCount"], 2);
+
+    // Content restrictions narrow the same list: an MPA PG-13 viewer no longer sees the R rating
+    // even though the item carrying it is in a library they can open.
+    fixture
+        .restrict_viewer_to_max_rating("MPA", "PG-13")
+        .await?;
+    let (status, restricted) = fixture
+        .get(
+            &format!("/OfficialRatings?UserId={}", fixture.viewer_id),
+            &fixture.viewer_token,
+        )
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(names(&restricted), ["PG-13"]);
+    assert_eq!(restricted["TotalRecordCount"], 1);
 
     Ok(())
 }

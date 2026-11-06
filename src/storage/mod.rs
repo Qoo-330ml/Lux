@@ -49,6 +49,14 @@ pub(crate) struct StoredMediaFacet {
     pub(crate) item_count: i64,
 }
 
+/// One distinct official rating code (the value `media_content_restriction_index` stores for the
+/// Emby `OfficialRating` field) together with its visible item count.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredMediaCertification {
+    pub(crate) certification_code: String,
+    pub(crate) item_count: i64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MediaFacetKind {
     Genre,

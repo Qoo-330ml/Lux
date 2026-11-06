@@ -6,7 +6,7 @@ use crate::domain::content_restrictions::ContentRestrictionIndexProjection;
 use crate::storage::{
     CONTENT_RESTRICTION_INDEX_BATCH_LIMIT, ContentRestrictionIndexBatchOutcome,
     ContentRestrictionIndexWrite, MediaContentRestrictionIndexCandidate, MediaFacetKind,
-    StoredMediaFacet,
+    StoredMediaCertification, StoredMediaFacet,
 };
 use crate::storage::{
     CatalogSearchQuery, GlobalCollectionSourcePreference, GlobalMovieCollectionReference,
@@ -3853,6 +3853,72 @@ impl Database {
                     name: year.to_string(),
                     item_count,
                 })
+                .collect(),
+            total,
+        ))
+    }
+
+    /// Distinct official rating codes of the items the filter can see, with how many visible items
+    /// carry each (sorted by code). Reads the `media_content_restriction_index` projection, the
+    /// same column the Emby `OfficialRating` field is rendered from, so it never parses NFO JSON;
+    /// `limit` is clamped by the caller.
+    pub(crate) async fn list_catalog_certifications(
+        &self,
+        filter: &CatalogFilterQuery<'_>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredMediaCertification>, i64), StorageError> {
+        if filter.library_ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let (where_clause, filter_binds) = catalog_filter_where_clause(filter);
+        let from = format!(
+            "FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             JOIN media_content_restriction_index rating
+               ON rating.item_id = mi.id
+              AND rating.certification_code IS NOT NULL
+             {where_clause}"
+        );
+        let list_query = format!(
+            "SELECT rating.certification_code AS certification_code, COUNT(*) AS item_count
+             {from}
+             GROUP BY rating.certification_code
+             ORDER BY rating.certification_code
+             LIMIT ? OFFSET ?"
+        );
+        let mut list = self.query_as::<(String, i64)>(sqlx::AssertSqlSafe(list_query));
+        for bind in &filter_binds {
+            list = match bind {
+                CatalogBind::Text(value) => list.bind(*value),
+                CatalogBind::Integer(value) => list.bind(*value),
+                CatalogBind::Real(value) => list.bind(*value),
+            };
+        }
+        let rows = list
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        let count_query = format!("SELECT COUNT(DISTINCT rating.certification_code) {from}");
+        let mut count = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_query));
+        for bind in &filter_binds {
+            count = match bind {
+                CatalogBind::Text(value) => count.bind(*value),
+                CatalogBind::Integer(value) => count.bind(*value),
+                CatalogBind::Real(value) => count.bind(*value),
+            };
+        }
+        let total = count.fetch_one(&self.pool).await.map_err(self.sqlx_err())?;
+        Ok((
+            rows.into_iter()
+                .map(
+                    |(certification_code, item_count)| StoredMediaCertification {
+                        certification_code,
+                        item_count,
+                    },
+                )
                 .collect(),
             total,
         ))
