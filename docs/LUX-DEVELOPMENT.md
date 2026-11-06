@@ -20374,8 +20374,9 @@ Hills 或任何第三方客户端上复测。
 
 预计文件：`src/api/emby_similar.rs`、`src/api/legacy.rs`、`src/api/emby.rs`、`src/application/catalog.rs`、
 `src/storage/catalog.rs`、`tests/emby/emby_similar.rs`、`tests/emby/main.rs`、`docs/COMPATIBILITY.md`、
-`docs/CHANGELOG.md`、`docs/LUX-DEVELOPMENT.md`、`docs/TEST-TARGETS.md`。rebase 到 `a7c3cdc5` 时上述文件与
-`test` 无冲突；`test` 上的 STRM 媒体源 id 改动不影响本端点。
+`docs/CHANGELOG.md`、`docs/LUX-DEVELOPMENT.md`、`docs/TEST-TARGETS.md`。rebase 到 `8ca9b0aa`（含
+LUX-888 与 STRM 媒体源 id 改动）时只有 `docs/LUX-DEVELOPMENT.md` 的两段任务记录落在同一插入点，按
+“双方内容都保留”解决（LUX-888 在前、LUX-889 在后）；源码无冲突。
 
 实施结果（2026-11-06，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 或修复后的客户端上复测）：
 
@@ -20384,7 +20385,8 @@ Hills 或任何第三方客户端上复测。
   `SEARCH facet USING COVERING INDEX idx_media_item_facets_lookup (kind=? AND name_key=?)`，没有
   `USE TEMP B-TREE FOR ORDER BY` 或 `SCAN media_items`；列表与总数语句只在有界并集上聚合。
 - `cargo fmt --all -- --check` 通过。
-- `cargo test --locked --test emby -- --list` 在本分支为 49 例（基线 43 + 本任务 6）。
+- `cargo test --locked --test emby` 整组 56/56 通过（`-- --list` 为 56 例：43 例基线 + LUX-888 的 7 例 +
+  本任务 6 例）。
 
 返工（2026-11-06，独立审查后）：
 
@@ -20396,8 +20398,9 @@ Hills 或任何第三方客户端上复测。
 - 新增测试：插入 2×(K+50) 条同 Genre 条目，断言页 ≤ Limit、总数 = 2K-1（两个 Genre 共用同一个条目）、
   第 200 个之后的条目不在池内、两次请求结果一致，以及单分支计划使用 `idx_media_item_facets_lookup`、
   无 `USE TEMP B-TREE FOR ORDER BY`、无 `SCAN media_items`；另一用例验证 12 个源 Genre 只取前 10 个。
-- 复跑：`cargo test --locked --test emby emby_similar::` 6/6、`cargo test --locked --lib similar_catalog`
-  2/2、fmt、clippy、`check-backend-branches.py` 通过。
+- 复跑：`cargo test --locked --test emby emby_similar::` 6/6；rebase 到 `8ca9b0aa` 后整组
+  `cargo test --locked --test emby` 56/56、`cargo test --locked --lib similar_catalog` 2/2、fmt、clippy、
+  `check-backend-branches.py` 通过。
 
 限制与剩余风险：
 

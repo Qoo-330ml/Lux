@@ -293,7 +293,6 @@ cargo test --locked --test scanner
 
 优先把新文件放进现有分组的领域目录：`tests/<group>/<file>.rs`，并在 `tests/<group>/main.rs` 里加一行 `mod <file>;`。只有确定无法与任何分组共存时才新增顶层 `tests/<file>.rs`，判据是：改进程级环境变量、装全局 subscriber、关全局闸门（如 `shutdown_background_workers()`）、或需要外部服务（PostgreSQL、外部素材目录）。
 
-
 ## 7. LUX-889 追加（2026-11-06）
 
 `tests/emby/emby_similar.rs` 是 LUX-889 新增的模块（`tests/emby/main.rs` 追加一行 `mod emby_similar;`），
@@ -301,6 +300,8 @@ cargo test --locked --test scanner
 不同类型、ACL 排除、`Limit` 与 `TotalRecordCount`、空列表、404/401、根路径与 `/emby` 前缀、
 `EnableUserData`/图片类型选择、空值与非法 `Limit`。
 
-本分支 rebase 到 `a7c3cdc5` 后 `cargo test --locked --test emby -- --list` 为 **49** 例（第 1、2、5.1 节
-记录的 43 例基线 + 本任务 6 例）。第 1、2、5.1 节的数字保留基线/合并时的口径，不在本任务中改写；
-LUX-888、LUX-890 等并行任务的 `emby` 新增模块合并后，需要以合并后的 `--list` 重新核对本节的 49。
+本分支 rebase 到 `8ca9b0aa`（已含 LUX-888）后 `cargo test --locked --test emby -- --list` 为 **56**
+例（43 例基线 + LUX-888 的 `emby_empty_numeric_params` 7 例 + 本任务 6 例），整组
+`cargo test --locked --test emby` 为 56 passed、0 failed。第 1、2、5.1 节的数字保留基线/合并时的口径，
+不在本任务中改写；LUX-890 等并行任务的 `emby` 新增模块合并后，需要以合并后的 `--list` 重新核对本节的
+56。
