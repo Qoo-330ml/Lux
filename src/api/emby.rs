@@ -150,6 +150,7 @@ pub(super) fn api_routes() -> (Router<ReadyAppState>, Vec<String>) {
                 .post(emby_update_item)
                 .delete(emby_delete_item),
         )
+        .route("/Items/{item_id}/Similar", get(emby_item_similar))
         .route("/Items/{item_id}/Refresh", post(emby_refresh_item))
         .route("/Library/Refresh", post(emby_refresh_library))
         .route("/Items/{item_id}/Children", get(emby_collection_children))

@@ -256,7 +256,12 @@ async fn start_server() -> Result<Harness, Box<dyn std::error::Error>> {
         "Drama Series",
     )
     .await?;
-    insert_genres(&database, "sim-series-drama", &["Drama", "Sci-Fi", "Thriller"]).await?;
+    insert_genres(
+        &database,
+        "sim-series-drama",
+        &["Drama", "Sci-Fi", "Thriller"],
+    )
+    .await?;
 
     insert_image(&database, "sim-alpha-poster", "sim-movie-alpha", "POSTER").await?;
     insert_image(&database, "sim-alpha-fanart", "sim-movie-alpha", "FANART").await?;
@@ -464,7 +469,7 @@ async fn series_similar_only_returns_series() -> Result<(), Box<dyn std::error::
         )
         .await?;
     assert_eq!(status, reqwest::StatusCode::OK);
-    assert_eq!(names(&empty), Vec::<&str>::new());
+    assert!(names(&empty).is_empty());
     assert_eq!(empty["TotalRecordCount"], 0);
 
     harness.server.abort();
