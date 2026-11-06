@@ -316,14 +316,15 @@ LUX-891 合并后已按合并后的实测核对：`cargo test --locked --test em
 ## 8. LUX-894 追加（2026-11-06）
 
 `tests/admin/lux_websocket.rs` 是 LUX-894（`GET /api/v1/ws`）新增的模块（`tests/admin/main.rs` 追加一行
-`mod lux_websocket;`），命令为 `cargo test --locked --test admin lux_websocket::`，共 **28** 例：普通 GET
+`mod lux_websocket;`），命令为 `cargo test --locked --test admin lux_websocket::`，共 **30** 例：普通 GET
 `426`；Origin 七条（缺失 / `null` / 非法 / 多值按缺失处理，host 大小写与非默认端口归一化，与 `Host`
 不一致 `400`，`Sec-Fetch-Site: cross-site` `400`，转发头不参与判断，缺失 Origin 时 cookie `401` 而客户端
 令牌放行）；cookie 与客户端令牌认证；未认证 `401`、被设备/客户端规则拒绝 `403`；管理员双频道与普通用户
 只有 `user` 频道；`progress` 事件携带 `itemId`；每用户与全局预算 `429` + `Retry-After: 30`、释放与
 管理/用户预算分离；降权只停 `admin` 帧并可在恢复后继续；会话撤销 `1008`；关停 `1001` 且不阻塞、关停后
 新握手 `503`；>4 KiB `1009`、二进制 `1003`、未知 `type` 忽略；协议级 ping 保持空闲连接、空闲 `1001`；
-重校验 5xx 不断连。
+重校验 5xx 不断连；另外两例来自审查返工：45 s 重校验不写 `user_devices`、`drain_lux_websocket_connections`
+在连接超出排空时间时返回 `false`。
 
 同一分支的单元测试在 `src/api/lux_websocket.rs`：`cargo test --locked --lib lux_websocket::` 共 **14** 例
 （Origin 解析与归一化、信封逐字渲染、`itemId` 256 字符边界、`{"type":"ping"}` 识别、升级 token 判定、
@@ -334,12 +335,15 @@ ADR-054 的预算与定时器默认值（用户 128/16、管理 64/8、4 KiB、2
 模块内的等待方式（返工后）：所有依赖时间的断言都轮询到条件成立或 `CONDITION_DEADLINE`（20 s），例如空闲关闭
 轮询连接预算空位后再读 close 码、协议 ping 保活数到足够的 ping 且超过 1.6 个空闲窗后再断言仍可通信；只有负向
 断言（“不应收到 admin 帧”“不应有 pong”）使用 400 ms 的短窗口。心跳/空闲的时钟比例与依据写在各自用例的注释里，
-因此整组在机器同时跑其它构建/测试（load average 200~290、10 个烧机进程）时连续 5 次 28/28。
+因此模块在 10 个烧机进程、机器 load average 30~330 时连续 3 次 30/30。
 
-本分支 rebase 前的实测：`cargo test --locked --test admin -- --list` 为 **53** 例（25 例基线 + 本任务
-28 例）；整组 `cargo test --locked --test admin` 连续 2 次均为 52 passed / 1 failed，唯一失败是 5.3 节已记录的
+LUX-891 的 `/embywebsocket` 模块在本次审查返工中新增一例（关停后新握手 `503`），
+`cargo test --locked --test emby -- --list` 由 82 例变为 **83** 例（`emby_websocket::` 24 例）。
+
+本分支的实测：`cargo test --locked --test admin -- --list` 为 **55** 例（25 例基线 + 本任务
+30 例）；整组 `cargo test --locked --test admin` 连续 2 次均为 54 passed / 1 failed，唯一失败是 5.3 节已记录的
 环境型用例 `admin_settings::transcoding_settings_are_admin_only_validated_and_persisted`（本机 VideoToolbox
 可用，用例断言 `transcodingStatus.available == false`，与 WebSocket 无关），单跑该用例同样失败；
-`cargo test --locked --test admin lux_websocket::` 连续 2 次 28/28；`cargo test --locked --test emby` 82/82；
+`cargo test --locked --test admin lux_websocket::` 加压下连续 3 次 30/30；`cargo test --locked --test emby` 83/83；
 `LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test shutdown` 2/2。第 1、2、5.1 节的数字保留
 基线/合并时的口径，不在本任务中改写；LUX-897 删除 SSE 用例后需要再以合并后的 `--list` 核对。

@@ -20962,12 +20962,14 @@ rustfmt 按新标识符长度重排（`payload_fits` 合并为一行），无逻
 
 验收：
 
-- [x] 新增 `tests/admin/lux_websocket.rs`（并入 `--test admin`，28 例）：未认证 401；无管理权限时只投
+- [x] 新增 `tests/admin/lux_websocket.rs`（并入 `--test admin`，30 例）：未认证 401；无管理权限时只投
       `user` 帧；跨源 400；`Origin` 缺失 + cookie 401；`Origin` 缺失 + 客户端令牌通过；`Sec-Fetch-Site:
       cross-site` 拒绝；预算超限 429 + `Retry-After: 30`；关停 1001；会话撤销 1008；>4 KiB 1009；二进制
       1003；未知 `type` 忽略且不关连接。另覆盖 426、`null`/非法/多值 Origin、host 大小写与默认端口归一化、
       转发头不参与判断、被设备/客户端规则拒绝 403、令牌认证、`progress` 的 `itemId`、每用户与全局预算
       各自的 429 与释放、管理/用户预算分离、协议级 ping 保活、空闲 1001、重校验 5xx 不断连。
+      第 2 轮审查返工又补两例：45 s 重校验不写 `user_devices`、`drain_lux_websocket_connections`
+      在连接超出排空时间时返回 `false`。
 - [x] 降权用例：admin 帧停止、user 帧继续、连接不关闭；恢复权限后 admin 帧恢复。
 - [ ] 真实浏览器验证：协议级 pong 会重置 120 s 空闲计时（否则每条连接都会被误杀）；JS 客户端不依赖
       应用层 ping 判活。**未执行**：本任务用真实 socket 的 `tokio-tungstenite` 客户端覆盖了同一语义
@@ -21015,13 +21017,14 @@ rustfmt 按新标识符长度重排（`payload_fits` 合并为一行），无逻
    并行排空 Emby 与 Lux 的三份预算，总上界仍是 5 s；关停信号置位后新握手返回 `503`。Emby 的路由、DTO、
    协议与限额未改，SSE 的两条路由及其测试一行未动。
 
-验证（返工后）：`cargo test --locked --test admin lux_websocket::` 在 10 个 `yes` 烧机进程且机器 load average
-200~290 时连续 5 次 28/28（54–74 s）；同一压力下整组 `cargo test --locked --test admin` 为 52 passed / 1 failed；
-停掉烧机进程后整组连续 2 次 52 passed / 1 failed。唯一失败始终是基线已有的环境型用例
+验证（第 2 轮审查返工后）：`cargo test --locked --test admin lux_websocket::` 在 10 个 `yes` 烧机进程且机器
+load average 200~290 时连续 3 次 30/30；同一压力下整组 `cargo test --locked --test admin` 为 54 passed / 1 failed；
+停掉烧机进程后整组连续 2 次 54 passed / 1 failed。唯一失败始终是基线已有的环境型用例
 `admin_settings::transcoding_settings_are_admin_only_validated_and_persisted`（本机 VideoToolbox 可用，用例
 断言 `transcodingStatus.available == false`；`docs/TEST-TARGETS.md` §5.3 已记录，单跑同样失败，与本改动无关）。
-`cargo test --locked --test emby` 82/82；`LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test shutdown`
-2/2；`cargo test --locked --lib websocket::` 24/24、`cargo test --locked --lib lux_websocket::` 14/14；
+`cargo test --locked --test emby` 83/83（其中 `emby_websocket::` 24 例，含新增的「关停后新握手 503」）；
+`LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test shutdown` 2/2；
+`cargo test --locked --lib websocket::` 24/24、`cargo test --locked --lib lux_websocket::` 14/14；
 `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
 `python3 scripts/check-backend-branches.py`（28 files / 266 branches）、`cargo build --locked` 全部通过。
 本机为 arm64（`uname -m`），未做 NAS/x86 并发验证，也未在真实反向代理后握手（属 LUX-896）。
@@ -21040,6 +21043,25 @@ rustfmt 按新标识符长度重排（`payload_fits` 合并为一行），无逻
 - **时钟比例**：保活用例心跳 250 ms / 空闲 2.5 s（10 倍），并写注释说明 250 ms ≥ 50 倍典型 5 ms 调度延迟；
   空闲用例把心跳设为与空闲窗相同（1 s）——服务端先判空闲再发 ping，避免测试客户端在服务端已关闭后才补发 pong
   被 RST 掩盖 close 帧；比例依据写在用例注释里。
+
+第 2 轮审查返工（2026-11-06）：
+
+1. **文档（P1）**：`docs/API.md` 的 WS 契约曾写 `proxy_set_header Host $http_host;` 并指向
+   `docs/DEPLOYMENT.md`，但该样例属于 LUX-896 且尚未合入（现在仍是 `$host`、没有 `Upgrade`/`Connection`）。
+   现在契约只描述端点要求（反代需转发 `Upgrade`/`Connection`、保留 `Host` 完整 authority），nginx 样例明确
+   以 LUX-896 落地后的 `docs/DEPLOYMENT.md` 为准；本分支没有改任何 nginx 样例。`docs/LUX-DEVELOPMENT.md` 与
+   `docs/CHANGELOG.md` 里没有同类部署指令（LUX-896 任务条目里的描述属于该任务自己的范围）。
+2. **Emby 关停握手（P2）**：`/embywebsocket` 在共享关停信号置位后仍会完成新握手，与 ADR-054 D10 不一致。
+   `emby_websocket` 现在在认证之前检查 `WebsocketShutdown::is_signalled()` 并返回 `503`；新增用例
+   `emby_websocket_refuses_new_handshakes_once_shutdown_started`（先收到已有连接的 `1001`，再断言新握手 `503`）。
+3. **重校验写设备清单（P3）**：45 s 重校验原先走完整的 `require_web_user`，对带 `device_id` 的会话每周期
+   upsert `user_devices`。`src/api/users.rs` 拆出 `require_web_user_observing_device(..., record_device)`，
+   新增只读入口 `require_web_user_read_only`（同样的查询与权限判定，只跳过设备观测写入），WS 重校验改用它；
+   普通 HTTP 请求行为不变。用例 `revalidation_does_not_write_the_device_inventory` 先冻结该行的
+   `last_seen_at`，再用「降权只有重校验能发现」证明重校验确实发生，然后断言该值仍是冻结值。
+4. **死代码（P3）**：`drain_lux_websocket_connections` 没有调用者。现在它是
+   `shutdown_websocket_connections` 里 Lux 一侧的排空实现（`src/main.rs` 走的同一条路径），不再有独立死代码；
+   用例 `a_bounded_drain_reports_a_connection_that_outlives_it` 覆盖「连接未退出 → `false`」「信号后 → `true`」。
 
 #### LUX-895：前端实时客户端（未开始）
 
