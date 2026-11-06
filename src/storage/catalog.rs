@@ -3124,6 +3124,9 @@ impl Database {
             query.content_restrictions,
         );
         let runtime_ticks = resume_runtime_ticks_sql();
+        let resume_state = resumable_state_predicate("us");
+        let resume_progress =
+            resumable_progress_predicate("position_ticks", "resume_runtime_ticks");
         let resume_rank = Self::resume_rank_expression(latest_episode_per_series);
         let (next_episode_ctes, ranking_ctes) = Self::resume_next_episode_query_parts(
             include_next_unplayed_episode,
@@ -3140,15 +3143,14 @@ impl Database {
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                  JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
                  WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
-                   AND us.is_played = 0 AND us.hide_from_resume = 0 AND us.position_ticks >= ?
+                   AND {resume_state}
                    AND mi.library_id IN ({library_placeholders}){content_restriction_predicate}
              ),
              eligible AS (
                  SELECT id, item_type, series_id, season_number, episode_number,
                         sort_title, last_played_at
                  FROM candidates
-                 WHERE resume_runtime_ticks > 0
-                   AND position_ticks * 100 < resume_runtime_ticks * ?
+                 WHERE {resume_progress}
              ){next_episode_ctes}{ranking_ctes},
              qualified AS (
                  SELECT id, sort_title, last_played_at,
@@ -3272,6 +3274,9 @@ impl Database {
             query.content_restrictions,
         );
         let runtime_ticks = resume_runtime_ticks_sql();
+        let resume_state = resumable_state_predicate("us");
+        let resume_progress =
+            resumable_progress_predicate("position_ticks", "resume_runtime_ticks");
         let resume_rank = Self::resume_rank_expression(latest_episode_per_series);
         let (next_episode_ctes, ranking_ctes) = Self::resume_next_episode_query_parts(
             include_next_unplayed_episode,
@@ -3289,14 +3294,13 @@ impl Database {
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                  JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
                  WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
-                   AND us.is_played = 0 AND us.hide_from_resume = 0 AND us.position_ticks >= ?
+                   AND {resume_state}
                    AND mi.library_id IN ({library_placeholders}){content_restriction_predicate}
              ), eligible AS (
                  SELECT id, item_type, series_id, season_number, episode_number,
                         sort_title, last_played_at
                  FROM candidates
-                 WHERE resume_runtime_ticks > 0
-                   AND position_ticks * 100 < resume_runtime_ticks * ?
+                 WHERE {resume_progress}
              ){next_episode_ctes}{ranking_ctes}
              SELECT COUNT(*) FROM ranked WHERE resume_rank = 1"
         );
@@ -5964,6 +5968,39 @@ impl Database {
             }
         }
         Ok(contexts)
+    }
+
+    /// One page of a library's rating-sync candidates, ordered by item id.
+    ///
+    /// Pagination is keyset based (`after_id`) rather than offset based: a ratings run walks the
+    /// library while metadata refreshes may insert or remove rows, and an offset would then skip
+    /// or repeat items. Removed and merged-away items are excluded because a rating write to a
+    /// duplicate would only update a sidecar nothing reads any more.
+    pub(crate) async fn list_ratings_sync_items(
+        &self,
+        library_id: &str,
+        item_type: &str,
+        after_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<StoredRatingsSyncItem>, StorageError> {
+        self.query_as::<StoredRatingsSyncItem>(
+            "SELECT mi.id, mi.title, mi.provider_ids_json, mi.production_year,
+                    mi.season_number, mi.episode_number, mi.series_id, mi.parent_id
+             FROM media_items mi
+             WHERE mi.library_id = ? AND mi.item_type = ? AND mi.removed_at IS NULL
+               AND mi.merged_into_item_id IS NULL
+               AND (? IS NULL OR mi.id > ?)
+             ORDER BY mi.id
+             LIMIT ?",
+        )
+        .bind(library_id)
+        .bind(item_type)
+        .bind(after_id)
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_movie_nfo_writeback_context(
@@ -11052,6 +11089,7 @@ fn catalog_list_union_selected_sql<'a>(
         || !filter.studio_keys.is_empty()
         || filter.is_played.is_some()
         || filter.is_favorite.is_some()
+        || filter.is_resumable.is_some()
         || filter.min_date_last_saved.is_some()
         || filter.metadata_pending
         || filter.sort_by != CatalogSort::DateCreated
@@ -11296,6 +11334,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ratings_sync_items_page_by_library_type_and_keyset()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        database
+            .query(
+                "INSERT INTO libraries (id, name, kind) VALUES
+                     ('ratings-library', 'Movies', 'MOVIE'),
+                     ('other-library', 'Other', 'MOVIE')",
+            )
+            .execute(&database.pool)
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items
+                     (id, library_id, item_type, title, sort_title, provider_ids_json,
+                      production_year, season_number, episode_number, series_id, removed_at,
+                      identification_status)
+                 VALUES
+                     ('a-movie', 'ratings-library', 'MOVIE', 'A', 'a',
+                      '{\"imdb\":\"tt1\",\"tmdb\":2}', 2001, NULL, NULL, NULL, NULL, 'LOCAL_CONFIRMED'),
+                     ('b-movie', 'ratings-library', 'MOVIE', 'B', 'b', NULL, NULL, NULL, NULL, NULL,
+                      NULL, 'LOCAL_CONFIRMED'),
+                     ('c-removed', 'ratings-library', 'MOVIE', 'C', 'c', NULL, NULL, NULL, NULL,
+                      NULL, 10, 'LOCAL_CONFIRMED'),
+                     ('d-series', 'ratings-library', 'SERIES', 'D', 'd', NULL, NULL, NULL, NULL,
+                      NULL, NULL, 'LOCAL_CONFIRMED'),
+                     ('e-episode', 'ratings-library', 'EPISODE', 'E', 'e', NULL, NULL, 1, 2,
+                      'd-series', NULL, 'LOCAL_CONFIRMED'),
+                     ('f-other', 'other-library', 'MOVIE', 'F', 'f', NULL, NULL, NULL, NULL, NULL,
+                      NULL, 'LOCAL_CONFIRMED')",
+            )
+            .execute(&database.pool)
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items
+                     (id, library_id, item_type, title, sort_title, merged_into_item_id,
+                      identification_status)
+                 VALUES ('g-merged', 'ratings-library', 'MOVIE', 'G', 'g', 'a-movie',
+                         'LOCAL_CONFIRMED')",
+            )
+            .execute(&database.pool)
+            .await?;
+
+        let first_page = database
+            .list_ratings_sync_items("ratings-library", "MOVIE", None, 1)
+            .await?;
+        assert_eq!(first_page.len(), 1);
+        assert_eq!(first_page[0].id, "a-movie");
+        assert_eq!(first_page[0].title, "A");
+        assert_eq!(first_page[0].production_year, Some(2001));
+        assert_eq!(
+            first_page[0].provider_ids_json.as_deref(),
+            Some("{\"imdb\":\"tt1\",\"tmdb\":2}")
+        );
+
+        let second_page = database
+            .list_ratings_sync_items("ratings-library", "MOVIE", Some("a-movie"), 10)
+            .await?;
+        assert_eq!(
+            second_page
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b-movie"],
+            "the removed item and other libraries must not appear"
+        );
+
+        let episodes = database
+            .list_ratings_sync_items("ratings-library", "EPISODE", None, 10)
+            .await?;
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].season_number, Some(1));
+        assert_eq!(episodes[0].episode_number, Some(2));
+        assert_eq!(episodes[0].series_id.as_deref(), Some("d-series"));
+
+        assert!(
+            database
+                .list_ratings_sync_items("ratings-library", "SEASON", None, 10)
+                .await?
+                .is_empty(),
+            "seasons are not rating-sync candidates"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn multi_library_union_list_preserves_global_order()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
@@ -11338,6 +11468,7 @@ mod tests {
             studio_keys: &[],
             is_played: None,
             is_favorite: None,
+            is_resumable: None,
             min_date_last_saved: None,
             metadata_pending: false,
             parent_id_scope: None,
@@ -11447,6 +11578,7 @@ mod tests {
             studio_keys: &[],
             is_played: None,
             is_favorite: None,
+            is_resumable: None,
             min_date_last_saved: None,
             metadata_pending: false,
             parent_id_scope: None,
@@ -11615,6 +11747,7 @@ mod tests {
             studio_keys: &[],
             is_played: None,
             is_favorite: None,
+            is_resumable: None,
             min_date_last_saved: None,
             metadata_pending: false,
             parent_id_scope: None,
@@ -11651,6 +11784,7 @@ mod tests {
             studio_keys: &[],
             is_played: None,
             is_favorite: None,
+            is_resumable: None,
             min_date_last_saved: None,
             metadata_pending: false,
             parent_id_scope: None,

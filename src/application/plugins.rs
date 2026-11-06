@@ -63,7 +63,7 @@ use crate::{
         schedule::{
             DEFAULT_CHAPTER_DETECTION_SCHEDULE, DEFAULT_DANMAKU_MATCH_SCHEDULE,
             DEFAULT_ONLINE_CHAPTER_DETECTION_SCHEDULE, DEFAULT_STRM_MEDIA_INFO_SCHEDULE,
-            validate_cron,
+            RATINGS_SYNC_TASK_TYPE, validate_cron,
         },
         strm_target::{StrmTargetKind, classify_strm_target},
     },
@@ -1941,6 +1941,43 @@ impl PluginService {
         self.sync_chapter_detection_scheduled_tasks().await
     }
 
+    /// Rewrites the schedule of the library-scoped `RATINGS_SYNC` task the plugin declares.
+    ///
+    /// The schedule lives in the plugin configuration (`scheduleConfigKey`) exactly like the other
+    /// manifest tasks, so the task page edits the same value the plugin settings page shows and a
+    /// manifest sync afterwards keeps both in step.
+    pub async fn update_ratings_sync_schedule(
+        &self,
+        plugin_id: &str,
+        schedule: &str,
+    ) -> Result<(), PluginServiceError> {
+        let schedule = schedule.trim();
+        validate_cron(schedule).map_err(|_| PluginServiceError::InvalidConfig)?;
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
+        let plugin = catalog
+            .get(&plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
+        let Some(task) =
+            plugin.manifest.scheduled_tasks.iter().find(|task| {
+                task.task_type == RATINGS_SYNC_TASK_TYPE && task.owner_type == "LIBRARY"
+            })
+        else {
+            return Err(PluginServiceError::InvalidConfig);
+        };
+        let schedule_key = task.schedule_config_key.clone();
+        let fields = self.config_fields_for_plugin(plugin).await?;
+        let mut values = merge_default_config_values(
+            &fields,
+            normalize_plugin_config(&plugin_id, self.read_plugin_config(&plugin_id).await?),
+        );
+        values.insert(schedule_key, Value::String(schedule.to_owned()));
+        let values = validate_config_values(&fields, &values)?;
+        validate_dynamic_plugin_config(&plugin_id, &values)?;
+        self.write_plugin_config(&plugin_id, &values).await?;
+        self.sync_manifest_scheduled_tasks().await
+    }
+
     pub async fn media_info_settings(&self) -> Result<MediaInfoSettings, PluginServiceError> {
         let catalog = self.catalog_snapshot().await;
         let plugin = catalog
@@ -2816,6 +2853,18 @@ impl PluginService {
     async fn plugin_state(&self, plugin_id: &str) -> Result<(bool, bool), PluginServiceError> {
         let status = self.database.plugin_installation_status(plugin_id).await?;
         Ok((status.is_some(), status == Some(true)))
+    }
+
+    /// Whether a background task may call this plugin right now.
+    ///
+    /// A stopped or disabled plugin is not an error for a scheduler, so callers get `false`
+    /// instead of a service error and can report a precondition failure.
+    pub async fn plugin_installed_and_enabled(
+        &self,
+        plugin_id: &str,
+    ) -> Result<bool, PluginServiceError> {
+        let (installed, enabled) = self.plugin_state(plugin_id).await?;
+        Ok(installed && enabled)
     }
 
     async fn installed_other_ip_location_plugins(&self) -> Result<Vec<String>, PluginServiceError> {

@@ -8,8 +8,29 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 
 ## [Unreleased]
 
+### 新增
+
+- **Trakt 评分可以按计划写回旁车 NFO**：`org.lux.trakt-ratings` 插件声明的媒体库级 `RATINGS_SYNC`
+  任务现在能真正执行（此前调度器会以“不支持的任务类型”拒绝）。任务默认按 UTC 每周日 04:00 运行；
+  每次执行在后台分页遍历该媒体库，只对已有 NFO 旁车的电影、剧集和分集向插件批量查询评分，把可信结果
+  按评分写回器已有的格式更新旁车的 `<ratings>` 容器、平铺 `<rating>`/`<votes>`/`<criticrating>`，
+  写完主动刷新这些目录的本地元数据，因此详情页和 Emby 客户端马上能看到新分数。没有旁车的条目不查询、
+  也不会新建旁车；只在标题上匹配、被插件标记为低置信度、或返回越界数值（分数不在 0-10、票数为负、
+  `max` 不是 10、名称非法）的结果一律跳过。同一媒体库同时只允许一个运行，`TRAKT_UNAUTHORIZED` /
+  `TRAKT_NOT_CONFIGURED` 会中止整次运行，单条写盘失败只影响该条目。运行没有独立作业记录和界面进度，
+  结束时在日志里输出一行 `scanned/queried/written/unchanged/skipped_*/failed` 汇总；每次都是全量重查
+  （还没有“条目上次同步时间”标记）。
+
 ### 修复
 
+- **Emby 列表的 `Filters=IsResumable` / `Filters=IsFavorite` 现在生效**：Emby 列表接口的 `Filters`
+  参数此前只识别 `IsPlayed`/`IsUnplayed`，`Filters=IsResumable` 被静默忽略、返回完整列表，
+  `Filters` 里的 `IsFavorite` 也不生效（只有单独的 `IsFavorite=true` 参数有效）。现在
+  `Filters=IsResumable` 与「继续观看」使用同一套判定（未标记已看、未隐藏续播、达到最小续播进度，且
+  低于该用户的已看百分比），只返回当前请求用户有未看完进度的条目；`Filters=IsFavorite` 等价于
+  `IsFavorite=true`。过滤器按 AND 组合，因此 `IsResumable` 与 `IsPlayed` 同时出现会返回空列表，而不是
+  让其中一个值静默生效。`/Users/{userId}/Items` 与带 `UserId` 的 `/Items`、根路径与 `/emby` 前缀行为
+  一致，分页与 `TotalRecordCount` 都基于过滤后的结果。
 - **已有光盘图的条目不再被海报覆盖**：刮削器返回的海报图（`Primary`/`Poster`）一直兼作 `DISC` 的
   兜底图，完整刷新时这条兜底会按覆盖策略复用同名文件，把媒体目录里已有的 `disc.jpg` 直接改写成海报的
   字节，结果海报和光盘图变成同一张。现在先写上游明确给出的 `Disc` 候选；只有它全部下载失败、且条目

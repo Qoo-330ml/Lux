@@ -22,7 +22,7 @@ use crate::{
     storage::{
         CatalogFilterQuery, CatalogSearchQuery, CatalogSort as StorageCatalogSort, Database,
         GLOBAL_COLLECTION_LIBRARY_ID, MediaFacetKind, RecentByLibraryReadModelQuery,
-        RecentReadModelQuery, ResumeItemsQuery, ResumePointerQuery, StorageError,
+        RecentReadModelQuery, ResumeItemsQuery, ResumePointerQuery, ResumeThresholds, StorageError,
         StoredCatalogDetail, StoredCatalogRow, StoredMediaChapter, StoredMediaFacet,
         UserContentRestrictions, WatchHistoryQuery,
     },
@@ -42,6 +42,8 @@ pub struct CatalogFilter {
     pub studio_keys: Vec<String>,
     pub is_played: Option<bool>,
     pub is_favorite: Option<bool>,
+    /// Emby `Filters=IsResumable`: keep what the continue-watching list would offer the user.
+    pub is_resumable: bool,
     pub min_date_last_saved: Option<i64>,
     pub metadata_pending: bool,
     pub sort_by: CatalogSort,
@@ -63,6 +65,7 @@ impl Default for CatalogFilter {
             studio_keys: Vec::new(),
             is_played: None,
             is_favorite: None,
+            is_resumable: false,
             min_date_last_saved: None,
             metadata_pending: false,
             sort_by: CatalogSort::default(),
@@ -1177,6 +1180,7 @@ impl CatalogService {
             || !query.studio_keys.is_empty()
             || query.is_played.is_some()
             || query.is_favorite.is_some()
+            || query.is_resumable.is_some()
             || query.min_date_last_saved.is_some()
             || query.metadata_pending
             || query.parent_id_scope.is_some()
@@ -1259,6 +1263,26 @@ impl CatalogService {
         }
     }
 
+    /// Thresholds of the continue-watching decision used by `Filters=IsResumable`.
+    ///
+    /// The settings read is skipped unless the filter asks for it, so ordinary list requests keep
+    /// their existing query count. `home_resume_settings` is the same read `Items/Resume` uses, so
+    /// the filter cannot drift into a second set of thresholds.
+    async fn resume_thresholds(
+        &self,
+        user_id: &str,
+        is_resumable: bool,
+    ) -> Result<Option<ResumeThresholds>, CatalogError> {
+        if !is_resumable {
+            return Ok(None);
+        }
+        let (played_percent, minimum_ticks) = self.database.home_resume_settings(user_id).await?;
+        Ok(Some(ResumeThresholds {
+            played_percent,
+            minimum_ticks,
+        }))
+    }
+
     async fn load_library_page(
         &self,
         request: &LibraryPageRequest,
@@ -1266,6 +1290,9 @@ impl CatalogService {
         let library_ids = vec![request.library_id.clone()];
         let user_id = request.principal.user_id_string();
         let filter = &request.filter;
+        let is_resumable = self
+            .resume_thresholds(&user_id, filter.is_resumable)
+            .await?;
         let query = CatalogFilterQuery {
             library_ids: &library_ids,
             user_id: &user_id,
@@ -1280,6 +1307,7 @@ impl CatalogService {
             studio_keys: &filter.studio_keys,
             is_played: filter.is_played,
             is_favorite: filter.is_favorite,
+            is_resumable,
             min_date_last_saved: filter.min_date_last_saved,
             metadata_pending: filter.metadata_pending,
             parent_id_scope: request.parent_scope.as_ref().map(|scope| match scope {
@@ -1407,6 +1435,7 @@ impl CatalogService {
             studio_keys: &no_values,
             is_played: None,
             is_favorite: None,
+            is_resumable: None,
             min_date_last_saved: None,
             metadata_pending: false,
             parent_id_scope: None,
@@ -1445,6 +1474,9 @@ impl CatalogService {
         } else {
             self.database.user_content_restrictions(&user_id).await?
         };
+        let is_resumable = self
+            .resume_thresholds(&user_id, filter.is_resumable)
+            .await?;
         let query = CatalogFilterQuery {
             library_ids: &library_ids,
             user_id: &user_id,
@@ -1459,6 +1491,7 @@ impl CatalogService {
             studio_keys: &filter.studio_keys,
             is_played: filter.is_played,
             is_favorite: filter.is_favorite,
+            is_resumable,
             min_date_last_saved: filter.min_date_last_saved,
             metadata_pending: filter.metadata_pending,
             parent_id_scope: None,

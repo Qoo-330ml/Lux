@@ -5,6 +5,7 @@ mod emby_counts;
 mod emby_facets;
 mod emby_global_collection_playback;
 mod emby_incremental_refresh;
+mod emby_item_filters;
 mod emby_multi_part_playback;
 mod emby_system;
 mod mixed_library_api;

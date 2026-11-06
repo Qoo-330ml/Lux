@@ -283,6 +283,7 @@ pub(super) fn catalog_filter_from_values(
         studio_keys: Vec::new(),
         is_played,
         is_favorite,
+        is_resumable: false,
         min_date_last_saved: None,
         metadata_pending,
         sort_by: catalog_sort_from_value(sort_by),
@@ -325,6 +326,41 @@ fn emby_facet_keys(value: Option<&str>) -> Vec<String> {
     keys
 }
 
+/// The Emby `Filters` values Lux understands.
+#[derive(Default)]
+struct EmbyItemFilters {
+    is_played: Option<bool>,
+    is_resumable: bool,
+    is_favorite: bool,
+}
+
+/// Parses the comma-separated Emby `Filters` value case-insensitively.
+///
+/// Unknown values stay ignored. `IsUnplayed` keeps precedence over `IsPlayed`, as it did before
+/// `IsResumable`/`IsFavorite` were understood.
+fn emby_item_filters(value: Option<&str>) -> EmbyItemFilters {
+    let mut parsed = EmbyItemFilters::default();
+    let mut is_unplayed = false;
+    let mut is_played = false;
+    for value in value.unwrap_or_default().split(',').map(str::trim) {
+        if value.eq_ignore_ascii_case("IsUnplayed") {
+            is_unplayed = true;
+        } else if value.eq_ignore_ascii_case("IsPlayed") {
+            is_played = true;
+        } else if value.eq_ignore_ascii_case("IsResumable") {
+            parsed.is_resumable = true;
+        } else if value.eq_ignore_ascii_case("IsFavorite") {
+            parsed.is_favorite = true;
+        }
+    }
+    if is_unplayed {
+        parsed.is_played = Some(false);
+    } else if is_played {
+        parsed.is_played = Some(true);
+    }
+    parsed
+}
+
 pub(super) fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter {
     let mut filter = catalog_filter_from_values(
         query.include_item_types.as_deref(),
@@ -338,17 +374,18 @@ pub(super) fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter 
     filter.min_date_last_saved = query.min_date_last_saved;
     filter.genre_keys = emby_facet_keys(query.genres.as_deref());
     filter.studio_keys = emby_facet_keys(query.studios.as_deref());
-    let requested_filters = query.filters.as_deref().unwrap_or_default();
-    if requested_filters
-        .split(',')
-        .any(|value| value.trim().eq_ignore_ascii_case("IsUnplayed"))
-    {
-        filter.is_played = Some(false);
-    } else if requested_filters
-        .split(',')
-        .any(|value| value.trim().eq_ignore_ascii_case("IsPlayed"))
-    {
-        filter.is_played = Some(true);
+    let requested_filters = emby_item_filters(query.filters.as_deref());
+    if requested_filters.is_played.is_some() {
+        filter.is_played = requested_filters.is_played;
+    }
+    // `IsResumable` implies an unfinished item, and the storage predicate enforces
+    // `is_played = 0` on its own. Combining it with `IsPlayed` is therefore a contradiction that
+    // returns an empty page instead of letting one value silently win.
+    filter.is_resumable = requested_filters.is_resumable;
+    // The dedicated `IsFavorite` parameter stays authoritative; `Filters=IsFavorite` is the
+    // standard-Emby spelling of `IsFavorite=true`.
+    if filter.is_favorite.is_none() && requested_filters.is_favorite {
+        filter.is_favorite = Some(true);
     }
     let ids = query.ids.as_deref().map(|values| {
         values
@@ -1432,6 +1469,7 @@ pub(super) async fn emby_group_latest_page(
             studio_keys: Vec::new(),
             is_played: None,
             is_favorite: None,
+            is_resumable: false,
             min_date_last_saved: None,
             metadata_pending: false,
             sort_by: CatalogSort::Name,

@@ -85,6 +85,7 @@ use crate::{
         },
         people::{PeopleError, PeopleService, PersonMetadataUpdate},
         plugins::{PluginPage, PluginService, PluginServiceError},
+        ratings_sync::RatingsSyncService,
         reidentify::{MetadataReidentifyError, MetadataReidentifyService},
         restart::RestartHandle,
         scanner::{ScanJob, ScanJobError, ScanJobService, ScannerError},
@@ -951,6 +952,12 @@ impl AppState {
         )
         .with_library_covers(Some(library_covers.clone()))
         .with_danmaku(danmaku.clone())
+        .with_ratings_sync(RatingsSyncService::new(
+            database.clone(),
+            plugins.clone(),
+            NfoWriteService::new_with_config_dir(database.clone(), config_dir.clone()),
+            scan_jobs.clone(),
+        ))
         .with_library_deletion(
             crate::application::library_deletion::LibraryDeletionService::new(
                 database.clone(),

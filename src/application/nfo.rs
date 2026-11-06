@@ -32,7 +32,8 @@ use crate::application::metadata_writeback::item_metadata_writeback_enabled;
 use crate::application::people::ActorCredit;
 use crate::application::probe::{MediaProbeResult, MediaStreamResult, StreamType};
 use crate::storage::{
-    Database, MediaMetadataUpdate, StorageError, StoredMediaSourcePath, StoredMediaWritebackContext,
+    Database, MediaMetadataUpdate, StorageError, StoredMediaItemKind, StoredMediaSourcePath,
+    StoredMediaWritebackContext,
 };
 
 mod ratings;
@@ -3216,6 +3217,31 @@ impl NfoWriteService {
         self.read_item_projection_at_target(&target).await
     }
 
+    /// Whether `item_id` already has a sidecar NFO a rating write could rewrite.
+    ///
+    /// This is the read-only twin of [`Self::write_item_ratings`]: the same target resolution,
+    /// but nothing is created, parsed or written, so a caller can skip upstream work for items
+    /// whose ratings could never be stored. Items that are not a movie, series or episode report
+    /// `false` because those are exactly the kinds the rating writer skips.
+    pub async fn item_has_nfo(&self, item_id: &str) -> Result<bool, NfoWriteError> {
+        let Some(kind) = self.database.find_media_item_kind(item_id).await? else {
+            return Ok(false);
+        };
+        if !matches!(kind.item_type.as_str(), "MOVIE" | "SERIES" | "EPISODE") {
+            return Ok(false);
+        }
+        let target = match self.item_nfo_target_for_kind(item_id, &kind).await {
+            Ok(target) => target,
+            // A source that vanished (or was never indexed) is "no NFO", not a sync failure.
+            Err(NfoWriteError::ItemNotFound) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        Ok(tokio::fs::metadata(&target)
+            .await
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false))
+    }
+
     pub(crate) async fn read_item_projection_with_writeback_context_cached(
         &self,
         season_number: Option<i64>,
@@ -3466,6 +3492,14 @@ impl NfoWriteService {
             .find_media_item_kind(item_id)
             .await?
             .ok_or(NfoWriteError::ItemNotFound)?;
+        self.item_nfo_target_for_kind(item_id, &kind).await
+    }
+
+    async fn item_nfo_target_for_kind(
+        &self,
+        item_id: &str,
+        kind: &StoredMediaItemKind,
+    ) -> Result<PathBuf, NfoWriteError> {
         let source = match kind.item_type.as_str() {
             "MOVIE" | "EPISODE" | "VIDEO" => {
                 self.database

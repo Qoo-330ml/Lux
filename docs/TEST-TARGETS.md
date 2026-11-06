@@ -10,17 +10,17 @@
 |---|---|---|---|
 | `--test admin` | 管理后台、日志导出、可观测性与运维事件 | 14 | 25 |
 | `--test api_web` | HTTP 契约（错误/限流/压缩/健康/远程策略）、Web 会话、Webhook | 13 | 57 |
-| `--test auth_users` | 认证、会话、登录背景、用户与用户设置、设备配对、界面偏好迁移 | 10 | 71 |
-| `--test emby` | Emby 兼容层（认证、系统信息、增量刷新、发现、多段播放、检索、下载） | 11 | 39 |
-| `--test scanner` | 媒体库扫描、增量/混合扫描、计划任务、作业事件与关停 | 7 | 151 |
-| `--test library` | 媒体库生命周期、合并/拆分、集合、目录与系列 API | 12 | 50 |
+| `--test auth_users` | 认证、会话、登录背景、用户与用户设置、设备配对、界面偏好迁移 | 10 | 73 |
+| `--test emby` | Emby 兼容层（认证、系统信息、增量刷新、发现、多段播放、检索、下载） | 12 | 43 |
+| `--test scanner` | 媒体库扫描、增量/混合扫描、计划任务、作业事件与关停 | 7 | 152 |
+| `--test library` | 媒体库生命周期、合并/拆分、集合、目录与系列 API | 12 | 51 |
 | `--test metadata` | 元数据抓取与选择、NFO 回写、扫描后剧集元数据、人物、字幕 | 14 | 157 |
 | `--test images` | 图片变体、写回、缩略图与图片 API | 6 | 66 |
 | `--test playback` | 播放、播放令牌/历史/续播、观看状态归档、章节与片头片尾检测 | 10 | 35 |
-| `--test storage` | SQLite/PostgreSQL 存储、迁移、WAL、数据库维护与启动守卫 | 9 | 116 |
-| `--test plugins` | 插件协议与运行时、弹幕、IP 属地、媒体信息插件配置 | 11 | 120 |
+| `--test storage` | SQLite/PostgreSQL 存储、迁移、WAL、数据库维护与启动守卫 | 9 | 117 |
+| `--test plugins` | 插件协议与运行时、弹幕、IP 属地、媒体信息插件配置 | 11 | 128 |
 | `--test strm` | STRM 目标解析/探测/播放与 ffprobe | 9 | 42 |
-| 合计（12 组） |  | 126 | 929 |
+| 合计（12 组） |  | 127 | 946 |
 
 另有 8 个 binary 因为进程级共享状态或外部服务依赖保持独立，见第 4 节：`--test background_work_budget`、`--test filmly_image_diag`、`--test image_variants_perf`、`--test performance`、`--test postgres_database`、`--test reidentify`、`--test scanned_metadata`、`--test shutdown`。合计 12 + 8 = 20 个集成测试 target。
 
@@ -75,13 +75,14 @@ cargo test --locked --test <新 target> <旧名>::
 | `sessions` | 2 | `cargo test --locked --test auth_users sessions::` |
 | `setup` | 5 | `cargo test --locked --test auth_users setup::` |
 | `user_settings` | 2 | `cargo test --locked --test auth_users user_settings::` |
-| `users` | 39 | `cargo test --locked --test auth_users users::` |
+| `users` | 41 | `cargo test --locked --test auth_users users::` |
 | `discovery` | 3 | `cargo test --locked --test emby discovery::` |
 | `download_api` | 1 | `cargo test --locked --test emby download_api::` |
-| `emby_auth` | 15 | `cargo test --locked --test emby emby_auth::` |
+| `emby_auth` | 17 | `cargo test --locked --test emby emby_auth::` |
 | `emby_counts` | 1 | `cargo test --locked --test emby emby_counts::` |
 | `emby_global_collection_playback` | 1 | `cargo test --locked --test emby emby_global_collection_playback::` |
 | `emby_incremental_refresh` | 8 | `cargo test --locked --test emby emby_incremental_refresh::` |
+| † `emby_item_filters` | 2 | `cargo test --locked --test emby emby_item_filters::` |
 | `emby_multi_part_playback` | 1 | `cargo test --locked --test emby emby_multi_part_playback::` |
 | `emby_system` | 2 | `cargo test --locked --test emby emby_system::` |
 | `mixed_library_api` | 3 | `cargo test --locked --test emby mixed_library_api::` |
@@ -91,10 +92,10 @@ cargo test --locked --test <新 target> <旧名>::
 | `mixed_scanner` | 1 | `cargo test --locked --test scanner mixed_scanner::` |
 | `scanner` | 18 | `cargo test --locked --test scanner scanner::` |
 | `scanning_jobs` | 96 | `cargo test --locked --test scanner scanning_jobs::` |
-| `scheduled_tasks` | 9 | `cargo test --locked --test scanner scheduled_tasks::` |
+| `scheduled_tasks` | 10 | `cargo test --locked --test scanner scheduled_tasks::` |
 | `series_scanner` | 11 | `cargo test --locked --test scanner series_scanner::` |
 | `shutdown_jobs` | 14 | `cargo test --locked --test scanner shutdown_jobs::` |
-| `catalog` | 4 | `cargo test --locked --test library catalog::` |
+| `catalog` | 5 | `cargo test --locked --test library catalog::` |
 | `cd_movie_versions` | 2 | `cargo test --locked --test library cd_movie_versions::` |
 | `collections` | 4 | `cargo test --locked --test library collections::` |
 | `item_merge` | 1 | `cargo test --locked --test library item_merge::` |
@@ -139,7 +140,7 @@ cargo test --locked --test <新 target> <旧名>::
 | `database_config` | 4 | `cargo test --locked --test storage database_config::` |
 | `database_maintenance` | 12 | `cargo test --locked --test storage database_maintenance::` |
 | `database_setup_api` | 4 | `cargo test --locked --test storage database_setup_api::` |
-| `database_startup_guard` | 4 | `cargo test --locked --test storage database_startup_guard::` |
+| `database_startup_guard` | 5 | `cargo test --locked --test storage database_startup_guard::` |
 | `log_migration` | 10 | `cargo test --locked --test storage log_migration::` |
 | `sqlite_wal` | 2 | `cargo test --locked --test storage sqlite_wal::` |
 | `storage` | 76 | `cargo test --locked --test storage storage::` |
@@ -155,6 +156,7 @@ cargo test --locked --test <新 target> <旧名>::
 | `media_info_config_api` | 1 | `cargo test --locked --test plugins media_info_config_api::` |
 | `plugin_protocol` | 54 | `cargo test --locked --test plugins plugin_protocol::` |
 | `plugin_runtime` | 14 | `cargo test --locked --test plugins plugin_runtime::` |
+| † `ratings_sync` | 8 | `cargo test --locked --test plugins ratings_sync::` |
 | `plugins` | 9 | `cargo test --locked --test plugins plugins::` |
 | `probe` | 21 | `cargo test --locked --test strm probe::` |
 | `strm` | 1 | `cargo test --locked --test strm strm::` |
@@ -168,12 +170,12 @@ cargo test --locked --test <新 target> <旧名>::
 | `background_work_budget` | 1 | `cargo test --locked --test background_work_budget`（本来就没有合并） |
 | `image_variants_perf` | 2 | `cargo test --locked --test image_variants_perf`（本来就没有合并） |
 | `performance` | 25 | `cargo test --locked --test performance`（本来就没有合并） |
-| `postgres_database` | 36 | `cargo test --locked --test postgres_database`（本来就没有合并） |
+| `postgres_database` | 38 | `cargo test --locked --test postgres_database`（本来就没有合并） |
 | `reidentify` | 25 | `cargo test --locked --test reidentify`（本来就没有合并） |
 | `scanned_metadata` | 23 | `cargo test --locked --test scanned_metadata`（本来就没有合并） |
 | `shutdown` | 2 | `cargo test --locked --test shutdown`（本来就没有合并） |
 | `filmly_image_diag` | 1 | `cargo test --locked --test filmly_image_diag`（本来就没有合并） |
-| **合计** | **1044** |  |
+| **合计** | **1063** |  |
 
 ## 3. 只跑某一个原文件的测试
 
@@ -243,18 +245,18 @@ cargo test --locked --test scanner
 |---|---|---|---|
 | `admin` | 22 | 25 | 新增 3 例（后续任务） |
 | `api_web` | 39 | 57 | 新增 18 例（后续任务） |
-| `auth_users` | 70 | 71 | 新增 1 例（后续任务） |
-| `emby` | 38 | 39 | 新增 1 例（后续任务） |
-| `scanner` | 137 | 151 | 新增 14 例（后续任务） |
-| `library` | 49 | 50 | 新增 1 例（后续任务） |
+| `auth_users` | 70 | 73 | 新增 3 例（后续任务） |
+| `emby` | 38 | 43 | 新增 5 例（后续任务） |
+| `scanner` | 137 | 152 | 新增 15 例（后续任务） |
+| `library` | 49 | 51 | 新增 2 例（后续任务） |
 | `metadata` | 143 | 157 | 新增 14 例（LUX-886 6 例、LUX-887 1 例，其余为先前任务） |
 | `images` | 52 | 66 | 新增 14 例（LUX-887 1 例，其余为先前任务） |
 | `playback` | 34 | 35 | 新增 1 例（后续任务） |
-| `storage` | 112 | 115 | 新增 3 例（后续任务） |
-| `plugins` | 84 | 117 | 新增 33 例（后续任务） |
+| `storage` | 112 | 117 | 新增 5 例（后续任务） |
+| `plugins` | 84 | 128 | 新增 44 例（后续任务） |
 | `strm` | 42 | 42 | 一致 |
-| 独立 binary 合计 | 112 | 114 | 新增 2 例（后续任务） |
-| **合计** | **934** | **1039** | 差异均为合并后新增用例 |
+| 独立 binary 合计 | 112 | 117 | 新增 5 例（后续任务） |
+| **合计** | **934** | **1063** | 差异均为合并后新增用例 |
 
 ### 5.2 单个用例稳定性复核
 
