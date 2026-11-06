@@ -237,6 +237,10 @@ pub(super) fn api_routes() -> (Router<ReadyAppState>, Vec<String>) {
             post(emby_mark_favorite).delete(emby_unmark_favorite),
         )
         .route("/Sessions/Logout", post(emby_logout))
+        // Yamby (and Emby clients with a server-status page) connect here for the realtime
+        // session list and scan state. Registered on both mounts like every other Emby route, so
+        // `/embywebsocket` and `/emby/embywebsocket` (any casing) both answer.
+        .route("/embywebsocket", get(emby_websocket))
         .finish();
     let routes = routes
         .route_layer(middleware::from_fn(credentials::normalize_credentials))

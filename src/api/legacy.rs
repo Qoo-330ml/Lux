@@ -150,6 +150,10 @@ use emby_filter_metadata::*;
 #[path = "playback.rs"]
 mod playback;
 use playback::*;
+#[path = "emby_websocket.rs"]
+mod emby_websocket;
+pub use emby_websocket::EmbyWebsocketLimits;
+use emby_websocket::*;
 #[path = "media.rs"]
 mod media;
 use media::*;
@@ -211,6 +215,10 @@ pub struct CoreState {
     danmaku_search_rate_limiter: crate::security::DanmakuSearchRateLimiter,
     /// Bounds the number of concurrent server-sent-event streams.
     sse_permits: SseConnectionBudget,
+    /// Bounds the number of concurrent Emby WebSocket connections (global and per user).
+    emby_websocket_connections: EmbyWebsocketConnections,
+    /// Trips every open Emby WebSocket connection when the process starts shutting down.
+    emby_websocket_shutdown: EmbyWebsocketShutdown,
 }
 
 /// Delay between the `setup/complete` response and the restart request.
@@ -750,6 +758,35 @@ impl AppState {
         self
     }
 
+    /// Overrides the `/embywebsocket` resource limits (tests shrink them so a limit is observable
+    /// without waiting for the production values).
+    pub fn with_emby_websocket_limits(mut self, limits: EmbyWebsocketLimits) -> Self {
+        self.core.emby_websocket_connections = EmbyWebsocketConnections::new(limits);
+        self
+    }
+
+    /// Asks every open Emby WebSocket connection to send its close frame and exit.
+    pub fn signal_emby_websocket_shutdown(&self) {
+        self.core.emby_websocket_shutdown.signal();
+    }
+
+    /// Signals every open Emby WebSocket connection to close and waits up to the production
+    /// drain timeout for them to exit. Answers `false` when a connection outlived it.
+    pub async fn shutdown_emby_websocket_connections(&self) -> bool {
+        self.signal_emby_websocket_shutdown();
+        self.drain_emby_websocket_connections(EMBY_WEBSOCKET_SHUTDOWN_DRAIN_TIMEOUT)
+            .await
+    }
+
+    /// Waits up to `timeout` for every open Emby WebSocket connection to release its slot.
+    /// Answers `false` when a connection outlived the timeout.
+    pub async fn drain_emby_websocket_connections(&self, timeout: std::time::Duration) -> bool {
+        self.core
+            .emby_websocket_connections
+            .wait_until_idle(timeout)
+            .await
+    }
+
     pub fn ready(
         config: Config,
         database: Database,
@@ -1011,6 +1048,8 @@ impl AppState {
             request_rate_limiter: crate::security::RequestRateLimiter::default(),
             danmaku_search_rate_limiter: crate::security::DanmakuSearchRateLimiter::default(),
             sse_permits: SseConnectionBudget::default(),
+            emby_websocket_connections: EmbyWebsocketConnections::default(),
+            emby_websocket_shutdown: EmbyWebsocketShutdown::default(),
         };
         // Built here (not in `start_realtime_watchers`) so the shutdown can reach its stop handle.
         let library_watch = LibraryWatchService::with_scan_jobs_and_metadata(

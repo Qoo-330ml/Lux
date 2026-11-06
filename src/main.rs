@@ -12,7 +12,7 @@ use luxd::{
 };
 use std::net::SocketAddr;
 use tokio::{net::TcpListener, sync::watch};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // The benchmark feature installs its own counting allocator in the library crate.
 #[cfg(all(
@@ -324,12 +324,18 @@ async fn serve(
         control_rx,
         control_tx.clone(),
         shutdown_tx.clone(),
+        shutdown_state.clone(),
     ))
     .await;
     let _ = shutdown_tx.send(true);
     let _ = discovery_task.await;
     mail_worker.shutdown().await;
     serve_result?;
+    // An upgraded WebSocket connection is detached from the HTTP connection, so `axum::serve`
+    // does not wait for it. Close them here, before any worker or the database goes away.
+    if !shutdown_state.shutdown_emby_websocket_connections().await {
+        warn!("emby websocket connections outlived the shutdown drain timeout");
+    }
     let shutdown_reason = *control_tx.borrow();
     if let Err(error) = shutdown_state.shutdown_background_workers_checked().await {
         return Err(std::io::Error::other(error).into());
@@ -357,6 +363,7 @@ async fn shutdown_signal(
     mut control_rx: watch::Receiver<ShutdownReason>,
     control_tx: watch::Sender<ShutdownReason>,
     shutdown: watch::Sender<bool>,
+    state: AppState,
 ) {
     let ctrl_c = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
@@ -404,6 +411,10 @@ async fn shutdown_signal(
         }
     }
 
+    // Long-lived responses (Emby WebSocket) do not end on their own, so they are told to close
+    // before the graceful drain starts waiting for in-flight requests. Background workers are
+    // drained once, after `serve` returns, by the caller below.
+    state.signal_emby_websocket_shutdown();
     // Only signal the HTTP server to stop here. Workers are drained once, after `serve` returns
     // and no further requests can start work, by the caller below.
     let _ = shutdown.send(true);

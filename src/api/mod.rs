@@ -61,4 +61,7 @@ pub mod lux;
 
 mod legacy;
 
-pub use legacy::{AppState, CoreState, ReadyServices, app, app_with_state, setup_app_with_state};
+pub use legacy::{
+    AppState, CoreState, EmbyWebsocketLimits, ReadyServices, app, app_with_state,
+    setup_app_with_state,
+};
