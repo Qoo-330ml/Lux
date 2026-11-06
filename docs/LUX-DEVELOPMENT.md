@@ -21222,6 +21222,32 @@ rebase 后复验（2026-11-06，3/3）：`pnpm --dir web install --frozen-lockfi
 tsc --noEmit` 通过；`pnpm --dir web test` 连跑两次均为 167 个 `node --test` 用例 + 168 个 vitest 文件 /
 1564 例全绿。
 
+返工记录（2026-11-06，审查后补修：缓存清理范围与联网重建）：
+
+- **P1 `me` 的 401 也要清缓存**。`SessionRoutes` 原来只在 401 时渲染 `LoginPage`，上一个账号的
+  `home/*`、`favorites`、`watch-history`、`admin/*` 原样留在页级单例 `QueryClient` 里；`clearSessionCaches`
+  只在显式退出和实时 `endSession` 中调用，因此 `refetchOnReconnect`（离线期间会话被注销）与
+  `AdminLibrariesPage` / `AccountPage` 对 `me` 的主动失效这两条路径会把旧数据带进下一次登录
+  （`watch-history` 还不在用户频道的失效键里）。现在 `SessionRoutes` 用一个只跑一次的 effect（`me` 进入 401
+  时置位、恢复后复位）调用 `clearUserCaches()`；这里**不** `invalidateQueries(me)`，否则 401 → 重取 → 401
+  自激。
+- **P2 清缓存不再删掉会话之外的服务端状态**。`clearSessionCaches` 的 predicate 原来只保留 `me`，把
+  `["setup"]`（以及 `login-background`）一起删了，回登录页前会先闪"正在启动 Lux"，`setup` 请求再失败就落到
+  错误屏。现在保留名单是 `me` / `setup` / `login-background` 三个根键（仍是短否决名单，新增的用户数据键
+  会自动被清），并拆出 `clearUserCaches()`（只清账号数据、不动 `me`）供 401 分支复用。
+- **P3 联网后重建半开连接**。`offline` 时如果 socket 仍然打开（Wi-Fi 切换、合盖没收到 close），原来的
+  `suspend()` 因为 `socket !== null` 不置 `pendingRetry`，`online` 又直接返回：hub 一直报 `connected`，
+  各页的 30 s 兜底轮询也就一直关着。现在 `online` 发现仍有 socket 就关掉它、广播 `disconnected` 并立即重连
+  （页面隐藏时由 `connect()` 转成 `pendingRetry`），同时上报一次 `onConnectionFailure`，让重连后的首个
+  `ready` 补做用户侧的 `home` 全量失效——断网期间可能漏帧（D15①）。
+
+补修后复验（2026-11-06）：`npx tsc --noEmit`、`pnpm --dir web build` 通过；`pnpm --dir web test` 连跑两次，
+第一次 169 个 vitest 文件 / 1571 例中有 1 例失败（`admin-user-access-rules.test.tsx` 的并行负载 flake，
+单跑 15/15 通过，与本任务无关），第二次全绿；`node --test` 两次均 167/167。新增用例：
+`web/tests/session-caches.test.ts`（保留/清理范围）、`login-page.test.tsx` 的"401 无实时关闭也清缓存并换账号
+不显示旧数据"、`realtime-socket.test.ts` 的"联网后重建已打开的 socket"、`user-events.test.tsx` 的
+"断网期间回到轮询、联网重连后补一次全量失效"。
+
 #### LUX-896：反代配置与部署文档（样例与文档已完成，真实握手未运行）
 
 状态：文档与样例已完成（2026-11-06）；LUX-894 已合并到 `test`，本分支已 rebase 到 `a8c7928a`，并补齐
