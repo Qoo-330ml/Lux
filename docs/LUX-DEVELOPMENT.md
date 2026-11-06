@@ -20944,9 +20944,10 @@ rustfmt 按新标识符长度重排（`payload_fits` 合并为一行），无逻
 `cargo build --locked` 通过。移动块的逐段核对方式：把基线 `src/api/emby_websocket.rs` 的每个被删块做纯改名后与
 新模块的可执行代码逐字符比对（忽略注释、换行与 `pub(crate)`），14 个块全部命中，缺 0。
 
-#### LUX-894：后端 `GET /api/v1/ws`（未开始）
+#### LUX-894：后端 `GET /api/v1/ws`（已完成）
 
-状态：未开始（计划）。依赖：LUX-893。必须与 LUX-896 同批合入。
+状态：已完成（2026-11-06）。依赖：LUX-893。必须与 LUX-896 同批合入。真实浏览器的协议级 pong 验证与真实部署
+的并发观测两项未执行，见下方验收。
 
 范围：新增 `src/api/lux_websocket.rs`，注册 `GET /api/v1/ws`：Upgrade 之前的 Origin 闸门（ADR-054 D5：
 只比较 `Origin` 的 host[:port] 与 `Host`、不比较 scheme、`Sec-Fetch-Site: cross-site` 拒绝、缺失 `Origin`
@@ -20961,22 +20962,69 @@ rustfmt 按新标识符长度重排（`payload_fits` 合并为一行），无逻
 
 验收：
 
-- [ ] 新增 `tests/admin/lux_websocket.rs`（并入 `--test admin`）：未认证 401；无管理权限时只投 `user`
-      帧；跨源 400；`Origin` 缺失 + cookie 401；`Origin` 缺失 + 客户端令牌通过；`Sec-Fetch-Site:
+- [x] 新增 `tests/admin/lux_websocket.rs`（并入 `--test admin`，28 例）：未认证 401；无管理权限时只投
+      `user` 帧；跨源 400；`Origin` 缺失 + cookie 401；`Origin` 缺失 + 客户端令牌通过；`Sec-Fetch-Site:
       cross-site` 拒绝；预算超限 429 + `Retry-After: 30`；关停 1001；会话撤销 1008；>4 KiB 1009；二进制
-      1003；未知 `type` 忽略且不关连接。
-- [ ] 降权用例：admin 帧停止、user 帧继续、连接不关闭；恢复权限后 admin 帧恢复。
+      1003；未知 `type` 忽略且不关连接。另覆盖 426、`null`/非法/多值 Origin、host 大小写与默认端口归一化、
+      转发头不参与判断、被设备/客户端规则拒绝 403、令牌认证、`progress` 的 `itemId`、每用户与全局预算
+      各自的 429 与释放、管理/用户预算分离、协议级 ping 保活、空闲 1001、重校验 5xx 不断连。
+- [x] 降权用例：admin 帧停止、user 帧继续、连接不关闭；恢复权限后 admin 帧恢复。
 - [ ] 真实浏览器验证：协议级 pong 会重置 120 s 空闲计时（否则每条连接都会被误杀）；JS 客户端不依赖
-      应用层 ping 判活。
+      应用层 ping 判活。**未执行**：本任务用真实 socket 的 `tokio-tungstenite` 客户端覆盖了同一语义
+      （它像浏览器一样在读取时自动回 pong，`protocol_pings_keep_a_silent_connection_alive` 与
+      `an_idle_connection_is_closed_with_1001_and_the_slot_is_released` 两例），但没有驱动真实浏览器，
+      真实浏览器验收留给 LUX-895 前后的联调补做。
 - [ ] 记录一次真实部署的并发观测（峰值连接数、每用户峰值、429 次数），写入 ADR-054「资源与预算」；
-      实测与假设偏差超过 2 倍时按同一推导重算。
-- [ ] `cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets
+      实测与假设偏差超过 2 倍时按同一推导重算。**未执行**：开发机没有真实部署，也没有可代表部署的并发
+      连接数据；ADR-054 的落地记录已如实标注该项仍待补，数值未因实测调整。
+- [x] `cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets
       --all-features -- -D warnings`、`cargo test --locked --test admin` 通过。
 
 预计改动文件：新增 `src/api/lux_websocket.rs`、`tests/admin/lux_websocket.rs`；修改 `src/api/legacy.rs`
 （`CoreState` 的预算与关停字段、builder）、`src/api/mod.rs`、`src/api/routes.rs`、`src/main.rs`、
 `tests/admin/main.rs`、`docs/API.md`、`docs/decisions/054-web-realtime-websocket.md`（回填实测值）、
 `docs/TEST-TARGETS.md`、`docs/CHANGELOG.md`、`docs/LUX-DEVELOPMENT.md`。
+
+实施结果（2026-11-06）：新增 `src/api/lux_websocket.rs`（约 1100 行含单测）与 `tests/admin/lux_websocket.rs`
+（28 例）；`src/api/websocket/mod.rs` 增 5 个 Lux 常量（用户 128/16、管理 64/8、4 KiB 契约上限）与 64 KiB
+传输上限；`src/api/websocket/shutdown.rs` 增 `is_signalled()`；`src/api/legacy.rs` 增
+`lux_websocket_connections` 与共享的（改名后）`websocket_shutdown` 字段、`with_lux_websocket_limits`、
+`shutdown_websocket_connections`、`drain_lux_websocket_connections`；`src/api/mod.rs` 导出
+`LuxWebsocketLimits` 与 `WebsocketLimits`；`src/api/routes.rs` 在 ready 树挂载 `GET /api/v1/ws`（不进 Emby
+路由构建器）；`src/main.rs` 的关停链改为 `signal_websocket_shutdown()` 与 `shutdown_websocket_connections()`
+（同一信号、5 s 有界排空）；`tests/admin/main.rs` 追加 `mod lux_websocket;`。
+
+与计划或 ADR 字面表述不同、需要记住的六点：
+
+1. **管理频道由主体的 `can_manage_server` 推导，没有额外调用 `require_admin(.., false)`**。ADR-054 D7 要求
+   频道只从服务端主体推导；cookie 会话下二者完全等价（`require_admin` 的会话分支就是 `can_manage_server`
+   检查且 `require_csrf=false`），而 `require_admin` 的客户端令牌分支会一律拒绝令牌，与 D7 冲突。令牌主体
+   本身能管理服务器时也会收到 `admin` 帧，但这不增加权限：帧内没有数据，而该令牌仍被管理员 JSON API 拒绝。
+2. **缺失 Origin + cookie 返回 401，有效但不匹配的 Origin 与 `Sec-Fetch-Site: cross-site` 返回 400**。401 是
+   本任务验收条目的要求（`Origin` 缺失 + cookie 401），ADR-054 只把 400 绑定到“Origin 不允许”；差别已写入
+   ADR-054 的落地记录，拒绝原因仍按 `origin-missing` / `origin-mismatch` / `sec-fetch-site` 分类记日志且不记
+   头的原值。
+3. **4 KiB 契约上限由 handler 执行**：tungstenite 的 `max_message_size` 被触发时不会写 close 帧，客户端只会
+   看到 `1006`；因此传输层上限设 64 KiB，超 4 KiB 的消息由 handler 自行发 `1009` 关闭。超过 64 KiB 的消息是
+   协议违规，连接直接断开（无 close 帧），已写入 ADR 落地记录。
+4. **重校验只按 45 s 定时器执行，不按帧**（ADR-054 的显式取舍）。每次重校验的失败按 401/403（`1008` 关闭）
+   与 5xx（保留连接、按 `auth_warn_interval` 限频 warn）分流；降权只清空 admin 订阅，恢复后重新订阅、不补发。
+5. **预算超限沿用 Lux 错误信封**（`RATE_LIMITED` + `Retry-After: 30`），与 SSE 的 429 同形状；预算实例与
+   Emby 的 32/4 分开，一条连接只占握手主体所属的那个预算。
+6. **关停**：`CoreState` 的关停字段改名为 `websocket_shutdown` 由两条端点共用（`src/main.rs` 只发一个信号），
+   并行排空 Emby 与 Lux 的三份预算，总上界仍是 5 s；关停信号置位后新握手返回 `503`。Emby 的路由、DTO、
+   协议与限额未改，SSE 的两条路由及其测试一行未动。
+
+验证：`cargo test --locked --test admin lux_websocket::` 28/28（连续 2 次）；整组
+`cargo test --locked --test admin` 连续 2 次均为 52 passed / 1 failed，唯一失败是基线已有的环境型用例
+`admin_settings::transcoding_settings_are_admin_only_validated_and_persisted`（本机 VideoToolbox 可用，用例
+断言 `transcodingStatus.available == false`；`docs/TEST-TARGETS.md` §5.3 已记录，单跑同样失败，与本改动无关）；
+`cargo test --locked --test emby` 82/82；
+`LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test shutdown` 2/2；
+`cargo test --locked --lib websocket::` 23/23、`cargo test --locked --lib lux_websocket::` 13/13；
+`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+`python3 scripts/check-backend-branches.py`（28 files / 266 branches）、`cargo build --locked` 全部通过。
+本机为 arm64（`uname -m`），未做 NAS/x86 并发验证，也未在真实反向代理后握手（属 LUX-896）。
 
 #### LUX-895：前端实时客户端（未开始）
 

@@ -312,3 +312,28 @@ cargo test --locked --test scanner
 LUX-891 合并后已按合并后的实测核对：`cargo test --locked --test emby -- --list` 为 **82** 例 / 16 个
 模块（上述 59 例 + `emby_websocket` 23 例，三轮返工补齐了推送限频、写超时、周期重校验、大文档完整推送、
 超大文档跳过、写缓冲严格大小关系、极限限额覆盖等用例），第 1、2、5.1 节的 `emby` 行与合计同时更新。
+
+## 8. LUX-894 追加（2026-11-06）
+
+`tests/admin/lux_websocket.rs` 是 LUX-894（`GET /api/v1/ws`）新增的模块（`tests/admin/main.rs` 追加一行
+`mod lux_websocket;`），命令为 `cargo test --locked --test admin lux_websocket::`，共 **28** 例：普通 GET
+`426`；Origin 七条（缺失 / `null` / 非法 / 多值按缺失处理，host 大小写与非默认端口归一化，与 `Host`
+不一致 `400`，`Sec-Fetch-Site: cross-site` `400`，转发头不参与判断，缺失 Origin 时 cookie `401` 而客户端
+令牌放行）；cookie 与客户端令牌认证；未认证 `401`、被设备/客户端规则拒绝 `403`；管理员双频道与普通用户
+只有 `user` 频道；`progress` 事件携带 `itemId`；每用户与全局预算 `429` + `Retry-After: 30`、释放与
+管理/用户预算分离；降权只停 `admin` 帧并可在恢复后继续；会话撤销 `1008`；关停 `1001` 且不阻塞、关停后
+新握手 `503`；>4 KiB `1009`、二进制 `1003`、未知 `type` 忽略；协议级 ping 保持空闲连接、空闲 `1001`；
+重校验 5xx 不断连。
+
+同一分支的单元测试在 `src/api/lux_websocket.rs`：`cargo test --locked --lib lux_websocket::` 共 **13** 例
+（Origin 解析与归一化、信封逐字渲染、`itemId` 256 字符边界、`{"type":"ping"}` 识别、`ready` 之外的帧类型、
+以及用真实 hub 制造 `Lagged` 后降级为 `home` / `all` 的映射）。`cargo test --locked --lib websocket::`
+随之从 10 例变为 **23** 例（10 例共享基础设施 + 本任务 13 例）。
+
+本分支 rebase 前的实测：`cargo test --locked --test admin -- --list` 为 **53** 例（25 例基线 + 本任务
+28 例）；整组 `cargo test --locked --test admin` 连续 2 次均为 52 passed / 1 failed，唯一失败是 5.3 节已记录的
+环境型用例 `admin_settings::transcoding_settings_are_admin_only_validated_and_persisted`（本机 VideoToolbox
+可用，用例断言 `transcodingStatus.available == false`，与 WebSocket 无关），单跑该用例同样失败；
+`cargo test --locked --test admin lux_websocket::` 连续 2 次 28/28；`cargo test --locked --test emby` 82/82；
+`LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test shutdown` 2/2。第 1、2、5.1 节的数字保留
+基线/合并时的口径，不在本任务中改写；LUX-897 删除 SSE 用例后需要再以合并后的 `--list` 核对。
