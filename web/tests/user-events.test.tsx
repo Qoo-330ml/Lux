@@ -10,7 +10,7 @@ import { useRealtimeConnectionState } from "../src/features/activity/useUserEven
 import { useAdminEvents } from "../src/features/admin/useAdminEvents";
 import { api, ApiError } from "../src/lib/api/client";
 import { queryKeys } from "../src/lib/api/query-keys";
-import { FakeWebSocket, installFakeWebSocket } from "./support/fake-websocket";
+import { FakeWebSocket, dispatchNetworkStatus, installFakeWebSocket } from "./support/fake-websocket";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -137,6 +137,26 @@ it("does not force a home sweep when the user channel joins an already-ready con
   expect(client.getQueryState(["home", "carousel"])?.isInvalidated).toBe(false);
   expect(invalidate).not.toHaveBeenCalled();
   expect(connectionText()).toBe("connected");
+});
+
+it("drops to polling and reconnects when the network returns with a socket still open", async () => {
+  client.setQueryData(["home", "carousel"], { value: "fresh" });
+  renderShell();
+  markReady();
+  expect(connectionText()).toBe("connected");
+
+  // The browser can keep a half-open socket across a network change, so `offline` alone changes
+  // nothing visible. `online` must replace it or the pages would never resume their polling.
+  act(() => dispatchNetworkStatus(false));
+  act(() => dispatchNetworkStatus(true));
+  await act(async () => { await Promise.resolve(); });
+  expect(FakeWebSocket.instances).toHaveLength(2);
+  expect(connectionText()).toBe("disconnected");
+
+  markReady();
+  expect(connectionText()).toBe("connected");
+  // The channel was down, so the retry catches up with one full home sweep.
+  expect(client.getQueryState(["home", "carousel"])?.isInvalidated).toBe(true);
 });
 
 it("keeps the polling fallback when WebSocket is unavailable", () => {

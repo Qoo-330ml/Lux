@@ -382,7 +382,21 @@ export class RealtimeSocket {
 
   private handleOnline = () => {
     this.offline = false;
-    if (!this.stopped) this.resume();
+    if (this.stopped) return;
+    if (this.socket !== null) {
+      // A socket can survive a network change as a half-open TCP connection (Wi-Fi switch, a
+      // closed lid): the browser never fires `close`, so the client would keep reporting
+      // "connected" while nothing can arrive and every page keeps its polling fallback off.
+      // Drop it and connect again; `connect()` defers to `pendingRetry` if the tab is hidden.
+      // The network was gone, so frames may have been missed: report it the same way a failed
+      // attempt is reported, which makes the next `ready` do the user channel's catch-up sweep.
+      this.teardownSocket(true);
+      this.options.onConnectionFailure?.();
+      this.setState("disconnected");
+      this.connect();
+      return;
+    }
+    this.resume();
   };
 
   private setState(next: RealtimeConnectionState) {

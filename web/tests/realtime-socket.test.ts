@@ -393,6 +393,32 @@ describe("realtime visibility and network", () => {
     harness.socket.stop();
   });
 
+  it("rebuilds an open socket when the network comes back", () => {
+    const harness = createHarness();
+    harness.socket.start();
+    const stale = FakeWebSocket.last();
+    stale?.ready();
+    expect(harness.states).toEqual(["connected"]);
+
+    // A Wi-Fi switch or a closed lid can leave a half-open socket that never fires `close`: the
+    // browser keeps reporting it OPEN while nothing can arrive.
+    act(() => dispatchNetworkStatus(false));
+    expect(stale?.closeCalls).toHaveLength(0);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+
+    act(() => dispatchNetworkStatus(true));
+    expect(stale?.closeCalls).toHaveLength(1);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(harness.states).toEqual(["connected", "disconnected"]);
+    // The network was gone, so the user channel has to catch up once the retry is ready (D15①).
+    expect(harness.options.onConnectionFailure).toHaveBeenCalledTimes(1);
+
+    FakeWebSocket.last()?.ready();
+    expect(harness.states).toEqual(["connected", "disconnected", "connected"]);
+    expect(harness.options.onReady).toHaveBeenCalledTimes(2);
+    harness.socket.stop();
+  });
+
   it("pauses reconnects while offline and retries once when back online", () => {
     const harness = createHarness();
     harness.socket.start();
