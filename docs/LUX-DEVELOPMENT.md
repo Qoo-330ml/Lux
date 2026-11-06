@@ -20215,9 +20215,10 @@ rebase 后的 `--list` 一致。
 - `GET /Tags`：鉴权、目标用户校验与分页校验与 `/OfficialRatings` 相同，然后返回
   `{"Items":[],"TotalRecordCount":0}`。它不读数据库，因为没有 tags 数据；媒体库 ACL 对它没有可观察的
   作用面（响应本来就没有内容），已在 COMPATIBILITY 记录中写明。
-- 查询解析：新端点用自己的 `EmbyFilterMetadataQuery`，空的 `StartIndex=`/`Limit=` 按未提供处理（Hills 的
-  筛选面板会带空 `Limit=`），空的 `ParentId=` 按“不限媒体库”处理。`Limit<=0` 与 `/Genres` 一样按默认
-  50 处理，`Limit>1000` 或 `StartIndex<0` 返回 400。没有改动 `EmbyFacetsQuery`，避免与并行任务冲突。
+- 查询解析：新端点用 `EmbyFilterMetadataQuery`，空的 `StartIndex=`/`Limit=` 复用 LUX-888 合并后的共享
+  `deserialize_optional_i64`（同样是先 `trim()` 再解析；本任务原先的私有 `empty_query_number` 已删除，
+  不保留两份实现），空的 `ParentId=` 按“不限媒体库”处理。`Limit<=0` 与 `/Genres` 一样按默认 50 处理，
+  `Limit>1000` 或 `StartIndex<0` 返回 400。
 - 路由：在 `EmbyRouteBuilder` 里追加 `/OfficialRatings`、`/Tags` 两行；根路径、`/emby` 前缀与路径大小写
   不敏感由既有 builder 与请求路径归一化覆盖（`/EMBY/officialratings` 有测试）。
 
@@ -20274,6 +20275,19 @@ Hills 或任何第三方客户端上复测。
 - 就地修订两处与新行为矛盾的旧文本：`docs/COMPATIBILITY.md`
   “Emby 筛选辅助端点：Genres、Studios、Years”一节的未实现列表，以及本文 P2 清单里的
   “Tags 因 NFO 缓存无该数据而未实现”。
+
+合并 LUX-888（本地 `test` 头 `8ca9b0aa`）后：
+
+- rebase 到最新 `test`，`docs/COMPATIBILITY.md` 与 `docs/TEST-TARGETS.md` 的冲突按“保留双方内容”解决：
+  LUX-888 与 LUX-890 两个兼容记录都在，`TEST-TARGETS.md` 同时保留 `emby_empty_numeric_params`（7 例）与
+  `emby_filter_metadata`（3 例）两行；`--test emby` 计数按 rebase 后实测更新为 13 个模块 / 53 个测试。
+- 删除私有 `empty_query_number`，`EmbyFilterMetadataQuery` 的 `StartIndex`/`Limit` 改用
+  `deserialize_optional_i64`；空值与空白值语义不变（先 `trim()` 再解析），仍只有一份实现。
+- 复跑：`cargo test --locked --test emby -- --list` 53 tests / 13 模块；
+  `cargo test --locked --test emby emby_filter_metadata::` 3/3；
+  `cargo test --locked --test emby emby_empty_numeric_params::` 7/7；`cargo fmt --all -- --check` 通过；
+  `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过；
+  `python3 scripts/check-backend-branches.py` 通过（28 个文件、266 处）。
 
 限制与剩余风险：
 

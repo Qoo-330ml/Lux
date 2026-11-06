@@ -17,8 +17,9 @@ use super::*;
 
 /// Query of the Emby filter-panel metadata endpoints.
 ///
-/// Unlike the `/Genres` query, an empty `StartIndex=`/`Limit=` counts as absent: Hills sends
-/// `Limit=` on filter-panel requests and an empty value is not a malformed number.
+/// `StartIndex=`/`Limit=` reuse the shared `deserialize_optional_i64`, so an empty or
+/// whitespace-only value counts as absent (Hills sends `Limit=` on filter-panel requests) while a
+/// malformed non-empty value still answers `400`.
 #[derive(Deserialize, Default)]
 pub(super) struct EmbyFilterMetadataQuery {
     #[serde(flatten)]
@@ -33,31 +34,16 @@ pub(super) struct EmbyFilterMetadataQuery {
         rename = "StartIndex",
         alias = "startIndex",
         default,
-        deserialize_with = "empty_query_number"
+        deserialize_with = "deserialize_optional_i64"
     )]
     pub(super) start_index: Option<i64>,
     #[serde(
         rename = "Limit",
         alias = "limit",
         default,
-        deserialize_with = "empty_query_number"
+        deserialize_with = "deserialize_optional_i64"
     )]
     pub(super) limit: Option<i64>,
-}
-
-/// Reads an optional integer query value where an empty string means "not provided".
-fn empty_query_number<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<String>::deserialize(deserializer)?;
-    match value.as_deref().map(str::trim) {
-        None | Some("") => Ok(None),
-        Some(raw) => raw
-            .parse::<i64>()
-            .map(Some)
-            .map_err(serde::de::Error::custom),
-    }
 }
 
 /// The page window both endpoints share; `EMBY_MAX_PAGE_LIMIT` is the server-side upper bound.

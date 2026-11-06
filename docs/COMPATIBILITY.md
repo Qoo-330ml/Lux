@@ -30,7 +30,8 @@ Emby 客户端上复测；`Items[]` 的 `Name`/`Id` 形状按 Emby `NameIdPair` 
   （`/EMBY/officialratings` 有测试覆盖）。
 - 分页：`Limit` 默认 50（`Limit<=0` 也按默认 50 处理，与 `/Genres` 一致）、服务端上限 1000；
   `Limit>1000` 或 `StartIndex<0` 返回 400；空的 `StartIndex=`/`Limit=` 按未提供处理（Hills 的筛选面板
-  会带空 `Limit=`），空的 `ParentId=` 按“不限媒体库”处理。
+  会带空 `Limit=`；与 LUX-888 的共享 `deserialize_optional_i64` 同一实现），空的 `ParentId=` 按
+  “不限媒体库”处理。
 - `IncludeItemTypes`：与 `/Items` 使用同一份解析规则。整组都无法识别时返回空列表（200 空信封），不会
   退化成“不过滤”的全量结果；混合有效与无效类型时只按有效类型过滤。
 - `Recursive` 被接受但不改变结果：与其他 facet 端点一样，分级聚合始终覆盖所选库/类型的全部可见条目。
