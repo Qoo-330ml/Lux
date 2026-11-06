@@ -1761,8 +1761,9 @@ Lux 当时返回 404 空响应，客户端页面不报错、推荐区整块缺�
   `Fields` 与 `/Items` 同义，默认仍带 `UserData` 等列表字段。
 - `EnableUserData=false` 移除 `UserData`。`EnableImageTypes`（逗号或 `|` 分隔、大小写不敏感）只保留
   请求的 `ImageTags` 键，未请求 `Backdrop` 时清空 `BackdropImageTags`；`ImageTypeLimit=0` 清空全部图片
-  tag，正数把 `BackdropImageTags` 截断到该数量，负数按“不限制”处理。这三个参数的语义来自 Emby/Jellyfin
-  文档与客户端请求形态，属静态推断，没有逐项真机比对。
+  tag，正数把 `BackdropImageTags` 截断到该数量，负数按“不限制”处理。显式空的 `EnableImageTypes=`
+  （以及空的 `ImageTypeLimit=`）按未提供处理，与 LUX-888 的空值规则一致：响应保留全部图片 tag，而不是
+  清空。这些参数的语义来自 Emby/Jellyfin 文档与客户端请求形态，属静态推断，没有逐项真机比对。
 - 相似规则：同类型（`Movie`/`Series`）且至少共享一个已入库 Genre；**候选池有硬上限**：最多 10 个源
   Genre（按 `name_key` 取前 10 个），每个 Genre 最多 200 个通过 ACL、可见性与内容限制的候选；在这两个
   上限内按共享数量降序，再按 `LOWER(title)`、条目 id 升序稳定排序，并排除自身。数据只来自

@@ -20345,7 +20345,8 @@ Hills 或任何第三方客户端上复测。
   和现有鉴权/播放令牌中间件一致。抓包只出现根 `Items` 形态，没有新增
   `/Users/{userId}/Items/{id}/Similar`。
 - DTO：`{"Items":[...],"TotalRecordCount":n}`，条目由现有列表投影生成，`Fields` 与列表端点同义；
-  `EnableUserData=false` 去掉 `UserData`，`EnableImageTypes`/`ImageTypeLimit` 过滤图片 tag。
+  `EnableUserData=false` 去掉 `UserData`，`EnableImageTypes`/`ImageTypeLimit` 过滤图片 tag。显式空的
+  `EnableImageTypes=` 与未提供等价（保留全部图片 tag），与 LUX-888 的空值规则一致。
 - 相似规则：新增 `CatalogService::list_similar_items` 与存储层 `list_similar_catalog_rows`。候选必须是
   同类型（MOVIE/SERIES）、与源条目至少共享一个 `media_item_facets(kind='GENRE')` 键。**候选池先设硬
   上限再排序**：源条目的 Genre 按 `name_key` 取前 10 个，每个 Genre 的候选分支最多取 200 个通过 ACL、
@@ -20357,8 +20358,8 @@ Hills 或任何第三方客户端上复测。
   与 `COUNT(DISTINCT item_id)` 都只处理这个并集；`TotalRecordCount` 因此是候选池内的去重数量，不是
   全库相似条目总数。
 - 错误与分页：条目不存在或不可见 404（与 `/Items/{id}` 一致），未鉴权 401；`Limit` 默认 50、上限 1000，
-  空值按未提供（本端点自己的 Query 结构体处理，不依赖 LUX-888），负数、非整数或超上限 400；无相似条目
-  200 空列表。响应不返回 `StartIndex`（规格只要求 `Items`/`TotalRecordCount`）。
+  空值按未提供（`Limit`/`ImageTypeLimit` 复用 LUX-888 的共享 `deserialize_optional_i64`），负数、非整数
+  或超上限 400；无相似条目 200 空列表。响应不返回 `StartIndex`（规格只要求 `Items`/`TotalRecordCount`）。
 
 验收：
 
