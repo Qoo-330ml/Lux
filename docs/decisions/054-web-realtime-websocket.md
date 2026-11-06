@@ -290,7 +290,7 @@ WS 握手是 `GET`，带不了 `X-CSRF-Token`，所以本端点**不要求也不
 
 ### 管理员频道授权与周期重校验
 
-- 资格只在握手时算一次，之后按 45 秒周期重校验（`EMBY_WEBSOCKET_REVALIDATE_INTERVAL`，见「资源与
+- 资格只在握手时算一次，之后按 45 秒周期重校验（`WEBSOCKET_DEFAULT_REVALIDATE_INTERVAL`，见「资源与
   预算」的来源说明）。重校验复用握手时的同一组函数（含远程访问与设备/客户端规则），帧投递只读这次
   结果。
 - **与 LUX-891 的一处有意差异**：Emby 端点在每次推送前都重校验（推送由客户端的 `SessionsStart` 节奏
@@ -359,10 +359,10 @@ Lux 的部署定位是单进程 + SQLite 的家庭 NAS（ADR-001、ADR-002），
 
 - 新总量 128 + 64 = 192，是旧上限 64 的 3 倍。常态占用按每条连接 16 KiB 量级估算约 3 MiB，与今天的
   1 MiB 同一数量级。这里的 16 KiB 不是新估算：LUX-891 的写边界是
-  `EMBY_WEBSOCKET_WRITE_BUFFER_BYTES = 16 * 1024`（初始容量提示）与
-  `EMBY_WEBSOCKET_MAX_WRITE_BUFFER_BYTES = 4 * 1024 * 1024`（硬上限），Lux 的失效帧只有几十字节，缓冲
+  `WEBSOCKET_DEFAULT_WRITE_BUFFER_BYTES = 16 * 1024`（初始容量提示）与
+  `WEBSOCKET_DEFAULT_MAX_WRITE_BUFFER_BYTES = 4 * 1024 * 1024`（硬上限），Lux 的失效帧只有几十字节，缓冲
   不会长到初始容量以上；4 MiB/条只是“对端停止读取”时的结构上界（192 × 4 MiB = 768 MiB 是理论上界，
-  不是预期占用），而 `EMBY_WEBSOCKET_SEND_TIMEOUT = 10 s` 的发送超时会把实际增长限制在 10 秒内产生的
+  不是预期占用），而 `WEBSOCKET_DEFAULT_SEND_TIMEOUT = 10 s` 的发送超时会把实际增长限制在 10 秒内产生的
   帧上并关闭连接。**该超时与上限的实测值待 LUX-894 记录**（RSS 差值，本机 arm64）。
 - 一条连接只占一个预算名额，按握手主体归类：`can_manage_server` 为真 → 计入管理预算，否则计入用户
   预算（管理员的用户频道帧仍走同一条连接，不额外占名额）。降权后**不迁移**名额，只停投 admin 帧，
@@ -386,14 +386,16 @@ Lux 的部署定位是单进程 + SQLite 的家庭 NAS（ADR-001、ADR-002），
 
 | 参数 | 取值 | 来源 |
 |---|---|---|
-| 服务端协议级 ping | 25 s | `EMBY_WEBSOCKET_HEARTBEAT_INTERVAL`（`src/api/emby_websocket.rs:36`，LUX-891 返工分支） |
-| 空闲关闭 | 120 s 无任何入站帧（含 pong） | `EMBY_WEBSOCKET_IDLE_TIMEOUT`（同文件 `:34`） |
-| 周期重校验 | 45 s | `EMBY_WEBSOCKET_REVALIDATE_INTERVAL`（同文件 `:62`） |
-| 关停排空 | 5 s | `EMBY_WEBSOCKET_SHUTDOWN_DRAIN_TIMEOUT`（同文件 `:38`） |
+| 服务端协议级 ping | 25 s | `WEBSOCKET_DEFAULT_HEARTBEAT_INTERVAL`（`src/api/websocket/mod.rs`，LUX-893 抽取） |
+| 空闲关闭 | 120 s 无任何入站帧（含 pong） | `WEBSOCKET_DEFAULT_IDLE_TIMEOUT`（同文件） |
+| 周期重校验 | 45 s | `WEBSOCKET_DEFAULT_REVALIDATE_INTERVAL`（同文件） |
+| 关停排空 | 5 s | `EMBY_WEBSOCKET_SHUTDOWN_DRAIN_TIMEOUT`（`src/api/emby_websocket.rs`；`wait_until_idle` 在 `src/api/websocket/budget.rs`） |
 
 上表的常量读自本地 `tspace/emby-websocket` 分支（LUX-891 仍在返工，尚未合并到 `test`，所以当前快照里
 没有 `src/api/emby_websocket.rs`）。LUX-893 抽取时以**合并后**的常量为准；若数值发生变化必须同步修订
-本节，并在 `docs/LUX-DEVELOPMENT.md` 的 LUX-893 结果里记录最终值。
+本节，并在 `docs/LUX-DEVELOPMENT.md` 的 LUX-893 结果里记录最终值。LUX-893 已按合并后的常量核对：四个
+数值均未变，前三个随共享基础设施移到 `src/api/websocket/mod.rs`（`WEBSOCKET_DEFAULT_*`），排空上限仍
+留在 Emby 模块（它是 `/embywebsocket` 关停的配置，不是共享类型的字段）。
 
 浏览器对协议级 ping **自动回 pong**（RFC 6455 §5.5.2），所以“120 s 无入站帧”在正常浏览器上是
 120 s 无 pong，而不是 120 s 无用户消息。LUX-891 的该常量注释写的就是“连 pong 都不发才算空闲”，
@@ -411,8 +413,8 @@ JS 看不见协议级 ping，客户端不能据此判活；判活只依赖 `clos
 - 关停开始时（`ReadyAppState::shutdown` 链，`src/api/legacy.rs` 现有顺序）先置位共享的关停
   `watch`，两个 WebSocket 端点（`/embywebsocket`、`/api/v1/ws`）同时收到：停止接受新握手
   （`503`），向每条连接发 `1001`（going away），然后**有界等待**排空 5 秒
-  （`EMBY_WEBSOCKET_SHUTDOWN_DRAIN_TIMEOUT`，`emby_websocket.rs:38`；由 `wait_until_idle(timeout)`
-  执行）。
+  （`EMBY_WEBSOCKET_SHUTDOWN_DRAIN_TIMEOUT`，`src/api/emby_websocket.rs`；由共享的
+  `wait_until_idle(timeout)` 执行）。
 - 关停排空必须发生在数据库关闭与事件 hub drop 之前，否则连接会在没有 close 帧的情况下被切断，
   客户端只能看到 `1006` 并做一次全量失效（功能上可接受，但日志里会与反代故障混淆）。
 - 关停期间不再投递 `invalidate` 帧；已排队的帧直接丢弃，客户端重连后的全量失效会补齐。
@@ -470,13 +472,18 @@ JS 看不见协议级 ping，客户端不能据此判活；判活只依赖 `clos
 - 共用的是底层基础设施，抽到 `src/api/websocket/{mod,budget,shutdown,send}.rs`（LUX-893）：
   全局/每用户连接计数、关停 `watch`、有界写与 close 帧构造、周期重校验的节奏常量。两边的差异只保留
   在各自的顶层循环里：Emby 的唤醒源是 `StreamState` 计划，Lux 的是 `broadcast::Receiver`。
-- 抽取是纯 move，验收标准是 LUX-891 的集成测试与单测全部保持通过（22 + 9 例，见盘点报告），
+  LUX-893 已落地：类型改为中性名（`WebsocketConnections` / `WebsocketPermit` / `WebsocketShutdown` /
+  `WebsocketLimits`），`EmbyWebsocketLimits` 保留为同一个 limits 类型的公开别名，Emby 模块只剩协议
+  与循环代码。
+- 抽取是纯 move，验收标准是 LUX-891 的集成测试与单测全部保持通过（合并后实际为 23 + 10 例，见盘点报告），
   clippy 干净，零行为变更。抽取必须先于 LUX-894（依赖 LUX-891 已合并，避免在四个文件的同一区域反复
   冲突：`src/api/legacy.rs` 的 `CoreState` 字段与 builder、`src/api/mod.rs` 的 `pub use`、
   `src/main.rs` 的两处关停调用、`Cargo.toml`）。
-- 预算实例分开：Emby 继续用今天的 32 全局 / 4 每用户（`MAX_EMBY_WEBSOCKET_CONNECTIONS` /
-  `MAX_EMBY_WEBSOCKET_CONNECTIONS_PER_USER`），Lux 的 user/admin 各自一个实例；三者互不挤占，但共享
-  同一套类型、可注入的 limits 结构（`EmbyWebsocketLimits` 的通用化，测试可缩小上限）与关停信号。
+- 预算实例分开：Emby 继续用今天的 32 全局 / 4 每用户（LUX-893 起是 limits 类型的默认值
+  `WEBSOCKET_DEFAULT_MAX_CONNECTIONS` / `WEBSOCKET_DEFAULT_MAX_CONNECTIONS_PER_USER`，注入给 Emby 自己的
+  实例），Lux 的 user/admin 各自一个实例；三者互不挤占，但共享
+  同一套类型、可注入的 limits 结构（`WebsocketLimits`，`EmbyWebsocketLimits` 是它的别名，测试可缩小
+  上限）与关停信号。
 - 协议细节保持两边独立：`/embywebsocket` 继续接受 Emby 客户端习惯的 `?api_key=` 与 `deviceId=` 查询
   参数（那是 Emby 兼容面，LUX-891 已固定），`/api/v1/ws` **不接受**任何 query 凭据（D6）。同一个文件里
   的两条路径在这一点上刻意不同，不要互相“对齐”。

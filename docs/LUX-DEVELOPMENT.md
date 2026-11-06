@@ -20876,9 +20876,9 @@ ADR-017 中受影响的三处加“已被 ADR-054 部分取代”的状态标注
 回退均已记录。ADR-030（英文状态注记）、ADR-049、ADR-017 各加一处最小标注，指向 ADR-054 的具体条款，正文
 未改。本任务只改文档，未运行 Rust 或 Web 测试；`cargo`、`pnpm` 均未执行，提交内容为 `docs/` 五个文件。
 
-#### LUX-893：抽取共享 WebSocket 基础设施（未开始）
+#### LUX-893：抽取共享 WebSocket 基础设施（已完成）
 
-状态：未开始（计划）。依赖：LUX-891 合并到 `test`。
+状态：已完成（2026-11-06）。依赖：LUX-891 已合并到 `test`（基线 `536986ba`）。
 
 范围：把 LUX-891 在 `src/api/emby_websocket.rs` 中已经打磨过的通用部分抽到
 `src/api/websocket/{mod,budget,shutdown,send}.rs`：全局与每用户连接计数（`EmbyWebsocketConnections` /
@@ -20894,18 +20894,55 @@ ADR-017 中受影响的三处加“已被 ADR-054 部分取代”的状态标注
 
 验收：
 
-- [ ] LUX-891 的集成与单测全部保持通过（合并后按实际计数记录；盘点时为 `--test emby emby_websocket::`
-      22 例、`--lib emby_websocket::` 9 例），测试断言不改。
-- [ ] `cargo clippy --locked --all-targets --all-features -- -D warnings`、`cargo fmt --all -- --check`
+- [x] LUX-891 的集成与单测全部保持通过（合并后按实际计数记录：`--test emby emby_websocket::` 23 例、
+      `--lib` 里 websocket 相关 10 例；其中 6 例随共享代码移到 `api::websocket::*`，断言逐字未改，见实施结果），
+      测试断言不改、未增删任何 WebSocket 测试。
+- [x] `cargo clippy --locked --all-targets --all-features -- -D warnings`、`cargo fmt --all -- --check`
       通过；`cargo build --locked` 通过。
-- [ ] 仓库中不存在第二份计数/关停/写边界实现：`grep -rn "wait_until_idle\|payload_fits\|close_code" src/`
-      只命中 `src/api/websocket/*` 与其调用点。
-- [ ] 关停顺序、close code 取值、预算计数语义与 LUX-891 逐项相同；`/embywebsocket` 行为无变化，
+- [x] 仓库中不存在第二份计数/关停/写边界实现：`grep -rn "wait_until_idle\|payload_fits\|close_code" src/`
+      只命中 `src/api/websocket/*` 与其调用点（`src/api/emby_websocket.rs`、`src/api/legacy.rs:787`）。
+- [x] 关停顺序、close code 取值、预算计数语义与 LUX-891 逐项相同；`/embywebsocket` 行为无变化，
       Emby 仍是 32 全局 / 4 每用户，`1000`/`1001`/`1008` 常量随模块移动。
 
 预计改动文件：新增 `src/api/websocket/mod.rs`、`budget.rs`、`shutdown.rs`、`send.rs`；修改
 `src/api/emby_websocket.rs`、`src/api/mod.rs`、`src/api/legacy.rs`、`src/main.rs`、`Cargo.toml`（如需调整
 feature）、`docs/TEST-TARGETS.md`（若测试过滤路径变化）。
+
+实施结果（2026-11-06）：新模块 `src/api/websocket/{mod,budget,shutdown,send}.rs`，`mod.rs` 声明三个子模块
+并在那里集中导出；`src/api/mod.rs` 只加一行 `mod websocket;`（`api` 私有，子模块 `emby_websocket` 直接可见）。
+
+被移动的项（旧位置 → 新位置；均只改名，逻辑/常量值/日志文本不变）：
+
+| 旧（`src/api/emby_websocket.rs`） | 新 |
+|---|---|
+| `EmbyWebsocketConnections` / `EmbyWebsocketConnectionState` / `EmbyWebsocketPermit`（`try_acquire`、`limits`、`wait_until_idle`、`Drop` 释放） | `budget.rs`：`WebsocketConnections` / `WebsocketConnectionState` / `WebsocketPermit` |
+| `EmbyWebsocketShutdown`（`signal` / `subscribe`） | `shutdown.rs`：`WebsocketShutdown` |
+| `bounded` / `send_bounded` / `payload_fits` / `utf8_close`、`EMBY_WEBSOCKET_FRAME_HEADER_BYTES`、`CLOSE_NORMAL`/`CLOSE_GOING_AWAY`/`CLOSE_POLICY_VIOLATION` | `send.rs`：同名函数、`WEBSOCKET_FRAME_HEADER_BYTES`、同名 close code 常量（改为 `pub(crate)`） |
+| `EmbyWebsocketLimits`、`Default`、`normalized()`、12 个默认常量、`_CONNECTIONS_LIMIT`/`_MAX_DURATION`/`_WRITE_BUFFER_BYTES_LIMIT` | `mod.rs`：`WebsocketLimits`、`Default`、`normalized()`、`WEBSOCKET_DEFAULT_*`、`WEBSOCKET_MAX_*` |
+| 6 个单测（`bounded_send_*` 2 例、写缓冲/上限/文档上限/极限覆盖 4 例） | `api::websocket::send::tests`（3 例）、`api::websocket::tests`（3 例） |
+
+留在 `emby_websocket.rs`：`StreamState`/`StreamPlan`/`StreamTiming` 推送计划、`handle_client_message`、
+`revalidated_principal`、`ConnectionContext`、`run_connection`、`next_wake`、`warn_*`、`emby_session_entries`/
+`emby_scheduled_task_entries` 调用与消息格式（`KEEP_ALIVE_REPLY`、`Sessions`/`ScheduledTasksInfo`）、
+`EMBY_WEBSOCKET_SHUTDOWN_DRAIN_TIMEOUT`（Emby 关停的排空上限，`legacy.rs` 直接引用）。
+
+偏离“纯移动”的地方（逐条）：① `EmbyWebsocketLimits` 改为 `pub use crate::api::websocket::WebsocketLimits as
+EmbyWebsocketLimits;`——`Default` 每个类型只能有一个实现，而集成测试用扁平结构体字面量构造该类型，只有类型
+别名能同时满足“API 不变”和“默认值不变”；因此 12 个默认值（含 Emby 协议的 1 s/60 s 间隔钳制、8 KiB 入站、
+16 KiB/4 MiB 写缓冲）随类型移到 `mod.rs`，值一个未改。② `normalized()` 由 `fn` 改为 `pub(crate) fn`（`budget.rs`
+调用）。③ 共享常量的文档注释把“`/embywebsocket` 的连接”改成中性表述（“one budget instance”“these
+endpoints”“by default”），语义与数值不变，因为文档现在服务两个端点。④ `send_bounded`/`payload_fits` 的换行由
+rustfmt 按新标识符长度重排（`payload_fits` 合并为一行），无逻辑变化。
+
+`src/main.rs` 与 `Cargo.*` 未改动；`docs/TEST-TARGETS.md` 的数字未变（集成测试模块名与 23 例不变）。
+
+验证：`cargo test --locked --test emby emby_websocket::` 23/23；`cargo test --locked --lib emby_websocket::` 4/4、
+`cargo test --locked --lib websocket::` 10/10（两者合计即 LUX-891 的 10 例，过滤器 `websocket::` 同时命中
+`api::websocket::*` 与 `api::legacy::emby_websocket::*`）；`cargo test --locked --test emby` 82/82 连续 2 次；
+`LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test shutdown` 2/2；`cargo fmt --all -- --check`、
+`cargo clippy --locked --all-targets --all-features -- -D warnings`、`python3 scripts/check-backend-branches.py`、
+`cargo build --locked` 通过。移动块的逐段核对方式：把基线 `src/api/emby_websocket.rs` 的每个被删块做纯改名后与
+新模块的可执行代码逐字符比对（忽略注释、换行与 `pub(crate)`），14 个块全部命中，缺 0。
 
 #### LUX-894：后端 `GET /api/v1/ws`（未开始）
 
