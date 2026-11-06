@@ -20136,6 +20136,13 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
 - `cargo fmt --all -- --check` 通过；`cargo clippy --locked --all-targets --all-features -- -D warnings`
   通过（0 警告）；`python3 scripts/check-backend-branches.py` 通过（28 files，266 branches）。
 
+rebase 复核：合并前本地 `test` 前进到 `a7c3cdc5`（含 `feb8834d` STRM 媒体源 ID 改为 32 位十六进制、
+`a7c3cdc5` 的兼容记录），已 rebase 且无冲突（两条文档记录分别位于文件不同位置，双方内容都保留）。
+rebase 后重跑：`cargo test --locked --test emby` 47/47（`-- --list` 仍是 47，本模块 4 条）、
+`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+`python3 scripts/check-backend-branches.py` 全部通过；`docs/TEST-TARGETS.md` 的 `--test emby` 计数与
+rebase 后的 `--list` 一致。
+
 限制与剩余风险：
 
 - 抓包报告没有保留完整查询串，所以“客户端是否也发空 `StartIndex=`”“除这三个端点外是否还有空值”没有
