@@ -20647,10 +20647,10 @@ LUX-890 合并后的去重与 P3 修正（2026-11-06）：
 
 验证命令与结果：
 
-- `cargo test --locked --test emby emby_websocket::` 22/22（新增模块，第 2 轮返工后）。
-- `cargo test --locked --lib emby_websocket::` 9/9（新增单元测试）。
-- `cargo test --locked --test emby` 81/81（16 个模块，第 2 轮返工后实测）。
-- `cargo test --locked --test emby -- --list`：81 tests / 16 模块（`docs/TEST-TARGETS.md` 按此更新）。
+- `cargo test --locked --test emby emby_websocket::` 23/23（新增模块，第 3 轮返工后）。
+- `cargo test --locked --lib emby_websocket::` 10/10（新增单元测试）。
+- `cargo test --locked --test emby` 82/82（16 个模块，第 3 轮返工后实测，连续 3 次）。
+- `cargo test --locked --test emby -- --list`：82 tests / 16 模块（`docs/TEST-TARGETS.md` 按此更新）。
 - `cargo fmt --all -- --check` 通过。
 - `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。
 - `python3 scripts/check-backend-branches.py` 通过（28 个文件、266 处，未新增 `DatabaseBackend::` 分支）。
@@ -20784,6 +20784,51 @@ emby_websocket::` 6/6、`cargo test --locked --test emby` 77/77、
 第 2 轮返工后复跑：`cargo test --locked --test emby emby_websocket::` 22/22、`cargo test --locked --lib
 emby_websocket::` 9/9、`cargo test --locked --test emby` 81/81、
 `LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test shutdown` 2/2、
+`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+`python3 scripts/check-backend-branches.py`、`cargo build --locked` 全部通过。
+
+### 第 3 轮返工（独立审查后，2026-11-06，最后一轮）
+
+三条 P3 全部成立，逐条先写失败测试再修；另对已知的 `--test emby` 偶发失败做了根因调查（见第 4 条）。
+
+1. **`payload_fits` 未计入帧头**：旧比较只看 `payload.len() < max_write_buffer_bytes`，而 tungstenite 计的是
+   “整帧长度（payload + 帧头）+ 已缓冲字节”，所以 payload 落在 `[max-10, max-1]` 时会通过检查、`start_send`
+   却返回 `WriteBufferFull`，走 `break None` 断连，与“跳过本次推送、连接保留”的承诺不符。新增
+   `EMBY_WEBSOCKET_FRAME_HEADER_BYTES = 16`（服务端到客户端的帧头 2/4/10 字节，16 覆盖最大帧头并留出一个
+   已缓冲控制帧的余量），比较改为 `payload.len() + 16 < max`（饱和加法，避免 `usize::MAX` 覆盖时溢出）。
+   单测覆盖边界：`max-17` 发送、`max-16`/`max-1`/`max` 跳过（红测试：撤掉余量后 `max-16` 断言失败）。
+2. **公开限额覆盖仍可能 panic**：`Semaphore::new(max_connections)` 在超过 `Semaphore::MAX_PERMITS` 时 panic；
+   `Instant::now() + Duration` 在 `Duration::MAX` 这类覆盖下溢出 panic（发生在 `101` 之后的连接任务里）。
+   `normalized()` 现在把 `max_connections` 钳到 `EMBY_WEBSOCKET_MAX_CONNECTIONS_LIMIT = 1024`（默认 32；
+   一千条连接已超出任何现实部署的 fd/缓冲预算，`MAX_PERMITS` 只是硬天花板），`max_connections_per_user`
+   同样钳到 1024，所有时长字段（`min_interval`、`max_interval`、`heartbeat_interval`、`idle_timeout`、
+   `send_timeout`、`revalidate_interval`、`auth_warn_interval`）钳到
+   `EMBY_WEBSOCKET_MAX_DURATION = 24 h`（默认空闲超时 120 s，24 h 已远超本端点会保持的任何状态）。
+   单测用 `usize::MAX`/`Duration::MAX` 覆盖全部字段，并在钳制后构造 `EmbyWebsocketConnections`、计算
+   各截止时间以证明不会 panic；端到端用例用同一组极限覆盖完成握手并做一次 `KeepAlive` 往返
+   （红测试：撤掉钳制后该用例在 `batch_semaphore.rs` 的 `Semaphore::new` 处 panic）。
+3. **洪水用例时间窗余量过窄**：`min_interval = 200 ms`、`max_interval = 400 ms` 时推送约在 0/400/800 ms，
+   而窗口只有 900 ms，第三条稍晚一点就失败。窗口放宽到 1800 ms（约 3 个间隔 + 余量），断言条件不变。
+   顺带复核了本文件其它固定窗口：`expect_no_message` 的 1.3 s/1.6 s/400 ms 都是“应无消息”的负向断言，
+   窗口越长越安全；`closes_a_stalled_reader` 的 100 ms 检查相对 300 ms 超时留有 200 ms 余量；其余用例
+   用逐帧读取或 5–10 s 的读超时，没有第二个“刚好够用”的正向窗口。
+4. **`emby_incremental_refresh::emby_media_updated_queues_incremental_scan_for_absolute_path` 偶发失败
+   （调查，未改生产代码）**：
+   - 证据：写了一个临时探针（未提交）复刻该用例的请求，在 `202` 之后连续采样 `scan_jobs.status` 与
+     `scan_job_paths` 行数：`attempt=0` 为 `PENDING / paths=1`，约 50 ms 后的 `attempt=1` 已是
+     `COMPLETED / paths=0`，且 `total_count` 始终为 1。
+   - 机制：`/Library/Media/Updated` 的 handler 在返回 `202` **之前**就 `spawn_emby_scan_job` 起了后台扫描
+     工作线程；该线程完成作业后走 `postprocessing.rs` 的 `clear_scan_job_paths`（增量扫描的路径表是队列而非
+     历史）。用例在收到 `202` 之后才 `SELECT ... FROM scan_job_paths LIMIT 1`，于是高负载下（整组 16 线程
+     并行）工作线程先完成时该查询得到 `RowNotFound`。
+   - 结论：**测试侧竞态**，与 WebSocket 无关；`scan_jobs` 行在完成后保留（`job_type`/`total_count` 可靠），
+     只有路径行是瞬态的。为此只改测试：持久断言改为 `job_type = INCREMENTAL_SCAN` 且 `total_count = 1`
+     （入队时写入、完成时不清零），相对路径改为“仍在队列中时才断言为 `NewMovie`”，不再与工作线程抢。
+   - 复现情况：48 次并行单测运行与多次整组运行都未能直接抓到失败（窗口只有几十毫秒），因此上面的判定基于
+     探针的确定性证据，而不是一次抓到的 panic 文本。
+
+第 3 轮返工后复跑：`emby_websocket::` 23/23、`--lib emby_websocket::` 10/10、`--test emby` 连续 3 次
+82/82、`LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test shutdown` 2/2、
 `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
 `python3 scripts/check-backend-branches.py`、`cargo build --locked` 全部通过。
 
