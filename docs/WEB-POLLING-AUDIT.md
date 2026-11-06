@@ -128,3 +128,18 @@ cd web
 grep -rn "refetchInterval\|setInterval" src   # 41 行，与本文件清单一一对应
 npx vitest run tests/player-info-hook.test.tsx
 ```
+
+## 后续补充：实时通道迁移（LUX-895，2026-11-06）
+
+上文「关键前提」与「逐处清单」记录的是 SSE 时代（`/api/v1/events`、`/api/v1/admin/events`）的事实。按
+「不改历史」的要求原文保留，这里只追加迁移后的现状：
+
+- 连接状态的名字已改：`SseConnectionState` → `RealtimeConnectionState`、
+  `useSseConnectionState()` → `useRealtimeConnectionState()`、`SseConnectionContext` →
+  `RealtimeConnectionContext`。上文表格里写 `sseState==="connected"` 的行指的是同一个语义——**收到首帧
+  `ready` 之后**才算已连接，因此"已连接即关闭兜底轮询"的判断没有变化，只是文件名/行号会整体位移。
+- 传输层已换成 `GET /api/v1/ws`（ADR-054），用户频道与管理频道共用一条连接（`web/src/lib/realtime/`）。
+  用户侧「已按连接状态关闭兜底轮询」的行为不变；`useAdminEvents` 仍然不导出连接状态，所以管理端的
+  2 s / 5 s / 15 s 兜底轮询照旧，上文的「需要后续任务处理」第 1 条仍然成立（由 LUX-898 处理）。
+- WebSocket 不可用（例如环境里没有 `WebSocket` 构造器）时连接保持断开，用户面的 30 s 兜底轮询因此照旧
+  生效；断线重连期间同样落到这条兜底。

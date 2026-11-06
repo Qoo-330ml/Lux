@@ -21063,9 +21063,9 @@ load average 200~290 时连续 3 次 30/30；同一压力下整组 `cargo test -
    `shutdown_websocket_connections` 里 Lux 一侧的排空实现（`src/main.rs` 走的同一条路径），不再有独立死代码；
    用例 `a_bounded_drain_reports_a_connection_that_outlives_it` 覆盖「连接未退出 → `false`」「信号后 → `true`」。
 
-#### LUX-895：前端实时客户端（未开始）
+#### LUX-895：前端实时客户端（已完成）
 
-状态：未开始（计划）。依赖：ADR-054 的协议冻结（不等 LUX-894 完成即可开发）；发布需与 LUX-894 同版本。
+状态：已完成（2026-11-06）。依赖：ADR-054 的协议冻结（不等 LUX-894 完成即可开发）；发布需与 LUX-894 同版本。
 
 范围：新增 `web/src/lib/realtime/{socket.ts,types.ts}`（URL 由 `location` 推导、不带凭据、退避、可见性、
 离线、close code 分支），`useUserEvents` / `useAdminEvents` 只换传输层，失效逻辑逐字保留；类型改名
@@ -21077,14 +21077,14 @@ load average 200~290 时连续 3 次 30/30；同一压力下整组 `cargo test -
 
 验收：
 
-- [ ] 退避为 `min(30 s, 500 ms × 2^n)` 加 ±20% 抖动，只有收到首帧 `ready` 才把 `n` 归零（假计时器断言
+- [x] 退避为 `min(30 s, 500 ms × 2^n)` 加 ±20% 抖动，只有收到首帧 `ready` 才把 `n` 归零（假计时器断言
       上界与抖动区间）。
-- [ ] `1008` 不重连并失效 `queryKeys.me`（回到登录页）；`1001`/`1000` 至少等 5 s；连续 5 次 `1006`
+- [x] `1008` 不重连并失效 `queryKeys.me`（回到登录页）；`1001`/`1000` 至少等 5 s；连续 5 次 `1006`
       触发一次 `api.me()`，401 按会话失效处理。
-- [ ] `document.hidden` 与 `offline` 暂停重连，`visibilitychange` 转可见与 `online` 立即重试一次。
-- [ ] 三个易碎行为各有断言：用户侧首次 open 不全量失效；管理侧每次 open 做 `all` 失效；管理侧 250 ms
+- [x] `document.hidden` 与 `offline` 暂停重连，`visibilitychange` 转可见与 `online` 立即重试一次。
+- [x] 三个易碎行为各有断言：用户侧首次 open 不全量失效；管理侧每次 open 做 `all` 失效；管理侧 250 ms
       合并窗。
-- [ ] `pnpm --dir web test`、`pnpm --dir web build` 通过；`grep -rn "EventSource" web/src` 为空。
+- [x] `pnpm --dir web test`、`pnpm --dir web build` 通过；`grep -rn "EventSource" web/src` 为空。
 
 预计改动文件：新增 `web/src/lib/realtime/socket.ts`、`web/src/lib/realtime/types.ts`、
 `web/tests/support/fake-websocket.ts`；修改 `web/src/features/activity/useUserEvents.ts`、
@@ -21093,6 +21093,48 @@ load average 200~290 时连续 3 次 30/30；同一压力下整组 `cargo test -
 `web/src/features/detail/MediaDetailActions.tsx`、`web/src/features/detail/MediaDetailSections.tsx`、
 `web/src/features/detail/MediaDetailHero.tsx`、`web/tests/user-events.test.tsx`、
 `web/tests/admin-events.test.tsx`、`web/tests/lux-shell.test.tsx`、`web/tests/library-page.test.ts`。
+
+实施结果（2026-11-06）：新增 `web/src/lib/realtime/{types,socket,client}.ts` 与
+`web/tests/support/fake-websocket.ts`，`socket.ts`、`types.ts` 按计划，`client.ts` 是计划外拆出的页面级
+单例 hub：ADR-054 决定 1 要求用户频道与管理频道共用一条连接，若两个 hook 各自 `new` 一个客户端，管理页
+仍是 2 条连接，ADR「后果」里"每标签页连接数从 2 降到 1"就落不了地。hub 由第一个订阅者建连、最后一个
+订阅者关断，`useAdminEvents` 因此仍不需要导出连接状态（留给 LUX-898）。
+
+线协议侧（`types.ts`）：URL 固定为 `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/api/v1/ws`，
+不带 query、不放凭据（同源 cookie 由浏览器随握手携带）；只解析 `ready` 与 `invalidate`，`channel` 只接受
+`user`/`admin`，`itemId` 不是非空字符串或超过 256 字符时整帧丢弃，未知字段忽略，未知 `type` 与非法 JSON
+静默丢弃；上行只有每 25 s 一次的 `{"type":"ping"}`。25 s 的依据：服务端 120 s 无任何入站帧（含协议级
+pong）即关闭，4 个 ping 仍在窗口内留满余量，同时与服务端协议级 ping 的 25 s 同节奏。
+
+重连（`socket.ts`）：`min(30 s, 500 ms × 2^n)` 再乘 1±20% 抖动，`n` 只在首帧 `ready` 时归零；首次重试
+等 500 ms，基线到 30 s 封顶，叠加抖动后实际落在 [24 s, 36 s]。握手成功但 10 s 内没有 `ready` 按异常关闭
+处理（`1006` 分支，计入 probe 计数）。`1008` 立即停连并回调会话失效、不再重连；`1000`/`1001` 的等待下限
+固定 5 s（退避仍在下面继续增长）；连续第 5 次 `1006` 触发一次 `api.me()`，只有 401 按会话失效处理，
+其余错误继续退避。隐藏标签页与 `offline` 会取消已排定的重连并挂起重试，`visibilitychange` 转可见、
+`online` 各自立即重试一次；重连、ready 截止、ping 三类定时器每类同时只有一份，`stop()` 全部清理。
+
+与应用层的接缝：`useUserEvents` / `useAdminEvents` 的 scope 校验表、`refreshQueries` 的在途刷新去重、
+管理侧 250 ms 合并窗逐字未改，只把 `EventSource` 的 `open`/`invalidate` 回调换成 `ready`/`invalidate`
+回调；`libraryId` 分支按 D14 删除而不是移植。"已连接"仍然只指收到首帧 `ready` 之后，所以
+`homeRefetchInterval` 签名与语义不变、WebSocket 不可用时保持今天的 30 s 兜底。`SseConnectionContext`
+一并改名 `RealtimeConnectionContext`，否则 `grep "Sse"` 仍会命中实时相关代码。
+
+一处计划外的必要改动：`web/src/app/App.tsx` 的 `SessionRoutes` 把 `/auth/me` 的 401 当作"无会话"。
+`invalidateQueries(queryKeys.me)` 重新请求后若得到 401，React Query 仍保留上一次成功的 `data`，
+`!me.data` 分支不会命中，界面会停在已失效的会话上，D11 要求的"回到登录页"无法只靠失效本身达成。
+
+验证（本机 arm64，2026-11-06）：`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web build`
+通过；`pnpm --dir web test` 166 个测试文件 / 1535 例全绿（`tests/asset-precompression.test.mjs` 需要
+`web/dist`，所以先 build 再 test）；`grep -rn "EventSource" web/src web/tests` 无输出。新增/改写的用例：
+`web/tests/realtime-socket.test.ts` 23 例（URL、信封解析、退避与抖动区间、ready 前不算连接、ping 节奏、
+1008/1001/1000、5×1006 探测、隐藏标签页、离线、定时器不累积、无 WebSocket 时的兜底）、
+`user-events.test.tsx` 14 例、`admin-events.test.tsx` 9 例（含 LuxShell + AdminLayout 只开 1 条连接）、
+`lux-shell.test.tsx` 18 例、`library-page.test.ts` 19 例、`login-page.test.tsx` 15 例（新增 1 例：
+shell 已挂载时 `/auth/me` 返回 401 回到登录页）。
+
+未验证项：没有对接真实后端（LUX-894 的 `/api/v1/ws` 尚未合入本基线），也没有在真实浏览器或真实反向代理
+上验证握手、协议级 ping/pong 与 `1006` 的实际表现；本任务的全部结论来自注入假 WebSocket 的单元/组件
+测试。
 
 #### LUX-896：反代配置与部署文档（样例与文档已完成，真实握手未运行）
 
