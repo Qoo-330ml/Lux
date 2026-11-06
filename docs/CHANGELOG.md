@@ -125,6 +125,20 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
   保留），清理时正在进行的请求也不会把旧配置下取到的响应写回缓存；「完整刷新」现在清理的是真正负责
   刮削的解析器所持有的缓存，不再是空操作。响应缓存的 TTL、命中语义和插件协议均未改变。
 
+### 变更
+
+- **部署文档与反向代理样例补上 WebSocket 升级配置**：`docs/DEPLOYMENT.md` 的 nginx 样例与
+  `scripts/proxy-smoke.nginx.conf` 都补了 `proxy_set_header Upgrade $http_upgrade;` 与
+  `proxy_set_header Connection "upgrade";`，`Host` 从 `$host` 改为 `$http_host`（`$host` 会丢掉非默认
+  端口，而实时通道只比较 `Origin` 的 host[:port] 与 `Host`，两者不一致时所有握手都会被 `400` 拒绝）。
+  文档新增「缺头、改写 Host 与排查」：缺这两行时握手以普通 GET 到达、浏览器只看到 `close 1006`、与 401
+  无法区分，前端随后静默回落到轮询；同时给出服务端日志分类、`502/504`、`400/426`、`401`、`101` 的读法、
+  直连与经反代两条 `curl` 对照命令，以及“改写 `Host` 要在反代侧修正、不放宽同源校验（没有
+  `LUX_ALLOWED_ORIGINS`）”的说明。Caddy 与 Tailscale 链路仍标注未实机验证。`scripts/proxy-smoke.sh`
+  增加 `/api/v1/ws` 经 nginx 的 `101` 冒烟（首帧 `ready`、缺 `Origin` 与跨源被拒、普通 `GET` 不升级），
+  并在启动容器前跑新增的 `scripts/check-proxy-config.sh` 静态检查（已接入 `scripts/check-all.sh`）。
+  本次没有运行冒烟，结果与未验证项见 `docs/COMPATIBILITY.md` 的 LUX-896 记录。
+
 ## [0.7.14] - 2026-11-05
 
 图片宽度这一套设置删掉了，筛选图交给刮削器插件自己判断；扫描器也学会把 `Season 1 DV`、`Season 1 HDR` 这种同季不同版本的目录合并成一个剧集的多版本。

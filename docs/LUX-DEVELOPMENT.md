@@ -21094,9 +21094,12 @@ load average 200~290 时连续 3 次 30/30；同一压力下整组 `cargo test -
 `web/src/features/detail/MediaDetailHero.tsx`、`web/tests/user-events.test.tsx`、
 `web/tests/admin-events.test.tsx`、`web/tests/lux-shell.test.tsx`、`web/tests/library-page.test.ts`。
 
-#### LUX-896：反代配置与部署文档（未开始）
+#### LUX-896：反代配置与部署文档（样例与文档已完成，真实握手未运行）
 
-状态：未开始（计划）。依赖：LUX-894。**必须与 LUX-894 同批合入**，不得后置。
+状态：部分完成（2026-11-06）。依赖：LUX-894。**必须与 LUX-894 同批合入**，不得后置。文档与两份 nginx
+样例已改完并通过静态检查；真实 nginx 的 `101` 握手**未运行**（本机没有 nginx，任务约束禁止 Docker 构建
+与安装软件，当前分支也还没有 `/api/v1/ws`），因此合并前必须在含 LUX-894 的镜像上补跑
+`scripts/proxy-smoke.sh`。
 
 范围：`docs/DEPLOYMENT.md` 的 nginx 样例补 `proxy_set_header Upgrade $http_upgrade;` 与
 `proxy_set_header Connection "upgrade";`，并把 `Host` 明确为 `$http_host`（保留非默认端口，否则
@@ -21111,11 +21114,58 @@ Caddy 链路仍标注未实机验证）。
 
 - [ ] `scripts/proxy-smoke.sh` 在真实 nginx 容器里完成 `101` 握手并收到 `{"type":"ready","version":1}`。
 - [ ] 故意删掉 `Upgrade`/`Connection` 头时，实测表现与文档描述一致（`1006`），且文档写明前端会落到轮询。
-- [ ] 非默认端口部署（`Host` 带端口）的说明与 ADR-054 D5 一致；`$host` 造成端口丢失的后果被写出。
+- [x] 非默认端口部署（`Host` 带端口）的说明与 ADR-054 D5 一致；`$host` 造成端口丢失的后果被写出。
 - [ ] `docs/COMPATIBILITY.md` 记录验证日期、nginx 版本与未验证项（Caddy/Hills 链路）。
 
 预计改动文件：`docs/DEPLOYMENT.md`、`scripts/proxy-smoke.nginx.conf`、`scripts/proxy-smoke.sh`（如需
 增加握手断言）、`docs/COMPATIBILITY.md`、`docs/CHANGELOG.md`、`docs/LUX-DEVELOPMENT.md`。
+
+实施结果（2026-11-06，部分完成：样例与文档完成，真实握手未运行）：
+
+- `docs/DEPLOYMENT.md`：nginx 样例补 `proxy_set_header Upgrade $http_upgrade;` 与
+  `proxy_set_header Connection "upgrade";`，`Host` 由 `$host` 改为 `$http_host`，保留
+  `proxy_http_version 1.1;`、`proxy_buffering off;`、1 小时的读写超时。新增「WebSocket 升级」与
+  「缺头、改写 Host 与排查」两节：`101` 的必要条件、缺头时以普通 GET 到达且浏览器只见 `close 1006`、
+  与 401 不可区分、前端静默落到轮询（用户面 30 s，管理面 2 s/5 s/15 s）、服务端日志的拒绝分类、`502/504`
+  → `400/426` → `401` → `101` 的读法、直连与经反代两条 `curl` 对照命令（`--max-time` 在 `101` 后会超时，
+  属正常）、“改写 `Host` 要在反代侧修正、不放宽校验（没有 `LUX_ALLOWED_ORIGINS`，不读转发头）”、
+  Caddy/Tailscale Serve 链路未实机验证。Tailscale 检查项第 4 条收窄为检查项（不再断言 Serve 一定透传
+  `Upgrade`），第 5 条注明转发头只用于展示与访问诊断；“反代应传 `X-Forwarded-For`/`X-Forwarded-Proto`”
+  一句补上同样的限定。
+- `scripts/proxy-smoke.nginx.conf`：同样的两行升级头与 `Host $http_host`；注释写明端口丢失会导致 `400`。
+- 新增 `scripts/check-proxy-config.sh`：不依赖 nginx/docker 的静态检查，从 `docs/DEPLOYMENT.md` 抽出
+  `nginx` 代码块，与 smoke 样例一起断言 `Upgrade`/`Connection`/`Host $http_host`/HTTP/1.1/关闭缓冲/
+  `proxy_read_timeout`，并禁止 `Host $host;`；临时目录建在 `.tmp/` 下并自清理。已接入
+  `scripts/check-all.sh`，`scripts/proxy-smoke.sh` 在启动容器前先调用它。
+- `scripts/proxy-smoke.sh`：登录后新增 `/api/v1/ws` 冒烟——带 cookie 的同源握手断言 `101`、响应
+  `Upgrade: websocket`、`Sec-WebSocket-Accept` 等于客户端 key 的 SHA-1/base64；用 `openssl s_client`
+  在有界轮询里读首帧并断言 `{"type":"ready","version":1}`；缺 `Origin` 与跨源握手断言 4xx（跨源固定
+  `400`），普通 `GET` 断言 4xx 并把实际码写进结果 JSON。监听端口 `18611` 是非默认端口，所以这条冒烟同时
+  是 `Host $http_host` 的回归测试。
+- `docs/COMPATIBILITY.md` 追加 LUX-896 记录（静态结论、未验证项、探针自测）；`docs/CHANGELOG.md`
+  Unreleased 追加「变更」条目。
+
+验收状态（与上面的验收清单逐项对应）：
+
+- [x] 两份 nginx 样例都带 `Upgrade`/`Connection` 与 `Host $http_host`，由
+      `scripts/check-proxy-config.sh` 静态断言（`nginx -t` 未运行：本机没有 nginx）。
+- [ ] `scripts/proxy-smoke.sh` 在真实 nginx 容器里完成 `101` 握手并收到
+      `{"type":"ready","version":1}`：**未运行**（需要含 LUX-894 的镜像与 Docker 构建，本任务禁止）。
+      断言已写好，探针本身用本机 TLS 桩验证过。
+- [ ] 故意删掉 `Upgrade`/`Connection` 头时的实测表现：**未运行**；文档按 ADR-054 写成“普通 GET →
+      `400`/`426` → 浏览器 `1006` → 前端落到轮询”，并标注 ADR 内部 `400`（提取器默认）与 `426`
+      （端点合同）的措辞冲突，以端点合同为准；冒烟对普通 GET 只断言 4xx 并记录实际码。
+- [x] 非默认端口说明与 ADR-054 D5 一致（`$host` 丢端口 → 每次握手 `400`）；冒烟端口 `18611` 让这条成为
+      可执行断言，但该断言尚未实机运行。
+- [x] `docs/COMPATIBILITY.md` 记录日期与未验证项（真实 nginx、缺头实测、Caddy/Tailscale Serve）。
+      未记录 nginx 版本：本机没有 nginx，冒烟未运行（脚本默认镜像 `nginx:1.27-alpine`）。
+
+验证：`bash -n scripts/*.sh`、`bash -n scripts/lib/*.sh` 通过；`scripts/check-proxy-config.sh` 通过
+（输出 “nginx samples carry Upgrade/Connection, Host $http_host, HTTP/1.1 and no buffering”）；冒烟探针
+用本机自签名证书的 TLS socket 桩（`.tmp/` 内、已删除）验证：`curl` 取到 `101` 且
+`Sec-WebSocket-Accept` 匹配、`openssl s_client` 读到首帧、桩的 `400`/`426` 分支被正确识别——这只证明探针
+可用，不证明 nginx。`scripts/proxy-smoke.sh` **未运行**（本机无 nginx、禁止 Docker 构建、当前分支没有
+`/api/v1/ws`）。本次没有 `src/`、`web/` 改动，未跑 Rust/Web 测试。
 
 #### LUX-897：删除两条 SSE 路由与旧测试（未开始）
 

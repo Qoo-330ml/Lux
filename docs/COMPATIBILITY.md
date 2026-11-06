@@ -1880,3 +1880,42 @@ Lux 当时返回 404 空响应，客户端页面不报错、推荐区整块缺�
   `RUST_LOG=luxd=debug` 下无任何该路径请求，也没有新的长连接），说明 WebSocket 不在日志页启动。「服务器
   状态」页面的入口没有在时间预算内找到，因此客户端**从未实际握手**。临时服务器、端口转发与实例数据都已
   删除，手机设置未改动。
+
+## LUX-896 WebSocket 反向代理配置与部署文档（2026-11-06）
+
+证据等级：**样例与文档只做了静态检查，真实反向代理握手未运行**。本任务只改 `docs/` 与 `scripts/`；
+`scripts/proxy-smoke.sh` 新增的 `101` 断言需要包含 LUX-894 `/api/v1/ws` 的镜像，并用 Docker 构建
+`lux:arm64-local`（本任务约束禁止 Docker 构建与安装软件），本机也没有 nginx。下面把“静态一致”与“实机
+验证”分开记录：
+
+- nginx 样例（`docs/DEPLOYMENT.md` 的 `## Nginx 反向代理`、`scripts/proxy-smoke.nginx.conf`）：都补了
+  `proxy_set_header Upgrade $http_upgrade;` 与 `proxy_set_header Connection "upgrade";`，`Host` 由 `$host`
+  改为 `$http_host`，保留 `proxy_http_version 1.1;`、`proxy_buffering off;` 与 1 小时的
+  `proxy_read_timeout`（远大于 25 s 心跳）。`scripts/check-proxy-config.sh` 从 `docs/DEPLOYMENT.md` 抽出
+  `nginx` 代码块，与 smoke 样例一起断言这几条；`scripts/proxy-smoke.sh` 在启动容器前先跑它，
+  `scripts/check-all.sh` 也调用它，所以样例被删改时会先失败。
+- 非默认端口：smoke 监听 `18611`，只有 `Origin: https://127.0.0.1:18611` 与 `Host: $http_host` 一致时才
+  能升级；写成 `$host` 时 `Host` 变成 `127.0.0.1`，握手会因端口丢失被 `400` 拒绝。这条已写成
+  `scripts/proxy-smoke.sh` 的断言，**未实机运行**。
+- 缺头的症状：文档写明“握手以普通 GET 到达 → 不升级 → 浏览器只看到 `close 1006`，与 401 无法区分 →
+  前端静默落到轮询（用户面 30 s，管理面 2 s/5 s/15 s）”，并给出服务端日志的拒绝分类
+  （`origin-missing`/`origin-mismatch`/`sec-fetch-site`/`unauthenticated`/`budget`）与
+  `502/504 → 400/426 → 401 → 101` 的读法。
+- 状态码措辞冲突：ADR-054 的端点合同要求缺 `Upgrade` 时显式返回 `426`，同一 ADR 的「反向代理要求」一节
+  仍写着 Axum 提取器默认的 `400`。部署文档按端点合同写 `426` 并标注该冲突；冒烟对普通 GET 只断言 4xx 并把
+  实际值写进结果 JSON，避免把 LUX-894 的实现细节固定成契约。ADR 正文未修改。
+- `Host` 改写：文档写明“反代改写 `Host` 会让所有握手被 Origin 校验拒绝，修正在反代侧，不是放宽校验”；
+  明确 Lux 没有 `LUX_ALLOWED_ORIGINS`，也不读取 `X-Forwarded-Proto`/`Forwarded`/`X-Forwarded-Host`。
+- Caddy：按 Caddy 文档，`reverse_proxy` 默认透传 `Upgrade`/`Connection` 并保留原始 `Host`；仓库里没有
+  Caddy 配置，该链路**未实机验证**（与 ADR-054 的结论一致，本任务不改这一结论）。
+- 冒烟探针自测（**不代表反向代理**）：用本机自签名证书的本地 TLS socket 桩（建在 `.tmp/` 内、已删除）
+  验证了两处新逻辑——`curl --http1.1 --max-time` 能取到 `101` 状态与握手头，`Sec-WebSocket-Accept` 与
+  客户端 key 匹配；`openssl s_client` 能在有界轮询内读到 `{"type":"ready","version":1}` 首帧。桩同时
+  覆盖 `400`（跨源、缺 `Origin`）与 `426`（普通 GET）。这只证明探针本身可用，不证明 nginx 行为。
+- **未验证项**：真实 nginx 的 `101` 与首帧、缺头时的实测状态码（`400`/`426`）、非默认端口实测、`$host`
+  回归实测、Caddy/Tailscale Serve 链路、含 LUX-894 的镜像本身。合并 LUX-894 后应在有 Docker 的机器执行
+  ``LUX_IMAGE=<含 /api/v1/ws 的镜像> ./scripts/proxy-smoke.sh`` 补跑，并把结果回填到本节。
+
+本次实际执行：`bash -n scripts/*.sh`、`bash -n scripts/lib/*.sh`、`scripts/check-proxy-config.sh`（均
+通过）；`scripts/proxy-smoke.sh` **未运行**（本机无 nginx、任务禁止 Docker 构建、当前分支还没有
+`/api/v1/ws`）。
