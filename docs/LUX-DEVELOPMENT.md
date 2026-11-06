@@ -20107,8 +20107,9 @@ Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 
 - 校验与上限不变：`Limit=abc`、`Limit=1.5`、`StartIndex=abc` 仍在反序列化阶段 400；`StartIndex=-1` 仍因
   负偏移 400；`Limit` 超上限（列表 1000、`Users/Query` 100）仍 400；`Sessions` 的 `ActiveWithinSeconds`
   仍限制在 1..=2592000；`Limit=0` 的既有规则未改。
-- 有意未改：`/Users/{userId}/Images/{imageType}?Index=`（`Option<i32>`，不是列表端点）；`/Items` 的
-  `Limit`/`StartIndex` 仍然不声明 camelCase 别名（既有行为，与本次空值问题无关）。
+- 有意未改：`/Items` 的 `Limit`/`StartIndex` 仍然不声明 camelCase 别名（既有行为，与本次空值问题无关）。
+  （`/Users/{userId}/Images/{imageType}?Index=` 在首轮实现中曾被列为未改，返工后已接入
+  `deserialize_optional_i32`，见下方返工记录。）
 
 验收：
 

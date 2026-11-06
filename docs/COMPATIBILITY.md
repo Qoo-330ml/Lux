@@ -15,11 +15,14 @@ Lux 返回 `400`（`Failed to deserialize query string: Limit: cannot parse inte
   `IsFavorite=` 条目是同一套做法。实现上只有一份判定逻辑：私有 `blank_optional_value<T>` 供
   `deserialize_optional_bool`、`deserialize_optional_i64`、`deserialize_optional_i32` 三个适配器共用，
   没有按结构体各写一份。
-- 非空值的校验完全不变：`Limit=abc`、`Limit=1.5`、`StartIndex=abc`、`Index=abc`、`Hide=abc` 仍在反序列化
+- 非空值的校验基本不变：`Limit=abc`、`Limit=1.5`、`StartIndex=abc`、`Index=abc`、`Hide=abc` 仍在反序列化
   阶段 `400`；`StartIndex=-1` 仍因负偏移 `400`；超过服务端上限仍 `400`（列表端点 `Limit` 上限 1000、
-  `Users/Query` 为 100、`Sessions` 的 `ActiveWithinSeconds` 为 30 天即 2592000 秒）；`Limit=0` 的既有规则
-  不变（请求总数时是纯计数请求，否则按端点默认值）；`Hide` 空值只表示“没提供”，查询与 JSON body 都没给出
-  时仍然是 `400`。
+  `Users/Query` 为 100、`Sessions` 的 `ActiveWithinSeconds` 为 30 天即 2592000 秒）；各端点对 `Limit=0` 的
+  既有规则**逐端点保持原样**（例如 `/Library/MediaFolders` 的 `Limit=0` 仍是 `400`，其他端点各按自己的默认值
+  或纯计数语义）；`Hide` 空值只表示“没提供”，查询与 JSON body 都没给出时仍然是 `400`。
+- 唯一的放宽之外的小差异：共享判定先 `trim()` 再解析，所以带前后空白的数值（如 `Limit=%2010`、
+  `StartIndex=%201`、`Hide=%20true`）此前会 `400`，现在按去空白后的值解析并生效。这是本次引入的行为变化，
+  与“空值按未提供”出自同一处实现；该放宽没有专门的回归测试，也未评估其对其他客户端的影响。
 
 ### 穷尽检查清单：Emby 路由用到的查询类型
 
