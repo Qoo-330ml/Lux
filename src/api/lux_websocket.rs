@@ -1142,6 +1142,35 @@ mod tests {
     }
 
     #[test]
+    fn the_default_budgets_match_the_adr() {
+        let limits = LuxWebsocketLimits::default();
+        assert_eq!(limits.user_max_connections, 128);
+        assert_eq!(limits.user_max_connections_per_user, 16);
+        assert_eq!(limits.admin_max_connections, 64);
+        assert_eq!(limits.admin_max_connections_per_user, 8);
+        assert_eq!(limits.protocol.max_message_bytes, 4 * 1024);
+        // The Emby channel keeps its own budget and its own inbound limit: sharing the
+        // infrastructure must not share the numbers.
+        let emby = WebsocketLimits::default();
+        assert_eq!(emby.max_connections, 32);
+        assert_eq!(emby.max_connections_per_user, 4);
+        assert_eq!(emby.max_message_bytes, 8 * 1024);
+
+        let connections = LuxWebsocketConnections::new(limits);
+        let user = connections.budget(false).limits();
+        assert_eq!(user.max_connections, 128);
+        assert_eq!(user.max_connections_per_user, 16);
+        let admin = connections.budget(true).limits();
+        assert_eq!(admin.max_connections, 64);
+        assert_eq!(admin.max_connections_per_user, 8);
+        let protocol = connections.protocol_limits();
+        assert_eq!(protocol.heartbeat_interval, Duration::from_secs(25));
+        assert_eq!(protocol.idle_timeout, Duration::from_secs(120));
+        assert_eq!(protocol.revalidate_interval, Duration::from_secs(45));
+        assert_eq!(protocol.send_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
     fn upgrade_detection_requires_both_tokens() {
         let websocket = headers(&[
             ("upgrade", "websocket"),

@@ -325,10 +325,11 @@ LUX-891 合并后已按合并后的实测核对：`cargo test --locked --test em
 新握手 `503`；>4 KiB `1009`、二进制 `1003`、未知 `type` 忽略；协议级 ping 保持空闲连接、空闲 `1001`；
 重校验 5xx 不断连。
 
-同一分支的单元测试在 `src/api/lux_websocket.rs`：`cargo test --locked --lib lux_websocket::` 共 **13** 例
-（Origin 解析与归一化、信封逐字渲染、`itemId` 256 字符边界、`{"type":"ping"}` 识别、`ready` 之外的帧类型、
-以及用真实 hub 制造 `Lagged` 后降级为 `home` / `all` 的映射）。`cargo test --locked --lib websocket::`
-随之从 10 例变为 **23** 例（10 例共享基础设施 + 本任务 13 例）。
+同一分支的单元测试在 `src/api/lux_websocket.rs`：`cargo test --locked --lib lux_websocket::` 共 **14** 例
+（Origin 解析与归一化、信封逐字渲染、`itemId` 256 字符边界、`{"type":"ping"}` 识别、升级 token 判定、
+ADR-054 的预算与定时器默认值（用户 128/16、管理 64/8、4 KiB、25 s/120 s/45 s/10 s，以及 Emby 仍是
+32/4 与 8 KiB），以及用真实 hub 制造 `Lagged` 后降级为 `home` / `all` 的映射）。`cargo test --locked
+--lib websocket::` 随之从 10 例变为 **24** 例（10 例共享基础设施 + 本任务 14 例）。
 
 本分支 rebase 前的实测：`cargo test --locked --test admin -- --list` 为 **53** 例（25 例基线 + 本任务
 28 例）；整组 `cargo test --locked --test admin` 连续 2 次均为 52 passed / 1 failed，唯一失败是 5.3 节已记录的

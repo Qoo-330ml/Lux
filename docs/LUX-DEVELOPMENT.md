@@ -21021,7 +21021,7 @@ rustfmt 按新标识符长度重排（`payload_fits` 合并为一行），无逻
 断言 `transcodingStatus.available == false`；`docs/TEST-TARGETS.md` §5.3 已记录，单跑同样失败，与本改动无关）；
 `cargo test --locked --test emby` 82/82；
 `LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test shutdown` 2/2；
-`cargo test --locked --lib websocket::` 23/23、`cargo test --locked --lib lux_websocket::` 13/13；
+`cargo test --locked --lib websocket::` 24/24、`cargo test --locked --lib lux_websocket::` 14/14；
 `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
 `python3 scripts/check-backend-branches.py`（28 files / 266 branches）、`cargo build --locked` 全部通过。
 本机为 arm64（`uname -m`），未做 NAS/x86 并发验证，也未在真实反向代理后握手（属 LUX-896）。
