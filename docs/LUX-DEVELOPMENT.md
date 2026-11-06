@@ -21015,16 +21015,31 @@ rustfmt 按新标识符长度重排（`payload_fits` 合并为一行），无逻
    并行排空 Emby 与 Lux 的三份预算，总上界仍是 5 s；关停信号置位后新握手返回 `503`。Emby 的路由、DTO、
    协议与限额未改，SSE 的两条路由及其测试一行未动。
 
-验证：`cargo test --locked --test admin lux_websocket::` 28/28（连续 2 次）；整组
-`cargo test --locked --test admin` 连续 2 次均为 52 passed / 1 failed，唯一失败是基线已有的环境型用例
+验证（返工后）：`cargo test --locked --test admin lux_websocket::` 在 10 个 `yes` 烧机进程且机器 load average
+200~290 时连续 5 次 28/28（54–74 s）；同一压力下整组 `cargo test --locked --test admin` 为 52 passed / 1 failed；
+停掉烧机进程后整组连续 2 次 52 passed / 1 failed。唯一失败始终是基线已有的环境型用例
 `admin_settings::transcoding_settings_are_admin_only_validated_and_persisted`（本机 VideoToolbox 可用，用例
-断言 `transcodingStatus.available == false`；`docs/TEST-TARGETS.md` §5.3 已记录，单跑同样失败，与本改动无关）；
-`cargo test --locked --test emby` 82/82；
-`LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test shutdown` 2/2；
-`cargo test --locked --lib websocket::` 24/24、`cargo test --locked --lib lux_websocket::` 14/14；
+断言 `transcodingStatus.available == false`；`docs/TEST-TARGETS.md` §5.3 已记录，单跑同样失败，与本改动无关）。
+`cargo test --locked --test emby` 82/82；`LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test shutdown`
+2/2；`cargo test --locked --lib websocket::` 24/24、`cargo test --locked --lib lux_websocket::` 14/14；
 `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
 `python3 scripts/check-backend-branches.py`（28 files / 266 branches）、`cargo build --locked` 全部通过。
 本机为 arm64（`uname -m`），未做 NAS/x86 并发验证，也未在真实反向代理后握手（属 LUX-896）。
+
+返工（2026-11-06，加压稳定性）：两个用例原先依赖固定时间窗——空闲关闭用 `sleep` 后读 close，「保活」在固定
+窗口内断言“没被关闭”——在机器同时跑其它构建/测试时被调度延迟误杀（空闲用例在整组里 27/28、保活用例在整组里
+51/53）。审查复现结果是**测试结构问题**，生产代码没有复现出竞态，因此只改测试：
+
+- **空闲关闭**：不再 `sleep`，改为轮询连接预算空位（`wait_for_capacity`，只有连接任务写完 close 帧、释放槽位后
+  新握手才会成功），随后读 close 帧并断言 `1001` + reason `idle timeout`（同时把“空闲”与关停区分开）。
+- **协议 ping 保活**：改为肯定断言——数到至少 4 个协议 ping 且已观察 1.6 个空闲窗后，再发布一次失效并断言仍能
+  收到帧，而不是“窗口内没被关闭”。
+- **其余等待**：降权/恢复、预算释放、会话撤销、关停、5xx 重校验、事件投递全部改为“轮询到条件成立或
+  `CONDITION_DEADLINE`（20 s）”；只有负向断言（“不应收到 admin 帧”“不应有 pong”）保留短窗口
+  `QUIET_WINDOW`（400 ms），因为窗口越长只越慢、不会更强。
+- **时钟比例**：保活用例心跳 250 ms / 空闲 2.5 s（10 倍），并写注释说明 250 ms ≥ 50 倍典型 5 ms 调度延迟；
+  空闲用例把心跳设为与空闲窗相同（1 s）——服务端先判空闲再发 ping，避免测试客户端在服务端已关闭后才补发 pong
+  被 RST 掩盖 close 帧；比例依据写在用例注释里。
 
 #### LUX-895：前端实时客户端（未开始）
 

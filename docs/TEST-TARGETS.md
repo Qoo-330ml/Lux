@@ -331,6 +331,11 @@ ADR-054 的预算与定时器默认值（用户 128/16、管理 64/8、4 KiB、2
 32/4 与 8 KiB），以及用真实 hub 制造 `Lagged` 后降级为 `home` / `all` 的映射）。`cargo test --locked
 --lib websocket::` 随之从 10 例变为 **24** 例（10 例共享基础设施 + 本任务 14 例）。
 
+模块内的等待方式（返工后）：所有依赖时间的断言都轮询到条件成立或 `CONDITION_DEADLINE`（20 s），例如空闲关闭
+轮询连接预算空位后再读 close 码、协议 ping 保活数到足够的 ping 且超过 1.6 个空闲窗后再断言仍可通信；只有负向
+断言（“不应收到 admin 帧”“不应有 pong”）使用 400 ms 的短窗口。心跳/空闲的时钟比例与依据写在各自用例的注释里，
+因此整组在机器同时跑其它构建/测试（load average 200~290、10 个烧机进程）时连续 5 次 28/28。
+
 本分支 rebase 前的实测：`cargo test --locked --test admin -- --list` 为 **53** 例（25 例基线 + 本任务
 28 例）；整组 `cargo test --locked --test admin` 连续 2 次均为 52 passed / 1 failed，唯一失败是 5.3 节已记录的
 环境型用例 `admin_settings::transcoding_settings_are_admin_only_validated_and_persisted`（本机 VideoToolbox
