@@ -403,6 +403,15 @@ async fn lux_similar_items_match_the_emby_ranking_and_respect_library_acl()
     assert_eq!(body["page"], 1);
     assert_eq!(body["pageSize"], 20);
     assert_eq!(body["hasNext"], false);
+    // The page is built from the Lux item DTO (camelCase `userData`/`mediaSources`), never from
+    // the Emby `Items` projection (`Name`/`Id`/`UserData`).
+    let first = &body["items"][0];
+    assert_eq!(first["title"], "Alpha Similar");
+    assert!(first.get("userData").is_some());
+    assert!(first.get("mediaSources").is_some());
+    assert!(first.get("Id").is_none());
+    assert!(first.get("Name").is_none());
+    assert!(first.get("UserData").is_none());
 
     // The Emby compatibility route is only a protocol adapter over the same service, so the same
     // user and library must see the same ids in the same order.
