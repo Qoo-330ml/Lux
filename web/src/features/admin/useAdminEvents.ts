@@ -65,22 +65,31 @@ const queryKeysByScope: Record<Exclude<AdminEventScope, "all">, QueryKey[]> = {
 };
 
 /**
- * Invalidates only the queries a mounted admin view is currently subscribed to.
+ * Marks the queries an admin event makes stale, refreshing only the ones on screen.
  *
  * The scope lists above describe which data a kind of event can make stale, not which pages are
  * open. Refreshing every listed key blindly makes the server answer requests for pages that are
  * not on screen -- the `jobs` stream alone would touch ten keys up to once per second while a job
- * runs. An unmounted page fetches again when it mounts, so it does not need the refresh here.
+ * runs. The queries that are not on screen are still marked stale with `refetchType: "none"`:
+ * `web/src/main.tsx` keeps every query fresh for 60 s, so a page that unmounts while a job runs
+ * would otherwise keep showing the job as running when it comes back inside that window. An
+ * invalidation overrides `staleTime`, so the next mount refetches; nothing is fetched now.
  */
 function invalidateSubscribedQueries(queryClient: QueryClient, queryKeys: QueryKey[]) {
-  const subscribed = new Map<string, QueryKey>();
+  const active = new Map<string, QueryKey>();
+  const inactive = new Map<string, QueryKey>();
   for (const queryKey of queryKeys) {
-    for (const query of queryClient.getQueryCache().findAll({ queryKey, type: "active" })) {
-      subscribed.set(JSON.stringify(query.queryKey), query.queryKey);
+    for (const query of queryClient.getQueryCache().findAll({ queryKey })) {
+      const hash = JSON.stringify(query.queryKey);
+      const target = query.isActive() ? active : inactive;
+      target.set(hash, query.queryKey);
     }
   }
-  for (const queryKey of subscribed.values()) {
+  for (const queryKey of active.values()) {
     void queryClient.invalidateQueries({ queryKey, exact: true });
+  }
+  for (const queryKey of inactive.values()) {
+    void queryClient.invalidateQueries({ queryKey, exact: true, refetchType: "none" });
   }
 }
 

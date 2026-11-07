@@ -11,6 +11,12 @@ import { FakeWebSocket, installFakeWebSocket } from "./support/fake-websocket";
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
+/** One `jobs` query whose page can be unmounted while the console stays mounted. */
+function StrmJobsPage({ queryFn }: { queryFn: () => Promise<unknown> }) {
+  useQuery({ queryKey: ["admin", "strm-probe-jobs", "all"], queryFn });
+  return null;
+}
+
 /** Stands in for an admin page that subscribes to two of the `jobs` scope query keys. */
 function SubscribedAdminQueries() {
   useQuery({
@@ -270,6 +276,59 @@ describe("admin realtime events", () => {
     await act(async () => await Promise.resolve());
     act(() => vi.advanceTimersByTime(250));
     expect(invalidate).toHaveBeenCalledTimes(2);
+  });
+
+  it("marks an unmounted query stale so the next mount refetches it (LUX-898)", async () => {
+    // `web/src/main.tsx` keeps every query fresh for 60 s. A frame that arrives while its page is
+    // unmounted must still mark the query stale, otherwise a job that finished meanwhile keeps
+    // showing as running until the stale window ends.
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { staleTime: 60_000, retry: false, refetchOnWindowFocus: false },
+      },
+    });
+    const load = vi.fn<() => Promise<unknown>>().mockResolvedValue({ jobs: [] });
+    root = createRoot(container);
+    const renderTree = (showPage: boolean) => act(() => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/admin"]}>
+            <Routes>
+              <Route path="/admin" element={<AdminLayout />}>
+                <Route index element={showPage ? <StrmJobsPage queryFn={load} /> : null} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+
+    renderTree(true);
+    await act(async () => await Promise.resolve());
+    expect(load).toHaveBeenCalledTimes(1);
+
+    // The `ready` sweep (D15②) refreshes the page while it is on screen.
+    act(() => socket().ready());
+    act(() => vi.advanceTimersByTime(250));
+    await act(async () => await Promise.resolve());
+    expect(load).toHaveBeenCalledTimes(2);
+
+    // Leaving the page keeps the console (and its connection) mounted.
+    renderTree(false);
+    await act(async () => await Promise.resolve());
+    expect(load).toHaveBeenCalledTimes(2);
+
+    act(() => socket().message({ type: "invalidate", channel: "admin", scope: "jobs" }));
+    act(() => vi.advanceTimersByTime(250));
+    await act(async () => await Promise.resolve());
+    // No request for a page that is not on screen...
+    expect(load).toHaveBeenCalledTimes(2);
+
+    // ...but the query was marked stale, so mounting it again refetches even inside the 60 s
+    // staleTime window.
+    renderTree(true);
+    await act(async () => await Promise.resolve());
+    expect(load).toHaveBeenCalledTimes(3);
   });
 
   it("prefetches a target page when its navigation link is activated", () => {
