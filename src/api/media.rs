@@ -1202,7 +1202,10 @@ pub(super) async fn lux_get_similar(
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let database = state.database();
     match similar_items_page(&state, principal, &item_id, limit).await {
-        Ok(Some(page)) => {
+        Ok(Some(mut page)) => {
+            // The endpoint accepts no page/cursor parameter, so it can only serve the first page
+            // of the bounded candidate pool. Never advertise a next page the caller cannot ask for.
+            page.has_next = false;
             match lux_catalog_page_json_for_user(database, &user.id.to_string(), &page).await {
                 Ok(body) => Json(body).into_response(),
                 Err(_) => api_error(

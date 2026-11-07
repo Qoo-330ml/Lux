@@ -498,7 +498,21 @@ async fn lux_similar_limit_defaults_caps_and_rejects_invalid_values()
         limited["total"], 3,
         "limit only trims the page, not the total"
     );
-    assert_eq!(limited["hasNext"], true);
+    assert_eq!(
+        limited["hasNext"], false,
+        "the endpoint has no paging parameter, so it never promises a next page"
+    );
+
+    // `total > limit` is the case that would otherwise advertise a next page; the endpoint can
+    // only serve the first page of its bounded candidate pool.
+    let (status, partial) = harness
+        .lux_similar("sim-movie-source", "?limit=2", &harness.viewer_cookie)
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(lux_ids(&partial), ["sim-movie-alpha", "sim-movie-charlie"]);
+    assert_eq!(partial["total"], 3);
+    assert_eq!(partial["pageSize"], 2);
+    assert_eq!(partial["hasNext"], false);
 
     let (status, capped) = harness
         .lux_similar("sim-movie-source", "?limit=1000", &harness.viewer_cookie)

@@ -408,7 +408,8 @@ Emby DTO/参数适配。
   `lux_catalog_items_json_for_user` 生成的 Lux 媒体条目（`MediaItem` 家族），**不是** Emby 的
   `Items`/`TotalRecordCount` DTO。
 - 因此该路由按本文件口径属于 **(b)**：信封与条目都是 `json!` 手拼的 `Value`，没有可派生的具名结构体。
-  `limit` 只裁剪当前页；`total` 是共享服务的有界候选池去重数量。
+  `limit` 只裁剪当前页；`total` 是共享服务的有界候选池去重数量。该端点只返回候选池的第一页
+  （没有 `page`/游标参数），所以 `page` 恒为 1、`hasNext` 恒为 `false`，不是可循环翻页的信封。
 - 目前没有前端消费（Web 详情页的相似区按规格另立任务），所以 `web/src/lib/api/types.ts` 与
   `generated/` 都不新增类型，也不需要重新生成绑定。后续 Web 接入时按「如何扩展到更多路由」的流程，
   先定 `{items,page,pageSize,hasNext,total}` 信封（G-Page）再处理 `MediaItem`（G-MediaItem），不要为此

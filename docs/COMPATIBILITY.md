@@ -1822,7 +1822,8 @@ Lux 当时返回 404 空响应，客户端页面不报错、推荐区整块缺�
 - 响应：Lux 自有形状 `{items,page,pageSize,hasNext,total}`，直接复用
   `lux_catalog_page_json_for_user`。`items` 是 Lux 媒体条目（`lux_catalog_items_json_for_user`），
   **不复用 Emby DTO**；`page` 固定为 1（该端点没有 `page` 参数，只有 `limit`），`pageSize` 回显生效的
-  `limit`，`hasNext` 表示是否还有未返回的候选，`total` 是有界候选池内的去重数量。
+  `limit`，`hasNext` 恒为 `false`（端点只提供有界候选池的第一页，没有 `page`/游标参数，不承诺可获取的
+  下一页），`total` 是有界候选池内的去重数量。
 - `limit`：默认 50，允许 1-1000；显式空值（`?limit=`）视为未提供；`0`、负数、非整数（含 `1.5`）和
   超过 1000 返回 400 `INVALID_REQUEST`。`limit` 只裁剪当前页，不改变 `total`；`0` 被拒绝与 Lux 其他列表
   `pageSize` 必须为正的规则一致，也避免分页信封做 `offset / limit` 时除零。
