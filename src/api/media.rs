@@ -1124,6 +1124,120 @@ pub(super) async fn lux_get_item(
     }
 }
 
+/// Default page size of `GET /api/v1/items/{item_id}/similar`. The hard cap matches the Emby
+/// adapter's `EMBY_MAX_PAGE_LIMIT`, so both protocols page over the same bounded candidate pool.
+const LUX_SIMILAR_DEFAULT_LIMIT: i64 = 50;
+const LUX_SIMILAR_MAX_LIMIT: i64 = 1_000;
+
+#[derive(Deserialize, Default)]
+pub(super) struct LuxSimilarQuery {
+    /// Read as a raw string so an explicit empty value (`?limit=`) means "not provided" instead of
+    /// a deserialization error; non-integers still answer 400. Like the other Lux list endpoints a
+    /// page size must be positive, hence `0` is rejected together with negatives and values above
+    /// the cap.
+    #[serde(default)]
+    limit: Option<String>,
+}
+
+fn lux_similar_limit(raw: Option<&str>) -> Result<i64, &'static str> {
+    let Some(raw) = raw else {
+        return Ok(LUX_SIMILAR_DEFAULT_LIMIT);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(LUX_SIMILAR_DEFAULT_LIMIT);
+    }
+    let limit = raw.parse::<i64>().map_err(|_| "相似条目分页参数无效")?;
+    if !(1..=LUX_SIMILAR_MAX_LIMIT).contains(&limit) {
+        return Err("相似条目分页参数无效");
+    }
+    Ok(limit)
+}
+
+/// Authoritative similar-items lookup shared by the native Lux route and the Emby compatibility
+/// adapter. `CatalogService::list_similar_items` owns the ranking, the ACL and content-restriction
+/// filtering, the bounded candidate pool and `total`; neither protocol re-implements that query.
+///
+/// `None` means the item does not exist or the principal cannot see it, exactly like
+/// `GET /api/v1/items/{item_id}`.
+pub(super) async fn similar_items_page(
+    state: &ReadyAppState,
+    principal: AccessPrincipal,
+    item_id: &str,
+    limit: i64,
+) -> Result<Option<CatalogPage>, CatalogError> {
+    state
+        .catalog()
+        .list_similar_items(principal, item_id, limit)
+        .await
+}
+
+/// `GET /api/v1/items/{item_id}/similar?limit=50`.
+///
+/// The response is the same `{items,page,pageSize,hasNext,total}` envelope as the other Lux list
+/// endpoints and uses the Lux item DTO, never the Emby one. `total` is the bounded candidate-pool
+/// count returned by the shared service; `limit` only trims the page.
+pub(super) async fn lux_get_similar(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Query(query): Query<LuxSimilarQuery>,
+    State(state): State<ReadyAppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let limit = match lux_similar_limit(query.limit.as_deref()) {
+        Ok(limit) => limit,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let database = state.database();
+    match similar_items_page(&state, principal, &item_id, limit).await {
+        Ok(Some(page)) => {
+            match lux_catalog_page_json_for_user(database, &user.id.to_string(), &page).await {
+                Ok(body) => Json(body).into_response(),
+                Err(_) => api_error(
+                    &headers,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    lux::ApiErrorCode::DatabaseUnavailable,
+                    "数据库暂时不可用",
+                )
+                .into_response(),
+            }
+        }
+        Ok(None) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "媒体条目不存在",
+        )
+        .into_response(),
+        Err(CatalogError::Storage(_)) => api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "数据库暂时不可用",
+        )
+        .into_response(),
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "媒体条目不存在",
+        )
+        .into_response(),
+    }
+}
+
 pub(super) struct LuxItemDetail {
     pub(super) body: Value,
     pub(super) user_state: Option<crate::storage::StoredUserItemState>,

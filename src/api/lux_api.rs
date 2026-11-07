@@ -26,6 +26,7 @@ pub(super) fn api_routes() -> Router<ReadyAppState> {
             get(lux_list_library_latest),
         )
         .route("/api/v1/items/{item_id}", get(lux_get_item))
+        .route("/api/v1/items/{item_id}/similar", get(lux_get_similar))
         .route("/api/v1/people", get(lux_search_people))
         .route(
             "/api/v1/people/{person_id}/items",
