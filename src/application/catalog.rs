@@ -160,6 +160,21 @@ const DEFAULT_SEARCH_ITEM_TYPES: [&str; 2] = ["MOVIE", "SERIES"];
 /// Item kinds that can carry playback progress, so the watch history only lists playable leaves.
 const WATCH_HISTORY_ITEM_TYPES: [&str; 3] = ["MOVIE", "EPISODE", "VIDEO"];
 
+/// Server-side upper bound for one tag page.
+///
+/// The HTTP front ends validate their own, smaller bounds before they call the service (100 for
+/// the Lux API, `EMBY_MAX_PAGE_LIMIT` for Emby), so this cap never shortens a valid request; it
+/// keeps the service entry point bounded for any future caller.
+pub(crate) const TAGS_MAX_PAGE_LIMIT: i64 = 1_000;
+
+/// Keeps a tag page request inside `0..=TAGS_MAX_PAGE_LIMIT`.
+///
+/// Clamped instead of asserted: an out-of-range value from a caller that skipped its own
+/// validation costs a bounded query and a short page, never a panic in a request path.
+pub(crate) fn clamped_tags_page_limit(limit: i64) -> i64 {
+    limit.clamp(0, TAGS_MAX_PAGE_LIMIT)
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct SearchFlightKey {
     user_id: String,
@@ -1526,6 +1541,68 @@ impl CatalogService {
         Ok(self
             .database
             .list_catalog_certifications(&query, offset, limit)
+            .await?)
+    }
+
+    /// Distinct tags visible to `principal`, optionally narrowed to one library, ordered by their
+    /// case-insensitive `name_key`.
+    ///
+    /// The list is de-duplicated on `name_key`, so `Star Wars` and `star wars` are one entry, and
+    /// the spelling of the first projected facet row is the displayed one. Visibility follows
+    /// [`Self::list_official_ratings`]: an unknown or inaccessible `library_id` is answered as not
+    /// found, an admin skips the content restrictions, and every other principal only sees the
+    /// tags of the items the restriction policy leaves visible. Served from the
+    /// `media_item_facets` projection, so a request never parses NFO JSON or loads a catalog page.
+    ///
+    /// `limit` is clamped to [`TAGS_MAX_PAGE_LIMIT`]; the routes validate their own bounds first.
+    #[cfg_attr(not(test), allow(dead_code))] // LUX-900's `/api/v1/tags` route is the next increment.
+    pub(crate) async fn list_tags(
+        &self,
+        principal: AccessPrincipal,
+        library_id: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredMediaFacet>, i64), CatalogError> {
+        let library_ids = self
+            .library_scope_for_principal(principal, library_id)
+            .await?;
+        let user_id = principal.user_id_string();
+        let content_restrictions = if principal.is_admin {
+            None
+        } else {
+            self.database.user_content_restrictions(&user_id).await?
+        };
+        let offset = offset.max(0);
+        let limit = clamped_tags_page_limit(limit);
+        let no_values: [String; 0] = [];
+        let query = CatalogFilterQuery {
+            library_ids: &library_ids,
+            user_id: &user_id,
+            item_types: &no_values,
+            excluded_item_types: &no_values,
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            provider_id_equals: None,
+            years: &[],
+            genre_keys: &no_values,
+            studio_keys: &no_values,
+            is_played: None,
+            is_favorite: None,
+            is_resumable: None,
+            min_date_last_saved: None,
+            metadata_pending: false,
+            parent_id_scope: None,
+            content_restrictions: content_restrictions.as_ref(),
+            sort_by: StorageCatalogSort::Name,
+            descending: false,
+            offset,
+            limit,
+            include_total: true,
+        };
+        Ok(self
+            .database
+            .list_catalog_tags(&query, offset, limit)
             .await?)
     }
 
@@ -7010,6 +7087,237 @@ mod tests {
             "the read-model page must answer the Latest request like the authoritative query"
         );
         assert_eq!(read_model_page.total, authoritative_page.total);
+        Ok(())
+    }
+
+    #[test]
+    fn tag_page_limit_is_clamped_to_the_server_bound() {
+        // The service clamps instead of asserting: a caller that forgot its own validation gets a
+        // bounded page rather than an unbounded storage query or a panic.
+        assert_eq!(super::clamped_tags_page_limit(-1), 0);
+        assert_eq!(super::clamped_tags_page_limit(0), 0);
+        assert_eq!(super::clamped_tags_page_limit(25), 25);
+        assert_eq!(
+            super::clamped_tags_page_limit(super::TAGS_MAX_PAGE_LIMIT),
+            super::TAGS_MAX_PAGE_LIMIT
+        );
+        assert_eq!(
+            super::clamped_tags_page_limit(super::TAGS_MAX_PAGE_LIMIT * 4),
+            super::TAGS_MAX_PAGE_LIMIT,
+            "an oversized limit never reaches the storage query"
+        );
+    }
+
+    async fn tag_test_setup() -> Result<
+        (
+            tempfile::TempDir,
+            Database,
+            super::CatalogService,
+            AccessPrincipal,
+            String,
+            String,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        use crate::{
+            application::libraries::LibraryService, auth::users::UserStore, config::Config,
+            library::LibraryKind,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let libraries = LibraryService::new(database.clone());
+        let visible_library = libraries
+            .create_library("Tag Visible", LibraryKind::Movie, false)
+            .await?;
+        let hidden_library = libraries
+            .create_library("Tag Hidden", LibraryKind::Movie, false)
+            .await?;
+        let user = UserStore::new(database.clone())?
+            .create_user("tag-viewer", "Tag Viewer", "test password", false)
+            .await?;
+        database
+            .set_user_library_access(&user.id.to_string(), &visible_library.id.to_string(), true)
+            .await?;
+        let catalog = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database.clone()),
+        );
+        Ok((
+            directory,
+            database,
+            catalog,
+            AccessPrincipal::new(user.id, false),
+            visible_library.id.to_string(),
+            hidden_library.id.to_string(),
+        ))
+    }
+
+    /// One visible movie per entry, each with one TAG facet and one content-restriction rating.
+    async fn insert_tag_item(
+        database: &Database,
+        item_id: &str,
+        library_id: &str,
+        tag: &str,
+        certification_code: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        sqlx::query(
+            "INSERT INTO media_items
+             (id, library_id, item_type, title, sort_title, identification_status,
+              has_available_source)
+             VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(item_id)
+        .bind(library_id)
+        .bind(item_id)
+        .bind(item_id.to_lowercase())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_item_facets (item_id, kind, name_key, name)
+             VALUES (?, 'TAG', ?, ?)",
+        )
+        .bind(item_id)
+        .bind(tag.to_lowercase())
+        .bind(tag)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_content_restriction_index (item_id, certification_code)
+             VALUES (?, ?)",
+        )
+        .bind(item_id)
+        .bind(certification_code)
+        .execute(database.pool())
+        .await?;
+        Ok(())
+    }
+
+    fn tag_names(tags: &[crate::storage::StoredMediaFacet]) -> Vec<&str> {
+        tags.iter().map(|tag| tag.name.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn list_tags_applies_library_acl_and_content_restrictions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::storage::NewUserContentRestrictions;
+
+        let (_directory, database, catalog, principal, visible_library_id, hidden_library_id) =
+            tag_test_setup().await?;
+        insert_tag_item(&database, "tag-visible", &visible_library_id, "Space", "PG").await?;
+        insert_tag_item(
+            &database,
+            "tag-restricted",
+            &visible_library_id,
+            "Gore",
+            "R",
+        )
+        .await?;
+        insert_tag_item(
+            &database,
+            "tag-elsewhere",
+            &hidden_library_id,
+            "Elsewhere",
+            "PG",
+        )
+        .await?;
+        database
+            .compare_and_swap_user_content_restrictions(
+                &principal.user_id_string(),
+                0,
+                NewUserContentRestrictions {
+                    rating_system: "MPA",
+                    maximum_rating: Some("PG-13"),
+                    allow_unrated: false,
+                    allowed_tags: &[],
+                    blocked_tags: &[],
+                },
+            )
+            .await?;
+
+        let (unscoped, unscoped_total) = catalog.list_tags(principal, None, 0, 10).await?;
+        assert_eq!(
+            tag_names(&unscoped),
+            ["Space"],
+            "the hidden library and the R-rated item contribute no tags"
+        );
+        assert_eq!(unscoped_total, 1);
+
+        let (scoped, scoped_total) = catalog
+            .list_tags(principal, Some(&visible_library_id), 0, 10)
+            .await?;
+        assert_eq!(tag_names(&scoped), ["Space"]);
+        assert_eq!(scoped_total, 1);
+
+        assert!(
+            matches!(
+                catalog
+                    .list_tags(principal, Some(&hidden_library_id), 0, 10)
+                    .await,
+                Err(super::CatalogError::LibraryNotFound)
+            ),
+            "an inaccessible library is answered as not found, not as an empty page"
+        );
+        assert!(matches!(
+            catalog
+                .list_tags(principal, Some("missing-library"), 0, 10)
+                .await,
+            Err(super::CatalogError::LibraryNotFound)
+        ));
+
+        let admin_principal = AccessPrincipal::new(
+            principal
+                .user_id
+                .ok_or("the test principal has a user id")?,
+            true,
+        );
+        let (admin_tags, admin_total) = catalog.list_tags(admin_principal, None, 0, 10).await?;
+        assert_eq!(
+            tag_names(&admin_tags),
+            ["Elsewhere", "Gore", "Space"],
+            "an admin sees every enabled library and ignores content restrictions"
+        );
+        assert_eq!(admin_total, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_tags_pages_and_clamps_an_oversized_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database, catalog, principal, visible_library_id, _hidden) =
+            tag_test_setup().await?;
+        insert_tag_item(&database, "tag-alpha", &visible_library_id, "Alpha", "PG").await?;
+        insert_tag_item(&database, "tag-bravo", &visible_library_id, "Bravo", "PG").await?;
+        insert_tag_item(
+            &database,
+            "tag-charlie",
+            &visible_library_id,
+            "Charlie",
+            "PG",
+        )
+        .await?;
+
+        let (first_page, total) = catalog.list_tags(principal, None, 0, 2).await?;
+        assert_eq!(
+            total, 3,
+            "the total describes the whole tag list, not the page"
+        );
+        assert_eq!(tag_names(&first_page), ["Alpha", "Bravo"]);
+        let (second_page, second_total) = catalog.list_tags(principal, None, 2, 2).await?;
+        assert_eq!(second_total, 3);
+        assert_eq!(tag_names(&second_page), ["Charlie"]);
+
+        // An oversized limit is clamped by the service (see `clamped_tags_page_limit`): the
+        // request still answers, bounded to `TAGS_MAX_PAGE_LIMIT`.
+        let (clamped, clamped_total) = catalog
+            .list_tags(principal, None, 0, super::TAGS_MAX_PAGE_LIMIT * 4)
+            .await?;
+        assert_eq!(clamped_total, 3);
+        assert_eq!(clamped.len(), 3);
         Ok(())
     }
 }
