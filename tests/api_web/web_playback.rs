@@ -2111,7 +2111,9 @@ async fn broken_hardware_encoder_falls_back_to_software_transcoding()
     .await?;
 
     // The self-test succeeds (probe args contain the lavfi source) but the real encode with the
-    // hardware encoder fails, which is exactly the "configured but unusable GPU" case.
+    // hardware encoder fails, which is exactly the "configured but unusable GPU" case. Detect the
+    // self-test by its lavfi input instead of the exact testsrc string, which the argument builder
+    // may extend with a pixel-format suffix.
     let fake_ffmpeg = temp_dir.path().join("fake-ffmpeg");
     let fake_ffmpeg_source = [
         "#!/bin/sh",
@@ -2122,7 +2124,7 @@ async fn broken_hardware_encoder_falls_back_to_software_transcoding()
         "segment=\"\"",
         "init=\"init.mp4\"",
         "for arg in \"$@\"; do",
-        "  [ \"$arg\" = \"testsrc=size=320x240:rate=30:duration=0.3\" ] && is_probe=1",
+        "  [ \"$arg\" = \"lavfi\" ] && is_probe=1",
         "  [ \"$arg\" = \"h264_videotoolbox\" ] && is_hardware=1",
         "done",
         "if [ \"$is_hardware\" = \"1\" ] && [ \"$is_probe\" = \"0\" ]; then exit 1; fi",

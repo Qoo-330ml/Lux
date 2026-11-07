@@ -167,7 +167,7 @@ async fn media_info_plugin_config_api_drives_a_background_run()
         3
     );
     let mut auto_queued = false;
-    for _ in 0..100 {
+    for _ in 0..500 {
         let count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM strm_probe_jobs WHERE library_id = ?")
                 .bind(&library_id)
@@ -196,11 +196,14 @@ async fn media_info_plugin_config_api_drives_a_background_run()
         }))
         .send()
         .await?;
-    assert_eq!(scheduled.status(), reqwest::StatusCode::OK);
+    let scheduled_status = scheduled.status();
+    let scheduled_body = scheduled.json::<Value>().await?;
     assert_eq!(
-        scheduled.json::<Value>().await?["scheduledTask"]["schedule"],
-        "0 4 * * *"
+        scheduled_status,
+        reqwest::StatusCode::OK,
+        "{scheduled_body}"
     );
+    assert_eq!(scheduled_body["scheduledTask"]["schedule"], "0 4 * * *");
 
     let plugins = client
         .get(format!(
@@ -220,8 +223,12 @@ async fn media_info_plugin_config_api_drives_a_background_run()
         .ok_or("missing STRM plugin")?;
     assert_eq!(plugin["configValues"]["schedule"], "0 4 * * *");
 
-    for _ in 0..200 {
-        let active: i64 = sqlx::query_scalar(
+    // The manual run is rejected with 409 while any STRM probe job is PENDING or RUNNING, so the
+    // automatically queued job has to reach a terminal state first. Wait for that explicitly: a
+    // fixed short sleep only passes when the machine is idle.
+    let mut active = i64::MAX;
+    for _ in 0..3_000 {
+        active = sqlx::query_scalar(
             "SELECT COUNT(*) FROM strm_probe_jobs WHERE status IN ('PENDING', 'RUNNING')",
         )
         .fetch_one(database_for_assertions.pool())
@@ -230,6 +237,16 @@ async fn media_info_plugin_config_api_drives_a_background_run()
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    if active != 0 {
+        let rows: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(
+            "SELECT id, status, error, created_at FROM strm_probe_jobs ORDER BY created_at",
+        )
+        .fetch_all(database_for_assertions.pool())
+        .await?;
+        panic!(
+            "the automatically queued STRM job must finish before a manual run is accepted: {rows:?}"
+        );
     }
 
     let run = client

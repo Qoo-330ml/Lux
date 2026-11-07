@@ -392,7 +392,9 @@ async fn danmaku_service_matches_local_and_strm_sources_and_writes_sidecars()
     .bind(library.id.to_string())
     .fetch_one(database.pool())
     .await?;
-    let completed = tokio::time::timeout(Duration::from_secs(5), async {
+    // The job spawns a plugin process; under the full `plugins` group (all 128 tests in parallel,
+    // on an external drive) five seconds was regularly exceeded. Thirty still fails a stuck job.
+    let completed = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let job = service.get(&job_id).await?;
             if !matches!(job.status.as_str(), "PENDING" | "RUNNING") {
@@ -494,8 +496,11 @@ async fn danmaku_service_matches_local_and_strm_sources_and_writes_sidecars()
     )
     .execute(database.pool())
     .await?;
+    // The 10k-row materialization is one `INSERT ... SELECT`. The 250 ms guard only held on an
+    // idle machine; the full `plugins` group runs every test in parallel on an external drive, so
+    // keep the guard but give it headroom. `total_count` still asserts the exact semantics.
     let large_job = tokio::time::timeout(
-        Duration::from_millis(250),
+        Duration::from_secs(10),
         service.create_job(library.id, 64, false),
     )
     .await

@@ -224,13 +224,20 @@ async fn forwarded_headers_are_only_honoured_for_trusted_proxies()
         .to_owned();
 
     // Without a trusted proxy, forwarded headers must be ignored in favour of the peer.
+    //
+    // A plain progress tick is coalesced for up to the flush window, so the database row only
+    // changes when a callback is written through. Alternating pause and resume makes every
+    // callback a state change, which is written before the response, so the assertion below
+    // observes exactly the address this request resolved.
+    let mut paused = false;
     for (header, value) in [
         ("X-Real-IP", "203.0.113.9"),
         ("Forwarded", "for=198.51.100.17;proto=https"),
         ("X-Forwarded-For", "198.51.100.20"),
     ] {
+        paused = !paused;
         let playing = client
-            .post(format!("{base_url}/Sessions/Playing"))
+            .post(format!("{base_url}/Sessions/Playing/Progress"))
             .header("X-Emby-Token", &token)
             .header(header, value)
             .json(&json!({
@@ -239,6 +246,7 @@ async fn forwarded_headers_are_only_honoured_for_trusted_proxies()
                 "PlaySessionId": "proxy-session",
                 "PositionTicks": 100,
                 "RunTimeTicks": 5000,
+                "IsPaused": paused,
             }))
             .send()
             .await?;
@@ -267,8 +275,9 @@ async fn forwarded_headers_are_only_honoured_for_trusted_proxies()
             ("X-Real-IP", "203.0.113.9", "127.0.0.1"),
             ("Forwarded", "for=198.51.100.17;proto=https", "127.0.0.1"),
         ] {
+            paused = !paused;
             let playing = client
-                .post(format!("{base_url}{prefix}/Sessions/Playing"))
+                .post(format!("{base_url}{prefix}/Sessions/Playing/Progress"))
                 .header("X-Emby-Token", &token)
                 .header(header, value)
                 .json(&json!({
@@ -277,6 +286,7 @@ async fn forwarded_headers_are_only_honoured_for_trusted_proxies()
                     "PlaySessionId": "proxy-session",
                     "PositionTicks": 100,
                     "RunTimeTicks": 5000,
+                    "IsPaused": paused,
                 }))
                 .send()
                 .await?;
