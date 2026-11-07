@@ -6,7 +6,6 @@ import { Link } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { AdminLibrary, AdminTaskActivity } from "../../lib/api/types";
-import { adminFallbackInterval, useAdminRealtimeConnectionState } from "../admin/useAdminEvents";
 
 const JOB_TYPE_LABELS: Record<string, string> = {
   RECONCILE_LIBRARY: "全量校验",
@@ -33,15 +32,10 @@ export function ScanActivityPopover() {
   const queryClient = useQueryClient();
   const rootRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
-  // The popover lives in the user shell, outside `AdminLayout`; the admin channel state still
-  // covers it (LUX-898) because it subscribes through the admin hook instead of opening a
-  // connection of its own. `adminTaskActivity` is in the `jobs` scope, so the 5 s fallback is only
-  // needed while the channel is down.
-  const adminRealtimeState = useAdminRealtimeConnectionState();
   const activity = useQuery({
     queryKey: queryKeys.adminTaskActivity,
     queryFn: () => api.adminTaskActivity(),
-    refetchInterval: open ? adminFallbackInterval(adminRealtimeState, 5_000) : false,
+    refetchInterval: open ? 5_000 : false,
     refetchIntervalInBackground: false,
   });
   const jobs = useMemo(() => {

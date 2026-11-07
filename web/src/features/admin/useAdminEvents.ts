@@ -94,21 +94,6 @@ function invalidateSubscribedQueries(queryClient: QueryClient, queryKeys: QueryK
 }
 
 /**
- * The polling fallback an admin query keeps while the admin channel is down (LUX-898).
- *
- * ADR-054 D2 keeps the 2 s / 5 s / 15 s fallbacks for a connection that cannot be established, so
- * they stay exactly as they were while the channel is disconnected. Once it is connected the
- * server's `invalidate` frames are what refreshes the scope-covered queries; a timer would only
- * repeat the request a frame already triggered.
- */
-export function adminFallbackInterval(
-  state: RealtimeConnectionState,
-  interval: number,
-): number | false {
-  return state === "connected" ? false : interval;
-}
-
-/**
  * The admin channel's state and invalidation handler, shared by every admin surface.
  *
  * The channel has no socket of its own: ADR-054 D1 puts the admin frames on the page's single

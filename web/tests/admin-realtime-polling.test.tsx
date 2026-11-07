@@ -11,8 +11,9 @@
 import { QueryClient, QueryClientProvider, useQueryClient, type QueryKey } from "@tanstack/react-query";
 import { act, useEffect, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { LuxShell } from "../src/components/layout/LuxShell";
 import { ScanActivityPopover } from "../src/features/activity/ScanActivityPopover";
 import {
   RealtimeConnectionContext,
@@ -147,7 +148,7 @@ describe("admin fallback polling", () => {
     expect(FakeWebSocket.instances).toHaveLength(1);
   });
 
-  it("stops the open task activity popover polling while connected", async () => {
+  it("keeps the task activity popover's interval independent of the admin channel", async () => {
     vi.spyOn(api, "adminTaskActivity").mockResolvedValue({
       activities: [{
         id: "scan-job-1",
@@ -169,14 +170,17 @@ describe("admin fallback polling", () => {
     act(() => container.querySelector<HTMLButtonElement>("button[aria-label*='后台任务活动']")?.click());
     expect(intervalOf(queryKeys.adminTaskActivity)).toBe(5_000);
 
+    // LUX-898 review: the popover stays on its baseline 5 s fallback. It is mounted by the user
+    // shell and several of the jobs it shows (STRM probe, chapter, danmaku, cover) never publish a
+    // `jobs` frame, so trusting a "connected" admin channel would freeze those rows.
     act(() => socket().ready());
-    expect(intervalOf(queryKeys.adminTaskActivity)).toBe(false);
+    expect(intervalOf(queryKeys.adminTaskActivity)).toBe(5_000);
 
     act(() => socket().serverClose(1006));
     expect(intervalOf(queryKeys.adminTaskActivity)).toBe(5_000);
   });
 
-  it("stops the four runtime-record job lists polling while connected", () => {
+  it("slows the four runtime-record job lists to 30 s while connected", () => {
     vi.spyOn(api, "adminScheduledTasks").mockReturnValue(new Promise(() => {}));
     vi.spyOn(api, "adminScheduledTaskPlans").mockReturnValue(new Promise(() => {}));
     vi.spyOn(api, "adminLibraries").mockReturnValue(new Promise(() => {}));
@@ -195,13 +199,60 @@ describe("admin fallback polling", () => {
       queryKeys.adminDanmakuMatchJobs(""),
       queryKeys.adminLibraryCoverJobs(""),
     ];
-    for (const key of jobKeys) expect(intervalOf(key)).toBe(5_000);
+    for (const key of jobKeys) expect(intervalOf(key)).toBe(queryRefreshIntervals.adminJobs);
 
+    // Only the scanner and the metadata reidentify service publish `jobs` frames; the four lists
+    // below also show work that only writes progress to the database, so a connected channel only
+    // stretches the fallback instead of stopping it.
     act(() => socket().ready());
-    for (const key of jobKeys) expect(intervalOf(key)).toBe(false);
+    for (const key of jobKeys) expect(intervalOf(key)).toBe(queryRefreshIntervals.adminJobsConnected);
+    expect(queryRefreshIntervals.adminJobsConnected).toBeGreaterThan(queryRefreshIntervals.adminJobs);
 
     act(() => socket().serverClose(1006));
-    for (const key of jobKeys) expect(intervalOf(key)).toBe(5_000);
+    for (const key of jobKeys) expect(intervalOf(key)).toBe(queryRefreshIntervals.adminJobs);
+  });
+
+  it("does not let a jobs frame refetch the task activity query on a user page", async () => {
+    // The popover is mounted by the user shell for administrators, but the shell subscribes only to
+    // the user channel: no admin frame may reach `adminTaskActivity` outside the console.
+    const activity = vi.spyOn(api, "adminTaskActivity").mockResolvedValue({
+      activities: [{
+        id: "scan-job-1",
+        kind: "scan",
+        taskType: "RECONCILE_LIBRARY",
+        libraryId: "library-1",
+        status: "RUNNING",
+        processedCount: 1,
+        totalCount: 2,
+      }],
+    });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [{ id: "library-1", name: "电影库" }] });
+    queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    act(() => {
+      root = createRoot(container);
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/"]}>
+            <Routes>
+              <Route element={<LuxShell user={{ id: "operator", usernameNormalized: "operator", canManageServer: true }} />}>
+                <Route index element={<div>home</div>} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(activity).toHaveBeenCalled());
+    });
+    expect(FakeWebSocket.instances).toHaveLength(1);
+
+    const calls = activity.mock.calls.length;
+    act(() => socket().ready());
+    act(() => socket().message({ type: "invalidate", channel: "admin", scope: "jobs" }));
+    act(() => vi.advanceTimersByTime(250));
+    await act(async () => await Promise.resolve());
+    expect(activity).toHaveBeenCalledTimes(calls);
   });
 
   it("leaves the transcoding session polling at two seconds when connected", () => {

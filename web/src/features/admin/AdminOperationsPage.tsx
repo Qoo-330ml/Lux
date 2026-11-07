@@ -22,7 +22,7 @@ import { useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { LuxSelect } from "../../components/LuxSelect";
 import { api } from "../../lib/api/client";
-import { queryKeys } from "../../lib/api/query-keys";
+import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type {
   AdminAuditEvent,
   AdminChapterDetectionJob,
@@ -36,7 +36,7 @@ import type {
   AdminStrmProbeJob,
 } from "../../lib/api/types";
 import { formatAdminDate } from "./date";
-import { adminFallbackInterval, useAdminRealtimeConnectionState } from "./useAdminEvents";
+import { useAdminRealtimeConnectionState } from "./useAdminEvents";
 import { LuxButton, LuxIconButton, LuxSwitch, LuxTextField, useLuxConfirm } from "../../components/ui";
 
 type OperationsTab = "registered" | "runs" | "logs";
@@ -201,11 +201,15 @@ const ERROR_LABELS: Record<string, string> = {
 
 export function AdminOperationsPage() {
   const queryClient = useQueryClient();
-  // LUX-898: the four runtime-record lists are all in the `jobs` scope. The fallback interval is
-  // shared by them and only applies while the admin channel is down; the badge counts keep coming
-  // from the same queries either way.
+  // LUX-898: the four runtime-record lists only *slow down* while the admin channel is connected.
+  // Only the scanner and the metadata reidentify service publish `jobs` frames; STRM probe, chapter
+  // detection, danmaku matching and library cover write progress to the database without an event,
+  // so stopping the timers would leave those rows at RUNNING. The badge counts keep coming from the
+  // same queries either way.
   const adminRealtimeState = useAdminRealtimeConnectionState();
-  const jobsFallbackInterval = adminFallbackInterval(adminRealtimeState, 5_000);
+  const jobsFallbackInterval = adminRealtimeState === "connected"
+    ? queryRefreshIntervals.adminJobsConnected
+    : queryRefreshIntervals.adminJobs;
   const [tab, setTab] = useState<OperationsTab>("registered");
   const [status, setStatus] = useState("");
   const [logLevel, setLogLevel] = useState("");

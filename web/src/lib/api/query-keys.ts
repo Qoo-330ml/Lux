@@ -125,5 +125,13 @@ export const queryRefreshIntervals = {
    * scope on audit/activity events, so a quiet server never refreshes them through frames.
    */
   liveDashboardConnected: 60_000,
+  /**
+   * LUX-898 review: the four runtime-record job lists keep a 30 s fallback while the admin channel
+   * is connected. Only the scanner and the metadata reidentify service publish `jobs` frames; the
+   * STRM probe, chapter detection, danmaku matching, library cover and scheduled-task services
+   * only write progress to the database, so their rows would freeze at RUNNING without a timer.
+   */
+  adminJobs: 5_000,
+  adminJobsConnected: 30_000,
   mediaSurface: 30_000,
 } as const;
