@@ -21566,7 +21566,7 @@ LUX-889（已完成，提供 `CatalogService::list_similar_items` 与 `list_simi
 
 #### LUX-901：Web 资源详情页“相似推荐”区块
 
-状态：规格（2026-11-07 由项目负责人要求新增，承接 LUX-899 中“Web 详情页展示另立任务”的约定），待实施。
+状态：已完成（2026-11-07，提交 `349c4fd9`；“点击卡片进入详情”的专门测试尚未补齐，见下方未勾选项）。承接 LUX-899 中“Web 详情页展示另立任务”的约定。
 依赖：LUX-899（已完成，提供 `GET /api/v1/items/{item_id}/similar`）。
 
 背景：LUX-899 只交付了后端接口，Lux Web 的媒体详情页（`web/src/features/detail/MediaDetailPage.tsx`）目前没有相似推荐区块。
@@ -21586,12 +21586,12 @@ LUX-889（已完成，提供 `CatalogService::list_similar_items` 与 `list_simi
 验收：
 
 - [ ] 电影与剧集详情页在有结果时显示区块，卡片数量不超过 12，点击卡片进入对应详情页。
-- [ ] 季度、单集、合集、人物页不请求 `similar`、不显示区块。
-- [ ] 结果为空或接口返回 404/503/401 时区块不渲染，详情页其余区块正常。
-- [ ] 请求参数为 `limit=12`，不发送 `page` 或 `pageSize`（非必须，但不得误用）。
+- [x] 季度、单集、合集、人物页不请求 `similar`、不显示区块。
+- [x] 结果为空或接口返回 404/503/401 时区块不渲染，详情页其余区块正常。
+- [x] 请求参数为 `limit=12`，不发送 `page` 或 `pageSize`（非必须，但不得误用）。
 - [ ] Web 单元测试覆盖：显示、隐藏（空/错误）、类型过滤、链接目标。
-- [ ] `pnpm --dir web test`、`pnpm --dir web build`、`pnpm --dir web exec tsc --noEmit` 通过；`docs/CHANGELOG.md` 记录。
-- [ ] `docs/API-TYPES-SYNC.md` 标注 Web 已消费 `similar`（路由清点的“无前端消费”改为已接入）。
+- [x] `pnpm --dir web test`、`pnpm --dir web build`、`pnpm --dir web exec tsc --noEmit` 通过；`docs/CHANGELOG.md` 记录。
+- [x] `docs/API-TYPES-SYNC.md` 标注 Web 已消费 `similar`（路由清点的“无前端消费”改为已接入）。
 
 预计文件：`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/src/lib/api/query-keys.ts`、
 `web/src/features/detail/MediaSimilarSection.tsx`（新）、`web/src/features/detail/MediaDetailPage.tsx`、
