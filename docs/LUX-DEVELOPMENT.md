@@ -21426,9 +21426,10 @@ TLS socket 桩（`.tmp/` 内、已删除）验证过 `101` + `Sec-WebSocket-Acce
 `docs/API.md`、`docs/WEB-POLLING-AUDIT.md`、`docs/TEST-TARGETS.md`、`docs/CHANGELOG.md`、
 `docs/DEPLOYMENT.md`、`docs/LUX-DEVELOPMENT.md`。
 
-#### LUX-898：管理端实时连接状态与关闭兜底轮询（未开始，独立任务）
+#### LUX-898：管理端实时连接状态与关闭兜底轮询（已完成）
 
-状态：未开始（计划）。依赖：无（不依赖 SSE → WebSocket 迁移，可单独发布）。
+状态：已完成（2026-11-07）。依赖：无（不依赖 SSE → WebSocket 迁移，可单独发布）；实现复用 LUX-895 的
+`RealtimeConnectionState` 与共享连接。
 
 范围：让管理端拿到实时连接状态（`useAdminEvents` 暴露状态，或复用 `useRealtimeConnectionState` 的管理版），
 管理页按“已连接”关闭兜底轮询：仪表盘 15 s、任务活动弹层 5 s、运行记录四类任务列表各 5 s；断线或握手
@@ -21439,17 +21440,61 @@ TLS socket 桩（`.tmp/` 内、已删除）验证过 `101` + `Sec-WebSocket-Acce
 
 验收：
 
-- [ ] 已连接时 `adminDashboard`、`adminTaskActivity` 与四类 jobs 查询的 `refetchInterval` 为 `false`，
+- [x] 已连接时 `adminDashboard`、`adminTaskActivity` 与四类 jobs 查询的 `refetchInterval` 为 `false`，
       断线后恢复原间隔（两态各有测试）。
-- [ ] 转码 2 s、`admin/emby-migrations*`、`admin/library-deletion-jobs`、
+- [x] 转码 2 s、`admin/emby-migrations*`、`admin/library-deletion-jobs`、
       `admin/content-restriction-index` 的轮询行为不变，原因写进 `docs/WEB-POLLING-AUDIT.md`。
-- [ ] `pnpm --dir web test`、`pnpm --dir web build` 通过；`docs/WEB-POLLING-AUDIT.md` 第 27、115 行附近
+- [x] `pnpm --dir web test`、`pnpm --dir web build` 通过；`docs/WEB-POLLING-AUDIT.md` 第 27、115 行附近
       的描述已更新为当前事实。
 
-预计改动文件：`web/src/features/admin/useAdminEvents.ts`、`web/src/features/admin/AdminLayout.tsx`、
-`web/src/features/admin/AdminDashboardPage.tsx`、`web/src/features/activity/ScanActivityPopover.tsx`、
-`web/src/features/admin/AdminOperationsPage.tsx`、`web/tests/admin-events.test.tsx`、
-`web/tests/admin-dashboard.test.tsx`、`docs/WEB-POLLING-AUDIT.md`、`docs/LUX-DEVELOPMENT.md`。
+实际改动文件：`web/src/features/admin/useAdminEvents.ts`、`web/src/features/admin/AdminDashboardPage.tsx`、
+`web/src/features/activity/ScanActivityPopover.tsx`、`web/src/features/admin/AdminOperationsPage.tsx`、
+`web/src/lib/realtime/client.ts`、`web/tests/admin-realtime-polling.test.tsx`（新）、
+`web/tests/realtime-client.test.ts`、`docs/WEB-POLLING-AUDIT.md`、`docs/LUX-DEVELOPMENT.md`。
+`AdminLayout.tsx` 未改：它继续调用 `useAdminEvents()`，只是该 hook 现在返回状态并负责管理端唯一一次
+频道注册。
+
+实施结果（2026-11-07）：
+
+- **状态来源是 admin 频道，不是用户频道**。`useAdminEvents()` 现在返回 `RealtimeConnectionState`，并新增
+  `useAdminRealtimeConnectionState()`（`web/src/features/admin/useAdminEvents.ts`）：两者都只在管理面挂载，
+  只在共享连接收到首帧 `ready` 时报告 `"connected"`；管理页不读 `RealtimeConnectionContext`，所以用户频道
+  已连接不会让管理页停止轮询，非管理员也不会订阅管理频道。仪表盘、任务活动弹层与运行记录四类任务列表
+  使用 `adminFallbackInterval(state, interval)`，已连接时返回 `false`，否则返回原间隔。
+- **不新开连接**。`web/src/lib/realtime/client.ts` 新增 `observeRealtime()`：与 `subscribeRealtime()` 收到
+  同样的 `ready` / `invalidate` / 状态 / 失败事件，但不启动也不保活 socket。管理频道用它被动观察
+  `LuxShell` 持有的那条 `/api/v1/ws`；只有 `AdminLayout` 的 `useAdminEvents()` 额外用 `subscribeRealtime()`
+  保证“没有用户频道时控制台仍有一条连接”。协议、退避与连接生命周期未改。管理端的失效处理（scope 表、
+  250 ms 合并窗、每次 open 全量失效、挂载时的 D15② 全量失效）收敛为一次注册，多个管理组件同时挂载不会
+  重复失效。
+- **关闭的四类**：`adminDashboard`（15 s）、`adminTaskActivity`（5 s，仅弹层打开时）、
+  `adminStrmProbeJobs` / `adminChapterDetectionJobs` / `adminDanmakuMatchJobs` / `adminLibraryCoverJobs`
+  （各 5 s）。四类 jobs 共用一个由连接状态派生的间隔，仍同时驱动「运行记录」标签页计数，不按标签页关闭。
+- **保持轮询的四类及原因**（写入 `docs/WEB-POLLING-AUDIT.md` 的 LUX-898 小节）：转码会话 2 s、
+  `admin/emby-migrations*` 5 s、媒体库删除任务（`AdminLibraryDeletionPanel`，有任务 5 s / 空闲 15 s）、
+  内容分类索引状态 5 s（仅 `pendingItems`）。它们都没有被任何管理事件 scope 覆盖，`invalidate` 帧不会因
+  这些数据变化而出现；`all` 帧只在连接建立与广播 lag 降级时出现，不能当常态刷新。补齐需要后端新增或
+  扩展事件 scope，超出本任务范围（`src/` 未改）。
+- **测试**：新增 `web/tests/admin-realtime-polling.test.tsx`（9 例）——仪表盘、任务活动弹层与四类 jobs 在
+  未连接 / 已连接 / 断线恢复 / `1008` 四种情形下的 `refetchInterval`；用户频道上下文声称 `connected` 时
+  管理页仍按 15 s 轮询且不建 socket；转码 2 s、媒体库删除任务（有任务 5 s / 空闲 15 s）与内容索引
+  （`pendingItems` 时 5 s）不变。
+  `web/tests/realtime-client.test.ts` 新增 `observeRealtime` 用例（不建连、收帧与状态、退出不关闭 owner 的
+  socket）。`admin-events.test.tsx` 的 D15②/D15③ 与“共享一条 socket”用例、`admin-dashboard.test.tsx`、
+  `admin-operations.test.tsx`、`scan-activity.test.tsx`、`user-events.test.tsx`、`lux-shell.test.tsx` 均未
+  改断言并保持通过。
+- **文档**：`docs/WEB-POLLING-AUDIT.md` 第 27 行改为管理频道连接状态的当前事实；第 115 行（「需要后续
+  任务处理」第 1 条）标记完成；表格第 10、15–19 行标注“admin 频道已连接时 `false`”；文末新增
+  「LUX-898」小节，记录剩余轮询表、所有权模型、降权后的已知窗口（ADR-054 D7 只停 admin 帧、不关连接，
+  客户端要等下一次重连才纠正）与复核命令。SSE 描述未改（属 LUX-897）。
+- **未做**：不改 `src/` 与后端事件 scope；不删 SSE 路由（LUX-897）；不改 `web/src/lib/realtime/{socket,types}.ts`
+  的协议或退避；不改转码 / Emby 迁移 / 媒体库删除 / 内容索引的轮询配置。
+
+验证（2026-11-07，本机 arm64）：`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web build`、
+`pnpm --dir web exec tsc --noEmit` 通过；`pnpm --dir web test` 连跑两次，均为 167 个 `node --test` 用例 +
+170 个 vitest 文件 / 1581 例全绿（`asset-precompression` 需要先构建 `web/dist`，因此构建在两次测试之前
+执行）。先写的失败用例（`admin-realtime-polling.test.tsx` 4 红）在实现后转绿；`web/tests/realtime-client.test.ts`
+的 observer 用例同样先红后绿。
 
 ## 31. 参考资料
 
