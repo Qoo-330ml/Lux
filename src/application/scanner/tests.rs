@@ -1776,6 +1776,10 @@ async fn local_metadata_worker_persists_capability_missing()
     .bind(library.id.to_string())
     .execute(database.pool())
     .await?;
+    // The raw UPDATE above bypasses the service write that signals the outbox worker. The worker
+    // otherwise only re-reads the queue after its 10 s idle fallback, which is this test's whole
+    // timeout budget.
+    jobs.notify_local_metadata_outbox_worker();
 
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
@@ -3492,6 +3496,12 @@ fn season_directory_accepts_a_single_trailing_label_word() {
     assert_eq!(parse_season_directory("S2"), Some((2, None)));
     assert_eq!(parse_season_directory("Specials"), Some((0, None)));
     assert_eq!(parse_season_directory("Season 1 (2024)"), Some((1, None)));
+    assert_eq!(
+        parse_season_directory("Season 1(1)"),
+        Some((1, None)),
+        "a duplicated season folder is still that season without the copy marker"
+    );
+    assert_eq!(parse_season_directory("S01(2)"), Some((1, None)));
     assert_eq!(
         parse_season_directory("Season 1 DV"),
         Some((1, Some("DV".to_owned())))

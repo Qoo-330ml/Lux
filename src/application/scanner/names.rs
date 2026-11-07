@@ -459,9 +459,9 @@ pub(super) fn parse_season_directory(value: &str) -> Option<(u32, Option<String>
     if remainder.is_empty() {
         return Some((season, None));
     }
-    if !remainder.starts_with(char::is_whitespace) {
-        return None;
-    }
+    // A duplicated folder is named `Season 1 (1)` by most tools but `Season 1(1)` by some, so the
+    // copy marker is recognised with or without the separating space. A version label such as
+    // `Season 1DV` still stays rejected: only a parenthesised number is a copy marker.
     let label = remainder.trim();
     if let Some(inner) = label
         .strip_prefix('(')
@@ -470,6 +470,9 @@ pub(super) fn parse_season_directory(value: &str) -> Option<(u32, Option<String>
         && inner.chars().all(|character| character.is_ascii_digit())
     {
         return Some((season, None));
+    }
+    if !remainder.starts_with(char::is_whitespace) {
+        return None;
     }
     if label.is_empty() || label.contains(char::is_whitespace) {
         return None;
