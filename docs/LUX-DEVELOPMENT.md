@@ -21530,9 +21530,9 @@ admin 事件）。
 （30 s/5 s、弹层不接入、壳层不因 `jobs` 帧重取）3 红。`web/tests/realtime-client.test.ts` 的 observer 用例
 同样先红后绿。
 
-#### LUX-899：Lux 原生 `GET /api/v1/items/{item_id}/similar`（Emby Similar 改为兼容适配层）
+#### LUX-899：Lux 原生 `GET /api/v1/items/{item_id}/similar`（Emby Similar 改为兼容适配层）（已完成）
 
-状态：规格草案（2026-11-07 由项目负责人确认修订 LUX-889 的约束后新增），待项目负责人确认后实施。依赖：
+状态：已完成（2026-11-07）。规格修订由项目负责人确认；子会话实现后经 7 轮独立审查返工，最终由本地测试验收（见 `docs/CHANGELOG.md` Unreleased）。依赖：
 LUX-889（已完成，提供 `CatalogService::list_similar_items` 与 `list_similar_catalog_rows`）。
 
 背景：LUX-889 把相似条目只做成 Emby 兼容路由，并约定“不改 `/api/v1` DTO 与 `web/`”。本任务取代该约束中
@@ -21542,7 +21542,7 @@ LUX-889（已完成，提供 `CatalogService::list_similar_items` 与 `list_simi
 
 - 新增 `GET /api/v1/items/{item_id}/similar`，鉴权与其他 `/api/v1/items/{item_id}/*` 路由一致（Lux token），
   执行媒体库 ACL 与内容限制。
-- 请求参数：`limit`（默认 50，上限 1000，非法值 400），其余不引入。
+- 请求参数：`limit`（默认 50，上限 1000，非法值 400）；`page`（1 起，默认 1，非法值 400）；`pageSize` 作为 `limit` 的别名（同时提供且不一致返回 400）。项目负责人于 2026-11-07 确认“按规格做分页”，`page` 与 `offset=(page-1)*limit` 属于本任务范围。
 - 响应 DTO 为 Lux 自有类型（不复用 Emby DTO），字段与分页约定沿用现有 `/api/v1` 列表响应，实施前在
   `docs/API.md` 与 `docs/API-TYPES-SYNC.md` 核对并同步。
 - 相似规则与候选池上限与 LUX-889 完全一致，由同一个 `CatalogService::list_similar_items` 提供，不复制 SQL。
@@ -21552,13 +21552,13 @@ LUX-889（已完成，提供 `CatalogService::list_similar_items` 与 `list_simi
 
 验收：
 
-- [ ] Lux 路由返回的 `items` 与 Emby 路由在同一库与同一用户下的条目 id 顺序一致（同一服务，回归对照测试）。
-- [ ] `limit` 生效；空值按未提供；负数、非整数或超上限 400；不存在或不可见的条目 404；未鉴权 401。
-- [ ] 被媒体库 ACL 或内容限制排除的条目不出现在结果或 `totalRecordCount`。
-- [ ] Emby `cargo test --locked --test emby emby_similar::` 6/6 保持通过，且不修改其断言。
-- [ ] 新增 Lux 路由集成测试（`--test auth_users` 或 `--test library` 中选择与路由所在域一致的分组，实施时在
+- [x] Lux 路由返回的 `items` 与 Emby 路由在同一库与同一用户下的条目 id 顺序一致（同一服务，回归对照测试）。
+- [x] `limit` 生效；空值按未提供；负数、非整数或超上限 400；不存在或不可见的条目 404；未鉴权 401。
+- [x] 被媒体库 ACL 或内容限制排除的条目不出现在结果或 `totalRecordCount`。
+- [x] Emby `cargo test --locked --test emby emby_similar::` 6/6 保持通过，且不修改其断言。
+- [x] 新增 Lux 路由集成测试（`--test auth_users` 或 `--test library` 中选择与路由所在域一致的分组，实施时在
       `docs/TEST-TARGETS.md` 登记）。
-- [ ] 存储与服务层不新增 SQL 扫描：沿用 LUX-889 的查询计划验收。
+- [x] 存储与服务层不新增 SQL 扫描：沿用 LUX-889 的查询计划验收。
 
 预计文件：`src/api/lux_api.rs`（或同域的新模块）、`src/api/emby_similar.rs`、`src/application/catalog.rs`、
 `src/api/dto` 中的 Lux 响应类型、`tests/` 下新增 Lux 路由测试、`docs/API.md`、`docs/API-TYPES-SYNC.md`、
