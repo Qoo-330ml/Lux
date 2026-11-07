@@ -934,6 +934,9 @@ fn emby_facet_id(kind: Option<MediaFacetKind>, name_key: &str) -> String {
     let prefix = match kind {
         Some(MediaFacetKind::Genre) => "genre",
         Some(MediaFacetKind::Studio) => "studio",
+        // No Emby route asks for TAG facets yet (LUX-900 only projects them); the arm keeps the
+        // match exhaustive until `/Tags` reads them.
+        Some(MediaFacetKind::Tag) => "tag",
         None => "year",
     };
     let hex = name_key
@@ -1001,6 +1004,8 @@ async fn emby_facets(
     let type_name = match kind {
         Some(MediaFacetKind::Genre) => "Genre",
         Some(MediaFacetKind::Studio) => "Studio",
+        // Unreachable until a route requests TAG facets; the arm keeps the match exhaustive.
+        Some(MediaFacetKind::Tag) => "Tag",
         None => "Year",
     };
     Json(json!({

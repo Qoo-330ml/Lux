@@ -61,6 +61,7 @@ pub(crate) struct StoredMediaCertification {
 pub(crate) enum MediaFacetKind {
     Genre,
     Studio,
+    Tag,
 }
 
 impl MediaFacetKind {
@@ -68,6 +69,7 @@ impl MediaFacetKind {
         match self {
             Self::Genre => "GENRE",
             Self::Studio => "STUDIO",
+            Self::Tag => "TAG",
         }
     }
 }

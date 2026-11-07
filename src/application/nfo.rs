@@ -150,6 +150,9 @@ pub struct LocalNfoDetails {
     pub countries: Vec<String>,
     pub genres: Vec<String>,
     pub studios: Vec<String>,
+    /// Item-level `<tag>` values, kept separate from `genres` so the parental-control projection
+    /// (`media_content_restriction_tags`) keeps matching on genres only.
+    pub tags: Vec<String>,
     pub provider_ids: BTreeMap<String, String>,
     pub directors: Vec<LocalNfoCredit>,
     pub writers: Vec<LocalNfoCredit>,
@@ -983,6 +986,7 @@ enum RichValueKind {
     Country,
     Genre,
     Studio,
+    Tag,
     Provider(String),
     Director(String),
     Writer(String),
@@ -1012,6 +1016,7 @@ fn rich_value_kind(event: &BytesStart<'_>) -> Result<Option<RichValueKind>, NfoE
         b"country" => RichValueKind::Country,
         b"genre" => RichValueKind::Genre,
         b"studio" => RichValueKind::Studio,
+        b"tag" => RichValueKind::Tag,
         b"trailer" => RichValueKind::Trailer,
         b"director" => {
             RichValueKind::Director(attribute_value(event, b"tmdbid")?.unwrap_or_default())
@@ -1180,6 +1185,7 @@ fn assign_rich_value(
         RichValueKind::Country => push_bounded(&mut details.countries, raw_value),
         RichValueKind::Genre => push_bounded(&mut details.genres, raw_value),
         RichValueKind::Studio => push_bounded(&mut details.studios, raw_value),
+        RichValueKind::Tag => push_bounded(&mut details.tags, raw_value),
         RichValueKind::Provider(provider) => {
             if let Some(value) = bounded_id(raw_value) {
                 details.provider_ids.insert(provider, value);
@@ -5032,6 +5038,44 @@ mod tests {
             !crate::application::images::should_suppress_internal_image_write(&target).await,
             "an external edit should invalidate the internal-write marker"
         );
+    }
+
+    #[test]
+    fn nfo_tag_elements_feed_the_item_tag_list() {
+        let details = parse_local_nfo_details(
+            br#"<movie><title>Tags</title><tag>  Sci-Fi  </tag>
+                <tag>Sci-Fi</tag><tag>Director's Cut</tag>
+                <tag>   </tag><tag></tag><genre>Drama</genre></movie>"#,
+        )
+        .expect("parse tag elements");
+
+        assert_eq!(details.tags, ["Sci-Fi", "Director's Cut"]);
+        assert_eq!(details.genres, ["Drama"]);
+    }
+
+    #[test]
+    fn nfo_tag_elements_follow_the_bounded_detail_rules() {
+        let mut xml = String::from("<movie>");
+        for index in 0..(MAX_MOVIE_NFO_DETAILS_ITEMS + 8) {
+            xml.push_str(&format!("<tag>tag-{index}</tag>"));
+        }
+        xml.push_str("</movie>");
+        let details = parse_local_nfo_details(xml.as_bytes()).expect("bounded tag parse");
+        assert_eq!(details.tags.len(), MAX_MOVIE_NFO_DETAILS_ITEMS);
+        assert_eq!(details.tags.first().map(String::as_str), Some("tag-0"));
+        assert_eq!(details.tags.last().map(String::as_str), Some("tag-63"));
+        assert!(
+            !details.tags.iter().any(|tag| tag == "tag-64"),
+            "tag values stop at the shared detail item bound"
+        );
+
+        let oversized = format!(
+            "<movie><tag>{}</tag></movie>",
+            "x".repeat(MAX_MOVIE_NFO_DETAILS_TEXT_BYTES + 1)
+        );
+        let error = parse_local_nfo_details(oversized.as_bytes())
+            .expect_err("an oversized tag is rejected like the other detail fields");
+        assert!(matches!(error, NfoError::FieldTooLarge));
     }
 
     #[test]

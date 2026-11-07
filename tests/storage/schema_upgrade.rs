@@ -1,4 +1,5 @@
-//! Schema upgrades that must keep existing rows working (ADR-052 P5 provenance columns).
+//! Schema upgrades that must keep existing rows working (ADR-052 P5 provenance columns, the
+//! LUX-900 `media_item_facets` kind rebuild).
 //!
 //! The upgrade is exercised the way a deployment sees it: build the schema *without* the new
 //! migration, write data, then apply the new migration and check that the old rows kept their
@@ -10,19 +11,31 @@ use sqlx::{SqlitePool, migrate::Migrator, sqlite::SqlitePoolOptions};
 
 const NEW_MIGRATION: &str = "0246_danmaku_manual_match_provenance.sql";
 
-/// Copies the SQLite migrations into `target`, skipping `skip`.
-fn copy_migrations(target: &Path, skip: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// Copies the SQLite migrations with a version below `before` into `target`.
+///
+/// Later migrations must not leak into an upgrade test: each test owns one migration and applies it
+/// separately, so the database it builds has to stop right before that migration.
+fn copy_migrations_before(target: &Path, before: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let limit = migration_version(before)?;
     fs::create_dir_all(target)?;
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
     for entry in fs::read_dir(source)? {
         let entry = entry?;
-        let name = entry.file_name();
-        if name.to_string_lossy() == skip {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if migration_version(&name)? >= limit {
             continue;
         }
-        fs::copy(entry.path(), target.join(name))?;
+        fs::copy(entry.path(), target.join(&name))?;
     }
     Ok(())
+}
+
+fn migration_version(name: &str) -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(name
+        .split('_')
+        .next()
+        .ok_or("migration file name")?
+        .parse::<i64>()?)
 }
 
 fn copy_one_migration(target: &Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -100,7 +113,7 @@ async fn danmaku_provenance_columns_upgrade_existing_rows_in_place()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let migrations = directory.path().join("migrations-old");
-    copy_migrations(&migrations, NEW_MIGRATION)?;
+    copy_migrations_before(&migrations, NEW_MIGRATION)?;
     let pool = open_pool(&directory.path().join("lux.db")).await?;
     Migrator::new(migrations.as_path())
         .await?
@@ -214,6 +227,143 @@ async fn danmaku_provenance_columns_upgrade_existing_rows_in_place()
         .await
         .is_err(),
         "one library must still have at most one active danmaku job"
+    );
+
+    pool.close().await;
+    Ok(())
+}
+
+const TAG_FACET_MIGRATION: &str = "0249_media_item_facets_tag.sql";
+
+#[tokio::test]
+async fn tag_facet_migration_keeps_existing_rows_and_requeues_items()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let migrations = directory.path().join("migrations-old");
+    copy_migrations_before(&migrations, TAG_FACET_MIGRATION)?;
+    let pool = open_pool(&directory.path().join("lux.db")).await?;
+    Migrator::new(migrations.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+    let old_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        old_version, 246,
+        "the SQLite history ends at 0246; 0247/0248 are PostgreSQL-only"
+    );
+
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('tag-library', 'Tags', 'MOVIE')")
+        .execute(&pool)
+        .await?;
+    for (item_id, removed_at) in [("tag-item", None), ("tag-removed-item", Some(1_i64))] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status, removed_at
+             ) VALUES (?, 'tag-library', 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', ?)",
+        )
+        .bind(item_id)
+        .bind(item_id)
+        .bind(item_id)
+        .bind(removed_at)
+        .execute(&pool)
+        .await?;
+    }
+    // An already indexed item keeps its genre and studio projection but is no longer queued.
+    sqlx::query(
+        "INSERT INTO media_item_facets (item_id, kind, name_key, name) VALUES
+             ('tag-item', 'GENRE', 'drama', 'Drama'),
+             ('tag-item', 'STUDIO', 'a24', 'A24')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query("DELETE FROM media_content_restriction_index_queue")
+        .execute(&pool)
+        .await?;
+
+    copy_one_migration(&migrations, TAG_FACET_MIGRATION)?;
+    Migrator::new(migrations.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+    let new_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(new_version, 249);
+
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT kind, name_key, name FROM media_item_facets
+         WHERE item_id = 'tag-item' ORDER BY kind, name_key",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        rows,
+        [
+            ("GENRE".to_owned(), "drama".to_owned(), "Drama".to_owned()),
+            ("STUDIO".to_owned(), "a24".to_owned(), "A24".to_owned()),
+        ],
+        "the rebuild must carry the existing GENRE/STUDIO rows over"
+    );
+
+    sqlx::query(
+        "INSERT INTO media_item_facets (item_id, kind, name_key, name)
+         VALUES ('tag-item', 'TAG', 'sci-fi', 'Sci-Fi')",
+    )
+    .execute(&pool)
+    .await?;
+    assert!(
+        sqlx::query(
+            "INSERT INTO media_item_facets (item_id, kind, name_key, name)
+             VALUES ('tag-item', 'ACTOR', 'someone', 'Someone')",
+        )
+        .execute(&pool)
+        .await
+        .is_err(),
+        "kind must stay constrained to the documented facet kinds"
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO media_item_facets (item_id, kind, name_key, name)
+             VALUES ('tag-item', 'TAG', 'sci-fi', 'Sci-Fi')",
+        )
+        .execute(&pool)
+        .await
+        .is_err(),
+        "the (item_id, kind, name_key) primary key must survive the rebuild"
+    );
+
+    let lookup_index: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name = 'idx_media_item_facets_lookup'
+           AND tbl_name = 'media_item_facets'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(lookup_index, 1);
+
+    let queued: Vec<String> = sqlx::query_scalar(
+        "SELECT item_id FROM media_content_restriction_index_queue ORDER BY item_id",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        queued,
+        ["tag-item"],
+        "only visible items are requeued for the tag backfill"
+    );
+
+    sqlx::query("DELETE FROM media_items WHERE id = 'tag-item'")
+        .execute(&pool)
+        .await?;
+    let remaining_facets: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_item_facets WHERE item_id = 'tag-item'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        remaining_facets, 0,
+        "the rebuilt table keeps the ON DELETE CASCADE to media_items"
     );
 
     pool.close().await;

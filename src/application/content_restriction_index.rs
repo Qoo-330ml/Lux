@@ -78,7 +78,7 @@ impl ContentRestrictionIndexService {
                 expected_nfo_json: candidate.nfo_metadata_json,
                 certification_code: projection.certification_code,
                 tags: projection.tags,
-                facets: facets_from_details(&details.genres, &details.studios),
+                facets: facets_from_details(&details.genres, &details.studios, &details.tags),
             });
         }
 
@@ -94,13 +94,19 @@ impl ContentRestrictionIndexService {
 
 const MAX_FACET_NAME_CHARS: usize = 256;
 
-/// Genre and studio values worth indexing: trimmed, bounded, de-duplicated case-insensitively
-/// (the first spelling wins as the display name).
-fn facets_from_details(genres: &[String], studios: &[String]) -> Vec<MediaItemFacetWrite> {
+/// Genre, studio and tag values worth indexing: trimmed, bounded, de-duplicated case-insensitively
+/// (the first spelling wins as the display name). Tags are the NFO `<tag>` values and stay a
+/// separate facet kind from genres, which the parental-control projection keeps using.
+fn facets_from_details(
+    genres: &[String],
+    studios: &[String],
+    tags: &[String],
+) -> Vec<MediaItemFacetWrite> {
     let mut facets: Vec<MediaItemFacetWrite> = Vec::new();
     for (kind, values) in [
         (MediaFacetKind::Genre, genres),
         (MediaFacetKind::Studio, studios),
+        (MediaFacetKind::Tag, tags),
     ] {
         for value in values {
             let name = value.trim();
@@ -485,6 +491,72 @@ mod tests {
                 ("STUDIO".to_owned(), "a24".to_owned(), "A24".to_owned()),
             ]
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn index_batches_project_nfo_tags_into_tag_facets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Tag Facet Index", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        let nfo_json = r#"{"genres":["Drama"],"studios":["A24"],"tags":[" Sci-Fi ","sci-fi","Director's Cut"]}"#;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('facet-tags-a', ?, 'MOVIE', 'facet-tags-a', 'facet-tags-a', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_item_nfo_cache (item_id, json, bytes)
+             VALUES ('facet-tags-a', ?, length(CAST(? AS BLOB)))",
+        )
+        .bind(nfo_json)
+        .bind(nfo_json)
+        .execute(database.pool())
+        .await?;
+
+        let report = ContentRestrictionIndexService::new(database.clone())
+            .index_batch(None, 10)
+            .await?;
+        assert_eq!(report.indexed, 1);
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT kind, name_key, name FROM media_item_facets
+             WHERE item_id = 'facet-tags-a' ORDER BY kind, name_key",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(
+            rows,
+            [
+                ("GENRE".to_owned(), "drama".to_owned(), "Drama".to_owned()),
+                ("STUDIO".to_owned(), "a24".to_owned(), "A24".to_owned()),
+                (
+                    "TAG".to_owned(),
+                    "director's cut".to_owned(),
+                    "Director's Cut".to_owned()
+                ),
+                ("TAG".to_owned(), "sci-fi".to_owned(), "Sci-Fi".to_owned()),
+            ]
+        );
+
+        // The parental-control projection stays on genres; NFO tags must not leak into it.
+        let restriction_tags: Vec<String> = sqlx::query_scalar(
+            "SELECT tag FROM media_content_restriction_tags
+             WHERE item_id = 'facet-tags-a' ORDER BY tag",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(restriction_tags, ["drama"]);
         Ok(())
     }
 }
