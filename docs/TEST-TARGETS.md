@@ -42,8 +42,8 @@ cargo test --locked --test <新 target> <旧名>::
 | `admin_api_key` | 4 | `cargo test --locked --test admin admin_api_key::` |
 | `admin_dashboard` | 1 | `cargo test --locked --test admin admin_dashboard::` |
 | `admin_database_diagnostics` | 1 | `cargo test --locked --test admin admin_database_diagnostics::` |
-| `admin_events` | 5 | `cargo test --locked --test admin admin_events::` |
 | `admin_health` | 1 | `cargo test --locked --test admin admin_health::` |
+| `admin_jobs` | 1 | `cargo test --locked --test admin admin_jobs::` |
 | `admin_library_audit` | 1 | `cargo test --locked --test admin admin_library_audit::` |
 | `admin_mail_settings` | 1 | `cargo test --locked --test admin admin_mail_settings::` |
 | `admin_performance_metrics` | 1 | `cargo test --locked --test admin admin_performance_metrics::` |
@@ -51,6 +51,7 @@ cargo test --locked --test <新 target> <旧名>::
 | `admin_user_invitations` | 1 | `cargo test --locked --test admin admin_user_invitations::` |
 | `log_export` | 2 | `cargo test --locked --test admin log_export::` |
 | `observability` | 2 | `cargo test --locked --test admin observability::` |
+| † `removed_event_streams` | 2 | `cargo test --locked --test admin removed_event_streams::` |
 | `user_query_events` | 1 | `cargo test --locked --test admin user_query_events::` |
 | † `user_event_scoping` | 2 | `cargo test --locked --test admin user_event_scoping::` |
 | `acl` | 1 | `cargo test --locked --test api_web acl::` |
@@ -349,3 +350,30 @@ LUX-891 的 `/embywebsocket` 模块在本次审查返工中新增一例（关停
 `cargo test --locked --test admin lux_websocket::` 加压下连续 3 次 30/30；`cargo test --locked --test emby` 83/83；
 `LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test shutdown` 2/2。第 1、2、5.1 节的数字保留
 基线/合并时的口径，不在本任务中改写；LUX-897 删除 SSE 用例后需要再以合并后的 `--list` 核对。
+
+## 9. LUX-897 追加（2026-11-06）
+
+LUX-897 删除了两条 SSE 端点（`GET /api/v1/events`、`GET /api/v1/admin/events`），测试随之硬切：
+
+- 删除 `tests/admin/admin_events.rs`。其中 4 例只验证 SSE 帧头、ready 帧与两条流共用的 64 条信号量
+  （`admin_event_stream_requires_an_authenticated_admin`、`admin_event_stream_sends_ready_frame_to_an_admin`、
+  `user_event_stream_is_authenticated_and_does_not_expose_admin_events`、`concurrent_event_streams_are_capped`），
+  随端点一起删除；`concurrent_event_streams_are_capped` 的“预算超限 `429` + `Retry-After: 30`”由
+  `lux_websocket::the_global_budget_answers_429_and_releases_the_slot` 与
+  `the_admin_and_user_budgets_are_separate_and_classified` 覆盖。剩下的
+  `admin_scan_job_endpoints_expose_media_progress_without_changing_file_counts` 与事件流无关，原样移到新模块
+  `tests/admin/admin_jobs.rs`（断言未改，模块名不再误导）。
+- 新增 `tests/admin/removed_event_streams.rs`（2 例）：两条旧路径在未登录与被登录管理员下都返回 `404`
+  （先红后绿：删除前的实际响应是 `401`/`200`）。
+- 仍有效的区域/用户事件隐私与“先持久化再通知”覆盖不删，只换传输：`tests/admin/user_event_scoping.rs`
+  2 例、`tests/admin/user_query_events.rs` 1 例、`tests/playback/playback_webhooks.rs` 的 home 失效断言
+  都改为经 `GET /api/v1/ws` 的 `user` 频道读取（共享客户端 `tests/common/realtime.rs`，由 admin 与
+  playback target 用 `#[path]` 引入）。断言范围不变：管理员连接收不到别人的用户级事件、普通用户收不到
+  `admin` 频道、目录级修改仍广播、非 `progress` 事件不带 `itemId`。
+- 服务端 `src/api/admin/admin_logs_events.rs` 的 4 个 SSE 帧单测（`user_event_frame_tests`）删除；
+  broadcast `Lagged` 降级仍由 `src/api/lux_websocket.rs` 的 `a_lagged_user_subscriber_degrades_to_home_without_an_item_id`
+  与 `a_lagged_admin_subscriber_degrades_to_all_without_an_item_id` 覆盖，hub 本身的行为用例
+  （`src/application/admin_events.rs` 的 12 例）未改动。
+
+实测：`cargo test --locked --test admin -- --list` 为 **53** 例（55 - 4 + 2；scan-job 用例保留，只换了模块名）。
+第 1、5.1 节的数字保留基线/合并时的口径；第 2 节的模块行按当前 `--list` 更新。

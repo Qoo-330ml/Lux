@@ -255,7 +255,7 @@ Lux 的 Web 实时通道是单端点 `GET /api/v1/ws`，Emby 兼容的 `/embyweb
 - `proxy_http_version 1.1;` 必须保留。`http2 on` 只影响浏览器到 nginx 的一段，nginx 到 `luxd` 仍是经典 HTTP/1.1 Upgrade，不需要 RFC 8441。
 - `proxy_set_header Upgrade $http_upgrade;` 与 `proxy_set_header Connection "upgrade";` 缺一不可（ADR-054 D12）。nginx 默认不转发这两类逐跳头，缺了它们握手会以普通 `GET` 到达 Lux。
 - `Host` 必须是 `$http_host`，**不是** `$host`。Lux 只比较 `Origin` 的 host[:port] 与 `Host` 头，不比较 scheme，也不读取任何转发头；`$host` 会丢掉非默认端口（`https://lux.example.internal:8443` 变成 `lux.example.internal`），于是每次握手都被 `400` 拒绝。非默认端口的部署尤其要检查这一行。
-- `proxy_buffering off;` 保留，帧才能即时下发；`proxy_read_timeout` 必须明显大于 25 秒的服务端心跳（样例的 1 小时足够）。
+- `proxy_buffering off;` 保留，WebSocket 帧才能即时下发；该指令同时服务媒体流响应，不是某一种已删除传输的专用要求。`proxy_read_timeout` 必须明显大于 25 秒的服务端心跳（样例的 1 小时足够）。
 - WS 握手是 `GET`，**不要求也不接受** CSRF 令牌；等价防护是会话 cookie 的 `SameSite=Lax` 加服务端的同源校验。因此不要把 nginx 配置成改写或补上 `Origin`。
 
 ### 缺头、改写 Host 与排查

@@ -21339,9 +21339,10 @@ TLS socket 桩（`.tmp/` 内、已删除）验证过 `101` + `Sec-WebSocket-Acce
 `/api/v1/ws`）。服务端行为由 LUX-894 的真实 socket 集成测试覆盖，但不等于反向代理验证。本次没有 `web/`
 改动，未跑 Web 测试。
 
-#### LUX-897：删除两条 SSE 路由与旧测试（未开始）
+#### LUX-897：删除两条 SSE 路由与旧测试（已完成）
 
-状态：未开始（计划）。依赖：LUX-894 与 LUX-895。必须与它们同属一个发布版本（硬切）。
+状态：已完成（2026-11-06）。依赖：LUX-894 与 LUX-895 已在基线 `7ac4ab4e` 上；与它们同属一个发布版本（硬切），
+没有并存版本。
 
 范围：删除 `GET /api/v1/events` 与 `GET /api/v1/admin/events` 的路由、handler、`pump_user_events`、
 `event_stream_response`、`sse_capacity_response` 与 `SseConnectionBudget` / `MAX_SSE_CONNECTIONS`（WS
@@ -21353,16 +21354,63 @@ TLS socket 桩（`.tmp/` 内、已删除）验证过 `101` + `Sec-WebSocket-Acce
 
 验收：
 
-- [ ] 两条旧端点返回 404；`grep -rn "api/v1/events\|api/v1/admin/events" src/ web/src docs/API.md` 为空
-      （仅允许出现在历史任务记录与 ADR 里）。
-- [ ] `grep -rn "text/event-stream\|EventSource" src/ web/src` 为空。
-- [ ] `cargo test --locked --test admin` 剩余用例全绿（记录删除与保留的用例数）；`python3
-      scripts/check-backend-branches.py` 通过。
-- [ ] `pnpm --dir web test`、`pnpm --dir web build` 通过；`docs/API.md` 不再描述 SSE。
+- [x] 两条旧端点返回 404：`tests/admin/removed_event_streams.rs` 的两例先红后绿（删除前的实际响应是未登录
+      `401`、登录 `200`），未登录与被登录管理员两种请求都断言 `404`；
+      `grep -rn "api/v1/events\|api/v1/admin/events" src/ web/src docs/API.md` 无输出。
+- [x] `grep -rn "text/event-stream\|EventSource" src/ web/src` 无输出。
+- [x] `cargo test --locked --test admin`：**52 passed / 1 failed（共 53 例）**，唯一失败是既有的环境型用例
+      `admin_settings::transcoding_settings_are_admin_only_validated_and_persisted`（本机 VideoToolbox，
+      基线同样失败，与 SSE 删除无关）；`python3 scripts/check-backend-branches.py` 通过。
+- [x] `pnpm --dir web test`、`pnpm --dir web build` 通过；`docs/API.md` 不再描述 SSE。
 
-预计改动文件：`src/api/admin/admin_logs_events.rs`、`src/api/admin/mod.rs`、`src/api/legacy.rs`、
-`tests/admin/admin_events.rs`、`tests/admin/main.rs`、`docs/API.md`、`docs/WEB-POLLING-AUDIT.md`、
-`docs/TEST-TARGETS.md`、`docs/CHANGELOG.md`、`docs/LUX-DEVELOPMENT.md`。
+实施记录（2026-11-06）：
+
+- **服务端删除**：`src/api/admin/admin_logs_events.rs` 的两条路由、`admin_events`、`user_events`、
+  `event_stream_response`、`pump_user_events`、`user_event_from_receive`、`user_event_frame` 与 4 个
+  SSE 帧单测；`src/api/legacy.rs` 的 `SseConnectionBudget`、`sse_permits` 字段、`with_sse_connection_limit`、
+  `MAX_SSE_CONNECTIONS`、`sse_capacity_response`，以及因此不再使用的 `AsyncWriteExt` 导入。
+- **保留**：`AdminEventHub` / `UserEventHub` 及全部广播/合并语义、`GET /api/v1/ws` 的协议与用户/管理双预算、
+  `WebsocketShutdown`、`/embywebsocket`、媒体流与 Emby 仍在用的其它缓冲/预算设施。删除后 `src/` 不再有
+  `text/event-stream`、`EventSource`、`SseConnectionBudget` 或 `sse_capacity_response` 引用。
+- **集成测试（admin 组 55 → 53）**：删除 `tests/admin/admin_events.rs` 的 4 例 SSE 用例
+  （`admin_event_stream_requires_an_authenticated_admin`、`admin_event_stream_sends_ready_frame_to_an_admin`、
+  `user_event_stream_is_authenticated_and_does_not_expose_admin_events`、`concurrent_event_streams_are_capped`）；
+  该文件与事件流无关的 `admin_scan_job_endpoints_expose_media_progress_without_changing_file_counts`
+  原样移到新模块 `tests/admin/admin_jobs.rs`（1 例，断言未改）；新增
+  `tests/admin/removed_event_streams.rs` 2 例（404，未登录 + 登录）。原 SSE 预算的 `429` +
+  `Retry-After: 30` 由 `lux_websocket::the_global_budget_answers_429_and_releases_the_slot` 与
+  `the_admin_and_user_budgets_are_separate_and_classified` 继续覆盖。
+- **保留的行为覆盖改走 WS**：`tests/admin/user_event_scoping.rs` 2 例、`tests/admin/user_query_events.rs`
+  1 例、`tests/playback/playback_webhooks.rs` 的 home 失效断言 1 例，改为通过共享的
+  `tests/common/realtime.rs`（`#[path]` 引入 admin/playback target）连接 `GET /api/v1/ws` 并读 `user`
+  频道；断言范围不变（跨用户隐私、目录级广播、先持久化再通知、非 `progress` 帧不带 `itemId`）。服务端
+  4 个 SSE 帧单测删除后，broadcast `Lagged` 降级仍由 `src/api/lux_websocket.rs` 的 2 个单测覆盖，
+  `src/application/admin_events.rs` 的 12 个 hub 用例未改动。
+- **文档**：`docs/API.md` 删除两段 SSE 契约；`docs/WEB-POLLING-AUDIT.md` 的传输描述与连接状态名改为
+  `GET /api/v1/ws` / `useRealtimeConnectionState`；`docs/TEST-TARGETS.md` 第 2 节模块行与新增的 §9 记录
+  删除/保留用例数；`docs/CHANGELOG.md` 记录**（破坏性）移除 SSE 端点**并修正 LUX-894/895 条目里“两者并存”的
+  表述；`docs/DEPLOYMENT.md` 的 `proxy_buffering off;` 说明改为 WebSocket 帧与媒体流，不再描述成 SSE 要求；
+  ADR-054、`docs/COMPATIBILITY.md` 与历史任务记录中的 SSE 提及按“不改历史”保留。
+
+验证（2026-11-06，本机 arm64）：
+
+- `cargo test --locked --test admin`：52 passed / 1 failed（53 例，失败为上述 VideoToolbox 环境用例）；
+  `cargo test --locked --test emby`：83/83；`LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test
+  shutdown`：2/2；`cargo test --locked --lib websocket`：25/25。
+- `cargo fmt --all -- --check` 通过；`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过；
+  `python3 scripts/check-backend-branches.py`（`28 files, 266 branches`）、
+  `python3 scripts/check-migration-parity.py`（`179 paired, 50 SQLite-only, 19 PostgreSQL-only`）通过。
+- `pnpm --dir web test`：node `--test` 167/167 + vitest 169 个文件 / 1571 例全绿；`pnpm --dir web build`
+  通过（74 个资源、gzip 后 960260 字节）。Web 端没有依赖被删端点（`web/src` 的 SSE/EventSource 引用为空），
+  因此没有 `web/` 代码改动。
+
+预计改动文件（实际）：`src/api/admin/admin_logs_events.rs`、`src/api/legacy.rs`、`src/api/emby_resume_visibility.rs`
+（注释）、`src/api/lux_websocket.rs`（注释）、`tests/admin/admin_events.rs`（删除）、
+`tests/admin/admin_jobs.rs`（新增）、`tests/admin/removed_event_streams.rs`（新增）、
+`tests/admin/user_event_scoping.rs`、`tests/admin/user_query_events.rs`、`tests/admin/main.rs`、
+`tests/common/realtime.rs`（新增）、`tests/playback/main.rs`、`tests/playback/playback_webhooks.rs`、
+`docs/API.md`、`docs/WEB-POLLING-AUDIT.md`、`docs/TEST-TARGETS.md`、`docs/CHANGELOG.md`、
+`docs/DEPLOYMENT.md`、`docs/LUX-DEVELOPMENT.md`。
 
 #### LUX-898：管理端实时连接状态与关闭兜底轮询（未开始，独立任务）
 

@@ -70,7 +70,7 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
   空列表：Lux 还没有标签数据源（NFO 缓存里没有条目级 tags），筛选面板因此显示空标签而不是请求失败，
   等后续任务补充。
 - **Lux Web 的实时通道新增 WebSocket 端点 `GET /api/v1/ws`**：同一发布版本里由它取代两条 SSE 端点
-  （`GET /api/v1/events`、`GET /api/v1/admin/events`，删除在后续任务完成，本版本两者并存）。一条连接
+  （两条旧流已由 LUX-897 删除，不存在两者并存的版本）。一条连接
   同时承载用户频道与管理员频道，由服务端按握手主体决定，客户端不发订阅消息；首帧为
   `{"type":"ready","version":1}`，之后只有 `{"type":"invalidate","channel":"user|admin","scope":"…"}`（用户侧
   `progress` 事件可带 `itemId`，上限 256 字符；服务端从不发送 `libraryId`），广播丢帧时用户频道降级为
@@ -82,7 +82,7 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
   未知类型忽略，二进制帧以 `1003` 关闭，超过 4 KiB 的消息以 `1009` 关闭。连接每 25 秒收到协议级 ping、
   120 秒无任何入站帧后关闭；服务端每 45 秒重新校验主体权限，降权只停止管理频道帧而不断开连接，会话撤销
   或登出以 `1008` 关闭，重校验暂时失败（5xx）保留连接。进程关停时两个实时端点由同一信号驱动并以 `1001`
-  关闭且有界排空。Web 端的实时客户端与两条 SSE 路由的删除在后续任务中完成。
+  关闭且有界排空。Web 端的实时客户端由 LUX-895 接入，两条 SSE 路由由 LUX-897 在同一发布版本删除。
 - **Web 端实时通道改用 WebSocket**：Web 客户端不再连接 `GET /api/v1/events` /
   `GET /api/v1/admin/events` 两条 SSE 流，改为一条 `GET /api/v1/ws` 连接同时承载用户频道与管理频道
   （ADR-054）。连接由 `web/src/lib/realtime/` 持有：URL 由 `location` 推导为
@@ -94,7 +94,8 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
   查询，好让 `/auth/me` 的 401 把界面切到登录页），所以同一标签页换账号后不会看到上一个账号的继续观看、
   收藏或历史。标签页隐藏或断网时暂停重连，恢复可见或联网后立即重试
   一次，且不累积定时器。用户频道与管理频道共用这一条连接，管理页每标签页的连接数因此从 2 降到 1；
-  WebSocket 不可用时仍按原有的 30 秒（管理面 2/5/15 秒）轮询兜底。两条 SSE 路由的删除属于 LUX-897。
+  WebSocket 不可用时仍按原有的 30 秒（管理面 2/5/15 秒）轮询兜底。两条 SSE 路由已在同一发布版本中由
+  LUX-897 删除。
 
 ### 修复
 
@@ -145,6 +146,13 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 
 ### 变更
 
+- **（破坏性）移除 SSE 端点**：`GET /api/v1/events` 与 `GET /api/v1/admin/events` 两条
+  `text/event-stream` 失效通知流被删除，实时失效通知只有一个 WebSocket 端点 `GET /api/v1/ws`（ADR-054
+  的硬切决定，不存在双轨版本）。这是有意的破坏性变更：仍连接旧路径的客户端会收到 `404`，不会再有任何
+  事件推送；浏览器端已由 LUX-895 切到 `GET /api/v1/ws`，未升级的极旧第三方页面只能自行改连。删除的只是
+  两个 HTTP 路由、SSE 帧渲染与它们共用的一条连接预算；广播 hub、用户/管理频道的失效语义、Emby 的
+  `/embywebsocket`、关停联动与 `/api/v1/ws` 的协议/预算/Origin 校验都没有变化，轮询兜底也与之前一致。
+  `docs/API.md` 不再描述 SSE 契约，`docs/TEST-TARGETS.md` 记录了删除与保留的用例。
 - **部署文档与反向代理样例补上 WebSocket 升级配置**：`docs/DEPLOYMENT.md` 的 nginx 样例与
   `scripts/proxy-smoke.nginx.conf` 都补了 `proxy_set_header Upgrade $http_upgrade;` 与
   `proxy_set_header Connection "upgrade";`，`Host` 从 `$host` 改为 `$http_host`（`$host` 会丢掉非默认
