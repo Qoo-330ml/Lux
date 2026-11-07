@@ -21564,6 +21564,40 @@ LUX-889（已完成，提供 `CatalogService::list_similar_items` 与 `list_simi
 `src/api/dto` 中的 Lux 响应类型、`tests/` 下新增 Lux 路由测试、`docs/API.md`、`docs/API-TYPES-SYNC.md`、
 `docs/COMPATIBILITY.md`、`docs/CHANGELOG.md`、`docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
 
+#### LUX-901：Web 资源详情页“相似推荐”区块
+
+状态：规格（2026-11-07 由项目负责人要求新增，承接 LUX-899 中“Web 详情页展示另立任务”的约定），待实施。
+依赖：LUX-899（已完成，提供 `GET /api/v1/items/{item_id}/similar`）。
+
+背景：LUX-899 只交付了后端接口，Lux Web 的媒体详情页（`web/src/features/detail/MediaDetailPage.tsx`）目前没有相似推荐区块。
+
+范围：
+
+- API 客户端：`web/src/lib/api/client.ts` 增加 `similarItems(itemId, { limit })`，请求 `/api/v1/items/{id}/similar`，
+  返回 `PageResponse<MediaItem>`；`web/src/lib/api/types.ts` 与 `query-keys.ts` 同步增加类型与查询键。
+- 区块：新增 `web/src/features/detail/MediaSimilarSection.tsx`，在媒体详情页的剧集/主要内容之后、剧照/NFO 之前渲染。
+  - 仅对 `MOVIE` 与 `SERIES` 详情页显示；季度、单集、合集、人物页不显示。
+  - 请求 `limit=12`，只展示第一页，不做翻页控件。
+  - 卡片复用现有 `MediaCard`（`web/src/features/home/media.tsx`），点击进入对应详情页。
+  - 加载中显示与其他区块一致的占位；结果为空或请求失败时整个区块不渲染（相似区不得影响详情页主体）。
+  - 样式写入 `web/src/features/detail/detail.css`，沿用现有详情页区块的间距与标题样式。
+- 不做：后端改动、迁移、新接口、Emby 端改动、翻页/“更多”入口、相似规则调整。
+
+验收：
+
+- [ ] 电影与剧集详情页在有结果时显示区块，卡片数量不超过 12，点击卡片进入对应详情页。
+- [ ] 季度、单集、合集、人物页不请求 `similar`、不显示区块。
+- [ ] 结果为空或接口返回 404/503/401 时区块不渲染，详情页其余区块正常。
+- [ ] 请求参数为 `limit=12`，不发送 `page` 或 `pageSize`（非必须，但不得误用）。
+- [ ] Web 单元测试覆盖：显示、隐藏（空/错误）、类型过滤、链接目标。
+- [ ] `pnpm --dir web test`、`pnpm --dir web build`、`pnpm --dir web exec tsc --noEmit` 通过；`docs/CHANGELOG.md` 记录。
+- [ ] `docs/API-TYPES-SYNC.md` 标注 Web 已消费 `similar`（路由清点的“无前端消费”改为已接入）。
+
+预计文件：`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/src/lib/api/query-keys.ts`、
+`web/src/features/detail/MediaSimilarSection.tsx`（新）、`web/src/features/detail/MediaDetailPage.tsx`、
+`web/src/features/detail/detail.css`、`web/tests/media-similar-section.test.tsx`（新）、`docs/API-TYPES-SYNC.md`、
+`docs/CHANGELOG.md`、`docs/LUX-DEVELOPMENT.md`。
+
 ## 31. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
