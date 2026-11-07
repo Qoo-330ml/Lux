@@ -59,8 +59,26 @@ Emby 客户端上复测；`Items[]` 的 `Name`/`Id` 形状按 Emby `NameIdPair` 
   返回空列表（200 空信封），不会退化成“不过滤”的全量结果；混合有效与无效类型时只按有效类型过滤。
   `/Genres`、`/Studios`、`/Years` 仍是旧的内联解析，全无效时会退化成不过滤，待后续任务对齐。
 - `Recursive` 被接受但不改变结果：与其他 facet 端点一样，分级聚合始终覆盖所选库/类型的全部可见条目。
-- **剩余缺口**：分级目前只能列出，不能用于 `/Items` 筛选——`/Items` 不接受 `OfficialRatings=` 参数，
+- **剩余缺口（分级）**：分级目前只能列出，不能用于 `/Items` 筛选——`/Items` 不接受 `OfficialRatings=` 参数，
   所以在筛选面板里选中某个分级不会改变列表。对应后续任务待立项，本任务没有改 `/Items` 过滤。
+- **剩余缺口（标签）**：标签同样只能列出，不能用于 `/Items` 筛选。`EmbyItemsQuery` 与
+  `catalog_filter_from_values` 都没有标签字段（`CatalogFilter` 的 facet 键只有 `genre_keys`/`studio_keys`），
+  `/Items?Tags=…`、`/Items?TagIds=…` 目前被静默忽略：既不返回 400，也不改变结果，客户端无从得知过滤没有
+  生效。条目 DTO 的 `TagItems` 仍恒为 `[]`（`src/api/emby_catalog.rs` 固定输出空数组，`tests/library/catalog.rs`
+  有对应断言），Emby 详情响应也不会因此多出标签。对应后续任务待立项，本任务没有改 `/Items` 过滤，也没有改
+  条目 DTO 形状。
+- **目录并发闸门的取舍（有意）**：`GET /api/v1/tags` 是 Lux 原生目录聚合，计入目录并发闸门
+  （`is_catalog_aggregation_path` 匹配 `["api","v1","tags"]`），饱和时排队超过 2 秒返回 503
+  `CATALOG_BUSY` 并附 `Retry-After`；Emby `/Tags` 与 `/Genres`、`/OfficialRatings` 一样只是 Emby 兼容
+  适配层，不在该闸门的路径表里，因此不进闸门——与 LUX-899 对 Emby `Items/{id}/Similar` 的处理一致
+  （`similar_endpoints_use_the_catalog_aggregation_guard` 断言 Lux 的 `similar` 与 `/api/v1/tags` 计入、
+  Emby `Items/{id}/Similar` 不计入；Emby `/Tags` 没有单独的断言，行为由同一张路径表保证）。这是有意的
+  兼容取舍：Emby 端点保持接入前的失败语义，不会因为 Lux 侧排队就被改写成 503。风险在于闸门只保护 Lux 一侧：
+  Emby 筛选面板的 `/Tags` 与闸门互不影响，客户端并发或失败重试时会绕过 2 秒准入，继续占用连接池与 CPU 执行
+  同一份 `GROUP BY name_key` + `COUNT(DISTINCT name_key)` 聚合，可能拖慢已经排队的 Lux 目录请求甚至让连接池
+  饱和；单次请求的返回行数由 `Limit`（默认 50、上限 1000）与服务端 400 约束，但 `COUNT(DISTINCT name_key)`
+  仍要扫描所选可见范围内的 TAG 行，成本随范围增长而不是随页大小增长。后续若要收紧，需要为 Emby 适配层另加
+  一条有界队列并同步补测试，不能只靠把 Emby 路径塞进现有闸门。
 - 自动化：`cargo test --locked --test emby emby_filter_metadata::`（5 例）覆盖去重、库 ACL、内容限制、
   `ParentId`、`IncludeItemTypes`（有效/全无效/混合）、分页与上限、空 `Limit=` 与 `Limit=0`、未鉴权 401、
   根路径/`/emby`/大小写混用，以及 `Tags` 的真实标签列表、类型过滤/分页与 `/api/v1/tags` 的名称一致性。

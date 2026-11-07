@@ -8,19 +8,19 @@
 
 | 新 target | 领域 | 原文件数 | 测试数 |
 |---|---|---|---|
-| `--test admin` | 管理后台、日志导出、可观测性与运维事件 | 14 | 25 |
+| `--test admin` | 管理后台、日志导出、可观测性与运维事件 | 14 | 60 |
 | `--test api_web` | HTTP 契约（错误/限流/压缩/健康/远程策略）、Web 会话、Webhook | 13 | 57 |
 | `--test auth_users` | 认证、会话、登录背景、用户与用户设置、设备配对、界面偏好迁移 | 10 | 73 |
 | `--test emby` | Emby 兼容层（认证、系统信息、增量刷新、发现、多段播放、检索、下载、WebSocket） | 16 | 85 |
 | `--test scanner` | 媒体库扫描、增量/混合扫描、计划任务、作业事件与关停 | 7 | 152 |
-| `--test library` | 媒体库生命周期、合并/拆分、集合、目录与系列 API | 12 | 51 |
+| `--test library` | 媒体库生命周期、合并/拆分、集合、目录与系列 API | 12 | 62 |
 | `--test metadata` | 元数据抓取与选择、NFO 回写、扫描后剧集元数据、人物、字幕 | 14 | 157 |
 | `--test images` | 图片变体、写回、缩略图与图片 API | 6 | 66 |
 | `--test playback` | 播放、播放令牌/历史/续播、观看状态归档、章节与片头片尾检测 | 10 | 35 |
-| `--test storage` | SQLite/PostgreSQL 存储、迁移、WAL、数据库维护与启动守卫 | 9 | 117 |
+| `--test storage` | SQLite/PostgreSQL 存储、迁移、WAL、数据库维护与启动守卫 | 9 | 118 |
 | `--test plugins` | 插件协议与运行时、弹幕、IP 属地、媒体信息插件配置 | 11 | 128 |
 | `--test strm` | STRM 目标解析/探测/播放与 ffprobe | 9 | 42 |
-| 合计（12 组） |  | 131 | 988 |
+| 合计（12 组） |  | 131 | 1035 |
 
 另有 8 个 binary 因为进程级共享状态或外部服务依赖保持独立，见第 4 节：`--test background_work_budget`、`--test filmly_image_diag`、`--test image_variants_perf`、`--test performance`、`--test postgres_database`、`--test reidentify`、`--test scanned_metadata`、`--test shutdown`。合计 12 + 8 = 20 个集成测试 target。
 
@@ -50,6 +50,7 @@ cargo test --locked --test <新 target> <旧名>::
 | `admin_settings` | 2 | `cargo test --locked --test admin admin_settings::` |
 | `admin_user_invitations` | 1 | `cargo test --locked --test admin admin_user_invitations::` |
 | `log_export` | 2 | `cargo test --locked --test admin log_export::` |
+| † `lux_websocket` | 30 | `cargo test --locked --test admin lux_websocket::` |
 | `observability` | 2 | `cargo test --locked --test admin observability::` |
 | † `realtime_contract` | 7 | `cargo test --locked --test admin realtime_contract::` |
 | † `removed_event_streams` | 2 | `cargo test --locked --test admin removed_event_streams::` |
@@ -93,7 +94,7 @@ cargo test --locked --test <新 target> <旧名>::
 | † `emby_empty_numeric_params` | 7 | `cargo test --locked --test emby emby_empty_numeric_params::` |
 | † `emby_filter_metadata` | 5 | `cargo test --locked --test emby emby_filter_metadata::` |
 | † `emby_similar` | 6 | `cargo test --locked --test emby emby_similar::` |
-| † `emby_websocket` | 23 | `cargo test --locked --test emby emby_websocket::` |
+| † `emby_websocket` | 24 | `cargo test --locked --test emby emby_websocket::` |
 | `job_events_api` | 2 | `cargo test --locked --test scanner job_events_api::` |
 | `mixed_scanner` | 1 | `cargo test --locked --test scanner mixed_scanner::` |
 | `scanner` | 18 | `cargo test --locked --test scanner scanner::` |
@@ -152,7 +153,7 @@ cargo test --locked --test <新 target> <旧名>::
 | `log_migration` | 10 | `cargo test --locked --test storage log_migration::` |
 | `sqlite_wal` | 2 | `cargo test --locked --test storage sqlite_wal::` |
 | `storage` | 76 | `cargo test --locked --test storage storage::` |
-| † `schema_upgrade` | 1 | `cargo test --locked --test storage schema_upgrade::` |
+| † `schema_upgrade` | 2 | `cargo test --locked --test storage schema_upgrade::` |
 | † `index_audit` | 3 | `cargo test --locked --test storage index_audit::` |
 | `danmaku` | 13 | `cargo test --locked --test plugins danmaku::` |
 | `danmaku_api` | 2 | `cargo test --locked --test plugins danmaku_api::` |
@@ -183,7 +184,7 @@ cargo test --locked --test <新 target> <旧名>::
 | `scanned_metadata` | 23 | `cargo test --locked --test scanned_metadata`（本来就没有合并） |
 | `shutdown` | 2 | `cargo test --locked --test shutdown`（本来就没有合并） |
 | `filmly_image_diag` | 1 | `cargo test --locked --test filmly_image_diag`（本来就没有合并） |
-| **合计** | **1073** |  |
+| **合计** | **1152** |  |
 
 ## 3. 只跑某一个原文件的测试
 
@@ -251,20 +252,20 @@ cargo test --locked --test scanner
 
 | 新 target | 合并前同名文件测试数之和 | 当前 `--test <group> -- --list` | 结果 |
 |---|---|---|---|
-| `admin` | 22 | 25 | 新增 3 例（后续任务） |
+| `admin` | 22 | 60 | 新增 38 例（LUX-894 的 `lux_websocket` 30 例、LUX-897 的实时通道相关模块 5 例、其余 3 例为先前任务） |
 | `api_web` | 39 | 57 | 新增 18 例（后续任务） |
 | `auth_users` | 70 | 73 | 新增 3 例（后续任务） |
 | `emby` | 38 | 85 | 新增 47 例（LUX-900 第五增量的 `emby_filter_metadata` 2 例、`emby_websocket` 1 例未同步，其余为先前任务） |
 | `scanner` | 137 | 152 | 新增 15 例（后续任务） |
-| `library` | 49 | 51 | 新增 2 例（后续任务） |
+| `library` | 49 | 62 | 新增 13 例（LUX-899 的 `similar_api` 6 例、LUX-900 的 `tags_api` 5 例、其余 2 例为先前任务） |
 | `metadata` | 143 | 157 | 新增 14 例（LUX-886 6 例、LUX-887 1 例，其余为先前任务） |
 | `images` | 52 | 66 | 新增 14 例（LUX-887 1 例，其余为先前任务） |
 | `playback` | 34 | 35 | 新增 1 例（后续任务） |
-| `storage` | 112 | 117 | 新增 5 例（后续任务） |
+| `storage` | 112 | 118 | 新增 6 例（`schema_upgrade` 1 例此前未同步，其余 5 例为后续任务） |
 | `plugins` | 84 | 128 | 新增 44 例（后续任务） |
 | `strm` | 42 | 42 | 一致 |
 | 独立 binary 合计 | 112 | 117 | 新增 5 例（后续任务） |
-| **合计** | **934** | **1105** | 差异均为合并后新增用例 |
+| **合计** | **934** | **1152** | 差异均为合并后新增用例 |
 
 ### 5.2 单个用例稳定性复核
 
@@ -438,6 +439,17 @@ Emby `GET /Tags` 改读标签投影，测试仍在既有模块 `tests/emby/emby_
 `GET /api/v1/tags` 的名称、顺序与总数一致）。
 
 - `emby` 分组的模块列表不变（仍 16 个），只有用例数变化：`cargo test --locked --test emby -- --list` 为
-  **85** 例（LUX-899 记录 83 例 + 本增量 2 例）。第 1、2、5.1 节的 `emby` 行与合计已按本次实测同步。
-- 顺带核对出上一处未同步：`emby_websocket` 实际 24 例（第 2 节原记 23 例），因此本增量之前的真实基线是
-  83 例而不是 82 例；第 1、5.1 节按 85 例改正，第 2 节该模块行仍留待其所属任务确认新增用例的描述。
+  **85** 例（LUX-899 记录 83 例 + 本增量 2 例）。第 1、2、5.1 节的 `emby` 行现在同为 85 例。
+- 按 `--list` 逐行核对第 2 节的模块计数时，一并改正了四处此前未同步的数字，第 1、5.1 节随之更新，三处合计
+  重新闭合：
+  - `emby_websocket` 23 → **24**（`21c4589c` 的实时通道返工新增 1 例，文档未同步），`emby` 的模块行之和
+    因此 84 → **85**。
+  - `admin` 补上缺失的 `† lux_websocket` 一行（LUX-894 的 30 例），模块行之和 30 → **60**，与
+    `cargo test --locked --test admin -- --list` 一致。
+  - `schema_upgrade` 1 → **2**，`storage` 合计 117 → **118**，与 `--list` 一致。
+  - `library` 的模块行本就合计 62（`similar_api` 6 + `tags_api` 5 + 其余），只是第 1、5.1 节仍写 51。
+- 闭合关系（第 1、2、5.1 节现在一致）：第 1 节 12 组合计 **1035** = 60 + 57 + 73 + 85 + 152 + 62 + 157 +
+  66 + 35 + 118 + 128 + 42；第 2 节合计 **1152** = 12 组模块行之和 1035 + 8 个独立 binary 117；第 5.1 节
+  合计 **1152**，与第 2 节相同（第 5.1 节“合并前”的 934 是基线口径，不参与本次闭合）。
+- 8 个独立 binary 的数字沿用既有记录，本次未逐个重测（其中 `postgres_database` 需要外部 PostgreSQL、
+  `performance`/`image_variants_perf` 需要性能环境）；三张表对它们使用同一组 117，因此不影响上述闭合。
