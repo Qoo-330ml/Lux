@@ -113,6 +113,7 @@ cargo test --locked --test <新 target> <旧名>::
 | `library_order` | 1 | `cargo test --locked --test library library_order::` |
 | `media_deletion` | 3 | `cargo test --locked --test library media_deletion::` |
 | `series_api` | 1 | `cargo test --locked --test library series_api::` |
+| † `similar_api` | 4 | `cargo test --locked --test library similar_api::` |
 | `identification` | 1 | `cargo test --locked --test metadata identification::` |
 | `media_matching` | 10 | `cargo test --locked --test metadata media_matching::` |
 | `metadata` | 22 | `cargo test --locked --test metadata metadata::` |
@@ -383,3 +384,18 @@ LUX-897 删除了两条 SSE 端点（`GET /api/v1/events`、`GET /api/v1/admin/e
 实测：`cargo test --locked --test admin -- --list` 为 **60** 例（55 - 4 + 2 + 7；scan-job 用例保留，只换了
 模块名，另加 7 例共享客户端合约测试）。第 1、5.1 节的数字保留基线/合并时的口径；第 2 节的模块行按当前
 `--list` 更新。
+
+## 10. LUX-899 追加（2026-11-07）
+
+`tests/library/similar_api.rs` 是 LUX-899 新增的模块（`tests/library/main.rs` 追加一行 `mod similar_api;`），
+命令为 `cargo test --locked --test library similar_api::`，共 **4** 例：同一用户同一库下 Lux 原生
+`GET /api/v1/items/{item_id}/similar` 与 Emby `GET /Items/{id}/Similar` 的条目 id 顺序一致（普通用户与
+管理员，含 ACL 排除项不出现在 `items`/`total`）、`limit` 默认 50/上限 1000/空值按未提供/`0`、负数、非整数、
+超上限 400、未知或不可见条目 404 与无会话 401、剧集只返回剧集且无相似条目时返回 200 空列表（`total=0`）。
+
+- 该模块按路由所在域放在 `library` 分组（目录/媒体条目 API），与 `catalog`、`series_api` 等相邻；没有新建
+  顶层 target，也没有改其他分组的归属。
+- 实测：`cargo test --locked --test library -- --list` 为 **55** 例（51 例基线 + 本任务 4 例），
+  `cargo test --locked --test library` 55/55 通过；`cargo test --locked --test emby -- --list` 仍为 **83**
+  例，其中 `emby_similar::` 6/6（断言未改）；`cargo test --locked --lib similar_catalog` 2/2。
+- 第 1、2、5.1 节的历史数字保留基线/合并时的口径（第 2 节新增本模块一行）。

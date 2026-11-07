@@ -23,7 +23,7 @@
 | (c) | 非 JSON：图片字节流、媒体流、字幕文本、XML |
 | 204 | 成功但无响应体 |
 
-统计口径：`src/api/lux_api.rs` 共 **46 条 route 条目、48 个 handler**（`/items/{item_id}/metadata` 与 `/people/{person_id}` 各有两个方法）。
+统计口径：`src/api/lux_api.rs` 共 **47 条 route 条目、49 个 handler**（`/items/{item_id}/metadata` 与 `/people/{person_id}` 各有两个方法；LUX-899 新增 `/items/{item_id}/similar`）。
 
 ## 全量路由清点
 
@@ -75,6 +75,7 @@
 | 44 | `/api/v1/items/{item_id}/metadata` | GET, PATCH | `lux_get_metadata` / `lux_update_metadata` | (b) | `metadata_json`（`media.rs:1274`） | `ItemMetadata` / `MetadataFieldName` |
 | 45 | `/api/v1/items/{item_id}/download` | GET, HEAD | `lux_download` | (c) | 文件下载流 | — |
 | 46 | `/api/v1/watch-history` | GET | `lux_list_watch_history` | (b) | `lux_catalog_page_json_for_user` | `PageResponse<MediaItem>` |
+| 47 | `/api/v1/items/{item_id}/similar` | GET | `lux_get_similar` | (b) | `lux_catalog_page_json_for_user`（`media.rs:4377`） | **无前端消费**（见「LUX-899 原生相似条目接口」） |
 
 ### 统计
 
@@ -82,10 +83,10 @@
 | --- | --- | --- |
 | (a) 全新具名结构体 | 1 | 2% |
 | (a)+(b) 混合（元素具名、信封手拼） | 1 | 2% |
-| (b) `json!` 手拼 / `Value` | 26 | 57% |
-| (c) 非 JSON | 12 | 27% |
+| (b) `json!` 手拼 / `Value` | 27 | 57% |
+| (c) 非 JSON | 12 | 26% |
 | 204 无响应体 | 6 | 13% |
-| **合计** | **46** | 100% |
+| **合计** | **47** | 100% |
 
 结论：Lux API 的 JSON 响应里 **只有 1 条路由（`/people/{id}`）已经是纯具名结构体**，(b) 占 57%。
 `types.ts` 中 221 个导出类型的绝大部分（含整个 `Admin*` 家族）对应的是 `src/api/admin/**` 与 `src/api/users.rs` 的路由，
@@ -153,7 +154,7 @@
 
 ## 阶段 1 结论
 
-- Lux API 45 条路由中，(b) `json!` 手拼占 56%，(a) 纯具名结构体只有 1 条；这正是 `types.ts` 需要手工镜像的根因。
+- Lux API 47 条路由中，(b) `json!` 手拼占 57%，(a) 纯具名结构体只有 1 条；这正是 `types.ts` 需要手工镜像的根因。
 - 全量改造需要 11~16 人日，必须先做 `MediaItem` / 播放会话两个大件；本次试点取 3 组小形状（约 1.2 人日）先打通「Rust 结构体 → 生成 TS → re-export」和防漂移检查。
 - 清点过程中发现 4 处既有漂移，已记录为后续验收样本。
 
@@ -396,6 +397,24 @@ ts-rs 生成流程（`--features ts-bindings` → `scripts/generate-api-types.sh
 - `DELETE` 成功为 `204`，因此生成类型不适用；`POST` 复用现有 match-jobs 作业 DTO（`{ job }` 信封）。
 - 生成命令与防漂移检查沿用第 3 节：`scripts/generate-api-types.sh`、`scripts/check-api-types.sh`
   （后者已接入 `scripts/check-all.sh`）。
+
+## LUX-899 原生相似条目接口
+
+`GET /api/v1/items/{item_id}/similar?limit=`（`src/api/lux_api.rs` 的 `lux_get_similar`）是相似条目的
+权威实现；Emby `GET /Items/{id}/Similar` 改为调用同一个 `CatalogService::list_similar_items`，只保留
+Emby DTO/参数适配。
+
+- 响应形状直接复用 `lux_catalog_page_json_for_user`：`{items,page,pageSize,hasNext,total}`。`items` 是
+  `lux_catalog_items_json_for_user` 生成的 Lux 媒体条目（`MediaItem` 家族），**不是** Emby 的
+  `Items`/`TotalRecordCount` DTO。
+- 因此该路由按本文件口径属于 **(b)**：信封与条目都是 `json!` 手拼的 `Value`，没有可派生的具名结构体。
+  `limit` 只裁剪当前页；`total` 是共享服务的有界候选池去重数量。
+- 目前没有前端消费（Web 详情页的相似区按规格另立任务），所以 `web/src/lib/api/types.ts` 与
+  `generated/` 都不新增类型，也不需要重新生成绑定。后续 Web 接入时按「如何扩展到更多路由」的流程，
+  先定 `{items,page,pageSize,hasNext,total}` 信封（G-Page）再处理 `MediaItem`（G-MediaItem），不要为此
+  单独发明一个 `Option` 合成信封。
+- 请求参数只有 `limit`（默认 50、1-1000，空值按未提供，`0`/负数/非整数/超过 1000 为 400），是读路径的
+  查询参数，不在本文件的请求体范围内。
 
 ## 已知限制
 

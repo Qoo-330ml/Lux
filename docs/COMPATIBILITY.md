@@ -1809,6 +1809,37 @@ Lux 当时返回 404 空响应，客户端页面不报错、推荐区整块缺�
   `EnableUserData`/图片类型选择、空值与非法 `Limit`。该记录只证明 Lux 服务端合同，不代表客户端已确认
   推荐区恢复。
 
+## LUX-899 Lux 原生 `GET /api/v1/items/{id}/similar`（2026-11-07）
+
+证据等级：**Lux 服务端合同**（自动化测试），不是客户端真机验证；本任务不做 Web 详情页展示，也没有在
+修复后的客户端上复测推荐区。该接口取代 LUX-889 中“不改 `/api/v1`”的约束，成为相似条目的权威实现。
+
+- 路由与鉴权：`GET /api/v1/items/{item_id}/similar`，与其他 `/api/v1/items/{item_id}/*` 一样走
+  `require_web_user`（Web session 或用户级客户端令牌），未鉴权 401
+  `AUTHENTICATION_REQUIRED`。条目不存在或对当前用户不可见（含媒体库 ACL）返回 404 `NOT_FOUND`，
+  与 `/api/v1/items/{item_id}` 一致；数据库不可用返回 503。媒体库 ACL 与内容限制由共享服务执行，被排除
+  的条目不会出现在 `items` 或 `total`。
+- 响应：Lux 自有形状 `{items,page,pageSize,hasNext,total}`，直接复用
+  `lux_catalog_page_json_for_user`。`items` 是 Lux 媒体条目（`lux_catalog_items_json_for_user`），
+  **不复用 Emby DTO**；`page` 固定为 1（该端点没有 `page` 参数，只有 `limit`），`pageSize` 回显生效的
+  `limit`，`hasNext` 表示是否还有未返回的候选，`total` 是有界候选池内的去重数量。
+- `limit`：默认 50，允许 1-1000；显式空值（`?limit=`）视为未提供；`0`、负数、非整数（含 `1.5`）和
+  超过 1000 返回 400 `INVALID_REQUEST`。`limit` 只裁剪当前页，不改变 `total`；`0` 被拒绝与 Lux 其他列表
+  `pageSize` 必须为正的规则一致，也避免分页信封做 `offset / limit` 时除零。
+- 相似规则与候选池：与 LUX-889 完全一致，由同一个 `CatalogService::list_similar_items` 提供：同类型
+  （`MOVIE`/`SERIES`）、至少共享一个已入库 Genre、最多 10 个源 Genre × 每个 200 个通过 ACL/可见性/内容
+  限制的候选，共享数量降序后再按 `LOWER(title)`、条目 id 升序，并排除自身。没有复制 SQL、没有新增
+  迁移、没有改查询逻辑；`cargo test --locked --lib similar_catalog` 的查询计划断言继续通过。
+- Emby 兼容层：`GET /Items/{id}/Similar`（根路径与 `/emby` 前缀）改为调用同一个
+  `similar_items_page` 入口，只保留 Emby 的 `Items`/`TotalRecordCount` DTO、`Fields`、`EnableUserData`、
+  `EnableImageTypes`/`ImageTypeLimit` 与 `Limit` 处理，对外状态码、字段、排序和 `TotalRecordCount`
+  不变；`emby_similar` 的 6 个用例断言未改。
+- 自动化：新增 `tests/library/similar_api.rs`（`cargo test --locked --test library similar_api::`，
+  4 例）：同一用户同一库下 Lux 与 Emby 的条目 id 顺序一致（普通用户与管理员、含 ACL 排除项）、
+  `limit` 默认值/上限/400、404/401（未知条目、无权条目、无会话）、剧集只返回剧集与无相似条目的 200
+  空列表。`cargo test --locked --test emby emby_similar::` 6/6；本机 `uname -m` = `arm64`（macOS），
+  不代表 NAS/x86_64 性能，也未做客户端 UI 复测。
+
 ## LUX-891：Emby `/embywebsocket`（Yamby 实时会话与计划任务）
 
 目标客户端：Yamby 2.1.0.11（versionCode 20010012）与 2.0.5.5。入口是「服务器状态/日志」页，
