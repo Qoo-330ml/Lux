@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use crate::realtime::RealtimeChannel;
 use luxd::{
     api::{AppState, app_with_state},
     application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
@@ -28,71 +29,6 @@ impl TestApp {
     }
 }
 
-/// One `/api/v1/events` stream with its own frame buffer, so a chunk that
-/// carries several frames is not lost between assertions.
-struct EventStream {
-    response: reqwest::Response,
-    buffer: String,
-}
-
-impl EventStream {
-    async fn open(
-        client: &reqwest::Client,
-        base: &str,
-        cookies: &str,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut response = client
-            .get(format!("{base}/api/v1/events"))
-            .header(COOKIE, cookies)
-            .send()
-            .await?;
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-        let ready = response.chunk().await?.ok_or("missing ready frame")?;
-        let ready = String::from_utf8(ready.to_vec())?;
-        assert!(ready.contains("event: ready"));
-        Ok(Self {
-            response,
-            buffer: ready,
-        })
-    }
-
-    /// Returns the data object of the next `invalidate` frame.
-    async fn next_invalidation(&mut self) -> Result<Value, Box<dyn std::error::Error>> {
-        loop {
-            if let Some(index) = self.buffer.find("\n\n") {
-                let frame = self.buffer[..index].to_owned();
-                self.buffer.drain(..index + 2);
-                if frame.contains("event: invalidate") {
-                    let data = frame
-                        .lines()
-                        .find_map(|line| line.strip_prefix("data: "))
-                        .ok_or("missing data")?;
-                    return Ok(serde_json::from_str(data)?);
-                }
-                continue;
-            }
-            let chunk = tokio::time::timeout(Duration::from_secs(2), self.response.chunk())
-                .await??
-                .ok_or("event stream closed")?;
-            self.buffer.push_str(std::str::from_utf8(&chunk)?);
-        }
-    }
-
-    async fn next_invalidation_scope(&mut self) -> Result<String, Box<dyn std::error::Error>> {
-        let data = self.next_invalidation().await?;
-        Ok(data["scope"].as_str().ok_or("scope")?.to_owned())
-    }
-
-    async fn expect_silence(&mut self, message: &str) {
-        if let Ok(Ok(Some(chunk))) =
-            tokio::time::timeout(Duration::from_millis(750), self.response.chunk()).await
-        {
-            let received = String::from_utf8_lossy(&chunk).to_string();
-            panic!("{message}; received: {received}");
-        }
-    }
-}
-
 fn cookie_value(headers: &HeaderMap, name: &str) -> String {
     headers
         .get_all(SET_COOKIE)
@@ -107,7 +43,7 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> String {
 }
 
 /// Boots one SQLite-backed server with an admin, a `viewer` account and one
-/// scanned movie so both accounts can open an SSE stream and the admin can act.
+/// scanned movie so both accounts can open a realtime connection and the admin can act.
 async fn spawn_app() -> Result<TestApp, Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
     let config = Config {
@@ -189,8 +125,8 @@ async fn user_level_events_stay_private_while_admin_events_reach_everyone()
 
     let (admin_cookies, admin_csrf) = login(client, base, "admin", "correct password").await?;
     let (viewer_cookies, _viewer_csrf) = login(client, base, "viewer", "viewer password").await?;
-    let mut admin_events = EventStream::open(client, base, &admin_cookies).await?;
-    let mut viewer_events = EventStream::open(client, base, &viewer_cookies).await?;
+    let mut admin_events = RealtimeChannel::connect(base, &admin_cookies).await?;
+    let mut viewer_events = RealtimeChannel::connect(base, &viewer_cookies).await?;
 
     // Favorites are per-user state: only the acting user's connections react.
     let favorite = client
@@ -201,9 +137,12 @@ async fn user_level_events_stay_private_while_admin_events_reach_everyone()
         .send()
         .await?;
     assert_eq!(favorite.status(), reqwest::StatusCode::NO_CONTENT);
-    assert_eq!(admin_events.next_invalidation_scope().await?, "favorites");
+    assert_eq!(admin_events.next_user_scope().await?, "favorites");
     viewer_events
-        .expect_silence("another user's favorites event must not reach the viewer's stream")
+        .expect_user_silence(
+            Duration::from_millis(750),
+            "another user's favorites event must not reach the viewer's connection",
+        )
         .await;
 
     // Playback progress is per-user as well.
@@ -219,9 +158,12 @@ async fn user_level_events_stay_private_while_admin_events_reach_everyone()
         .send()
         .await?;
     assert_eq!(progress.status(), reqwest::StatusCode::NO_CONTENT);
-    assert_eq!(admin_events.next_invalidation_scope().await?, "home");
+    assert_eq!(admin_events.next_user_scope().await?, "home");
     viewer_events
-        .expect_silence("another user's progress event must not reach the viewer's stream")
+        .expect_user_silence(
+            Duration::from_millis(750),
+            "another user's progress event must not reach the viewer's connection",
+        )
         .await;
 
     // Directory-level administrator changes are still broadcast.
@@ -233,7 +175,7 @@ async fn user_level_events_stay_private_while_admin_events_reach_everyone()
         .send()
         .await?;
     assert_eq!(settings.status(), reqwest::StatusCode::OK);
-    assert_eq!(viewer_events.next_invalidation_scope().await?, "home");
+    assert_eq!(viewer_events.next_user_scope().await?, "home");
     app.abort();
     Ok(())
 }
@@ -248,8 +190,8 @@ async fn web_playback_progress_is_private_and_played_flips_notify_the_whole_user
 
     let (admin_cookies, admin_csrf) = login(client, base, "admin", "correct password").await?;
     let (viewer_cookies, _viewer_csrf) = login(client, base, "viewer", "viewer password").await?;
-    let mut admin_events = EventStream::open(client, base, &admin_cookies).await?;
-    let mut viewer_events = EventStream::open(client, base, &viewer_cookies).await?;
+    let mut admin_events = RealtimeChannel::connect(base, &admin_cookies).await?;
+    let mut viewer_events = RealtimeChannel::connect(base, &viewer_cookies).await?;
 
     let session = client
         .post(format!("{base}/api/v1/playback/sessions"))
@@ -291,10 +233,10 @@ async fn web_playback_progress_is_private_and_played_flips_notify_the_whole_user
         .await?;
     assert_eq!(reported.status(), reqwest::StatusCode::OK);
 
-    let progress = admin_events.next_invalidation().await?;
+    let progress = admin_events.next_user_invalidation().await?;
     assert_eq!(progress["scope"].as_str(), Some("progress"));
     assert_eq!(progress["itemId"].as_str(), Some(item_id));
-    let played_flip = admin_events.next_invalidation().await?;
+    let played_flip = admin_events.next_user_invalidation().await?;
     assert_eq!(
         played_flip["scope"].as_str(),
         Some("item"),
@@ -302,7 +244,10 @@ async fn web_playback_progress_is_private_and_played_flips_notify_the_whole_user
     );
 
     viewer_events
-        .expect_silence("another user's web playback event must not reach the viewer's stream")
+        .expect_user_silence(
+            Duration::from_millis(750),
+            "another user's web playback event must not reach the viewer's connection",
+        )
         .await;
     app.abort();
     Ok(())

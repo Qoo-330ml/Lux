@@ -1,5 +1,4 @@
-use std::time::Duration;
-
+use crate::realtime::RealtimeChannel;
 use luxd::{
     api::{AppState, app_with_state},
     application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
@@ -9,33 +8,8 @@ use luxd::{
     storage::Database,
 };
 use reqwest::header::{COOKIE, SET_COOKIE};
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::net::TcpListener;
-
-async fn next_scope(
-    response: &mut reqwest::Response,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let frame = tokio::time::timeout(Duration::from_secs(2), async {
-        let mut frame = String::new();
-        loop {
-            let chunk = response.chunk().await?.ok_or("event stream closed")?;
-            frame.push_str(std::str::from_utf8(&chunk)?);
-            if frame.contains("event: invalidate") && frame.ends_with("\n\n") {
-                let data = frame
-                    .lines()
-                    .find_map(|line| line.strip_prefix("data: "))
-                    .ok_or("missing data")?;
-                let value: Value = serde_json::from_str(data)?;
-                assert_eq!(value.as_object().ok_or("event object")?.len(), 1);
-                return Ok::<_, Box<dyn std::error::Error>>(
-                    value["scope"].as_str().ok_or("scope")?.to_owned(),
-                );
-            }
-        }
-    })
-    .await??;
-    Ok(frame)
-}
 
 #[tokio::test]
 async fn user_mutations_notify_other_web_sessions_after_persistence()
@@ -99,13 +73,7 @@ async fn user_mutations_notify_other_web_sessions_after_persistence()
         .split("; ")
         .find_map(|v| v.strip_prefix("lux_csrf="))
         .ok_or("csrf")?;
-    let mut events = client
-        .get(format!("{base}/api/v1/events"))
-        .header(COOKIE, &cookies)
-        .send()
-        .await?;
-    assert_eq!(events.status(), reqwest::StatusCode::OK);
-    assert!(std::str::from_utf8(&events.chunk().await?.ok_or("ready")?)?.contains("event: ready"));
+    let mut events = RealtimeChannel::connect(&base, &cookies).await?;
 
     for (suffix, body, expected) in [
         ("favorite", json!({"favorite":true}), "favorites"),
@@ -121,7 +89,7 @@ async fn user_mutations_notify_other_web_sessions_after_persistence()
             .send()
             .await?;
         assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
-        assert_eq!(next_scope(&mut events).await?, expected);
+        assert_eq!(events.next_user_scope().await?, expected);
         let (favorite, played): (i64, i64) = sqlx::query_as(
             "SELECT is_favorite, is_played FROM user_item_state WHERE user_id = ? AND item_id = ?",
         )
@@ -140,7 +108,7 @@ async fn user_mutations_notify_other_web_sessions_after_persistence()
         .header(COOKIE, &cookies).header("X-CSRF-Token", csrf)
         .json(&json!({"state":"PLAYING", "positionTicks":1000000000_i64, "durationTicks":2000000000_i64})).send().await?;
     assert_eq!(progress.status(), reqwest::StatusCode::NO_CONTENT);
-    assert_eq!(next_scope(&mut events).await?, "home");
+    assert_eq!(events.next_user_scope().await?, "home");
 
     let response = client
         .patch(format!("{base}/api/v1/auth/library-order"))
@@ -150,7 +118,7 @@ async fn user_mutations_notify_other_web_sessions_after_persistence()
         .send()
         .await?;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(next_scope(&mut events).await?, "home");
+    assert_eq!(events.next_user_scope().await?, "home");
     server.abort();
     Ok(())
 }

@@ -126,7 +126,7 @@ use crate::{
         StoredPlaybackSession, TrustedProxyCidrCache, WebPlaybackEventClaim,
     },
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
 #[path = "admin.rs"]
 mod admin;
@@ -169,25 +169,9 @@ mod routes;
 #[path = "users.rs"]
 mod users;
 
-/// Concurrency budget for server-sent-event streams; the default keeps resource use bounded.
-#[derive(Clone)]
-pub(crate) struct SseConnectionBudget(Arc<tokio::sync::Semaphore>);
-
-impl Default for SseConnectionBudget {
-    fn default() -> Self {
-        Self(Arc::new(tokio::sync::Semaphore::new(MAX_SSE_CONNECTIONS)))
-    }
-}
-
-impl SseConnectionBudget {
-    fn try_acquire(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        self.0.clone().try_acquire_owned().ok()
-    }
-}
-
 /// State that exists in every process mode, including the pre-setup mode.
 ///
-/// It holds the middleware pieces (rate limiters, SSE budget, resource and request metrics), the
+/// It holds the middleware pieces (rate limiters, resource and request metrics), the
 /// event hubs, the connection handle, and the three non-service options (`database`,
 /// `config_dir`, `restart_handle`) that setup itself needs. Business services live in
 /// [`ReadyServices`].
@@ -218,8 +202,6 @@ pub struct CoreState {
     request_rate_limiter: crate::security::RequestRateLimiter,
     /// Per-administrator-session budget for the manual danmaku search endpoint (ADR-052 P5).
     danmaku_search_rate_limiter: crate::security::DanmakuSearchRateLimiter,
-    /// Bounds the number of concurrent server-sent-event streams.
-    sse_permits: SseConnectionBudget,
     /// Bounds the number of concurrent Emby WebSocket connections (global and per user).
     emby_websocket_connections: WebsocketConnections,
     /// Bounds the concurrent Lux WebSocket connections: one budget per channel (ADR-054 D8).
@@ -743,12 +725,6 @@ impl AppState {
         }
     }
 
-    /// Overrides the concurrent SSE stream budget (tests use a small value).
-    pub fn with_sse_connection_limit(mut self, limit: usize) -> Self {
-        self.core.sse_permits = SseConnectionBudget(Arc::new(tokio::sync::Semaphore::new(limit)));
-        self
-    }
-
     /// Overrides the per-peer request budget (tests use a small value).
     pub fn with_request_rate_limit(mut self, limit: u32) -> Self {
         self.core.request_rate_limiter = crate::security::RequestRateLimiter::new(limit);
@@ -1096,7 +1072,6 @@ impl AppState {
             device_pairing_rate_limiter: DevicePairingRateLimiter::default(),
             request_rate_limiter: crate::security::RequestRateLimiter::default(),
             danmaku_search_rate_limiter: crate::security::DanmakuSearchRateLimiter::default(),
-            sse_permits: SseConnectionBudget::default(),
             emby_websocket_connections: WebsocketConnections::default(),
             lux_websocket_connections: LuxWebsocketConnections::default(),
             websocket_shutdown: WebsocketShutdown::default(),
@@ -1463,8 +1438,6 @@ async fn require_web_csrf(headers: &HeaderMap, state: &ReadyAppState) -> Result<
 }
 
 const MAX_CONCURRENT_CATALOG_REQUESTS: usize = 16;
-/// Each stream holds a task and a 16 KiB buffer, so the cap keeps them bounded.
-const MAX_SSE_CONNECTIONS: usize = 64;
 const MAX_IN_FLIGHT_CATALOG_REQUESTS: usize = 64;
 
 fn is_catalog_aggregation_path(path: &str) -> bool {
@@ -1904,20 +1877,6 @@ pub(super) async fn request_client_ip(
         Ok(address) => address.map(|address| address.to_string()),
         Err(_) => None,
     }
-}
-
-fn sse_capacity_response(headers: &HeaderMap) -> Response {
-    let mut response = api_error(
-        headers,
-        StatusCode::TOO_MANY_REQUESTS,
-        super::lux::ApiErrorCode::RateLimited,
-        "同时打开的事件流过多，请稍后重试",
-    )
-    .into_response();
-    response
-        .headers_mut()
-        .insert("retry-after", HeaderValue::from_static("30"));
-    response
 }
 
 async fn request_access_ip(

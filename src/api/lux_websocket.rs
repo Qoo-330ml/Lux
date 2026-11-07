@@ -521,7 +521,7 @@ fn normalize_authority(value: &str, default_ports: &[u16]) -> Option<String> {
     }
 }
 
-/// `429` + `Retry-After: 30`, the same shape the SSE budget answered with (ADR-054 "超限行为").
+/// `429` + `Retry-After: 30` (ADR-054「超限行为」).
 fn lux_websocket_capacity_response(headers: &HeaderMap) -> Response {
     let mut response = api_error(
         headers,

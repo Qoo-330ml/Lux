@@ -57,7 +57,7 @@ pub(in crate::api::legacy) async fn emby_hide_from_resume(
     let catalog = state.catalog();
     let item_id = emby_internal_id(&item_id);
     // Publish with the canonical user id: the path segment is a public Emby id
-    // and must not be used as the SSE routing key.
+    // and must not be used as the realtime routing key.
     let notification_user_id = principal.user_id.map(|user_id| user_id.to_string());
     match catalog.set_resume_hidden(principal, &item_id, hidden).await {
         Ok(user_state) => {
