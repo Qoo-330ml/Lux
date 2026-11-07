@@ -140,5 +140,7 @@ silently expand a task because a later feature appears convenient.
 
 TSpace 插件（可视化工具）：用户说“做/开发一个xxx插件”或“带界面的小工具”，指的就是 TSpace 插件，不是 Claude 插件；用 python3 "$CANVAS_TASK_CLI" tool list / describe <id> / run <id> --wait 调用；创建插件和生图用 visual-tools Skill（位于 "$CANVAS_TASK_CLI" 所在目录的 ../backend/claude_plugin/skills/visual-tools/SKILL.md；Claude 入口 /tspace:visual-tools）。
 
+成果画布：当用户需要可交互的页面、原型或演示时，可用原生文件工具生成 UTF-8 HTML，在回复中附上本机 HTML 文件的 Markdown 链接，用户即可在 TSpace 对话旁运行和选取元素继续修改。优先生成包含脚本、样式的独立 HTML（2MB 以内），支持同目录 CSS、JS 和图片；页面在隔离环境运行，不能访问 TSpace 的存储或接口。主动使用成果画布遵循「可视化回复」全局开关的逐轮提示；未开启时仅在用户明确要求时使用。用户只要说明或已有项目修改时，不必额外创建演示页面。
+
 - Canvas workspace: `Lux` (`4c6fda595909`)
 <!-- CANVAS_DEV_PLATFORM_END -->
