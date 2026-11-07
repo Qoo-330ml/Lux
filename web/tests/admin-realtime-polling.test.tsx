@@ -87,14 +87,17 @@ describe("admin fallback polling", () => {
   const intervalOf = (queryKey: QueryKey) =>
     queryClient.getQueryCache().find({ queryKey })?.options.refetchInterval;
 
-  it("keeps polling the dashboard until the admin channel is connected", () => {
+  it("slows the dashboard down instead of stopping it when the admin channel connects", () => {
+    // The dashboard carries per-request samples (uptime, CPU, memory, storage) that no admin frame
+    // refreshes, so a connected channel only stretches the interval; it never turns it off.
     vi.spyOn(api, "adminDashboard").mockReturnValue(new Promise(() => {}));
     renderPage(<AdminDashboardPage />, { connection: true });
 
     expect(intervalOf(queryKeys.adminDashboard)).toBe(queryRefreshIntervals.liveDashboard);
 
     act(() => socket().ready());
-    expect(intervalOf(queryKeys.adminDashboard)).toBe(false);
+    expect(intervalOf(queryKeys.adminDashboard)).toBe(queryRefreshIntervals.liveDashboardConnected);
+    expect(queryRefreshIntervals.liveDashboardConnected).toBeGreaterThan(queryRefreshIntervals.liveDashboard);
   });
 
   it("does not trust the user channel's connection state for admin polling", () => {
@@ -110,17 +113,31 @@ describe("admin fallback polling", () => {
     vi.spyOn(api, "adminDashboard").mockReturnValue(new Promise(() => {}));
     renderPage(<AdminDashboardPage />, { connection: true });
     act(() => socket().ready());
-    expect(intervalOf(queryKeys.adminDashboard)).toBe(false);
+    expect(intervalOf(queryKeys.adminDashboard)).toBe(queryRefreshIntervals.liveDashboardConnected);
 
     act(() => socket().serverClose(1006));
     expect(intervalOf(queryKeys.adminDashboard)).toBe(queryRefreshIntervals.liveDashboard);
+  });
+
+  it("returns the dashboard to the slow interval when the connection comes back", () => {
+    vi.spyOn(api, "adminDashboard").mockReturnValue(new Promise(() => {}));
+    renderPage(<AdminDashboardPage />, { connection: true });
+    act(() => socket().ready());
+    act(() => socket().serverClose(1006));
+    expect(intervalOf(queryKeys.adminDashboard)).toBe(queryRefreshIntervals.liveDashboard);
+
+    // The client reconnects after 500 ms + jitter; the first `ready` of the new connection is what
+    // counts as connected again.
+    act(() => vi.advanceTimersByTime(500));
+    act(() => socket().ready());
+    expect(intervalOf(queryKeys.adminDashboard)).toBe(queryRefreshIntervals.liveDashboardConnected);
   });
 
   it("restores the dashboard interval after a 1008 close without reconnecting", () => {
     vi.spyOn(api, "adminDashboard").mockReturnValue(new Promise(() => {}));
     renderPage(<AdminDashboardPage />, { connection: true });
     act(() => socket().ready());
-    expect(intervalOf(queryKeys.adminDashboard)).toBe(false);
+    expect(intervalOf(queryKeys.adminDashboard)).toBe(queryRefreshIntervals.liveDashboardConnected);
 
     // 1008 means the session is gone: the admin channel is down for good, so the fallback returns
     // and the client must not keep reconnecting.

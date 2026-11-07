@@ -7,17 +7,21 @@ import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { AdminDashboard } from "../../lib/api/types";
 import { LuxTextField } from "../../components/ui";
-import { adminFallbackInterval, useAdminRealtimeConnectionState } from "./useAdminEvents";
+import { useAdminRealtimeConnectionState } from "./useAdminEvents";
 
 export function AdminDashboardPage() {
   const queryClient = useQueryClient();
-  // LUX-898: the dashboard is covered by the `dashboard`/`jobs` scopes, so its 15 s fallback only
-  // runs while the admin channel is down.
+  // LUX-898: a connected admin channel must not switch the dashboard off. Uptime, CPU, memory and
+  // storage are sampled per request, and the server only publishes the `dashboard` scope on
+  // audit/activity events, so a quiet server would freeze them. Stretch the interval instead; the
+  // task activity popover and the four job lists do stop, because `jobs` frames cover them.
   const adminRealtimeState = useAdminRealtimeConnectionState();
   const dashboard = useQuery({
     queryKey: queryKeys.adminDashboard,
     queryFn: () => api.adminDashboard(),
-    refetchInterval: adminFallbackInterval(adminRealtimeState, queryRefreshIntervals.liveDashboard),
+    refetchInterval: adminRealtimeState === "connected"
+      ? queryRefreshIntervals.liveDashboardConnected
+      : queryRefreshIntervals.liveDashboard,
   });
   const [serverName, setServerName] = useState<string | null>(null);
   const [nameEditorOpen, setNameEditorOpen] = useState(false);

@@ -119,5 +119,11 @@ export const queryKeys = {
 
 export const queryRefreshIntervals = {
   liveDashboard: 15_000,
+  /**
+   * LUX-898: with the admin channel connected the dashboard still polls, only slower. Uptime,
+   * CPU, memory and storage are sampled per request and the server publishes the `dashboard`
+   * scope on audit/activity events, so a quiet server never refreshes them through frames.
+   */
+  liveDashboardConnected: 60_000,
   mediaSurface: 30_000,
 } as const;
