@@ -1828,7 +1828,7 @@ Lux 当时返回 404 空响应，客户端页面不报错、推荐区整块缺�
   未提供；`limit` 的 `0`、负数、非整数（含 `1.5`）或超过 1000，以及 `page` 的 `0`、负数、非整数返回
   400 `INVALID_REQUEST`。`offset = (page - 1) * limit`，`limit` 只决定每页条数，不改变 `total`；`0` 被
   拒绝与 Lux 其他列表 `pageSize` 必须为正的规则一致，也避免分页信封做 `offset / limit` 时除零。
-  `pageSize` 不是请求参数。
+  `pageSize` 是 `limit` 的别名，使用同一 1-1000 边界；两者同时提供且数值不同返回 400。
 - 相似规则与候选池：与 LUX-889 完全一致，由同一个 `CatalogService::list_similar_items` 提供：同类型
   （`MOVIE`/`SERIES`）、至少共享一个已入库 Genre、最多 10 个源 Genre × 每个 200 个通过 ACL/可见性/内容
   限制的候选，共享数量降序后再按 `LOWER(title)`、条目 id 升序，并排除自身。没有复制 SQL、没有新增
@@ -1842,8 +1842,9 @@ Lux 当时返回 404 空响应，客户端页面不报错、推荐区整块缺�
   `EMBY_MAX_PAGE_LIMIT`（1000），不接收 `page`，行为与 6 例断言不变。`src/api/media.rs` 的单测
   `lux_similar_limit_and_page_validation` 钉住 Lux 的 1000/1001 与 page 边界。
 - 并发闸门只覆盖 Lux 路由：`/api/v1/items/{id}/similar` 计入目录聚合闸门；Emby
-  `/Items/{id}/Similar`（根路径与 `/emby` 前缀）不计入，保持 LUX-889 之前的对外行为（饱和时不会因此
-  变成 503）。
+  `/Items/{id}/Similar`（根路径与 `/emby` 前缀）与 Lux 共用同一聚合查询，但为了避免饱和时把 Emby
+  相似区变成 503，Emby 路径刻意不计入目录闸门。因此已鉴权用户可以通过 Emby 路径绕过新增的并发上限；
+  这是已知的性能权衡，列为后续风险。
 - 自动化：新增 `tests/library/similar_api.rs`（`cargo test --locked --test library similar_api::`，
   6 例）：同一用户同一库下 Lux 与 Emby 的条目 id 顺序一致（普通用户与管理员、含 ACL 排除项）、
   `limit`/`page` 默认值与 400 边界、`limit=1000` 接受、三页拼接与一次取全顺序一致且无重复/遗漏、超界页

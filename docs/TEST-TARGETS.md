@@ -391,7 +391,8 @@ LUX-897 删除了两条 SSE 端点（`GET /api/v1/events`、`GET /api/v1/admin/e
 命令为 `cargo test --locked --test library similar_api::`，共 **6** 例：同一用户同一库下 Lux 原生
 `GET /api/v1/items/{item_id}/similar` 与 Emby `GET /Items/{id}/Similar` 的条目 id 顺序一致（普通用户与
 管理员，含 ACL 排除项不出现在 `items`/`total`/Emby `TotalRecordCount`）、`limit` 默认 50/上限 1000、`page`
-默认 1/边界 400、空值按未提供、`limit=1000` 接受且 1001 拒绝（Emby 仍拒绝 1001）、三页拼接与 `limit=5`
+默认 1/边界 400、空值按未提供、`pageSize` 作为 `limit` 别名且冲突 400、`limit=1000` 接受且 1001 拒绝
+（Emby 仍拒绝 1001）、三页拼接与 `limit=5`
 一次取全的 id 顺序一致且无重复/遗漏、超界页返回 200 空列表且 `hasNext=false`、`total` 在各页相同、未知或
 不可见条目 404 与无会话 401、内容限制排除的条目不出现在 `items`/`total`、剧集只返回剧集且无相似条目时
 返回 200 空列表。

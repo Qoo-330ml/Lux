@@ -15,9 +15,9 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
   id），并排除自身、用户无权访问的媒体库以及被内容限制屏蔽的条目。响应沿用 `/api/v1` 列表的分页形状
   `{items,page,pageSize,hasNext,total}` 与 Lux 媒体条目 DTO；`total` 是有界候选池内的去重总数（与 Emby
   `TotalRecordCount` 同义），`page` 从 1 起、默认 1，`pageSize` 为生效的 `limit`，`hasNext =
-  offset + items.len() < total`（`offset = (page - 1) * limit`）。`limit` 默认 50、允许 1-1000；`page`
-  为 0、负数或非整数，以及 `limit` 为 0、负数、非整数或超过 1000 都返回 400；空值按未提供；页超出候选池
-  返回 200 空列表。条目不存在或不可见返回 404，未鉴权 401。该接口现在是相似条目的权威实现，Emby
+  offset + items.len() < total`（`offset = (page - 1) * limit`）。`limit` 默认 50、允许 1-1000；`pageSize`
+  是 `limit` 的别名，两者同时提供且数值不同返回 400；`page` 为 0、负数或非整数，以及 `limit` 为 0、负数、
+  非整数或超过 1000 都返回 400；空值按未提供；页超出候选池返回 200 空列表。条目不存在或不可见返回 404，未鉴权 401。该接口现在是相似条目的权威实现，Emby
   `GET /Items/{id}/Similar` 改为调用同一个服务，只保留协议适配，对外行为不变；不新增迁移，也不改
   Web 页面。
 

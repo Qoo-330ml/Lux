@@ -1138,21 +1138,43 @@ pub(super) struct LuxSimilarQuery {
     /// the cap.
     #[serde(default)]
     limit: Option<String>,
+    /// Accepted as an alias for `limit` (the Web client sends `pageSize`); when both are present
+    /// they must agree, otherwise the request answers 400.
+    #[serde(rename = "pageSize", alias = "page_size", default)]
+    page_size: Option<String>,
     /// 1-based page; an empty value is treated as absent (page 1). The offset is `(page - 1) *
     /// limit`, computed with `checked_mul` so an absurd page answers 400 instead of overflowing.
     #[serde(default)]
     page: Option<String>,
 }
 
-fn lux_similar_limit(raw: Option<&str>) -> Result<i64, &'static str> {
+fn optional_similar_page_size(raw: Option<&str>) -> Result<Option<i64>, &'static str> {
     let Some(raw) = raw else {
-        return Ok(LUX_SIMILAR_DEFAULT_LIMIT);
+        return Ok(None);
     };
     let raw = raw.trim();
     if raw.is_empty() {
-        return Ok(LUX_SIMILAR_DEFAULT_LIMIT);
+        return Ok(None);
     }
-    let limit = raw.parse::<i64>().map_err(|_| "相似条目分页参数无效")?;
+    raw.parse::<i64>()
+        .map(Some)
+        .map_err(|_| "相似条目分页参数无效")
+}
+
+/// Resolves the page size from `limit` and its `pageSize` alias. Empty values are absent; if both
+/// are present they must agree. The bounds stay the single `limit` contract (50 default, 1-1000);
+/// `pageSize` adds no separate 1-100 rule.
+fn lux_similar_limit(limit: Option<&str>, page_size: Option<&str>) -> Result<i64, &'static str> {
+    let limit = optional_similar_page_size(limit)?;
+    let page_size = optional_similar_page_size(page_size)?;
+    let limit = match (limit, page_size) {
+        (Some(limit), Some(page_size)) if limit != page_size => {
+            return Err("相似条目分页参数无效");
+        }
+        (Some(limit), _) => limit,
+        (None, Some(page_size)) => page_size,
+        (None, None) => LUX_SIMILAR_DEFAULT_LIMIT,
+    };
     if !(1..=LUX_SIMILAR_MAX_LIMIT).contains(&limit) {
         return Err("相似条目分页参数无效");
     }
@@ -1212,7 +1234,7 @@ pub(super) async fn lux_get_similar(
         Ok(user) => user,
         Err(response) => return response,
     };
-    let limit = match lux_similar_limit(query.limit.as_deref()) {
+    let limit = match lux_similar_limit(query.limit.as_deref(), query.page_size.as_deref()) {
         Ok(limit) => limit,
         Err(message) => {
             return api_error(
@@ -5122,9 +5144,21 @@ mod similar_limit_tests {
 
     #[test]
     fn lux_similar_limit_and_page_validation() {
-        assert_eq!(lux_similar_limit(None), Ok(LUX_SIMILAR_DEFAULT_LIMIT));
-        assert_eq!(lux_similar_limit(Some("1000")), Ok(LUX_SIMILAR_MAX_LIMIT));
-        assert_eq!(lux_similar_limit(Some("1001")), Err("相似条目分页参数无效"));
+        assert_eq!(lux_similar_limit(None, None), Ok(LUX_SIMILAR_DEFAULT_LIMIT));
+        assert_eq!(
+            lux_similar_limit(Some("1000"), None),
+            Ok(LUX_SIMILAR_MAX_LIMIT)
+        );
+        assert_eq!(
+            lux_similar_limit(Some("1001"), None),
+            Err("相似条目分页参数无效")
+        );
+        assert_eq!(lux_similar_limit(None, Some("20")), Ok(20));
+        assert_eq!(lux_similar_limit(Some("20"), Some("20")), Ok(20));
+        assert_eq!(
+            lux_similar_limit(Some("20"), Some("10")),
+            Err("相似条目分页参数无效")
+        );
         assert_eq!(lux_similar_page(None), Ok(1));
         assert_eq!(lux_similar_page(Some("2")), Ok(2));
         assert_eq!(lux_similar_page(Some("0")), Err("相似条目分页参数无效"));

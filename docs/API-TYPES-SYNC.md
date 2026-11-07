@@ -416,9 +416,10 @@ Emby DTO/参数适配。
   先定 `{items,page,pageSize,hasNext,total}` 信封（G-Page）再处理 `MediaItem`（G-MediaItem），不要为此
   单独发明一个 `Option` 合成信封。
 - 请求参数是 `limit`（默认 50、1-1000，空值按未提供，`0`/负数/非整数/超过 1000 为 400）与 `page`
-  （1 起、默认 1，空值按未提供，`0`/负数/非整数为 400），属于读路径查询参数，不在本文件的请求体范围内。
-  `pageSize` 不是请求参数；Lux 与 Emby 的默认值/上限分开定义（`LUX_SIMILAR_*` 与
-  `EMBY_SIMILAR_DEFAULT_LIMIT`/`EMBY_MAX_PAGE_LIMIT`），Emby 不接收 `page`。
+  （1 起、默认 1，空值按未提供，`0`/负数/非整数为 400）；`pageSize` 是 `limit` 的别名，使用同一默认值与
+  上限，两者同时提供且数值不一致返回 400。它们属于读路径查询参数，不在本文件的请求体范围内。Lux 与 Emby
+  的默认值/上限分开定义（`LUX_SIMILAR_*` 与 `EMBY_SIMILAR_DEFAULT_LIMIT`/`EMBY_MAX_PAGE_LIMIT`），
+  Emby 不接收 `page`。
 
 ## 已知限制
 

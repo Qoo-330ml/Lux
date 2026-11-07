@@ -546,22 +546,42 @@ async fn lux_similar_limit_and_page_validate_and_default() -> Result<(), Box<dyn
         3,
     );
 
-    // `pageSize` is not part of the contract; only `page` + `limit` are honoured.
-    let (status, ignored_page_size) = harness
-        .lux_similar(
-            "sim-movie-source",
-            "?limit=2&page=1&pageSize=1",
-            &harness.viewer_cookie,
-        )
-        .await?;
-    assert_eq!(status, reqwest::StatusCode::OK);
-    assert_lux_page(
-        &ignored_page_size,
-        &["sim-movie-alpha", "sim-movie-charlie"],
-        1,
-        2,
-        3,
-    );
+    // `pageSize` is accepted as an alias for `limit`; an explicitly empty value is absent.
+    for query in [
+        "?pageSize=20",
+        "?limit=20&pageSize=20",
+        "?limit=&pageSize=20",
+        "?limit=20&pageSize=",
+    ] {
+        let (status, body) = harness
+            .lux_similar("sim-movie-source", query, &harness.viewer_cookie)
+            .await?;
+        assert_eq!(status, reqwest::StatusCode::OK, "query {query}");
+        assert_lux_page(
+            &body,
+            &["sim-movie-alpha", "sim-movie-charlie", "sim-movie-bravo"],
+            1,
+            20,
+            3,
+        );
+    }
+
+    // Conflicting aliases and pageSize values outside the shared page bounds are rejected.
+    for query in [
+        "?limit=20&pageSize=10",
+        "?pageSize=1001",
+        "?pageSize=0",
+        "?pageSize=abc",
+    ] {
+        let (status, _) = harness
+            .lux_similar("sim-movie-source", query, &harness.viewer_cookie)
+            .await?;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "query {query} must be rejected"
+        );
+    }
 
     for query in [
         "?limit=0",
