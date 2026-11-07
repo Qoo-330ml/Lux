@@ -1835,6 +1835,10 @@ Lux 当时返回 404 空响应，客户端页面不报错、推荐区整块缺�
   `similar_items_page` 入口，只保留 Emby 的 `Items`/`TotalRecordCount` DTO、`Fields`、`EnableUserData`、
   `EnableImageTypes`/`ImageTypeLimit` 与 `Limit` 处理，对外状态码、字段、排序和 `TotalRecordCount`
   不变；`emby_similar` 的 6 个用例断言未改。
+- 分页上限只有一份定义：`SIMILAR_DEFAULT_LIMIT`（50）与 `SIMILAR_MAX_LIMIT`（即
+  `EMBY_MAX_PAGE_LIMIT`，1000）定义在 Lux handler 旁边，Emby 适配层直接引用，不再单独维护
+  `EMBY_SIMILAR_DEFAULT_LIMIT` 或硬编码上限。`src/api/media.rs` 的单测
+  `similar_limit_tests::similar_limits_share_the_emby_page_cap` 钉住该共享关系。
 - 自动化：新增 `tests/library/similar_api.rs`（`cargo test --locked --test library similar_api::`，
   5 例）：同一用户同一库下 Lux 与 Emby 的条目 id 顺序一致（普通用户与管理员、含 ACL 排除项）、
   `limit` 默认值/上限/400、404/401（未知条目、无权条目、无会话）、内容限制排除的条目不出现在

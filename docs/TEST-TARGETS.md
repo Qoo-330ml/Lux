@@ -396,6 +396,9 @@ LUX-897 删除了两条 SSE 端点（`GET /api/v1/events`、`GET /api/v1/admin/e
 
 - 该模块按路由所在域放在 `library` 分组（目录/媒体条目 API），与 `catalog`、`series_api` 等相邻；没有新建
   顶层 target，也没有改其他分组的归属。
+- `src/api/media.rs` 另新增 1 例单测 `similar_limit_tests::similar_limits_share_the_emby_page_cap`
+  （`cargo test --locked --lib similar_limits_share_the_emby_page_cap`），断言两端默认值/上限来自同一组
+  共享常量（上限即 `EMBY_MAX_PAGE_LIMIT`）。
 - 实测：`cargo test --locked --test library -- --list` 为 **56** 例（51 例基线 + 本任务 5 例），
   `cargo test --locked --test library` 56/56 通过；`cargo test --locked --test emby -- --list` 仍为 **83**
   例，其中 `emby_similar::` 6/6（断言未改）；`cargo test --locked --lib similar_catalog` 2/2。

@@ -415,7 +415,8 @@ Emby DTO/参数适配。
   先定 `{items,page,pageSize,hasNext,total}` 信封（G-Page）再处理 `MediaItem`（G-MediaItem），不要为此
   单独发明一个 `Option` 合成信封。
 - 请求参数只有 `limit`（默认 50、1-1000，空值按未提供，`0`/负数/非整数/超过 1000 为 400），是读路径的
-  查询参数，不在本文件的请求体范围内。
+  查询参数，不在本文件的请求体范围内；默认值与上限和 Emby 适配层共用同一组
+  `SIMILAR_DEFAULT_LIMIT`/`SIMILAR_MAX_LIMIT` 常量。
 
 ## 已知限制
 
