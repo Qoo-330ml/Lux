@@ -20461,6 +20461,8 @@ Hills 或任何第三方客户端上复测。
 
 #### LUX-889：Emby `GET /Items/{id}/Similar`
 
+> 约束修订（2026-11-07）：本任务中“不改 `/api/v1` DTO 与 `web/`”仅对 LUX-889 当时的范围有效；`/api/v1` 相似接口见 LUX-899。
+
 背景：真机抓包（2026-11-06）确认 Hills 1.11.0 与 Yamby 2.1.0.11 每次进入电影/剧集详情页都会请求
 `/emby/Items/<id>/Similar`（Hills 带 `UserId`、`Fields`、`Limit`、`ImageTypeLimit`；Yamby 另带
 `EnableTotalRecordCount=false`），Lux 返回 404 空响应，详情页的相似/推荐区整块缺失且页面不报错
@@ -21527,6 +21529,40 @@ admin 事件）。
 执行）。先写的失败用例在实现后转绿：首轮 4 红；审查返工 1（仪表盘 60 s/15 s 两态）4 红；审查返工 2
 （30 s/5 s、弹层不接入、壳层不因 `jobs` 帧重取）3 红。`web/tests/realtime-client.test.ts` 的 observer 用例
 同样先红后绿。
+
+#### LUX-899：Lux 原生 `GET /api/v1/items/{item_id}/similar`（Emby Similar 改为兼容适配层）
+
+状态：规格草案（2026-11-07 由项目负责人确认修订 LUX-889 的约束后新增），待项目负责人确认后实施。依赖：
+LUX-889（已完成，提供 `CatalogService::list_similar_items` 与 `list_similar_catalog_rows`）。
+
+背景：LUX-889 把相似条目只做成 Emby 兼容路由，并约定“不改 `/api/v1` DTO 与 `web/`”。本任务取代该约束中
+关于 `/api/v1` 的部分：Lux 原生接口成为相似条目的权威实现，Emby `/Items/{id}/Similar` 只做协议适配。
+
+范围：
+
+- 新增 `GET /api/v1/items/{item_id}/similar`，鉴权与其他 `/api/v1/items/{item_id}/*` 路由一致（Lux token），
+  执行媒体库 ACL 与内容限制。
+- 请求参数：`limit`（默认 50，上限 1000，非法值 400），其余不引入。
+- 响应 DTO 为 Lux 自有类型（不复用 Emby DTO），字段与分页约定沿用现有 `/api/v1` 列表响应，实施前在
+  `docs/API.md` 与 `docs/API-TYPES-SYNC.md` 核对并同步。
+- 相似规则与候选池上限与 LUX-889 完全一致，由同一个 `CatalogService::list_similar_items` 提供，不复制 SQL。
+- Emby `GET /Items/{id}/Similar` 改为调用同一服务，只保留 Emby DTO 映射与 `Fields`/`EnableUserData`/
+  `EnableImageTypes` 等 Emby 参数处理；对外行为（状态码、字段、排序、`TotalRecordCount`）保持不变。
+- 不做：Web 详情页展示（另立任务，需项目负责人单独确认）；新增迁移；改变相似规则；`/Users/{userId}/...` 形态。
+
+验收：
+
+- [ ] Lux 路由返回的 `items` 与 Emby 路由在同一库与同一用户下的条目 id 顺序一致（同一服务，回归对照测试）。
+- [ ] `limit` 生效；空值按未提供；负数、非整数或超上限 400；不存在或不可见的条目 404；未鉴权 401。
+- [ ] 被媒体库 ACL 或内容限制排除的条目不出现在结果或 `totalRecordCount`。
+- [ ] Emby `cargo test --locked --test emby emby_similar::` 6/6 保持通过，且不修改其断言。
+- [ ] 新增 Lux 路由集成测试（`--test auth_users` 或 `--test library` 中选择与路由所在域一致的分组，实施时在
+      `docs/TEST-TARGETS.md` 登记）。
+- [ ] 存储与服务层不新增 SQL 扫描：沿用 LUX-889 的查询计划验收。
+
+预计文件：`src/api/lux_api.rs`（或同域的新模块）、`src/api/emby_similar.rs`、`src/application/catalog.rs`、
+`src/api/dto` 中的 Lux 响应类型、`tests/` 下新增 Lux 路由测试、`docs/API.md`、`docs/API-TYPES-SYNC.md`、
+`docs/COMPATIBILITY.md`、`docs/CHANGELOG.md`、`docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
 
 ## 31. 参考资料
 
