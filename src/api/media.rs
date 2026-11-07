@@ -1175,9 +1175,13 @@ pub(super) async fn similar_items_page(
 
 /// `GET /api/v1/items/{item_id}/similar?limit=50`.
 ///
-/// The response is the same `{items,page,pageSize,hasNext,total}` envelope as the other Lux list
-/// endpoints and uses the Lux item DTO, never the Emby one. `total` is the bounded candidate-pool
-/// count returned by the shared service; `limit` only trims the page.
+/// The response uses the regular Lux list envelope `{items,page,pageSize,hasNext,total}` and the
+/// Lux item DTO, never the Emby one. `total` is the bounded candidate-pool count returned by the
+/// shared service (at most 10 source genres x 200 candidates, i.e. 2000), `page` is 1, `pageSize`
+/// is the effective `limit`, and `hasNext` is true when the pool holds more items than this page
+/// returned. A caller can raise `limit` (up to 1000) to fetch more; a pool above 1000 cannot be
+/// fully retrieved through this endpoint, which is why `hasNext` is only a truncation signal.
+/// `limit` itself only trims the page and never changes `total`.
 pub(super) async fn lux_get_similar(
     headers: HeaderMap,
     Path(item_id): Path<String>,
@@ -1203,12 +1207,12 @@ pub(super) async fn lux_get_similar(
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let database = state.database();
     match similar_items_page(&state, principal, &item_id, limit).await {
-        Ok(Some(page)) => {
-            // This endpoint has no page/cursor parameter: it serves only the first page of the
-            // bounded candidate pool and deliberately exposes no candidate-pool total. Building
-            // the page without a total keeps `hasNext: false` from contradicting a `total`, and
-            // stops clients from deriving paging from a count they cannot page through.
-            let page = CatalogPage::without_total(page.items, 0, limit, false);
+        Ok(Some(mut page)) => {
+            // The endpoint has no page/cursor parameter, so it serves the first page of the
+            // bounded candidate pool. Keep the service's pool total and advertise truncation:
+            // `hasNext` is true exactly when the pool has items this page did not return, so the
+            // caller can raise `limit` (up to 1000) instead of guessing from `total`.
+            page.has_next = page.total > page.items.len() as i64;
             match lux_catalog_page_json_for_user(database, &user.id.to_string(), &page).await {
                 Ok(body) => Json(body).into_response(),
                 Err(_) => api_error(
