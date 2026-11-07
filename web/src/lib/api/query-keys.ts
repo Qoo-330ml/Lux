@@ -26,6 +26,8 @@ export const queryKeys = {
   ) => ["library", libraryId, page, pageSize, itemTypes ?? "root", sortBy, sortOrder, metadataStatus, filters] as const,
   collection: (collectionId: string) => ["collection", collectionId] as const,
   item: (itemId: string) => ["item", itemId] as const,
+  // Nested under the item prefix so a detail refresh also refreshes its recommendations.
+  similar: (itemId: string, limit = 12) => ["item", itemId, "similar", limit] as const,
   person: (personId: string) => ["person", personId] as const,
   personItems: (personId: string) => ["person", personId, "items"] as const,
   itemImages: (itemId: string) => ["item-images", itemId] as const,

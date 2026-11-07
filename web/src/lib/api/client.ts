@@ -127,6 +127,8 @@ import type {
   LoginBackgroundResponse,
   MetadataFieldName,
   PageResponse,
+  SimilarItemsQuery,
+  SimilarItemsResponse,
   PersonDetail,
   PlaybackState,
   PlaybackEventState,
@@ -743,6 +745,13 @@ export class LuxApiClient {
 
   item(itemId: string) {
     return this.request<MediaItem>(`/api/v1/items/${encodeURIComponent(itemId)}`);
+  }
+
+  similarItems(itemId: string, options: SimilarItemsQuery = {}) {
+    const params = new URLSearchParams({ limit: String(options.limit ?? 12) });
+    return this.request<SimilarItemsResponse>(
+      `/api/v1/items/${encodeURIComponent(itemId)}/similar?${params}`,
+    );
   }
 
   person(personId: string) {
