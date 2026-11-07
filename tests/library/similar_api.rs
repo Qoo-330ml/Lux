@@ -17,6 +17,8 @@ struct Harness {
     viewer_cookie: String,
     admin_emby_token: String,
     viewer_emby_token: String,
+    viewer_id: String,
+    database: Database,
     server: tokio::task::JoinHandle<Result<(), std::io::Error>>,
     _temp_dir: tempfile::TempDir,
 }
@@ -40,6 +42,21 @@ async fn insert_item(
     .bind(title)
     .bind(title.to_lowercase())
     .bind(format!("similar:{id}"))
+    .execute(database.pool())
+    .await
+    .map(|_| ())
+}
+
+async fn insert_rating(
+    database: &Database,
+    item_id: &str,
+    certification: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO media_content_restriction_index (item_id, certification_code) VALUES (?, ?)",
+    )
+    .bind(item_id)
+    .bind(certification)
     .execute(database.pool())
     .await
     .map(|_| ())
@@ -253,20 +270,22 @@ async fn start_server() -> Result<Harness, Box<dyn std::error::Error>> {
     )
     .await?;
 
+    let viewer_id = viewer.id.to_string();
     for library_id in [&movies, &shows] {
         sqlx::query(
             "INSERT INTO user_library_access (user_id, library_id, can_view) VALUES (?, ?, 1)",
         )
-        .bind(viewer.id.to_string())
+        .bind(&viewer_id)
         .bind(library_id)
         .execute(database.pool())
         .await?;
     }
     sqlx::query("UPDATE users SET library_access_mode = 'SELECTED' WHERE id = ?")
-        .bind(viewer.id.to_string())
+        .bind(&viewer_id)
         .execute(database.pool())
         .await?;
 
+    let harness_database = database.clone();
     let web_auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let app = app_with_state(AppState::ready(
@@ -302,6 +321,8 @@ async fn start_server() -> Result<Harness, Box<dyn std::error::Error>> {
         viewer_cookie,
         admin_emby_token,
         viewer_emby_token,
+        viewer_id,
+        database: harness_database,
         server,
         _temp_dir: temp_dir,
     })
@@ -503,6 +524,50 @@ async fn lux_similar_limit_defaults_caps_and_rejects_invalid_values()
             "query {query} must be rejected"
         );
     }
+
+    harness.server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn lux_similar_excludes_items_blocked_by_content_restrictions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = start_server().await?;
+    // The viewer may watch up to PG-13 and unrated items are not allowed; every relevant item has
+    // an index row, and Charlie is the only one above the limit.
+    sqlx::query(
+        "INSERT INTO user_content_restrictions
+         (user_id, rating_system, maximum_rating, allow_unrated)
+         VALUES (?, 'MPA', 'PG-13', 0)",
+    )
+    .bind(&harness.viewer_id)
+    .execute(harness.database.pool())
+    .await?;
+    for (item_id, certification) in [
+        ("sim-movie-source", "PG"),
+        ("sim-movie-alpha", "PG"),
+        ("sim-movie-bravo", "PG"),
+        ("sim-movie-charlie", "R"),
+    ] {
+        insert_rating(&harness.database, item_id, certification).await?;
+    }
+
+    let (status, body) = harness
+        .lux_similar("sim-movie-source", "?limit=20", &harness.viewer_cookie)
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(lux_ids(&body), ["sim-movie-alpha", "sim-movie-bravo"]);
+    assert_eq!(body["total"], 2);
+    assert!(!lux_ids(&body).contains(&"sim-movie-charlie"));
+
+    // The Emby adapter shares the same restriction predicate and also drops Charlie from its
+    // TotalRecordCount.
+    let (emby_status, emby_body) = harness
+        .emby_similar("sim-movie-source", "?Limit=20", &harness.viewer_emby_token)
+        .await?;
+    assert_eq!(emby_status, reqwest::StatusCode::OK);
+    assert_eq!(emby_ids(&emby_body), ["sim-movie-alpha", "sim-movie-bravo"]);
+    assert_eq!(emby_body["TotalRecordCount"], 2);
 
     harness.server.abort();
     Ok(())

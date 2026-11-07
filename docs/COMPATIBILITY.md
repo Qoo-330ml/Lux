@@ -1835,9 +1835,10 @@ Lux 当时返回 404 空响应，客户端页面不报错、推荐区整块缺�
   `EnableImageTypes`/`ImageTypeLimit` 与 `Limit` 处理，对外状态码、字段、排序和 `TotalRecordCount`
   不变；`emby_similar` 的 6 个用例断言未改。
 - 自动化：新增 `tests/library/similar_api.rs`（`cargo test --locked --test library similar_api::`，
-  4 例）：同一用户同一库下 Lux 与 Emby 的条目 id 顺序一致（普通用户与管理员、含 ACL 排除项）、
-  `limit` 默认值/上限/400、404/401（未知条目、无权条目、无会话）、剧集只返回剧集与无相似条目的 200
-  空列表。`cargo test --locked --test emby emby_similar::` 6/6；本机 `uname -m` = `arm64`（macOS），
+  5 例）：同一用户同一库下 Lux 与 Emby 的条目 id 顺序一致（普通用户与管理员、含 ACL 排除项）、
+  `limit` 默认值/上限/400、404/401（未知条目、无权条目、无会话）、内容限制排除的条目不出现在
+  `items`/`total`、剧集只返回剧集与无相似条目的 200 空列表。
+  `cargo test --locked --test emby emby_similar::` 6/6；本机 `uname -m` = `arm64`（macOS），
   不代表 NAS/x86_64 性能，也未做客户端 UI 复测。
 
 ## LUX-891：Emby `/embywebsocket`（Yamby 实时会话与计划任务）
