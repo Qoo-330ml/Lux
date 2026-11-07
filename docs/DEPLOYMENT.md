@@ -236,6 +236,7 @@ server {
 
         proxy_set_header Range $http_range;
         proxy_set_header If-Range $http_if_range;
+        # 只为媒体流响应；WebSocket 在 101 之后是隧道，帧不经过响应缓冲。
         proxy_buffering off;
         proxy_request_buffering off;
         proxy_read_timeout 1h;
@@ -255,7 +256,7 @@ Lux 的 Web 实时通道是单端点 `GET /api/v1/ws`，Emby 兼容的 `/embyweb
 - `proxy_http_version 1.1;` 必须保留。`http2 on` 只影响浏览器到 nginx 的一段，nginx 到 `luxd` 仍是经典 HTTP/1.1 Upgrade，不需要 RFC 8441。
 - `proxy_set_header Upgrade $http_upgrade;` 与 `proxy_set_header Connection "upgrade";` 缺一不可（ADR-054 D12）。nginx 默认不转发这两类逐跳头，缺了它们握手会以普通 `GET` 到达 Lux。
 - `Host` 必须是 `$http_host`，**不是** `$host`。Lux 只比较 `Origin` 的 host[:port] 与 `Host` 头，不比较 scheme，也不读取任何转发头；`$host` 会丢掉非默认端口（`https://lux.example.internal:8443` 变成 `lux.example.internal`），于是每次握手都被 `400` 拒绝。非默认端口的部署尤其要检查这一行。
-- `proxy_buffering off;` 保留，WebSocket 帧才能即时下发；该指令同时服务媒体流响应，不是某一种已删除传输的专用要求。`proxy_read_timeout` 必须明显大于 25 秒的服务端心跳（样例的 1 小时足够）。
+- `proxy_buffering off;` 只影响普通 HTTP 响应，保留它是为了媒体流（HLS 分片/直通）不被整段缓冲。WebSocket 在 `101` 之后由 nginx 按隧道转发，帧不经过响应缓冲，因此该指令**不是** `/api/v1/ws` 的要求，删掉它不会破坏实时通道。`proxy_read_timeout` 才必须明显大于 25 秒的服务端心跳（样例的 1 小时足够）。
 - WS 握手是 `GET`，**不要求也不接受** CSRF 令牌；等价防护是会话 cookie 的 `SameSite=Lax` 加服务端的同源校验。因此不要把 nginx 配置成改写或补上 `Origin`。
 
 ### 缺头、改写 Host 与排查
@@ -264,7 +265,7 @@ Lux 的 Web 实时通道是单端点 `GET /api/v1/ws`，Emby 兼容的 `/embyweb
 - **服务端日志的拒绝分类**：握手被拒时 Lux 只记录原因分类（`origin-missing` / `origin-mismatch` / `sec-fetch-site` / `unauthenticated` / `budget`），不记录头原值。看到 `origin-missing`/`origin-mismatch` 说明请求已经是升级请求但来源校验没过；看不到任何握手拒绝分类、只看到该路径的普通 `GET`（部署开启请求日志时），说明升级头没到 Lux。`Origin` 只在 `debug` 级记录。
 - **反代改写了 `Host`**（例如改成上游 `127.0.0.1:8097`）：`Origin` 与 `Host` 不再一致，**所有握手都会被 `400` 拒绝**，前端落到轮询。修正在反代侧（`proxy_set_header Host $http_host;`），不是放宽校验：Lux 没有 `LUX_ALLOWED_ORIGINS` 之类的来源白名单，也不会用 `X-Forwarded-Proto`、`Forwarded`、`X-Forwarded-Host` 判断来源。
 - **反代补了 `Sec-Fetch-Site: cross-site`**（或中间层 WAF 会改写该头）：Lux 一律拒绝握手，这属于中间层行为，不在 Lux 配置里放宽。
-- **`101` 之后收不到帧**：检查 `proxy_buffering off;` 是否被别的配置覆盖，以及 `proxy_read_timeout` 是否短于 25 秒心跳。
+- **`101` 之后收不到帧**：WebSocket 帧不经过 `proxy_buffering`，不要从这条指令排查。先检查 `proxy_read_timeout` 是否短于 25 秒心跳，再检查中间层（WAF、负载均衡、第二层反代）是否按空闲超时断开、限流或吞掉了双向字节；每一层代理都必须转发 `Upgrade`/`Connection`。
 
 手工复现握手时，先直连上游、再经反代，两次对比（`curl` 在 `101` 之后会一直等数据，`--max-time` 结束属正常）：
 

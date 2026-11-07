@@ -1,5 +1,19 @@
 # Lux 客户端兼容性矩阵
 
+## LUX-897 SSE 端点删除（2026-11-06）
+
+分级：**服务端 404 由自动化测试固定；未在真实第三方客户端上复测**。
+
+`GET /api/v1/events` 与 `GET /api/v1/admin/events` 已由 LUX-897 在同一发布版本删除（ADR-054 硬切），现在
+两者都返回 `404`：未登录与被登录管理员完全一致，不再有 `401`、`200`、ready 帧或 `text/event-stream`。
+实时失效通知只剩 `GET /api/v1/ws`（同一条连接承载用户/管理频道）。Lux Web 已由 LUX-895 切到该端点，
+`web/src` 没有 SSE/EventSource 引用，因此浏览器端不受影响；仍连接旧路径的第三方页面或脚本会拿到 `404`，
+必须改接 `GET /api/v1/ws`。断线时的轮询兜底不变（用户面 30 秒，管理面 2/5/15 秒）。REST/Emby DTO、数据库
+schema、`/embywebsocket` 与播放协议均未改。自动化：`cargo test --locked --test admin removed_event_streams::`
+（未登录/管理员各 1 例）、`user_event_scoping::`/`user_query_events::` 改经 WebSocket 验证，
+`grep -rn "text/event-stream\|EventSource" src/ web/src` 为空。历史小节（LUX-555–560、LUX-894/895/896）
+保留当时的 SSE 描述作历史参考。
+
 ## LUX-890 Emby `GET /Tags` 与 `GET /OfficialRatings`（2026-11-06）
 
 证据等级：**请求形态为真机抓包确认，响应形态为静态推断**。Hills 1.11.0 打开媒体库筛选面板时实抓
@@ -384,6 +398,9 @@ Web 库页仅挂载窗口可见行、上下各两行缓冲及聚焦卡片所在�
 相关定向测试 24/24、冻结依赖安装、TypeScript、production build 与 fmt 通过；全量 Web 检查的 2 个静态失败和 4 个 Vitest 失败均在原始基线复现，详见 LUX-DEVELOPMENT.md 的 LUX-552 验收记录。新增依赖 `@tanstack/react-virtual` 使用独立库页 chunk（约 8.42KB gzip）。
 
 ## LUX-555–560 Web 用户事件与查询策略（2026-10-15）
+
+> **后续修订（LUX-897，2026-11-06）**：本节描述的 `/api/v1/events` 已随两条 SSE 端点删除（`404`），实时
+> 通道改为 `GET /api/v1/ws`，详见文首 LUX-897 条目。以下内容保留当时的兼容性记录。
 
 同源、已登录 `/api/v1/events` 继续以 version 1 ready 帧开始，失效 scope 扩展为
 home/item/library/favorites。服务端只广播作用域，不包含用户、媒体、媒体库 ID 或业务数据；

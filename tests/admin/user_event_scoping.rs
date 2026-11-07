@@ -143,7 +143,7 @@ async fn user_level_events_stay_private_while_admin_events_reach_everyone()
             Duration::from_millis(750),
             "another user's favorites event must not reach the viewer's connection",
         )
-        .await;
+        .await?;
 
     // Playback progress is per-user as well.
     let progress = client
@@ -164,7 +164,7 @@ async fn user_level_events_stay_private_while_admin_events_reach_everyone()
             Duration::from_millis(750),
             "another user's progress event must not reach the viewer's connection",
         )
-        .await;
+        .await?;
 
     // Directory-level administrator changes are still broadcast.
     let settings = client
@@ -248,7 +248,7 @@ async fn web_playback_progress_is_private_and_played_flips_notify_the_whole_user
             Duration::from_millis(750),
             "another user's web playback event must not reach the viewer's connection",
         )
-        .await;
+        .await?;
     app.abort();
     Ok(())
 }

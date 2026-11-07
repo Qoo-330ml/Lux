@@ -27,6 +27,9 @@ type ClientSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 /// How long a test waits for an invalidation before failing.
 const FRAME_DEADLINE: Duration = Duration::from_secs(10);
 
+/// Largest `itemId` the server may put in a frame (ADR-054 D3).
+const MAX_ITEM_ID_CHARS: usize = 256;
+
 /// One open realtime connection carrying the `user` channel (and the `admin`
 /// channel when the handshake principal manages the server).
 pub struct RealtimeChannel {
@@ -58,7 +61,7 @@ impl RealtimeChannel {
         let ready = next_frame(&mut socket, FRAME_DEADLINE)
             .await
             .map_err(|error| format!("no ready frame: {error}"))?
-            .ok_or("the server closed before the ready frame")?;
+            .ok_or("the server sent no ready frame")?;
         assert_eq!(
             ready,
             serde_json::json!({"type": "ready", "version": 1}),
@@ -67,19 +70,36 @@ impl RealtimeChannel {
         Ok(Self { socket })
     }
 
-    /// The next `user`-channel invalidation, skipping frames of the `admin` channel.
+    /// The next `user`-channel invalidation, skipping validated `admin` frames.
     ///
     /// A manager connection carries both channels; these tests assert user-facing
-    /// behavior, so an admin frame is not the frame they are waiting for.
+    /// behavior, so an admin frame is not the frame they are waiting for. Every
+    /// frame that does arrive is checked against the frozen envelope, which keeps
+    /// the assertions the old SSE parser made (`scope` only, plus `itemId` on
+    /// `progress`) even though the envelope now also names `type` and `channel`.
     pub async fn next_user_invalidation(&mut self) -> Result<Value, String> {
         loop {
             let frame = next_frame(&mut self.socket, FRAME_DEADLINE)
                 .await?
-                .ok_or_else(|| {
-                    "the realtime connection closed before an invalidation".to_owned()
-                })?;
-            if frame["type"] == "invalidate" && frame["channel"] == "user" {
-                return Ok(frame);
+                .ok_or_else(|| format!("no user invalidation within {FRAME_DEADLINE:?}"))?;
+            match frame["type"].as_str() {
+                Some("invalidate") => match frame["channel"].as_str() {
+                    Some("user") => {
+                        validate_user_invalidation(&frame)?;
+                        return Ok(frame);
+                    }
+                    Some("admin") => validate_admin_invalidation(&frame)?,
+                    other => {
+                        return Err(format!(
+                            "an invalidation with an unknown channel {other:?}: {frame}"
+                        ));
+                    }
+                },
+                other => {
+                    return Err(format!(
+                        "an unexpected frame type {other:?} after ready: {frame}"
+                    ));
+                }
             }
         }
     }
@@ -95,24 +115,137 @@ impl RealtimeChannel {
 
     /// Asserts that no `user`-channel invalidation arrives within `window`.
     ///
-    /// Admin frames, protocol pings and application pings are ignored: the
-    /// assertion is about the user's media caches, not about the transport.
-    pub async fn expect_user_silence(&mut self, window: Duration, message: &str) {
+    /// Only the deadline passing is silence. Admin frames, protocol pings and
+    /// application pings are ignored, but a closed connection or an IO error is
+    /// **not** silence: the privacy assertions would otherwise pass because the
+    /// viewer's socket died instead of because no event was sent.
+    pub async fn expect_user_silence(
+        &mut self,
+        window: Duration,
+        message: &str,
+    ) -> Result<(), String> {
         let until = tokio::time::Instant::now() + window;
         loop {
             match next_frame_until(&mut self.socket, until).await {
-                Ok(Some(frame)) if frame["type"] == "invalidate" && frame["channel"] == "user" => {
-                    panic!("{message}; received: {frame}");
+                Ok(Some(frame)) if is_user_invalidation(&frame) => {
+                    return Err(format!("{message}; received: {frame}"));
                 }
                 Ok(Some(_)) => continue,
-                Ok(None) => return,
-                Err(error) => panic!("{message}; received error: {error}"),
+                Ok(None) => return Ok(()),
+                Err(error) => {
+                    return Err(format!(
+                        "{message}; the connection ended while waiting: {error}"
+                    ));
+                }
             }
         }
     }
 }
 
-/// The next protocol text frame before the deadline; `Ok(None)` on timeout or close.
+/// Whether a frame is a `user`-channel invalidation.
+///
+/// Frames arrive from the server, which the envelope validator checks; this
+/// predicate only decides which frames the silence assertion reacts to.
+pub(crate) fn is_user_invalidation(frame: &Value) -> bool {
+    frame["type"] == "invalidate" && frame["channel"] == "user"
+}
+
+/// Checks a `user`-channel invalidation against the frozen envelope (ADR-054 D3).
+///
+/// Every `invalidate` frame has exactly `type`, `channel` and `scope`. Only a
+/// `progress` frame may add `itemId` (at most 256 characters); no frame ever
+/// carries `libraryId`, a user id or any business payload.
+pub(crate) fn validate_user_invalidation(frame: &Value) -> Result<(), String> {
+    let object = validate_invalidation_object(frame, "user")?;
+    let scope = frame["scope"]
+        .as_str()
+        .ok_or_else(|| format!("an invalidation without a string scope: {frame}"))?;
+    let allows_item_id = scope == "progress";
+    for key in object.keys() {
+        match key.as_str() {
+            "type" | "channel" | "scope" => {}
+            "itemId" if allows_item_id => {
+                let item_id = frame["itemId"].as_str().ok_or_else(|| {
+                    format!("a progress invalidation with a non-string itemId: {frame}")
+                })?;
+                if item_id.chars().count() > MAX_ITEM_ID_CHARS {
+                    return Err(format!(
+                        "an itemId longer than {MAX_ITEM_ID_CHARS} characters: {frame}"
+                    ));
+                }
+            }
+            "itemId" => {
+                return Err(format!(
+                    "only a progress invalidation may carry itemId: {frame}"
+                ));
+            }
+            "libraryId" => {
+                return Err(format!("the envelope never carries libraryId: {frame}"));
+            }
+            other => {
+                return Err(format!(
+                    "an unexpected key `{other}` in a user invalidation: {frame}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Checks an `admin`-channel invalidation against the frozen envelope (ADR-054 D3).
+///
+/// The admin envelope is exactly `type`, `channel` and `scope`: a lagged admin
+/// subscriber degrades to `all` without an `itemId`, and `libraryId` never exists.
+pub(crate) fn validate_admin_invalidation(frame: &Value) -> Result<(), String> {
+    let object = validate_invalidation_object(frame, "admin")?;
+    for key in object.keys() {
+        match key.as_str() {
+            "type" | "channel" | "scope" => {}
+            "itemId" => {
+                return Err(format!(
+                    "an admin invalidation must not carry itemId: {frame}"
+                ));
+            }
+            "libraryId" => {
+                return Err(format!("the envelope never carries libraryId: {frame}"));
+            }
+            other => {
+                return Err(format!(
+                    "an unexpected key `{other}` in an admin invalidation: {frame}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Shared shape checks for both channels; answers the JSON object on success.
+fn validate_invalidation_object<'a>(
+    frame: &'a Value,
+    channel: &str,
+) -> Result<&'a serde_json::Map<String, Value>, String> {
+    let object = frame
+        .as_object()
+        .ok_or_else(|| format!("an invalidation must be a JSON object: {frame}"))?;
+    if frame["type"] != "invalidate" {
+        return Err(format!("an unexpected frame type: {frame}"));
+    }
+    if frame["channel"] != channel {
+        return Err(format!("an invalidation on the wrong channel: {frame}"));
+    }
+    let scope = frame["scope"]
+        .as_str()
+        .ok_or_else(|| format!("an invalidation without a string scope: {frame}"))?;
+    if scope.is_empty() {
+        return Err(format!("an invalidation with an empty scope: {frame}"));
+    }
+    Ok(object)
+}
+
+/// The next protocol text frame before the deadline; `Ok(None)` only on timeout.
+///
+/// A closed connection, an IO/protocol error or a server close frame is an
+/// `Err`: callers must not mistake the transport ending for "no events".
 async fn next_frame(
     socket: &mut ClientSocket,
     deadline: Duration,
@@ -131,7 +264,9 @@ async fn next_frame_until(
         }
         match tokio::time::timeout(remaining, socket.next()).await {
             Err(_) => return Ok(None),
-            Ok(None) => return Ok(None),
+            Ok(None) => {
+                return Err("the server closed the websocket stream".to_owned());
+            }
             Ok(Some(Ok(Message::Text(text)))) => {
                 let frame = serde_json::from_str::<Value>(text.as_ref())
                     .map_err(|error| format!("server sent a non-JSON text frame: {error}"))?;
@@ -147,7 +282,7 @@ async fn next_frame_until(
                 ));
             }
             Ok(Some(Err(WsError::ConnectionClosed | WsError::Protocol(_) | WsError::Io(_)))) => {
-                return Ok(None);
+                return Err("the websocket connection ended or failed".to_owned());
             }
             Ok(Some(Err(error))) => return Err(format!("websocket error: {error}")),
         }

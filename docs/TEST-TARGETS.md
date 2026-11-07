@@ -51,6 +51,7 @@ cargo test --locked --test <新 target> <旧名>::
 | `admin_user_invitations` | 1 | `cargo test --locked --test admin admin_user_invitations::` |
 | `log_export` | 2 | `cargo test --locked --test admin log_export::` |
 | `observability` | 2 | `cargo test --locked --test admin observability::` |
+| † `realtime_contract` | 7 | `cargo test --locked --test admin realtime_contract::` |
 | † `removed_event_streams` | 2 | `cargo test --locked --test admin removed_event_streams::` |
 | `user_query_events` | 1 | `cargo test --locked --test admin user_query_events::` |
 | † `user_event_scoping` | 2 | `cargo test --locked --test admin user_event_scoping::` |
@@ -365,6 +366,10 @@ LUX-897 删除了两条 SSE 端点（`GET /api/v1/events`、`GET /api/v1/admin/e
   `tests/admin/admin_jobs.rs`（断言未改，模块名不再误导）。
 - 新增 `tests/admin/removed_event_streams.rs`（2 例）：两条旧路径在未登录与被登录管理员下都返回 `404`
   （先红后绿：删除前的实际响应是 `401`/`200`）。
+- 新增 `tests/admin/realtime_contract.rs`（7 例）钉住共享客户端的合约：非 `progress` 的 user 帧只能有
+  `type`/`channel`/`scope` 三个键（多一个键就失败，端到端也验证 `next_user_scope` 会报错），`progress`
+  允许 `itemId`（上限 256 字符），admin 帧不带 `itemId`/`libraryId`，连接被关闭/IO 结束不能算
+  `expect_user_silence` 的“静默”（到期无帧才通过）。
 - 仍有效的区域/用户事件隐私与“先持久化再通知”覆盖不删，只换传输：`tests/admin/user_event_scoping.rs`
   2 例、`tests/admin/user_query_events.rs` 1 例、`tests/playback/playback_webhooks.rs` 的 home 失效断言
   都改为经 `GET /api/v1/ws` 的 `user` 频道读取（共享客户端 `tests/common/realtime.rs`，由 admin 与
@@ -375,5 +380,6 @@ LUX-897 删除了两条 SSE 端点（`GET /api/v1/events`、`GET /api/v1/admin/e
   与 `a_lagged_admin_subscriber_degrades_to_all_without_an_item_id` 覆盖，hub 本身的行为用例
   （`src/application/admin_events.rs` 的 12 例）未改动。
 
-实测：`cargo test --locked --test admin -- --list` 为 **53** 例（55 - 4 + 2；scan-job 用例保留，只换了模块名）。
-第 1、5.1 节的数字保留基线/合并时的口径；第 2 节的模块行按当前 `--list` 更新。
+实测：`cargo test --locked --test admin -- --list` 为 **60** 例（55 - 4 + 2 + 7；scan-job 用例保留，只换了
+模块名，另加 7 例共享客户端合约测试）。第 1、5.1 节的数字保留基线/合并时的口径；第 2 节的模块行按当前
+`--list` 更新。

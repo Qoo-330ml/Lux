@@ -21358,7 +21358,7 @@ TLS socket 桩（`.tmp/` 内、已删除）验证过 `101` + `Sec-WebSocket-Acce
       `401`、登录 `200`），未登录与被登录管理员两种请求都断言 `404`；
       `grep -rn "api/v1/events\|api/v1/admin/events" src/ web/src docs/API.md` 无输出。
 - [x] `grep -rn "text/event-stream\|EventSource" src/ web/src` 无输出。
-- [x] `cargo test --locked --test admin`：**52 passed / 1 failed（共 53 例）**，唯一失败是既有的环境型用例
+- [x] `cargo test --locked --test admin`：**59 passed / 1 failed（共 60 例）**，唯一失败是既有的环境型用例
       `admin_settings::transcoding_settings_are_admin_only_validated_and_persisted`（本机 VideoToolbox，
       基线同样失败，与 SSE 删除无关）；`python3 scripts/check-backend-branches.py` 通过。
 - [x] `pnpm --dir web test`、`pnpm --dir web build` 通过；`docs/API.md` 不再描述 SSE。
@@ -21372,18 +21372,23 @@ TLS socket 桩（`.tmp/` 内、已删除）验证过 `101` + `Sec-WebSocket-Acce
 - **保留**：`AdminEventHub` / `UserEventHub` 及全部广播/合并语义、`GET /api/v1/ws` 的协议与用户/管理双预算、
   `WebsocketShutdown`、`/embywebsocket`、媒体流与 Emby 仍在用的其它缓冲/预算设施。删除后 `src/` 不再有
   `text/event-stream`、`EventSource`、`SseConnectionBudget` 或 `sse_capacity_response` 引用。
-- **集成测试（admin 组 55 → 53）**：删除 `tests/admin/admin_events.rs` 的 4 例 SSE 用例
+- **集成测试（admin 组 55 → 60）**：删除 `tests/admin/admin_events.rs` 的 4 例 SSE 用例
   （`admin_event_stream_requires_an_authenticated_admin`、`admin_event_stream_sends_ready_frame_to_an_admin`、
   `user_event_stream_is_authenticated_and_does_not_expose_admin_events`、`concurrent_event_streams_are_capped`）；
   该文件与事件流无关的 `admin_scan_job_endpoints_expose_media_progress_without_changing_file_counts`
   原样移到新模块 `tests/admin/admin_jobs.rs`（1 例，断言未改）；新增
-  `tests/admin/removed_event_streams.rs` 2 例（404，未登录 + 登录）。原 SSE 预算的 `429` +
+  `tests/admin/removed_event_streams.rs` 2 例（404，未登录 + 登录），并新增
+  `tests/admin/realtime_contract.rs` 7 例钉住共享客户端的合约。原 SSE 预算的 `429` +
   `Retry-After: 30` 由 `lux_websocket::the_global_budget_answers_429_and_releases_the_slot` 与
   `the_admin_and_user_budgets_are_separate_and_classified` 继续覆盖。
 - **保留的行为覆盖改走 WS**：`tests/admin/user_event_scoping.rs` 2 例、`tests/admin/user_query_events.rs`
   1 例、`tests/playback/playback_webhooks.rs` 的 home 失效断言 1 例，改为通过共享的
   `tests/common/realtime.rs`（`#[path]` 引入 admin/playback target）连接 `GET /api/v1/ws` 并读 `user`
-  频道；断言范围不变（跨用户隐私、目录级广播、先持久化再通知、非 `progress` 帧不带 `itemId`）。服务端
+  频道；断言范围不变（跨用户隐私、目录级广播、先持久化再通知、非 `progress` 帧不带 `itemId`）。
+  `tests/common/realtime.rs` 对每个观察到的帧校验冻结信封：非 `progress` 的 user 帧只能有
+  `type`/`channel`/`scope`，`progress` 可带 `itemId`（≤256 字符），admin 帧不带 `itemId`/`libraryId`
+  （多键与错位 `itemId` 都有反例测试）。`expect_user_silence` 只在到期无帧时通过，连接关闭/IO 结束返回
+  `Err`，避免隐私断言因“连接已死”而假通过（`realtime_contract` 用真实 socket 关闭验证）。服务端
   4 个 SSE 帧单测删除后，broadcast `Lagged` 降级仍由 `src/api/lux_websocket.rs` 的 2 个单测覆盖，
   `src/application/admin_events.rs` 的 12 个 hub 用例未改动。
 - **文档**：`docs/API.md` 删除两段 SSE 契约；`docs/WEB-POLLING-AUDIT.md` 的传输描述与连接状态名改为
@@ -21394,7 +21399,7 @@ TLS socket 桩（`.tmp/` 内、已删除）验证过 `101` + `Sec-WebSocket-Acce
 
 验证（2026-11-06，本机 arm64）：
 
-- `cargo test --locked --test admin`：52 passed / 1 failed（53 例，失败为上述 VideoToolbox 环境用例）；
+- `cargo test --locked --test admin`：59 passed / 1 failed（60 例，失败为上述 VideoToolbox 环境用例）；
   `cargo test --locked --test emby`：83/83；`LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test
   shutdown`：2/2；`cargo test --locked --lib websocket`：25/25。
 - `cargo fmt --all -- --check` 通过；`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过；
@@ -21404,9 +21409,18 @@ TLS socket 桩（`.tmp/` 内、已删除）验证过 `101` + `Sec-WebSocket-Acce
   通过（74 个资源、gzip 后 960260 字节）。Web 端没有依赖被删端点（`web/src` 的 SSE/EventSource 引用为空），
   因此没有 `web/` 代码改动。
 
+审查返工（2026-11-06）：按独立审查补齐测试与文档——① 恢复旧 SSE 解析器对帧数据“只有 scope”的约束，
+在共享客户端按 WebSocket 信封校验键集合（非 `progress` 只有 `type`/`channel`/`scope`，`progress` 允许
+`itemId`，admin 帧拒绝 `itemId`/`libraryId`），并加反例测试；② `expect_user_silence` 区分“到期无帧”与
+“连接结束/IO 错误”，后者失败，并用真实 socket 关闭验证；③ 修正 `docs/DEPLOYMENT.md`：`proxy_buffering`
+只影响普通 HTTP 响应，WebSocket 在 `101` 之后是隧道，保留它只为媒体流，排查 `101` 后收不到帧时不再检查
+它；④ `docs/COMPATIBILITY.md` 顶部新增 LUX-897 条目（两条 SSE 路由返回 `404`、客户端改连
+`/api/v1/ws`），LUX-555–560 旧条目加指向新条目的历史注记。Test target 计数同步为 admin 60 例。
+
 预计改动文件（实际）：`src/api/admin/admin_logs_events.rs`、`src/api/legacy.rs`、`src/api/emby_resume_visibility.rs`
 （注释）、`src/api/lux_websocket.rs`（注释）、`tests/admin/admin_events.rs`（删除）、
 `tests/admin/admin_jobs.rs`（新增）、`tests/admin/removed_event_streams.rs`（新增）、
+`tests/admin/realtime_contract.rs`（新增）、
 `tests/admin/user_event_scoping.rs`、`tests/admin/user_query_events.rs`、`tests/admin/main.rs`、
 `tests/common/realtime.rs`（新增）、`tests/playback/main.rs`、`tests/playback/playback_webhooks.rs`、
 `docs/API.md`、`docs/WEB-POLLING-AUDIT.md`、`docs/TEST-TARGETS.md`、`docs/CHANGELOG.md`、
