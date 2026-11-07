@@ -7,13 +7,17 @@ import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { AdminDashboard } from "../../lib/api/types";
 import { LuxTextField } from "../../components/ui";
+import { adminFallbackInterval, useAdminRealtimeConnectionState } from "./useAdminEvents";
 
 export function AdminDashboardPage() {
   const queryClient = useQueryClient();
+  // LUX-898: the dashboard is covered by the `dashboard`/`jobs` scopes, so its 15 s fallback only
+  // runs while the admin channel is down.
+  const adminRealtimeState = useAdminRealtimeConnectionState();
   const dashboard = useQuery({
     queryKey: queryKeys.adminDashboard,
     queryFn: () => api.adminDashboard(),
-    refetchInterval: queryRefreshIntervals.liveDashboard,
+    refetchInterval: adminFallbackInterval(adminRealtimeState, queryRefreshIntervals.liveDashboard),
   });
   const [serverName, setServerName] = useState<string | null>(null);
   const [nameEditorOpen, setNameEditorOpen] = useState(false);

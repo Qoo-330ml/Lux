@@ -28,33 +28,42 @@ let connectionState: RealtimeConnectionState = "disconnected";
 /** The page-wide cache the subscribers share; cleared once when the session ends. */
 let sessionQueryClient: QueryClient | null = null;
 const subscribers = new Set<RealtimeHandlers>();
+/**
+ * Listeners registered by `observeRealtime`. They see every event the subscribers see but never
+ * own the connection: they neither start it nor keep it alive.
+ */
+const observers = new Set<RealtimeHandlers>();
 
 /** Current state, for a hook that mounts while a connection already exists. */
 export function realtimeConnectionState(): RealtimeConnectionState {
   return connectionState;
 }
 
+function forEachListener(notify: (handlers: RealtimeHandlers) => void) {
+  for (const handlers of [...subscribers, ...observers]) notify(handlers);
+}
+
 /**
  * The only writer of `connectionState`: every change (from the socket or from the hub itself)
- * reaches the subscribers through the same path.
+ * reaches the subscribers and observers through the same path.
  */
 function setConnectionState(next: RealtimeConnectionState) {
   if (connectionState === next) return;
   connectionState = next;
-  for (const subscriber of [...subscribers]) subscriber.onStateChange?.(next);
+  forEachListener((handlers) => handlers.onStateChange?.(next));
 }
 
 function createSocket(): RealtimeSocket {
   return new RealtimeSocket({
     onReady: () => {
-      for (const subscriber of [...subscribers]) subscriber.onReady();
+      forEachListener((handlers) => handlers.onReady());
     },
     onInvalidate: (frame) => {
-      for (const subscriber of [...subscribers]) subscriber.onInvalidate(frame);
+      forEachListener((handlers) => handlers.onInvalidate(frame));
     },
     onStateChange: setConnectionState,
     onConnectionFailure: () => {
-      for (const subscriber of [...subscribers]) subscriber.onConnectionFailure?.();
+      forEachListener((handlers) => handlers.onConnectionFailure?.());
     },
     onSessionCheck: () => {
       void probeSession();
@@ -121,5 +130,25 @@ export function subscribeRealtime(queryClient: QueryClient, handlers: RealtimeHa
     socket?.stop();
     socket = null;
     setConnectionState("disconnected");
+  };
+}
+
+/**
+ * Listens to the shared connection without owning it.
+ *
+ * `subscribeRealtime` is for the surface that *is* the page's connection: its first subscriber
+ * starts the socket and its last one stops it. A channel that only rides a connection someone else
+ * keeps alive -- the admin channel inside the user shell, which owns the socket through
+ * `useUserEvents` -- must not resurrect or extend that connection, so it registers here instead:
+ * it receives the same `ready`/`invalidate`/state events, opens nothing, and unsubscribing leaves
+ * the socket to its real owner.
+ *
+ * The state is not replayed on registration; call `realtimeConnectionState()` once at that point
+ * and follow `onStateChange` afterwards (that is what the admin channel does).
+ */
+export function observeRealtime(handlers: RealtimeHandlers): () => void {
+  observers.add(handlers);
+  return () => {
+    observers.delete(handlers);
   };
 }

@@ -4,6 +4,7 @@ import { QueryClient } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { api, ApiError } from "../src/lib/api/client";
 import {
+  observeRealtime,
   realtimeConnectionState,
   subscribeRealtime,
   type RealtimeHandlers,
@@ -95,4 +96,41 @@ it("broadcasts disconnected when the session ends on a live connection", async (
   const sockets = FakeWebSocket.instances.length;
   vi.advanceTimersByTime(5 * 60_000);
   expect(FakeWebSocket.instances).toHaveLength(sockets);
+});
+
+it("lets an observer follow the connection without owning it", () => {
+  // LUX-898: the admin channel rides the shell's connection, so it must observe it and never open
+  // or keep a socket of its own.
+  const client = new QueryClient();
+  const observed: Required<RealtimeHandlers> = {
+    onReady: vi.fn(),
+    onInvalidate: vi.fn(),
+    onStateChange: vi.fn(),
+    onConnectionFailure: vi.fn(),
+  };
+  const stopObserving = observeRealtime(observed);
+
+  expect(FakeWebSocket.instances).toHaveLength(0);
+
+  const owner = subscribe(client);
+  lastSocket().ready();
+  expect(observed.onStateChange).toHaveBeenLastCalledWith("connected");
+
+  lastSocket().message({ type: "invalidate", channel: "admin", scope: "jobs" });
+  expect(observed.onInvalidate).toHaveBeenCalledWith({
+    type: "invalidate",
+    channel: "admin",
+    scope: "jobs",
+    itemId: undefined,
+  });
+
+  // Dropping the observer must not close the owner's socket.
+  stopObserving();
+  expect(lastSocket().closeCalls).toHaveLength(0);
+  expect(realtimeConnectionState()).toBe("connected");
+
+  lastSocket().serverClose(1006);
+  vi.advanceTimersByTime(500);
+  expect(owner.onConnectionFailure).toHaveBeenCalled();
+  expect(observed.onStateChange).not.toHaveBeenLastCalledWith("disconnected");
 });

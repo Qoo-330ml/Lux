@@ -36,6 +36,7 @@ import type {
   AdminStrmProbeJob,
 } from "../../lib/api/types";
 import { formatAdminDate } from "./date";
+import { adminFallbackInterval, useAdminRealtimeConnectionState } from "./useAdminEvents";
 import { LuxButton, LuxIconButton, LuxSwitch, LuxTextField, useLuxConfirm } from "../../components/ui";
 
 type OperationsTab = "registered" | "runs" | "logs";
@@ -200,6 +201,11 @@ const ERROR_LABELS: Record<string, string> = {
 
 export function AdminOperationsPage() {
   const queryClient = useQueryClient();
+  // LUX-898: the four runtime-record lists are all in the `jobs` scope. The fallback interval is
+  // shared by them and only applies while the admin channel is down; the badge counts keep coming
+  // from the same queries either way.
+  const adminRealtimeState = useAdminRealtimeConnectionState();
+  const jobsFallbackInterval = adminFallbackInterval(adminRealtimeState, 5_000);
   const [tab, setTab] = useState<OperationsTab>("registered");
   const [status, setStatus] = useState("");
   const [logLevel, setLogLevel] = useState("");
@@ -250,25 +256,25 @@ export function AdminOperationsPage() {
     queryKey: queryKeys.adminStrmProbeJobs(status),
     queryFn: () => api.adminStrmProbeJobs(status || undefined),
     enabled: !isMetadataOnlyJobStatus(status),
-    refetchInterval: 5_000,
+    refetchInterval: jobsFallbackInterval,
   });
   const chapterJobs = useQuery({
     queryKey: queryKeys.adminChapterDetectionJobs(status),
     queryFn: () => api.adminChapterDetectionJobs(status || undefined),
     enabled: !isMetadataOnlyJobStatus(status),
-    refetchInterval: 5_000,
+    refetchInterval: jobsFallbackInterval,
   });
   const danmakuJobs = useQuery({
     queryKey: queryKeys.adminDanmakuMatchJobs(status),
     queryFn: () => api.adminDanmakuMatchJobs(status || undefined),
     enabled: !isMetadataOnlyJobStatus(status),
-    refetchInterval: 5_000,
+    refetchInterval: jobsFallbackInterval,
   });
   const libraryCoverJobs = useQuery({
     queryKey: queryKeys.adminLibraryCoverJobs(status),
     queryFn: () => api.adminLibraryCoverJobs(status || undefined),
     enabled: !isMetadataOnlyJobStatus(status),
-    refetchInterval: 5_000,
+    refetchInterval: jobsFallbackInterval,
   });
   const logs = useQuery({ queryKey: queryKeys.adminLogs, queryFn: () => api.adminLogs() });
   const cancel = useMutation({
