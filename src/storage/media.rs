@@ -3232,7 +3232,7 @@ impl Database {
         item_id: &str,
         identity_key: &str,
     ) -> Result<bool, StorageError> {
-        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         let occupied = self
             .query_scalar::<i64>(
                 "SELECT COUNT(*) FROM media_items
@@ -3581,7 +3581,7 @@ impl Database {
         } = collection;
         let provider_name = provider.to_ascii_uppercase();
         let provider_key = provider.to_ascii_lowercase();
-        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         let existing = self
             .query_as::<CollectionIdRow>(
                 "SELECT id, item_id
@@ -3846,7 +3846,7 @@ impl Database {
         if title.is_empty() {
             return Ok(None);
         }
-        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         let library_id = if let Some(item_id) = item_ids.first() {
             self.query_scalar::<Option<String>>(
                 "SELECT mi.library_id
@@ -3944,7 +3944,7 @@ impl Database {
         collection_item_id: &str,
         item_ids: &[String],
     ) -> Result<Option<StoredEmbyCollection>, StorageError> {
-        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         let Some(row) = self
             .query_as::<EmbyCollectionRow>(
                 "SELECT c.library_id, c.title
@@ -3980,7 +3980,7 @@ impl Database {
         collection_item_id: &str,
         item_ids: &[String],
     ) -> Result<Option<StoredEmbyCollection>, StorageError> {
-        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         let Some(row) = self
             .query_as::<EmbyCollectionWithIdRow>(
                 "SELECT c.id, c.library_id, c.title
