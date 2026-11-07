@@ -643,6 +643,12 @@ html[data-lux-theme="light"] .lux-detail-badge.is-audio { border-color: rgba(4,1
 
 .lux-detail-stills { max-width: none; min-width: 0; margin-top: 64px; padding-top: 24px; }
 
+.lux-detail-similar { order: 2; max-width: none; min-width: 0; margin-top: 64px; padding-top: 24px; }
+
+.lux-detail-similar-rail { margin-top: 22px; }
+
+.lux-detail-similar .lux-media-rail { padding: 0 2px 12px; }
+
 @media (max-width: 900px) {
   .lux-detail-grid { grid-template-columns: minmax(200px, 250px) minmax(0, 1fr); gap: 28px; }
   .lux-detail-page-episode .lux-detail-grid { grid-template-columns: minmax(260px, 360px) minmax(0, 1fr); }
@@ -708,6 +714,7 @@ html[data-lux-theme="light"] .lux-detail-badge.is-audio { border-color: rgba(4,1
   .lux-detail-tagline .lux-tagline-quote { font-size: 1.6rem; }
   .lux-detail-cast { order: 2; }
   .lux-detail-stills { order: 3; margin-top: 32px; padding-top: 12px; }
+  .lux-detail-similar { order: 3; margin-top: 32px; padding-top: 12px; }
   .lux-detail-nfo { order: 3; margin-top: 32px; }
   .lux-detail-series-seasons { order: 3; margin-top: 32px; }
   .lux-detail-series-seasons > .lux-series-children { margin-top: 0; padding-top: 0; }

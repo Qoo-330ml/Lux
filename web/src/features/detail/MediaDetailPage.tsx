@@ -10,6 +10,7 @@ import { MediaMergeSourcesSection } from "./MediaMergeSourcesSection";
 import { mediaTitle } from "../home/media-display";
 import { MediaDetailActions, MediaDetailActionControls, MediaDetailMobileHeader } from "./MediaDetailActions";
 import { MediaEpisodesProvider, MediaEpisodesSection } from "./MediaEpisodesSection";
+import { MediaSimilarSection } from "./MediaSimilarSection";
 import { MediaDetailArtwork, MediaDetailHero, MediaSeriesProvider } from "./MediaDetailHero";
 import { useRealtimeConnectionState } from "../activity/useUserEvents";
 
@@ -75,6 +76,7 @@ function MediaDetailContent({ media }: { media: MediaItem }) {
             <MediaCastSection actors={media.actors} />
           </div>
           </MediaEpisodesSection>
+          <MediaSimilarSection item={media} />
           {showStills ? <MediaStillsSection itemId={media.id} title={mediaTitle(media)} /> : null}
           <div className="lux-detail-nfo">
             <MediaNfoSection item={media} source={source} />

@@ -162,9 +162,10 @@ const WATCH_HISTORY_ITEM_TYPES: [&str; 3] = ["MOVIE", "EPISODE", "VIDEO"];
 
 /// Server-side upper bound for one tag page.
 ///
-/// The HTTP front ends validate their own, smaller bounds before they call the service (100 for
-/// the Lux API, `EMBY_MAX_PAGE_LIMIT` for Emby), so this cap never shortens a valid request; it
-/// keeps the service entry point bounded for any future caller.
+/// The Lux tags endpoint uses this cap directly (`GET /api/v1/tags` accepts `pageSize` in
+/// `1..=TAGS_MAX_PAGE_LIMIT`), so 1000 is the effective page size of that route. The clamp below
+/// only protects a caller that skips its own validation and keeps the service entry point
+/// bounded.
 pub(crate) const TAGS_MAX_PAGE_LIMIT: i64 = 1_000;
 
 /// Keeps a tag page request inside `0..=TAGS_MAX_PAGE_LIMIT`.

@@ -75,7 +75,7 @@
 | 44 | `/api/v1/items/{item_id}/metadata` | GET, PATCH | `lux_get_metadata` / `lux_update_metadata` | (b) | `metadata_json`（`media.rs:1274`） | `ItemMetadata` / `MetadataFieldName` |
 | 45 | `/api/v1/items/{item_id}/download` | GET, HEAD | `lux_download` | (c) | 文件下载流 | — |
 | 46 | `/api/v1/watch-history` | GET | `lux_list_watch_history` | (b) | `lux_catalog_page_json_for_user` | `PageResponse<MediaItem>` |
-| 47 | `/api/v1/items/{item_id}/similar` | GET | `lux_get_similar` | (b) | `lux_catalog_page_json_for_user` | **无前端消费**（见「LUX-899 原生相似条目接口」） |
+| 47 | `/api/v1/items/{item_id}/similar` | GET | `lux_get_similar` | (b) | `lux_catalog_page_json_for_user` | `PageResponse<MediaItem>`（已接入 Web 详情页相似推荐，见「LUX-899 原生相似条目接口」） |
 | 48 | `/api/v1/tags` | GET | `lux_list_tags` | (a) | `LuxTagsResponse`（`media.rs`） | `LuxTagsResponse` / `LuxTag`（生成绑定，暂无调用点；见「LUX-900 原生标签列表接口」） |
 
 ### 统计
@@ -412,10 +412,12 @@ Emby DTO/参数适配。
   `total` 是有界候选池（最多 10 个源 Genre × 每个 200 个候选，即 2000）内的去重总数；`page` 是请求的
   1 起页码，`pageSize` 是生效的 `limit`，`hasNext = offset + items.len() < total`（`offset =
   (page - 1) * limit`）。`offset` 超出候选池时返回 200 与空 `items`。
-- 目前没有前端消费（Web 详情页的相似区按规格另立任务），所以 `web/src/lib/api/types.ts` 与
-  `generated/` 都不新增类型，也不需要重新生成绑定。后续 Web 接入时按「如何扩展到更多路由」的流程，
-  先定 `{items,page,pageSize,hasNext,total}` 信封（G-Page）再处理 `MediaItem`（G-MediaItem），不要为此
-  单独发明一个 `Option` 合成信封。
+- 目前 Web 详情页的「相似推荐」区块（LUX-901）已接入该路由：`web/src/lib/api/client.ts` 的
+  `similarItems` 只发送 `limit=12`（不发送 `page`/`pageSize`），复用 `lux_catalog_page_json_for_user` 的
+  `{items,page,pageSize,hasNext,total}` 信封；`types.ts` 只增加 `SimilarItemsQuery` 与
+  `SimilarItemsResponse`（后者的别名是 `PageResponse<MediaItem>`），`generated/` 不新增类型，也不需要重新
+  生成绑定。响应仍是 (b) 手拼 `Value`，尚未按「如何扩展到更多路由」拆成 G-Page/G-MediaItem 具名结构体；
+  后续做该拆分时，Web 侧类型应随之一并迁移。该区块只用于电影与剧集详情，结果为空或请求失败时整体不渲染。
 - 请求参数是 `limit`（默认 50、1-1000，空值按未提供，`0`/负数/非整数/超过 1000 为 400）与 `page`
   （1 起、默认 1，空值按未提供，`0`/负数/非整数为 400）；`pageSize` 是 `limit` 的别名，使用同一默认值与
   上限，两者同时提供且数值不一致返回 400。它们属于读路径查询参数，不在本文件的请求体范围内。Lux 与 Emby

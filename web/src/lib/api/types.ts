@@ -418,6 +418,14 @@ export type PageResponse<T> = {
   hasNext?: boolean;
 };
 
+/** Query options for `GET /api/v1/items/{item_id}/similar`; the Web section only asks for one page. */
+export type SimilarItemsQuery = {
+  limit?: number;
+};
+
+/** Similar items reuse the standard catalog page envelope (LUX-899). */
+export type SimilarItemsResponse = PageResponse<MediaItem>;
+
 export type AdminMetadataBatchConfirmation = {
   confirmedCount: number;
   failedCount: number;
