@@ -1457,6 +1457,7 @@ fn is_catalog_aggregation_path(path: &str) -> bool {
             | ["api", "v1", "libraries", _, "items"]
             | ["api", "v1", "libraries", _, "latest"]
             | ["api", "v1", "items", _, "children"]
+            | ["api", "v1", "items", _, "similar"]
             | ["api", "v1", "collections", _]
             | ["Users", _, "Items"]
             | ["Users", _, "Items", "Root" | "Resume" | "Latest" | "NextUp"]
@@ -1467,6 +1468,7 @@ fn is_catalog_aggregation_path(path: &str) -> bool {
             | ["Items", "Root"]
             | ["Search", "Hints"]
             | ["Items", _, "Children"]
+            | ["Items", _, "Similar"]
     )
 }
 
@@ -2616,6 +2618,17 @@ mod tests {
             "/Items/item-1/PlaybackInfo",
         ] {
             assert!(!is_catalog_aggregation_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn similar_endpoints_use_the_catalog_aggregation_guard() {
+        for path in [
+            "/api/v1/items/item-1/similar",
+            "/Items/item-1/Similar",
+            "/emby/Items/item-1/Similar",
+        ] {
+            assert!(is_catalog_aggregation_path(path), "{path}");
         }
     }
 
