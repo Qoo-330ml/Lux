@@ -1,7 +1,9 @@
 use super::*;
 
-// The similar page bounds (`SIMILAR_DEFAULT_LIMIT` / `SIMILAR_MAX_LIMIT`) are defined next to the
-// authoritative Lux route; this adapter must not carry its own copy.
+/// Similar-items page size when the caller does not send `Limit`, matching the other Emby item
+/// list endpoints. The page cap remains the shared `EMBY_MAX_PAGE_LIMIT` (1000); the native Lux
+/// route has its own, larger candidate-pool cap and must not share these bounds.
+const EMBY_SIMILAR_DEFAULT_LIMIT: i64 = 50;
 
 /// Query parameters of `GET /Items/{id}/Similar`.
 ///
@@ -53,11 +55,11 @@ pub(super) struct EmbySimilarQuery {
 
 fn emby_similar_limit(limit: Option<i64>) -> Result<i64, StatusCode> {
     let limit = match limit {
-        None | Some(0) => SIMILAR_DEFAULT_LIMIT,
+        None | Some(0) => EMBY_SIMILAR_DEFAULT_LIMIT,
         Some(value) if value < 0 => return Err(StatusCode::BAD_REQUEST),
         Some(value) => value,
     };
-    if limit > SIMILAR_MAX_LIMIT {
+    if limit > EMBY_MAX_PAGE_LIMIT {
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok(limit)

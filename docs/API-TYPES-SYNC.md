@@ -75,7 +75,7 @@
 | 44 | `/api/v1/items/{item_id}/metadata` | GET, PATCH | `lux_get_metadata` / `lux_update_metadata` | (b) | `metadata_json`（`media.rs:1274`） | `ItemMetadata` / `MetadataFieldName` |
 | 45 | `/api/v1/items/{item_id}/download` | GET, HEAD | `lux_download` | (c) | 文件下载流 | — |
 | 46 | `/api/v1/watch-history` | GET | `lux_list_watch_history` | (b) | `lux_catalog_page_json_for_user` | `PageResponse<MediaItem>` |
-| 47 | `/api/v1/items/{item_id}/similar` | GET | `lux_get_similar` | (b) | `lux_catalog_page_json_for_user`（`media.rs:4383`） | **无前端消费**（见「LUX-899 原生相似条目接口」） |
+| 47 | `/api/v1/items/{item_id}/similar` | GET | `lux_get_similar` | (b) | `lux_catalog_page_json_for_user` | **无前端消费**（见「LUX-899 原生相似条目接口」） |
 
 ### 统计
 
@@ -409,16 +409,16 @@ Emby DTO/参数适配。
   `Items`/`TotalRecordCount` DTO。
 - 因此该路由按本文件口径属于 **(b)**：信封与条目都是 `json!` 手拼的 `Value`，没有可派生的具名结构体。
   `total` 是有界候选池（最多 10 个源 Genre × 每个 200 个候选，即 2000）内的去重数量；`limit` 只裁剪当前页。
-  `page` 恒为 1（没有 `page`/游标参数），`hasNext` 为 `total > items.len()`：为 true 时表示候选池还有
-  未返回的条目，调用方可以调大 `limit`（上限 1000）取回更多；但候选池上限 2000 高于该 limit 上限，
-  所以 `hasNext=true` 且候选池超过 1000 时无法一次取完。
+  本端点只支持 `limit`，`page`/`pageSize` 被忽略；`page` 恒为 1，`pageSize` 为生效的 `limit`。
+  `hasNext` 为 `total > items.len()`：为 true 时表示候选池还有未返回的条目，调用方可以调大 `limit`
+  （上限 2000，与候选池上限一致）到 `total` 以内取回全部。
 - 目前没有前端消费（Web 详情页的相似区按规格另立任务），所以 `web/src/lib/api/types.ts` 与
   `generated/` 都不新增类型，也不需要重新生成绑定。后续 Web 接入时按「如何扩展到更多路由」的流程，
   先定 `{items,page,pageSize,hasNext,total}` 信封（G-Page）再处理 `MediaItem`（G-MediaItem），不要为此
   单独发明一个 `Option` 合成信封。
-- 请求参数只有 `limit`（默认 50、1-1000，空值按未提供，`0`/负数/非整数/超过 1000 为 400），是读路径的
-  查询参数，不在本文件的请求体范围内；默认值与上限和 Emby 适配层共用同一组
-  `SIMILAR_DEFAULT_LIMIT`/`SIMILAR_MAX_LIMIT` 常量。
+- 请求参数只有 `limit`（默认 50、1-2000，空值按未提供，`0`/负数/非整数/超过 2000 为 400），是读路径的
+  查询参数，不在本文件的请求体范围内；Lux 的上限与 Emby 适配层的 1000 分开定义
+  （`LUX_SIMILAR_*` 与 `EMBY_SIMILAR_DEFAULT_LIMIT`/`EMBY_MAX_PAGE_LIMIT`）。
 
 ## 已知限制
 

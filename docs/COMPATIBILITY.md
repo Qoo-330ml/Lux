@@ -1821,13 +1821,12 @@ Lux 当时返回 404 空响应，客户端页面不报错、推荐区整块缺�
   的条目不会出现在 `items` 或 `total` 中，也不会进入 Emby 的 `TotalRecordCount` 和候选池计数。
 - 响应：Lux 自有形状 `{items,page,pageSize,hasNext,total}`，直接复用
   `lux_catalog_page_json_for_user`。`items` 是 Lux 媒体条目（`lux_catalog_items_json_for_user`），
-  **不复用 Emby DTO**；`page` 固定为 1（该端点没有 `page` 参数，只有 `limit`），`pageSize` 回显生效的
-  `limit`，`total` 是有界候选池内的去重数量，`hasNext` 为 `total > items.len()`：为 `true` 时表示候选池
-  还有未返回的条目，调用方可以调大 `limit`（上限 1000）取回更多。已知限制：候选池上限 2000 高于该
-  `limit` 上限，所以 `hasNext=true` 且候选池超过 1000 时无法一次取完。Emby 的 `TotalRecordCount` 与
-  `total` 同义，保持不变。
-- `limit`：默认 50，允许 1-1000；显式空值（`?limit=`）视为未提供；`0`、负数、非整数（含 `1.5`）和
-  超过 1000 返回 400 `INVALID_REQUEST`。`limit` 只裁剪当前页，不改变 `total`；`0` 被拒绝与 Lux 其他列表
+  **不复用 Emby DTO**；本端点只支持 `limit`，`page`/`pageSize` 被忽略，`page` 固定为 1、`pageSize` 回显
+  生效的 `limit`，`total` 是有界候选池内的去重数量，`hasNext` 为 `total > items.len()`：为 `true` 时表示
+  候选池还有未返回的条目，请把 `limit` 调大到 `total` 以内取回（上限 2000 与候选池上限一致，因此一定
+  能收敛）。Emby 的 `TotalRecordCount` 与 `total` 同义，保持不变。
+- `limit`：默认 50，允许 1-2000（与候选池上限一致）；显式空值（`?limit=`）视为未提供；`0`、负数、
+  非整数（含 `1.5`）和超过 2000 返回 400 `INVALID_REQUEST`。`limit` 只裁剪当前页，不改变 `total`；`0` 被拒绝与 Lux 其他列表
   `pageSize` 必须为正的规则一致，也避免分页信封做 `offset / limit` 时除零。
 - 相似规则与候选池：与 LUX-889 完全一致，由同一个 `CatalogService::list_similar_items` 提供：同类型
   （`MOVIE`/`SERIES`）、至少共享一个已入库 Genre、最多 10 个源 Genre × 每个 200 个通过 ACL/可见性/内容
@@ -1837,14 +1836,19 @@ Lux 当时返回 404 空响应，客户端页面不报错、推荐区整块缺�
   `similar_items_page` 入口，只保留 Emby 的 `Items`/`TotalRecordCount` DTO、`Fields`、`EnableUserData`、
   `EnableImageTypes`/`ImageTypeLimit` 与 `Limit` 处理，对外状态码、字段、排序和 `TotalRecordCount`
   不变；`emby_similar` 的 6 个用例断言未改。
-- 分页上限只有一份定义：`SIMILAR_DEFAULT_LIMIT`（50）与 `SIMILAR_MAX_LIMIT`（即
-  `EMBY_MAX_PAGE_LIMIT`，1000）定义在 Lux handler 旁边，Emby 适配层直接引用，不再单独维护
-  `EMBY_SIMILAR_DEFAULT_LIMIT` 或硬编码上限。`src/api/media.rs` 的单测
-  `similar_limit_tests::similar_limits_share_the_emby_page_cap` 钉住该共享关系。
+- 分页上限按协议分开：Lux 使用 `LUX_SIMILAR_DEFAULT_LIMIT`（50）与 `LUX_SIMILAR_MAX_LIMIT`
+  （2000，与候选池上限一致，使 `hasNext` 始终可行动）；Emby 适配层保留自己的
+  `EMBY_SIMILAR_DEFAULT_LIMIT`（50）与 `EMBY_MAX_PAGE_LIMIT`（1000），行为与 6 例断言不变。
+  `src/api/media.rs` 的单测 `lux_similar_limit_accepts_the_candidate_pool_cap` 钉住 Lux 的
+  2000/2001 边界。
+- 并发闸门只覆盖 Lux 路由：`/api/v1/items/{id}/similar` 计入目录聚合闸门；Emby
+  `/Items/{id}/Similar`（根路径与 `/emby` 前缀）不计入，保持 LUX-889 之前的对外行为（饱和时不会因此
+  变成 503）。
 - 自动化：新增 `tests/library/similar_api.rs`（`cargo test --locked --test library similar_api::`，
   5 例）：同一用户同一库下 Lux 与 Emby 的条目 id 顺序一致（普通用户与管理员、含 ACL 排除项）、
-  `limit` 默认值/上限/400、404/401（未知条目、无权条目、无会话）、内容限制排除的条目不出现在
-  `items`/`total`（Emby 同源端点也不进 `TotalRecordCount`）、剧集只返回剧集与无相似条目的 200 空列表。
+  `limit` 默认值/上限（Lux 2000，Emby 1000）/400、404/401（未知条目、无权条目、无会话）、内容限制排除的
+  条目不出现在 `items`/`total`（Emby 同源端点也不进 `TotalRecordCount`）、剧集只返回剧集与无相似条目的
+  200 空列表。
   `cargo test --locked --test emby emby_similar::` 6/6；本机 `uname -m` = `arm64`（macOS），
   不代表 NAS/x86_64 性能，也未做客户端 UI 复测。
 

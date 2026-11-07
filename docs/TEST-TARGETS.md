@@ -390,17 +390,19 @@ LUX-897 删除了两条 SSE 端点（`GET /api/v1/events`、`GET /api/v1/admin/e
 `tests/library/similar_api.rs` 是 LUX-899 新增的模块（`tests/library/main.rs` 追加一行 `mod similar_api;`），
 命令为 `cargo test --locked --test library similar_api::`，共 **5** 例：同一用户同一库下 Lux 原生
 `GET /api/v1/items/{item_id}/similar` 与 Emby `GET /Items/{id}/Similar` 的条目 id 顺序一致（普通用户与
-管理员，含 ACL 排除项不出现在 `items`/`total`/Emby `TotalRecordCount`）、`limit` 默认 50/上限 1000/空值按
-未提供/`0`、负数、非整数、超上限 400、`total` 为候选池去重数量且 `hasNext` 在 `total > items.len()` 时为
-true（`limit=1/2`）、全部返回时为 false（`limit=5/1000`）、未知或不可见条目 404 与无会话 401、内容限制
-排除的条目不出现在 `items`/`total`、剧集只返回剧集且无相似条目时返回 200 空列表。
+管理员，含 ACL 排除项不出现在 `items`/`total`/Emby `TotalRecordCount`）、`limit` 默认 50/上限 2000/空值按
+未提供/`0`、负数、非整数、超上限 400、Lux 接受 `limit=2000` 并拒绝 2001（Emby 仍拒绝 1001）、
+`page`/`pageSize` 被忽略、`total` 为候选池去重数量且 `hasNext` 在 `total > items.len()` 时为 true
+（`limit=1/2`）、全部返回时为 false（`limit=5/2000`）、未知或不可见条目 404 与无会话 401、内容限制排除的
+条目不出现在 `items`/`total`、剧集只返回剧集且无相似条目时返回 200 空列表。
 
 - 该模块按路由所在域放在 `library` 分组（目录/媒体条目 API），与 `catalog`、`series_api` 等相邻；没有新建
   顶层 target，也没有改其他分组的归属。
-- `src/api/media.rs` 另新增 1 例单测 `similar_limit_tests::similar_limits_share_the_emby_page_cap`
-  （`cargo test --locked --lib similar_limits_share_the_emby_page_cap`），断言两端默认值/上限来自同一组
-  共享常量（上限即 `EMBY_MAX_PAGE_LIMIT`）。
+- `src/api/media.rs` 另新增 1 例单测 `similar_limit_tests::lux_similar_limit_accepts_the_candidate_pool_cap`
+  （`cargo test --locked --lib lux_similar_limit`），断言 Lux 默认值 50、接受 2000 / 拒绝 2001；Emby 的
+  1000 上限由既有 `emby_similar` 用例保持。
 - 实测：`cargo test --locked --test library -- --list` 为 **56** 例（51 例基线 + 本任务 5 例），
   `cargo test --locked --test library` 56/56 通过；`cargo test --locked --test emby -- --list` 仍为 **83**
   例，其中 `emby_similar::` 6/6（断言未改）；`cargo test --locked --lib similar_catalog` 2/2。
+  闸门单测 `similar_endpoints_use_the_catalog_aggregation_guard` 断言 Lux 路由计入、Emby 两条路径不计入。
 - 第 1、2、5.1 节的历史数字保留基线/合并时的口径（第 2 节新增本模块一行）。

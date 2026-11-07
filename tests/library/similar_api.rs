@@ -530,21 +530,50 @@ async fn lux_similar_limit_defaults_caps_and_rejects_invalid_values()
         3,
     );
 
+    // The candidate pool is 10 x 200 = 2000, so the whole pool fits in one page at the cap.
     let (status, capped) = harness
-        .lux_similar("sim-movie-source", "?limit=1000", &harness.viewer_cookie)
+        .lux_similar("sim-movie-source", "?limit=2000", &harness.viewer_cookie)
         .await?;
     assert_eq!(status, reqwest::StatusCode::OK);
     assert_lux_page(
         &capped,
         &["sim-movie-alpha", "sim-movie-charlie", "sim-movie-bravo"],
-        1000,
+        2000,
+        3,
+    );
+
+    // 1001 exceeds the Emby adapter's page cap but is inside the Lux candidate-pool cap.
+    let (status, above_emby_cap) = harness
+        .lux_similar("sim-movie-source", "?limit=1001", &harness.viewer_cookie)
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_lux_page(
+        &above_emby_cap,
+        &["sim-movie-alpha", "sim-movie-charlie", "sim-movie-bravo"],
+        1001,
+        3,
+    );
+
+    // `page`/`pageSize` are not part of this endpoint's contract and are ignored.
+    let (status, ignored_paging) = harness
+        .lux_similar(
+            "sim-movie-source",
+            "?limit=2&page=5&pageSize=1",
+            &harness.viewer_cookie,
+        )
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_lux_page(
+        &ignored_paging,
+        &["sim-movie-alpha", "sim-movie-charlie"],
+        2,
         3,
     );
 
     for query in [
         "?limit=0",
         "?limit=-1",
-        "?limit=1001",
+        "?limit=2001",
         "?limit=abc",
         "?limit=1.5",
     ] {
