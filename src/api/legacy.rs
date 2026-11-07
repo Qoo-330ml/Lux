@@ -1454,6 +1454,7 @@ fn is_catalog_aggregation_path(path: &str) -> bool {
             "v1",
             "favorites" | "search" | "home" | "continue-watching"
         ] | ["api", "v1", "home", "carousel"]
+            | ["api", "v1", "tags"]
             | ["api", "v1", "libraries", _, "items"]
             | ["api", "v1", "libraries", _, "latest"]
             | ["api", "v1", "items", _, "children"]
@@ -2598,6 +2599,7 @@ mod tests {
             "/api/v1/home",
             "/api/v1/home/carousel",
             "/api/v1/continue-watching",
+            "/api/v1/tags",
             "/api/v1/libraries/library-1/items",
             "/api/v1/libraries/library-1/latest",
             "/api/v1/collections/collection-1",
@@ -2624,6 +2626,10 @@ mod tests {
     fn similar_endpoints_use_the_catalog_aggregation_guard() {
         // The native Lux route is a bounded catalog aggregation and belongs to the guard.
         assert!(is_catalog_aggregation_path("/api/v1/items/item-1/similar"));
+        // The native tag list is the same class of bounded facet aggregation: its `GROUP BY` /
+        // `COUNT(DISTINCT)` runs per request, so it must share the catalog worker pool instead of
+        // letting arbitrary concurrency exhaust the connection pool.
+        assert!(is_catalog_aggregation_path("/api/v1/tags"));
         // The Emby compatibility adapter must keep its pre-LUX-899 behaviour and never enter the
         // guard, so saturation cannot turn an Emby similar request into a 503.
         for path in ["/Items/item-1/Similar", "/emby/Items/item-1/Similar"] {

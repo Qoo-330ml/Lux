@@ -1344,18 +1344,44 @@ pub(super) struct LuxTagsResponse {
 /// Page bounds of the native Lux tags route: 50 tags by default, at most 1000 per page.
 const LUX_TAGS_DEFAULT_PAGE_SIZE: i64 = 50;
 
-#[derive(Deserialize, Default)]
+/// Single-valued query parameters of `GET /api/v1/tags`.
+///
+/// `page`, `pageSize` and `libraryId` are parsed from the raw query string rather than through
+/// axum's `Query` extractor, so a repeated parameter answers the regular `400 INVALID_REQUEST`
+/// JSON envelope instead of a plain-text extractor rejection. `itemType` is the one multi-valued
+/// parameter and is collected separately by [`lux_tags_item_types`].
+#[derive(Default)]
 pub(super) struct LuxTagsQuery {
-    /// 1-based page; an empty value is treated as absent (page 1). Read as a raw string so an
-    /// explicit empty value keeps meaning "not provided" and a non-integer answers the regular
-    /// `400 INVALID_REQUEST` error body instead of a query-extractor rejection.
-    #[serde(default)]
+    /// 1-based page; an empty value is treated as absent (page 1).
     page: Option<String>,
-    #[serde(rename = "pageSize", default)]
     page_size: Option<String>,
     /// Restricts the list to one library; empty means every visible library.
-    #[serde(rename = "libraryId", default)]
     library_id: Option<String>,
+}
+
+impl LuxTagsQuery {
+    /// Parses the raw query and rejects a single-valued parameter that appears more than once.
+    fn parse(raw_query: &RawQuery) -> Result<Self, &'static str> {
+        let mut query = Self::default();
+        let Some(raw) = raw_query.0.as_deref() else {
+            return Ok(query);
+        };
+        for (name, value) in url::form_urlencoded::parse(raw.as_bytes()) {
+            let slot = match name.as_ref() {
+                "page" => &mut query.page,
+                "pageSize" => &mut query.page_size,
+                "libraryId" => &mut query.library_id,
+                // `itemType` may repeat and unknown parameters are ignored, like the other Lux
+                // list endpoints.
+                _ => continue,
+            };
+            if slot.is_some() {
+                return Err("标签查询参数重复");
+            }
+            *slot = Some(value.into_owned());
+        }
+        Ok(query)
+    }
 }
 
 fn lux_tags_page_size(raw: Option<&str>) -> Result<i64, &'static str> {
@@ -1429,16 +1455,28 @@ fn lux_tags_item_types(raw_query: &RawQuery) -> Vec<String> {
 /// parses the query, converts `page` into an offset and maps the storage rows to the Lux DTO.
 ///
 /// An unknown or inaccessible `libraryId` answers 404. Invalid pagination answers 400, and an
-/// oversized `pageSize` is rejected instead of being clamped.
+/// oversized `pageSize` is rejected instead of being clamped. A repeated `page`, `pageSize` or
+/// `libraryId` also answers 400 with the same envelope, while `itemType` may repeat.
 pub(super) async fn lux_list_tags(
     headers: HeaderMap,
     raw_query: RawQuery,
-    Query(query): Query<LuxTagsQuery>,
     State(state): State<ReadyAppState>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
         Ok(user) => user,
         Err(response) => return response,
+    };
+    let query = match LuxTagsQuery::parse(&raw_query) {
+        Ok(query) => query,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
     };
     let page_size = match lux_tags_page_size(query.page_size.as_deref()) {
         Ok(page_size) => page_size,

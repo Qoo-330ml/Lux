@@ -3805,14 +3805,14 @@ impl Database {
     /// The rows come from the `media_item_facets` projection alone; `media_items` and `libraries`
     /// are joined for the shared visibility predicate (library scope, removal, content
     /// restrictions), exactly like [`Self::list_catalog_facets`], so no request parses NFO JSON or
-    /// loads a catalog page. `limit` is clamped by the caller.
+    /// loads a catalog page. `limit` is clamped by the caller. It backs the native
+    /// `GET /api/v1/tags` route through `CatalogService::list_tags`.
     ///
     /// A name key can be projected with more than one spelling (`Sci-Fi` and `sci-fi`), so the
     /// display name is the byte-order smallest spelling of the group: `MIN(name COLLATE BINARY)`
     /// on SQLite and `MIN(name COLLATE "C")` on PostgreSQL. The rule is the same on both backends
     /// and does not depend on insertion order, so a re-projected item or a backend migration never
     /// renames a tag. The page order uses the same explicit collation so it is byte order too.
-    #[cfg_attr(not(test), allow(dead_code))] // LUX-900's `/api/v1/tags` route is the next increment.
     pub(crate) async fn list_catalog_tags(
         &self,
         filter: &CatalogFilterQuery<'_>,

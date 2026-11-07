@@ -408,6 +408,60 @@ async fn lux_tags_pages_and_rejects_invalid_page_parameters()
     Ok(())
 }
 
+/// A repeated single-valued parameter used to be rejected by axum's query extractor with a
+/// plain-text 400. It must answer the same `INVALID_REQUEST` JSON envelope as every other bad
+/// parameter, while the multi-valued `itemType` keeps accepting repeats.
+#[tokio::test]
+async fn lux_tags_rejects_repeated_single_valued_parameters()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = start_server().await?;
+    let movies = harness.library_id("Movies").await?;
+    for query in [
+        "?page=1&page=2".to_owned(),
+        "?pageSize=50&pageSize=100".to_owned(),
+        format!("?libraryId={movies}&libraryId={movies}"),
+    ] {
+        let (status, body) = harness
+            .lux_tags(&query, Some(&harness.viewer_cookie))
+            .await?;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "query {query} must be rejected"
+        );
+        // The body is parsed as JSON by the harness, so reaching this point already proves the
+        // response is not the extractor's plain text; the envelope carries all three keys.
+        assert_eq!(body["error"]["code"], "INVALID_REQUEST", "query {query}");
+        assert!(
+            body["error"]["message"].as_str().is_some(),
+            "query {query} must carry a message"
+        );
+        assert!(
+            body["error"]["requestId"].as_str().is_some(),
+            "query {query} must carry a request id"
+        );
+    }
+
+    // `itemType` stays repeatable, including next to the single-valued parameters.
+    let (status, body) = harness
+        .lux_tags(
+            "?itemType=movie&itemType=SERIES&pageSize=50",
+            Some(&harness.viewer_cookie),
+        )
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_tags_page(
+        &body,
+        &["Adventure", "Mystery", "Space", "Star Wars"],
+        1,
+        50,
+        4,
+    );
+
+    harness.server.abort();
+    Ok(())
+}
+
 #[tokio::test]
 async fn lux_tags_filters_by_library_and_item_type() -> Result<(), Box<dyn std::error::Error>> {
     let harness = start_server().await?;
