@@ -1558,7 +1558,6 @@ impl CatalogService {
     /// parses NFO JSON or loads a catalog page.
     ///
     /// `limit` is clamped to [`TAGS_MAX_PAGE_LIMIT`]; the routes validate their own bounds first.
-    #[cfg_attr(not(test), allow(dead_code))] // LUX-900's `/api/v1/tags` route is the next increment.
     pub(crate) async fn list_tags(
         &self,
         principal: AccessPrincipal,

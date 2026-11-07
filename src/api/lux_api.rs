@@ -3,6 +3,7 @@ use super::*;
 pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new()
         .route("/api/v1/libraries", get(lux_list_libraries))
+        .route("/api/v1/tags", get(lux_list_tags))
         .route(
             "/api/v1/libraries/{library_id}/cover",
             get(lux_library_cover).head(lux_library_cover),

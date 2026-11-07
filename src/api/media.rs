@@ -1309,6 +1309,227 @@ pub(super) async fn lux_get_similar(
     }
 }
 
+/// One distinct tag of `GET /api/v1/tags`.
+///
+/// Only the display name is public: the storage projection also carries the `name_key` and the
+/// visible item count, and neither is part of the contract.
+#[derive(Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-bindings",
+    ts(export, export_to = "web/src/lib/api/generated/")
+)]
+pub(super) struct LuxTag {
+    pub(super) name: String,
+}
+
+/// Body of `GET /api/v1/tags`.
+///
+/// The pagination field names follow the other `/api/v1` lists (`page`, `pageSize`, `total`); the
+/// collection is `tags` because the endpoint returns tags rather than catalog items.
+#[derive(Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-bindings",
+    ts(export, export_to = "web/src/lib/api/generated/")
+)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct LuxTagsResponse {
+    pub(super) tags: Vec<LuxTag>,
+    pub(super) page: i64,
+    pub(super) page_size: i64,
+    pub(super) total: i64,
+}
+
+/// Page bounds of the native Lux tags route: 50 tags by default, at most 1000 per page.
+const LUX_TAGS_DEFAULT_PAGE_SIZE: i64 = 50;
+
+#[derive(Deserialize, Default)]
+pub(super) struct LuxTagsQuery {
+    /// 1-based page; an empty value is treated as absent (page 1). Read as a raw string so an
+    /// explicit empty value keeps meaning "not provided" and a non-integer answers the regular
+    /// `400 INVALID_REQUEST` error body instead of a query-extractor rejection.
+    #[serde(default)]
+    page: Option<String>,
+    #[serde(rename = "pageSize", default)]
+    page_size: Option<String>,
+    /// Restricts the list to one library; empty means every visible library.
+    #[serde(rename = "libraryId", default)]
+    library_id: Option<String>,
+}
+
+fn lux_tags_page_size(raw: Option<&str>) -> Result<i64, &'static str> {
+    let Some(raw) = raw else {
+        return Ok(LUX_TAGS_DEFAULT_PAGE_SIZE);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(LUX_TAGS_DEFAULT_PAGE_SIZE);
+    }
+    let page_size = raw.parse::<i64>().map_err(|_| "标签分页参数无效")?;
+    // The service clamps an oversized limit; the route rejects it instead, so a client cannot
+    // believe it received 1000 tags while asking for more.
+    if !(1..=crate::application::catalog::TAGS_MAX_PAGE_LIMIT).contains(&page_size) {
+        return Err("标签分页参数无效");
+    }
+    Ok(page_size)
+}
+
+fn lux_tags_page(raw: Option<&str>) -> Result<i64, &'static str> {
+    let Some(raw) = raw else {
+        return Ok(1);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(1);
+    }
+    let page = raw.parse::<i64>().map_err(|_| "标签分页参数无效")?;
+    if page < 1 {
+        return Err("标签分页参数无效");
+    }
+    Ok(page)
+}
+
+/// Canonicalizes the optional `libraryId`. A malformed value is answered as not found (never as a
+/// 400), because the contract only distinguishes "not visible" from "visible".
+fn lux_tags_library_id(raw: Option<&str>) -> Result<Option<String>, ()> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    raw.parse::<crate::domain::ids::LibraryId>()
+        .map(|id| Some(id.to_string()))
+        .map_err(|_| ())
+}
+
+/// Collects every `itemType` value, so the parameter may repeat (`itemType=A&itemType=B`) or use
+/// commas (`itemType=A,B`), then applies the same normalization as
+/// `/api/v1/libraries/{library_id}/items`: names are case-insensitive, unknown values are ignored,
+/// an empty value means every type and an all-unknown value matches no rows.
+fn lux_tags_item_types(raw_query: &RawQuery) -> Vec<String> {
+    let mut values = Vec::new();
+    if let Some(query) = raw_query.0.as_deref() {
+        for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            if name == "itemType" {
+                values.push(value.into_owned());
+            }
+        }
+    }
+    emby_item_types_from_value(Some(values.join(",").as_str()))
+}
+
+/// `GET /api/v1/tags?libraryId=...&itemType=...&page=1&pageSize=50`.
+///
+/// Returns the distinct tags of the items the caller can see, ordered by the case-insensitive
+/// name key, so `Star Wars` and `star wars` are one entry. `CatalogService::list_tags` owns the
+/// library ACL, the content restrictions, the projection query and the total; the handler only
+/// parses the query, converts `page` into an offset and maps the storage rows to the Lux DTO.
+///
+/// An unknown or inaccessible `libraryId` answers 404. Invalid pagination answers 400, and an
+/// oversized `pageSize` is rejected instead of being clamped.
+pub(super) async fn lux_list_tags(
+    headers: HeaderMap,
+    raw_query: RawQuery,
+    Query(query): Query<LuxTagsQuery>,
+    State(state): State<ReadyAppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let page_size = match lux_tags_page_size(query.page_size.as_deref()) {
+        Ok(page_size) => page_size,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let page = match lux_tags_page(query.page.as_deref()) {
+        Ok(page) => page,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(offset) = page
+        .checked_sub(1)
+        .and_then(|pages| pages.checked_mul(page_size))
+    else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "标签分页参数无效",
+        )
+        .into_response();
+    };
+    let library_id = match lux_tags_library_id(query.library_id.as_deref()) {
+        Ok(library_id) => library_id,
+        Err(()) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "媒体库不存在或不可访问",
+            )
+            .into_response();
+        }
+    };
+    let item_types = lux_tags_item_types(&raw_query);
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    match state
+        .catalog()
+        .list_tags(
+            principal,
+            library_id.as_deref(),
+            &item_types,
+            offset,
+            page_size,
+        )
+        .await
+    {
+        Ok((tags, total)) => Json(LuxTagsResponse {
+            tags: tags
+                .into_iter()
+                .map(|tag| LuxTag { name: tag.name })
+                .collect(),
+            page,
+            page_size,
+            total,
+        })
+        .into_response(),
+        Err(CatalogError::Storage(_)) => api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "数据库暂时不可用",
+        )
+        .into_response(),
+        // Unknown, disabled, inaccessible and malformed library ids all look the same, so the
+        // response never reveals whether a library exists.
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "媒体库不存在或不可访问",
+        )
+        .into_response(),
+    }
+}
+
 pub(super) struct LuxItemDetail {
     pub(super) body: Value,
     pub(super) user_state: Option<crate::storage::StoredUserItemState>,

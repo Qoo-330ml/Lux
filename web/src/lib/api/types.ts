@@ -373,6 +373,12 @@ export type { ItemImagesResponse } from "./generated/ItemImagesResponse";
 
 export type { ItemImageSelectResponse } from "./generated/ItemImageSelectResponse";
 
+// `GET /api/v1/tags` has no Web consumer yet; the bindings are generated from the Rust DTO so a
+// future page cannot drift from the endpoint.
+export type { LuxTag } from "./generated/LuxTag";
+
+export type { LuxTagsResponse } from "./generated/LuxTagsResponse";
+
 export type ImageSearchResult = {
   id: string;
   imageType: string;

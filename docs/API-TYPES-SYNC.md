@@ -23,7 +23,7 @@
 | (c) | 非 JSON：图片字节流、媒体流、字幕文本、XML |
 | 204 | 成功但无响应体 |
 
-统计口径：`src/api/lux_api.rs` 共 **47 条 route 条目、49 个 handler**（`/items/{item_id}/metadata` 与 `/people/{person_id}` 各有两个方法；LUX-899 新增 `/items/{item_id}/similar`）。
+统计口径：`src/api/lux_api.rs` 共 **48 条 route 条目、50 个 handler**（`/items/{item_id}/metadata` 与 `/people/{person_id}` 各有两个方法；LUX-899 新增 `/items/{item_id}/similar`，LUX-900 新增 `/api/v1/tags`）。
 
 ## 全量路由清点
 
@@ -76,19 +76,20 @@
 | 45 | `/api/v1/items/{item_id}/download` | GET, HEAD | `lux_download` | (c) | 文件下载流 | — |
 | 46 | `/api/v1/watch-history` | GET | `lux_list_watch_history` | (b) | `lux_catalog_page_json_for_user` | `PageResponse<MediaItem>` |
 | 47 | `/api/v1/items/{item_id}/similar` | GET | `lux_get_similar` | (b) | `lux_catalog_page_json_for_user` | **无前端消费**（见「LUX-899 原生相似条目接口」） |
+| 48 | `/api/v1/tags` | GET | `lux_list_tags` | (a) | `LuxTagsResponse`（`media.rs`） | `LuxTagsResponse` / `LuxTag`（生成绑定，暂无调用点；见「LUX-900 原生标签列表接口」） |
 
 ### 统计
 
 | 类别 | route 条目 | 占比 |
 | --- | --- | --- |
-| (a) 全新具名结构体 | 1 | 2% |
+| (a) 全新具名结构体 | 2 | 4% |
 | (a)+(b) 混合（元素具名、信封手拼） | 1 | 2% |
-| (b) `json!` 手拼 / `Value` | 27 | 57% |
-| (c) 非 JSON | 12 | 26% |
+| (b) `json!` 手拼 / `Value` | 27 | 56% |
+| (c) 非 JSON | 12 | 25% |
 | 204 无响应体 | 6 | 13% |
-| **合计** | **47** | 100% |
+| **合计** | **48** | 100% |
 
-结论：Lux API 的 JSON 响应里 **只有 1 条路由（`/people/{id}`）已经是纯具名结构体**，(b) 占 57%。
+结论：Lux API 的 JSON 响应里 **只有 2 条路由（`/people/{id}` 与 `/tags`）已经是纯具名结构体**，(b) 占 56%。
 `types.ts` 中 221 个导出类型的绝大部分（含整个 `Admin*` 家族）对应的是 `src/api/admin/**` 与 `src/api/users.rs` 的路由，
 不在本次清点范围内，但同样属于 (b)。
 
@@ -420,6 +421,28 @@ Emby DTO/参数适配。
   上限，两者同时提供且数值不一致返回 400。它们属于读路径查询参数，不在本文件的请求体范围内。Lux 与 Emby
   的默认值/上限分开定义（`LUX_SIMILAR_*` 与 `EMBY_SIMILAR_DEFAULT_LIMIT`/`EMBY_MAX_PAGE_LIMIT`），
   Emby 不接收 `page`。
+
+## LUX-900 原生标签列表接口
+
+`GET /api/v1/tags`（路由在 `src/api/lux_api.rs` 注册，handler `lux_list_tags` 与 DTO 位于 `src/api/media.rs`）
+是首个在实现时就写成具名结构体并接入 ts-rs 的 Lux 标签响应，按本文件口径属于 **(a)**：
+
+| 类型 | 定义位置 | 覆盖路由 | 生成文件 |
+| --- | --- | --- | --- |
+| `LuxTagsResponse` | `src/api/media.rs` | `GET /api/v1/tags` | `LuxTagsResponse.ts` |
+| `LuxTag` | 同上 | 响应项 | `LuxTag.ts` |
+
+- 响应形状是 `{tags:[{name}],page,pageSize,total}`：分页字段名与其它 `/api/v1` 列表一致，集合名是 `tags`
+  而不是 `items`，因为返回的是标签而不是媒体条目；`total` 是去重后的标签总数。
+- `LuxTag` 只有 `name`；存储投影里的 `name_key` 与 `item_count` 不出现在响应里，因此 DTO 不是
+  `StoredMediaFacet` 的直接序列化。
+- `web/src/lib/api/types.ts` 只用 `export type { LuxTag } from "./generated/LuxTag"` 与
+  `export type { LuxTagsResponse } from "./generated/LuxTagsResponse"` 转出这两个生成类型；没有新增
+  `client.ts` 函数、页面或调用点，生成命令与防漂移检查沿用第 3 节
+  （`scripts/generate-api-types.sh`、`scripts/check-api-types.sh`）。
+- 这是新端点，不存在「响应字节不变」的兼容负担；`page`/`pageSize`/`total` 都是 `i64`
+  （`TS_RS_LARGE_INT=number`）。
+- 查询参数（`libraryId`、`itemType`、`page`、`pageSize`）与状态码不在本文件的请求体范围内，见 `docs/API.md`。
 
 ## 已知限制
 

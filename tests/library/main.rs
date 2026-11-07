@@ -14,3 +14,4 @@ mod library_order;
 mod media_deletion;
 mod series_api;
 mod similar_api;
+mod tags_api;

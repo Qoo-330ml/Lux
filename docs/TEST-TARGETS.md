@@ -114,6 +114,7 @@ cargo test --locked --test <新 target> <旧名>::
 | `media_deletion` | 3 | `cargo test --locked --test library media_deletion::` |
 | `series_api` | 1 | `cargo test --locked --test library series_api::` |
 | † `similar_api` | 6 | `cargo test --locked --test library similar_api::` |
+| † `tags_api` | 4 | `cargo test --locked --test library tags_api::` |
 | `identification` | 1 | `cargo test --locked --test metadata identification::` |
 | `media_matching` | 10 | `cargo test --locked --test metadata media_matching::` |
 | `metadata` | 22 | `cargo test --locked --test metadata metadata::` |
@@ -407,3 +408,21 @@ LUX-897 删除了两条 SSE 端点（`GET /api/v1/events`、`GET /api/v1/admin/e
   例，其中 `emby_similar::` 6/6（断言未改）；`cargo test --locked --lib similar_catalog` 2/2。
   闸门单测 `similar_endpoints_use_the_catalog_aggregation_guard` 断言 Lux 路由计入、Emby 两条路径不计入。
 - 第 1、2、5.1 节的历史数字保留基线/合并时的口径（第 2 节新增本模块一行）。
+
+## 11. LUX-900 追加（2026-11-07）
+
+`tests/library/tags_api.rs` 是 LUX-900 新增的模块（`tests/library/main.rs` 追加一行 `mod tags_api;`），
+命令为 `cargo test --locked --test library tags_api::`，共 **4** 例：`GET /api/v1/tags` 的响应只含
+`tags`（每项只有 `name`）、`page`、`pageSize`、`total`，`total` 是去重后的标签总数；`pageSize` 默认 50、
+`page=1` 起且接受 1-1000 的上限，`page<1`/负数/非整数/`pageSize=0`/`pageSize=1001`/非整数均返回 400
+`INVALID_REQUEST`，多页拼接无重复且越界页返回 200 空列表；`libraryId` 限制到单个可见库，不可见库、不存在的
+UUID 与格式非法的 ID 一律 404 `NOT_FOUND`；`itemType` 支持逗号分隔与重复参数、大小写不敏感、空值表示全部、
+全部无法识别时返回 200 空列表与 `total=0`；隐藏媒体库的标签、超出用户内容限制的标签不出现在普通用户的
+列表与 `total` 中，管理员跳过内容限制并看到全部启用库；同名的 `Star Wars`/`star wars` 合并为一项；未鉴权
+返回 401 `AUTHENTICATION_REQUIRED`。
+
+- 该模块按路由所在域放在 `library` 分组（媒体库/目录查询 API），与 `similar_api`、`catalog` 等相邻；没有
+  新建顶层 target，也没有改其他分组的归属。
+- 第 1、2、5.1 节的历史数字保留基线/合并时的口径（第 2 节新增本模块一行）。
+- 实测：`cargo test --locked --test library -- --list` 为 **61** 例（57 例基线 + 本任务 4 例），
+  `cargo test --locked --test library tags_api::` 4/4 通过。
