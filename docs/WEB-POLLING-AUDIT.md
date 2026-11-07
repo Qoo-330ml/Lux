@@ -24,7 +24,7 @@ grep -rn "refetchInterval\|setInterval" src
   因此实际语义是：**标签页隐藏（`document.hidden === true`）时暂停；窗口可见但失去焦点（例如切到另一个应用窗口）时仍会继续轮询**。任务要求的「页面不可见」正是 `document.hidden`/`visibilityState === "hidden"` 这一条件，所以「查询类轮询无需再加开关」的结论仍然成立。下表「页面不可见时仍轮询」一列即指标签页隐藏时是否仍轮询；本文件把显式写了 `refetchIntervalInBackground: false` 的行标注为「显式」，未写的标注为「默认」。
 - 真正会在后台继续跑的是 `window.setInterval`：心跳（必须继续）和客户端统计采样（纯展示，本次改为隐藏时暂停）。
 - 用户事件实时通道：`GET /api/v1/ws` 的 `user` 频道（`useUserEvents`），通过 `RealtimeConnectionContext` + `useRealtimeConnectionState()` 暴露连接状态，事件里的 `scope` 会 invalidate `home`、`libraries`、`item`、`item-images`、`playback`、`children`、`favorites`、`collection`、`person`、`library:<id>`。
-- 管理事件实时通道：同一条 `GET /api/v1/ws` 连接的 `admin` 频道（`useAdminEvents`），`scope` 取值 `all | dashboard | jobs | libraries | plugins | users | metadata | settings`，按 `queryKeysByScope` invalidate 对应查询。LUX-898 起管理端可以拿到连接状态：`useAdminEvents()` 返回状态，另导出 `useAdminRealtimeConnectionState()` 给管理页与任务活动弹层；它是 **admin 频道**的状态（由管理端自己订阅），不读用户频道的 `RealtimeConnectionState`，非管理员不订阅管理频道。仪表盘、任务活动弹层与运行记录四类任务列表已按“已连接”关闭兜底轮询，其余没有 scope 覆盖的查询继续轮询（见文末「LUX-898」）。
+- 管理事件实时通道：同一条 `GET /api/v1/ws` 连接的 `admin` 频道（`useAdminEvents`），`scope` 取值 `all | dashboard | jobs | libraries | plugins | users | metadata | settings`，按 `queryKeysByScope` invalidate 对应查询。LUX-898 起管理端可以拿到连接状态：`useAdminEvents()` 返回状态，另导出 `useAdminRealtimeConnectionState()` 给管理页与任务活动弹层；它是 **admin 频道**的状态（由管理端自己订阅），不读用户频道的 `RealtimeConnectionState`，非管理员不订阅管理频道。仪表盘在已连接时降为 60 s 长间隔兜底（断线 15 s；运行时长/CPU/内存/存储是逐次请求采样，不能停），任务活动弹层与运行记录四类任务列表在已连接时关闭兜底轮询；其余没有 scope 覆盖的查询继续轮询（见文末「LUX-898」）。
 
 ## 逐处清单
 
@@ -44,7 +44,7 @@ grep -rn "refetchInterval\|setInterval" src
 | 12 | `src/features/admin/EmbyMigrationPluginConfig.tsx:198` | Emby 迁移作业列表（`adminEmbyMigrations`） | 5s，仅历史面板打开时 | 否（默认） | 否：`queryKeysByScope` 未包含 `admin/emby-migrations`，只有连接时 `all` 快照 | 需后端新增 `emby` 事件或把该 key 归入 `jobs` scope 后再关轮询 |
 | 13 | `src/features/admin/EmbyMigrationPluginConfig.tsx:205` | 单个迁移作业详情（`adminEmbyMigration`） | 5s，仅作业进行中 | 否（默认） | 否（同上） | 同上 |
 | 14 | `src/features/admin/AdminTranscodingPage.tsx:39` | 转码会话列表（`adminTranscodingSessions`） | 2s（全站最密） | 否（默认） | 否：`admin/transcoding/sessions` 不在任何 scope 内 | 建议后续加管理事件 `transcoding` scope（需后端），把 2s 兜底降到 10s 或改为事件驱动 |
-| 15 | `src/features/admin/AdminDashboardPage.tsx:16` | 管理仪表盘（`adminDashboard`） | 15s（`liveDashboard`）；**（LUX-898）admin 频道已连接时 `false`** | 否（默认） | 是（`dashboard`/`jobs` scope） | 保持：已按管理频道连接状态关闭兜底轮询 |
+| 15 | `src/features/admin/AdminDashboardPage.tsx:16` | 管理仪表盘（`adminDashboard`） | 15s（`liveDashboard`）；**（LUX-898）admin 频道已连接时降为 60s（`liveDashboardConnected`）** | 否（默认） | 是（`dashboard`/`jobs` scope），但运行时长/CPU/内存/存储是逐次请求采样 | 保持轮询但降频：已连接时 60 s，断线时 15 s（见文末「LUX-898」） |
 | 16 | `src/features/admin/AdminOperationsPage.tsx:190` | STRM 探测任务列表（`adminStrmProbeJobs`） | 5s；**（LUX-898）admin 频道已连接时 `false`** | 否（默认） | 是（`jobs` scope） | 同上（已按管理频道连接状态关闭）；这些查询同时驱动「运行记录」标签页计数，间隔由同一个状态决定，不按标签页关闭 |
 | 17 | `src/features/admin/AdminOperationsPage.tsx:196` | 片头片尾检测任务（`adminChapterDetectionJobs`） | 5s；**（LUX-898）admin 频道已连接时 `false`** | 否（默认） | 是（`jobs` scope） | 同上 |
 | 18 | `src/features/admin/AdminOperationsPage.tsx:202` | 弹幕匹配任务（`adminDanmakuMatchJobs`） | 5s；**（LUX-898）admin 频道已连接时 `false`** | 否（默认） | 是（`jobs` scope） | 同上 |
@@ -112,7 +112,7 @@ grep -rn "refetchInterval\|setInterval" src
 
 ## 需要后续任务处理（本次不改后端）
 
-1. **管理端连接状态（已由 LUX-898 完成，2026-11-07）**：`useAdminEvents()` 现在返回连接状态，并导出 `useAdminRealtimeConnectionState()`（admin 频道，独立于用户频道）；管理仪表盘 15s、任务活动弹层 5s、运行记录四类任务列表 5s 在已连接时改为 `refetchInterval: false`，断线、握手失败与 `1008` 之后恢复原间隔。剩余轮询点与原因见文末「LUX-898」。
+1. **管理端连接状态（已由 LUX-898 完成，2026-11-07）**：`useAdminEvents()` 现在返回连接状态，并导出 `useAdminRealtimeConnectionState()`（admin 频道，独立于用户频道）；管理仪表盘在已连接时由 15 s 降为 60 s 长间隔兜底（断线 15 s），任务活动弹层 5 s 与运行记录四类任务列表 5 s 在已连接时改为 `refetchInterval: false`；断线、握手失败与 `1008` 之后都恢复原间隔。剩余轮询点与原因见文末「LUX-898」。
 2. **管理事件 scope 缺口**：
    - 转码会话（`admin/transcoding/sessions`，2s）没有任何 scope，需要后端新增 `transcoding` 事件；
    - Emby 迁移作业（`admin/emby-migrations*`）不在 `queryKeysByScope` 中，需要新增 `emby` scope 或归入 `jobs`；
@@ -147,7 +147,8 @@ npx vitest run tests/player-info-hook.test.tsx
 
 ## 后续补充：管理端连接状态与关闭兜底轮询（LUX-898，2026-11-07）
 
-管理端现在和用户侧一样按“已连接”关闭兜底轮询，但判断来源不同，这一点是本节的关键：
+管理端现在按“已连接”调整兜底轮询（任务类查询关闭，仪表盘降频），但判断来源与用户侧不同，这是本节的
+关键：
 
 - **状态来自 admin 频道，不来自用户频道**。`useAdminEvents()` 返回 `RealtimeConnectionState`（`AdminLayout`
   使用），另导出 `useAdminRealtimeConnectionState()` 给各个管理面直接调用：任务活动弹层挂在 `LuxShell`
@@ -162,12 +163,16 @@ npx vitest run tests/player-info-hook.test.tsx
 - **只有收到首帧 `ready` 才报 connected**；断线、握手失败（从未 ready）或 `1008` 会话结束都会回到
   `disconnected`，轮询立即恢复。250 ms 合并窗与“每次 open 全量失效”（ADR-054 D15②③）收敛到管理端唯一的
   一次注册里，多个管理组件同时挂载时不会重复失效。
+- **离开页面期间到达的帧也会让缓存过期**。管理端失效只对**活动**查询立即重取，未挂载的查询用
+  `refetchType: "none"` 标记为过期（`invalidateSubscribedQueries`），否则页级 `QueryClient` 的 60 s
+  `staleTime`（`web/src/main.tsx`）会让“卸载期间任务已结束”的页面在 60 s 内重新挂载时继续显示运行中。
+  标记过期优先于 `staleTime`，下次挂载即重取；卸载期间不会发请求。
 
 ### 现在的管理端轮询
 
 | 查询 | 断线 / 未连接 | admin 频道已连接 | 结论 |
 |---|---|---|---|
-| `adminDashboard`（仪表盘） | 15 s（`queryRefreshIntervals.liveDashboard`） | `false` | 关闭（`dashboard`/`jobs` scope） |
+| `adminDashboard`（仪表盘） | 15 s（`queryRefreshIntervals.liveDashboard`） | 60 s（`queryRefreshIntervals.liveDashboardConnected`） | **降频**：运行时长/CPU/内存/存储逐次采样，不能关（见下） |
 | `adminTaskActivity`（任务活动弹层，仅在打开时） | 5 s | `false` | 关闭（`jobs` scope） |
 | `adminStrmProbeJobs` / `adminChapterDetectionJobs` / `adminDanmakuMatchJobs` / `adminLibraryCoverJobs` | 5 s | `false` | 关闭（`jobs` scope） |
 | `adminTranscodingSessions`（转码会话） | 2 s | 2 s | **不变**：`admin/transcoding/sessions` 不在任何 scope 内 |
@@ -175,7 +180,13 @@ npx vitest run tests/player-info-hook.test.tsx
 | `adminLibraryDeletionJobs`（媒体库删除任务，`AdminLibraryDeletionPanel`） | 有任务 5 s / 空闲 15 s | 同左 | **不变**：`jobs` 与 `libraries` scope 都不含 `library-deletion-jobs` |
 | `admin/content-restriction-index`（内容分类索引状态） | 5 s（仅 `pendingItems` 时） | 5 s | **不变**：`users`/`metadata` scope 都不含该 key |
 
-后四类保持轮询的原因相同：它们的数据没有被任何管理事件 scope 覆盖，`invalidate` 帧不会因为转码进度、
+**仪表盘为什么只降频、不关闭**：`adminDashboard` 虽然在 `dashboard`/`jobs` scope 内，但它的运行时长、
+CPU、内存占用与存储占用是服务端**每次请求实时采样**的值；服务端只在审计/活动事件时发布 `dashboard`
+scope，空闲服务器不会产生这些事件，于是帧驱动的刷新等于没有。关掉 15 s 轮询会让这些数字永久冻结，
+所以已连接时保留 60 s 兜底（`liveDashboardConnected`），断线恢复 15 s。任务列表不同：任务进度变化本身
+就会产生 `jobs` 帧，因此四类任务列表可以关闭轮询。
+
+上表最后四类保持轮询的原因相同：它们的数据没有被任何管理事件 scope 覆盖，`invalidate` 帧不会因为转码进度、
 迁移作业、库删除或索引回填而变化。`all` 帧只在连接建立时和广播 lag 降级时出现，不能当作常态刷新；没有
 scope 就等于没有刷新信号，关掉轮询会让这些面板在页面停留期间冻结。补齐它们需要后端新增或扩展事件 scope
 （`transcoding`、`emby` 等），超出 LUX-898 的范围（本任务不改后端事件 scope），仍按上文的「管理事件 scope
@@ -184,8 +195,8 @@ scope 就等于没有刷新信号，关掉轮询会让这些面板在页面停�
 ### 已知限制
 
 - **降权后的窗口（ADR-054 D7）**：服务端重校验（周期 45 s）发现管理员降权时只停投 admin 帧、不关闭
-  连接，也不下发“频道已停”的帧。客户端没有可判定的信号，会继续报 `connected` 并按“已连接”不轮询，直到
-  连接因其它原因断开并重连（或用户打开仍轮询的那几个页面）才纠正。这是信封冻结（D3）的直接代价，不是
+  连接，也不下发“频道已停”的帧。客户端没有可判定的信号，会继续报 `connected` 并按“已连接”的间隔运行
+  （任务类不轮询、仪表盘 60 s），直到连接因其它原因断开并重连（或用户打开仍轮询的那几个页面）才纠正。这是信封冻结（D3）的直接代价，不是
   本任务新增的。
 - **没有用户频道时**管理页仍保持轮询：admin 观察者不拥有连接，只有 `AdminLayout`（控制台）会主动建连；
   独立渲染的管理页（例如测试）不会自己拉起 socket。
@@ -198,8 +209,10 @@ grep -rn "useAdminRealtimeConnectionState\|adminFallbackInterval" src
 npx vitest run tests/admin-realtime-polling.test.tsx tests/realtime-client.test.ts tests/admin-events.test.tsx
 ```
 
-`web/tests/admin-realtime-polling.test.tsx`（9 例）覆盖：仪表盘、任务活动弹层与四类任务列表在“未连接 /
-已连接 / 断线恢复 / `1008`”四种情形下的 `refetchInterval`；用户频道上下文声称 connected 时管理页仍轮询；
-转码 2 s、媒体库删除任务（有任务 5 s / 空闲 15 s）与内容索引（`pendingItems` 时 5 s）在已连接时不变。
+`web/tests/admin-realtime-polling.test.tsx`（10 例）覆盖：仪表盘“断线 15 s / 已连接 60 s / 断线恢复 /
+重连恢复 / `1008`”，任务活动弹层与四类任务列表“未连接 5 s / 已连接 `false` / 断线恢复 5 s”；用户频道
+上下文声称 connected 时管理页仍按 15 s 轮询；转码 2 s、媒体库删除任务（有任务 5 s / 空闲 15 s）与内容
+索引（`pendingItems` 时 5 s）在已连接时不变。`web/tests/admin-events.test.tsx` 新增一例：`staleTime`
+60 s 时，页面卸载期间到达的 `jobs` 帧把缓存标记为过期，重新挂载必须重取，且卸载期间不发请求。
 `web/tests/realtime-client.test.ts` 新增 `observeRealtime` 用例：观察者不建连、能收到状态与帧，退出时不
 关闭 owner 的 socket。
