@@ -281,6 +281,36 @@ async fn tag_facet_migration_keeps_existing_rows_and_requeues_items()
     sqlx::query("DELETE FROM media_content_restriction_index_queue")
         .execute(&pool)
         .await?;
+    // The pre-0249 snapshot: written by the parser that did not know about `<tag>`, with a valid
+    // item fingerprint and a finished local metadata backfill for the root.
+    let old_json = r#"{"genres":["Drama"],"studios":["A24"]}"#;
+    assert!(!old_json.contains("tags"));
+    sqlx::query(
+        "INSERT INTO media_item_nfo_cache (item_id, fingerprint, json, bytes)
+         VALUES ('tag-item', x'01020304', ?, length(CAST(? AS BLOB)))",
+    )
+    .bind(old_json)
+    .bind(old_json)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "UPDATE media_items SET nfo_metadata_fingerprint = x'01020304' WHERE id = 'tag-item'",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO library_roots (
+             id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ('tag-root', 'tag-library', '/media', '/media', 1, 1)",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_local_metadata_backfills (library_root_id, cursor_entry_id, status)
+         VALUES ('tag-root', 'entry-9', 'COMPLETED')",
+    )
+    .execute(&pool)
+    .await?;
 
     copy_one_migration(&migrations, TAG_FACET_MIGRATION)?;
     Migrator::new(migrations.as_path())
@@ -291,6 +321,34 @@ async fn tag_facet_migration_keeps_existing_rows_and_requeues_items()
         .fetch_one(&pool)
         .await?;
     assert_eq!(new_version, 249);
+
+    // The stale snapshot is invalidated for the rebuild but stays readable, and the local metadata
+    // backfill is re-armed so unchanged items are revisited instead of only changed sidecars.
+    let invalidated_fingerprint: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT nfo_metadata_fingerprint FROM media_items WHERE id = 'tag-item'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(invalidated_fingerprint, None);
+    let kept_json: String =
+        sqlx::query_scalar("SELECT json FROM media_item_nfo_cache WHERE item_id = 'tag-item'")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(
+        kept_json, old_json,
+        "the read-only snapshot stays available until the pipeline rebuilds it"
+    );
+    let backfill: (String, Option<String>) = sqlx::query_as(
+        "SELECT status, cursor_entry_id FROM scan_local_metadata_backfills
+         WHERE library_root_id = 'tag-root'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        backfill,
+        ("PENDING".to_owned(), None),
+        "every root is walked again so the invalidated snapshots are rebuilt"
+    );
 
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT kind, name_key, name FROM media_item_facets
