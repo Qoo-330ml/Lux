@@ -3798,6 +3798,90 @@ impl Database {
         ))
     }
 
+    /// Distinct tag values (`media_item_facets` kind `TAG`) of the items the filter can see: one
+    /// row per case-insensitive name (`name_key`), with that name's display spelling, how many
+    /// visible items carry it, ordered by `name_key`.
+    ///
+    /// The rows come from the `media_item_facets` projection alone; `media_items` and `libraries`
+    /// are joined for the shared visibility predicate (library scope, removal, content
+    /// restrictions), exactly like [`Self::list_catalog_facets`], so no request parses NFO JSON or
+    /// loads a catalog page. `limit` is clamped by the caller.
+    ///
+    /// A name key can be projected with more than one spelling (`Sci-Fi` and `sci-fi`), so the
+    /// display name is the byte-order smallest spelling of the group: `MIN(name COLLATE BINARY)`
+    /// on SQLite and `MIN(name COLLATE "C")` on PostgreSQL. The rule is the same on both backends
+    /// and does not depend on insertion order, so a re-projected item or a backend migration never
+    /// renames a tag. The page order uses the same explicit collation so it is byte order too.
+    #[cfg_attr(not(test), allow(dead_code))] // LUX-900's `/api/v1/tags` route is the next increment.
+    pub(crate) async fn list_catalog_tags(
+        &self,
+        filter: &CatalogFilterQuery<'_>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredMediaFacet>, i64), StorageError> {
+        if filter.library_ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let (where_clause, filter_binds) = catalog_filter_where_clause(filter);
+        let from = format!(
+            "FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             JOIN media_item_facets facet
+               ON facet.item_id = mi.id AND facet.kind = '{}'
+             {where_clause}",
+            MediaFacetKind::Tag.as_str()
+        );
+        // Both backends run the same query text; only the explicit byte-order collation differs.
+        let collation = if self.backend == DatabaseBackend::Postgres {
+            "\"C\""
+        } else {
+            "BINARY"
+        };
+        let list_query = format!(
+            "SELECT facet.name_key AS name_key,
+                    MIN(facet.name COLLATE {collation}) AS name,
+                    COUNT(*) AS item_count
+             {from}
+             GROUP BY facet.name_key
+             ORDER BY facet.name_key COLLATE {collation}
+             LIMIT ? OFFSET ?"
+        );
+        let mut list = self.query_as::<(String, String, i64)>(sqlx::AssertSqlSafe(list_query));
+        for bind in &filter_binds {
+            list = match bind {
+                CatalogBind::Text(value) => list.bind(*value),
+                CatalogBind::Integer(value) => list.bind(*value),
+                CatalogBind::Real(value) => list.bind(*value),
+            };
+        }
+        let rows = list
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        let count_query = format!("SELECT COUNT(DISTINCT facet.name_key) {from}");
+        let mut count = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_query));
+        for bind in &filter_binds {
+            count = match bind {
+                CatalogBind::Text(value) => count.bind(*value),
+                CatalogBind::Integer(value) => count.bind(*value),
+                CatalogBind::Real(value) => count.bind(*value),
+            };
+        }
+        let total = count.fetch_one(&self.pool).await.map_err(self.sqlx_err())?;
+        Ok((
+            rows.into_iter()
+                .map(|(name_key, name, item_count)| StoredMediaFacet {
+                    name_key,
+                    name,
+                    item_count,
+                })
+                .collect(),
+            total,
+        ))
+    }
+
     /// Distinct production years of the items the filter can see (newest first) with item
     /// counts, in the same shape as [`Self::list_catalog_facets`].
     pub(crate) async fn list_catalog_years(
@@ -14012,6 +14096,283 @@ mod tests {
         );
 
         database.close().await;
+        Ok(())
+    }
+
+    async fn insert_tag_movie(
+        database: &Database,
+        id: &str,
+        library_id: &str,
+        title: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO media_items
+             (id, library_id, item_type, title, sort_title, identification_status,
+              has_available_source)
+             VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(id)
+        .bind(library_id)
+        .bind(title)
+        .bind(title.to_lowercase())
+        .execute(database.pool())
+        .await
+        .map(|_| ())
+    }
+
+    async fn insert_item_facet(
+        database: &Database,
+        item_id: &str,
+        kind: &str,
+        name_key: &str,
+        name: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO media_item_facets (item_id, kind, name_key, name)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(item_id)
+        .bind(kind)
+        .bind(name_key)
+        .bind(name)
+        .execute(database.pool())
+        .await
+        .map(|_| ())
+    }
+
+    /// The filter the tag list service builds: no item-type narrowing, so the shared visibility
+    /// predicate only drops folders on top of the library scope and the content restrictions.
+    fn tag_facet_filter<'a>(library_ids: &'a [String]) -> CatalogFilterQuery<'a> {
+        CatalogFilterQuery {
+            library_ids,
+            user_id: "tag-user",
+            item_types: &[],
+            excluded_item_types: &[],
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            provider_id_equals: None,
+            years: &[],
+            genre_keys: &[],
+            studio_keys: &[],
+            is_played: None,
+            is_favorite: None,
+            is_resumable: None,
+            min_date_last_saved: None,
+            metadata_pending: false,
+            parent_id_scope: None,
+            content_restrictions: None,
+            sort_by: CatalogSort::Name,
+            descending: false,
+            offset: 0,
+            limit: 50,
+            include_total: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn tag_facet_list_reads_only_tag_rows_and_counts_visible_items()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::storage::StoredMediaFacet;
+
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('tag-lib', 'Tags', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        insert_tag_movie(&database, "tag-a", "tag-lib", "A").await?;
+        insert_tag_movie(&database, "tag-b", "tag-lib", "B").await?;
+        // GENRE and STUDIO values share the projection and must never appear in the tag list.
+        insert_item_facet(&database, "tag-a", "TAG", "space", "Space").await?;
+        insert_item_facet(&database, "tag-b", "TAG", "space", "Space").await?;
+        insert_item_facet(&database, "tag-b", "TAG", "noir", "Noir").await?;
+        insert_item_facet(&database, "tag-a", "GENRE", "drama", "Drama").await?;
+        insert_item_facet(&database, "tag-b", "GENRE", "horror", "Horror").await?;
+        insert_item_facet(&database, "tag-a", "STUDIO", "a24", "A24").await?;
+
+        let library_ids = vec!["tag-lib".to_owned()];
+        let (tags, total) = database
+            .list_catalog_tags(&tag_facet_filter(&library_ids), 0, 50)
+            .await?;
+
+        assert_eq!(total, 2);
+        assert_eq!(
+            tags,
+            vec![
+                StoredMediaFacet {
+                    name_key: "noir".to_owned(),
+                    name: "Noir".to_owned(),
+                    item_count: 1,
+                },
+                StoredMediaFacet {
+                    name_key: "space".to_owned(),
+                    name: "Space".to_owned(),
+                    item_count: 2,
+                },
+            ],
+            "one row per tag name, ordered by name_key, GENRE/STUDIO excluded"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tag_facet_list_keeps_the_byte_order_smallest_spelling_of_a_shared_name_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('tag-lib', 'Tags', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        // Two spellings per case-insensitive name, projected in opposite orders. The display name
+        // is the byte-order smallest spelling (upper case sorts before lower case), so it is
+        // "Sci-Fi"/"Noir" whichever row was written first: neither `MIN(rowid)` nor
+        // "first row wins" would answer both of these correctly.
+        insert_tag_movie(&database, "tag-first", "tag-lib", "First").await?;
+        insert_tag_movie(&database, "tag-second", "tag-lib", "Second").await?;
+        insert_tag_movie(&database, "tag-third", "tag-lib", "Third").await?;
+        insert_tag_movie(&database, "tag-fourth", "tag-lib", "Fourth").await?;
+        insert_item_facet(&database, "tag-first", "TAG", "sci-fi", "sci-fi").await?;
+        insert_item_facet(&database, "tag-second", "TAG", "sci-fi", "Sci-Fi").await?;
+        insert_item_facet(&database, "tag-third", "TAG", "noir", "Noir").await?;
+        insert_item_facet(&database, "tag-fourth", "TAG", "noir", "noir").await?;
+        // A locale-aware comparison sorts the lower-case spelling first; only an explicit byte
+        // order keeps "Été", which is why the collation is spelled out in the query.
+        insert_tag_movie(&database, "tag-fifth", "tag-lib", "Fifth").await?;
+        insert_tag_movie(&database, "tag-sixth", "tag-lib", "Sixth").await?;
+        insert_item_facet(&database, "tag-fifth", "TAG", "été", "été").await?;
+        insert_item_facet(&database, "tag-sixth", "TAG", "été", "Été").await?;
+
+        let library_ids = vec!["tag-lib".to_owned()];
+        let (tags, total) = database
+            .list_catalog_tags(&tag_facet_filter(&library_ids), 0, 50)
+            .await?;
+
+        assert_eq!(total, 3, "one case-insensitive name is one entry");
+        assert_eq!(
+            tags,
+            vec![
+                crate::storage::StoredMediaFacet {
+                    name_key: "noir".to_owned(),
+                    name: "Noir".to_owned(),
+                    item_count: 2,
+                },
+                crate::storage::StoredMediaFacet {
+                    name_key: "sci-fi".to_owned(),
+                    name: "Sci-Fi".to_owned(),
+                    item_count: 2,
+                },
+                crate::storage::StoredMediaFacet {
+                    name_key: "été".to_owned(),
+                    name: "Été".to_owned(),
+                    item_count: 2,
+                },
+            ],
+            "the byte-order smallest spelling wins, independent of insertion order"
+        );
+
+        // Deleting and re-projecting the first row must not rename the tag: the rule ignores
+        // storage order entirely.
+        database
+            .query("DELETE FROM media_items WHERE id = 'tag-first'")
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items
+                 (id, library_id, item_type, title, sort_title, identification_status,
+                  has_available_source)
+                 VALUES ('tag-first', 'tag-lib', 'MOVIE', 'First', 'first', 'LOCAL_CONFIRMED', 1)",
+            )
+            .execute(database.pool())
+            .await?;
+        insert_item_facet(&database, "tag-first", "TAG", "sci-fi", "sci-fi").await?;
+        let (reprojected, reprojected_total) = database
+            .list_catalog_tags(&tag_facet_filter(&library_ids), 0, 50)
+            .await?;
+        assert_eq!(reprojected_total, 3);
+        assert_eq!(reprojected, tags);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tag_facet_list_skips_items_outside_the_library_scope_and_removed_items()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        database
+            .query(
+                "INSERT INTO libraries (id, name, kind) VALUES
+                     ('tag-lib', 'Tags', 'MOVIE'),
+                     ('tag-other-lib', 'Other', 'MOVIE')",
+            )
+            .execute(database.pool())
+            .await?;
+        insert_tag_movie(&database, "tag-visible", "tag-lib", "Visible").await?;
+        insert_tag_movie(&database, "tag-elsewhere", "tag-other-lib", "Elsewhere").await?;
+        insert_tag_movie(&database, "tag-removed", "tag-lib", "Removed").await?;
+        insert_item_facet(&database, "tag-visible", "TAG", "seen", "Seen").await?;
+        insert_item_facet(&database, "tag-elsewhere", "TAG", "hidden", "Hidden").await?;
+        insert_item_facet(&database, "tag-removed", "TAG", "gone", "Gone").await?;
+        database
+            .query("UPDATE media_items SET removed_at = unixepoch() WHERE id = 'tag-removed'")
+            .execute(database.pool())
+            .await?;
+
+        let library_ids = vec!["tag-lib".to_owned()];
+        let (tags, total) = database
+            .list_catalog_tags(&tag_facet_filter(&library_ids), 0, 50)
+            .await?;
+        assert_eq!(total, 1);
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].name, "Seen");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tag_facet_list_pages_by_name_key_and_reports_the_whole_total()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('tag-lib', 'Tags', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        insert_tag_movie(&database, "tag-paged", "tag-lib", "Paged").await?;
+        for index in 0..30 {
+            insert_item_facet(
+                &database,
+                "tag-paged",
+                "TAG",
+                &format!("tag-{index:02}"),
+                &format!("Tag {index:02}"),
+            )
+            .await?;
+        }
+
+        let library_ids = vec!["tag-lib".to_owned()];
+        let (first_page, total) = database
+            .list_catalog_tags(&tag_facet_filter(&library_ids), 0, 10)
+            .await?;
+        assert_eq!(
+            total, 30,
+            "the total counts every distinct tag, not the page"
+        );
+        assert_eq!(first_page.len(), 10);
+        assert_eq!(first_page[0].name_key, "tag-00");
+        assert_eq!(first_page[9].name_key, "tag-09");
+
+        let (last_page, last_total) = database
+            .list_catalog_tags(&tag_facet_filter(&library_ids), 25, 10)
+            .await?;
+        assert_eq!(last_total, 30);
+        assert_eq!(last_page.len(), 5);
+        assert_eq!(last_page[4].name_key, "tag-29");
+
+        let (stable_page, _) = database
+            .list_catalog_tags(&tag_facet_filter(&library_ids), 0, 10)
+            .await?;
+        assert_eq!(
+            stable_page, first_page,
+            "the same request returns the same page"
+        );
         Ok(())
     }
 }

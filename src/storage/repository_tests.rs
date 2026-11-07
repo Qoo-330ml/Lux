@@ -37897,3 +37897,150 @@ async fn media_source_local_location_resolves_nested_files_and_strm_files() {
             .is_none()
     );
 }
+
+/// The tag list has to answer the same display spelling on PostgreSQL, where the database
+/// collation is locale aware by default: only the explicit `COLLATE "C"` in the query keeps the
+/// byte-order rule that SQLite gets from `COLLATE BINARY`.
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_tag_facet_list_keeps_the_byte_order_smallest_spelling()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_url = DatabaseConfiguration::Postgres(admin_connection.clone())
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect_with_configuration(
+        &Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp.path().join("config"),
+        },
+        &DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+    let outcome = assert_tag_facet_spelling_contract(&database).await;
+    database.close().await;
+    let cleanup = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    cleanup?;
+    outcome
+}
+
+/// Shared by the PostgreSQL test: two spellings per case-insensitive name, written in the order
+/// that a "first row wins" or locale-aware rule would answer differently.
+async fn assert_tag_facet_spelling_contract(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    database
+        .query("INSERT INTO libraries (id, name, kind) VALUES ('pg-tag-lib', 'Tags', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    for (item_id, tag) in [
+        ("pg-tag-first", "sci-fi"),
+        ("pg-tag-second", "Sci-Fi"),
+        ("pg-tag-third", "Noir"),
+        ("pg-tag-fourth", "noir"),
+        ("pg-tag-fifth", "été"),
+        ("pg-tag-sixth", "Été"),
+    ] {
+        database
+            .query(
+                "INSERT INTO media_items
+                 (id, library_id, item_type, title, sort_title, identification_status,
+                  has_available_source)
+                 VALUES (?, 'pg-tag-lib', 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(item_id)
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_item_facets (item_id, kind, name_key, name)
+                 VALUES (?, 'TAG', ?, ?)",
+            )
+            .bind(item_id)
+            .bind(tag.to_lowercase())
+            .bind(tag)
+            .execute(database.pool())
+            .await?;
+    }
+    // A GENRE row with the same spelling must not leak into the tag list.
+    database
+        .query(
+            "INSERT INTO media_item_facets (item_id, kind, name_key, name)
+             VALUES ('pg-tag-first', 'GENRE', 'sci-fi', 'Sci-Fi')",
+        )
+        .execute(database.pool())
+        .await?;
+
+    let library_ids = vec!["pg-tag-lib".to_owned()];
+    let filter = CatalogFilterQuery {
+        library_ids: &library_ids,
+        user_id: "pg-tag-user",
+        item_types: &[],
+        excluded_item_types: &[],
+        item_ids: None,
+        person_id: None,
+        media_source_ids: None,
+        provider_id_equals: None,
+        years: &[],
+        genre_keys: &[],
+        studio_keys: &[],
+        is_played: None,
+        is_favorite: None,
+        is_resumable: None,
+        min_date_last_saved: None,
+        metadata_pending: false,
+        parent_id_scope: None,
+        content_restrictions: None,
+        sort_by: CatalogSort::Name,
+        descending: false,
+        offset: 0,
+        limit: 50,
+        include_total: true,
+    };
+    let (tags, total) = database.list_catalog_tags(&filter, 0, 50).await?;
+    assert_eq!(total, 3);
+    assert_eq!(
+        tags.iter()
+            .map(|tag| (tag.name_key.as_str(), tag.name.as_str(), tag.item_count))
+            .collect::<Vec<_>>(),
+        vec![
+            ("noir", "Noir", 2),
+            ("sci-fi", "Sci-Fi", 2),
+            ("été", "Été", 2)
+        ],
+        "PostgreSQL must answer the byte-order smallest spelling of each name key"
+    );
+    Ok(())
+}
