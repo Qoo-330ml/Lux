@@ -1468,7 +1468,6 @@ fn is_catalog_aggregation_path(path: &str) -> bool {
             | ["Items", "Root"]
             | ["Search", "Hints"]
             | ["Items", _, "Children"]
-            | ["Items", _, "Similar"]
     )
 }
 
@@ -2623,12 +2622,12 @@ mod tests {
 
     #[test]
     fn similar_endpoints_use_the_catalog_aggregation_guard() {
-        for path in [
-            "/api/v1/items/item-1/similar",
-            "/Items/item-1/Similar",
-            "/emby/Items/item-1/Similar",
-        ] {
-            assert!(is_catalog_aggregation_path(path), "{path}");
+        // The native Lux route is a bounded catalog aggregation and belongs to the guard.
+        assert!(is_catalog_aggregation_path("/api/v1/items/item-1/similar"));
+        // The Emby compatibility adapter must keep its pre-LUX-899 behaviour and never enter the
+        // guard, so saturation cannot turn an Emby similar request into a 503.
+        for path in ["/Items/item-1/Similar", "/emby/Items/item-1/Similar"] {
+            assert!(!is_catalog_aggregation_path(path), "{path}");
         }
     }
 
