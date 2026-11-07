@@ -400,7 +400,7 @@ ts-rs 生成流程（`--features ts-bindings` → `scripts/generate-api-types.sh
 
 ## LUX-899 原生相似条目接口
 
-`GET /api/v1/items/{item_id}/similar?limit=`（`src/api/lux_api.rs` 的 `lux_get_similar`）是相似条目的
+`GET /api/v1/items/{item_id}/similar?limit=`（路由在 `src/api/lux_api.rs` 注册，handler `lux_get_similar` 位于 `src/api/media.rs`）是相似条目的
 权威实现；Emby `GET /Items/{id}/Similar` 改为调用同一个 `CatalogService::list_similar_items`，只保留
 Emby DTO/参数适配。
 

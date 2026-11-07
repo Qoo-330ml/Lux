@@ -1223,7 +1223,7 @@ pub(super) async fn similar_items_page(
 /// (at most 10 source genres x 200 candidates, i.e. 2000). `offset = (page - 1) * limit` is
 /// applied after the bounded union has been ranked, and `hasNext` uses the standard
 /// `offset + items.len() < total` rule. An offset past the pool answers 200 with an empty page.
-/// The endpoint accepts `limit` and `page` only; `pageSize` is not a request parameter.
+/// The endpoint accepts `limit` (or its alias `pageSize`) and `page`; see `LuxSimilarQuery`.
 pub(super) async fn lux_get_similar(
     headers: HeaderMap,
     Path(item_id): Path<String>,
