@@ -1818,14 +1818,15 @@ Lux 当时返回 404 空响应，客户端页面不报错、推荐区整块缺�
   `require_web_user`（Web session 或用户级客户端令牌），未鉴权 401
   `AUTHENTICATION_REQUIRED`。条目不存在或对当前用户不可见（含媒体库 ACL）返回 404 `NOT_FOUND`，
   与 `/api/v1/items/{item_id}` 一致；数据库不可用返回 503。媒体库 ACL 与内容限制由共享服务执行，被排除
-  的条目不会出现在 `items` 或 `total`。
-- 响应：Lux 自有形状 `{items,page,pageSize,hasNext,total}`，直接复用
-  `lux_catalog_page_json_for_user`。`items` 是 Lux 媒体条目（`lux_catalog_items_json_for_user`），
-  **不复用 Emby DTO**；`page` 固定为 1（该端点没有 `page` 参数，只有 `limit`），`pageSize` 回显生效的
-  `limit`，`hasNext` 恒为 `false`（端点只提供有界候选池的第一页，没有 `page`/游标参数，不承诺可获取的
-  下一页），`total` 是有界候选池内的去重数量。
+  的条目不会出现在 `items`（Lux 端点不返回 `total`）或 Emby 的 `TotalRecordCount` 中，也不会进入候选池计数。
+- 响应：Lux 自有形状 `{items,page,pageSize,hasNext}`（**不返回** `total`），由
+  `CatalogPage::without_total` + `lux_catalog_page_json_for_user` 生成。`items` 是 Lux 媒体条目
+  （`lux_catalog_items_json_for_user`），**不复用 Emby DTO**；`page` 固定为 1（该端点没有 `page` 参数，
+  只有 `limit`），`pageSize` 回显生效的 `limit`，`hasNext` 恒为 `false`（端点只提供有界候选池的第一页，
+  没有 `page`/游标参数，不承诺可获取的下一页）。也正因为无法翻页，响应不返回候选池 `total`，避免
+  与 `hasNext=false` 互相矛盾。Emby 的 `TotalRecordCount` 仍是有界候选池的去重数量，保持不变。
 - `limit`：默认 50，允许 1-1000；显式空值（`?limit=`）视为未提供；`0`、负数、非整数（含 `1.5`）和
-  超过 1000 返回 400 `INVALID_REQUEST`。`limit` 只裁剪当前页，不改变 `total`；`0` 被拒绝与 Lux 其他列表
+  超过 1000 返回 400 `INVALID_REQUEST`。`limit` 只裁剪第一页（端点不返回 `total`）；`0` 被拒绝与 Lux 其他列表
   `pageSize` 必须为正的规则一致，也避免分页信封做 `offset / limit` 时除零。
 - 相似规则与候选池：与 LUX-889 完全一致，由同一个 `CatalogService::list_similar_items` 提供：同类型
   （`MOVIE`/`SERIES`）、至少共享一个已入库 Genre、最多 10 个源 Genre × 每个 200 个通过 ACL/可见性/内容
@@ -1842,7 +1843,7 @@ Lux 当时返回 404 空响应，客户端页面不报错、推荐区整块缺�
 - 自动化：新增 `tests/library/similar_api.rs`（`cargo test --locked --test library similar_api::`，
   5 例）：同一用户同一库下 Lux 与 Emby 的条目 id 顺序一致（普通用户与管理员、含 ACL 排除项）、
   `limit` 默认值/上限/400、404/401（未知条目、无权条目、无会话）、内容限制排除的条目不出现在
-  `items`/`total`、剧集只返回剧集与无相似条目的 200 空列表。
+  `items`（Lux 不返回 `total`）/Emby `TotalRecordCount`、剧集只返回剧集与无相似条目的 200 空列表。
   `cargo test --locked --test emby emby_similar::` 6/6；本机 `uname -m` = `arm64`（macOS），
   不代表 NAS/x86_64 性能，也未做客户端 UI 复测。
 

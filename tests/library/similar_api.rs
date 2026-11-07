@@ -404,6 +404,21 @@ fn emby_ids(body: &Value) -> Vec<&str> {
         .unwrap_or_default()
 }
 
+/// Asserts the first-page-only Lux envelope: no candidate-pool `total`, `page` 1, the effective
+/// `pageSize`, no next page and at most `limit` items.
+fn assert_lux_first_page(body: &Value, ids: &[&str], limit: i64) {
+    assert_eq!(lux_ids(body).as_slice(), ids);
+    assert!(
+        body.get("total").is_none(),
+        "the Lux route must not expose a candidate-pool total"
+    );
+    assert_eq!(body["page"], 1);
+    assert_eq!(body["pageSize"], limit);
+    assert_eq!(body["hasNext"], false);
+    let item_count = body["items"].as_array().map_or(0, Vec::len) as i64;
+    assert!(item_count <= limit, "items must not exceed the limit");
+}
+
 #[tokio::test]
 async fn lux_similar_items_match_the_emby_ranking_and_respect_library_acl()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -413,17 +428,11 @@ async fn lux_similar_items_match_the_emby_ranking_and_respect_library_acl()
         .await?;
     assert_eq!(status, reqwest::StatusCode::OK);
     // More shared genres outrank fewer; a title tie-break keeps equal counts stable.
-    assert_eq!(
-        lux_ids(&body),
-        ["sim-movie-alpha", "sim-movie-charlie", "sim-movie-bravo"]
+    assert_lux_first_page(
+        &body,
+        &["sim-movie-alpha", "sim-movie-charlie", "sim-movie-bravo"],
+        20,
     );
-    assert_eq!(
-        body["total"], 3,
-        "the total is the visible candidate count, not just the page"
-    );
-    assert_eq!(body["page"], 1);
-    assert_eq!(body["pageSize"], 20);
-    assert_eq!(body["hasNext"], false);
     // The page is built from the Lux item DTO (camelCase `userData`/`mediaSources`), never from
     // the Emby `Items` projection (`Name`/`Id`/`UserData`).
     let first = &body["items"][0];
@@ -449,16 +458,16 @@ async fn lux_similar_items_match_the_emby_ranking_and_respect_library_acl()
         .lux_similar("sim-movie-source", "?limit=20", &harness.admin_cookie)
         .await?;
     assert_eq!(status, reqwest::StatusCode::OK);
-    assert_eq!(
-        lux_ids(&admin_body),
-        [
+    assert_lux_first_page(
+        &admin_body,
+        &[
             "sim-movie-alpha",
             "sim-movie-hidden",
             "sim-movie-charlie",
-            "sim-movie-bravo"
-        ]
+            "sim-movie-bravo",
+        ],
+        20,
     );
-    assert_eq!(admin_body["total"], 4);
     let (emby_status, admin_emby_body) = harness
         .emby_similar("sim-movie-source", "?Limit=20", &harness.admin_emby_token)
         .await?;
@@ -485,42 +494,36 @@ async fn lux_similar_limit_defaults_caps_and_rejects_invalid_values()
             .lux_similar("sim-movie-source", query, &harness.viewer_cookie)
             .await?;
         assert_eq!(status, reqwest::StatusCode::OK, "query {query}");
-        assert_eq!(body["pageSize"], 50, "query {query}");
-        assert_eq!(body["total"], 3, "query {query}");
+        assert_lux_first_page(
+            &body,
+            &["sim-movie-alpha", "sim-movie-charlie", "sim-movie-bravo"],
+            50,
+        );
     }
 
     let (status, limited) = harness
         .lux_similar("sim-movie-source", "?limit=1", &harness.viewer_cookie)
         .await?;
     assert_eq!(status, reqwest::StatusCode::OK);
-    assert_eq!(lux_ids(&limited), ["sim-movie-alpha"]);
-    assert_eq!(
-        limited["total"], 3,
-        "limit only trims the page, not the total"
-    );
-    assert_eq!(
-        limited["hasNext"], false,
-        "the endpoint has no paging parameter, so it never promises a next page"
-    );
+    assert_lux_first_page(&limited, &["sim-movie-alpha"], 1);
 
-    // `total > limit` is the case that would otherwise advertise a next page; the endpoint can
-    // only serve the first page of its bounded candidate pool.
+    // The candidate pool is larger than the limit, but the endpoint only serves its first page
+    // and must not leak the pool size as `total`.
     let (status, partial) = harness
         .lux_similar("sim-movie-source", "?limit=2", &harness.viewer_cookie)
         .await?;
     assert_eq!(status, reqwest::StatusCode::OK);
-    assert_eq!(lux_ids(&partial), ["sim-movie-alpha", "sim-movie-charlie"]);
-    assert_eq!(partial["total"], 3);
-    assert_eq!(partial["pageSize"], 2);
-    assert_eq!(partial["hasNext"], false);
+    assert_lux_first_page(&partial, &["sim-movie-alpha", "sim-movie-charlie"], 2);
 
     let (status, capped) = harness
         .lux_similar("sim-movie-source", "?limit=1000", &harness.viewer_cookie)
         .await?;
     assert_eq!(status, reqwest::StatusCode::OK);
-    assert_eq!(capped["pageSize"], 1000);
-    assert_eq!(capped["total"], 3);
-    assert_eq!(capped["hasNext"], false);
+    assert_lux_first_page(
+        &capped,
+        &["sim-movie-alpha", "sim-movie-charlie", "sim-movie-bravo"],
+        1000,
+    );
 
     for query in [
         "?limit=0",
@@ -570,8 +573,7 @@ async fn lux_similar_excludes_items_blocked_by_content_restrictions()
         .lux_similar("sim-movie-source", "?limit=20", &harness.viewer_cookie)
         .await?;
     assert_eq!(status, reqwest::StatusCode::OK);
-    assert_eq!(lux_ids(&body), ["sim-movie-alpha", "sim-movie-bravo"]);
-    assert_eq!(body["total"], 2);
+    assert_lux_first_page(&body, &["sim-movie-alpha", "sim-movie-bravo"], 20);
     assert!(!lux_ids(&body).contains(&"sim-movie-charlie"));
 
     // The Emby adapter shares the same restriction predicate and also drops Charlie from its
@@ -627,8 +629,7 @@ async fn lux_similar_only_returns_the_same_type_and_handles_an_empty_result()
         .lux_similar("sim-series-source", "?limit=20", &harness.viewer_cookie)
         .await?;
     assert_eq!(status, reqwest::StatusCode::OK);
-    assert_eq!(lux_ids(&body), ["sim-series-alpha"]);
-    assert_eq!(body["total"], 1);
+    assert_lux_first_page(&body, &["sim-series-alpha"], 20);
     assert!(!lux_ids(&body).contains(&"sim-series-drama"));
     assert!(!lux_ids(&body).contains(&"sim-movie-alpha"));
 
@@ -636,9 +637,7 @@ async fn lux_similar_only_returns_the_same_type_and_handles_an_empty_result()
         .lux_similar("sim-movie-no-genre", "?limit=20", &harness.viewer_cookie)
         .await?;
     assert_eq!(status, reqwest::StatusCode::OK);
-    assert!(lux_ids(&empty).is_empty());
-    assert_eq!(empty["total"], 0);
-    assert_eq!(empty["hasNext"], false);
+    assert_lux_first_page(&empty, &[], 20);
 
     harness.server.abort();
     Ok(())

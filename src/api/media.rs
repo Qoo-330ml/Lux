@@ -1203,10 +1203,12 @@ pub(super) async fn lux_get_similar(
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let database = state.database();
     match similar_items_page(&state, principal, &item_id, limit).await {
-        Ok(Some(mut page)) => {
-            // The endpoint accepts no page/cursor parameter, so it can only serve the first page
-            // of the bounded candidate pool. Never advertise a next page the caller cannot ask for.
-            page.has_next = false;
+        Ok(Some(page)) => {
+            // This endpoint has no page/cursor parameter: it serves only the first page of the
+            // bounded candidate pool and deliberately exposes no candidate-pool total. Building
+            // the page without a total keeps `hasNext: false` from contradicting a `total`, and
+            // stops clients from deriving paging from a count they cannot page through.
+            let page = CatalogPage::without_total(page.items, 0, limit, false);
             match lux_catalog_page_json_for_user(database, &user.id.to_string(), &page).await {
                 Ok(body) => Json(body).into_response(),
                 Err(_) => api_error(

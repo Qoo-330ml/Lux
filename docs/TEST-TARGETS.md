@@ -390,9 +390,9 @@ LUX-897 删除了两条 SSE 端点（`GET /api/v1/events`、`GET /api/v1/admin/e
 `tests/library/similar_api.rs` 是 LUX-899 新增的模块（`tests/library/main.rs` 追加一行 `mod similar_api;`），
 命令为 `cargo test --locked --test library similar_api::`，共 **5** 例：同一用户同一库下 Lux 原生
 `GET /api/v1/items/{item_id}/similar` 与 Emby `GET /Items/{id}/Similar` 的条目 id 顺序一致（普通用户与
-管理员，含 ACL 排除项不出现在 `items`/`total`）、`limit` 默认 50/上限 1000/空值按未提供/`0`、负数、非整数、
-超上限 400、`total > limit` 时 `hasNext` 仍为 `false`、未知或不可见条目 404 与无会话 401、内容限制排除的
-条目不出现在 `items`/`total`、剧集只返回剧集且无相似条目时返回 200 空列表（`total=0`）。
+管理员，含 ACL 排除项不出现在 `items`/Emby `TotalRecordCount`）、`limit` 默认 50/上限 1000/空值按未提供/
+`0`、负数、非整数、超上限 400、响应不返回 `total` 且 `hasNext` 恒为 `false`、未知或不可见条目 404 与无会话
+401、内容限制排除的条目不出现在 `items`、剧集只返回剧集且无相似条目时返回 200 空列表。
 
 - 该模块按路由所在域放在 `library` 分组（目录/媒体条目 API），与 `catalog`、`series_api` 等相邻；没有新建
   顶层 target，也没有改其他分组的归属。
