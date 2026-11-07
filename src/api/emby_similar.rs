@@ -1,8 +1,10 @@
 use super::*;
 
+// The native Lux route has its own `LUX_SIMILAR_DEFAULT_LIMIT` = 50 and `LUX_SIMILAR_MAX_LIMIT`
+// = 1000 (the same upper bound as `EMBY_MAX_PAGE_LIMIT` below) and additionally accepts a
+// 1-based `page`; this Emby adapter keeps the Emby item-list bounds and does not accept `page`.
 /// Similar-items page size when the caller does not send `Limit`, matching the other Emby item
-/// list endpoints. The page cap remains the shared `EMBY_MAX_PAGE_LIMIT` (1000); the native Lux
-/// route has its own, larger candidate-pool cap and must not share these bounds.
+/// list endpoints. The page cap remains the shared `EMBY_MAX_PAGE_LIMIT` (1000).
 const EMBY_SIMILAR_DEFAULT_LIMIT: i64 = 50;
 
 /// Query parameters of `GET /Items/{id}/Similar`.
