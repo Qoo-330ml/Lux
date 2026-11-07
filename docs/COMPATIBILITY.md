@@ -36,13 +36,18 @@ Emby 客户端上复测；`Items[]` 的 `Name`/`Id` 形状按 Emby `NameIdPair` 
   不会贡献 facet。这不是本任务新增的过滤，是既有投影的取值范围的直接结果。
 - 内容限制：非管理员用户的分级列表与 `/Items` 使用同一条内容限制谓词，超出 `maximum_rating` 的条目连同
   其分级一起被排除；管理员不受内容限制（与既有列表一致）。库 ACL 与内容限制同时生效。
-- `GET /Tags`：**目前恒返回 200 与 `{"Items":[],"TotalRecordCount":0}`**，不再是 404，筛选面板显示空
-  列表而不是请求失败。`ParentId` 的库权限与 `/OfficialRatings` 一样校验：非空 `ParentId` 指向未知或用户
-  不可见的媒体库时返回 404，空 `ParentId=` 按“不限媒体库”处理；以后给 Tags 填数据源时不会留下越权入口。
-  **Tags 目前恒空，原因是无数据源，仍待后续任务填充**：NFO 解析结果里没有条目级
-  `<tag>`，`media_item_facets` 只有 `GENRE`/`STUDIO` 两种 kind，`media_content_restriction_tags` 存的是
-  **小写 genre**（家长控制用的投影），不能当作 Emby tags 返回。按任务约束没有新增迁移、没有扫描器改动、
-  也没有在请求里解析 NFO；`Fields=TagItems` 的现有行为不变。
+- `GET /Tags`（LUX-900 起）：读取 `TAG` 投影（`media_item_facets`，迁移 0249 新增的 kind），调用与原生
+  `GET /api/v1/tags` 相同的 `CatalogService::list_tags`，所以同一媒体库、同一用户下两个端点返回的标签名称
+  集合与顺序一致，只有信封不同。标签按不区分大小写的 `name_key` 去重（`Star Wars` 与 `star wars` 只算
+  一项，显示名取字节序最小的写法）并按该键升序排列。可见范围与 `/OfficialRatings` 相同：非空 `ParentId`
+  指向未知或用户不可见的媒体库时返回 404，空 `ParentId=` 按“不限媒体库”处理；管理员跳过内容限制，其他
+  用户只看到内容限制后仍可见条目上的标签。`IncludeItemTypes`、`StartIndex`/`Limit` 同样复用
+  `/OfficialRatings` 的解析与分页（默认 50、上限 1000、非法 400）。响应信封为
+  `{"Items":[{"Name":…,"Id":…,"ServerId":…}],"TotalRecordCount":n,"StartIndex":n}`，`Id` 就是标签名
+  （与 `OfficialRatings` 的 `Id = Name` 一致），不返回 facet `Id`、条目数或 `name_key`。请求只读投影表，
+  不解析 NFO、不扫库。**存量库需要等待回填**：0249 迁移把所有可见条目重新入队并清掉 NFO 指纹，worker 分批
+  补写 `TAG` 行；回填完成前这些条目上的标签不会出现在筛选面板里（面板暂时仍是空列表）。
+  `Fields=TagItems` 的现有行为不变。
 - 鉴权与路径：两个端点都要求 Emby token/API key（未鉴权 401），同时支持根路径与 `/emby` 前缀；路由走
   既有 `EmbyRouteBuilder`，因此 `/emby` 前缀与路径大小写不敏感的行为自动一致
   （`/EMBY/officialratings` 有测试覆盖）。
@@ -56,9 +61,9 @@ Emby 客户端上复测；`Items[]` 的 `Name`/`Id` 形状按 Emby `NameIdPair` 
 - `Recursive` 被接受但不改变结果：与其他 facet 端点一样，分级聚合始终覆盖所选库/类型的全部可见条目。
 - **剩余缺口**：分级目前只能列出，不能用于 `/Items` 筛选——`/Items` 不接受 `OfficialRatings=` 参数，
   所以在筛选面板里选中某个分级不会改变列表。对应后续任务待立项，本任务没有改 `/Items` 过滤。
-- 自动化：`cargo test --locked --test emby emby_filter_metadata::`（3 例）覆盖去重、库 ACL、内容限制、
+- 自动化：`cargo test --locked --test emby emby_filter_metadata::`（5 例）覆盖去重、库 ACL、内容限制、
   `ParentId`、`IncludeItemTypes`（有效/全无效/混合）、分页与上限、空 `Limit=` 与 `Limit=0`、未鉴权 401、
-  根路径/`/emby`/大小写混用与 `Tags` 空信封。
+  根路径/`/emby`/大小写混用，以及 `Tags` 的真实标签列表、类型过滤/分页与 `/api/v1/tags` 的名称一致性。
 
 ## LUX-888 Emby 查询端点容忍空的可选数值/布尔参数（2026-11-06）
 
@@ -228,7 +233,7 @@ Lux 侧改动（`src/api/emby_catalog.rs`、`src/application/probe.rs`，无迁�
 
 - 新增 `GET /Genres`、`/Studios`、`/Years`（同样挂在 `/emby` 前缀下，路径大小写不敏感）。需要 Emby token，按用户的媒体库权限和内容限制收窄；支持 `UserId`、`ParentId`（仅媒体库 ID，未授权或未知返回 404）、`IncludeItemTypes`、`StartIndex`、`Limit`（上限与 `/Persons` 相同，超限 400）。返回 `{ Items, TotalRecordCount, StartIndex }`，每项含 `Name`、不透明的 `Id`、`Type`（`Genre`/`Studio`/`Year`）和 `ChildCount`（可见条目数）；`Genres`、`Studios` 按名称排序，`Years` 由新到旧。
 - `GET /Items`、`/Users/{id}/Items` 新增 `Genres`、`Studios` 筛选，值用 `|` 分隔、任一命中即匹配，大小写不敏感，最多 32 个值。`Years` 参数原本就支持。
-- **后续修订（LUX-890）**：`/Tags` 返回 200 空列表（无数据源，待后续投影填充）；`/OfficialRatings` 已实现（归一化分级码子集）。仍**未实现**：`GenreIds`、`StudioIds` 按 ID 筛选（`Id` 仅是稳定的不透明值，客户端请用 `Genres`/`Studios` 名称筛选）；Genres/Studios 的图片。
+- **后续修订（LUX-890）**：`/Tags` 已不再是空列表——LUX-900 起改为读取 `TAG` 投影（与 `/api/v1/tags` 同一服务）；`/OfficialRatings` 已实现（归一化分级码子集）。仍**未实现**：`GenreIds`、`StudioIds` 按 ID 筛选（`Id` 仅是稳定的不透明值，客户端请用 `Genres`/`Studios` 名称筛选）；Genres/Studios 的图片。
 - 数据来源：迁移 `0245`/`0247` 新增 `media_item_facets(item_id, kind, name_key, name)`，由内容限制索引 worker 从同一份 NFO 快照写入，NFO 变化后经既有队列重建。请求路径只读该表，不解析 NFO、不扫库。升级时迁移会把所有存量条目重新入队，回填在后台分批完成；回填完成前 `/Genres`、`/Studios` 与 `Genres`/`Studios` 筛选只覆盖已索引的条目。回填会重写内容限制索引行，并触发一次 catalog outbox 更新。
 - 验证：`cargo test --locked --test emby emby_facets::`；`cargo test --locked --lib content_restriction_index`。
 

@@ -2,7 +2,10 @@
 //!
 //! Hills requests both endpoints when it opens a library filter panel. `OfficialRatings` is
 //! served from the certification projection that the Emby `OfficialRating` field already renders;
-//! `Tags` has no data source yet and deliberately answers an empty envelope instead of `404`.
+//! `Tags` is served from the `TAG` facet projection through `CatalogService::list_tags`, so both
+//! endpoints share the same envelope, the same `ParentId` ACL and the same page bounds. The
+//! fixture seeds one hidden library, one restricted item and two spellings of one tag, so a single
+//! server proves the projection, the de-duplication, the ACL and the pagination through HTTP.
 
 use luxd::{
     api::{AppState, app_with_state},
@@ -55,6 +58,20 @@ async fn insert_rating(
     .map(|_| ())
 }
 
+/// One `TAG` facet row, matching what the content-restriction index worker projects from the NFO
+/// `<tag>` values: the lower-cased `name_key` is the de-duplication key, `name` the display value.
+async fn insert_tag(database: &Database, item_id: &str, tag: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO media_item_facets (item_id, kind, name_key, name) VALUES (?, 'TAG', ?, ?)",
+    )
+    .bind(item_id)
+    .bind(tag.to_lowercase())
+    .bind(tag)
+    .execute(database.pool())
+    .await
+    .map(|_| ())
+}
+
 async fn emby_login(
     client: &reqwest::Client,
     base_url: &str,
@@ -90,13 +107,54 @@ fn names(body: &Value) -> Vec<&str> {
         .unwrap_or_default()
 }
 
+/// Signs in through the Lux Web API and returns the `Cookie` header value the session endpoints
+/// accept. Used only by the parity test, which compares `/Tags` with `/api/v1/tags`.
+async fn web_login(
+    client: &reqwest::Client,
+    base_url: &str,
+    username: &str,
+    password: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let response = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": username, "password": password }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let cookies = response
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>();
+    let session = cookies
+        .iter()
+        .find_map(|value| value.strip_prefix("lux_session=")?.split(';').next())
+        .ok_or("missing lux_session cookie")?;
+    let csrf = cookies
+        .iter()
+        .find_map(|value| value.strip_prefix("lux_csrf=")?.split(';').next())
+        .ok_or("missing lux_csrf cookie")?;
+    Ok(format!("lux_session={session}; lux_csrf={csrf}"))
+}
+
+fn lux_tag_names(body: &Value) -> Vec<&str> {
+    body["tags"]
+        .as_array()
+        .map(|tags| tags.iter().filter_map(|tag| tag["name"].as_str()).collect())
+        .unwrap_or_default()
+}
+
 struct Fixture {
     database: Database,
     admin_token: String,
     viewer_token: String,
+    admin_cookie: String,
+    viewer_cookie: String,
     viewer_id: String,
     movies: String,
     private: String,
+    shows: String,
     base_url: String,
     client: reqwest::Client,
     server: tokio::task::JoinHandle<Result<(), std::io::Error>>,
@@ -153,6 +211,13 @@ impl Fixture {
             .bind(viewer.id.to_string())
             .execute(database.pool())
             .await?;
+        // One tag per item plus a second spelling of the movies' `Star Wars` key: the projection
+        // must collapse the two spellings into one entry and keep the byte-order smallest name.
+        insert_tag(&database, "rating-movie-1", "Star Wars").await?;
+        insert_tag(&database, "rating-movie-2", "star wars").await?;
+        insert_tag(&database, "rating-movie-3", "Gore").await?;
+        insert_tag(&database, "rating-private-1", "Elsewhere").await?;
+        insert_tag(&database, "rating-series-1", "Space").await?;
 
         let web_auth = WebAuthService::new(database.clone())?;
         let emby_auth = EmbyAuthService::new(database.clone())?;
@@ -170,13 +235,18 @@ impl Fixture {
         let client = reqwest::Client::builder().no_proxy().build()?;
         let admin_token = emby_login(&client, &base_url, "admin", "correct password").await?;
         let viewer_token = emby_login(&client, &base_url, "viewer", "viewer password").await?;
+        let admin_cookie = web_login(&client, &base_url, "admin", "correct password").await?;
+        let viewer_cookie = web_login(&client, &base_url, "viewer", "viewer password").await?;
         Ok(Self {
             database,
             admin_token,
             viewer_token,
+            admin_cookie,
+            viewer_cookie,
             viewer_id: viewer.id.to_string(),
             movies,
             private,
+            shows,
             base_url,
             client,
             server,
@@ -201,6 +271,23 @@ impl Fixture {
         } else {
             Value::Null
         };
+        Ok((status, body))
+    }
+
+    /// `GET /api/v1/tags` with the Lux Web session, used by the parity test.
+    async fn lux_tags(
+        &self,
+        query: &str,
+        cookie: &str,
+    ) -> Result<(reqwest::StatusCode, Value), Box<dyn std::error::Error>> {
+        let response = self
+            .client
+            .get(format!("{}/api/v1/tags{query}", self.base_url))
+            .header(reqwest::header::COOKIE, cookie)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.json().await?;
         Ok((status, body))
     }
 
@@ -388,7 +475,7 @@ async fn official_ratings_apply_parent_id_item_types_and_pagination()
 }
 
 #[tokio::test]
-async fn tags_answer_an_empty_envelope_and_scope_the_parent_library()
+async fn tags_list_the_visible_tags_and_scope_the_parent_library()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = Fixture::start().await?;
 
@@ -399,6 +486,9 @@ async fn tags_answer_an_empty_envelope_and_scope_the_parent_library()
         .await?;
     assert_eq!(unauthorised.status(), reqwest::StatusCode::UNAUTHORIZED);
 
+    // Root path, `/emby` prefix, mixed case and the filter panel's empty `ParentId=`/`Limit=` all
+    // answer the same list: an administrator skips the content restrictions and opens every
+    // enabled library, and the two `star wars` spellings collapse into one `Star Wars` entry.
     for path in [
         "/Tags",
         "/emby/Tags",
@@ -407,22 +497,49 @@ async fn tags_answer_an_empty_envelope_and_scope_the_parent_library()
     ] {
         let (status, body) = fixture.get(path, &fixture.admin_token).await?;
         assert_eq!(status, reqwest::StatusCode::OK, "path {path}");
-        assert_eq!(body["Items"], json!([]), "path {path}");
-        assert_eq!(body["TotalRecordCount"], 0, "path {path}");
+        assert_eq!(
+            names(&body),
+            ["Elsewhere", "Gore", "Space", "Star Wars"],
+            "path {path}"
+        );
+        assert_eq!(body["TotalRecordCount"], 4, "path {path}");
+        assert_eq!(body["StartIndex"], 0, "path {path}");
     }
 
-    // The library scope is enforced even though the list is empty: a future tag projection must
-    // not inherit an ACL shortcut just because today's answer has no rows.
-    let (status, body) = fixture
-        .get(
-            &format!("/Tags?ParentId={}", fixture.movies),
-            &fixture.viewer_token,
-        )
-        .await?;
+    // The envelope is the `NameIdPair` shape of `/OfficialRatings`: `Id` repeats the tag name and
+    // the row carries the server id. There is no facet id, item count or `name_key`.
+    let (status, all) = fixture.get("/Tags", &fixture.admin_token).await?;
     assert_eq!(status, reqwest::StatusCode::OK);
-    assert_eq!(body["Items"], json!([]));
-    assert_eq!(body["TotalRecordCount"], 0);
+    let first = &all["Items"][0];
+    assert_eq!(first["Name"], "Elsewhere");
+    assert_eq!(first["Id"], "Elsewhere");
+    assert!(first["ServerId"].is_string());
+    let row_keys = first
+        .as_object()
+        .map(|row| row.keys().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(row_keys, Some(vec!["Id", "Name", "ServerId"]));
 
+    // The viewer only holds `Movies`, so an empty `ParentId` lists that one library instead of
+    // answering 404 or leaking the `Private` tag.
+    let (status, viewer) = fixture.get("/Tags", &fixture.viewer_token).await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(names(&viewer), ["Gore", "Star Wars"]);
+    assert_eq!(viewer["TotalRecordCount"], 2);
+
+    // Naming the one library the viewer can open, or sending the filter panel's empty
+    // `ParentId=`, returns exactly the same rows.
+    for path in [
+        format!("/Tags?ParentId={}", fixture.movies),
+        "/Tags?ParentId=".to_owned(),
+    ] {
+        let (status, body) = fixture.get(&path, &fixture.viewer_token).await?;
+        assert_eq!(status, reqwest::StatusCode::OK, "path {path}");
+        assert_eq!(names(&body), ["Gore", "Star Wars"], "path {path}");
+        assert_eq!(body["TotalRecordCount"], 2, "path {path}");
+    }
+
+    // A library the viewer cannot open, or one that does not exist, answers 404 like
+    // `/OfficialRatings`: the ACL is checked by the service, not by the empty answer.
     for path in [
         format!("/Tags?ParentId={}", fixture.private),
         "/Tags?ParentId=00000000-0000-0000-0000-000000000000".to_owned(),
@@ -431,7 +548,7 @@ async fn tags_answer_an_empty_envelope_and_scope_the_parent_library()
         assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "path {path}");
     }
 
-    // The admin can open every library, so the same scoped request still succeeds.
+    // The admin can open every library, so the same scoped request lists that library's tag.
     let (status, body) = fixture
         .get(
             &format!("/Tags?ParentId={}", fixture.private),
@@ -439,7 +556,200 @@ async fn tags_answer_an_empty_envelope_and_scope_the_parent_library()
         )
         .await?;
     assert_eq!(status, reqwest::StatusCode::OK);
-    assert_eq!(body["TotalRecordCount"], 0);
+    assert_eq!(names(&body), ["Elsewhere"]);
+    assert_eq!(body["TotalRecordCount"], 1);
+
+    // Content restrictions narrow the list the way they narrow `/Items`: the R-rated item's tag
+    // disappears for a viewer capped at PG-13.
+    fixture
+        .restrict_viewer_to_max_rating("MPA", "PG-13")
+        .await?;
+    let (status, restricted) = fixture.get("/Tags", &fixture.viewer_token).await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(names(&restricted), ["Star Wars"]);
+    assert_eq!(restricted["TotalRecordCount"], 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn tags_apply_include_item_types_and_pagination() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::start().await?;
+
+    let (status, movies) = fixture
+        .get(
+            &format!("/Tags?ParentId={}", fixture.movies),
+            &fixture.admin_token,
+        )
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(names(&movies), ["Gore", "Star Wars"]);
+    assert_eq!(movies["TotalRecordCount"], 2);
+
+    let (status, shows) = fixture
+        .get(
+            &format!("/Tags?ParentId={}", fixture.shows),
+            &fixture.admin_token,
+        )
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(names(&shows), ["Space"]);
+
+    // `IncludeItemTypes` goes through the `/OfficialRatings` parser: a recognized value narrows
+    // the tag list, an entirely unrecognized list matches nothing, and a mixed list keeps only the
+    // types it recognizes.
+    let (status, series) = fixture
+        .get("/Tags?IncludeItemTypes=Series", &fixture.admin_token)
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(names(&series), ["Space"]);
+    assert_eq!(series["TotalRecordCount"], 1);
+
+    let (status, movie_types) = fixture
+        .get("/Tags?IncludeItemTypes=Movie", &fixture.admin_token)
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(names(&movie_types), ["Elsewhere", "Gore", "Star Wars"]);
+
+    let (status, unknown_type) = fixture
+        .get("/Tags?IncludeItemTypes=Photo", &fixture.admin_token)
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert!(names(&unknown_type).is_empty());
+    assert_eq!(unknown_type["TotalRecordCount"], 0);
+
+    let (status, mixed_types) = fixture
+        .get("/Tags?IncludeItemTypes=Photo,Series", &fixture.admin_token)
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(names(&mixed_types), ["Space"]);
+
+    // `StartIndex`/`Limit` page the `name_key` order and keep the total of the whole list.
+    let (status, page) = fixture
+        .get("/Tags?StartIndex=1&Limit=2", &fixture.admin_token)
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(names(&page), ["Gore", "Space"]);
+    assert_eq!(page["TotalRecordCount"], 4);
+    assert_eq!(page["StartIndex"], 1);
+
+    let (status, past_end) = fixture
+        .get("/Tags?StartIndex=4&Limit=2", &fixture.admin_token)
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert!(names(&past_end).is_empty());
+    assert_eq!(past_end["TotalRecordCount"], 4);
+
+    // Empty `StartIndex=`/`Limit=` and `Limit=0` keep the `/OfficialRatings` defaults.
+    let (status, empty_params) = fixture
+        .get("/Tags?Limit=&StartIndex=", &fixture.admin_token)
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(names(&empty_params).len(), 4);
+
+    let (status, zero_limit) = fixture.get("/Tags?Limit=0", &fixture.admin_token).await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(names(&zero_limit).len(), 4);
+
+    // The server-side upper bound and a negative offset are rejected, not clamped.
+    for path in ["/Tags?Limit=1001", "/Tags?StartIndex=-1"] {
+        let (status, _) = fixture.get(path, &fixture.admin_token).await?;
+        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "path {path}");
+    }
+
+    Ok(())
+}
+
+/// Asserts that one Emby `/Tags` request and one `/api/v1/tags` request name the same rows in the
+/// same order and report the same total, and returns the names.
+async fn assert_tag_names_match(
+    fixture: &Fixture,
+    emby_path: &str,
+    lux_query: &str,
+    cookie: &str,
+    token: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let (status, emby) = fixture.get(emby_path, token).await?;
+    assert_eq!(status, reqwest::StatusCode::OK, "emby path {emby_path}");
+    let (status, lux) = fixture.lux_tags(lux_query, cookie).await?;
+    assert_eq!(status, reqwest::StatusCode::OK, "lux query {lux_query}");
+    let emby_names = names(&emby)
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let lux_names = lux_tag_names(&lux)
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(emby_names, lux_names, "{emby_path} vs {lux_query}");
+    assert_eq!(
+        emby["TotalRecordCount"].as_i64(),
+        lux["total"].as_i64(),
+        "{emby_path} vs {lux_query}"
+    );
+    Ok(emby_names)
+}
+
+/// `/Tags` and `/api/v1/tags` read the same `TAG` projection through `CatalogService::list_tags`,
+/// so for one library and one user they must answer the same name set; only the envelope differs.
+#[tokio::test]
+async fn tags_match_the_lux_tags_endpoint() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::start().await?;
+
+    let movies = assert_tag_names_match(
+        &fixture,
+        &format!("/Tags?ParentId={}", fixture.movies),
+        &format!("?libraryId={}", fixture.movies),
+        &fixture.admin_cookie,
+        &fixture.admin_token,
+    )
+    .await?;
+    assert_eq!(movies, ["Gore", "Star Wars"]);
+
+    // The viewer's library ACL and the content restrictions apply on both routes.
+    let viewer = assert_tag_names_match(
+        &fixture,
+        "/Tags",
+        "",
+        &fixture.viewer_cookie,
+        &fixture.viewer_token,
+    )
+    .await?;
+    assert_eq!(viewer, ["Gore", "Star Wars"]);
+
+    // `IncludeItemTypes` and `itemType` share one parser, so a type filter selects the same page.
+    let series = assert_tag_names_match(
+        &fixture,
+        "/Tags?IncludeItemTypes=Series",
+        "?itemType=SERIES",
+        &fixture.admin_cookie,
+        &fixture.admin_token,
+    )
+    .await?;
+    assert_eq!(series, ["Space"]);
+
+    // The second page keeps the same order and total on both routes (`StartIndex` is an offset,
+    // `page` is 1-based).
+    let second_page = assert_tag_names_match(
+        &fixture,
+        "/Tags?StartIndex=2&Limit=2",
+        "?page=2&pageSize=2",
+        &fixture.admin_cookie,
+        &fixture.admin_token,
+    )
+    .await?;
+    assert_eq!(second_page, ["Space", "Star Wars"]);
+
+    // The administrator can address the library the viewer cannot open.
+    let private = assert_tag_names_match(
+        &fixture,
+        &format!("/Tags?ParentId={}", fixture.private),
+        &format!("?libraryId={}", fixture.private),
+        &fixture.admin_cookie,
+        &fixture.admin_token,
+    )
+    .await?;
+    assert_eq!(private, ["Elsewhere"]);
 
     Ok(())
 }

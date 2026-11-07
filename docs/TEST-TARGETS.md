@@ -11,7 +11,7 @@
 | `--test admin` | 管理后台、日志导出、可观测性与运维事件 | 14 | 25 |
 | `--test api_web` | HTTP 契约（错误/限流/压缩/健康/远程策略）、Web 会话、Webhook | 13 | 57 |
 | `--test auth_users` | 认证、会话、登录背景、用户与用户设置、设备配对、界面偏好迁移 | 10 | 73 |
-| `--test emby` | Emby 兼容层（认证、系统信息、增量刷新、发现、多段播放、检索、下载、WebSocket） | 16 | 82 |
+| `--test emby` | Emby 兼容层（认证、系统信息、增量刷新、发现、多段播放、检索、下载、WebSocket） | 16 | 85 |
 | `--test scanner` | 媒体库扫描、增量/混合扫描、计划任务、作业事件与关停 | 7 | 152 |
 | `--test library` | 媒体库生命周期、合并/拆分、集合、目录与系列 API | 12 | 51 |
 | `--test metadata` | 元数据抓取与选择、NFO 回写、扫描后剧集元数据、人物、字幕 | 14 | 157 |
@@ -20,7 +20,7 @@
 | `--test storage` | SQLite/PostgreSQL 存储、迁移、WAL、数据库维护与启动守卫 | 9 | 117 |
 | `--test plugins` | 插件协议与运行时、弹幕、IP 属地、媒体信息插件配置 | 11 | 128 |
 | `--test strm` | STRM 目标解析/探测/播放与 ffprobe | 9 | 42 |
-| 合计（12 组） |  | 131 | 985 |
+| 合计（12 组） |  | 131 | 988 |
 
 另有 8 个 binary 因为进程级共享状态或外部服务依赖保持独立，见第 4 节：`--test background_work_budget`、`--test filmly_image_diag`、`--test image_variants_perf`、`--test performance`、`--test postgres_database`、`--test reidentify`、`--test scanned_metadata`、`--test shutdown`。合计 12 + 8 = 20 个集成测试 target。
 
@@ -91,7 +91,7 @@ cargo test --locked --test <新 target> <旧名>::
 | `search` | 3 | `cargo test --locked --test emby search::` |
 | † `emby_facets` | 1 | `cargo test --locked --test emby emby_facets::` |
 | † `emby_empty_numeric_params` | 7 | `cargo test --locked --test emby emby_empty_numeric_params::` |
-| † `emby_filter_metadata` | 3 | `cargo test --locked --test emby emby_filter_metadata::` |
+| † `emby_filter_metadata` | 5 | `cargo test --locked --test emby emby_filter_metadata::` |
 | † `emby_similar` | 6 | `cargo test --locked --test emby emby_similar::` |
 | † `emby_websocket` | 23 | `cargo test --locked --test emby emby_websocket::` |
 | `job_events_api` | 2 | `cargo test --locked --test scanner job_events_api::` |
@@ -254,7 +254,7 @@ cargo test --locked --test scanner
 | `admin` | 22 | 25 | 新增 3 例（后续任务） |
 | `api_web` | 39 | 57 | 新增 18 例（后续任务） |
 | `auth_users` | 70 | 73 | 新增 3 例（后续任务） |
-| `emby` | 38 | 82 | 新增 44 例（后续任务） |
+| `emby` | 38 | 85 | 新增 47 例（LUX-900 第五增量的 `emby_filter_metadata` 2 例、`emby_websocket` 1 例未同步，其余为先前任务） |
 | `scanner` | 137 | 152 | 新增 15 例（后续任务） |
 | `library` | 49 | 51 | 新增 2 例（后续任务） |
 | `metadata` | 143 | 157 | 新增 14 例（LUX-886 6 例、LUX-887 1 例，其余为先前任务） |
@@ -264,7 +264,7 @@ cargo test --locked --test scanner
 | `plugins` | 84 | 128 | 新增 44 例（后续任务） |
 | `strm` | 42 | 42 | 一致 |
 | 独立 binary 合计 | 112 | 117 | 新增 5 例（后续任务） |
-| **合计** | **934** | **1102** | 差异均为合并后新增用例 |
+| **合计** | **934** | **1105** | 差异均为合并后新增用例 |
 
 ### 5.2 单个用例稳定性复核
 
@@ -427,3 +427,17 @@ JSON 错误信封（不是提取器的纯文本 400），`itemType` 仍可重复
 - 第 1、2、5.1 节的历史数字保留基线/合并时的口径（第 2 节新增本模块一行）。
 - 实测：`cargo test --locked --test library -- --list` 为 **62** 例（57 例基线 + 本任务 5 例），
   `cargo test --locked --test library tags_api::` 5/5 通过。
+
+## 12. LUX-900 第五增量追加（2026-11-07）
+
+Emby `GET /Tags` 改读标签投影，测试仍在既有模块 `tests/emby/emby_filter_metadata.rs` 里，没有新增文件或
+`mod` 行。该模块由 3 例扩为 **5** 例：`tags_list_the_visible_tags_and_scope_the_parent_library`（真实标签
+与去重、根路径/`/emby`/大小写、管理员与普通用户的可见范围、内容限制、`ParentId` 的 404 与空值不限库）、
+`tags_apply_include_item_types_and_pagination`（`IncludeItemTypes` 有效/全无效/混合，`StartIndex`/`Limit`
+分页、默认 50、上限 1000、非法 400）、`tags_match_the_lux_tags_endpoint`（同一库同一用户下与
+`GET /api/v1/tags` 的名称、顺序与总数一致）。
+
+- `emby` 分组的模块列表不变（仍 16 个），只有用例数变化：`cargo test --locked --test emby -- --list` 为
+  **85** 例（LUX-899 记录 83 例 + 本增量 2 例）。第 1、2、5.1 节的 `emby` 行与合计已按本次实测同步。
+- 顺带核对出上一处未同步：`emby_websocket` 实际 24 例（第 2 节原记 23 例），因此本增量之前的真实基线是
+  83 例而不是 82 例；第 1、5.1 节按 85 例改正，第 2 节该模块行仍留待其所属任务确认新增用例的描述。

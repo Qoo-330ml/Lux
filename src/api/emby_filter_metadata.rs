@@ -8,10 +8,16 @@
 //! (normalized MPA/TVPG/BBFC codes). The index is filled from NFO metadata in the background, so a
 //! request never parses NFO JSON. These values are **not** the raw NFO certification the Emby
 //! `OfficialRating` field renders: an unrecognized rating does not appear at all, and a recognized
-//! one may be spelled differently (an NFO `Rated R` is listed as `R`). `Tags` has no stored data
-//! source yet: item tags are not parsed from NFO and there is no `TAG` facet kind, so the endpoint
-//! answers an empty envelope instead of `404` (an empty filter list rather than a failed request).
-//! It stays empty until a later task adds a tag projection.
+//! one may be spelled differently (an NFO `Rated R` is listed as `R`).
+//!
+//! `Tags` reads the `TAG` projection of `media_item_facets` through `CatalogService::list_tags`,
+//! the same service that answers the native `GET /api/v1/tags` route, so both endpoints name the
+//! same tags for one library and one user. The projection is written by the same background
+//! worker, so a request never parses NFO JSON; tags are de-duplicated on their case-insensitive
+//! name key (`Star Wars` and `star wars` are one entry) and ordered by it. The library ACL, the
+//! content restrictions and the page bounds follow `/OfficialRatings` exactly. Items projected
+//! before migration 0249 carry no tag rows until that backfill has run, so an older library keeps
+//! answering an empty list until then.
 
 use super::*;
 
@@ -138,28 +144,38 @@ pub(super) async fn emby_tags(
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    let (offset, _limit) = match emby_filter_metadata_page(&query) {
+    let (offset, limit) = match emby_filter_metadata_page(&query) {
         Ok(page) => page,
         Err(status) => return status.into_response(),
     };
-    // `Tags` has no data source yet, but a non-empty `ParentId` is still resolved exactly like
-    // `/OfficialRatings`: an unknown or inaccessible library answers 404. Filling this endpoint
-    // later must not turn the empty answer into an ACL shortcut.
+    // Same rules as `/OfficialRatings`: an entirely unrecognized type list matches nothing, and a
+    // non-empty `ParentId` naming an unknown or inaccessible library answers 404 (the service
+    // enforces the ACL, exactly like the rating list).
+    let item_types = emby_item_types_from_value(query.include_item_types.as_deref());
     let parent_id = emby_filter_metadata_parent_id(query.parent_id.as_deref());
-    match state
+    let result = state
         .catalog()
-        .library_scope_for_principal(principal, parent_id.as_deref())
-        .await
-    {
-        Ok(_) => {}
+        .list_tags(principal, parent_id.as_deref(), &item_types, offset, limit)
+        .await;
+    let (tags, total) = match result {
+        Ok(result) => result,
         Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
             return StatusCode::NOT_FOUND.into_response();
         }
         Err(CatalogError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
+    };
     Json(json!({
-        "Items": Vec::<Value>::new(),
-        "TotalRecordCount": 0,
+        "Items": tags
+            .into_iter()
+            .map(|tag| {
+                json!({
+                    "Name": tag.name,
+                    "Id": tag.name,
+                    "ServerId": state.server_id,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "TotalRecordCount": total,
         "StartIndex": offset,
     }))
     .into_response()
