@@ -1533,16 +1533,18 @@ impl CatalogService {
     /// first and then by title.
     ///
     /// Returns `None` when the item does not exist or the principal cannot see it, matching the
-    /// item detail endpoint's 404. The caller must already have validated `limit`; the storage
-    /// query caps the candidate pool before ranking (ten source genres, at most 200 visible
-    /// candidates each) and applies `limit` to the ranked result. `page.total` is therefore the
-    /// number of distinct items in that bounded pool, not the catalog-wide number of similar
-    /// items. Only the `media_item_facets` projection is read, so a request never parses NFO JSON
-    /// or scans the catalog.
+    /// item detail endpoint's 404. The caller must already have validated `offset` and `limit`.
+    /// The storage query caps the candidate pool before ranking (ten source genres, at most 200
+    /// visible candidates each), ranks that bounded union and only then applies `LIMIT`/`OFFSET`,
+    /// so paging never re-sorts or scans the catalog. `page.total` is therefore the number of
+    /// distinct items in that bounded pool, not the catalog-wide number of similar items. Only the
+    /// `media_item_facets` projection is read, so a request never parses NFO JSON or scans the
+    /// catalog.
     pub(crate) async fn list_similar_items(
         &self,
         principal: AccessPrincipal,
         item_id: &str,
+        offset: i64,
         limit: i64,
     ) -> Result<Option<CatalogPage>, CatalogError> {
         let Some(source_item) = self.find_item(principal, item_id).await? else {
@@ -1551,7 +1553,7 @@ impl CatalogService {
         // Emby's Similar endpoint is a movie/series recommendation surface. Any other type has no
         // meaningful same-type genre neighbourhood, so it answers with an empty page.
         if !matches!(source_item.item_type.as_str(), "MOVIE" | "SERIES") {
-            return Ok(Some(CatalogPage::new(Vec::new(), 0, 0, limit)));
+            return Ok(Some(CatalogPage::new(Vec::new(), 0, offset, limit)));
         }
         let library_ids = self.access.accessible_library_ids(principal).await?;
         let user_id = principal.user_id_string();
@@ -1579,7 +1581,7 @@ impl CatalogService {
             content_restrictions: content_restrictions.as_ref(),
             sort_by: StorageCatalogSort::Name,
             descending: false,
-            offset: 0,
+            offset,
             limit,
             include_total: true,
         };
@@ -1590,7 +1592,7 @@ impl CatalogService {
         let mut items = assemble_items(rows);
         self.populate_item_details_and_episode_counts(&mut items, content_restrictions.as_ref())
             .await?;
-        Ok(Some(CatalogPage::new(items, total, 0, limit)))
+        Ok(Some(CatalogPage::new(items, total, offset, limit)))
     }
 
     pub async fn list_all_items_filtered(

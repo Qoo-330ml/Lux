@@ -1124,12 +1124,11 @@ pub(super) async fn lux_get_item(
     }
 }
 
-/// Page bounds of the native Lux similar-items route. The query's bounded candidate pool is
-/// 10 source genres x 200 candidates, so allowing `limit` up to the pool size makes
-/// `hasNext: true` actionable: raising `limit` to at most `total` always returns every candidate.
-/// The Emby compatibility adapter keeps its own default and its `EMBY_MAX_PAGE_LIMIT` cap.
+/// Page bounds of the native Lux similar-items route: 50 items by default, at most 1000 per
+/// page, with a separate 1-based `page` parameter. The candidate pool itself stays bounded at
+/// 10 source genres x 200 candidates; paging reaches the rest of it instead of raising `limit`.
 const LUX_SIMILAR_DEFAULT_LIMIT: i64 = 50;
-const LUX_SIMILAR_MAX_LIMIT: i64 = 2_000;
+const LUX_SIMILAR_MAX_LIMIT: i64 = 1_000;
 
 #[derive(Deserialize, Default)]
 pub(super) struct LuxSimilarQuery {
@@ -1139,6 +1138,10 @@ pub(super) struct LuxSimilarQuery {
     /// the cap.
     #[serde(default)]
     limit: Option<String>,
+    /// 1-based page; an empty value is treated as absent (page 1). The offset is `(page - 1) *
+    /// limit`, computed with `checked_mul` so an absurd page answers 400 instead of overflowing.
+    #[serde(default)]
+    page: Option<String>,
 }
 
 fn lux_similar_limit(raw: Option<&str>) -> Result<i64, &'static str> {
@@ -1156,6 +1159,21 @@ fn lux_similar_limit(raw: Option<&str>) -> Result<i64, &'static str> {
     Ok(limit)
 }
 
+fn lux_similar_page(raw: Option<&str>) -> Result<i64, &'static str> {
+    let Some(raw) = raw else {
+        return Ok(1);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(1);
+    }
+    let page = raw.parse::<i64>().map_err(|_| "相似条目分页参数无效")?;
+    if page < 1 {
+        return Err("相似条目分页参数无效");
+    }
+    Ok(page)
+}
+
 /// Authoritative similar-items lookup shared by the native Lux route and the Emby compatibility
 /// adapter. `CatalogService::list_similar_items` owns the ranking, the ACL and content-restriction
 /// filtering, the bounded candidate pool and `total`; neither protocol re-implements that query.
@@ -1166,24 +1184,24 @@ pub(super) async fn similar_items_page(
     state: &ReadyAppState,
     principal: AccessPrincipal,
     item_id: &str,
+    offset: i64,
     limit: i64,
 ) -> Result<Option<CatalogPage>, CatalogError> {
     state
         .catalog()
-        .list_similar_items(principal, item_id, limit)
+        .list_similar_items(principal, item_id, offset, limit)
         .await
 }
 
-/// `GET /api/v1/items/{item_id}/similar?limit=50`.
+/// `GET /api/v1/items/{item_id}/similar?limit=50&page=1`.
 ///
 /// The response uses the regular Lux list envelope `{items,page,pageSize,hasNext,total}` and the
-/// Lux item DTO, never the Emby one. `total` is the bounded candidate-pool count returned by the
-/// shared service (at most 10 source genres x 200 candidates, i.e. 2000), `page` is 1, `pageSize`
-/// is the effective `limit`, and `hasNext` is true exactly when `total > items.len()`. The
-/// endpoint accepts only `limit`; `page` and `pageSize` are ignored. When `hasNext` is true the
-/// caller can raise `limit` (up to 2000) to at most `total` and receive every candidate, because
-/// the limit cap equals the candidate-pool cap. `limit` itself only trims the page and never
-/// changes `total`.
+/// Lux item DTO, never the Emby one. `page` is the requested 1-based page and `pageSize` is the
+/// effective `limit`; `total` is the bounded candidate-pool count returned by the shared service
+/// (at most 10 source genres x 200 candidates, i.e. 2000). `offset = (page - 1) * limit` is
+/// applied after the bounded union has been ranked, and `hasNext` uses the standard
+/// `offset + items.len() < total` rule. An offset past the pool answers 200 with an empty page.
+/// The endpoint accepts `limit` and `page` only; `pageSize` is not a request parameter.
 pub(super) async fn lux_get_similar(
     headers: HeaderMap,
     Path(item_id): Path<String>,
@@ -1206,15 +1224,34 @@ pub(super) async fn lux_get_similar(
             .into_response();
         }
     };
+    let page_number = match lux_similar_page(query.page.as_deref()) {
+        Ok(page) => page,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(offset) = page_number
+        .checked_sub(1)
+        .and_then(|pages| pages.checked_mul(limit))
+    else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "相似条目分页参数无效",
+        )
+        .into_response();
+    };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let database = state.database();
-    match similar_items_page(&state, principal, &item_id, limit).await {
-        Ok(Some(mut page)) => {
-            // The endpoint has no page/cursor parameter, so it serves the first page of the
-            // bounded candidate pool. Keep the service's pool total and advertise truncation:
-            // `hasNext` is true exactly when the pool has items this page did not return, so the
-            // caller can raise `limit` (up to 2000) instead of guessing from `total`.
-            page.has_next = page.total > page.items.len() as i64;
+    match similar_items_page(&state, principal, &item_id, offset, limit).await {
+        Ok(Some(page)) => {
             match lux_catalog_page_json_for_user(database, &user.id.to_string(), &page).await {
                 Ok(body) => Json(body).into_response(),
                 Err(_) => api_error(
@@ -5084,9 +5121,12 @@ mod similar_limit_tests {
     use super::*;
 
     #[test]
-    fn lux_similar_limit_accepts_the_candidate_pool_cap() {
+    fn lux_similar_limit_and_page_validation() {
         assert_eq!(lux_similar_limit(None), Ok(LUX_SIMILAR_DEFAULT_LIMIT));
-        assert_eq!(lux_similar_limit(Some("2000")), Ok(LUX_SIMILAR_MAX_LIMIT));
-        assert_eq!(lux_similar_limit(Some("2001")), Err("相似条目分页参数无效"));
+        assert_eq!(lux_similar_limit(Some("1000")), Ok(LUX_SIMILAR_MAX_LIMIT));
+        assert_eq!(lux_similar_limit(Some("1001")), Err("相似条目分页参数无效"));
+        assert_eq!(lux_similar_page(None), Ok(1));
+        assert_eq!(lux_similar_page(Some("2")), Ok(2));
+        assert_eq!(lux_similar_page(Some("0")), Err("相似条目分页参数无效"));
     }
 }

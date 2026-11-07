@@ -404,19 +404,20 @@ fn emby_ids(body: &Value) -> Vec<&str> {
         .unwrap_or_default()
 }
 
-/// Asserts the Lux list envelope: `total` is the bounded candidate-pool count, `hasNext` reports
-/// whether the pool has items beyond this page, `page` is 1 and `pageSize` is the effective limit.
-fn assert_lux_page(body: &Value, ids: &[&str], limit: i64, expected_total: i64) {
+/// Asserts one Lux list page: `total` is the bounded candidate-pool count and `hasNext` uses the
+/// standard `offset + items.len() < total` rule.
+fn assert_lux_page(body: &Value, ids: &[&str], page: i64, limit: i64, expected_total: i64) {
     assert_eq!(lux_ids(body).as_slice(), ids);
     assert_eq!(body["total"], expected_total);
-    assert_eq!(body["page"], 1);
+    assert_eq!(body["page"], page);
     assert_eq!(body["pageSize"], limit);
     let item_count = body["items"].as_array().map_or(0, Vec::len) as i64;
     assert!(item_count <= limit, "items must not exceed the limit");
+    let offset = (page - 1) * limit;
     assert_eq!(
         body["hasNext"],
-        expected_total > item_count,
-        "hasNext must report whether the candidate pool has items beyond this page"
+        offset + item_count < expected_total,
+        "hasNext must use the standard offset + items.len() < total rule"
     );
 }
 
@@ -432,6 +433,7 @@ async fn lux_similar_items_match_the_emby_ranking_and_respect_library_acl()
     assert_lux_page(
         &body,
         &["sim-movie-alpha", "sim-movie-charlie", "sim-movie-bravo"],
+        1,
         20,
         3,
     );
@@ -468,6 +470,7 @@ async fn lux_similar_items_match_the_emby_ranking_and_respect_library_acl()
             "sim-movie-charlie",
             "sim-movie-bravo",
         ],
+        1,
         20,
         4,
     );
@@ -489,10 +492,11 @@ async fn lux_similar_items_match_the_emby_ranking_and_respect_library_acl()
 }
 
 #[tokio::test]
-async fn lux_similar_limit_defaults_caps_and_rejects_invalid_values()
--> Result<(), Box<dyn std::error::Error>> {
+async fn lux_similar_limit_and_page_validate_and_default() -> Result<(), Box<dyn std::error::Error>>
+{
     let harness = start_server().await?;
-    for query in ["?limit=", ""] {
+    // `limit` and `page` default to 50 and 1; explicit blanks are treated as absent.
+    for query in ["", "?limit=", "?page=", "?limit=&page="] {
         let (status, body) = harness
             .lux_similar("sim-movie-source", query, &harness.viewer_cookie)
             .await?;
@@ -500,6 +504,7 @@ async fn lux_similar_limit_defaults_caps_and_rejects_invalid_values()
         assert_lux_page(
             &body,
             &["sim-movie-alpha", "sim-movie-charlie", "sim-movie-bravo"],
+            1,
             50,
             3,
         );
@@ -509,63 +514,51 @@ async fn lux_similar_limit_defaults_caps_and_rejects_invalid_values()
         .lux_similar("sim-movie-source", "?limit=1", &harness.viewer_cookie)
         .await?;
     assert_eq!(status, reqwest::StatusCode::OK);
-    assert_lux_page(&limited, &["sim-movie-alpha"], 1, 3);
+    assert_lux_page(&limited, &["sim-movie-alpha"], 1, 1, 3);
 
-    // The pool has three items, so a two-item page is truncated and advertises `hasNext`.
     let (status, partial) = harness
         .lux_similar("sim-movie-source", "?limit=2", &harness.viewer_cookie)
         .await?;
     assert_eq!(status, reqwest::StatusCode::OK);
-    assert_lux_page(&partial, &["sim-movie-alpha", "sim-movie-charlie"], 2, 3);
+    assert_lux_page(&partial, &["sim-movie-alpha", "sim-movie-charlie"], 1, 2, 3);
 
-    // A limit larger than the pool returns everything and clears `hasNext`.
-    let (status, complete) = harness
-        .lux_similar("sim-movie-source", "?limit=5", &harness.viewer_cookie)
+    // The second page of the three-item pool has one item and no next page.
+    let (status, second) = harness
+        .lux_similar(
+            "sim-movie-source",
+            "?limit=2&page=2",
+            &harness.viewer_cookie,
+        )
         .await?;
     assert_eq!(status, reqwest::StatusCode::OK);
-    assert_lux_page(
-        &complete,
-        &["sim-movie-alpha", "sim-movie-charlie", "sim-movie-bravo"],
-        5,
-        3,
-    );
+    assert_lux_page(&second, &["sim-movie-bravo"], 2, 2, 3);
 
-    // The candidate pool is 10 x 200 = 2000, so the whole pool fits in one page at the cap.
+    // limit=1000 is the cap; the page is accepted.
     let (status, capped) = harness
-        .lux_similar("sim-movie-source", "?limit=2000", &harness.viewer_cookie)
+        .lux_similar("sim-movie-source", "?limit=1000", &harness.viewer_cookie)
         .await?;
     assert_eq!(status, reqwest::StatusCode::OK);
     assert_lux_page(
         &capped,
         &["sim-movie-alpha", "sim-movie-charlie", "sim-movie-bravo"],
-        2000,
+        1,
+        1000,
         3,
     );
 
-    // 1001 exceeds the Emby adapter's page cap but is inside the Lux candidate-pool cap.
-    let (status, above_emby_cap) = harness
-        .lux_similar("sim-movie-source", "?limit=1001", &harness.viewer_cookie)
-        .await?;
-    assert_eq!(status, reqwest::StatusCode::OK);
-    assert_lux_page(
-        &above_emby_cap,
-        &["sim-movie-alpha", "sim-movie-charlie", "sim-movie-bravo"],
-        1001,
-        3,
-    );
-
-    // `page`/`pageSize` are not part of this endpoint's contract and are ignored.
-    let (status, ignored_paging) = harness
+    // `pageSize` is not part of the contract; only `page` + `limit` are honoured.
+    let (status, ignored_page_size) = harness
         .lux_similar(
             "sim-movie-source",
-            "?limit=2&page=5&pageSize=1",
+            "?limit=2&page=1&pageSize=1",
             &harness.viewer_cookie,
         )
         .await?;
     assert_eq!(status, reqwest::StatusCode::OK);
     assert_lux_page(
-        &ignored_paging,
+        &ignored_page_size,
         &["sim-movie-alpha", "sim-movie-charlie"],
+        1,
         2,
         3,
     );
@@ -573,9 +566,13 @@ async fn lux_similar_limit_defaults_caps_and_rejects_invalid_values()
     for query in [
         "?limit=0",
         "?limit=-1",
-        "?limit=2001",
+        "?limit=1001",
         "?limit=abc",
         "?limit=1.5",
+        "?page=0",
+        "?page=-1",
+        "?page=abc",
+        "?page=1.5",
     ] {
         let (status, _) = harness
             .lux_similar("sim-movie-source", query, &harness.viewer_cookie)
@@ -586,6 +583,102 @@ async fn lux_similar_limit_defaults_caps_and_rejects_invalid_values()
             "query {query} must be rejected"
         );
     }
+
+    harness.server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn lux_similar_paginates_without_gaps_or_duplicates() -> Result<(), Box<dyn std::error::Error>>
+{
+    let harness = start_server().await?;
+    let movies: String = sqlx::query_scalar("SELECT id FROM libraries WHERE name = 'Movies'")
+        .fetch_one(harness.database.pool())
+        .await?;
+    for (id, title, genre) in [
+        ("sim-movie-delta", "Delta Similar", "Drama"),
+        ("sim-movie-echo", "Echo Similar", "Sci-Fi"),
+    ] {
+        insert_item(&harness.database, id, &movies, "MOVIE", title).await?;
+        insert_genres(&harness.database, id, &[genre]).await?;
+    }
+
+    let (status, first) = harness
+        .lux_similar(
+            "sim-movie-source",
+            "?limit=2&page=1",
+            &harness.viewer_cookie,
+        )
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_lux_page(&first, &["sim-movie-alpha", "sim-movie-charlie"], 1, 2, 5);
+
+    let (status, second) = harness
+        .lux_similar(
+            "sim-movie-source",
+            "?limit=2&page=2",
+            &harness.viewer_cookie,
+        )
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_lux_page(&second, &["sim-movie-bravo", "sim-movie-delta"], 2, 2, 5);
+
+    let (status, third) = harness
+        .lux_similar(
+            "sim-movie-source",
+            "?limit=2&page=3",
+            &harness.viewer_cookie,
+        )
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_lux_page(&third, &["sim-movie-echo"], 3, 2, 5);
+
+    let (status, all) = harness
+        .lux_similar(
+            "sim-movie-source",
+            "?limit=5&page=1",
+            &harness.viewer_cookie,
+        )
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_lux_page(
+        &all,
+        &[
+            "sim-movie-alpha",
+            "sim-movie-charlie",
+            "sim-movie-bravo",
+            "sim-movie-delta",
+            "sim-movie-echo",
+        ],
+        1,
+        5,
+        5,
+    );
+
+    let assembled = [&first, &second, &third]
+        .into_iter()
+        .flat_map(|page| lux_ids(page))
+        .collect::<Vec<_>>();
+    assert_eq!(assembled, lux_ids(&all));
+    assert_eq!(
+        assembled
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        assembled.len(),
+        "pagination must not repeat an item"
+    );
+
+    // A page past the pool is a 200 with an empty page and no next page.
+    let (status, beyond) = harness
+        .lux_similar(
+            "sim-movie-source",
+            "?limit=2&page=4",
+            &harness.viewer_cookie,
+        )
+        .await?;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_lux_page(&beyond, &[], 4, 2, 5);
 
     harness.server.abort();
     Ok(())
@@ -618,7 +711,7 @@ async fn lux_similar_excludes_items_blocked_by_content_restrictions()
         .lux_similar("sim-movie-source", "?limit=20", &harness.viewer_cookie)
         .await?;
     assert_eq!(status, reqwest::StatusCode::OK);
-    assert_lux_page(&body, &["sim-movie-alpha", "sim-movie-bravo"], 20, 2);
+    assert_lux_page(&body, &["sim-movie-alpha", "sim-movie-bravo"], 1, 20, 2);
     assert!(!lux_ids(&body).contains(&"sim-movie-charlie"));
 
     // The Emby adapter shares the same restriction predicate and also drops Charlie from its
@@ -674,7 +767,7 @@ async fn lux_similar_only_returns_the_same_type_and_handles_an_empty_result()
         .lux_similar("sim-series-source", "?limit=20", &harness.viewer_cookie)
         .await?;
     assert_eq!(status, reqwest::StatusCode::OK);
-    assert_lux_page(&body, &["sim-series-alpha"], 20, 1);
+    assert_lux_page(&body, &["sim-series-alpha"], 1, 20, 1);
     assert!(!lux_ids(&body).contains(&"sim-series-drama"));
     assert!(!lux_ids(&body).contains(&"sim-movie-alpha"));
 
@@ -682,7 +775,7 @@ async fn lux_similar_only_returns_the_same_type_and_handles_an_empty_result()
         .lux_similar("sim-movie-no-genre", "?limit=20", &harness.viewer_cookie)
         .await?;
     assert_eq!(status, reqwest::StatusCode::OK);
-    assert_lux_page(&empty, &[], 20, 0);
+    assert_lux_page(&empty, &[], 1, 20, 0);
 
     harness.server.abort();
     Ok(())

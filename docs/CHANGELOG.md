@@ -13,11 +13,11 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 - **相似推荐有了 Lux 原生接口**：新增 `GET /api/v1/items/{item_id}/similar?limit=50`，返回与条目同类型
   （电影/剧集）且至少共享一个 Genre 的条目，排序与 Emby 的相似推荐完全一致（共享数量降序，再按标题、
   id），并排除自身、用户无权访问的媒体库以及被内容限制屏蔽的条目。响应沿用 `/api/v1` 列表的分页形状
-  `{items,page,pageSize,hasNext,total}` 与 Lux 媒体条目 DTO；`total` 是有界候选池内的去重数量（与 Emby
-  `TotalRecordCount` 同义），`limit` 只裁剪当前页；`hasNext` 为 `total > items.len()`，为 true 时提示
-  候选池还有未返回条目，请把 `limit` 调大到 `total` 以内取回（上限 2000 与候选池上限一致）。本端点只
-  支持 `limit`，`page`/`pageSize` 被忽略。`limit` 默认 50、允许 1-2000，空值按未提供，`0`/负数/非整数或
-  超过 2000 返回 400；条目不存在或不可见返回 404，未鉴权 401。该接口现在是相似条目的权威实现，Emby
+  `{items,page,pageSize,hasNext,total}` 与 Lux 媒体条目 DTO；`total` 是有界候选池内的去重总数（与 Emby
+  `TotalRecordCount` 同义），`page` 从 1 起、默认 1，`pageSize` 为生效的 `limit`，`hasNext =
+  offset + items.len() < total`（`offset = (page - 1) * limit`）。`limit` 默认 50、允许 1-1000；`page`
+  为 0、负数或非整数，以及 `limit` 为 0、负数、非整数或超过 1000 都返回 400；空值按未提供；页超出候选池
+  返回 200 空列表。条目不存在或不可见返回 404，未鉴权 401。该接口现在是相似条目的权威实现，Emby
   `GET /Items/{id}/Similar` 改为调用同一个服务，只保留协议适配，对外行为不变；不新增迁移，也不改
   Web 页面。
 

@@ -95,7 +95,8 @@ pub(super) async fn emby_item_similar(
     };
     // The native Lux route is the authoritative implementation of this query; this handler only
     // adapts the result to the Emby `Items`/`TotalRecordCount` DTO and its query parameters.
-    let page = match similar_items_page(&state, principal, &emby_internal_id(&item_id), limit).await
+    let page = match similar_items_page(&state, principal, &emby_internal_id(&item_id), 0, limit)
+        .await
     {
         Ok(Some(page)) => page,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
