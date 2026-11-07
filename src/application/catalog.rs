@@ -1544,15 +1544,18 @@ impl CatalogService {
             .await?)
     }
 
-    /// Distinct tags visible to `principal`, optionally narrowed to one library, ordered by their
-    /// case-insensitive `name_key`.
+    /// Distinct tags visible to `principal`, optionally narrowed to one library and to item
+    /// types, ordered by their case-insensitive `name_key`.
     ///
-    /// The list is de-duplicated on `name_key`, so `Star Wars` and `star wars` are one entry, and
-    /// the spelling of the first projected facet row is the displayed one. Visibility follows
-    /// [`Self::list_official_ratings`]: an unknown or inaccessible `library_id` is answered as not
-    /// found, an admin skips the content restrictions, and every other principal only sees the
-    /// tags of the items the restriction policy leaves visible. Served from the
-    /// `media_item_facets` projection, so a request never parses NFO JSON or loads a catalog page.
+    /// The list is de-duplicated on `name_key`, so `Star Wars` and `star wars` are one entry. A
+    /// name key can be projected with more than one spelling, so the display name is the
+    /// byte-order smallest one (`COLLATE BINARY` on SQLite, `COLLATE "C"` on PostgreSQL): the same
+    /// rule on both backends, independent of insertion order, so re-projecting an item never
+    /// renames a tag. Visibility follows [`Self::list_official_ratings`]: an unknown or
+    /// inaccessible `library_id` is answered as not found, an admin skips the content
+    /// restrictions, and every other principal only sees the tags of the items the restriction
+    /// policy leaves visible. Served from the `media_item_facets` projection, so a request never
+    /// parses NFO JSON or loads a catalog page.
     ///
     /// `limit` is clamped to [`TAGS_MAX_PAGE_LIMIT`]; the routes validate their own bounds first.
     #[cfg_attr(not(test), allow(dead_code))] // LUX-900's `/api/v1/tags` route is the next increment.
@@ -1560,6 +1563,7 @@ impl CatalogService {
         &self,
         principal: AccessPrincipal,
         library_id: Option<&str>,
+        item_types: &[String],
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<StoredMediaFacet>, i64), CatalogError> {
@@ -1578,7 +1582,7 @@ impl CatalogService {
         let query = CatalogFilterQuery {
             library_ids: &library_ids,
             user_id: &user_id,
-            item_types: &no_values,
+            item_types,
             excluded_item_types: &no_values,
             item_ids: None,
             person_id: None,
@@ -7165,14 +7169,35 @@ mod tests {
         tag: &str,
         certification_code: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        insert_tag_item_of_type(
+            database,
+            item_id,
+            library_id,
+            "MOVIE",
+            tag,
+            certification_code,
+        )
+        .await
+    }
+
+    /// The same projection for an explicit `item_type`, so type filters can be exercised.
+    async fn insert_tag_item_of_type(
+        database: &Database,
+        item_id: &str,
+        library_id: &str,
+        item_type: &str,
+        tag: &str,
+        certification_code: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         sqlx::query(
             "INSERT INTO media_items
              (id, library_id, item_type, title, sort_title, identification_status,
               has_available_source)
-             VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+             VALUES (?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', 1)",
         )
         .bind(item_id)
         .bind(library_id)
+        .bind(item_type)
         .bind(item_id)
         .bind(item_id.to_lowercase())
         .execute(database.pool())
@@ -7239,7 +7264,7 @@ mod tests {
             )
             .await?;
 
-        let (unscoped, unscoped_total) = catalog.list_tags(principal, None, 0, 10).await?;
+        let (unscoped, unscoped_total) = catalog.list_tags(principal, None, &[], 0, 10).await?;
         assert_eq!(
             tag_names(&unscoped),
             ["Space"],
@@ -7248,7 +7273,7 @@ mod tests {
         assert_eq!(unscoped_total, 1);
 
         let (scoped, scoped_total) = catalog
-            .list_tags(principal, Some(&visible_library_id), 0, 10)
+            .list_tags(principal, Some(&visible_library_id), &[], 0, 10)
             .await?;
         assert_eq!(tag_names(&scoped), ["Space"]);
         assert_eq!(scoped_total, 1);
@@ -7256,7 +7281,7 @@ mod tests {
         assert!(
             matches!(
                 catalog
-                    .list_tags(principal, Some(&hidden_library_id), 0, 10)
+                    .list_tags(principal, Some(&hidden_library_id), &[], 0, 10)
                     .await,
                 Err(super::CatalogError::LibraryNotFound)
             ),
@@ -7264,7 +7289,7 @@ mod tests {
         );
         assert!(matches!(
             catalog
-                .list_tags(principal, Some("missing-library"), 0, 10)
+                .list_tags(principal, Some("missing-library"), &[], 0, 10)
                 .await,
             Err(super::CatalogError::LibraryNotFound)
         ));
@@ -7275,7 +7300,8 @@ mod tests {
                 .ok_or("the test principal has a user id")?,
             true,
         );
-        let (admin_tags, admin_total) = catalog.list_tags(admin_principal, None, 0, 10).await?;
+        let (admin_tags, admin_total) =
+            catalog.list_tags(admin_principal, None, &[], 0, 10).await?;
         assert_eq!(
             tag_names(&admin_tags),
             ["Elsewhere", "Gore", "Space"],
@@ -7301,23 +7327,71 @@ mod tests {
         )
         .await?;
 
-        let (first_page, total) = catalog.list_tags(principal, None, 0, 2).await?;
+        let (first_page, total) = catalog.list_tags(principal, None, &[], 0, 2).await?;
         assert_eq!(
             total, 3,
             "the total describes the whole tag list, not the page"
         );
         assert_eq!(tag_names(&first_page), ["Alpha", "Bravo"]);
-        let (second_page, second_total) = catalog.list_tags(principal, None, 2, 2).await?;
+        let (second_page, second_total) = catalog.list_tags(principal, None, &[], 2, 2).await?;
         assert_eq!(second_total, 3);
         assert_eq!(tag_names(&second_page), ["Charlie"]);
 
         // An oversized limit is clamped by the service (see `clamped_tags_page_limit`): the
         // request still answers, bounded to `TAGS_MAX_PAGE_LIMIT`.
         let (clamped, clamped_total) = catalog
-            .list_tags(principal, None, 0, super::TAGS_MAX_PAGE_LIMIT * 4)
+            .list_tags(principal, None, &[], 0, super::TAGS_MAX_PAGE_LIMIT * 4)
             .await?;
         assert_eq!(clamped_total, 3);
         assert_eq!(clamped.len(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_tags_filters_by_item_type() -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database, catalog, principal, visible_library_id, _hidden) =
+            tag_test_setup().await?;
+        insert_tag_item_of_type(
+            &database,
+            "tag-movie",
+            &visible_library_id,
+            "MOVIE",
+            "Movie Only",
+            "PG",
+        )
+        .await?;
+        insert_tag_item_of_type(
+            &database,
+            "tag-series",
+            &visible_library_id,
+            "SERIES",
+            "Series Only",
+            "PG",
+        )
+        .await?;
+
+        let all = vec!["MOVIE".to_owned(), "SERIES".to_owned()];
+        let (tags, total) = catalog.list_tags(principal, None, &all, 0, 10).await?;
+        assert_eq!(tag_names(&tags), ["Movie Only", "Series Only"]);
+        assert_eq!(total, 2);
+
+        let only_movies = vec!["MOVIE".to_owned()];
+        let (tags, total) = catalog
+            .list_tags(principal, None, &only_movies, 0, 10)
+            .await?;
+        assert_eq!(
+            tag_names(&tags),
+            ["Movie Only"],
+            "`IncludeItemTypes` narrows the tag list through the shared item-type predicate"
+        );
+        assert_eq!(total, 1);
+
+        let only_series = vec!["SERIES".to_owned()];
+        let (tags, total) = catalog
+            .list_tags(principal, None, &only_series, 0, 10)
+            .await?;
+        assert_eq!(tag_names(&tags), ["Series Only"]);
+        assert_eq!(total, 1);
         Ok(())
     }
 }

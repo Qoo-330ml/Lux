@@ -22,8 +22,8 @@
     },
     {
       "path": "src/storage/catalog.rs",
-      "count": 11,
-      "note": "catalog SQL with backend-specific JSON/tsvector handling"
+      "count": 12,
+      "note": "catalog SQL with backend-specific JSON/tsvector handling, plus the tag list's explicit byte-order collation (BINARY vs \"C\") for the shared query shape"
     },
     {
       "path": "src/storage/database_cleanup.rs",
@@ -141,6 +141,6 @@
       "note": "user SQL with backend-specific upsert forms"
     }
   ],
-  "total": 266,
+  "total": 267,
   "rule": "New code must not add DatabaseBackend:: branches. Growing an existing file requires editing this manifest in the same commit, which documents the reason in review."
 }

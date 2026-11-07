@@ -3799,18 +3799,19 @@ impl Database {
     }
 
     /// Distinct tag values (`media_item_facets` kind `TAG`) of the items the filter can see: one
-    /// row per case-insensitive name (`name_key`), with the spelling of that name's first
-    /// projected row, how many visible items carry it, ordered by `name_key`.
+    /// row per case-insensitive name (`name_key`), with that name's display spelling, how many
+    /// visible items carry it, ordered by `name_key`.
     ///
     /// The rows come from the `media_item_facets` projection alone; `media_items` and `libraries`
     /// are joined for the shared visibility predicate (library scope, removal, content
     /// restrictions), exactly like [`Self::list_catalog_facets`], so no request parses NFO JSON or
     /// loads a catalog page. `limit` is clamped by the caller.
     ///
-    /// SQLite answers a bare column from the row that produced the query's single `min()`
-    /// aggregate, which is how the first spelling survives the group. PostgreSQL keeps no
-    /// insertion order, so it answers the smallest spelling instead; the result shape is
-    /// identical on both backends.
+    /// A name key can be projected with more than one spelling (`Sci-Fi` and `sci-fi`), so the
+    /// display name is the byte-order smallest spelling of the group: `MIN(name COLLATE BINARY)`
+    /// on SQLite and `MIN(name COLLATE "C")` on PostgreSQL. The rule is the same on both backends
+    /// and does not depend on insertion order, so a re-projected item or a backend migration never
+    /// renames a tag. The page order uses the same explicit collation so it is byte order too.
     #[cfg_attr(not(test), allow(dead_code))] // LUX-900's `/api/v1/tags` route is the next increment.
     pub(crate) async fn list_catalog_tags(
         &self,
@@ -3830,29 +3831,21 @@ impl Database {
              {where_clause}",
             MediaFacetKind::Tag.as_str()
         );
-        let list_query = if self.backend == DatabaseBackend::Postgres {
-            format!(
-                "SELECT facet.name_key AS name_key, MIN(facet.name) AS name, COUNT(*) AS item_count
-                 {from}
-                 GROUP BY facet.name_key
-                 ORDER BY facet.name_key
-                 LIMIT ? OFFSET ?"
-            )
+        // Both backends run the same query text; only the explicit byte-order collation differs.
+        let collation = if self.backend == DatabaseBackend::Postgres {
+            "\"C\""
         } else {
-            // `first_seen` is not returned: it only selects the row the bare `facet.name` reads
-            // its value from, so the first spelling of a name key wins over the alphabetical one.
-            format!(
-                "SELECT name_key, name, item_count
-                 FROM (
-                     SELECT facet.name_key AS name_key, facet.name AS name, COUNT(*) AS item_count,
-                            MIN(facet.rowid) AS first_seen
-                     {from}
-                     GROUP BY facet.name_key
-                 )
-                 ORDER BY name_key
-                 LIMIT ? OFFSET ?"
-            )
+            "BINARY"
         };
+        let list_query = format!(
+            "SELECT facet.name_key AS name_key,
+                    MIN(facet.name COLLATE {collation}) AS name,
+                    COUNT(*) AS item_count
+             {from}
+             GROUP BY facet.name_key
+             ORDER BY facet.name_key COLLATE {collation}
+             LIMIT ? OFFSET ?"
+        );
         let mut list = self.query_as::<(String, String, i64)>(sqlx::AssertSqlSafe(list_query));
         for bind in &filter_binds {
             list = match bind {
@@ -14223,30 +14216,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tag_facet_list_keeps_the_first_projected_spelling_of_a_shared_name_key()
+    async fn tag_facet_list_keeps_the_byte_order_smallest_spelling_of_a_shared_name_key()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_temp_dir, database) = crate::storage::test_database().await?;
         database
             .query("INSERT INTO libraries (id, name, kind) VALUES ('tag-lib', 'Tags', 'MOVIE')")
             .execute(database.pool())
             .await?;
-        // The lowercase spelling is projected first, the title-case one later; the earlier row is
-        // also the alphabetically *later* name, so `MIN(name)` would answer "Sci-Fi" here.
+        // Two spellings per case-insensitive name, projected in opposite orders. The display name
+        // is the byte-order smallest spelling (upper case sorts before lower case), so it is
+        // "Sci-Fi"/"Noir" whichever row was written first: neither `MIN(rowid)` nor
+        // "first row wins" would answer both of these correctly.
         insert_tag_movie(&database, "tag-first", "tag-lib", "First").await?;
         insert_tag_movie(&database, "tag-second", "tag-lib", "Second").await?;
+        insert_tag_movie(&database, "tag-third", "tag-lib", "Third").await?;
+        insert_tag_movie(&database, "tag-fourth", "tag-lib", "Fourth").await?;
         insert_item_facet(&database, "tag-first", "TAG", "sci-fi", "sci-fi").await?;
         insert_item_facet(&database, "tag-second", "TAG", "sci-fi", "Sci-Fi").await?;
+        insert_item_facet(&database, "tag-third", "TAG", "noir", "Noir").await?;
+        insert_item_facet(&database, "tag-fourth", "TAG", "noir", "noir").await?;
+        // A locale-aware comparison sorts the lower-case spelling first; only an explicit byte
+        // order keeps "Été", which is why the collation is spelled out in the query.
+        insert_tag_movie(&database, "tag-fifth", "tag-lib", "Fifth").await?;
+        insert_tag_movie(&database, "tag-sixth", "tag-lib", "Sixth").await?;
+        insert_item_facet(&database, "tag-fifth", "TAG", "été", "été").await?;
+        insert_item_facet(&database, "tag-sixth", "TAG", "été", "Été").await?;
 
         let library_ids = vec!["tag-lib".to_owned()];
         let (tags, total) = database
             .list_catalog_tags(&tag_facet_filter(&library_ids), 0, 50)
             .await?;
 
-        assert_eq!(total, 1, "one case-insensitive name is one entry");
-        assert_eq!(tags.len(), 1);
-        assert_eq!(tags[0].name_key, "sci-fi");
-        assert_eq!(tags[0].name, "sci-fi", "the first projected spelling wins");
-        assert_eq!(tags[0].item_count, 2);
+        assert_eq!(total, 3, "one case-insensitive name is one entry");
+        assert_eq!(
+            tags,
+            vec![
+                crate::storage::StoredMediaFacet {
+                    name_key: "noir".to_owned(),
+                    name: "Noir".to_owned(),
+                    item_count: 2,
+                },
+                crate::storage::StoredMediaFacet {
+                    name_key: "sci-fi".to_owned(),
+                    name: "Sci-Fi".to_owned(),
+                    item_count: 2,
+                },
+                crate::storage::StoredMediaFacet {
+                    name_key: "été".to_owned(),
+                    name: "Été".to_owned(),
+                    item_count: 2,
+                },
+            ],
+            "the byte-order smallest spelling wins, independent of insertion order"
+        );
+
+        // Deleting and re-projecting the first row must not rename the tag: the rule ignores
+        // storage order entirely.
+        database
+            .query("DELETE FROM media_items WHERE id = 'tag-first'")
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items
+                 (id, library_id, item_type, title, sort_title, identification_status,
+                  has_available_source)
+                 VALUES ('tag-first', 'tag-lib', 'MOVIE', 'First', 'first', 'LOCAL_CONFIRMED', 1)",
+            )
+            .execute(database.pool())
+            .await?;
+        insert_item_facet(&database, "tag-first", "TAG", "sci-fi", "sci-fi").await?;
+        let (reprojected, reprojected_total) = database
+            .list_catalog_tags(&tag_facet_filter(&library_ids), 0, 50)
+            .await?;
+        assert_eq!(reprojected_total, 3);
+        assert_eq!(reprojected, tags);
         Ok(())
     }
 
