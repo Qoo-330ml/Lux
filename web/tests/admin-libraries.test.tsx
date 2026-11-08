@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { AdminLibrariesPage } from "../src/features/admin/AdminLibrariesPage";
 import { api } from "../src/lib/api/client";
-import type { AdminLibraryDeletionJob, AdminPlugin } from "../src/lib/api/types";
+import type { AdminLibraryDeletionJob, AdminPlugin, AdminSettings } from "../src/lib/api/types";
 import { stylesheet as allStyles } from "./style-source.mjs";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -94,6 +94,36 @@ const mediaProbePlugin: AdminPlugin = {
   configSource: "NONE",
 };
 
+const adminSettingsFixture: AdminSettings = {
+  resumePlayedPercent: 90,
+  resumeMinTicks: 1_200_000_000,
+  mediaStrategy: {
+    metadataLanguage: "zh-CN",
+    imageLanguage: "zh-CN",
+    region: "CN",
+    scraperId: null,
+    applyScope: "NEW_CONTENT",
+    images: {
+      poster: true,
+      artwork: false,
+      banner: false,
+      logo: true,
+      thumbnail: true,
+      thumbnailScrapingMode: "SCRAPER_FIRST",
+      disc: false,
+      wallpaper: false,
+      writeToMetadata: false,
+      maxBackdropCount: 1,
+    },
+    subtitles: {
+      autoDownload: false,
+      languages: ["zh-CN"],
+      forcedOnly: false,
+      hearingImpaired: false,
+    },
+  },
+};
+
 describe("AdminLibrariesPage library cards", () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -104,35 +134,7 @@ describe("AdminLibrariesPage library cards", () => {
     vi.spyOn(api, "adminPlugins").mockResolvedValue({ plugins: [configuredScraper] });
     vi.spyOn(api, "adminChapterSources").mockResolvedValue({ sources: [] });
     vi.spyOn(api, "adminLibraryDeletionJobs").mockResolvedValue({ jobs: [], page: 1, pageSize: 20, total: 0 });
-    vi.spyOn(api, "adminSettings").mockResolvedValue({
-      resumePlayedPercent: 90,
-      resumeMinTicks: 1_200_000_000,
-      mediaStrategy: {
-        metadataLanguage: "zh-CN",
-        imageLanguage: "zh-CN",
-        region: "CN",
-        scraperId: null,
-        applyScope: "NEW_CONTENT",
-        images: {
-          poster: true,
-          artwork: false,
-          banner: false,
-          logo: true,
-          thumbnail: true,
-          thumbnailScrapingMode: "SCRAPER_FIRST",
-          disc: false,
-          wallpaper: false,
-          writeToMetadata: false,
-          maxBackdropCount: 1,
-        },
-        subtitles: {
-          autoDownload: false,
-          languages: ["zh-CN"],
-          forcedOnly: false,
-          hearingImpaired: false,
-        },
-      },
-    });
+    vi.spyOn(api, "adminSettings").mockResolvedValue(adminSettingsFixture);
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -981,6 +983,40 @@ describe("AdminLibrariesPage library cards", () => {
 
     expect(document.body.textContent).toContain("TMDb 元数据插件");
     expect(document.body.textContent).not.toContain("Trakt 多源评分");
+  });
+
+  it("keeps a saved scraper that cannot answer metadata.search visible but disabled", async () => {
+    const ratingsOnly: AdminPlugin = {
+      ...configuredScraper,
+      id: "org.lux.trakt-ratings",
+      name: "Trakt 多源评分",
+      capabilities: ["ratings.lookup", "ratings.batch", "ratings.search"],
+    };
+    vi.mocked(api.adminPlugins).mockResolvedValue({ plugins: [configuredScraper, ratingsOnly] });
+    vi.mocked(api.adminSettings).mockResolvedValue({
+      ...adminSettingsFixture,
+      mediaStrategy: { ...adminSettingsFixture.mediaStrategy, scraperId: "org.lux.trakt-ratings" },
+    });
+    await renderPage();
+
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("[role='tab']")]
+        .find((button) => button.textContent?.includes("高级"))
+        ?.click();
+    });
+
+    // The stored value stays selected and readable instead of silently falling back to the placeholder.
+    const trigger = container.querySelector<HTMLButtonElement>("#global-strategy-scraper");
+    expect(trigger).toBeTruthy();
+    expect(trigger?.textContent).toContain("已配置（不受支持）");
+
+    await act(async () => trigger?.click());
+
+    const savedOption = document.querySelector<HTMLButtonElement>("[role='option'][data-value='org.lux.trakt-ratings']");
+    expect(savedOption).toBeTruthy();
+    expect(savedOption?.textContent).toContain("已配置（不受支持）");
+    expect(savedOption?.disabled).toBe(true);
+    expect(document.querySelector("[role='option'][data-value='tmdb']")).toBeTruthy();
   });
 
   it("does not list media probe plugins as library scrapers", async () => {

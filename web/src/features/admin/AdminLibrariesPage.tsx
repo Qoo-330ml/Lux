@@ -823,12 +823,23 @@ function ScraperListEditor({ value, plugins, onChange }: { value: AdminLibrarySc
 }
 
 function ScraperSelect({ id, value, plugins, onChange }: { id: string; value: string; plugins: AdminPlugin[]; onChange: (value: string) => void }) {
-  const visiblePlugins = plugins.filter((plugin) => isLibraryScraperPlugin(plugin) && (plugin.available || plugin.id === value));
-  const options = visiblePlugins.map((plugin) => ({
-    value: plugin.id,
-    label: `${plugin.name}${plugin.available ? "" : "（暂不可用）"}`,
-    disabled: !plugin.available,
-  }));
+  const capablePlugins = plugins.filter(isLibraryScraperPlugin);
+  const savedPlugin = plugins.find((plugin) => plugin.id === value);
+  // A scraper saved before the metadata.search rule can still be on disk. Keep it in the list and
+  // disable it instead of silently hiding the value the administrator already has.
+  const savedOption = value && !capablePlugins.some((plugin) => plugin.id === value)
+    ? [{ value, label: savedPlugin ? "已配置（不受支持）" : "已配置（暂不可用）", disabled: true }]
+    : [];
+  const options = [
+    ...capablePlugins
+      .filter((plugin) => plugin.available || plugin.id === value)
+      .map((plugin) => ({
+        value: plugin.id,
+        label: `${plugin.name}${plugin.available ? "" : "（暂不可用）"}`,
+        disabled: !plugin.available,
+      })),
+    ...savedOption,
+  ];
   return <label className="lux-admin-scraper-field" htmlFor={id}>
     刮削器
     <LuxSelect id={id} value={value} options={options} placeholder="未配置刮削器" disabled={options.length === 0} onChange={onChange} aria-label="刮削器" />
