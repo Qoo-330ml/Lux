@@ -193,7 +193,7 @@ impl PluginManifest {
             }
         }
         match self.plugin_type.as_str() {
-            "metadata" => {}
+            PLUGIN_TYPE_METADATA => {}
             PLUGIN_TYPE_LOGIN_BACKGROUND => {
                 if self.category != PLUGIN_CATEGORY_UTILITY {
                     return Err(PluginManifestError::Invalid(
@@ -389,6 +389,7 @@ impl PluginManifest {
                 )));
             }
         }
+        validate_ratings_capabilities(&self.capabilities, &self.plugin_type)?;
         self.runtime.validate()?;
         if self.emby_routes.len() > 32 {
             return Err(PluginManifestError::Invalid(
@@ -2176,6 +2177,39 @@ impl fmt::Display for PluginManifestError {
 
 impl std::error::Error for PluginManifestError {}
 
+/// Rejects a `ratings.*` capability the protocol does not define, and any `ratings.*` capability on
+/// a plugin type other than `metadata`.
+///
+/// A ratings plugin is a `type: metadata` plugin by contract, but it is read-only and out of the
+/// scraper path: that is why the capability prefix, not the plugin type alone, decides where it may
+/// appear.
+fn validate_ratings_capabilities(
+    capabilities: &[String],
+    plugin_type: &str,
+) -> Result<(), PluginManifestError> {
+    let mut declares_ratings = false;
+    for capability in capabilities {
+        if !capability.starts_with("ratings.") {
+            continue;
+        }
+        if !matches!(
+            capability.as_str(),
+            RATINGS_LOOKUP_CAPABILITY | RATINGS_BATCH_CAPABILITY | RATINGS_SEARCH_CAPABILITY
+        ) {
+            return Err(PluginManifestError::Invalid(format!(
+                "unsupported ratings capability: {capability}"
+            )));
+        }
+        declares_ratings = true;
+    }
+    if declares_ratings && plugin_type != PLUGIN_TYPE_METADATA {
+        return Err(PluginManifestError::Invalid(
+            "only metadata plugins may declare ratings capabilities".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_identifier(
     field: &str,
     value: &str,
@@ -2262,6 +2296,28 @@ mod tests {
         .expect("notification manifest should deserialize")
     }
 
+    /// A manifest shaped like `org.lux.trakt-ratings`: a `metadata` plugin in the scraper category
+    /// that answers ratings lookups. The type and capabilities are overridable so the rejection
+    /// cases stay readable.
+    fn ratings_manifest(
+        plugin_type: &str,
+        category: &str,
+        capabilities: &[&str],
+    ) -> PluginManifest {
+        serde_json::from_value(json!({
+            "formatVersion": 1,
+            "id": "org.lux.trakt-ratings",
+            "name": "Trakt ratings",
+            "version": "1.0.0",
+            "apiVersion": 1,
+            "runtime": {"kind": "process", "entrypoint": "bin/ratings"},
+            "type": plugin_type,
+            "category": category,
+            "capabilities": capabilities,
+        }))
+        .expect("ratings manifest should deserialize")
+    }
+
     #[test]
     fn data_migration_manifest_requires_migration_category_and_capability() {
         let manifest: PluginManifest = serde_json::from_value(json!({
@@ -2293,6 +2349,98 @@ mod tests {
         );
         assert!(
             notification_manifest("NOTIFICATION", &[])
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ratings_capabilities_are_accepted_on_metadata_plugins() {
+        for capabilities in [
+            vec!["ratings.lookup", "ratings.batch", "ratings.search"],
+            vec!["ratings.lookup"],
+            vec!["ratings.batch"],
+            vec!["ratings.search"],
+            vec!["metadata.search", "ratings.batch"],
+            Vec::new(),
+        ] {
+            assert!(
+                ratings_manifest("metadata", "SCRAPER", &capabilities)
+                    .validate()
+                    .is_ok(),
+                "metadata plugin should accept {capabilities:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_ratings_capabilities_are_rejected() {
+        for capability in ["ratings.foo", "ratings.", "ratings.lookup.extra"] {
+            let error = ratings_manifest("metadata", "SCRAPER", &["ratings.lookup", capability])
+                .validate()
+                .expect_err("an unknown ratings capability must be rejected");
+            assert!(
+                error.to_string().contains(capability),
+                "error should name {capability}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn ratings_capabilities_are_rejected_outside_metadata_plugins() {
+        for (plugin_type, category, capabilities) in [
+            (
+                "media_probe",
+                "MEDIA",
+                vec!["media.probe", "ratings.lookup"],
+            ),
+            (
+                "ip_location",
+                "NETWORK",
+                vec!["ip.location", "ratings.batch"],
+            ),
+            (
+                "strm_resolver",
+                "MEDIA",
+                vec!["strm.resolve", "ratings.search"],
+            ),
+            ("danmaku", "MEDIA", vec!["danmaku.match", "ratings.batch"]),
+            (
+                "notification",
+                "NOTIFICATION",
+                vec!["notification.send", "ratings.lookup"],
+            ),
+            (
+                "data_migration",
+                "MIGRATION",
+                vec!["migration.emby", "ratings.search"],
+            ),
+        ] {
+            assert!(
+                ratings_manifest(plugin_type, category, &capabilities)
+                    .validate()
+                    .is_err(),
+                "{plugin_type} plugin must not declare ratings capabilities"
+            );
+        }
+    }
+
+    #[test]
+    fn ratings_capabilities_do_not_change_the_existing_danmaku_rules() {
+        assert!(
+            ratings_manifest("danmaku", "MEDIA", &["danmaku.match", "danmaku.search"])
+                .validate()
+                .is_err(),
+            "danmaku.search still requires danmaku.fetch"
+        );
+        assert!(
+            ratings_manifest("danmaku", "MEDIA", &["danmaku.match"])
+                .validate()
+                .is_ok(),
+            "a match-only danmaku plugin is still valid"
+        );
+        assert!(
+            ratings_manifest("danmaku", "MEDIA", &["danmaku.match", "danmaku.foo"])
                 .validate()
                 .is_err()
         );
