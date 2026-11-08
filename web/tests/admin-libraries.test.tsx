@@ -53,7 +53,7 @@ const configuredScraper: AdminPlugin = {
   category: "SCRAPER",
   version: "1.0.0",
   runtime: "builtin",
-  capabilities: ["metadata"],
+  capabilities: ["metadata.search", "metadata.get"],
   status: "READY",
   running: true,
   lastError: null,
@@ -957,6 +957,30 @@ describe("AdminLibrariesPage library cards", () => {
 
     expect(document.body.textContent).toContain("TMDb 元数据插件");
     expect(document.body.textContent).not.toContain("仅使用本地元数据");
+  });
+
+  it("does not offer a SCRAPER plugin that declares only ratings.* capabilities", async () => {
+    const ratingsOnly: AdminPlugin = {
+      ...configuredScraper,
+      id: "org.lux.trakt-ratings",
+      name: "Trakt 多源评分",
+      capabilities: ["ratings.lookup", "ratings.batch", "ratings.search"],
+    };
+    vi.mocked(api.adminPlugins).mockResolvedValue({ plugins: [configuredScraper, ratingsOnly] });
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("[aria-label='打开 01每日更新 操作菜单']")?.click();
+    });
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
+        .find((button) => button.textContent?.includes("编辑"))
+        ?.click();
+    });
+    await act(async () => container.querySelector<HTMLButtonElement>("[aria-label='刮削器']")?.click());
+
+    expect(document.body.textContent).toContain("TMDb 元数据插件");
+    expect(document.body.textContent).not.toContain("Trakt 多源评分");
   });
 
   it("does not list media probe plugins as library scrapers", async () => {

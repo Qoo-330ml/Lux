@@ -762,10 +762,17 @@ function normalizeLibraryScrapers(library: AdminLibrary): AdminLibraryScraper[] 
     }));
 }
 
+// A library scraper must declare metadata.search; the backend refuses selection otherwise (LUX-902).
+// A SCRAPER-category plugin with only ratings.* (e.g. the Trakt ratings plugin) is not offered.
+function isLibraryScraperPlugin(plugin: AdminPlugin): boolean {
+  return plugin.category.trim().toUpperCase() === "SCRAPER"
+    && (plugin.capabilities ?? []).some((capability) => capability.trim().toLowerCase() === "metadata.search");
+}
+
 function ScraperListEditor({ value, plugins, onChange }: { value: AdminLibraryScraper[]; plugins: AdminPlugin[]; onChange: (value: AdminLibraryScraper[]) => void }) {
   const [dragging, setDragging] = useState<number | null>(null);
   const selected = new Set(value.map((scraper) => scraper.scraperId));
-  const availablePlugins = plugins.filter((plugin) => plugin.category.trim().toUpperCase() === "SCRAPER");
+  const availablePlugins = plugins.filter(isLibraryScraperPlugin);
   const options = availablePlugins
     .filter((plugin) => plugin.available && !selected.has(plugin.id))
     .map((plugin) => ({ value: plugin.id, label: plugin.name }));
@@ -816,7 +823,7 @@ function ScraperListEditor({ value, plugins, onChange }: { value: AdminLibrarySc
 }
 
 function ScraperSelect({ id, value, plugins, onChange }: { id: string; value: string; plugins: AdminPlugin[]; onChange: (value: string) => void }) {
-  const visiblePlugins = plugins.filter((plugin) => plugin.category.trim().toUpperCase() === "SCRAPER" && (plugin.available || plugin.id === value));
+  const visiblePlugins = plugins.filter((plugin) => isLibraryScraperPlugin(plugin) && (plugin.available || plugin.id === value));
   const options = visiblePlugins.map((plugin) => ({
     value: plugin.id,
     label: `${plugin.name}${plugin.available ? "" : "（暂不可用）"}`,
