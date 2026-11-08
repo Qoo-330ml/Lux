@@ -47,6 +47,25 @@ pub const METADATA_IMAGES_CAPABILITY: &str = "metadata.images";
 pub const METADATA_CREDITS_CAPABILITY: &str = "metadata.credits";
 pub const METADATA_EXTERNAL_IDS_CAPABILITY: &str = "metadata.externalIds";
 pub const METADATA_TRAILERS_CAPABILITY: &str = "metadata.trailers";
+/// The only plugin type allowed to declare a `ratings.*` capability.
+pub const PLUGIN_TYPE_METADATA: &str = "metadata";
+/// Rating lookup capabilities of a read-only ratings plugin.
+///
+/// The plugin that declares them (`org.lux.trakt-ratings`) is a `type: metadata` plugin, but it
+/// deliberately does not implement `metadata.search`, so it is not a scraper.
+pub const RATINGS_LOOKUP_CAPABILITY: &str = "ratings.lookup";
+pub const RATINGS_BATCH_CAPABILITY: &str = "ratings.batch";
+pub const RATINGS_SEARCH_CAPABILITY: &str = "ratings.search";
+/// Lookups one `ratings.batch` request may carry; a larger request is refused by the plugin.
+pub const MAX_RATINGS_BATCH_ITEMS: usize = 200;
+/// Stable `error.code` values a ratings plugin returns.
+pub const RATINGS_ERROR_NOT_FOUND: &str = "TRAKT_NOT_FOUND";
+pub const RATINGS_ERROR_NOT_CONFIGURED: &str = "TRAKT_NOT_CONFIGURED";
+pub const RATINGS_ERROR_UNAUTHORIZED: &str = "TRAKT_UNAUTHORIZED";
+pub const RATINGS_ERROR_RATE_LIMITED: &str = "TRAKT_RATE_LIMITED";
+pub const RATINGS_ERROR_UPSTREAM: &str = "TRAKT_UPSTREAM_ERROR";
+pub const RATINGS_ERROR_INVALID_REQUEST: &str = "TRAKT_INVALID_REQUEST";
+pub const RATINGS_ERROR_BATCH_TOO_LARGE: &str = "TRAKT_BATCH_TOO_LARGE";
 pub const STRM_RESOLVE_METHOD: &str = "strm.resolve";
 pub const CHAPTER_DETECT_METHOD: &str = "chapters.detect";
 pub const CHAPTER_LOOKUP_METHOD: &str = "chapters.lookup";
@@ -55,6 +74,9 @@ pub const DANMAKU_MATCH_METHOD: &str = "danmaku.match";
 pub const DANMAKU_SEARCH_METHOD: &str = "danmaku.search";
 pub const DANMAKU_FETCH_METHOD: &str = "danmaku.fetch";
 pub const LOGIN_BACKGROUND_GET_METHOD: &str = "login_background.get";
+pub const RATINGS_LOOKUP_METHOD: &str = "ratings.lookup";
+pub const RATINGS_BATCH_METHOD: &str = "ratings.batch";
+pub const RATINGS_SEARCH_METHOD: &str = "ratings.search";
 pub const UNIFIED_LOGIN_BACKGROUND_PLUGIN_ID: &str = "org.lux.login-background";
 pub const LOGIN_BACKGROUND_CUSTOM_IMAGE_PATH: &str = "/api/v1/auth/login-background/custom-image";
 pub const MAX_LOGIN_BACKGROUND_RESULT_BYTES: usize = 256 * 1024;
@@ -1905,6 +1927,238 @@ pub enum MediaProbeRpcStreamType {
     Video,
     Audio,
     Subtitle,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RatingsLookupKind {
+    /// A film, looked up by IMDb id or by TMDb id plus title and year.
+    #[default]
+    Movie,
+    /// A series, with the same identifier rules as a film.
+    Show,
+    /// One episode of a series, addressed through the series identity.
+    Episode,
+}
+
+/// One rating lookup, sent as the body of `ratings.lookup` or as one item of `ratings.batch`.
+///
+/// A lookup always carries an identifier: a bare `title` is never enough, because the provider
+/// could only guess and the host would then write a score that belongs to another title.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RatingsLookupRpcRequest {
+    pub kind: RatingsLookupKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imdb: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmdb: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub year: Option<i64>,
+    /// The series identity an episode lookup reuses, as an IMDb or Trakt id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub season: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode: Option<i64>,
+}
+
+/// The body of `ratings.batch`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RatingsBatchRpcRequest {
+    #[serde(default)]
+    pub items: Vec<RatingsLookupRpcRequest>,
+}
+
+impl RatingsBatchRpcRequest {
+    /// Enforces the request bounds the plugin relies on before a process is started.
+    pub fn validate(&self) -> Result<(), RatingsRpcValidationError> {
+        if self.items.is_empty() {
+            return Err(RatingsRpcValidationError::Empty);
+        }
+        if self.items.len() > MAX_RATINGS_BATCH_ITEMS {
+            return Err(RatingsRpcValidationError::TooLarge);
+        }
+        Ok(())
+    }
+}
+
+/// Why a host-built `ratings.*` request was refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RatingsRpcValidationError {
+    /// A batch with no lookup can never produce a result.
+    Empty,
+    /// A batch larger than [`MAX_RATINGS_BATCH_ITEMS`]; the plugin answers
+    /// `TRAKT_BATCH_TOO_LARGE` for the same condition.
+    TooLarge,
+}
+
+impl fmt::Display for RatingsRpcValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Empty => "ratings batch request is empty",
+            Self::TooLarge => "ratings batch request is too large",
+        })
+    }
+}
+
+impl std::error::Error for RatingsRpcValidationError {}
+
+/// The body of `ratings.search`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RatingsSearchRpcRequest {
+    pub query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<RatingsLookupKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub year: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// One provider score. The host keeps the order the plugin sent, because the last entry is the one
+/// the sidecar writer records as the default score.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RatingsSource {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rating: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub votes: Option<i64>,
+}
+
+/// Upstream counters for the matched title.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RatingsStats {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rating: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub votes: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watchers: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plays: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collectors: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comments: Option<i64>,
+}
+
+/// The score the host may write back into the sidecar.
+///
+/// `confident: false` is a hard stop for the host: it must keep the rating it already has, even
+/// when the rest of the object carries a score. `criticRating` is `null` when the provider has no
+/// critic score, which is different from a score of `0.0`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RatingsWriteback {
+    #[serde(default)]
+    pub confident: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rating: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub votes: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critic_rating: Option<f64>,
+}
+
+/// The `result` of one successful lookup.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RatingsLookupRpcResult {
+    /// The numeric Trakt id, reused by the episode lookups of the same series.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trakt_id: Option<i64>,
+    /// How the plugin matched the title, for example `imdb` or `title+year`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_by: Option<String>,
+    /// The plugin's own doubt about the match. A low-confidence match is never written back even
+    /// when `writeback.confident` is `true`.
+    #[serde(default)]
+    pub low_confidence: bool,
+    /// The vote count below which the plugin refuses to call a match confident.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_votes: Option<i64>,
+    /// The source whose score the host should display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<RatingsSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<RatingsStats>,
+    /// Score histogram keyed by the `"1"`…`"10"` bucket.
+    #[serde(default)]
+    pub distribution: BTreeMap<String, i64>,
+    #[serde(default)]
+    pub sources: Vec<RatingsSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writeback: Option<RatingsWriteback>,
+}
+
+/// One candidate of `ratings.search`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RatingsSearchCandidate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trakt_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub year: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+}
+
+/// The body of a successful `ratings.search`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RatingsSearchRpcResponse {
+    #[serde(default)]
+    pub items: Vec<RatingsSearchCandidate>,
+}
+
+/// One failed lookup. `code` is one of the `RATINGS_ERROR_*` values.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RatingsRpcError {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// One member of a `ratings.batch` response.
+///
+/// `input` is the request element the plugin echoed back, kept as opaque JSON so the host can
+/// correlate a result with what it asked even when the plugin reorders the batch.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RatingsBatchRpcEntry {
+    #[serde(default)]
+    pub input: Value,
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<RatingsLookupRpcResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<RatingsRpcError>,
+}
+
+/// The body of a `ratings.batch` response.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RatingsBatchRpcResponse {
+    #[serde(default)]
+    pub results: Vec<RatingsBatchRpcEntry>,
 }
 
 #[derive(Debug)]

@@ -9,4 +9,5 @@ mod media_info_config_api;
 mod plugin_protocol;
 mod plugin_runtime;
 mod plugins;
+mod ratings_protocol;
 mod ratings_sync;
