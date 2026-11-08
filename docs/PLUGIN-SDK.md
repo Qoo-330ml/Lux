@@ -284,6 +284,8 @@ Actions 在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` runner 上分别构建。Relea
 - `metadata.credits`：返回演员/人物的 provider-neutral cast 列表。
 - `metadata.externalIds`：返回 `ProviderIds`。
 - `metadata.trailers`：返回预告片候选。
+- `ratings.lookup` / `ratings.batch` / `ratings.search`：只读评分查询，只由声明 `ratings.*` 的 `metadata`
+  插件提供，见下文“评分查询调用约定”。
 - `media.probe`：接收一个已由 Lux 宿主校验的媒体地址，以及 `includeMediaInfo`、
   `includeThumbnail` 和 `thumbnailPositionPercent`。媒体信息由 `ffprobe` 返回受限的 format/stream 信息；
   缩略图由 `ffmpeg` 在 duration 的 `thumbnailPositionPercent` 百分比位置生成 JPEG（缺省为 30），并通过受限的
@@ -467,6 +469,93 @@ TMDb 插件的首选语言由管理员配置覆盖请求中的默认语言。语
 zh-SG、zh-HK、zh-TW，开关默认关闭。替代 API 地址开关默认关闭；开启后可选择官方地址、
 `https://api.tmdb.org` 或填写自定义 HTTP(S) 基础地址。地址由宿主校验，不得包含凭据、查询参数
 或片段。
+
+### 评分查询调用约定
+
+评分查询插件（`org.lux.trakt-ratings`）是只读的 `type: "metadata"`、`category: "SCRAPER"` 插件，只实现
+`ratings.lookup`、`ratings.batch` 和 `ratings.search`，**不实现** `metadata.search`。因此它不能充当媒体库
+刮削器：清单校验只允许 `metadata` 类型的插件声明 `ratings.*`，且未知的 `ratings.*` 能力名（例如
+`ratings.foo`）会被拒绝；声明了 `metadata` 类型却没有声明 `metadata.search` 的插件不会被选为
+`metadata.search` 的调用目标。已经声明 `metadata.search` 的刮削器行为不变。
+
+三个方法都只接收标识符，不接受路径、URL、媒体源 ID 或用户数据。`ratings.lookup` 的请求就是一个查询对象：
+
+```json
+{"kind": "movie", "imdb": "tt0111161"}
+```
+
+```json
+{"kind": "movie", "title": "片名", "tmdb": "278", "year": 1994}
+```
+
+```json
+{"kind": "episode", "show": "tt0903747", "season": 5, "episode": 14}
+```
+
+`kind` 只能是 `movie`、`show` 或 `episode`。只有标题不足以匹配：`title` 必须与 `tmdb` 和 `year` 一同发送，
+分集则复用剧集的 IMDb 或 Trakt ID。`ratings.batch` 把同样的查询对象放进数组，一次最多 200 条：
+
+```json
+{"items": [{"kind": "movie", "imdb": "tt0111161"}]}
+```
+
+超过 200 条时插件返回 `TRAKT_BATCH_TOO_LARGE`；宿主侧对应的上限是 `MAX_RATINGS_BATCH_ITEMS`，
+调用方必须在发送前自行校验（`RatingsBatchRpcRequest::validate` 会拒绝空批次和超限批次）。`ratings.search` 接收
+`{"query": string, "kind"?: "movie"|"show", "year"?: number, "limit"?: number}`，返回候选列表：
+
+```json
+{"items": [{"traktId": 129, "title": "片名", "year": 1994, "kind": "movie", "score": 0.98}]}
+```
+
+`ratings.lookup` 与 `ratings.batch` 的每个结果：
+
+```json
+{
+  "traktId": 129,
+  "matchedBy": "imdb",
+  "lowConfidence": false,
+  "minVotes": 10,
+  "primary": {"source": "trakt", "rating": 8.7, "votes": 12345},
+  "stats": {"rating": 8.7, "votes": 12345, "watchers": 30000, "plays": 40000, "collectors": 5000, "comments": 120},
+  "distribution": {"1": 10, "5": 400, "10": 9000},
+  "sources": [
+    {"source": "imdb", "rating": 9.3, "votes": 2500000},
+    {"source": "trakt", "rating": 8.7, "votes": 12345}
+  ],
+  "writeback": {"confident": true, "source": "trakt", "rating": 8.7, "votes": 12345, "criticRating": 82.0}
+}
+```
+
+`ratings.batch` 的响应是 `{"results": [...]}`，每个成员回显它对应的请求元素：
+
+```json
+{"results": [{"input": {"kind": "movie", "imdb": "tt0111161"}, "ok": true, "result": {"traktId": 129}}]}
+{"results": [{"input": {"kind": "movie", "imdb": "tt0111161"}, "ok": false, "error": {"code": "TRAKT_NOT_FOUND", "message": "no match"}}]}
+```
+
+`traktId` 是该条目的数字 Trakt ID，供同一剧集的分集查询复用。`primary` 是宿主应展示的来源，
+`distribution` 以 `"1"`–`"10"` 为键记录评分分布，`stats` 是上游计数；三者只用于展示，不参与回写。
+`criticRating` 可以是 `null`，表示上游没有影评人评分，与 `0.0` 不同。
+
+`writeback` 是唯一的回写入口：`confident: true` 时宿主可以把 `rating`、`votes` 和 `criticRating` 写入
+NFO 旁车；**`confident: false` 时宿主不得覆盖用户原有评分**，即使对象里仍带有分数。`lowConfidence: true`
+或 `matchedBy: "title+year"` 的匹配同样不写回。宿主仍会校验分数范围（0–10）和票数，超出范围的载荷按
+无效响应丢弃，而不是修正后写入。
+
+错误码只出现在 `error.code`，`message` 是供人阅读的文本，不包含凭据或完整上游 URL：
+
+| 错误码 | 含义 | 宿主处理建议 |
+|---|---|---|
+| `TRAKT_NOT_FOUND` | 上游没有该条目 | 不重试，跳过该条目 |
+| `TRAKT_NOT_CONFIGURED` | 插件缺少凭据配置 | 暂停整次运行，提示管理员配置 |
+| `TRAKT_UNAUTHORIZED` | 凭据被上游拒绝 | 暂停整次运行，不重试 |
+| `TRAKT_RATE_LIMITED` | 触发上游限流 | 按插件给出的退避等待后重试 |
+| `TRAKT_UPSTREAM_ERROR` | 上游临时故障 | 有界重试，超过次数后跳过 |
+| `TRAKT_INVALID_REQUEST` | 请求本身不合法 | 不重试，按宿主缺陷处理 |
+| `TRAKT_BATCH_TOO_LARGE` | 单批超过 200 条 | 拆分批次后重试 |
+
+未知错误码按失败处理，不得盲目重试。响应中的未知字段一律被忽略，插件可以新增字段而不破坏旧宿主；
+这要求插件只新增可选字段，不改变既有字段的类型。
 
 ### IP 归属地调用约定
 
