@@ -479,8 +479,9 @@ zh-SG、zh-HK、zh-TW，开关默认关闭。替代 API 地址开关默认关闭
 `metadata.search` 的调用目标。已经声明 `metadata.search` 的刮削器行为不变。
 
 本节的依据是 ADR-053 与 `src/application/ratings_sync/output.rs`，描述的是宿主**实际读取**的结构。宿主只读
-下文列出的字段：`stats`、`distribution`、`sources`、`minVotes`、`primary`、`nfo.xml` 等其余字段一律忽略，
-插件可以使用它们，但宿主不会据此写盘或展示。
+以下字段：`traktId`、`matchedBy`、`lowConfidence`、`writeback.confident`，以及 `writeback.nfo.ratings`
+（其中的 `rating`、`votes`、`criticRating`）。`stats`、`distribution`、`sources`、`minVotes`、`primary` 与
+`nfo.xml` 宿主一律忽略：插件可以返回它们，但宿主不会据此写盘或展示，`nfo.xml` 也不会被读取。
 
 #### 请求
 
@@ -507,7 +508,8 @@ zh-SG、zh-HK、zh-TW，开关默认关闭。替代 API 地址开关默认关闭
 #### 响应
 
 `ratings.batch` 返回 `results` 数组，每个成员回显它对应的请求元素，并用 `ok` 区分成功与失败。回显数量不得
-超过请求数量，也不得超过 200 个：
+超过请求数量，也不得超过 200 个。违反这些信封规则（缺 `input` 或 `ok`、`ok: true` 缺 `result`、`ok: false` 缺字符串
+`code`）时，宿主视为整批响应无效并**中止整次运行**，不会只跳过单个条目。下面是合法示例：
 
 ```json
 {"results": [
@@ -583,8 +585,8 @@ zh-SG、zh-HK、zh-TW，开关默认关闭。替代 API 地址开关默认关闭
 | 错误码 | 宿主处理 |
 |---|---|
 | `TRAKT_NOT_FOUND` | 跳过该条目，不重试 |
-| `TRAKT_RATE_LIMITED` | 整批结束后等待 60 秒重试该条目一轮 |
-| `TRAKT_UPSTREAM_ERROR` | 整批结束后重试该条目一轮 |
+| `TRAKT_RATE_LIMITED` | 本轮分页全部结束后等待 60 秒，统一重试该条目一轮（仅一轮） |
+| `TRAKT_UPSTREAM_ERROR` | 与限流相同：本轮结束后等待 60 秒，统一重试一轮（仅一轮） |
 | `TRAKT_INVALID_REQUEST` | 不重试，计为失败 |
 | `TRAKT_UNAUTHORIZED` | 中止整次运行 |
 | `TRAKT_NOT_CONFIGURED` | 中止整次运行 |
