@@ -18,7 +18,7 @@
 | `--test images` | 图片变体、写回、缩略图与图片 API | 6 | 66 |
 | `--test playback` | 播放、播放令牌/历史/续播、观看状态归档、章节与片头片尾检测 | 10 | 35 |
 | `--test storage` | SQLite/PostgreSQL 存储、迁移、WAL、数据库维护与启动守卫 | 9 | 118 |
-| `--test plugins` | 插件协议与运行时、弹幕、评分协议、IP 属地、媒体信息插件配置 | 12 | 136 |
+| `--test plugins` | 插件协议与运行时、弹幕、IP 属地、媒体信息插件配置 | 11 | 129 |
 | `--test strm` | STRM 目标解析/探测/播放与 ffprobe | 9 | 42 |
 | 合计（12 组） |  | 131 | 1035 |
 
@@ -165,7 +165,6 @@ cargo test --locked --test <新 target> <旧名>::
 | `media_info_config_api` | 1 | `cargo test --locked --test plugins media_info_config_api::` |
 | `plugin_protocol` | 54 | `cargo test --locked --test plugins plugin_protocol::` |
 | `plugin_runtime` | 14 | `cargo test --locked --test plugins plugin_runtime::` |
-| † `ratings_protocol` | 7 | `cargo test --locked --test plugins ratings_protocol::` |
 | † `ratings_sync` | 8 | `cargo test --locked --test plugins ratings_sync::` |
 | `plugins` | 10 | `cargo test --locked --test plugins plugins::` |
 | `probe` | 21 | `cargo test --locked --test strm probe::` |
@@ -185,7 +184,7 @@ cargo test --locked --test <新 target> <旧名>::
 | `scanned_metadata` | 23 | `cargo test --locked --test scanned_metadata`（本来就没有合并） |
 | `shutdown` | 2 | `cargo test --locked --test shutdown`（本来就没有合并） |
 | `filmly_image_diag` | 1 | `cargo test --locked --test filmly_image_diag`（本来就没有合并） |
-| **合计** | **1160** |  |
+| **合计** | **1153** |  |
 
 ## 3. 只跑某一个原文件的测试
 
