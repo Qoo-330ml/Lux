@@ -478,84 +478,119 @@ zh-SG、zh-HK、zh-TW，开关默认关闭。替代 API 地址开关默认关闭
 `ratings.foo`）会被拒绝；声明了 `metadata` 类型却没有声明 `metadata.search` 的插件不会被选为
 `metadata.search` 的调用目标。已经声明 `metadata.search` 的刮削器行为不变。
 
-三个方法都只接收标识符，不接受路径、URL、媒体源 ID 或用户数据。`ratings.lookup` 的请求就是一个查询对象：
+本节的依据是 ADR-053 与 `src/application/ratings_sync/output.rs`，描述的是宿主**实际读取**的结构。宿主只读
+下文列出的字段：`stats`、`distribution`、`sources`、`minVotes`、`primary`、`nfo.xml` 等其余字段一律忽略，
+插件可以使用它们，但宿主不会据此写盘或展示。
 
-```json
-{"kind": "movie", "imdb": "tt0111161"}
-```
+#### 请求
 
-```json
-{"kind": "movie", "title": "片名", "tmdb": "278", "year": 1994}
-```
-
-```json
-{"kind": "episode", "show": "tt0903747", "season": 5, "episode": 14}
-```
-
-`kind` 只能是 `movie`、`show` 或 `episode`。只有标题不足以匹配：`title` 必须与 `tmdb` 和 `year` 一同发送，
-分集则复用剧集的 IMDb 或 Trakt ID。`ratings.batch` 把同样的查询对象放进数组，一次最多 200 条：
+`ratings.lookup` 的请求就是一个查询对象；`ratings.batch` 把同样的对象放进 `items`：
 
 ```json
 {"items": [{"kind": "movie", "imdb": "tt0111161"}]}
 ```
 
-超过 200 条时插件返回 `TRAKT_BATCH_TOO_LARGE`；宿主侧对应的上限是 `MAX_RATINGS_BATCH_ITEMS`，
-调用方必须在发送前自行校验（`RatingsBatchRpcRequest::validate` 会拒绝空批次和超限批次）。`ratings.search` 接收
-`{"query": string, "kind"?: "movie"|"show", "year"?: number, "limit"?: number}`，返回候选列表：
-
 ```json
-{"items": [{"traktId": 129, "title": "片名", "year": 1994, "kind": "movie", "score": 0.98}]}
+{"items": [
+  {"kind": "movie", "title": "片名", "tmdb": "278", "year": 1994},
+  {"kind": "show", "imdb": "tt0903747"},
+  {"kind": "episode", "show": "tt0903747", "season": 5, "episode": 14}
+]}
 ```
 
-`ratings.lookup` 与 `ratings.batch` 的每个结果：
+`kind` 只能是 `movie`、`show` 或 `episode`。宿主只使用可靠标识：IMDb ID，或 TMDb ID 加标题和年份，绝不只靠
+标题；分集复用剧集的 IMDb ID，或先前剧集查询返回的 Trakt ID。宿主每批最多发送 50 个查询，单批超时 120 秒；
+批级失败按 5 秒、30 秒退避重试两次后中止本次运行。`ratings.search` 接收
+`{"query": string, "kind"?: "movie"|"show", "year"?: number, "limit"?: number}` 并返回候选列表，它不参与
+写回。
+
+#### 响应
+
+`ratings.batch` 返回 `results` 数组，每个成员回显它对应的请求元素，并用 `ok` 区分成功与失败。回显数量不得
+超过请求数量，也不得超过 200 个：
+
+```json
+{"results": [
+  {"input": {"kind": "movie", "imdb": "tt0111161"}, "ok": true, "result": {"traktId": 129}}
+]}
+```
+
+```json
+{"results": [
+  {"input": {"kind": "movie", "imdb": "tt0111161"}, "ok": false,
+   "error": {"code": "TRAKT_NOT_FOUND", "message": "no match"}}
+]}
+```
+
+成功结果的宿主契约（`nfo.xml` 是插件序列化好的旁车片段，宿主不读取）：
 
 ```json
 {
   "traktId": 129,
   "matchedBy": "imdb",
   "lowConfidence": false,
-  "minVotes": 10,
-  "primary": {"source": "trakt", "rating": 8.7, "votes": 12345},
-  "stats": {"rating": 8.7, "votes": 12345, "watchers": 30000, "plays": 40000, "collectors": 5000, "comments": 120},
-  "distribution": {"1": 10, "5": 400, "10": 9000},
-  "sources": [
-    {"source": "imdb", "rating": 9.3, "votes": 2500000},
-    {"source": "trakt", "rating": 8.7, "votes": 12345}
-  ],
-  "writeback": {"confident": true, "source": "trakt", "rating": 8.7, "votes": 12345, "criticRating": 82.0}
+  "writeback": {
+    "confident": true,
+    "source": "trakt",
+    "rating": 6.564,
+    "votes": 280,
+    "criticRating": 7.2,
+    "nfo": {
+      "ratings": [
+        {"name": "tmdb", "value": 7.4, "votes": 1200, "max": 10, "default": false},
+        {"name": "trakt", "value": 6.564, "votes": 280, "max": 10, "default": true}
+      ],
+      "xml": "<nfo/>",
+      "rating": 6.564,
+      "votes": 280,
+      "criticRating": 7.2
+    }
+  }
 }
 ```
 
-`ratings.batch` 的响应是 `{"results": [...]}`，每个成员回显它对应的请求元素：
+`traktId` 是数字 Trakt ID，供同一剧集的分集查询复用。
 
-```json
-{"results": [{"input": {"kind": "movie", "imdb": "tt0111161"}, "ok": true, "result": {"traktId": 129}}]}
-{"results": [{"input": {"kind": "movie", "imdb": "tt0111161"}, "ok": false, "error": {"code": "TRAKT_NOT_FOUND", "message": "no match"}}]}
-```
+宿主只接受同时满足以下全部条件的结果；任何一项不满足就跳过该条目，不写任何文件：
 
-`traktId` 是该条目的数字 Trakt ID，供同一剧集的分集查询复用。`primary` 是宿主应展示的来源，
-`distribution` 以 `"1"`–`"10"` 为键记录评分分布，`stats` 是上游计数；三者只用于展示，不参与回写。
-`criticRating` 可以是 `null`，表示上游没有影评人评分，与 `0.0` 不同。
+- `writeback.nfo` 必须是对象，`null` 或缺省表示插件没有可写内容；
+- `writeback.confident` 必须为 `true`；
+- `lowConfidence` 不得为 `true`；
+- `matchedBy` 不得为 `title+year`（比较时忽略大小写和首尾空白）；
+- `nfo.rating` 必填，且是 0–10 的有限数；
+- `nfo.votes` 可选，存在时必须是非负整数；
+- `nfo.criticRating` 可选，`null` 表示没有影评人评分；存在时必须是 0–10 的有限数；
+- `nfo.ratings` 可选，`null` 视为空数组；最多 64 项，每项约束如下。
 
-`writeback` 是唯一的回写入口：`confident: true` 时宿主可以把 `rating`、`votes` 和 `criticRating` 写入
-NFO 旁车；**`confident: false` 时宿主不得覆盖用户原有评分**，即使对象里仍带有分数。`lowConfidence: true`
-或 `matchedBy: "title+year"` 的匹配同样不写回。宿主仍会校验分数范围（0–10）和票数，超出范围的载荷按
-无效响应丢弃，而不是修正后写入。
+| `ratings` 项字段 | 约束 |
+|---|---|
+| `name` | 必填；去掉首尾空白后 1–64 个字符，只允许 ASCII 小写字母、数字和下划线 |
+| `value` | 必填；0–10 的有限数 |
+| `votes` | 可选；非负整数 |
+| `max` | 必填；必须等于 `10` |
+| `default` | 可选布尔值，缺省为 `false` |
 
-错误码只出现在 `error.code`，`message` 是供人阅读的文本，不包含凭据或完整上游 URL：
+票数上限为 10^15，更大的值按解析错误处理。分数必须是有限数：`NaN`、`Infinity` 和越界值一律丢弃，宿主不会
+修正或截断后写入。`ratings` 的容器顺序原样保留，因为 Jellyfin 取最后一个非 `tomato` 条目，插件应把主来源
+排在最后。
 
-| 错误码 | 含义 | 宿主处理建议 |
-|---|---|---|
-| `TRAKT_NOT_FOUND` | 上游没有该条目 | 不重试，跳过该条目 |
-| `TRAKT_NOT_CONFIGURED` | 插件缺少凭据配置 | 暂停整次运行，提示管理员配置 |
-| `TRAKT_UNAUTHORIZED` | 凭据被上游拒绝 | 暂停整次运行，不重试 |
-| `TRAKT_RATE_LIMITED` | 触发上游限流 | 按插件给出的退避等待后重试 |
-| `TRAKT_UPSTREAM_ERROR` | 上游临时故障 | 有界重试，超过次数后跳过 |
-| `TRAKT_INVALID_REQUEST` | 请求本身不合法 | 不重试，按宿主缺陷处理 |
-| `TRAKT_BATCH_TOO_LARGE` | 单批超过 200 条 | 拆分批次后重试 |
+`writeback` 是唯一的写回入口：**`confident: false` 时宿主不得覆盖用户原有评分**，即使对象里仍带有分数；
+`lowConfidence: true` 或 `matchedBy: "title+year"` 的匹配同样不写盘。写回只替换旁车里的 `<ratings>` 容器和
+扁平的 `<rating>`、`<votes>`、`<criticrating>`；没有旁车的条目直接跳过，宿主不会新建旁车。
 
-未知错误码按失败处理，不得盲目重试。响应中的未知字段一律被忽略，插件可以新增字段而不破坏旧宿主；
-这要求插件只新增可选字段，不改变既有字段的类型。
+错误码只出现在 `error.code`；`message` 仅供人阅读，不得包含凭据、访问令牌或完整上游 URL。
+
+| 错误码 | 宿主处理 |
+|---|---|
+| `TRAKT_NOT_FOUND` | 跳过该条目，不重试 |
+| `TRAKT_RATE_LIMITED` | 整批结束后等待 60 秒重试该条目一轮 |
+| `TRAKT_UPSTREAM_ERROR` | 整批结束后重试该条目一轮 |
+| `TRAKT_INVALID_REQUEST` | 不重试，计为失败 |
+| `TRAKT_UNAUTHORIZED` | 中止整次运行 |
+| `TRAKT_NOT_CONFIGURED` | 中止整次运行 |
+
+宿主未分类的错误码（包括 `TRAKT_BATCH_TOO_LARGE`）计为失败，不盲目重试。日志只包含运行 id、媒体库 id、
+插件 id、条目 id、计数和耗时，不记录 `clientId`、完整 URL 或查询串。
 
 ### IP 归属地调用约定
 
