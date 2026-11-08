@@ -488,12 +488,12 @@ mod tests {
 
     use super::{
         PluginServiceError, ScraperError, ScraperPluginClient, ScraperResolver,
-        ScraperSearchResult, decode_bundle_response, decode_bundle_response_ref,
-        decode_credits_response, decode_credits_response_ref, decode_images_response,
-        decode_images_response_ref, decode_metadata_response, decode_metadata_response_ref,
-        decode_search_response, decode_search_response_ref, deserialize_value_ref,
-        metadata_capability_for_method, provider_id_for_key, provider_key_from_plugin_id,
-        retryable_scraper_error, scraper_id_matches_provider,
+        ScraperSearchResult, declares_metadata_search, decode_bundle_response,
+        decode_bundle_response_ref, decode_credits_response, decode_credits_response_ref,
+        decode_images_response, decode_images_response_ref, decode_metadata_response,
+        decode_metadata_response_ref, decode_search_response, decode_search_response_ref,
+        deserialize_value_ref, metadata_capability_for_method, provider_id_for_key,
+        provider_key_from_plugin_id, retryable_scraper_error, scraper_id_matches_provider,
     };
     use crate::application::plugin_runtime::PluginRuntimeError;
     use crate::{application::plugins::PluginService, config::Config, storage::Database};
@@ -787,6 +787,24 @@ mod tests {
     }
 
     #[test]
+    fn only_a_plugin_declaring_metadata_search_is_a_scraper() {
+        assert!(declares_metadata_search(&["metadata.search".to_owned()]));
+        assert!(declares_metadata_search(&["METADATA.SEARCH".to_owned()]));
+        assert!(declares_metadata_search(&[
+            "ratings.batch".to_owned(),
+            "metadata.search".to_owned()
+        ]));
+        // The Trakt ratings plugin: a usable plugin, but not a metadata source.
+        assert!(!declares_metadata_search(&[
+            "ratings.lookup".to_owned(),
+            "ratings.batch".to_owned(),
+            "ratings.search".to_owned(),
+        ]));
+        assert!(!declares_metadata_search(&["metadata.images".to_owned()]));
+        assert!(!declares_metadata_search(&[]));
+    }
+
+    #[test]
     fn unsupported_metadata_capability_has_stable_error_text() {
         let error = ScraperError::UnsupportedCapability("metadata.images".to_owned());
         assert_eq!(
@@ -918,6 +936,17 @@ pub(crate) fn metadata_capability_for_method(method: &str) -> Option<&'static st
         "metadata.trailers" => METADATA_TRAILERS_CAPABILITY,
         _ => return None,
     })
+}
+
+/// Whether a plugin declares `metadata.search` and can therefore act as a library scraper.
+///
+/// A `type: metadata` plugin may legitimately answer only `ratings.*` or only `metadata.images`;
+/// such a plugin is not a scraper, because every scraper role starts with a search. The check is
+/// case-insensitive to match how the per-method capability gate compares declarations.
+pub(crate) fn declares_metadata_search(capabilities: &[String]) -> bool {
+    capabilities
+        .iter()
+        .any(|declared| declared.eq_ignore_ascii_case(METADATA_SEARCH_CAPABILITY))
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]

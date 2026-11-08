@@ -1016,6 +1016,108 @@ async fn admin_cannot_select_a_media_probe_plugin_as_a_library_scraper()
 }
 
 #[tokio::test]
+async fn admin_cannot_select_a_ratings_only_plugin_as_a_library_scraper()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    let plugin_dir = config_dir.join("plugins/org.lux.trakt-ratings");
+    fs::create_dir_all(plugin_dir.join("binaries"))?;
+    fs::write(plugin_dir.join("binaries/plugin"), b"plugin")?;
+    // The real plugin is a `type: metadata` plugin in the SCRAPER category that answers ratings
+    // lookups only. It therefore passes the category check and must be rejected for the missing
+    // `metadata.search` capability instead.
+    fs::write(
+        plugin_dir.join("manifest.json"),
+        serde_json::to_vec(&json!({
+            "formatVersion": 1,
+            "id": "org.lux.trakt-ratings",
+            "name": "Trakt ratings",
+            "version": "1.0.0",
+            "apiVersion": 1,
+            "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+            "type": "metadata",
+            "category": "SCRAPER",
+            "capabilities": ["ratings.lookup", "ratings.batch", "ratings.search"],
+            "permissions": {"network": ["ratings.example.test"], "filesystem": []},
+            "files": []
+        }))?,
+    )?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir,
+    };
+    let (base_url, server) = start_server(config).await?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+    let (cookies, csrf) = admin_session(&client, &base_url).await?;
+
+    let installed = client
+        .post(format!(
+            "{base_url}/api/v1/admin/plugins/org.lux.trakt-ratings/install"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(installed.status(), reqwest::StatusCode::CREATED);
+
+    // It stays an installed, enabled plugin: only the scraper role is refused.
+    let catalog = client
+        .get(format!(
+            "{base_url}/api/v1/admin/plugins/installed?page=1&pageSize=20"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    let trakt = plugin_by_id(&catalog, "org.lux.trakt-ratings");
+    assert_eq!(trakt["category"], "SCRAPER");
+    assert_eq!(trakt["installed"], true);
+    assert_eq!(trakt["enabled"], true);
+    assert_eq!(
+        trakt["capabilities"],
+        json!(["ratings.lookup", "ratings.batch", "ratings.search"])
+    );
+
+    let response = client
+        .post(format!("{base_url}/api/v1/admin/libraries"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "name": "Movies",
+            "kind": "MOVIE",
+            "scraperId": "org.lux.trakt-ratings"
+        }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        response.json::<Value>().await?["error"]["code"],
+        "PLUGIN_UNAVAILABLE"
+    );
+
+    // A backup position is the same scraper role, so it is refused the same way.
+    let response = client
+        .post(format!("{base_url}/api/v1/admin/libraries"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "name": "Movies",
+            "kind": "MOVIE",
+            "scrapers": [{"scraperId": "org.lux.trakt-ratings", "role": "BACKUP"}]
+        }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn emby_route_plugin_is_only_exposed_when_installed_and_enabled()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

@@ -42,14 +42,14 @@ use crate::{
             DanmakuMatchStatus, DanmakuSearchResult, DanmakuSearchRpcRequest,
             EMBY_MIGRATION_CAPABILITY, IP_LOCATION_CAPABILITY, IpLocationRpcRequest,
             IpLocationRpcResult, LOGIN_BACKGROUND_GET_CAPABILITY, LOGIN_BACKGROUND_GET_METHOD,
-            LoginBackgroundRpcResult, MEDIA_PROBE_CAPABILITY, MediaProbeRpcResult,
-            MediaProbeRpcStreamType, NOTIFICATION_SEND_CAPABILITY, NOTIFICATION_SEND_METHOD,
-            NotificationSendRpcResult, PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_MIGRATION,
-            PLUGIN_CATEGORY_NETWORK, PLUGIN_CATEGORY_NOTIFICATION, PLUGIN_CATEGORY_SCRAPER,
-            PLUGIN_CATEGORY_UTILITY, PLUGIN_TYPE_CHAPTER_DETECTOR, PLUGIN_TYPE_DANMAKU,
-            PLUGIN_TYPE_DATA_MIGRATION, PLUGIN_TYPE_IP_LOCATION, PLUGIN_TYPE_LOGIN_BACKGROUND,
-            PLUGIN_TYPE_NOTIFICATION, PLUGIN_TYPE_STRM_RESOLVER, PluginConfigField,
-            PluginConfigOption, PluginEmbyRouteRequest, PluginEmbyRouteResponse,
+            LoginBackgroundRpcResult, MEDIA_PROBE_CAPABILITY, METADATA_SEARCH_CAPABILITY,
+            MediaProbeRpcResult, MediaProbeRpcStreamType, NOTIFICATION_SEND_CAPABILITY,
+            NOTIFICATION_SEND_METHOD, NotificationSendRpcResult, PLUGIN_CATEGORY_MEDIA,
+            PLUGIN_CATEGORY_MIGRATION, PLUGIN_CATEGORY_NETWORK, PLUGIN_CATEGORY_NOTIFICATION,
+            PLUGIN_CATEGORY_SCRAPER, PLUGIN_CATEGORY_UTILITY, PLUGIN_TYPE_CHAPTER_DETECTOR,
+            PLUGIN_TYPE_DANMAKU, PLUGIN_TYPE_DATA_MIGRATION, PLUGIN_TYPE_IP_LOCATION,
+            PLUGIN_TYPE_LOGIN_BACKGROUND, PLUGIN_TYPE_NOTIFICATION, PLUGIN_TYPE_STRM_RESOLVER,
+            PluginConfigField, PluginConfigOption, PluginEmbyRouteRequest, PluginEmbyRouteResponse,
             SECRET_CONFIG_FIELD_KEY, STRM_RESOLVE_CAPABILITY, STRM_RESOLVE_METHOD,
             StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
             declares_danmaku_manual_match, is_valid_login_background_asset_id,
@@ -931,6 +931,12 @@ impl PluginService {
         let view = self.view_for_id(&scraper_id, true, true).await?;
         if view.category != PLUGIN_CATEGORY_SCRAPER || !view.available {
             return Err(PluginServiceError::Unavailable(scraper_id));
+        }
+        // A `type: metadata` plugin without `metadata.search` cannot answer a single scraper call.
+        // The ratings plugin is exactly that: read-only, in the SCRAPER category, and never a
+        // metadata source for a library.
+        if !crate::application::scraper::declares_metadata_search(&view.capabilities) {
+            return Err(PluginServiceError::Unsupported(METADATA_SEARCH_CAPABILITY));
         }
         Ok(())
     }
