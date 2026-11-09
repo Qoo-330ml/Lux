@@ -335,7 +335,7 @@ Actions 在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` runner 上分别构建。Relea
   宿主负责迁移任务、映射、导入、幂等、恢复和历史事件落库；插件不能访问 Lux 数据库、媒体目录或任务对象。
 - `plugin.shutdown`：请求插件优雅退出。
 
-配置字段支持 text、password、select、toggle、number 和 `login_background` 专用的 `image`；select 可通过 multiple: true 声明多选，选项使用
+配置字段支持 text、textarea、password、select、toggle、number 和 `login_background` 专用的 `image`；select 可通过 multiple: true 声明多选，选项使用
 `{ "value": "...", "label": "..." }`。`number` 可以声明 `minimum`、`maximum` 和
 `defaultValue`。select 可以声明 `optionsSource`，当前支持 `media-libraries`，由 Lux 根据当前
 媒体库动态填充选项，不把媒体库 ID 或路径写死在插件包中。管理 API 返回的 `configValues` 只允许包含非敏感当前值。

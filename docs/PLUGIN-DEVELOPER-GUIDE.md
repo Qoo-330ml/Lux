@@ -255,7 +255,8 @@ Lux 对插件包有硬性上限，超出即拒绝安装（来源：`src/applicat
 
 | `type` | 说明 |
 |---|---|
-| `text` | 文本 |
+| `text` | 单行文本 |
+| `textarea` | 多行文本 |
 | `password` | 密码，必须同时 `sensitive: true`，不会回显 |
 | `select` | 下拉选择，`options` 为 `{value, label}` 数组；`multiple: true` 可多选 |
 | `toggle` | 开关 |
