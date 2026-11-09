@@ -21655,7 +21655,7 @@ content light level）只出现在帧级 side data，`-show_streams` 的 `side_d
 范围（只改 `src/application/probe.rs` 与对应测试）：
 
 - 解析 `side_data_list`，只识别 `side_data_type == "DOVI configuration record"` 的条目。
-- 只对视频流推导，且不覆盖已有的 `VideoRange`/`VideoRangeType`。
+- 只对视频流推导；推导结果只补充缺失键（`or_insert`），不改写已有值。
 - 推导规则（优先级从上到下）：
   - 存在杜比视界配置记录：`VideoRange = Dolby Vision`；`VideoRangeType` 按
     `dv_bl_signal_compatibility_id` 取 `1 → DOVIWithHDR10`、`2 → DOVIWithSDR`、`4 → DOVIWithHLG`，
@@ -21671,7 +21671,7 @@ content light level）只出现在帧级 side data，`-show_streams` 的 `side_d
 验收：
 
 - [ ] `cargo test --locked --test strm probe::` 通过，新增用例覆盖：SDR、HLG、HDR10、杜比视界（兼容 ID 1/2/4/0）、
-  无信号的未知 transfer 不输出、音频流不推导、已有 `VideoRange` 不被覆盖、`side_data_list` 为非数组时不 panic。
+  无信号的未知 transfer 不输出、音频流不推导、`side_data_list` 为非数组或条目畸形时不 panic 并回退到 transfer 规则。
 - [ ] `cargo fmt --all -- --check` 通过。
 - [ ] `cargo clippy --locked --all-targets --all-features -- -D warnings` 零警告（任务完成时运行）。
 - [ ] `COMPATIBILITY.md` 记录推导规则与 HDR10+ 的未覆盖说明。
