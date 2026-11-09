@@ -21644,6 +21644,39 @@ ADR-053 重复，且 ADR-053 不建表、不加迁移。已取消，不实施。
 
 ADR-053 明确 v1 不提供评分界面。若需要，等待 ADR 增补后另立任务。
 
+#### LUX-908：宿主侧 ffprobe 推导 VideoRange / VideoRangeType（仅 stream 级）
+
+背景：`ffprobe -show_streams` 不输出 `VideoRange`/`VideoRangeType`，宿主当前只保存 `ColorTransfer`、
+`ColorSpace`、`ColorPrimaries`。Emby 客户端依赖 `VideoRange` 显示 HDR 信息，因此由 ffprobe 的流级
+信息推导这两个字段。实测（2026-11-09，本机 ffprobe）：HDR10/HLG 的静态元数据（mastering display、
+content light level）只出现在帧级 side data，`-show_streams` 的 `side_data_list` 为空；而
+`color_transfer` 在流级稳定存在。因此 HDR10 只依据 `color_transfer`，不依赖静态元数据。
+
+范围（只改 `src/application/probe.rs` 与对应测试）：
+
+- 解析 `side_data_list`，只识别 `side_data_type == "DOVI configuration record"` 的条目。
+- 只对视频流推导，且不覆盖已有的 `VideoRange`/`VideoRangeType`。
+- 推导规则（优先级从上到下）：
+  - 存在杜比视界配置记录：`VideoRange = Dolby Vision`；`VideoRangeType` 按
+    `dv_bl_signal_compatibility_id` 取 `1 → DOVIWithHDR10`、`2 → DOVIWithSDR`、`4 → DOVIWithHLG`，
+    其他或缺失取 `DOVI`。
+  - `color_transfer = smpte2084`：`HDR10` / `HDR10`。
+  - `color_transfer = arib-std-b67`：`HLG` / `HLG`。
+  - `color_transfer` 为 `bt709`、`smpte170m`、`iec61966-2-1`、`bt2020-10`、`bt2020-12` 之一：`SDR` / `SDR`。
+  - 其他或缺失：不输出两个键，不猜测。
+- **不做** HDR10+ 识别：它需要逐帧读取动态元数据，本任务不引入 `-show_frames`，也不增加 ffprobe 调用。
+  PQ 流统一输出 `HDR10`。
+- 不改数据库、迁移、Emby 输出逻辑（`VideoRange` 的规范化沿用 LUX-878 词表）、插件仓库。
+
+验收：
+
+- [ ] `cargo test --locked --test strm probe::` 通过，新增用例覆盖：SDR、HLG、HDR10、杜比视界（兼容 ID 1/2/4/0）、
+  无信号的未知 transfer 不输出、音频流不推导、已有 `VideoRange` 不被覆盖、`side_data_list` 为非数组时不 panic。
+- [ ] `cargo fmt --all -- --check` 通过。
+- [ ] `cargo clippy --locked --all-targets --all-features -- -D warnings` 零警告（任务完成时运行）。
+- [ ] `COMPATIBILITY.md` 记录推导规则与 HDR10+ 的未覆盖说明。
+- [ ] 本任务不改 `Lux-plugins` 仓库中的 STRM 插件；插件侧需另立任务（它有独立的 `probe.rs` 副本）。
+
 ## 31. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
