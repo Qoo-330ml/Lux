@@ -1,22 +1,14 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckCircle2, Download, Globe2, PackageOpen, RefreshCw, Save, Settings2, Trash2, X } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
-import type { AdminPlugin } from "../../lib/api/types";
+import type { AdminPlugin, AdminPluginConfigField } from "../../lib/api/types";
 import { LuxSelect } from "../../components/LuxSelect";
 import { EmbyMigrationPluginConfig } from "./EmbyMigrationPluginConfig";
 import "./plugin-library.css";
-import { LuxButton, LuxIconButton, LuxSwitch, LuxTextField } from "../../components/ui";
+import { LuxButton, LuxIconButton, LuxSwitch, LuxTextField, LuxTextarea } from "../../components/ui";
 
-const CONFIG_SELECT_FIELDS_RENDERED_EXPLICITLY = new Set([
-  "apiBaseUrl",
-  "apiBaseUrlPreset",
-  "existingInfoPolicy",
-  "fallbackLanguages",
-  "libraryIds",
-  "preferredLanguage",
-]);
 const LOGIN_BACKGROUND_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 const MAX_PLUGIN_IMAGE_UPLOAD_BYTES = 5 * 1024 * 1024;
 const MAX_PLUGIN_STORE_SOURCES = 10;
@@ -236,183 +228,25 @@ export function AdminPluginsPage() {
   );
 }
 
+type PluginConfigPair = {
+  select: AdminPluginConfigField;
+  detail: AdminPluginConfigField;
+  customOption: { value: string; label: string };
+  gate: AdminPluginConfigField | null;
+};
+
+type PluginConfigValues = Record<string, unknown>;
+
 function PluginCard({ plugin, installing, installedManagement, toggling, uninstalling, updating, onInstall, onToggleEnabled, onUninstall, onUpdate }: { plugin: AdminPlugin; installing: boolean; installedManagement: boolean; toggling: boolean; uninstalling: boolean; updating: boolean; onInstall: () => void; onToggleEnabled: (enabled: boolean) => void; onUninstall: () => void; onUpdate: () => void }) {
-  const queryClient = useQueryClient();
   const [open, setOpen] = useState(false);
   const [uninstallDialogOpen, setUninstallDialogOpen] = useState(false);
-  const [apiKey, setApiKey] = useState("");
-  const [apiKeyDirty, setApiKeyDirty] = useState(false);
-  const [additionalSelectValues, setAdditionalSelectValues] = useState<Record<string, string | string[]>>({});
-  const [additionalToggleValues, setAdditionalToggleValues] = useState<Record<string, boolean>>({});
-  const [uploadedImageFields, setUploadedImageFields] = useState<Record<string, boolean>>({});
-  const [imageUploadErrors, setImageUploadErrors] = useState<Record<string, string>>({});
-  const [danmakuProviderBaseUrl, setDanmakuProviderBaseUrl] = useState("");
-  const [danmakuProviderBaseUrlDirty, setDanmakuProviderBaseUrlDirty] = useState(false);
-  const [preferredLanguage, setPreferredLanguage] = useState("zh-CN");
-  const [languageFallbackEnabled, setLanguageFallbackEnabled] = useState(false);
-  const [titleAliasReplacementEnabled, setTitleAliasReplacementEnabled] = useState(false);
-  const [originalLanguageEnabled, setOriginalLanguageEnabled] = useState(false);
-  const [fallbackLanguages, setFallbackLanguages] = useState<string[]>(["zh-SG", "zh-HK", "zh-TW"]);
-  const [alternateApiEnabled, setAlternateApiEnabled] = useState(false);
-  const [apiBaseUrlChoice, setApiBaseUrlChoice] = useState("official");
-  const [customApiBaseUrl, setCustomApiBaseUrl] = useState("");
-  const [libraryIds, setLibraryIds] = useState<string[]>([]);
-  const [matchOriginalFilename, setMatchOriginalFilename] = useState(true);
-  const [matchSimplifiedTraditionalTitles, setMatchSimplifiedTraditionalTitles] = useState(true);
-  const [matchEnglishTitle, setMatchEnglishTitle] = useState(false);
-  const [concurrency, setConcurrency] = useState(2);
-  const [overwrite, setOverwrite] = useState(false);
-  const [introWindowSeconds, setIntroWindowSeconds] = useState(180);
-  const [creditsWindowSeconds, setCreditsWindowSeconds] = useState(180);
-  const [matchThreshold, setMatchThreshold] = useState(80);
-  const [existingInfoPolicy, setExistingInfoPolicy] = useState("SKIP");
-  const [mediaInfoEnabled, setMediaInfoEnabled] = useState(true);
-  const [thumbnailEnabled, setThumbnailEnabled] = useState(false);
-  const [thumbnailPositionPercent, setThumbnailPositionPercent] = useState(30);
-  const [writeSidecars, setWriteSidecars] = useState(true);
-  const [schedule, setSchedule] = useState("0 3 * * *");
   const closeRef = useRef<HTMLButtonElement>(null);
   const uninstallCancelRef = useRef<HTMLButtonElement>(null);
-  const isDanmaku = plugin.id === "org.lux.danmaku";
-  const isMediaInfo = plugin.id === "org.lux.strm-media-info";
-  const isMigration = plugin.id === "org.lux.emby-migration";
-  const isLoginBackgroundProvider = plugin.capabilities?.includes("login_background.get") === true;
-  const isChapterSource = plugin.capabilities?.some((capability) => capability === "chapters.detect" || capability === "chapters.lookup") === true;
-  const configField = plugin.configFields.find((field) => field.key === "apiKey");
-  const danmakuProviderField = plugin.configFields.find((field) => field.key === "providerBaseUrl");
-  const preferredLanguageField = plugin.configFields.find((field) => field.key === "preferredLanguage");
-  const fallbackEnabledField = plugin.configFields.find((field) => field.key === "languageFallbackEnabled");
-  const titleAliasReplacementField = plugin.configFields.find((field) => field.key === "titleAliasReplacementEnabled");
-  const originalLanguageField = plugin.configFields.find((field) => field.key === "originalLanguageEnabled");
-  const fallbackLanguagesField = plugin.configFields.find((field) => field.key === "fallbackLanguages");
-  const alternateApiField = plugin.configFields.find((field) => field.key === "alternateApiEnabled");
-  const apiBaseUrlField = plugin.configFields.find((field) => field.key === "apiBaseUrl");
-  const apiBaseUrlPresetField = plugin.configFields.find((field) => field.key === "apiBaseUrlPreset")
-    ?? (apiBaseUrlField?.type === "select" ? apiBaseUrlField : undefined);
-  const customApiBaseUrlField = plugin.configFields.find((field) => field.key === "customApiBaseUrl")
-    ?? (apiBaseUrlField?.type === "text" ? apiBaseUrlField : undefined);
-  const libraryIdsField = plugin.configFields.find((field) => field.key === "libraryIds");
-  const concurrencyField = plugin.configFields.find((field) => field.key === "concurrency");
-  const overwriteField = plugin.configFields.find((field) => field.key === "overwrite");
-  const introWindowField = plugin.configFields.find((field) => field.key === "introWindowSeconds");
-  const creditsWindowField = plugin.configFields.find((field) => field.key === "creditsWindowSeconds");
-  const matchThresholdField = plugin.configFields.find((field) => field.key === "matchThreshold");
-  const existingInfoPolicyField = plugin.configFields.find((field) => field.key === "existingInfoPolicy");
-  const mediaInfoEnabledField = plugin.configFields.find((field) => field.key === "mediaInfoEnabled");
-  const thumbnailEnabledField = plugin.configFields.find((field) => field.key === "thumbnailEnabled");
-  const thumbnailPositionPercentField = plugin.configFields.find((field) => field.key === "thumbnailPositionPercent");
-  const writeSidecarsField = plugin.configFields.find((field) => field.key === "writeSidecars");
-  const scheduleField = plugin.configFields.find((field) => field.key === "schedule");
-  const additionalSelectFields = plugin.configFields.filter((field) =>
-    field.type === "select" && !CONFIG_SELECT_FIELDS_RENDERED_EXPLICITLY.has(field.key));
-  const additionalToggleFields = plugin.configFields.filter((field) => field.type === "toggle");
-  const imageFields = plugin.configFields.filter((field) => field.type === "image");
-  const additionalSelectConfig = additionalSelectFields.reduce<Record<string, string | string[]>>((config, field) => {
-    const value = additionalSelectValues[field.key];
-    if (Array.isArray(value) || (typeof value === "string" && value !== "")) {
-      config[field.key] = value;
-    }
-    return config;
-  }, {});
-  const additionalToggleConfig = additionalToggleFields.reduce<Record<string, boolean>>((config, field) => {
-    const value = additionalToggleValues[field.key];
-    if (typeof value === "boolean") config[field.key] = value;
-    return config;
-  }, {});
-  const requiredSelectMissing = additionalSelectFields.some((field) => {
-    const value = additionalSelectValues[field.key];
-    return field.required && (Array.isArray(value) ? value.length === 0 : !value);
-  });
-  const customApiBaseUrlOption = apiBaseUrlPresetField?.options?.find((option) => option.label === "自定义")?.value ?? "custom";
+  const isEmbyMigration = plugin.capabilities?.includes("migration.emby") === true;
   const canConfigure = plugin.installed && plugin.configurable && plugin.configFields.length > 0;
   const toggleBlockedByProvider = plugin.unavailableReason === "OTHER_IP_LOCATION_PLUGIN_INSTALLED";
   const closeDialog = useCallback(() => setOpen(false), []);
-  const save = useMutation({
-    mutationFn: () => isDanmaku
-      ? api.updateAdminPluginConfig(plugin.id, {
-          ...(danmakuProviderBaseUrlDirty ? { providerBaseUrl: danmakuProviderBaseUrl.trim() } : {}),
-          libraryIds,
-          matchOriginalFilename,
-          matchSimplifiedTraditionalTitles,
-          matchEnglishTitle,
-          concurrency,
-          overwrite,
-          ...additionalSelectConfig,
-        })
-      : isMediaInfo
-        ? api.updateAdminPluginConfig(plugin.id, {
-          libraryIds,
-          concurrency,
-          existingInfoPolicy,
-          ...(mediaInfoEnabledField ? { mediaInfoEnabled } : {}),
-          ...(thumbnailEnabledField ? { thumbnailEnabled } : {}),
-          ...(thumbnailPositionPercentField ? { thumbnailPositionPercent } : {}),
-          writeSidecars,
-          ...(scheduleField ? { schedule: schedule.trim() } : {}),
-          ...additionalSelectConfig,
-          })
-        : isChapterSource
-          ? api.updateAdminPluginConfig(plugin.id, {
-            concurrency,
-            ...(introWindowField ? { introWindowSeconds } : {}),
-            ...(creditsWindowField ? { creditsWindowSeconds } : {}),
-            ...(matchThresholdField ? { matchThreshold } : {}),
-            ...(scheduleField ? { schedule: schedule.trim() } : {}),
-            ...additionalSelectConfig,
-            })
-          : isLoginBackgroundProvider
-            ? api.updateAdminPluginConfig(plugin.id, {
-              ...additionalSelectConfig,
-              ...additionalToggleConfig,
-            })
-          : api.updateAdminPluginConfig(plugin.id, {
-          ...(apiKeyDirty ? { apiKey } : {}),
-          preferredLanguage,
-          languageFallbackEnabled,
-          titleAliasReplacementEnabled,
-          ...(originalLanguageField ? { originalLanguageEnabled } : {}),
-          fallbackLanguages,
-          alternateApiEnabled,
-          ...(apiBaseUrlPresetField?.key === "apiBaseUrlPreset"
-            ? {
-              apiBaseUrlPreset: apiBaseUrlChoice,
-              apiBaseUrl: apiBaseUrlChoice === customApiBaseUrlOption
-                ? customApiBaseUrl.trim()
-                : apiBaseUrlPresetField.options?.find((option) => option.value === apiBaseUrlChoice)?.label ?? "",
-            }
-            : apiBaseUrlField
-              ? {
-                apiBaseUrl: apiBaseUrlField.type === "select"
-                  ? apiBaseUrlChoice
-                  : customApiBaseUrl.trim(),
-                ...(customApiBaseUrlField?.key === "customApiBaseUrl"
-                  ? { customApiBaseUrl: customApiBaseUrl.trim() }
-                  : {}),
-              }
-              : {}),
-          ...additionalSelectConfig,
-        }),
-    onSuccess: () => {
-      setApiKey("");
-      setDanmakuProviderBaseUrl("");
-      setDanmakuProviderBaseUrlDirty(false);
-      closeDialog();
-      void queryClient.invalidateQueries({ queryKey: queryKeys.adminPlugins });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.adminInstalledPlugins });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraries });
-    },
-  });
-  const uploadImage = useMutation({
-    mutationFn: ({ fieldKey, file }: { fieldKey: string; file: File }) =>
-      api.uploadAdminPluginConfigImage(plugin.id, fieldKey, file),
-    onSuccess: (_result, { fieldKey }) => {
-      setUploadedImageFields((current) => ({ ...current, [fieldKey]: true }));
-      setImageUploadErrors((current) => ({ ...current, [fieldKey]: "" }));
-    },
-    onError: (error, { fieldKey }) => {
-      setImageUploadErrors((current) => ({ ...current, [fieldKey]: error.message }));
-    },
-  });
+
   useEffect(() => {
     if (!open) return;
     closeRef.current?.focus();
@@ -438,89 +272,6 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
     document.addEventListener("keydown", closeOnEscape);
     return () => document.removeEventListener("keydown", closeOnEscape);
   }, [uninstallDialogOpen]);
-
-  useEffect(() => {
-    if (!open) return;
-    const values = plugin.configValues ?? {};
-    const preferred = typeof values.preferredLanguage === "string"
-      ? values.preferredLanguage
-      : preferredLanguageField?.options?.[0]?.value ?? "zh-CN";
-    const fallback = Array.isArray(values.fallbackLanguages)
-      ? values.fallbackLanguages.filter((value): value is string => typeof value === "string")
-      : ["zh-TW"];
-    const configuredApiBaseUrl = typeof values.apiBaseUrl === "string"
-      ? values.apiBaseUrl
-      : typeof apiBaseUrlField?.defaultValue === "string"
-        ? apiBaseUrlField.defaultValue
-        : apiBaseUrlPresetField?.options?.[0]?.label ?? "https://api.themoviedb.org";
-    const configuredApiBaseUrlPreset = typeof values.apiBaseUrlPreset === "string"
-      ? values.apiBaseUrlPreset
-      : undefined;
-    const selectedApiOption = apiBaseUrlPresetField?.options?.find(
-      (option) => option.value !== customApiBaseUrlOption
-        && (option.value === configuredApiBaseUrlPreset
-          || option.value === configuredApiBaseUrl
-          || option.label === configuredApiBaseUrl),
-    );
-    setPreferredLanguage(preferred);
-    setLanguageFallbackEnabled(values.languageFallbackEnabled === true);
-    setTitleAliasReplacementEnabled(values.titleAliasReplacementEnabled === true);
-    setOriginalLanguageEnabled(values.originalLanguageEnabled === true);
-    setFallbackLanguages(fallback);
-    setAlternateApiEnabled(values.alternateApiEnabled === true);
-    setApiBaseUrlChoice(selectedApiOption?.value ?? customApiBaseUrlOption);
-    setCustomApiBaseUrl(typeof values.customApiBaseUrl === "string"
-      ? values.customApiBaseUrl
-      : selectedApiOption ? "" : configuredApiBaseUrl);
-    const configuredLibraryIds = Array.isArray(values.libraryIds)
-      ? values.libraryIds.filter((value): value is string => typeof value === "string")
-      : [];
-    setLibraryIds(configuredLibraryIds);
-    setMatchOriginalFilename(values.matchOriginalFilename !== false);
-    setMatchSimplifiedTraditionalTitles(values.matchSimplifiedTraditionalTitles !== false);
-    setMatchEnglishTitle(values.matchEnglishTitle === true);
-    setConcurrency(typeof values.concurrency === "number" ? values.concurrency : Number(concurrencyField?.defaultValue ?? 2));
-    setOverwrite(values.overwrite === true);
-    setIntroWindowSeconds(typeof values.introWindowSeconds === "number" ? values.introWindowSeconds : Number(introWindowField?.defaultValue ?? 180));
-    setCreditsWindowSeconds(typeof values.creditsWindowSeconds === "number" ? values.creditsWindowSeconds : Number(creditsWindowField?.defaultValue ?? 180));
-    setMatchThreshold(typeof values.matchThreshold === "number" ? values.matchThreshold : Number(matchThresholdField?.defaultValue ?? 80));
-    const configuredExistingInfoPolicy = typeof values.existingInfoPolicy === "string"
-      ? values.existingInfoPolicy
-      : String(existingInfoPolicyField?.defaultValue ?? "SKIP");
-    const configuredThumbnailPositionPercent = typeof values.thumbnailPositionPercent === "number"
-      ? values.thumbnailPositionPercent
-      : Number(thumbnailPositionPercentField?.defaultValue ?? 30);
-    setExistingInfoPolicy(configuredExistingInfoPolicy);
-    setMediaInfoEnabled(values.mediaInfoEnabled !== false);
-    setThumbnailEnabled(values.thumbnailEnabled === true);
-    setThumbnailPositionPercent(configuredThumbnailPositionPercent);
-    setWriteSidecars(values.writeSidecars !== false);
-    setSchedule(typeof values.schedule === "string" ? values.schedule : String(scheduleField?.defaultValue ?? "0 3 * * *"));
-    setAdditionalSelectValues(Object.fromEntries(additionalSelectFields.map((field) => {
-      const configuredValue = values[field.key];
-      const defaultValue = field.defaultValue;
-      const value = field.multiple
-        ? Array.isArray(configuredValue)
-          ? configuredValue.filter((item): item is string => typeof item === "string")
-          : Array.isArray(defaultValue)
-            ? defaultValue.filter((item): item is string => typeof item === "string")
-            : []
-        : typeof configuredValue === "string"
-          ? configuredValue
-          : typeof defaultValue === "string" ? defaultValue : "";
-      return [field.key, value];
-    })));
-    setAdditionalToggleValues(Object.fromEntries(additionalToggleFields.map((field) => {
-      const configuredValue = values[field.key];
-      return [field.key, typeof configuredValue === "boolean"
-        ? configuredValue
-        : field.defaultValue === true];
-    })));
-    setApiKey("");
-    setApiKeyDirty(false);
-    setDanmakuProviderBaseUrl("");
-    setDanmakuProviderBaseUrlDirty(false);
-  }, [apiBaseUrlField?.defaultValue, apiBaseUrlPresetField?.options, concurrencyField?.defaultValue, creditsWindowField?.defaultValue, customApiBaseUrlOption, existingInfoPolicyField?.defaultValue, introWindowField?.defaultValue, matchThresholdField?.defaultValue, open, originalLanguageField?.defaultValue, overwriteField?.defaultValue, plugin.configFields, plugin.configValues, preferredLanguageField?.options, scheduleField?.defaultValue, thumbnailPositionPercentField?.defaultValue, titleAliasReplacementField?.defaultValue]);
 
   return (
     <article className="lux-admin-plugin-card">
@@ -554,117 +305,12 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
       </div>
       {open && canConfigure ? (
         <div className="lux-admin-plugin-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeDialog(); }}>
-          <section className={`lux-admin-plugin-dialog${isMigration ? " lux-admin-plugin-migration-dialog" : ""}`} role="dialog" aria-modal="true" aria-labelledby={`plugin-config-title-${plugin.id}`}>
+          <section className={`lux-admin-plugin-dialog${isEmbyMigration ? " lux-admin-plugin-migration-dialog" : ""}`} role="dialog" aria-modal="true" aria-labelledby={`plugin-config-title-${plugin.id}`}>
             <div className="lux-admin-plugin-dialog-heading">
               <div><h2 id={`plugin-config-title-${plugin.id}`}>{plugin.name}</h2></div>
               <LuxIconButton className="lux-admin-plugin-dialog-close" ref={closeRef} type="button" aria-label={`关闭 ${plugin.name}配置`} onClick={closeDialog}><X size={17} /></LuxIconButton>
             </div>
-            {isMigration ? <EmbyMigrationPluginConfig plugin={plugin} /> : <form className="lux-admin-plugin-dialog-form" autoComplete="off" onSubmit={(event) => { event.preventDefault(); if (!requiredSelectMissing) save.mutate(); }}>
-              {isDanmaku ? <>
-                {danmakuProviderField ? <label htmlFor={"plugin-config-" + plugin.id + "-provider-base-url"}>{danmakuProviderField.label}<LuxTextField id={"plugin-config-" + plugin.id + "-provider-base-url"} type="url" value={danmakuProviderBaseUrl} onChange={(event) => { setDanmakuProviderBaseUrl(event.target.value); setDanmakuProviderBaseUrlDirty(true); }} placeholder="留空保留已保存的地址" autoComplete="url" required={danmakuProviderField.required && !plugin.configured} /><small>{danmakuProviderField.description}</small></label> : null}
-                {libraryIdsField ? <label htmlFor={"plugin-config-" + plugin.id + "-library-ids"}>{libraryIdsField.label}<LuxSelect id={"plugin-config-" + plugin.id + "-library-ids"} multiple value={libraryIds} options={libraryIdsField.options ?? []} onChange={setLibraryIds} aria-label={libraryIdsField.label} /><small>{libraryIdsField.description}</small></label> : null}
-                <LuxSwitch className="lux-admin-plugin-toggle" checked={matchOriginalFilename} onChange={(event) => setMatchOriginalFilename(event.target.checked)} label=<>使用原始文件名</> description=<>优先使用视频文件名请求上游匹配接口。</> />
-                <LuxSwitch className="lux-admin-plugin-toggle" checked={matchSimplifiedTraditionalTitles} onChange={(event) => setMatchSimplifiedTraditionalTitles(event.target.checked)} label=<>尝试简繁标题</> description=<>没有匹配结果时，尝试已登记的本地标题候选。</> />
-                <LuxSwitch className="lux-admin-plugin-toggle" checked={matchEnglishTitle} onChange={(event) => setMatchEnglishTitle(event.target.checked)} label=<>尝试英文标题</> description=<>没有匹配结果时，尝试已登记的英文或原始标题。</> />
-                {concurrencyField ? <label htmlFor={"plugin-config-" + plugin.id + "-concurrency"}>{concurrencyField.label}<LuxTextField id={"plugin-config-" + plugin.id + "-concurrency"} type="number" min={concurrencyField.minimum ?? 0} max={concurrencyField.maximum ?? 64} step={1} value={concurrency} onChange={(event) => setConcurrency(Number(event.target.value))} /><small>{concurrencyField.description}</small></label> : null}
-                {overwriteField ? <LuxSwitch className="lux-admin-plugin-toggle" checked={overwrite} onChange={(event) => setOverwrite(event.target.checked)} label=<>{overwriteField.label}</> description=<>{overwriteField.description}</> /> : null}
-              </> : isMediaInfo ? <>
-                {libraryIdsField ? <label htmlFor={"plugin-config-" + plugin.id + "-library-ids"}>{libraryIdsField.label}<LuxSelect id={"plugin-config-" + plugin.id + "-library-ids"} multiple value={libraryIds} options={libraryIdsField.options ?? []} onChange={setLibraryIds} aria-label={libraryIdsField.label} /><small>{libraryIdsField.description}</small></label> : null}
-                {concurrencyField ? <label htmlFor={"plugin-config-" + plugin.id + "-concurrency"}>{concurrencyField.label}<LuxTextField id={"plugin-config-" + plugin.id + "-concurrency"} type="number" min={concurrencyField.minimum ?? 1} max={concurrencyField.maximum ?? 64} value={concurrency} onChange={(event) => setConcurrency(Number(event.target.value))} /><small>{concurrencyField.description}</small></label> : null}
-                {introWindowField ? <label htmlFor={"plugin-config-" + plugin.id + "-intro-window"}>{introWindowField.label}<LuxTextField id={"plugin-config-" + plugin.id + "-intro-window"} type="number" min={introWindowField.minimum ?? 15} max={introWindowField.maximum ?? 300} value={introWindowSeconds} onChange={(event) => setIntroWindowSeconds(Number(event.target.value))} /><small>{introWindowField.description}</small></label> : null}
-                {creditsWindowField ? <label htmlFor={"plugin-config-" + plugin.id + "-credits-window"}>{creditsWindowField.label}<LuxTextField id={"plugin-config-" + plugin.id + "-credits-window"} type="number" min={creditsWindowField.minimum ?? 15} max={creditsWindowField.maximum ?? 600} value={creditsWindowSeconds} onChange={(event) => setCreditsWindowSeconds(Number(event.target.value))} /><small>{creditsWindowField.description}</small></label> : null}
-                {matchThresholdField ? <label htmlFor={"plugin-config-" + plugin.id + "-match-threshold"}>{matchThresholdField.label}<LuxTextField id={"plugin-config-" + plugin.id + "-match-threshold"} type="number" min={matchThresholdField.minimum ?? 1} max={matchThresholdField.maximum ?? 100} value={matchThreshold} onChange={(event) => setMatchThreshold(Number(event.target.value))} /><small>{matchThresholdField.description}</small></label> : null}
-                {existingInfoPolicyField ? <label htmlFor={"plugin-config-" + plugin.id + "-existing-info-policy"}>{existingInfoPolicyField.label}<LuxSelect id={"plugin-config-" + plugin.id + "-existing-info-policy"} value={existingInfoPolicy} options={existingInfoPolicyField.options ?? []} onChange={setExistingInfoPolicy} aria-label={existingInfoPolicyField.label} /><small>{existingInfoPolicyField.description}</small></label> : null}
-                {mediaInfoEnabledField ? <LuxSwitch className="lux-admin-plugin-toggle" checked={mediaInfoEnabled} onChange={(event) => setMediaInfoEnabled(event.target.checked)} label=<>{mediaInfoEnabledField.label}</> description=<>{mediaInfoEnabledField.description}</> /> : null}
-                {thumbnailEnabledField ? <LuxSwitch className="lux-admin-plugin-toggle" checked={thumbnailEnabled} onChange={(event) => setThumbnailEnabled(event.target.checked)} label=<>{thumbnailEnabledField.label}</> description=<>{thumbnailEnabledField.description}</> /> : null}
-                {thumbnailPositionPercentField ? <label htmlFor={"plugin-config-" + plugin.id + "-thumbnail-position-percent"}>{thumbnailPositionPercentField.label}<LuxTextField id={"plugin-config-" + plugin.id + "-thumbnail-position-percent"} type="number" required={thumbnailPositionPercentField.required} min={thumbnailPositionPercentField.minimum ?? 1} max={thumbnailPositionPercentField.maximum ?? 99} value={thumbnailPositionPercent} onChange={(event) => setThumbnailPositionPercent(Number(event.target.value))} /><small>{thumbnailPositionPercentField.description}</small></label> : null}
-                {writeSidecarsField ? <LuxSwitch className="lux-admin-plugin-toggle" checked={writeSidecars} onChange={(event) => setWriteSidecars(event.target.checked)} label=<>{writeSidecarsField.label}</> description=<>{writeSidecarsField.description}</> /> : null}
-                {scheduleField ? <label htmlFor={"plugin-config-" + plugin.id + "-schedule"}>{scheduleField.label}<LuxTextField id={"plugin-config-" + plugin.id + "-schedule"} type="text" required={scheduleField.required} value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder="0 3 * * *" /><small>{scheduleField.description}</small></label> : null}
-              </> : isChapterSource ? <>
-                {concurrencyField ? <label htmlFor={"plugin-config-" + plugin.id + "-concurrency"}>{concurrencyField.label}<LuxTextField id={"plugin-config-" + plugin.id + "-concurrency"} type="number" min={concurrencyField.minimum ?? 1} max={concurrencyField.maximum ?? 64} value={concurrency} onChange={(event) => setConcurrency(Number(event.target.value))} /><small>{concurrencyField.description}</small></label> : null}
-                {introWindowField ? <label htmlFor={"plugin-config-" + plugin.id + "-intro-window"}>{introWindowField.label}<LuxTextField id={"plugin-config-" + plugin.id + "-intro-window"} type="number" min={introWindowField.minimum ?? 15} max={introWindowField.maximum ?? 300} value={introWindowSeconds} onChange={(event) => setIntroWindowSeconds(Number(event.target.value))} /><small>{introWindowField.description}</small></label> : null}
-                {creditsWindowField ? <label htmlFor={"plugin-config-" + plugin.id + "-credits-window"}>{creditsWindowField.label}<LuxTextField id={"plugin-config-" + plugin.id + "-credits-window"} type="number" min={creditsWindowField.minimum ?? 15} max={creditsWindowField.maximum ?? 600} value={creditsWindowSeconds} onChange={(event) => setCreditsWindowSeconds(Number(event.target.value))} /><small>{creditsWindowField.description}</small></label> : null}
-                {matchThresholdField ? <label htmlFor={"plugin-config-" + plugin.id + "-match-threshold"}>{matchThresholdField.label}<LuxTextField id={"plugin-config-" + plugin.id + "-match-threshold"} type="number" min={matchThresholdField.minimum ?? 1} max={matchThresholdField.maximum ?? 100} value={matchThreshold} onChange={(event) => setMatchThreshold(Number(event.target.value))} /><small>{matchThresholdField.description}</small></label> : null}
-                {scheduleField ? <label htmlFor={"plugin-config-" + plugin.id + "-schedule"}>{scheduleField.label}<LuxTextField id={"plugin-config-" + plugin.id + "-schedule"} type="text" required={scheduleField.required} value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder="0 3 * * *" /><small>{scheduleField.description}</small></label> : null}
-              </> : <>
-                {configField ? <label htmlFor={"plugin-config-" + plugin.id + "-api-key"}>{configField.label}<LuxTextField id={"plugin-config-" + plugin.id + "-api-key"} type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setApiKeyDirty(true); }} placeholder="留空使用插件默认凭据" autoComplete="new-password" /></label> : null}
-                {preferredLanguageField ? <label htmlFor={"plugin-config-" + plugin.id + "-preferred-language"}>{preferredLanguageField.label}<LuxSelect id={"plugin-config-" + plugin.id + "-preferred-language"} value={preferredLanguage} options={preferredLanguageField.options ?? []} onChange={setPreferredLanguage} aria-label={preferredLanguageField.label} /></label> : null}
-                {titleAliasReplacementField ? <LuxSwitch className="lux-admin-plugin-toggle" checked={titleAliasReplacementEnabled} onChange={(event) => setTitleAliasReplacementEnabled(event.target.checked)} label=<>{titleAliasReplacementField.label}</> description=<>{titleAliasReplacementField.description}</> /> : null}
-                {originalLanguageField ? <LuxSwitch className="lux-admin-plugin-toggle" checked={originalLanguageEnabled} onChange={(event) => setOriginalLanguageEnabled(event.target.checked)} label=<>{originalLanguageField.label}</> description=<>{originalLanguageField.description}</> /> : null}
-                {fallbackEnabledField ? <LuxSwitch className="lux-admin-plugin-toggle" checked={languageFallbackEnabled} onChange={(event) => setLanguageFallbackEnabled(event.target.checked)} label=<>{fallbackEnabledField.label}</> description=<>{fallbackEnabledField.description}</> /> : null}
-                {fallbackLanguagesField ? <label htmlFor={"plugin-config-" + plugin.id + "-fallback-languages"}>{fallbackLanguagesField.label}<LuxSelect id={"plugin-config-" + plugin.id + "-fallback-languages"} multiple value={fallbackLanguages} options={fallbackLanguagesField.options ?? []} onChange={setFallbackLanguages} aria-label={fallbackLanguagesField.label} /><small>{fallbackLanguagesField.description}</small></label> : null}
-                {alternateApiField ? <LuxSwitch className="lux-admin-plugin-toggle" checked={alternateApiEnabled} onChange={(event) => setAlternateApiEnabled(event.target.checked)} label=<>{alternateApiField.label}</> description=<>{alternateApiField.description}</> /> : null}
-                {apiBaseUrlPresetField ? <label htmlFor={"plugin-config-" + plugin.id + "-api-base-url"}>{apiBaseUrlPresetField.label}<LuxSelect id={"plugin-config-" + plugin.id + "-api-base-url"} value={apiBaseUrlChoice} options={apiBaseUrlPresetField.options ?? []} disabled={!alternateApiEnabled} onChange={setApiBaseUrlChoice} aria-label={apiBaseUrlPresetField.label} /><small>{apiBaseUrlPresetField.description}</small></label> : null}
-                {customApiBaseUrlField && apiBaseUrlChoice === customApiBaseUrlOption ? <label htmlFor={"plugin-config-" + plugin.id + "-custom-api-base-url"}>{customApiBaseUrlField.label}<LuxTextField id={"plugin-config-" + plugin.id + "-custom-api-base-url"} type="url" value={customApiBaseUrl} disabled={!alternateApiEnabled} onChange={(event) => setCustomApiBaseUrl(event.target.value)} placeholder="https://example.com" autoComplete="url" /><small>{customApiBaseUrlField.description}</small></label> : null}
-              </>}
-              {isLoginBackgroundProvider ? (
-                <>
-                  {additionalToggleFields.map((field) => (
-                    <LuxSwitch key={field.key} className="lux-admin-plugin-toggle" checked={additionalToggleValues[field.key] === true} onChange={(event) => setAdditionalToggleValues((current) => ({ ...current, [field.key]: event.target.checked, }))} label=<><strong>{field.label}</strong>
-                        {field.description ? <small>{field.description}</small> : null}</> />
-                  ))}
-                  {imageFields.map((field) => {
-                    const savedAsset = plugin.configValues?.[field.key];
-                    const hasUploadedImage = uploadedImageFields[field.key] === true
-                      || (typeof savedAsset === "string" && /^sha256:[a-f0-9]{64}$/.test(savedAsset));
-                    const inputId = `plugin-config-${plugin.id}-${field.key}`;
-                    return (
-                      <label className="lux-admin-plugin-image-field" htmlFor={inputId} key={field.key}>
-                        <strong>{field.label}</strong>
-                        <input
-                          id={inputId}
-                          type="file"
-                          accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
-                          aria-label={`${field.label}（上传后立即替换旧图）`}
-                          disabled={uploadImage.isPending}
-                          onChange={(event) => {
-                            const input = event.currentTarget;
-                            const file = input.files?.[0];
-                            input.value = "";
-                            if (!file) return;
-                            if (file.size > MAX_PLUGIN_IMAGE_UPLOAD_BYTES) {
-                              setImageUploadErrors((current) => ({
-                                ...current,
-                                [field.key]: "图片不能超过 5 MiB；原有图片保持不变。",
-                              }));
-                              return;
-                            }
-                            if (file.type && !LOGIN_BACKGROUND_IMAGE_TYPES.has(file.type)) {
-                              setImageUploadErrors((current) => ({
-                                ...current,
-                                [field.key]: "仅支持 JPEG、PNG 或 WebP；原有图片保持不变。",
-                              }));
-                              return;
-                            }
-                            setImageUploadErrors((current) => ({ ...current, [field.key]: "" }));
-                            uploadImage.mutate({ fieldKey: field.key, file });
-                          }}
-                        />
-                        {field.description ? <small>{field.description}</small> : null}
-                        <small>上传成功会立即替换服务器托管图片；展示来源和许可确认仍需单独保存。</small>
-                        <span className="lux-admin-plugin-image-status" role="status" aria-live="polite">
-                          {uploadImage.isPending && uploadImage.variables?.fieldKey === field.key
-                            ? "正在上传…"
-                            : hasUploadedImage ? "已上传 1 张；选择新图可替换旧图。" : "尚未上传自定义图片。"}
-                        </span>
-                        {imageUploadErrors[field.key] ? <span className="lux-error-copy" role="alert">{imageUploadErrors[field.key]}</span> : null}
-                      </label>
-                    );
-                  })}
-                </>
-              ) : null}
-              {additionalSelectFields.map((field) => {
-                const id = `plugin-config-${plugin.id}-${field.key}`;
-                const value = additionalSelectValues[field.key];
-                return <label key={field.key} htmlFor={id}>{field.label}{field.multiple ? <LuxSelect id={id} multiple value={Array.isArray(value) ? value : []} options={field.options ?? []} onChange={(selected) => setAdditionalSelectValues((current) => ({ ...current, [field.key]: selected }))} aria-label={field.label} /> : <LuxSelect id={id} value={typeof value === "string" ? value : ""} options={field.options ?? []} placeholder={field.required ? "请选择" : "可选"} onChange={(selected) => setAdditionalSelectValues((current) => ({ ...current, [field.key]: selected }))} aria-label={field.label} />}{field.description ? <small>{field.description}</small> : null}</label>;
-              })}
-              <p>{isLoginBackgroundProvider ? "展示来源与许可确认需要保存配置；自定义图片上传后会立即替换托管图片。" : `${danmakuProviderField?.description ?? configField?.description ?? "插件配置"} 当前：${availabilityLabel(plugin.configSource)}。`}</p>
-              <div className="lux-admin-plugin-dialog-actions">
-                <LuxButton tone="secondary" type="button" onClick={closeDialog}>取消</LuxButton>
-                <LuxButton tone="primary" type="submit" disabled={save.isPending || uploadImage.isPending || requiredSelectMissing}><Save size={15} /> {save.isPending ? "保存中…" : "保存配置"}</LuxButton>
-              </div>
-              {save.error ? <span className="lux-error-copy" role="alert">{save.error.message}</span> : null}
-            </form>}
+            {isEmbyMigration ? <EmbyMigrationPluginConfig plugin={plugin} /> : <PluginConfigForm key={plugin.id} plugin={plugin} onClose={closeDialog} />}
           </section>
         </div>
       ) : null}
@@ -683,6 +329,377 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
       ) : null}
     </article>
   );
+}
+
+function PluginConfigForm({ plugin, onClose }: { plugin: AdminPlugin; onClose: () => void }) {
+  const queryClient = useQueryClient();
+  const pairs = configFieldPairs(plugin.configFields);
+  const detailFieldKeys = new Set(Array.from(pairs.values(), (pair) => pair.detail.key));
+  const [values, setValues] = useState<PluginConfigValues>(() => initialConfigValues(plugin, pairs));
+  const [dirtyFields, setDirtyFields] = useState<Set<string>>(() => new Set());
+  const [uploadedImageFields, setUploadedImageFields] = useState<Record<string, boolean>>({});
+  const [imageUploadErrors, setImageUploadErrors] = useState<Record<string, string>>({});
+  const requiredMissing = pluginConfigRequiredMissing(plugin, plugin.configFields, pairs, values);
+  const updateValue = (key: string, value: unknown) => {
+    setValues((current) => ({ ...current, [key]: value }));
+  };
+  const updateSecret = (key: string, value: unknown) => {
+    updateValue(key, value);
+    setDirtyFields((current) => {
+      const next = new Set(current);
+      next.add(key);
+      return next;
+    });
+  };
+  const updateField = (field: AdminPluginConfigField, value: unknown) => {
+    if (isSensitiveConfigField(field)) updateSecret(field.key, value);
+    else updateValue(field.key, value);
+  };
+  const save = useMutation({
+    mutationFn: () => api.updateAdminPluginConfig(plugin.id, buildPluginConfigPayload(plugin.configFields, pairs, values, dirtyFields)),
+    onSuccess: () => {
+      setDirtyFields(new Set());
+      onClose();
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminPlugins });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminInstalledPlugins });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraries });
+    },
+  });
+  const uploadImage = useMutation({
+    mutationFn: ({ fieldKey, file }: { fieldKey: string; file: File }) =>
+      api.uploadAdminPluginConfigImage(plugin.id, fieldKey, file),
+    onSuccess: (_result, { fieldKey }) => {
+      setUploadedImageFields((current) => ({ ...current, [fieldKey]: true }));
+      setImageUploadErrors((current) => ({ ...current, [fieldKey]: "" }));
+    },
+    onError: (error, { fieldKey }) => {
+      setImageUploadErrors((current) => ({ ...current, [fieldKey]: error.message }));
+    },
+  });
+
+  const renderField = (field: AdminPluginConfigField) => {
+    if (detailFieldKeys.has(field.key)) return null;
+    const id = configFieldDomId(plugin.id, field);
+    const pair = pairs.get(field.key);
+    if (pair) {
+      const selected = configStringValue(values, field.key);
+      const gateEnabled = !pair.gate || values[pair.gate.key] === true;
+      const detailId = configFieldDomId(plugin.id, pair.detail, true);
+      return (
+        <Fragment key={field.key}>
+          <label htmlFor={id}>
+            {field.label}
+            <LuxSelect id={id} value={selected} options={field.options ?? []} placeholder={field.required ? "请选择" : "可选"} disabled={!gateEnabled} onChange={(next) => updateField(field, next)} aria-label={field.label} />
+            {field.description ? <small>{field.description}</small> : null}
+          </label>
+          {selected === pair.customOption.value ? (
+            <label htmlFor={detailId}>
+              {pair.detail.label}
+              <LuxTextField id={detailId} type="url" value={configStringValue(values, pair.detail.key)} disabled={!gateEnabled} onChange={(event) => updateField(pair.detail, event.target.value)} placeholder="https://example.com" autoComplete="url" />
+              {pair.detail.description ? <small>{pair.detail.description}</small> : null}
+            </label>
+          ) : null}
+        </Fragment>
+      );
+    }
+    if (field.type === "toggle") {
+      return <LuxSwitch key={field.key} id={id} className="lux-admin-plugin-toggle" checked={values[field.key] === true} onChange={(event) => updateField(field, event.target.checked)} label=<><strong>{field.label}</strong></> description={field.description ?? undefined} />;
+    }
+    if (field.type === "image") {
+      const savedAsset = plugin.configValues?.[field.key];
+      const hasUploadedImage = uploadedImageFields[field.key] === true || isUploadedPluginImage(savedAsset);
+      return (
+        <label className="lux-admin-plugin-image-field" htmlFor={id} key={field.key}>
+          <strong>{field.label}</strong>
+          <input
+            id={id}
+            type="file"
+            accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
+            aria-label={`${field.label}（上传后立即替换旧图）`}
+            disabled={uploadImage.isPending}
+            onChange={(event) => {
+              const input = event.currentTarget;
+              const file = input.files?.[0];
+              input.value = "";
+              if (!file) return;
+              if (file.size > MAX_PLUGIN_IMAGE_UPLOAD_BYTES) {
+                setImageUploadErrors((current) => ({
+                  ...current,
+                  [field.key]: "图片不能超过 5 MiB；原有图片保持不变。",
+                }));
+                return;
+              }
+              if (file.type && !LOGIN_BACKGROUND_IMAGE_TYPES.has(file.type)) {
+                setImageUploadErrors((current) => ({
+                  ...current,
+                  [field.key]: "仅支持 JPEG、PNG 或 WebP；原有图片保持不变。",
+                }));
+                return;
+              }
+              setImageUploadErrors((current) => ({ ...current, [field.key]: "" }));
+              uploadImage.mutate({ fieldKey: field.key, file });
+            }}
+          />
+          {field.description ? <small>{field.description}</small> : null}
+          <small>上传成功会立即替换服务器托管图片；展示来源和许可确认仍需单独保存。</small>
+          <span className="lux-admin-plugin-image-status" role="status" aria-live="polite">
+            {uploadImage.isPending && uploadImage.variables?.fieldKey === field.key
+              ? "正在上传…"
+              : hasUploadedImage ? "已上传 1 张；选择新图可替换旧图。" : "尚未上传自定义图片。"}
+          </span>
+          {imageUploadErrors[field.key] ? <span className="lux-error-copy" role="alert">{imageUploadErrors[field.key]}</span> : null}
+        </label>
+      );
+    }
+    if (field.type === "select") {
+      const value = values[field.key];
+      return (
+        <label key={field.key} htmlFor={id}>
+          {field.label}
+          {field.multiple ? (
+            <LuxSelect id={id} multiple value={Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : []} options={field.options ?? []} onChange={(next) => updateField(field, next)} aria-label={field.label} />
+          ) : (
+            <LuxSelect id={id} value={typeof value === "string" ? value : ""} options={field.options ?? []} placeholder={field.required ? "请选择" : "可选"} onChange={(next) => updateField(field, next)} aria-label={field.label} />
+          )}
+          {field.description ? <small>{field.description}</small> : null}
+        </label>
+      );
+    }
+    if (field.type === "textarea") {
+      return (
+        <label key={field.key} htmlFor={id}>
+          {field.label}
+          <LuxTextarea id={id} value={configStringValue(values, field.key)} required={field.required} onChange={(event) => updateField(field, event.target.value)} />
+          {field.description ? <small>{field.description}</small> : null}
+        </label>
+      );
+    }
+    if (field.type === "number") {
+      const value = values[field.key];
+      return (
+        <label key={field.key} htmlFor={id}>
+          {field.label}
+          <LuxTextField id={id} type="number" min={field.minimum ?? undefined} max={field.maximum ?? undefined} step={1} value={typeof value === "number" && Number.isFinite(value) ? value : ""} required={field.required} onChange={(event) => updateField(field, Number(event.target.value))} />
+          {field.description ? <small>{field.description}</small> : null}
+        </label>
+      );
+    }
+    const sensitive = isSensitiveConfigField(field);
+    const urlField = looksLikeUrlField(field);
+    return (
+      <label key={field.key} htmlFor={id}>
+        {field.label}
+        <LuxTextField
+          id={id}
+          type={field.type === "password" ? "password" : urlField ? "url" : "text"}
+          value={configStringValue(values, field.key)}
+          onChange={(event) => updateField(field, event.target.value)}
+          placeholder={sensitive ? (field.type === "password" ? "留空使用插件默认凭据" : "留空保留已保存的地址") : undefined}
+          autoComplete={field.type === "password" ? "new-password" : urlField ? "url" : undefined}
+          required={sensitive ? field.required && !plugin.configured : field.required}
+        />
+        {field.description ? <small>{field.description}</small> : null}
+      </label>
+    );
+  };
+
+  return (
+    <form className="lux-admin-plugin-dialog-form" autoComplete="off" onSubmit={(event) => { event.preventDefault(); if (!requiredMissing) save.mutate(); }}>
+      {plugin.configFields.map(renderField)}
+      <p>{plugin.capabilities?.includes("login_background.get") ? "展示来源与许可确认需要保存配置；自定义图片上传后会立即替换托管图片。" : `${plugin.configFields[0]?.description ?? "插件配置"} 当前：${availabilityLabel(plugin.configSource)}。`}</p>
+      <div className="lux-admin-plugin-dialog-actions">
+        <LuxButton tone="secondary" type="button" onClick={onClose}>取消</LuxButton>
+        <LuxButton tone="primary" type="submit" disabled={save.isPending || uploadImage.isPending || requiredMissing}><Save size={15} /> {save.isPending ? "保存中…" : "保存配置"}</LuxButton>
+      </div>
+      {save.error ? <span className="lux-error-copy" role="alert">{save.error.message}</span> : null}
+    </form>
+  );
+}
+
+function configFieldPairs(fields: AdminPluginConfigField[]) {
+  const pairs = new Map<string, PluginConfigPair>();
+  const claimed = new Set<string>();
+  for (let index = 0; index < fields.length; index += 1) {
+    const select = fields[index];
+    if (!select) continue;
+    const customOption = customSelectOption(select);
+    if (!customOption) continue;
+    const detail = fields[index + 1];
+    if (!detail || claimed.has(detail.key) || !isEndpointDetailField(detail)) continue;
+    const previous = fields[index - 1];
+    const gate = previous?.type === "toggle" && !claimed.has(previous.key) ? previous : null;
+    pairs.set(select.key, { select, detail, customOption, gate });
+    claimed.add(detail.key);
+    index += 1;
+  }
+  return pairs;
+}
+
+function customSelectOption(field: AdminPluginConfigField) {
+  if (field.type !== "select" || field.multiple) return null;
+  return field.options?.find((option) => {
+    const label = String(option.label);
+    return option.value === "custom" || label.trim() === "自定义" || label.trim().startsWith("自定义");
+  }) ?? null;
+}
+
+function isEndpointDetailField(field: AdminPluginConfigField) {
+  if (field.type !== "text") return false;
+  const defaultValue = typeof field.defaultValue === "string" ? field.defaultValue : "";
+  const text = `${field.label} ${field.description ?? ""}`;
+  return /^https?:\/\//i.test(defaultValue) || /(?:地址|URL|url|endpoint|base\s*url)/i.test(text);
+}
+
+function initialConfigValues(plugin: AdminPlugin, pairs: Map<string, PluginConfigPair>): PluginConfigValues {
+  const configured = plugin.configValues ?? {};
+  const values: PluginConfigValues = {};
+  for (const field of plugin.configFields) {
+    if (field.type === "image") continue;
+    if (isSensitiveConfigField(field)) {
+      values[field.key] = "";
+      continue;
+    }
+    const stored = configured[field.key];
+    if (field.type === "toggle") {
+      values[field.key] = typeof stored === "boolean" ? stored : field.defaultValue === true;
+    } else if (field.type === "number") {
+      values[field.key] = typeof stored === "number"
+        ? stored
+        : typeof field.defaultValue === "number"
+          ? field.defaultValue
+          : typeof field.minimum === "number" ? field.minimum : 0;
+    } else if (field.type === "select") {
+      if (field.multiple) {
+        values[field.key] = Array.isArray(stored)
+          ? stored.filter((item): item is string => typeof item === "string")
+          : Array.isArray(field.defaultValue)
+            ? field.defaultValue.filter((item): item is string => typeof item === "string")
+            : [];
+      } else {
+        values[field.key] = typeof stored === "string"
+          ? stored
+          : typeof field.defaultValue === "string" ? field.defaultValue : "";
+      }
+    } else {
+      values[field.key] = typeof stored === "string"
+        ? stored
+        : typeof field.defaultValue === "string" ? field.defaultValue : "";
+    }
+  }
+  for (const pair of pairs.values()) {
+    const rawSelect = values[pair.select.key];
+    const rawDetail = values[pair.detail.key];
+    let selected = typeof rawSelect === "string" ? rawSelect : "";
+    const detailValue = typeof rawDetail === "string" ? rawDetail : "";
+    if (!selected) {
+      const matching = pair.select.options?.find((option) => option.value === detailValue || option.label === detailValue);
+      selected = matching?.value
+        ?? (detailValue
+          ? pair.customOption.value
+          : pair.select.options?.find((option) => option.value !== pair.customOption.value)?.value ?? "");
+      values[pair.select.key] = selected;
+    }
+    if (selected !== pair.customOption.value) {
+      // Only expose a custom detail input after choosing the custom option.
+      values[pair.detail.key] = "";
+    }
+  }
+  return values;
+}
+
+function buildPluginConfigPayload(fields: AdminPluginConfigField[], pairs: Map<string, PluginConfigPair>, values: PluginConfigValues, dirtyFields: Set<string>) {
+  const detailFieldKeys = new Set(Array.from(pairs.values(), (pair) => pair.detail.key));
+  const payload: Record<string, unknown> = {};
+  for (const field of fields) {
+    if (field.type === "image" || detailFieldKeys.has(field.key)) continue;
+    const pair = pairs.get(field.key);
+    if (pair) {
+      const selected = configStringValue(values, field.key);
+      payload[field.key] = selected;
+      const selectedOption = field.options?.find((option) => option.value === selected);
+      payload[pair.detail.key] = selected === pair.customOption.value
+        ? String(values[pair.detail.key] ?? "").trim()
+        : selectedOption?.label ?? "";
+      continue;
+    }
+    if (isSensitiveConfigField(field)) {
+      if (!dirtyFields.has(field.key)) continue;
+      const raw = String(values[field.key] ?? "");
+      payload[field.key] = field.type === "password" ? raw : raw.trim();
+      continue;
+    }
+    const value = values[field.key];
+    if (field.type === "toggle") {
+      payload[field.key] = value === true;
+    } else if (field.type === "number") {
+      payload[field.key] = typeof value === "number" && Number.isFinite(value) ? value : 0;
+    } else if (field.type === "select") {
+      if (field.multiple) {
+        payload[field.key] = Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+      } else {
+        const selected = configStringValue(values, field.key);
+        if (selected !== "") payload[field.key] = selected;
+      }
+    } else if (field.type === "text") {
+      payload[field.key] = typeof value === "string" ? value.trim() : "";
+    } else {
+      payload[field.key] = typeof value === "string" ? value : "";
+    }
+  }
+  return payload;
+}
+
+function pluginConfigRequiredMissing(plugin: AdminPlugin, fields: AdminPluginConfigField[], pairs: Map<string, PluginConfigPair>, values: PluginConfigValues) {
+  const detailFieldKeys = new Set(Array.from(pairs.values(), (pair) => pair.detail.key));
+  return fields.some((field) => {
+    if (field.type === "image" || detailFieldKeys.has(field.key)) return false;
+    if (isSensitiveConfigField(field)) {
+      return field.required && !plugin.configured && String(values[field.key] ?? "").trim() === "";
+    }
+    const pair = pairs.get(field.key);
+    if (pair) {
+      const selected = configStringValue(values, field.key);
+      if (field.required && selected === "") return true;
+      return pair.detail.required && selected === pair.customOption.value && String(values[pair.detail.key] ?? "").trim() === "";
+    }
+    if (field.type === "toggle") return false;
+    const value = values[field.key];
+    if (field.type === "select") {
+      return field.multiple
+        ? field.required && (!Array.isArray(value) || value.length === 0)
+        : field.required && (typeof value !== "string" || value === "");
+    }
+    if (field.type === "number") return field.required && !(typeof value === "number" && Number.isFinite(value));
+    return field.required && String(value ?? "").trim() === "";
+  });
+}
+
+function isSensitiveConfigField(field: AdminPluginConfigField) {
+  return field.sensitive || field.type === "password";
+}
+
+function looksLikeUrlField(field: AdminPluginConfigField) {
+  const defaultValue = typeof field.defaultValue === "string" ? field.defaultValue : "";
+  return /^https?:\/\//i.test(defaultValue)
+    || /(?:地址|URL|url|endpoint|base\s*url)/i.test(`${field.label} ${field.description ?? ""}`);
+}
+
+function configStringValue(values: PluginConfigValues, key: string) {
+  const value = values[key];
+  return typeof value === "string" ? value : "";
+}
+
+function configFieldDomId(pluginId: string, field: AdminPluginConfigField, customDetail = false) {
+  const key = configFieldDomKey(field.key);
+  return `plugin-config-${pluginId}-${customDetail && !key.startsWith("custom-") ? "custom-" : ""}${key}`;
+}
+
+function configFieldDomKey(key: string) {
+  return key.replace(/([a-z0-9])([A-Z])/g, "$1-$2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1-$2").toLowerCase();
+}
+
+function isUploadedPluginImage(value: unknown) {
+  return typeof value === "string" && /^sha256:[a-f0-9]{64}$/.test(value);
 }
 
 export function pluginCategoryLabel(category: string) {
