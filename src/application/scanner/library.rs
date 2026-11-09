@@ -2417,10 +2417,8 @@ pub(super) fn is_supported_movie_file(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "mkv" | "mp4" | "strm"
-            )
+            let extension = extension.to_ascii_lowercase();
+            super::SUPPORTED_MOVIE_EXTENSIONS.contains(&extension.as_str())
         })
 }
 
@@ -2513,4 +2511,42 @@ fn is_media_info_sidecar_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|file_name| file_name.to_str())
         .is_some_and(|file_name| file_name.to_ascii_lowercase().ends_with("-mediainfo.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::is_supported_movie_file;
+
+    #[test]
+    fn movie_file_allowlist_accepts_expanded_containers_case_insensitively() {
+        for name in [
+            "a.mkv", "a.MKV", "a.mp4", "a.Mp4", "a.strm", "a.ts", "a.TS", "a.m2ts", "a.mov",
+            "a.webm", "a.WEBM", "a.avi", "a.asf", "a.wmv", "a.flv",
+        ] {
+            assert!(
+                is_supported_movie_file(Path::new(name)),
+                "{name} must be a movie"
+            );
+        }
+    }
+
+    #[test]
+    fn movie_file_allowlist_rejects_sidecars_and_unlisted_extensions() {
+        for name in [
+            "a.nfo",
+            "a.jpg",
+            "a.srt",
+            "a.mpg",
+            "a.ogv",
+            "a",
+            "a.mkv.part",
+        ] {
+            assert!(
+                !is_supported_movie_file(Path::new(name)),
+                "{name} must not be a movie"
+            );
+        }
+    }
 }
