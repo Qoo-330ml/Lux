@@ -21670,12 +21670,13 @@ content light level）只出现在帧级 side data，`-show_streams` 的 `side_d
 
 验收：
 
-- [ ] `cargo test --locked --test strm probe::` 通过，新增用例覆盖：SDR、HLG、HDR10、杜比视界（兼容 ID 1/2/4/0）、
+- [x] `cargo test --locked --test strm probe::` 30/30 通过，新增用例覆盖：SDR、HLG、HDR10、杜比视界（兼容 ID 1/2/4/缺失）、
   无信号的未知 transfer 不输出、音频流不推导、`side_data_list` 为非数组或条目畸形时不 panic 并回退到 transfer 规则。
-- [ ] `cargo fmt --all -- --check` 通过。
-- [ ] `cargo clippy --locked --all-targets --all-features -- -D warnings` 零警告（任务完成时运行）。
-- [ ] `COMPATIBILITY.md` 记录推导规则与 HDR10+ 的未覆盖说明。
-- [ ] 本任务不改 `Lux-plugins` 仓库中的 STRM 插件；插件侧需另立任务（它有独立的 `probe.rs` 副本）。
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo clippy --locked --all-targets --all-features -- -D warnings` 零警告（2026-11-09）。
+- [x] 全量 `cargo test --locked --all-targets --no-fail-fast`：库 129、各集成 target 全部通过（`api_web` 需要 `web/dist`，已 `pnpm --dir web build` 后通过）。
+- [x] `COMPATIBILITY.md` 记录推导规则与 HDR10+ 的未覆盖说明。
+- [x] 本任务不改 `Lux-plugins` 仓库中的 STRM 插件；插件侧需另立任务（它有独立的 `probe.rs` 副本）。
 
 ## 31. 参考资料
 
