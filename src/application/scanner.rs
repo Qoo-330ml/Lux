@@ -84,6 +84,13 @@ const MANIFEST_STREAMED_ENTRY_BATCH_SIZE: usize = 8_192;
 const DISCOVERY_CHILD_DIRECTORY_BATCH_SIZE: usize = 200;
 const MAX_STRM_TARGET_BYTES: usize = 1024 * 1024;
 
+/// Lowercase extensions the scanner indexes as movie entries. `.strm` is a pointer file; the rest
+/// are media containers. Every extension-keyed lookup (scan filter, sibling variants, image
+/// media counting) reads this list so the allowlists cannot drift apart.
+pub(crate) const SUPPORTED_MOVIE_EXTENSIONS: [&str; 11] = [
+    "mkv", "mp4", "strm", "ts", "m2ts", "mov", "webm", "avi", "asf", "wmv", "flv",
+];
+
 mod jobs;
 mod library;
 mod manifest;

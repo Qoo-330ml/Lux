@@ -546,13 +546,15 @@ where
 }
 
 pub(super) fn movie_variant_extensions(path: &Path) -> Vec<String> {
-    let mut extensions = Vec::with_capacity(7);
+    let mut extensions = Vec::with_capacity(1 + 2 * super::SUPPORTED_MOVIE_EXTENSIONS.len());
     if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
         extensions.push(extension.to_owned());
     }
-    for extension in ["mkv", "MKV", "mp4", "MP4", "strm", "STRM"] {
-        if !extensions.iter().any(|existing| existing == extension) {
-            extensions.push(extension.to_owned());
+    for extension in super::SUPPORTED_MOVIE_EXTENSIONS {
+        for candidate in [extension.to_owned(), extension.to_ascii_uppercase()] {
+            if !extensions.contains(&candidate) {
+                extensions.push(candidate);
+            }
         }
     }
     extensions

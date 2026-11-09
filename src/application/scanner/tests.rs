@@ -657,7 +657,9 @@ async fn inferred_variant_counts_candidate_metadata_probes() {
     .await;
 
     assert_eq!(inferred_suffix.as_deref(), Some("Alternate-Cut"));
-    assert_eq!(probe_count.load(Ordering::Relaxed), 13);
+    // Two non-matching base candidates each probe all 22 unique sibling spellings (11 extensions
+    // in lower and upper case); the match then hits on the first probe: 2 * 22 + 1 = 45.
+    assert_eq!(probe_count.load(Ordering::Relaxed), 45);
 }
 
 #[tokio::test]

@@ -2364,7 +2364,9 @@ async fn directory_has_multiple_media_files(directory: &Path) -> Result<bool, Im
                 .extension()
                 .and_then(|value| value.to_str())
                 .is_some_and(|value| {
-                    matches!(value.to_ascii_lowercase().as_str(), "mkv" | "mp4" | "strm")
+                    let value = value.to_ascii_lowercase();
+                    crate::application::scanner::SUPPORTED_MOVIE_EXTENSIONS
+                        .contains(&value.as_str())
                 })
         {
             media_count += 1;
