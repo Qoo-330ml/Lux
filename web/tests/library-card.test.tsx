@@ -151,6 +151,41 @@ describe("LibraryCard", () => {
     expect(container.querySelector("[role=status]")?.textContent).toContain("扫描");
   });
 
+  it("queues a whole-library danmaku match from the context menu", async () => {
+    const danmaku = vi.spyOn(api, "startLibraryDanmakuMatch").mockResolvedValue({
+      job: { id: "danmaku-job", libraryId: "library-1", status: "PENDING", totalCount: 42, processedCount: 0 },
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <LibraryCard library={{ id: "library-1", name: "电影", kind: "MOVIE" }} />
+        </MemoryRouter>,
+      );
+    });
+
+    await act(async () => {
+      container.querySelector<HTMLElement>(".lux-library-card")?.dispatchEvent(new MouseEvent("contextmenu", {
+        bubbles: true,
+        cancelable: true,
+        clientX: 100,
+        clientY: 120,
+      }));
+    });
+
+    expect(document.body.querySelector("[role=menu]")?.textContent).toContain("刮削弹幕");
+
+    await act(async () => {
+      document.body.querySelector<HTMLButtonElement>("[data-library-action=danmaku]")?.click();
+    });
+    expect(danmaku).toHaveBeenCalledWith("library-1", { overwrite: false });
+    expect(container.querySelector("[role=status]")?.textContent).toContain("整库弹幕匹配任务已提交");
+    expect(container.querySelector("[role=status]")?.textContent).toContain("42");
+  });
+
   it("keeps its portaled menu open for inside pointer events and closes outside", async () => {
     container = document.createElement("div");
     document.body.append(container);

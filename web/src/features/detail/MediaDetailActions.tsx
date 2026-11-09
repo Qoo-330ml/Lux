@@ -18,10 +18,11 @@ import { LuxButton , luxButtonClass } from "../../components/ui";
 const LazyMetadataEditor = lazy(() => import("../media/MediaMetadataEditor").then((module) => ({ default: module.MediaMetadataEditor })));
 const LazyImageEditor = lazy(() => import("../media/MediaImageEditor").then((module) => ({ default: module.MediaImageEditor })));
 const LazySubtitleEditor = lazy(() => import("../media/MediaSubtitleEditor").then((module) => ({ default: module.MediaSubtitleEditor })));
+const LazyDanmakuDialog = lazy(() => import("../media/MediaDanmakuDialog").then((module) => ({ default: module.MediaDanmakuDialog })));
 const LazyIdentifier = lazy(() => import("../media/MediaIdentifier").then((module) => ({ default: module.MediaIdentifier })));
 const LazyDeleteDialog = lazy(() => import("../media/MediaDeleteDialog").then((module) => ({ default: module.MediaDeleteDialog })));
 
-type EditorKind = "metadata" | "images" | "subtitles" | "identify";
+type EditorKind = "metadata" | "images" | "subtitles" | "danmaku" | "identify";
 type ActionContextValue = {
   item: MediaItem;
   sourceId?: string;
@@ -201,6 +202,7 @@ export function MediaDetailActions({ item, pendingReview, children }: {
         void queryClient.invalidateQueries({ queryKey: queryKeys.itemImages(item.id) });
       }} /> : null}
       {editor === "subtitles" ? <LazySubtitleEditor item={item} sourceId={source?.id} onClose={closeEditor} onSaved={() => void queryClient.invalidateQueries({ queryKey: queryKeys.item(item.id) })} /> : null}
+      {editor === "danmaku" ? <LazyDanmakuDialog item={item} sourceId={source?.id} onClose={closeEditor} onSubmitted={(job) => setNotice(`弹幕匹配任务已提交 · ${job.totalCount} 项`)} /> : null}
       {deleteOpen ? <LazyDeleteDialog item={item} onClose={() => setDeleteOpen(false)} onConfirm={() => api.deleteItem(item.id, source?.id)} onDeleted={() => navigate("/libraries")} /> : null}
       {editor === "identify" ? <LazyIdentifier item={item} onClose={closeEditor} onSaved={() => {
         void queryClient.invalidateQueries({ queryKey: queryKeys.item(item.id) });
@@ -244,6 +246,7 @@ export const MediaDetailActionMenu = memo(function MediaDetailActionMenu({ class
     onEditMetadata={() => actions.setEditor("metadata")}
     onEditImages={() => actions.setEditor("images")}
     onEditSubtitles={() => actions.setEditor("subtitles")}
+    onScrapeDanmaku={() => actions.setEditor("danmaku")}
     onDelete={actions.openDelete}
     onIdentify={() => actions.setEditor("identify")}
     onRefreshMetadata={actions.refreshMetadata}

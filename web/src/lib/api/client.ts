@@ -1402,6 +1402,22 @@ export class LuxApiClient {
     );
   }
 
+  startLibraryDanmakuMatch(
+    libraryId: string,
+    options?: { concurrency?: number; overwrite?: boolean },
+  ) {
+    return this.request<{ job: AdminDanmakuMatchJob }>(
+      `/api/v1/admin/libraries/${encodeURIComponent(libraryId)}/danmaku/match`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          concurrency: options?.concurrency ?? 2,
+          overwrite: options?.overwrite ?? false,
+        }),
+      },
+    );
+  }
+
   adminUserInvitations(options: AdminUserInvitationListQuery = {}) {
     const params = new URLSearchParams({
       page: String(options.page ?? 1),

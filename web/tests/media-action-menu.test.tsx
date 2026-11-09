@@ -299,6 +299,60 @@ describe("MediaActionMenu", () => {
     expect(document.body.querySelector("[role=menu]")).toBeNull();
   });
 
+  it("opens at a context-menu point and offers danmaku scraping for movies", async () => {
+    const onScrapeDanmaku = vi.fn();
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <MediaActionMenu
+            item={{ id: "item-1", title: "二毛", itemType: "MOVIE" }}
+            contextPoint={{ x: 220, y: 180 }}
+            onEditMetadata={() => undefined}
+            onEditImages={() => undefined}
+            onScrapeDanmaku={onScrapeDanmaku}
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    const menu = document.body.querySelector<HTMLElement>("[role=menu]");
+    expect(menu).not.toBeNull();
+    expect(menu?.textContent).toContain("刮削弹幕");
+    expect(menu?.style.left).toBe("220px");
+    expect(menu?.style.position).toBe("fixed");
+
+    await act(async () => document.body.querySelector<HTMLElement>("[data-action=scrape-danmaku]")?.click());
+    expect(onScrapeDanmaku).toHaveBeenCalledOnce();
+    expect(document.body.querySelector("[role=menu]")).toBeNull();
+  });
+
+  it("hides danmaku scraping for item types without a matchable source", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <MediaActionMenu
+            item={{ id: "series-1", title: "示例剧集", itemType: "SERIES" }}
+            onEditMetadata={() => undefined}
+            onEditImages={() => undefined}
+            onScrapeDanmaku={() => undefined}
+          />
+        </MemoryRouter>,
+      );
+    });
+    await act(async () => container.querySelector<HTMLButtonElement>(".lux-media-actions-trigger")?.click());
+
+    expect(document.body.querySelector("[role=menu]")?.textContent).not.toContain("刮削弹幕");
+    expect(document.body.querySelector("[data-action=scrape-danmaku]")).toBeNull();
+  });
+
   it("keeps the portaled menu open for inside pointer events and closes outside", async () => {
     container = document.createElement("div");
     document.body.append(container);

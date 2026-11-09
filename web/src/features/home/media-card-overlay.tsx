@@ -12,6 +12,8 @@ type MediaCardOverlayProps = {
   children: ReactNode;
   onSelectionChange?: (itemId: string, selected: boolean) => void;
   onEditorChange: (editor: MediaCardEditor) => void;
+  onScrapeDanmaku: () => void;
+  contextPoint?: { x: number; y: number } | null;
   onDelete: () => void;
   onRefreshMetadata: () => void;
   refreshMode?: MetadataRefreshMode;
@@ -20,7 +22,7 @@ type MediaCardOverlayProps = {
   onUnlockMetadata: () => void;
 };
 
-export const MediaCardOverlay = memo(function MediaCardOverlay({ item, selectionMode, selected, readOnly, children, onSelectionChange, onEditorChange, ...actions }: MediaCardOverlayProps) {
+export const MediaCardOverlay = memo(function MediaCardOverlay({ item, selectionMode, selected, readOnly, children, onSelectionChange, onEditorChange, onScrapeDanmaku, contextPoint, ...actions }: MediaCardOverlayProps) {
   const canInteract = !readOnly && item.itemType !== "FOLDER";
   return (
     <div className="lux-media-art-shell">
@@ -31,7 +33,7 @@ export const MediaCardOverlay = memo(function MediaCardOverlay({ item, selection
         </label>
       ) : null}
       {children}
-      {canInteract ? <MediaActionMenu item={item} onEditMetadata={() => onEditorChange("metadata")} onEditImages={() => onEditorChange("images")} onEditSubtitles={() => onEditorChange("subtitles")} onIdentify={() => onEditorChange("identify")} {...actions} /> : null}
+      {canInteract ? <MediaActionMenu item={item} contextPoint={contextPoint} onEditMetadata={() => onEditorChange("metadata")} onEditImages={() => onEditorChange("images")} onEditSubtitles={() => onEditorChange("subtitles")} onScrapeDanmaku={onScrapeDanmaku} onIdentify={() => onEditorChange("identify")} {...actions} /> : null}
     </div>
   );
 });
