@@ -442,12 +442,13 @@ describe("AdminPluginsPage plugin cards", () => {
     }));
   });
 
-  it("renders Emby connection details in the migration plugin settings", async () => {
+  it("renders Emby connection details for any plugin declaring the migration capability", async () => {
     currentPlugin = {
       ...configuredPlugin,
-      id: "org.lux.emby-migration",
+      id: "org.example.migration-editor",
       name: "Emby 迁移助手",
       category: "MIGRATION",
+      capabilities: ["migration.emby"],
       configValues: { baseUrl: "http://emby.local:8096", allowPrivateNetwork: false },
       configFields: [
         { key: "baseUrl", label: "Emby 地址", type: "text", required: true, sensitive: false },
@@ -465,6 +466,167 @@ describe("AdminPluginsPage plugin cards", () => {
     expect(dialog?.querySelector<HTMLInputElement>('[id$="-base-url"]')?.value).toBe("http://emby.local:8096");
     expect(dialog?.querySelector<HTMLInputElement>('[id$="-api-key"]')?.type).toBe("password");
     expect(dialog?.textContent).toContain("允许连接局域网地址");
+  });
+
+  it("renders arbitrary manifest fields and saves values by their declared keys", async () => {
+    currentPlugin = {
+      ...configuredPlugin,
+      id: "org.example.generic-config",
+      name: "通用配置插件",
+      capabilities: ["utility.example"],
+      configValues: {
+        endpoint: "https://api.example.test/v1",
+        workerCount: 4,
+        mode: "fast",
+        tags: ["news"],
+        verbose: true,
+        note: "保留顺序",
+      },
+      configFields: [
+        { key: "endpoint", label: "服务地址", type: "text", required: true, sensitive: false, defaultValue: "https://api.example.test" },
+        { key: "accessToken", label: "访问令牌", type: "password", required: false, sensitive: true },
+        { key: "workerCount", label: "并发数", type: "number", required: false, sensitive: false, defaultValue: 2, minimum: 1, maximum: 8 },
+        { key: "mode", label: "运行模式", type: "select", required: false, sensitive: false, options: [{ value: "fast", label: "快速" }, { value: "safe", label: "安全" }] },
+        { key: "tags", label: "标签", type: "select", multiple: true, required: false, sensitive: false, options: [{ value: "news", label: "新闻" }, { value: "sports", label: "体育" }] },
+        { key: "verbose", label: "详细日志", type: "toggle", required: false, sensitive: false, defaultValue: false },
+        { key: "note", label: "备注", type: "textarea", required: false, sensitive: false },
+      ],
+    };
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="配置 通用配置插件"]')?.click();
+    });
+
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    expect(dialog?.textContent).toContain("服务地址");
+    expect(dialog?.querySelector<HTMLInputElement>('[id$="-endpoint"]')?.value).toBe("https://api.example.test/v1");
+    expect(dialog?.querySelector<HTMLInputElement>('input[type="password"]')?.value).toBe("");
+    expect(dialog?.querySelector<HTMLInputElement>('input[type="number"]')?.value).toBe("4");
+    expect(dialog?.querySelector<HTMLInputElement>('input[type="number"]')?.min).toBe("1");
+    expect(dialog?.querySelector<HTMLInputElement>('input[type="number"]')?.max).toBe("8");
+    const selects = Array.from(dialog?.querySelectorAll<HTMLButtonElement>("[role='combobox']") ?? []);
+    expect(selects).toHaveLength(2);
+    expect(selects[0]?.textContent).toContain("快速");
+    expect(selects[1]?.textContent).toContain("新闻");
+    expect(dialog?.querySelector<HTMLInputElement>('input[type="checkbox"]')?.checked).toBe(true);
+    expect(dialog?.querySelector<HTMLTextAreaElement>("textarea")?.value).toBe("保留顺序");
+
+    await act(async () => {
+      dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.click();
+    });
+    expect(api.updateAdminPluginConfig).toHaveBeenCalledWith("org.example.generic-config", {
+      endpoint: "https://api.example.test/v1",
+      workerCount: 4,
+      mode: "fast",
+      tags: ["news"],
+      verbose: true,
+      note: "保留顺序",
+    });
+  });
+
+  it("sends a sensitive manifest field only after it is edited", async () => {
+    currentPlugin = {
+      ...configuredPlugin,
+      id: "org.example.secret-config",
+      name: "密钥配置插件",
+      capabilities: ["utility.example"],
+      configValues: { endpoint: "https://api.example.test" },
+      configFields: [
+        { key: "endpoint", label: "服务地址", type: "text", required: true, sensitive: false },
+        { key: "accessToken", label: "访问令牌", type: "password", required: false, sensitive: true },
+      ],
+    };
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="配置 密钥配置插件"]')?.click();
+    });
+    let dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    await act(async () => {
+      dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.click();
+    });
+    expect(vi.mocked(api.updateAdminPluginConfig).mock.calls.at(-1)?.[1]).not.toHaveProperty("accessToken");
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="配置 密钥配置插件"]')?.click();
+    });
+    dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    const token = dialog?.querySelector<HTMLInputElement>('input[type="password"]');
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(token, "secret-token");
+      token?.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => {
+      dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.click();
+    });
+    expect(api.updateAdminPluginConfig).toHaveBeenCalledWith("org.example.secret-config", {
+      endpoint: "https://api.example.test",
+      accessToken: "secret-token",
+    });
+  });
+
+  it("pairs a custom select option with its detail field without hard-coding field names", async () => {
+    currentPlugin = {
+      ...configuredPlugin,
+      id: "org.example.gateway-config",
+      name: "网关配置插件",
+      capabilities: ["utility.example"],
+      configValues: {
+        enableCustomGateway: true,
+        gatewayPreset: "official",
+        gatewayBaseUrl: "https://official.example",
+      },
+      configFields: [
+        { key: "enableCustomGateway", label: "启用自定义网关", type: "toggle", required: false, sensitive: false, defaultValue: false },
+        {
+          key: "gatewayPreset",
+          label: "网关地址",
+          type: "select",
+          required: false,
+          sensitive: false,
+          options: [
+            { value: "official", label: "https://official.example" },
+            { value: "custom", label: "自定义" },
+          ],
+        },
+        { key: "gatewayBaseUrl", label: "自定义网关地址", type: "text", required: false, sensitive: false, defaultValue: "https://official.example" },
+      ],
+    };
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="配置 网关配置插件"]')?.click();
+    });
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    const gate = dialog?.querySelector<HTMLInputElement>('input[type="checkbox"]');
+    const select = dialog?.querySelector<HTMLButtonElement>("[role='combobox']");
+    expect(gate?.checked).toBe(true);
+    expect(select?.disabled).toBe(false);
+    expect(dialog?.querySelector<HTMLInputElement>('[id$="-custom-gateway-base-url"]')).toBeNull();
+
+    await act(async () => gate?.click());
+    expect(dialog?.querySelector<HTMLButtonElement>("[role='combobox']")?.disabled).toBe(true);
+    await act(async () => gate?.click());
+    expect(dialog?.querySelector<HTMLButtonElement>("[role='combobox']")?.disabled).toBe(false);
+
+    await act(async () => dialog?.querySelector<HTMLButtonElement>("[role='combobox']")?.click());
+    await act(async () => document.querySelector<HTMLButtonElement>("[role=option][data-value='custom']")?.click());
+    const customField = dialog?.querySelector<HTMLInputElement>('[id$="-custom-gateway-base-url"]');
+    expect(customField).toBeTruthy();
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(customField, "https://internal.example");
+      customField?.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    await act(async () => {
+      dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.click();
+    });
+    expect(api.updateAdminPluginConfig).toHaveBeenCalledWith("org.example.gateway-config", {
+      enableCustomGateway: true,
+      gatewayPreset: "custom",
+      gatewayBaseUrl: "https://internal.example",
+    });
   });
 
   it("renders TMDb language preference, fallback switch, and ordered multi-select", async () => {
@@ -1046,6 +1208,49 @@ describe("AdminPluginsPage plugin cards", () => {
       schedule: "0 3 * * *",
     }));
     expect(api.runAdminPlugin).not.toHaveBeenCalled();
+  });
+
+  it("renders chapter detector numbers and schedule through the generic manifest fields", async () => {
+    currentPlugin = {
+      ...configuredPlugin,
+      id: "org.example.chapter-detector",
+      name: "章节检测插件",
+      capabilities: ["chapters.detect"],
+      configValues: {
+        concurrency: 3,
+        introWindowSeconds: 120,
+        creditsWindowSeconds: 240,
+        matchThreshold: 75,
+        schedule: "0 4 * * 0",
+      },
+      configFields: [
+        { key: "concurrency", label: "并发数", type: "number", required: true, sensitive: false, defaultValue: 2, minimum: 1, maximum: 16 },
+        { key: "introWindowSeconds", label: "片头窗口秒数", type: "number", required: true, sensitive: false, defaultValue: 180, minimum: 15, maximum: 300 },
+        { key: "creditsWindowSeconds", label: "片尾窗口秒数", type: "number", required: true, sensitive: false, defaultValue: 180, minimum: 15, maximum: 600 },
+        { key: "matchThreshold", label: "匹配阈值", type: "number", required: true, sensitive: false, defaultValue: 80, minimum: 1, maximum: 100 },
+        { key: "schedule", label: "执行计划", type: "text", required: true, sensitive: false, defaultValue: "0 4 * * 0" },
+      ],
+    };
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="配置 章节检测插件"]')?.click();
+    });
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    const numbers = Array.from(dialog?.querySelectorAll<HTMLInputElement>('input[type="number"]') ?? []);
+    expect(numbers.map((input) => input.value)).toEqual(["3", "120", "240", "75"]);
+    expect(dialog?.querySelector<HTMLInputElement>('[id$="-schedule"]')?.value).toBe("0 4 * * 0");
+
+    await act(async () => {
+      dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.click();
+    });
+    expect(api.updateAdminPluginConfig).toHaveBeenCalledWith("org.example.chapter-detector", {
+      concurrency: 3,
+      introWindowSeconds: 120,
+      creditsWindowSeconds: 240,
+      matchThreshold: 75,
+      schedule: "0 4 * * 0",
+    });
   });
 
   it("does not show configuration action for plugins without configuration", async () => {

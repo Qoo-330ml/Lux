@@ -472,6 +472,12 @@
   opacity: .55;
 }
 
+.lux-admin-plugin-dialog-form textarea {
+  min-height: 88px;
+  padding-inline: 12px;
+  resize: vertical;
+}
+
 .lux-admin-plugin-dialog-form small {
   color: var(--lux-subtle);
   font-size: .7rem;
