@@ -1559,7 +1559,7 @@ COMPATIBILITY.md 是唯一兼容性事实来源。不能因为实现了官方 Sw
 #### P2：体验完善
 
 - DisplayPreferences 相关端点。
-- Years、Genres、Tags 等筛选辅助端点。（Years、Genres、Studios、OfficialRatings 已实现，见 `docs/COMPATIBILITY.md`；Tags 返回 200 空列表，无数据源，待后续投影填充。）
+- Years、Genres、Tags 等筛选辅助端点。（Years、Genres、Studios、OfficialRatings 已实现，见 `docs/COMPATIBILITY.md`；Tags 已由 LUX-900 的 TAG 投影提供，Lux 原生 `GET /api/v1/tags` 与 Emby `/Tags` 读取同一数据；`/Items` 的标签筛选仍未实现。）
 - Collections 与合集成员。
 - 多版本选择所需的 AlternateSources 等端点。
 - Sessions WebSocket 或实时消息，仅在目标客户端确有依赖时实现。（**已因 Yamby 实现**：Yamby 2.1.0.11 的「服务器状态」页固定连接 `/embywebsocket` 并依赖 `Sessions`/`ScheduledTasksInfo` 推送，失败后无退避重连，见 `docs/COMPATIBILITY.md` 的 LUX-891 一节与 `docs/reviews/2026-11-06-hills-yamby-static-analysis.md` §9.6。其余实时消息类型仍按"仅在有依赖时实现"处理。）
@@ -21597,6 +21597,52 @@ LUX-889（已完成，提供 `CatalogService::list_similar_items` 与 `list_simi
 `web/src/features/detail/MediaSimilarSection.tsx`（新）、`web/src/features/detail/MediaDetailPage.tsx`、
 `web/src/features/detail/detail.css`、`web/tests/media-similar-section.test.tsx`（新）、`docs/API-TYPES-SYNC.md`、
 `docs/CHANGELOG.md`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-902：Trakt 评分插件的刮削器排除与协议文档对齐
+
+状态：已完成（2026-11-08，本地合并至 `test`，提交 `6999f50a`…`c08d374d`，未推送）。依赖：无。验证：`plugins::`、`plugin_protocol::tests`、`admin-libraries` vitest 与 `web_static::` 由负责人复跑通过；全量 `--all-targets`、fmt、clippy 由子会话报告通过，负责人未复跑。权威设计见 `docs/decisions/053-scheduled-ratings-sync.md`（ADR-053）；
+评分同步、NFO 旁车写入与 `RATINGS_SYNC` 计划任务已由宿主实现（`src/application/ratings_sync/`），不属于本任务。
+
+背景：`org.lux.trakt-ratings` 是 `type: metadata`、`category: SCRAPER` 的只读查询插件，只实现 `ratings.*`，
+不实现 `metadata.search`。若被选为库刮削器，会在 `metadata.search` 上失败。
+
+范围：
+
+- 刮削器排除：只声明 `ratings.*`、不声明 `metadata.search` 的插件不得被选为库刮削器（后端 `validate_selection` 门禁），
+  Web 选择器不得把它作为可选项提供；已保存但不受支持的值显示为禁用项，不静默隐藏。
+- 清单校验：`ratings.*` 只能由 `metadata` 插件声明，未知 `ratings.*` 能力名拒绝，能力名大小写不敏感。
+- 文档：`docs/PLUGIN-SDK.md` 的评分约定与 ADR-053 及 `ratings_sync` 解析契约一致。
+- 不做：协议类型的第二份定义（已删除，以 `ratings_sync` 为唯一来源）、数据库、迁移、计划任务、NFO 写入、管理 API、新 Web 页面。
+
+验收：
+
+- [ ] 只声明 `ratings.*` 的插件不能被选为库刮削器（API 与单元测试）。
+- [ ] Web：已保存的不受支持刮削器显示为禁用项；只声明 `ratings.*` 的插件不作为新选项出现。
+- [ ] 清单校验大小写不敏感；未知 `ratings.*` 被拒绝。
+- [ ] `docs/PLUGIN-SDK.md` 的评分约定与 `src/application/ratings_sync/output.rs` 一致。
+- [ ] 相关 `cargo test --locked --test plugins <module>::`、`--lib` 过滤、`vitest` 与 `web_static::` 通过。
+
+预计文件：`src/application/plugin_protocol.rs`、`src/application/plugins.rs`、`src/application/scraper.rs`、
+`tests/plugins/`、`web/src/features/admin/AdminLibrariesPage.tsx`、`web/tests/admin-libraries.test.tsx`、
+`docs/PLUGIN-SDK.md`、`docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-903 至 LUX-905：已取消（由 ADR-053 覆盖）
+
+原方案的评分表（`item_external_ratings`、`item_rating_sync_state`）、独立同步服务与 NFO 写回器，与已接受的
+ADR-053 重复，且 ADR-053 不建表、不加迁移。已取消，不实施。若需要每条目的同步状态或“未命中”清单，应另写 ADR 增补。
+
+#### LUX-906：计划任务与管理员触发（已核对，无新增代码）
+
+状态：已完成核对（2026-11-08），未新增代码。结论：
+- 默认关闭：计划任务启用需同时满足插件启用、配置有效、必填项 `clientId` 存在，且媒体库已被显式选中（`src/application/plugins.rs`）；未选中任何库时不登记任务。
+- 未配置 Client ID：手动触发在发起任何上游请求前返回 `PluginNotConfigured`（`src/application/ratings_sync/mod.rs`）。
+- 并发：计划任务与手动触发都经 `RatingsSyncService::start`，共用按媒体库的活跃集合，重复触发返回 `AlreadyActive`。
+- 敏感信息：响应只含 `runId`、`libraryId`；`clientId` 不进入响应。
+- 验证：`cargo test --locked --lib ratings_sync` 17/17 通过（HEAD `c08d374d`）。
+
+#### LUX-907：Web 评分展示（暂缓）
+
+ADR-053 明确 v1 不提供评分界面。若需要，等待 ADR 增补后另立任务。
 
 ## 31. 参考资料
 
