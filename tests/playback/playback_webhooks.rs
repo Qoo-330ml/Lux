@@ -1,3 +1,4 @@
+use crate::realtime::RealtimeChannel;
 use axum::{Router, body::Bytes, extract::State, response::IntoResponse, routing::post};
 use luxd::{
     api::{AppState, app_with_state},
@@ -12,7 +13,7 @@ use luxd::{
     library::LibraryKind,
     storage::Database,
 };
-use reqwest::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
+use reqwest::header::{AUTHORIZATION, SET_COOKIE};
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, sync::mpsc};
 
@@ -194,14 +195,7 @@ async fn playback_webhooks_and_home_events_follow_emby_progress()
         cookie_value(web_login.headers(), "lux_session"),
         cookie_value(web_login.headers(), "lux_csrf")
     );
-    let mut user_events = client
-        .get(format!("{base_url}/api/v1/events"))
-        .header(COOKIE, cookies)
-        .send()
-        .await?;
-    assert_eq!(user_events.status(), reqwest::StatusCode::OK);
-    let ready_frame = user_events.chunk().await?.ok_or("missing ready frame")?;
-    assert!(String::from_utf8(ready_frame.to_vec())?.contains("event: ready"));
+    let mut user_events = RealtimeChannel::connect(&base_url, &cookies).await?;
 
     let paused = client
         .post(format!("{base_url}/Sessions/Playing/Progress"))
@@ -217,14 +211,18 @@ async fn playback_webhooks_and_home_events_follow_emby_progress()
         .send()
         .await?;
     assert_eq!(paused.status(), reqwest::StatusCode::NO_CONTENT);
-    let home_event =
-        tokio::time::timeout(std::time::Duration::from_millis(1_500), user_events.chunk())
-            .await??
-            .ok_or("missing home invalidation after Emby progress")?;
-    let home_event = String::from_utf8(home_event.to_vec())?;
-    assert_eq!(
-        home_event.trim(),
-        "event: invalidate\ndata: {\"scope\":\"home\"}"
+    let home_event = tokio::time::timeout(
+        std::time::Duration::from_millis(2_000),
+        user_events.next_user_invalidation(),
+    )
+    .await
+    .expect("timed out waiting for the home invalidation after Emby progress")
+    .expect("the realtime connection closed before the home invalidation");
+    assert_eq!(home_event["scope"], "home");
+    assert_eq!(home_event["channel"], "user");
+    assert!(
+        home_event.get("itemId").is_none(),
+        "a directory-level home invalidation must not carry an itemId: {home_event}"
     );
     assert_eq!(webhook_service.process_ready_deliveries().await?, 1);
     let paused_event: Value =

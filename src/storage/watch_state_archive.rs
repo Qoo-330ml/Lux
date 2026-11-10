@@ -471,14 +471,31 @@ impl Database {
     ///
     /// Runs after the database is ready rather than inside a request, and tolerates a failed pass:
     /// the next one sees the same rows, because a row is only consumed once it was applied.
-    pub fn spawn_detached_state_reconcile(&self) {
+    /// The returned worker owns the stop handle, so a shutdown can wait for a running pass.
+    pub fn spawn_detached_state_reconcile(&self) -> DetachedStateReconcileWorker {
         let database = self.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(WATCH_STATE_RECONCILE_INITIAL_DELAY).await;
+        let (shutdown_sender, mut shutdown) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            tokio::select! {
+                () = tokio::time::sleep(WATCH_STATE_RECONCILE_INITIAL_DELAY) => {}
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                }
+            }
             let mut ticker = tokio::time::interval(WATCH_STATE_RECONCILE_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    result = shutdown.changed() => {
+                        if result.is_err() || *shutdown.borrow() {
+                            return;
+                        }
+                        continue;
+                    }
+                }
                 match database
                     .restore_detached_watch_state(WATCH_STATE_RECONCILE_BATCH)
                     .await
@@ -507,5 +524,54 @@ impl Database {
                 }
             }
         });
+        DetachedStateReconcileWorker {
+            shutdown_sender,
+            task,
+        }
+    }
+}
+
+/// Stop handle for [`Database::spawn_detached_state_reconcile`].
+pub struct DetachedStateReconcileWorker {
+    shutdown_sender: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl DetachedStateReconcileWorker {
+    /// Stops the reconciler and waits for the pass in flight.
+    pub async fn shutdown(self) {
+        self.shutdown_sender.send_replace(true);
+        if self.task.await.is_err() {
+            tracing::warn!("detached state reconcile worker stopped unexpectedly");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reconciler is a safety net for state that lost its item, so its cadence stays at the
+    /// documented five minutes.
+    #[test]
+    fn the_reconcile_cadence_stays_five_minutes() {
+        assert_eq!(WATCH_STATE_RECONCILE_INTERVAL, Duration::from_secs(300));
+        assert_eq!(WATCH_STATE_RECONCILE_INITIAL_DELAY, Duration::from_secs(60));
+    }
+
+    /// Shutdown must interrupt the initial delay and the wait between passes.
+    #[tokio::test]
+    async fn shutdown_stops_the_reconciler() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        let worker = database.spawn_detached_state_reconcile();
+        tokio::time::timeout(Duration::from_secs(2), worker.shutdown())
+            .await
+            .expect("shutdown must interrupt the initial reconcile delay");
+        Ok(())
     }
 }

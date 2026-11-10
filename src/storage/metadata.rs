@@ -1249,6 +1249,12 @@ impl Database {
         Ok(attempts_by_item)
     }
 
+    /// Writes one identity's capability results in its own transaction.
+    ///
+    /// Production candidate-search paths write through
+    /// [`Self::record_metadata_capability_writes`]; this single-identity entry point stays for the
+    /// storage tests that pin the per-identity statement and retry contract.
+    #[cfg(test)]
     pub(crate) async fn record_metadata_capability_results(
         &self,
         item_id: &str,
@@ -1260,6 +1266,76 @@ impl Database {
         if results.is_empty() {
             return Ok(());
         }
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        self.write_metadata_capability_results_in_transaction(
+            &mut transaction,
+            item_id,
+            provider,
+            provider_id,
+            results,
+            now,
+        )
+        .await?;
+        transaction.commit().await.map_err(self.sqlx_err())
+    }
+
+    /// Writes every candidate's capability results and transient failures in one transaction.
+    ///
+    /// A manual candidate search resolves up to 20 results; writing one transaction per result
+    /// made a single user click the loudest writer on the metadata write lock
+    /// (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S1). Ordering and content per
+    /// `(provider, provider_id)` are unchanged: results first, then the failure retry rows that
+    /// read the attempt counts the results step just wrote.
+    pub(crate) async fn record_metadata_capability_writes(
+        &self,
+        item_id: &str,
+        writes: &[MetadataCapabilityWrite<'_>],
+    ) -> Result<(), StorageError> {
+        if writes
+            .iter()
+            .all(|write| write.results.is_empty() && write.transient_failures.is_empty())
+        {
+            return Ok(());
+        }
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        for write in writes {
+            if !write.results.is_empty() {
+                self.write_metadata_capability_results_in_transaction(
+                    &mut transaction,
+                    item_id,
+                    &write.provider,
+                    &write.provider_id,
+                    &write.results,
+                    write.now,
+                )
+                .await?;
+            }
+            if !write.transient_failures.is_empty() {
+                self.write_metadata_capability_failures_in_transaction(
+                    &mut transaction,
+                    item_id,
+                    &write.provider,
+                    &write.provider_id,
+                    &write.transient_failures,
+                    write.now,
+                )
+                .await?;
+            }
+        }
+        transaction.commit().await.map_err(self.sqlx_err())
+    }
+
+    async fn write_metadata_capability_results_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+        item_id: &str,
+        provider: &str,
+        provider_id: &str,
+        results: &[MetadataCapabilityResult<'_>],
+        now: i64,
+    ) -> Result<(), StorageError> {
         let mut unique_results = Vec::with_capacity(results.len());
         let mut result_indices = HashMap::with_capacity(results.len());
         for result in results {
@@ -1270,8 +1346,6 @@ impl Database {
                 unique_results.push(result);
             }
         }
-        let _write_guard = self.acquire_metadata_write_lock().await;
-        let mut transaction = self.begin_metadata_write_transaction().await?;
         for chunk in unique_results.chunks(100) {
             let values = std::iter::repeat_n("(?, ?, ?, ?, ?, 1, ?, NULL, ?, ?)", chunk.len())
                 .collect::<Vec<_>>()
@@ -1308,13 +1382,17 @@ impl Database {
                     .bind(now);
             }
             statement
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(self.sqlx_err())?;
         }
-        transaction.commit().await.map_err(self.sqlx_err())
+        Ok(())
     }
 
+    /// Records one identity's transient capability failures in its own transaction.
+    ///
+    /// Test-only for the same reason as [`Self::record_metadata_capability_results`].
+    #[cfg(test)]
     pub(crate) async fn record_metadata_capability_failures(
         &self,
         item_id: &str,
@@ -1326,6 +1404,29 @@ impl Database {
         if capabilities.is_empty() {
             return Ok(());
         }
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        self.write_metadata_capability_failures_in_transaction(
+            &mut transaction,
+            item_id,
+            provider,
+            provider_id,
+            capabilities,
+            now,
+        )
+        .await?;
+        transaction.commit().await.map_err(self.sqlx_err())
+    }
+
+    async fn write_metadata_capability_failures_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+        item_id: &str,
+        provider: &str,
+        provider_id: &str,
+        capabilities: &[&str],
+        now: i64,
+    ) -> Result<(), StorageError> {
         let mut unique_capabilities = Vec::with_capacity(capabilities.len());
         let mut seen = HashSet::with_capacity(capabilities.len());
         for capability in capabilities {
@@ -1333,8 +1434,6 @@ impl Database {
                 unique_capabilities.push(*capability);
             }
         }
-        let _write_guard = self.acquire_metadata_write_lock().await;
-        let mut transaction = self.begin_metadata_write_transaction().await?;
         let mut attempts = HashMap::with_capacity(unique_capabilities.len());
         for chunk in unique_capabilities.chunks(100) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
@@ -1352,7 +1451,7 @@ impl Database {
                 statement = statement.bind(*capability);
             }
             let rows = statement
-                .fetch_all(&mut *transaction)
+                .fetch_all(&mut **transaction)
                 .await
                 .map_err(self.sqlx_err())?;
             attempts.extend(rows);
@@ -1400,11 +1499,11 @@ impl Database {
                     .bind(now);
             }
             statement
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(self.sqlx_err())?;
         }
-        transaction.commit().await.map_err(self.sqlx_err())
+        Ok(())
     }
 
     pub(crate) async fn list_pending_metadata_candidates(
@@ -1740,6 +1839,16 @@ impl Database {
         // metadata transaction performs its updates.
         let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
+            // Selecting a candidate repeatedly (a background refresh re-selects the same
+            // `keep_pending` candidate) stores the same values again. `media_items` carries the
+            // whole-row `media_items_catalog_au` trigger, so every redundant write queues up to
+            // five `catalog_outbox` rows and a read-model rebuild. The `WHERE` condition therefore
+            // covers every assigned column and leaves `updated_at` alone unless a value changes:
+            // it is the "last modification" stamp behind Emby `DateLastSaved` and the
+            // `MinDateLastSaved` incremental filter (`src/storage/repository.rs` catalog filter),
+            // both of which are only correct when an unchanged row keeps its stamp. The same guard
+            // already governs `update_media_item_metadata_in_transaction` and
+            // `sync_media_item_nfo_state` in `catalog.rs`.
             "UPDATE media_items
              SET title = ?, sort_title = ?, original_title = ?, overview = ?, production_year = ?,
                  premiere_date = COALESCE(?, premiere_date),
@@ -1755,10 +1864,33 @@ impl Database {
                  nfo_metadata_json = NULL,
                  nfo_metadata_fingerprint = COALESCE(?, nfo_metadata_fingerprint),
                  poster_fallback_required = ?, updated_at = unixepoch()
-             WHERE id = ? AND removed_at IS NULL",
+             WHERE id = ? AND removed_at IS NULL
+               AND (
+                   title IS DISTINCT FROM ?
+                   OR sort_title IS DISTINCT FROM ?
+                   OR original_title IS DISTINCT FROM ?
+                   OR overview IS DISTINCT FROM ?
+                   OR production_year IS DISTINCT FROM ?
+                   OR (? IS NOT NULL AND premiere_date IS DISTINCT FROM ?)
+                   OR (? IS NOT NULL AND last_air_date IS DISTINCT FROM ?)
+                   OR (? IS NOT NULL AND status IS DISTINCT FROM ?)
+                   OR (? IS NOT NULL AND original_language IS DISTINCT FROM ?)
+                   OR (? = 1 AND rating IS DISTINCT FROM ?)
+                   OR (? IS NOT NULL AND rating_source IS DISTINCT FROM ?)
+                   OR provider_ids_json IS DISTINCT FROM ?
+                   OR (? IS NOT NULL AND metadata_scraper_id IS DISTINCT FROM ?)
+                   OR (CASE WHEN ? = 1 THEN 'PENDING' ELSE 'ONLINE_CONFIRMED' END)
+                      IS DISTINCT FROM identification_status
+                   OR metadata_fingerprint IS DISTINCT FROM ?
+                   OR metadata_provenance_json IS DISTINCT FROM ?
+                   OR locked_fields_json IS DISTINCT FROM ?
+                   OR nfo_metadata_json IS NOT NULL
+                   OR (? IS NOT NULL AND nfo_metadata_fingerprint IS DISTINCT FROM ?)
+                   OR poster_fallback_required IS DISTINCT FROM ?
+               )",
         )
         .bind(update.title)
-        .bind(sort_title)
+        .bind(&sort_title)
         .bind(update.original_title)
         .bind(update.overview)
         .bind(update.production_year)
@@ -1780,6 +1912,33 @@ impl Database {
         .bind(nfo_metadata_fingerprint)
         .bind(database_flag(update.poster_fallback_required))
         .bind(update.item_id)
+        .bind(update.title)
+        .bind(&sort_title)
+        .bind(update.original_title)
+        .bind(update.overview)
+        .bind(update.production_year)
+        .bind(update.premiere_date)
+        .bind(update.premiere_date)
+        .bind(update.last_air_date)
+        .bind(update.last_air_date)
+        .bind(update.status)
+        .bind(update.status)
+        .bind(update.original_language)
+        .bind(update.original_language)
+        .bind(database_flag(update.rating.is_some()))
+        .bind(update.rating.unwrap_or_default())
+        .bind(update.rating_source)
+        .bind(update.rating_source)
+        .bind(update.provider_ids_json)
+        .bind(update.metadata_scraper_id)
+        .bind(update.metadata_scraper_id)
+        .bind(database_flag(update.keep_pending))
+        .bind(update.metadata_fingerprint)
+        .bind(update.provenance_json)
+        .bind(update.locked_fields_json)
+        .bind(nfo_metadata_fingerprint)
+        .bind(nfo_metadata_fingerprint)
+        .bind(database_flag(update.poster_fallback_required))
         .execute(&mut *transaction)
         .await
         .map_err(self.sqlx_err())?;

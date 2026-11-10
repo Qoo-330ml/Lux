@@ -297,7 +297,26 @@ async fn chapter_detection_http_api_enforces_admin_csrf_and_persists_jobs()
     assert_eq!(detail.status(), reqwest::StatusCode::OK);
     assert_eq!(detail.json::<Value>().await?["job"]["pluginId"], PLUGIN_ID);
 
-    // The empty test library completes instantly; mark the job as running so the cancel path is reachable.
+    // The empty test library completes in the background worker. Wait for that to finish before
+    // marking the job as running, so the background worker cannot overwrite the status mid-test.
+    for _ in 0..100 {
+        let current = client
+            .get(format!(
+                "{base_url}/api/v1/admin/chapter-detection-jobs/{job_id}"
+            ))
+            .header(COOKIE, &cookie)
+            .send()
+            .await?
+            .json::<Value>()
+            .await?;
+        if !matches!(
+            current["job"]["status"].as_str(),
+            Some("PENDING" | "RUNNING")
+        ) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     sqlx::query("UPDATE chapter_detection_jobs SET status = 'RUNNING' WHERE id = ?")
         .bind(&job_id)
         .execute(database.pool())

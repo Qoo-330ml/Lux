@@ -145,6 +145,9 @@ pub(crate) fn scheduled_task_run_json(run: &ScheduledTaskRun) -> Value {
         ScheduledTaskRun::DanmakuMatch { jobs } => {
             json!({ "jobIds": jobs.iter().map(|job| job.id.clone()).collect::<Vec<_>>() })
         }
+        ScheduledTaskRun::RatingsSync { run_id, library_id } => {
+            json!({ "runId": run_id, "libraryId": library_id })
+        }
     }
 }
 
@@ -166,7 +169,10 @@ pub(crate) fn scheduled_task_error(headers: &HeaderMap, error: ScheduledTaskErro
         | ScheduledTaskError::Strm(StrmProbeError::AlreadyActive)
         | ScheduledTaskError::Chapter(ChapterDetectionError::AlreadyActive)
         | ScheduledTaskError::Cover(LibraryCoverError::AlreadyActive)
-        | ScheduledTaskError::Danmaku(DanmakuServiceError::AlreadyActive) => (
+        | ScheduledTaskError::Danmaku(DanmakuServiceError::AlreadyActive)
+        | ScheduledTaskError::RatingsSync(
+            crate::application::ratings_sync::RatingsSyncError::AlreadyActive,
+        ) => (
             StatusCode::CONFLICT,
             lux::ApiErrorCode::InvalidRequest,
             "同类任务已有运行中的作业",
@@ -179,6 +185,7 @@ pub(crate) fn scheduled_task_error(headers: &HeaderMap, error: ScheduledTaskErro
         | ScheduledTaskError::Chapter(_)
         | ScheduledTaskError::Cover(_)
         | ScheduledTaskError::Danmaku(_)
+        | ScheduledTaskError::RatingsSync(_)
         | ScheduledTaskError::Storage(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,
@@ -778,7 +785,15 @@ pub(crate) async fn admin_upsert_scheduled_task(
         && task_type == crate::application::schedule::STRM_MEDIA_INFO_TASK_TYPE;
     let is_global_danmaku = owner_type == "GLOBAL"
         && task_type == crate::application::schedule::DANMAKU_MATCH_TASK_TYPE;
-    if !SCHEDULE_TASK_TYPES.contains(&task_type.as_str()) && !is_global_strm && !is_global_danmaku {
+    // The ratings task is registered by a plugin for each selected library and keeps its schedule
+    // in that plugin's configuration, so it is editable here without joining the plan types.
+    let is_library_ratings = owner_type == "LIBRARY"
+        && task_type == crate::application::schedule::RATINGS_SYNC_TASK_TYPE;
+    if !SCHEDULE_TASK_TYPES.contains(&task_type.as_str())
+        && !is_global_strm
+        && !is_global_danmaku
+        && !is_library_ratings
+    {
         return api_error(
             &headers,
             StatusCode::BAD_REQUEST,
@@ -853,6 +868,15 @@ pub(crate) async fn admin_upsert_scheduled_task(
             )
             .into_response();
         }
+        Err(crate::application::admin_scheduled_tasks::ScheduledTaskConfigUpdateError::RatingsPluginNotRegistered) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "评分同步任务插件未注册",
+            )
+            .into_response();
+        }
         Err(crate::application::admin_scheduled_tasks::ScheduledTaskConfigUpdateError::RequiredSchedule(required)) => {
             let message = match required {
                 crate::application::admin_scheduled_tasks::RequiredScheduledTaskSchedule::StrmMediaInfo => {
@@ -863,6 +887,9 @@ pub(crate) async fn admin_upsert_scheduled_task(
                 }
                 crate::application::admin_scheduled_tasks::RequiredScheduledTaskSchedule::ChapterDetection => {
                     "片头片尾检测任务必须保留 Cron 执行计划"
+                }
+                crate::application::admin_scheduled_tasks::RequiredScheduledTaskSchedule::RatingsSync => {
+                    "评分同步任务必须保留 Cron 执行计划"
                 }
             };
             return api_error(

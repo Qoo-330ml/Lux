@@ -1,14 +1,27 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { ApiError, api } from "../../../lib/api/client";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { MeasureText } from "../danmaku/measure";
+import { createDanmakuEngine, type DanmakuEngine } from "../danmaku/engine";
+import { createDanmakuScheduler, type DanmakuScheduler } from "../danmaku/schedule";
 import {
-  activeDanmaku,
-  assignDanmakuLanes,
-  DANMAKU_LIMITS,
-  exceedsUtf8ByteLimit,
-  type DanmakuPlacement,
-  type LuxDanmakuEntry,
-} from "../danmaku";
-import { parseDanmakuWorkerRequest, type DanmakuWorkerResponse } from "../danmaku-worker";
+  DEFAULT_DANMAKU_SETTINGS,
+  danmakuLayoutFromSettings,
+  danmakuLayoutsEqual,
+  type DanmakuLayoutOptions,
+  type DanmakuSettings,
+} from "../danmaku/settings";
+import { useDanmakuTrack } from "../danmaku/useDanmakuTrack";
+
+const DEFAULT_VIEWPORT = { width: 1280, height: 720 };
+
+function requestLayoutFrame(callback: () => void): number {
+  if (typeof requestAnimationFrame === "function") return requestAnimationFrame(() => callback());
+  return setTimeout(callback, 0) as unknown as number;
+}
+
+function cancelLayoutFrame(handle: number) {
+  if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(handle);
+  else clearTimeout(handle);
+}
 
 type PlayerDanmakuOverlayProps = {
   itemId: string;
@@ -17,9 +30,30 @@ type PlayerDanmakuOverlayProps = {
   currentTime: number;
   playbackRate: number;
   lifecycleKey: string;
+  /**
+   * Optional. When the video is playing, the renderer interpolates the media clock between the
+   * sparse `timeupdate` samples with this flag and `playbackRate`; paused danmaku stay still.
+   */
+  playing?: boolean;
+  /** Optional. Receives "弹幕加载失败" / "已截断" / "内容为空" style messages, `null` when fine. */
   onStatusChange?: (status: string | null) => void;
+  /** Optional. Injects text measurement (tests, or a font probe). */
+  measure?: MeasureText;
+  /**
+   * Optional browser-local danmaku settings. They are applied live: opacity on the container, the
+   * rest through the scheduler's `updateLayout`, so no XML is fetched or parsed again.
+   */
+  settings?: DanmakuSettings;
 };
 
+/**
+ * Danmaku overlay.
+ *
+ * React owns only the host element and reloads data per playback lifecycle; the danmaku nodes and
+ * their per-frame `transform` updates live in `danmaku/engine.ts` so a 4-times-per-second
+ * `timeupdate` no longer re-renders the component tree. Settings changes reach the scheduler and the
+ * existing nodes in place.
+ */
 export function PlayerDanmakuOverlay({
   itemId,
   sourceId,
@@ -27,174 +61,127 @@ export function PlayerDanmakuOverlay({
   currentTime,
   playbackRate,
   lifecycleKey,
+  playing = false,
   onStatusChange,
+  measure,
+  settings = DEFAULT_DANMAKU_SETTINGS,
 }: PlayerDanmakuOverlayProps) {
   const hostRef = useRef<HTMLDivElement>(null);
-  const generationRef = useRef(0);
-  const [entries, setEntries] = useState<LuxDanmakuEntry[]>([]);
-  const [viewport, setViewport] = useState({ width: 1280, height: 720 });
-  const scheduled = useMemo(
-    () => assignDanmakuLanes(entries, viewport),
-    [entries, viewport],
+  const engineRef = useRef<DanmakuEngine | null>(null);
+  const schedulerRef = useRef<DanmakuScheduler | null>(null);
+  const clockRef = useRef({ mediaTime: currentTime, playing, playbackRate });
+  const measureRef = useRef(measure);
+  const [viewport, setViewport] = useState(DEFAULT_VIEWPORT);
+  const layout = useMemo<DanmakuLayoutOptions>(
+    () => danmakuLayoutFromSettings(settings),
+    [settings],
   );
-  const placements = useMemo(
-    () => activeDanmaku(scheduled, currentTime, viewport, playbackRate),
-    [currentTime, playbackRate, scheduled, viewport],
-  );
+  // Read by the scheduler-creation effect so a layout change never has to recreate it just to keep
+  // the current options.
+  const layoutRef = useRef<DanmakuLayoutOptions>(layout);
+  // Layout updates are coalesced into one animation frame: dragging a slider fires an input event per
+  // step, and each one must not walk a 50k-entry danmaku file.
+  const layoutFrameRef = useRef<number | null>(null);
+  const appliedLayoutRef = useRef<DanmakuLayoutOptions | null>(null);
+  const track = useDanmakuTrack({ itemId, sourceId, visible, lifecycleKey, onStatusChange });
 
+  const syncClock = useCallback(() => {
+    engineRef.current?.sync(clockRef.current);
+  }, []);
+
+  // Refresh the clock/measurer refs before the effects below use them in this same commit.
   useEffect(() => {
+    clockRef.current = { mediaTime: currentTime, playing, playbackRate };
+    measureRef.current = measure;
+  });
+
+  // Track the host size so lane geometry matches the visible overlay box.
+  useEffect(() => {
+    if (!visible) return;
+    const host = hostRef.current;
+    if (!host) return;
     const updateViewport = () => {
-      const host = hostRef.current;
-      if (!host) return;
-      setViewport({
-        width: Math.max(1, host.clientWidth || 1280),
-        height: Math.max(1, host.clientHeight || 720),
-      });
+      const width = Math.max(1, host.clientWidth || DEFAULT_VIEWPORT.width);
+      const height = Math.max(1, host.clientHeight || DEFAULT_VIEWPORT.height);
+      setViewport((previous) => (
+        previous.width === width && previous.height === height ? previous : { width, height }
+      ));
     };
     updateViewport();
     if (typeof ResizeObserver !== "undefined") {
       const observer = new ResizeObserver(updateViewport);
-      if (hostRef.current) observer.observe(hostRef.current);
+      observer.observe(host);
       return () => observer.disconnect();
     }
     window.addEventListener("resize", updateViewport);
     return () => window.removeEventListener("resize", updateViewport);
-  }, []);
+  }, [visible]);
 
+  // A fresh schedule per data/viewport change: lanes are assigned from the current window.
   useEffect(() => {
-    const generation = ++generationRef.current;
-    const controller = new AbortController();
-    let worker: Worker | null = null;
-    setEntries([]);
-    onStatusChange?.(null);
-    if (!visible || !itemId || !sourceId) return () => controller.abort();
+    schedulerRef.current = createDanmakuScheduler(track.entries, {
+      viewport,
+      measure: measureRef.current,
+      layout: layoutRef.current,
+    });
+    appliedLayoutRef.current = layoutRef.current;
+    syncClock();
+  }, [measure, syncClock, track.entries, viewport]);
 
-    const isCurrent = () => generationRef.current === generation && !controller.signal.aborted;
-    const fail = (message: string) => {
-      if (!isCurrent()) return;
-      setEntries([]);
-      onStatusChange?.(message);
-    };
-    const complete = (response: DanmakuWorkerResponse) => {
-      if (!isCurrent() || response.requestId !== generation) return;
-      if (response.type === "FAILED") {
-        fail(response.message);
-      } else {
-        setEntries(response.entries);
-        onStatusChange?.(response.entries.length > 0 ? null : "弹幕内容为空");
-      }
-    };
-    const load = async () => {
-      try {
-        const info = await api.webDanmaku(itemId, sourceId);
-        if (!isCurrent()) return;
-        const rawUrl = sameOriginRawUrl(info.rawUrl);
-        const response = await fetch(rawUrl, {
-          credentials: "same-origin",
-          signal: controller.signal,
-          headers: { Accept: "application/xml, text/xml" },
-        });
-        if (!response.ok) throw new Error("danmaku-request-failed");
-        const xml = await readDanmakuResponse(response, controller.signal);
-        if (!isCurrent()) return;
-        const request = { type: "PARSE" as const, requestId: generation, xml };
-        if (typeof Worker === "undefined") {
-          complete(parseDanmakuWorkerRequest(request));
-          return;
-        }
-        worker = new Worker(new URL("../danmaku-worker.ts", import.meta.url), { type: "module" });
-        worker.onmessage = (event: MessageEvent<DanmakuWorkerResponse>) => complete(event.data);
-        worker.onerror = () => fail("弹幕解析失败");
-        worker.postMessage(request);
-      } catch (error) {
-        if (!controller.signal.aborted) {
-          if (error instanceof ApiError && error.status === 404) return;
-          fail(error instanceof Error && error.message === "弹幕文件过大" ? error.message : "弹幕加载失败");
-        }
-      }
-    };
-    void load();
+  // Settings changes are coalesced into one frame, then re-lane the current window and redraw;
+  // existing nodes keep their identity, so a paused video updates without any reload.
+  useEffect(() => {
+    layoutRef.current = layout;
+    const scheduler = schedulerRef.current;
+    if (!scheduler) return;
+    const applied = appliedLayoutRef.current;
+    if (applied && danmakuLayoutsEqual(applied, layout)) return;
+    if (layoutFrameRef.current !== null) return;
+    layoutFrameRef.current = requestLayoutFrame(() => {
+      layoutFrameRef.current = null;
+      const active = schedulerRef.current;
+      if (!active) return;
+      active.updateLayout(layoutRef.current);
+      appliedLayoutRef.current = layoutRef.current;
+      syncClock();
+    });
     return () => {
-      controller.abort();
-      worker?.terminate();
+      if (layoutFrameRef.current === null) return;
+      cancelLayoutFrame(layoutFrameRef.current);
+      layoutFrameRef.current = null;
     };
-  }, [itemId, lifecycleKey, onStatusChange, sourceId, visible]);
+  }, [layout, syncClock]);
+
+  // The engine binds to the host element; it is the only owner of the danmaku DOM nodes.
+  useEffect(() => {
+    if (!visible) return;
+    const host = hostRef.current;
+    if (!host) return;
+    const engine = createDanmakuEngine({
+      container: host,
+      scheduler: () => schedulerRef.current,
+    });
+    engineRef.current = engine;
+    engine.sync(clockRef.current);
+    return () => {
+      engine.destroy();
+      engineRef.current = null;
+    };
+  }, [visible]);
+
+  // Every React sample re-anchors the clock; animation frames interpolate in between.
+  useEffect(() => {
+    syncClock();
+  }, [currentTime, playbackRate, playing, syncClock]);
 
   if (!visible) return null;
   return (
-    <div ref={hostRef} className="lux-player-danmaku-overlay" data-lux-danmaku-overlay aria-hidden="true">
-      {placements.map((placement) => <DanmakuText key={placement.id} placement={placement} />)}
-    </div>
+    <div
+      ref={hostRef}
+      className="lux-player-danmaku-overlay"
+      data-lux-danmaku-overlay
+      style={{ opacity: settings.opacity }}
+      aria-hidden="true"
+    />
   );
-}
-
-function DanmakuText({ placement }: { placement: DanmakuPlacement }) {
-  const style = {
-    color: placement.color,
-    fontSize: `${placement.fontSize}px`,
-    left: `${placement.x}px`,
-    top: `${placement.y}px`,
-  };
-  return (
-    <span
-      className={`lux-player-danmaku-text lux-player-danmaku-${placement.mode}`}
-      style={style}
-      data-danmaku-id={placement.id}
-    >
-      {placement.text}
-    </span>
-  );
-}
-
-function sameOriginRawUrl(rawUrl: string) {
-  const origin = typeof window === "undefined" ? "http://localhost" : window.location.origin;
-  const url = new URL(rawUrl, origin);
-  if (
-    url.origin !== origin
-    || !url.pathname.startsWith("/api/v1/items/")
-    || !url.pathname.endsWith("/danmaku/raw")
-  ) {
-    throw new Error("danmaku URL is not same-origin");
-  }
-  return `${url.pathname}${url.search}`;
-}
-
-async function readDanmakuResponse(response: Response, signal: AbortSignal) {
-  const declaredLength = response.headers.get("content-length");
-  if (declaredLength && Number(declaredLength) > DANMAKU_LIMITS.maxBytes) {
-    throw new Error("弹幕文件过大");
-  }
-  if (!response.body) {
-    const text = await response.text();
-    if (exceedsUtf8ByteLimit(text, DANMAKU_LIMITS.maxBytes)) {
-      throw new Error("弹幕文件过大");
-    }
-    return text;
-  }
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      if (signal.aborted) throw new DOMException("Aborted", "AbortError");
-      const result = await reader.read();
-      if (result.done) break;
-      total += result.value.byteLength;
-      if (total > DANMAKU_LIMITS.maxBytes) throw new Error("弹幕文件过大");
-      chunks.push(result.value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-  } catch {
-    throw new Error("弹幕内容编码无效");
-  }
 }

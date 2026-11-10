@@ -17,7 +17,9 @@ const SQLITE_USER_UPDATE_RETRY_WINDOW: Duration = Duration::from_secs(5);
 const MAX_LOGIN_BACKGROUND_CACHE_BYTES: usize = 256 * 1024;
 const DEFAULT_USER_DELETION_GRACE_DAYS: i64 = 7;
 const MAX_USER_DELETION_GRACE_DAYS: i64 = 3_650;
-const DEFAULT_USER_ACTIVITY_RETENTION_DAYS: i64 = 90;
+const DEFAULT_USER_ACTIVITY_RETENTION_DAYS: i64 = 7;
+/// The dashboard feed only looks this far back, so neither category query can scan the whole index.
+pub(super) const DASHBOARD_ACTIVITY_WINDOW_SECONDS: i64 = 30 * 24 * 60 * 60;
 const MAX_USER_ACTIVITY_RETENTION_DAYS: i64 = 3_650;
 const SECONDS_PER_DAY: i64 = 86_400;
 const MAX_USER_CONTENT_RESTRICTION_TAGS: usize = 100;
@@ -191,6 +193,23 @@ struct PluginInstallationStatusRow {
     plugin_id: String,
     is_enabled: i64,
 }
+
+/// Newest successful logins for the dashboard activity feed inside the dashboard window.
+pub(super) const ACTIVITY_FEED_LOGIN_SQL: &str = "SELECT id, user_id, actor_user_id, event_type,
+            target_type, target_id, metadata_json, occurred_at
+     FROM user_activity_events
+     WHERE event_type = 'AUTH_LOGIN' AND occurred_at >= ?
+     ORDER BY occurred_at DESC, id DESC
+     LIMIT ?";
+
+/// Newest playback state changes for the dashboard activity feed inside the dashboard window.
+pub(super) const ACTIVITY_FEED_PLAYBACK_SQL: &str = "SELECT id, user_id, actor_user_id, event_type,
+            target_type, target_id, metadata_json, occurred_at
+     FROM user_activity_events
+     WHERE event_type IN ('PLAYBACK_STARTED', 'PLAYBACK_PAUSED', 'PLAYBACK_STOPPED')
+       AND occurred_at >= ?
+     ORDER BY occurred_at DESC, id DESC
+     LIMIT ?";
 
 /// Typed projection of one `user_activity_events` row.
 #[derive(sqlx::FromRow)]
@@ -2314,49 +2333,74 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
+    /// Dashboard feed: the newest logins and the newest playback events of the last
+    /// [`DASHBOARD_ACTIVITY_WINDOW_SECONDS`] days.
+    ///
+    /// `LIMIT` bounds the returned rows; the scan is bounded by that fixed `occurred_at` window
+    /// (and by the configured retention, which is at most 3650 days). Without the lower bound a
+    /// category that has few or no rows in the window would still walk the entire retention index
+    /// every 15 seconds. With it, each query is a range `SEARCH` on
+    /// `idx_user_activity_events_retention (occurred_at, id)`; a category without rows in the
+    /// window still reads the window's rows, but that count is bounded.
+    /// `AUTH_LOGIN_FAILED` stays out of the feed.
     pub(crate) async fn list_activity_events(
         &self,
         limit: i64,
     ) -> Result<Vec<StoredActivityEvent>, StorageError> {
         let category_limit = (limit / 2).max(1);
-        let file_events = self
-            .log_store
-            .list_activity_events(limit)
+        let window_start =
+            current_unix_timestamp().saturating_sub(DASHBOARD_ACTIVITY_WINDOW_SECONDS);
+        let login_rows = self
+            .query_as::<UserActivityEventRow>(sqlx::AssertSqlSafe(ACTIVITY_FEED_LOGIN_SQL))
+            .bind(window_start)
+            .bind(category_limit)
+            .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Io {
-                path: self.path.clone(),
-                source,
-            })?;
-        let actor_user_ids = file_events
-            .iter()
-            .filter_map(|event| event.actor_user_id.clone())
+            .map_err(self.sqlx_err())?;
+        let playback_rows = self
+            .query_as::<UserActivityEventRow>(sqlx::AssertSqlSafe(ACTIVITY_FEED_PLAYBACK_SQL))
+            .bind(window_start)
+            .bind(category_limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        let rows = login_rows
+            .into_iter()
+            .chain(playback_rows)
             .collect::<Vec<_>>();
-        let actor_usernames = self.list_usernames_by_ids(&actor_user_ids).await?;
-        let item_ids = file_events
+        let username_keys = rows
             .iter()
-            .filter_map(|event| event.target_id.clone())
+            .map(|row| {
+                row.actor_user_id
+                    .clone()
+                    .unwrap_or_else(|| row.user_id.clone())
+            })
+            .collect::<Vec<_>>();
+        let usernames = self.list_usernames_by_ids(&username_keys).await?;
+        let item_ids = rows
+            .iter()
+            .filter_map(|row| row.target_id.clone())
             .collect::<Vec<_>>();
         let item_metadata = self.list_media_item_metadata_by_ids(&item_ids).await?;
-        let mut events = file_events
+        let mut events = rows
             .into_iter()
-            .map(|event| StoredActivityEvent {
-                actor_username: event.actor_username.or_else(|| {
-                    actor_usernames
-                        .get(event.actor_user_id.as_deref()?)
-                        .cloned()
-                }),
-                target_title: event
-                    .target_id
-                    .as_deref()
-                    .and_then(|item_id| item_metadata.get(item_id))
-                    .map(|metadata| metadata.title.clone()),
-                id: event.id,
-                actor_user_id: event.actor_user_id,
-                event_type: event.event_type,
-                target_type: event.target_type,
-                target_id: event.target_id,
-                metadata_json: event.metadata_json,
-                created_at: event.created_at,
+            .map(|row| {
+                let username_key = row.actor_user_id.as_deref().unwrap_or(&row.user_id);
+                StoredActivityEvent {
+                    actor_username: usernames.get(username_key).cloned(),
+                    target_title: row
+                        .target_id
+                        .as_deref()
+                        .and_then(|item_id| item_metadata.get(item_id))
+                        .map(|metadata| metadata.title.clone()),
+                    id: row.id,
+                    actor_user_id: row.actor_user_id,
+                    event_type: row.event_type,
+                    target_type: row.target_type,
+                    target_id: row.target_id,
+                    metadata_json: row.metadata_json,
+                    created_at: row.occurred_at,
+                }
             })
             .collect::<Vec<_>>();
         events.sort_by(|left, right| {
@@ -2367,17 +2411,6 @@ impl Database {
         });
         let mut seen_ids = HashSet::with_capacity(events.len());
         events.retain(|event| seen_ids.insert(event.id.clone()));
-        let mut login_count = 0_i64;
-        let mut playback_count = 0_i64;
-        events.retain(|event| {
-            if event.event_type == "AUTH_LOGIN" {
-                login_count += 1;
-                login_count <= category_limit
-            } else {
-                playback_count += 1;
-                playback_count <= category_limit
-            }
-        });
         events.truncate(usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
         Ok(events)
     }
@@ -3272,10 +3305,19 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
-    pub(crate) async fn set_trusted_proxy_cidrs_json(
-        &self,
-        value: &str,
-    ) -> Result<(), StorageError> {
+    /// Stores the raw JSON of the trusted-proxy CIDR setting.
+    ///
+    /// This is the one write path for `server_settings.trusted_proxy_cidrs`: the admin settings
+    /// write uses it, and it is public so an embedding test can change the setting the same way
+    /// instead of writing the row behind the reader cache. Callers pass the normalized JSON that
+    /// `crate::application::settings` validates.
+    ///
+    /// # Caching
+    ///
+    /// The access-IP resolver keeps the parsed list in memory. The epoch bump below runs after the
+    /// commit, so a read that starts once this call returned is guaranteed to refill from the new
+    /// value; keep the order (commit, then bump) if this body is ever refactored.
+    pub async fn set_trusted_proxy_cidrs_json(&self, value: &str) -> Result<(), StorageError> {
         self.query(
             "INSERT INTO server_settings (key, value)
              VALUES ('trusted_proxy_cidrs', ?)
@@ -3286,6 +3328,9 @@ impl Database {
         .execute(&self.pool)
         .await
         .map_err(self.sqlx_err())?;
+        // The access-IP resolver caches the parsed list; bump after the commit so the first read
+        // that starts once this returned refills from the new value.
+        self.access_changes.invalidate_trusted_proxy_cidrs();
         Ok(())
     }
 

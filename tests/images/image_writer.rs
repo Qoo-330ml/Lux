@@ -749,6 +749,66 @@ async fn downloads_flat_movie_images_to_distinct_media_prefixed_paths()
     Ok(())
 }
 
+/// LUX-887: the same upstream file may feed several artwork types, and each type keeps its own
+/// registered file; the same-type path conflict rule must not fold those rows together.
+#[tokio::test]
+async fn artwork_types_fed_by_one_source_write_distinct_files()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, item_id, _root, movie_dir) = prepared_movie().await?;
+    let app = Router::new().route(
+        "/shared",
+        get(|| async {
+            Response::builder()
+                .header(CONTENT_TYPE, "image/png")
+                .body(Body::from(PNG_1X1.to_vec()))
+                .expect("test image response should be valid")
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let service = ImageWriteService::with_config(database.clone(), local_image_config())?;
+    let image_url = format!("http://{address}/shared");
+
+    let mut written = Vec::new();
+    for image_type in ["ART", "BANNER", "THUMB", "WALLPAPER"] {
+        written.push(
+            service
+                .download_item_image(&item_id, image_type, &image_url)
+                .await?,
+        );
+    }
+    written.sort_by(|left, right| left.path.cmp(&right.path));
+    for report in &written {
+        assert_eq!(tokio::fs::read(&report.path).await?, PNG_1X1);
+    }
+    let distinct = written
+        .iter()
+        .map(|report| report.path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(distinct.len(), 4, "one file per artwork type");
+    let indexed: Vec<(String, String)> = sqlx::query_as(
+        "SELECT image_type, local_path FROM item_images WHERE item_id = ? ORDER BY image_type",
+    )
+    .bind(&item_id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(indexed.len(), 4);
+    for (image_type, local_path) in &indexed {
+        let path = PathBuf::from(local_path);
+        assert!(path.starts_with(&movie_dir));
+        assert_eq!(tokio::fs::read(&path).await?, PNG_1X1, "{image_type} file");
+    }
+    let registered = indexed
+        .iter()
+        .map(|(_, local_path)| PathBuf::from(local_path))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(registered, distinct);
+
+    server.abort();
+    Ok(())
+}
+
 #[tokio::test]
 async fn episode_images_use_distinct_paths_and_ignore_season_artwork()
 -> Result<(), Box<dyn std::error::Error>> {

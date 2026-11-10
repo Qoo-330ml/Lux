@@ -1657,10 +1657,12 @@ describe("MediaDetailPage series hierarchy", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    expect(container.querySelector(".lux-player-error-card")?.textContent)
-      .toContain("浏览器不支持此媒体");
-    expect(container.querySelector(".lux-player-error")?.textContent)
-      .toContain("请尝试其他版本");
+    // The UNSUPPORTED plan now explains its own reason instead of the generic
+    // "浏览器不支持此媒体" copy.
+    expect(container.querySelector(".lux-player-notice-layer")?.textContent)
+      .toContain("当前浏览器无法播放服务端 HLS");
+    expect(container.querySelector(".lux-player-notice-hint")?.textContent)
+      .toContain("换用支持 MSE 的现代浏览器");
   });
 
   it("offers the next pending metadata item when opened from the pending filter", async () => {

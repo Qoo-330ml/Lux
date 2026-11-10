@@ -30,10 +30,11 @@ use tower_http::{
 use uuid::Uuid;
 
 use crate::api::lux;
+use crate::api::websocket::{WebsocketConnections, WebsocketShutdown};
 use crate::{
     COMMIT, VERSION,
     application::admin_health::{AdminHealthProbeCache, admin_health_report},
-    application::danmaku::{DanmakuService, DanmakuServiceError},
+    application::danmaku::{DanmakuService, DanmakuServiceError, DanmakuSidecarScope},
     application::database_setup::{DatabaseSetupError, DatabaseSetupService},
     application::deletion::{MediaDeleteError, MediaDeleteService},
     application::downloads::{DownloadArtifact, DownloadError, DownloadService},
@@ -85,6 +86,7 @@ use crate::{
         },
         people::{PeopleError, PeopleService, PersonMetadataUpdate},
         plugins::{PluginPage, PluginService, PluginServiceError},
+        ratings_sync::RatingsSyncService,
         reidentify::{MetadataReidentifyError, MetadataReidentifyService},
         restart::RestartHandle,
         scanner::{ScanJob, ScanJobError, ScanJobService, ScannerError},
@@ -98,6 +100,7 @@ use crate::{
         },
         thumbnails::ThumbnailService,
         user_avatars::{MAX_USER_AVATAR_BYTES, UserAvatarError, UserAvatarService},
+        user_cleanup::UserCleanupWorker,
         watch::LibraryWatchService,
         webhooks::{BUILTIN_WEBHOOK_PROVIDER_ID, WebhookError, WebhookEventType, WebhookService},
     },
@@ -120,10 +123,10 @@ use crate::{
     storage::{
         DashboardStats, Database, ExternalSubtitleUpdate, NewPlaybackEvent,
         NewUserDeviceObservation, PersonListOptions, PersonSort, StorageError,
-        StoredPlaybackSession, WebPlaybackEventClaim,
+        StoredPlaybackSession, TrustedProxyCidrCache, WebPlaybackEventClaim,
     },
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
 #[path = "admin.rs"]
 mod admin;
@@ -135,11 +138,27 @@ mod emby_handlers;
 use emby_handlers::*;
 #[path = "emby_catalog.rs"]
 mod emby_catalog;
+#[path = "emby_similar.rs"]
+mod emby_similar;
+use emby_similar::*;
+#[path = "emby_image_diag.rs"]
+mod emby_image_diag;
 #[allow(unused_imports)]
 use emby_catalog::*;
+#[path = "emby_filter_metadata.rs"]
+mod emby_filter_metadata;
+use emby_filter_metadata::*;
 #[path = "playback.rs"]
 mod playback;
 use playback::*;
+#[path = "emby_websocket.rs"]
+mod emby_websocket;
+pub use emby_websocket::EmbyWebsocketLimits;
+use emby_websocket::*;
+#[path = "lux_websocket.rs"]
+mod lux_websocket;
+pub use lux_websocket::LuxWebsocketLimits;
+use lux_websocket::*;
 #[path = "media.rs"]
 mod media;
 use media::*;
@@ -150,25 +169,9 @@ mod routes;
 #[path = "users.rs"]
 mod users;
 
-/// Concurrency budget for server-sent-event streams; the default keeps resource use bounded.
-#[derive(Clone)]
-pub(crate) struct SseConnectionBudget(Arc<tokio::sync::Semaphore>);
-
-impl Default for SseConnectionBudget {
-    fn default() -> Self {
-        Self(Arc::new(tokio::sync::Semaphore::new(MAX_SSE_CONNECTIONS)))
-    }
-}
-
-impl SseConnectionBudget {
-    fn try_acquire(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        self.0.clone().try_acquire_owned().ok()
-    }
-}
-
 /// State that exists in every process mode, including the pre-setup mode.
 ///
-/// It holds the middleware pieces (rate limiters, SSE budget, resource and request metrics), the
+/// It holds the middleware pieces (rate limiters, resource and request metrics), the
 /// event hubs, the connection handle, and the three non-service options (`database`,
 /// `config_dir`, `restart_handle`) that setup itself needs. Business services live in
 /// [`ReadyServices`].
@@ -176,6 +179,12 @@ impl SseConnectionBudget {
 pub struct CoreState {
     admin_health_probe_cache: AdminHealthProbeCache,
     database: Option<Database>,
+    /// The parsed trusted-proxy CIDR list this process last read, keyed by database and epoch.
+    ///
+    /// The access-IP resolver needs the setting for every protected request that arrives with a
+    /// forwarded chain, while administrators change it rarely; the cached copy is dropped whenever
+    /// a write bumps `AccessChangeEpochs::trusted_proxy_cidrs_epoch`.
+    trusted_proxy_cidrs: TrustedProxyCidrCache,
     config_dir: Option<PathBuf>,
     database_selection_required: bool,
     restart_handle: Option<RestartHandle>,
@@ -191,8 +200,15 @@ pub struct CoreState {
     login_rate_limiter: LoginRateLimiter,
     device_pairing_rate_limiter: DevicePairingRateLimiter,
     request_rate_limiter: crate::security::RequestRateLimiter,
-    /// Bounds the number of concurrent server-sent-event streams.
-    sse_permits: SseConnectionBudget,
+    /// Per-administrator-session budget for the manual danmaku search endpoint (ADR-052 P5).
+    danmaku_search_rate_limiter: crate::security::DanmakuSearchRateLimiter,
+    /// Bounds the number of concurrent Emby WebSocket connections (global and per user).
+    emby_websocket_connections: WebsocketConnections,
+    /// Bounds the concurrent Lux WebSocket connections: one budget per channel (ADR-054 D8).
+    lux_websocket_connections: LuxWebsocketConnections,
+    /// Trips every open realtime WebSocket connection (`/embywebsocket` and `/api/v1/ws`) when the
+    /// process starts shutting down. Both endpoints watch the same signal (ADR-054 D10).
+    websocket_shutdown: WebsocketShutdown,
 }
 
 /// Delay between the `setup/complete` response and the restart request.
@@ -250,6 +266,7 @@ pub struct ReadyServices {
     scraper: ScraperProvider,
     collections: CollectionService,
     global_collection_sync_worker: GlobalCollectionSyncWorker,
+    catalog_outbox_workers: crate::application::catalog_read_model::CatalogOutboxWorkers,
     content_restriction_index_worker: Option<ContentRestrictionIndexWorker>,
     identity_merge_worker: IdentityMergeWorker,
     people: PeopleService,
@@ -258,6 +275,8 @@ pub struct ReadyServices {
     ip_location: IpLocationService,
     web_playback: WebPlaybackSessionService,
     playback_progress: PlaybackProgressService,
+    user_cleanup_worker: UserCleanupWorker,
+    library_watch: LibraryWatchService,
 }
 
 /// Shared HTTP state: a single `Router` is mounted for both modes.
@@ -610,10 +629,13 @@ impl AppState {
         scheduled_tasks -> ScheduledTaskService,
         plugins -> PluginService,
         global_collection_sync_worker -> GlobalCollectionSyncWorker,
+        catalog_outbox_workers -> crate::application::catalog_read_model::CatalogOutboxWorkers,
         identity_merge_worker -> IdentityMergeWorker,
         people -> PeopleService,
-        user_avatars -> UserAvatarService,
         playback_progress -> PlaybackProgressService,
+        user_cleanup_worker -> UserCleanupWorker,
+        web_playback -> WebPlaybackSessionService,
+        library_watch -> LibraryWatchService,
     }
 
     optional_service_accessor! {
@@ -651,14 +673,23 @@ impl AppState {
         if let Some(worker) = self.identity_merge_worker() {
             worker.shutdown().await;
         }
-        crate::application::probe::shutdown_probe_runtime()
+        if let Some(scan_jobs) = self.scan_jobs() {
+            scan_jobs.shutdown_local_metadata_outbox_worker().await;
+        }
+        // A failed probe drain must not leave the workers below running: it is reported after they
+        // were stopped, so the database is never closed under an active worker.
+        let probe_shutdown_error = crate::application::probe::shutdown_probe_runtime()
             .await
-            .map_err(|error| error.to_string())?;
+            .err()
+            .map(|error| error.to_string());
         if let Some(metadata_reidentify) = self.metadata_reidentify() {
             metadata_reidentify.shutdown().await;
         }
         if let Some(worker) = self.global_collection_sync_worker() {
             worker.shutdown().await;
+        }
+        if let Some(workers) = self.catalog_outbox_workers() {
+            workers.shutdown().await;
         }
         if let Some(webhooks) = self.webhooks() {
             webhooks.shutdown().await;
@@ -671,19 +702,114 @@ impl AppState {
         if let Some(playback_progress) = self.playback_progress() {
             playback_progress.shutdown().await;
         }
-        Ok(())
-    }
-
-    /// Overrides the concurrent SSE stream budget (tests use a small value).
-    pub fn with_sse_connection_limit(mut self, limit: usize) -> Self {
-        self.core.sse_permits = SseConnectionBudget(Arc::new(tokio::sync::Semaphore::new(limit)));
-        self
+        // Retention purges delete rows, so they must not be mid-batch when the database closes.
+        if let Some(worker) = self.user_cleanup_worker() {
+            worker.shutdown().await;
+        }
+        // The session reaper stops HLS sessions, so it must finish before the HLS directories and
+        // the database go away.
+        if let Some(web_playback) = self.web_playback() {
+            web_playback.shutdown().await;
+        }
+        // The login-background refresh reads plugin results, so it must stop before the plugins do.
+        if let Some(plugins) = self.plugins() {
+            plugins.shutdown().await;
+        }
+        // The library watcher owns `notify` watcher threads; stopping it drops them with the loop.
+        if let Some(library_watch) = self.library_watch() {
+            library_watch.shutdown().await;
+        }
+        match probe_shutdown_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Overrides the per-peer request budget (tests use a small value).
     pub fn with_request_rate_limit(mut self, limit: u32) -> Self {
         self.core.request_rate_limiter = crate::security::RequestRateLimiter::new(limit);
         self
+    }
+
+    /// Overrides the manual danmaku search budget (tests pin the window so `429` is deterministic).
+    pub fn with_danmaku_search_rate_limit(
+        mut self,
+        limit: u32,
+        window: std::time::Duration,
+    ) -> Self {
+        self.core.danmaku_search_rate_limiter =
+            crate::security::DanmakuSearchRateLimiter::new(limit, window);
+        self
+    }
+
+    /// Overrides the `/embywebsocket` resource limits (tests shrink them so a limit is observable
+    /// without waiting for the production values).
+    pub fn with_emby_websocket_limits(mut self, limits: EmbyWebsocketLimits) -> Self {
+        self.core.emby_websocket_connections = WebsocketConnections::new(limits);
+        self
+    }
+
+    /// Overrides the `/api/v1/ws` resource limits (tests shrink them so a budget or a timer is
+    /// observable without waiting for the production values).
+    pub fn with_lux_websocket_limits(mut self, limits: LuxWebsocketLimits) -> Self {
+        self.core.lux_websocket_connections = LuxWebsocketConnections::new(limits);
+        self
+    }
+
+    /// Asks every open realtime connection (`/embywebsocket` and `/api/v1/ws`) to send its close
+    /// frame and exit. Both endpoints watch the same signal (ADR-054 D10).
+    pub fn signal_websocket_shutdown(&self) {
+        self.core.websocket_shutdown.signal();
+    }
+
+    /// The Emby endpoint's historical name for [`Self::signal_websocket_shutdown`]; it trips the
+    /// shared signal, so the Lux connections are told to close as well.
+    pub fn signal_emby_websocket_shutdown(&self) {
+        self.signal_websocket_shutdown();
+    }
+
+    /// Signals every open realtime connection to close and waits up to the production drain
+    /// timeout for all of them to exit. Answers `false` when a connection outlived it.
+    pub async fn shutdown_websocket_connections(&self) -> bool {
+        self.signal_websocket_shutdown();
+        let timeout = EMBY_WEBSOCKET_SHUTDOWN_DRAIN_TIMEOUT;
+        // Both budgets are drained in parallel under the same bound.
+        // `drain_lux_websocket_connections` is the Lux half of this path (and answers `false` when
+        // one connection outlives `timeout`), so the shutdown chain and the test that pins the
+        // timeout run the same code.
+        let (emby, lux) = tokio::join!(
+            self.core
+                .emby_websocket_connections
+                .wait_until_idle(timeout),
+            self.drain_lux_websocket_connections(timeout),
+        );
+        emby && lux
+    }
+
+    /// Signals every open Emby WebSocket connection to close and waits up to the production
+    /// drain timeout for them to exit. Answers `false` when a connection outlived it.
+    pub async fn shutdown_emby_websocket_connections(&self) -> bool {
+        self.signal_websocket_shutdown();
+        self.drain_emby_websocket_connections(EMBY_WEBSOCKET_SHUTDOWN_DRAIN_TIMEOUT)
+            .await
+    }
+
+    /// Waits up to `timeout` for every open Emby WebSocket connection to release its slot.
+    /// Answers `false` when a connection outlived the timeout.
+    pub async fn drain_emby_websocket_connections(&self, timeout: std::time::Duration) -> bool {
+        self.core
+            .emby_websocket_connections
+            .wait_until_idle(timeout)
+            .await
+    }
+
+    /// Waits up to `timeout` for every open Lux WebSocket connection to release its slot.
+    /// Answers `false` when a connection outlived the timeout.
+    pub async fn drain_lux_websocket_connections(&self, timeout: std::time::Duration) -> bool {
+        self.core
+            .lux_websocket_connections
+            .wait_until_idle(timeout)
+            .await
     }
 
     pub fn ready(
@@ -894,6 +1020,12 @@ impl AppState {
         )
         .with_library_covers(Some(library_covers.clone()))
         .with_danmaku(danmaku.clone())
+        .with_ratings_sync(RatingsSyncService::new(
+            database.clone(),
+            plugins.clone(),
+            NfoWriteService::new_with_config_dir(database.clone(), config_dir.clone()),
+            scan_jobs.clone(),
+        ))
         .with_library_deletion(
             crate::application::library_deletion::LibraryDeletionService::new(
                 database.clone(),
@@ -903,6 +1035,8 @@ impl AppState {
             ),
         );
         let global_collection_sync_worker = GlobalCollectionSyncWorker::start(database.clone());
+        let catalog_outbox_workers =
+            crate::application::catalog_read_model::CatalogOutboxWorkers::start(database.clone());
         let identity_merge_worker = IdentityMergeWorker::start(
             database.clone(),
             Some(home.clone()),
@@ -914,6 +1048,7 @@ impl AppState {
         let core = CoreState {
             admin_health_probe_cache: AdminHealthProbeCache::default(),
             database: Some(database.clone()),
+            trusted_proxy_cidrs: TrustedProxyCidrCache::default(),
             config_dir: Some(config_dir.clone()),
             database_selection_required: false,
             restart_handle: None,
@@ -936,8 +1071,19 @@ impl AppState {
             login_rate_limiter: LoginRateLimiter::default(),
             device_pairing_rate_limiter: DevicePairingRateLimiter::default(),
             request_rate_limiter: crate::security::RequestRateLimiter::default(),
-            sse_permits: SseConnectionBudget::default(),
+            danmaku_search_rate_limiter: crate::security::DanmakuSearchRateLimiter::default(),
+            emby_websocket_connections: WebsocketConnections::default(),
+            lux_websocket_connections: LuxWebsocketConnections::default(),
+            websocket_shutdown: WebsocketShutdown::default(),
         };
+        // Built here (not in `start_realtime_watchers`) so the shutdown can reach its stop handle.
+        let library_watch = LibraryWatchService::with_scan_jobs_and_metadata(
+            database.clone(),
+            scan_jobs.clone(),
+            Some(metadata_reidentify.clone()),
+        )
+        .with_probe(Some(probe.clone()))
+        .with_library_change_notifications(libraries.change_notifier());
         let ready = ReadyServices {
             database_setup,
             setup,
@@ -987,10 +1133,17 @@ impl AppState {
             scraper,
             collections,
             global_collection_sync_worker,
+            catalog_outbox_workers,
             content_restriction_index_worker: None,
             identity_merge_worker,
             people,
             local_nfo,
+            user_cleanup_worker: UserCleanupWorker::start(
+                database.clone(),
+                user_avatars.clone(),
+                Some(config_dir.clone()),
+            ),
+            library_watch,
             user_avatars,
             ip_location: IpLocationService::new(plugins.clone()),
             web_playback,
@@ -1116,43 +1269,19 @@ impl AppState {
     }
 
     pub async fn start_realtime_watchers(&self) {
-        let Some(database) = self.core.database.clone() else {
+        let Some(watch_service) = self.library_watch() else {
             return;
         };
-        let Some(scan_jobs) = self.scan_jobs().cloned() else {
-            return;
-        };
-        let watch_service = LibraryWatchService::with_scan_jobs_and_metadata(
-            database,
-            scan_jobs,
-            self.metadata_reidentify().cloned(),
-        );
-        let watch_service = match self.libraries() {
-            Some(libraries) => {
-                watch_service.with_library_change_notifications(libraries.change_notifier())
-            }
-            None => watch_service,
-        };
-        watch_service.spawn();
+        watch_service.spawn_managed();
     }
 
     pub async fn start_scheduled_tasks(&self) {
-        if let (Some(database), Some(avatars)) = (self.core.database.as_ref(), self.user_avatars())
-        {
+        if let Some(database) = self.core.database.as_ref() {
             crate::application::catalog_read_model::spawn_startup_catalog_read_model(
                 database.clone(),
             );
             crate::application::catalog_read_model::spawn_startup_user_series_next(
                 database.clone(),
-            );
-            crate::application::catalog_read_model::spawn_search_reindex_worker(database.clone());
-            crate::application::catalog_read_model::spawn_catalog_items_incremental_worker(
-                database.clone(),
-            );
-            crate::application::user_cleanup::spawn_user_cleanup_worker(
-                database.clone(),
-                avatars.clone(),
-                self.core.config_dir.clone(),
             );
         }
         if let Some(plugins) = self.plugins()
@@ -1288,6 +1417,15 @@ async fn require_web_user(
     users::require_web_user(headers, state).await
 }
 
+/// The same authentication without the `user_devices` observation write; a long-lived connection
+/// revalidates with it so the device inventory is not updated every cycle.
+async fn require_web_user_read_only(
+    headers: &HeaderMap,
+    state: &ReadyAppState,
+) -> Result<UserRecord, Response> {
+    users::require_web_user_read_only(headers, state).await
+}
+
 async fn require_web_principal(
     headers: &HeaderMap,
     state: &ReadyAppState,
@@ -1300,8 +1438,6 @@ async fn require_web_csrf(headers: &HeaderMap, state: &ReadyAppState) -> Result<
 }
 
 const MAX_CONCURRENT_CATALOG_REQUESTS: usize = 16;
-/// Each stream holds a task and a 16 KiB buffer, so the cap keeps them bounded.
-const MAX_SSE_CONNECTIONS: usize = 64;
 const MAX_IN_FLIGHT_CATALOG_REQUESTS: usize = 64;
 
 fn is_catalog_aggregation_path(path: &str) -> bool {
@@ -1318,9 +1454,11 @@ fn is_catalog_aggregation_path(path: &str) -> bool {
             "v1",
             "favorites" | "search" | "home" | "continue-watching"
         ] | ["api", "v1", "home", "carousel"]
+            | ["api", "v1", "tags"]
             | ["api", "v1", "libraries", _, "items"]
             | ["api", "v1", "libraries", _, "latest"]
             | ["api", "v1", "items", _, "children"]
+            | ["api", "v1", "items", _, "similar"]
             | ["api", "v1", "collections", _]
             | ["Users", _, "Items"]
             | ["Users", _, "Items", "Root" | "Resume" | "Latest" | "NextUp"]
@@ -1538,8 +1676,17 @@ fn is_emby_subtitle_path(path: &str) -> bool {
         && segments.next().is_some_and(|segment| !segment.is_empty())
         && segments.next() == Some("Subtitles")
         && segments.next().is_some_and(|segment| !segment.is_empty())
-        && segments.next() == Some("Stream")
+        && segments.next().is_some_and(is_emby_subtitle_stream_segment)
         && segments.next().is_none()
+}
+
+/// `Stream` or `Stream.<format>`, the delivery shape Emby clients request for subtitle files.
+fn is_emby_subtitle_stream_segment(segment: &str) -> bool {
+    segment == "Stream"
+        || segment.strip_prefix("Stream.").is_some_and(|extension| {
+            (1..=8).contains(&extension.len())
+                && extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
 }
 
 fn is_emby_legacy_strm_path(path: &str) -> bool {
@@ -1734,20 +1881,6 @@ pub(super) async fn request_client_ip(
     }
 }
 
-fn sse_capacity_response(headers: &HeaderMap) -> Response {
-    let mut response = api_error(
-        headers,
-        StatusCode::TOO_MANY_REQUESTS,
-        super::lux::ApiErrorCode::RateLimited,
-        "同时打开的事件流过多，请稍后重试",
-    )
-    .into_response();
-    response
-        .headers_mut()
-        .insert("retry-after", HeaderValue::from_static("30"));
-    response
-}
-
 async fn request_access_ip(
     headers: &HeaderMap,
     state: &CoreState,
@@ -1771,7 +1904,7 @@ async fn request_access_ip(
         .database
         .as_ref()
         .ok_or(AccessIpResolutionError::TrustedProxySettingsUnavailable)?;
-    let trusted_proxy_values = crate::application::settings::read_trusted_proxy_cidrs(database)
+    let trusted_proxy_values = cached_trusted_proxy_cidrs(state, database)
         .await
         .map_err(|_| AccessIpResolutionError::TrustedProxySettingsUnavailable)?;
     let trusted_proxies = trusted_proxy_networks(
@@ -1785,6 +1918,41 @@ async fn request_access_ip(
     )
     .map(Some)
     .map_err(|_| AccessIpResolutionError::MalformedForwardedFor)
+}
+
+/// Reads the trusted-proxy CIDR setting through this process's cache.
+///
+/// The resolver consults the setting once per protected request that carries a forwarded chain,
+/// and reading it means one `server_settings` row, a `serde_json` parse and CIDR normalization.
+/// The parsed list is therefore cached on the state instance and stamped with the epoch the read
+/// started under (`AccessChangeEpochs::trusted_proxy_cidrs_epoch`):
+///
+/// * a write bumps the epoch after its commit, so a read that starts once the writer returned
+///   misses the cache and sees the new value - invalidation is immediate, not time based;
+/// * a read that overlaps a write never publishes its (possibly old) value, because the epoch it
+///   snapshotted no longer matches when it finishes;
+/// * a failed read is not cached, so a corrupt or unreadable setting keeps failing closed instead
+///   of being served from a previous value.
+///
+/// Only the normalized list is cached. Which addresses are treated as trusted proxies, and which
+/// forwarded hops are then accepted, is still decided per request by
+/// `resolve_client_ip_from_trusted_proxies`; raw forwarded values never bypass that step.
+async fn cached_trusted_proxy_cidrs(
+    state: &CoreState,
+    database: &Database,
+) -> Result<Vec<String>, ()> {
+    let epochs = database.access_changes();
+    let epoch = epochs.trusted_proxy_cidrs_epoch();
+    if let Some(values) = state.trusted_proxy_cidrs.get(database.server_id(), epoch) {
+        return Ok(values);
+    }
+    let values = crate::application::settings::read_trusted_proxy_cidrs(database).await?;
+    if epochs.trusted_proxy_cidrs_epoch() == epoch {
+        state
+            .trusted_proxy_cidrs
+            .insert(database.server_id(), epoch, values.clone());
+    }
+    Ok(values)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2431,6 +2599,7 @@ mod tests {
             "/api/v1/home",
             "/api/v1/home/carousel",
             "/api/v1/continue-watching",
+            "/api/v1/tags",
             "/api/v1/libraries/library-1/items",
             "/api/v1/libraries/library-1/latest",
             "/api/v1/collections/collection-1",
@@ -2449,6 +2618,21 @@ mod tests {
             "/Items/item-1/Download",
             "/Items/item-1/PlaybackInfo",
         ] {
+            assert!(!is_catalog_aggregation_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn similar_endpoints_use_the_catalog_aggregation_guard() {
+        // The native Lux route is a bounded catalog aggregation and belongs to the guard.
+        assert!(is_catalog_aggregation_path("/api/v1/items/item-1/similar"));
+        // The native tag list is the same class of bounded facet aggregation: its `GROUP BY` /
+        // `COUNT(DISTINCT)` runs per request, so it must share the catalog worker pool instead of
+        // letting arbitrary concurrency exhaust the connection pool.
+        assert!(is_catalog_aggregation_path("/api/v1/tags"));
+        // The Emby compatibility adapter must keep its pre-LUX-899 behaviour and never enter the
+        // guard, so saturation cannot turn an Emby similar request into a 503.
+        for path in ["/Items/item-1/Similar", "/emby/Items/item-1/Similar"] {
             assert!(!is_catalog_aggregation_path(path), "{path}");
         }
     }
@@ -2705,6 +2889,122 @@ mod tests {
         assert_eq!(
             request_access_ip(&headers, &state).await,
             Err(AccessIpResolutionError::TrustedProxySettingsUnavailable)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn access_ip_reads_the_trusted_proxy_settings_once_for_repeated_requests()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database) = access_ip_test_database().await?;
+        database
+            .set_trusted_proxy_cidrs_json("[\"10.0.0.0/8\"]")
+            .await?;
+        let state = AppState::default().with_database(database.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-lux-peer-ip", HeaderValue::from_static("10.0.0.9"));
+        headers.insert("x-forwarded-for", HeaderValue::from_static("192.0.2.66"));
+
+        database.reset_query_count();
+        assert_eq!(
+            request_access_ip(&headers, &state).await,
+            Ok(Some("192.0.2.66".parse()?))
+        );
+        assert_eq!(
+            request_access_ip(&headers, &state).await,
+            Ok(Some("192.0.2.66".parse()?))
+        );
+
+        // One `server_settings` read for the first request, none for the second one.
+        assert_eq!(database.query_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn access_ip_sees_a_trusted_proxy_change_on_the_next_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database) = access_ip_test_database().await?;
+        database
+            .set_trusted_proxy_cidrs_json("[\"10.0.0.0/8\"]")
+            .await?;
+        let state = AppState::default().with_database(database.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-lux-peer-ip", HeaderValue::from_static("10.0.0.9"));
+        headers.insert("x-forwarded-for", HeaderValue::from_static("192.0.2.66"));
+
+        // The configured range trusts the peer, so the forwarded address wins.
+        assert_eq!(
+            request_access_ip(&headers, &state).await,
+            Ok(Some("192.0.2.66".parse()?))
+        );
+
+        database
+            .set_trusted_proxy_cidrs_json("[\"192.0.2.0/24\"]")
+            .await?;
+        database.reset_query_count();
+        // The peer is no longer trusted, so the raw forwarded value must be ignored again.
+        assert_eq!(
+            request_access_ip(&headers, &state).await,
+            Ok(Some("10.0.0.9".parse()?))
+        );
+        assert_eq!(database.query_count(), 1);
+
+        database
+            .set_trusted_proxy_cidrs_json("[\"10.0.0.0/8\"]")
+            .await?;
+        assert_eq!(
+            request_access_ip(&headers, &state).await,
+            Ok(Some("192.0.2.66".parse()?))
+        );
+
+        // A stored value that cannot be parsed is never served from the cache either.
+        database.set_trusted_proxy_cidrs_json("not-json").await?;
+        assert_eq!(
+            request_access_ip(&headers, &state).await,
+            Err(AccessIpResolutionError::TrustedProxySettingsUnavailable)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trusted_proxy_settings_cache_is_scoped_to_one_state_and_database()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_a, database_a) = access_ip_test_database().await?;
+        let (_temp_b, database_b) = access_ip_test_database().await?;
+        database_a
+            .set_trusted_proxy_cidrs_json("[\"10.0.0.0/8\"]")
+            .await?;
+        database_b
+            .set_trusted_proxy_cidrs_json("[\"192.0.2.0/24\"]")
+            .await?;
+        let state_a = AppState::default().with_database(database_a.clone());
+        let state_b = AppState::default().with_database(database_b.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-lux-peer-ip", HeaderValue::from_static("10.0.0.9"));
+        headers.insert("x-forwarded-for", HeaderValue::from_static("192.0.2.66"));
+
+        assert_eq!(
+            request_access_ip(&headers, &state_a).await,
+            Ok(Some("192.0.2.66".parse()?))
+        );
+        assert_eq!(
+            request_access_ip(&headers, &state_b).await,
+            Ok(Some("10.0.0.9".parse()?))
+        );
+
+        // A write through one database must neither invalidate nor overwrite the other's entry.
+        database_a
+            .set_trusted_proxy_cidrs_json("[\"198.51.100.0/24\"]")
+            .await?;
+        database_b.reset_query_count();
+        assert_eq!(
+            request_access_ip(&headers, &state_b).await,
+            Ok(Some("10.0.0.9".parse()?))
+        );
+        assert_eq!(database_b.query_count(), 0);
+        assert_eq!(
+            request_access_ip(&headers, &state_a).await,
+            Ok(Some("10.0.0.9".parse()?))
         );
         Ok(())
     }
@@ -3014,6 +3314,20 @@ mod tests {
         assert!(!is_emby_subtitle_path(
             "/emby/videos/item-123/source-456/Subtitles/0/Stream"
         ));
+        for extension in ["srt", "ass", "vtt"] {
+            assert!(is_emby_subtitle_path(&format!(
+                "/emby/Videos/item-123/source-456/Subtitles/0/Stream.{extension}"
+            )));
+        }
+        for path in [
+            "/Videos/item-123/source-456/Subtitles/0/Stream.",
+            "/Videos/item-123/source-456/Subtitles/0/Stream.s-rt",
+            "/Videos/item-123/source-456/Subtitles/0/Stream.srt/extra",
+            "/Videos/item-123/source-456/Subtitles/0/Streams",
+            "/Videos/item-123/source-456/Subtitles/0/Stream.waytoolongext",
+        ] {
+            assert!(!is_emby_subtitle_path(path), "{path}");
+        }
     }
 
     #[test]

@@ -10,13 +10,14 @@ import { MediaMergeSourcesSection } from "./MediaMergeSourcesSection";
 import { mediaTitle } from "../home/media-display";
 import { MediaDetailActions, MediaDetailActionControls, MediaDetailMobileHeader } from "./MediaDetailActions";
 import { MediaEpisodesProvider, MediaEpisodesSection } from "./MediaEpisodesSection";
+import { MediaSimilarSection } from "./MediaSimilarSection";
 import { MediaDetailArtwork, MediaDetailHero, MediaSeriesProvider } from "./MediaDetailHero";
-import { useSseConnectionState } from "../activity/useUserEvents";
+import { useRealtimeConnectionState } from "../activity/useUserEvents";
 
 export function MediaDetailPage() {
   const { itemId = "" } = useParams();
-  const sseState = useSseConnectionState();
-  const refetchInterval = sseState === "connected" ? false : queryRefreshIntervals.mediaSurface;
+  const realtimeState = useRealtimeConnectionState();
+  const refetchInterval = realtimeState === "connected" ? false : queryRefreshIntervals.mediaSurface;
   const [routeParams] = useSearchParams();
   const item = useQuery({
     queryKey: queryKeys.item(itemId),
@@ -75,6 +76,7 @@ function MediaDetailContent({ media }: { media: MediaItem }) {
             <MediaCastSection actors={media.actors} />
           </div>
           </MediaEpisodesSection>
+          <MediaSimilarSection item={media} />
           {showStills ? <MediaStillsSection itemId={media.id} title={mediaTitle(media)} /> : null}
           <div className="lux-detail-nfo">
             <MediaNfoSection item={media} source={source} />

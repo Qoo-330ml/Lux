@@ -210,15 +210,27 @@ async fn emby_media_updated_queues_incremental_scan_for_absolute_path()
         serde_json::from_str::<serde_json::Value>(&response_body)?["scope"],
         "PATH"
     );
-    let job_type: String = sqlx::query_scalar("SELECT job_type FROM scan_jobs LIMIT 1")
-        .fetch_one(database.pool())
-        .await?;
-    assert_eq!(job_type, "INCREMENTAL_SCAN");
-    let queued_path: String =
-        sqlx::query_scalar("SELECT relative_path FROM scan_job_paths LIMIT 1")
+    // The handler that answered `202` already spawned the scan worker, so the job may be queued or
+    // already processed by now; `scan_job_paths` is a queue, not a history record (the worker
+    // deletes the row when it completes the job). The durable assertions are the job type and the
+    // path count written at enqueue, so the literal relative path is only checked while it is
+    // still queued instead of racing the worker.
+    let (job_type, total_count): (String, i64) =
+        sqlx::query_as("SELECT job_type, total_count FROM scan_jobs LIMIT 1")
             .fetch_one(database.pool())
             .await?;
-    assert_eq!(queued_path, "NewMovie");
+    assert_eq!(job_type, "INCREMENTAL_SCAN");
+    assert_eq!(
+        total_count, 1,
+        "the request must queue exactly one path for the incremental scan"
+    );
+    if let Some(queued_path) =
+        sqlx::query_scalar::<_, String>("SELECT relative_path FROM scan_job_paths LIMIT 1")
+            .fetch_optional(database.pool())
+            .await?
+    {
+        assert_eq!(queued_path, "NewMovie");
+    }
     assert_eq!(root.library_id, library.id);
     Ok(())
 }

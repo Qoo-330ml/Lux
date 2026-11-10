@@ -39,8 +39,8 @@ describe("AdminChangelogPage", () => {
     expect(container.querySelectorAll(".lux-changelog-release")).not.toHaveLength(0);
     expect(container.textContent).toContain("0.2.0");
     expect(container.textContent).toContain("0.1.0");
-    expect(container.textContent).toContain("支持每个用户独立调整自动标记已看的播放阈值");
-    expect(container.textContent).toContain("建立 Lux Rust 模块化单体服务");
+    expect(container.textContent).toContain("自动标记已看的阈值不再是全局一个值");
+    expect(container.textContent).toContain("Rust 模块化单体服务");
   });
 });
 

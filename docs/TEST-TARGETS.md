@@ -8,21 +8,21 @@
 
 | 新 target | 领域 | 原文件数 | 测试数 |
 |---|---|---|---|
-| `--test admin` | 管理后台、日志导出、可观测性与运维事件 | 13 | 23 |
-| `--test api_web` | HTTP 契约（错误/限流/压缩/健康/远程策略）、Web 会话、Webhook | 13 | 39 |
-| `--test auth_users` | 认证、会话、登录背景、用户与用户设置、设备配对、界面偏好迁移 | 10 | 70 |
-| `--test emby` | Emby 兼容层（认证、系统信息、增量刷新、发现、多段播放、检索、下载） | 10 | 38 |
-| `--test scanner` | 媒体库扫描、增量/混合扫描、计划任务、作业事件与关停 | 7 | 137 |
-| `--test library` | 媒体库生命周期、合并/拆分、集合、目录与系列 API | 12 | 49 |
-| `--test metadata` | 元数据抓取与选择、NFO 回写、扫描后剧集元数据、人物、字幕 | 14 | 143 |
-| `--test images` | 图片变体、写回、缩略图与图片 API | 5 | 52 |
-| `--test playback` | 播放、播放令牌/历史/续播、观看状态归档、章节与片头片尾检测 | 10 | 34 |
-| `--test storage` | SQLite/PostgreSQL 存储、迁移、WAL、数据库维护与启动守卫 | 7 | 112 |
-| `--test plugins` | 插件协议与运行时、弹幕、IP 属地、媒体信息插件配置 | 11 | 84 |
+| `--test admin` | 管理后台、日志导出、可观测性与运维事件 | 14 | 60 |
+| `--test api_web` | HTTP 契约（错误/限流/压缩/健康/远程策略）、Web 会话、Webhook | 13 | 57 |
+| `--test auth_users` | 认证、会话、登录背景、用户与用户设置、设备配对、界面偏好迁移 | 10 | 73 |
+| `--test emby` | Emby 兼容层（认证、系统信息、增量刷新、发现、多段播放、检索、下载、WebSocket） | 16 | 85 |
+| `--test scanner` | 媒体库扫描、增量/混合扫描、计划任务、作业事件与关停 | 7 | 152 |
+| `--test library` | 媒体库生命周期、合并/拆分、集合、目录与系列 API | 12 | 62 |
+| `--test metadata` | 元数据抓取与选择、NFO 回写、扫描后剧集元数据、人物、字幕 | 14 | 157 |
+| `--test images` | 图片变体、写回、缩略图与图片 API | 6 | 66 |
+| `--test playback` | 播放、播放令牌/历史/续播、观看状态归档、章节与片头片尾检测 | 10 | 35 |
+| `--test storage` | SQLite/PostgreSQL 存储、迁移、WAL、数据库维护与启动守卫 | 9 | 118 |
+| `--test plugins` | 插件协议与运行时、弹幕、IP 属地、媒体信息插件配置 | 11 | 129 |
 | `--test strm` | STRM 目标解析/探测/播放与 ffprobe | 9 | 42 |
-| 合计（12 组） |  | 120 | 822 |
+| 合计（12 组） |  | 131 | 1035 |
 
-另有 7 个 binary 因为进程级共享状态或外部服务依赖保持独立，见第 4 节：`--test background_work_budget`、`--test image_variants_perf`、`--test performance`、`--test postgres_database`、`--test reidentify`、`--test scanned_metadata`、`--test shutdown`。合计 12 + 7 = 19 个集成测试 target。
+另有 8 个 binary 因为进程级共享状态或外部服务依赖保持独立，见第 4 节：`--test background_work_budget`、`--test filmly_image_diag`、`--test image_variants_perf`、`--test performance`、`--test postgres_database`、`--test reidentify`、`--test scanned_metadata`、`--test shutdown`。合计 12 + 8 = 20 个集成测试 target。
 
 ## 2. 旧 target 名 → 新命令
 
@@ -34,21 +34,28 @@ cargo test --locked --test <新 target> <旧名>::
 
 例如 `cargo test --locked --test scanning_jobs` → `cargo test --locked --test scanner scanning_jobs::`。
 
-| 旧 target | 测试数 | 等价命令 |
+表中的测试数按当前 `cargo test --locked --test <group> <module>:: -- --list` 更新；合并当时的逐组对照见第
+5.1 节。标 † 的模块是合并后新增的（没有对应的旧 target 文件）。
+
+| 旧 target（模块） | 当前测试数 | 等价命令 |
 |---|---|---|
 | `admin_api_key` | 4 | `cargo test --locked --test admin admin_api_key::` |
 | `admin_dashboard` | 1 | `cargo test --locked --test admin admin_dashboard::` |
 | `admin_database_diagnostics` | 1 | `cargo test --locked --test admin admin_database_diagnostics::` |
-| `admin_events` | 5 | `cargo test --locked --test admin admin_events::` |
 | `admin_health` | 1 | `cargo test --locked --test admin admin_health::` |
+| `admin_jobs` | 1 | `cargo test --locked --test admin admin_jobs::` |
 | `admin_library_audit` | 1 | `cargo test --locked --test admin admin_library_audit::` |
 | `admin_mail_settings` | 1 | `cargo test --locked --test admin admin_mail_settings::` |
 | `admin_performance_metrics` | 1 | `cargo test --locked --test admin admin_performance_metrics::` |
 | `admin_settings` | 2 | `cargo test --locked --test admin admin_settings::` |
 | `admin_user_invitations` | 1 | `cargo test --locked --test admin admin_user_invitations::` |
 | `log_export` | 2 | `cargo test --locked --test admin log_export::` |
+| † `lux_websocket` | 30 | `cargo test --locked --test admin lux_websocket::` |
 | `observability` | 2 | `cargo test --locked --test admin observability::` |
+| † `realtime_contract` | 7 | `cargo test --locked --test admin realtime_contract::` |
+| † `removed_event_streams` | 2 | `cargo test --locked --test admin removed_event_streams::` |
 | `user_query_events` | 1 | `cargo test --locked --test admin user_query_events::` |
+| † `user_event_scoping` | 2 | `cargo test --locked --test admin user_event_scoping::` |
 | `acl` | 1 | `cargo test --locked --test api_web acl::` |
 | `api_error_contract` | 5 | `cargo test --locked --test api_web api_error_contract::` |
 | `domain` | 3 | `cargo test --locked --test api_web domain::` |
@@ -57,8 +64,8 @@ cargo test --locked --test <新 target> <旧名>::
 | `ready_version` | 2 | `cargo test --locked --test api_web ready_version::` |
 | `remote` | 8 | `cargo test --locked --test api_web remote::` |
 | `response_compression` | 2 | `cargo test --locked --test api_web response_compression::` |
-| `web_auth` | 4 | `cargo test --locked --test api_web web_auth::` |
-| `web_playback` | 3 | `cargo test --locked --test api_web web_playback::` |
+| `web_auth` | 10 | `cargo test --locked --test api_web web_auth::` |
+| `web_playback` | 15 | `cargo test --locked --test api_web web_playback::` |
 | `web_static` | 2 | `cargo test --locked --test api_web web_static::` |
 | `webhooks` | 6 | `cargo test --locked --test api_web webhooks::` |
 | `webhooks_api` | 1 | `cargo test --locked --test api_web webhooks_api::` |
@@ -67,29 +74,35 @@ cargo test --locked --test <新 target> <旧名>::
 | `device_pairings` | 8 | `cargo test --locked --test auth_users device_pairings::` |
 | `login_background` | 4 | `cargo test --locked --test auth_users login_background::` |
 | `lux_api_auth` | 1 | `cargo test --locked --test auth_users lux_api_auth::` |
-| `resume_favorites` | 5 | `cargo test --locked --test auth_users resume_favorites::` |
+| `resume_favorites` | 6 | `cargo test --locked --test auth_users resume_favorites::` |
 | `sessions` | 2 | `cargo test --locked --test auth_users sessions::` |
 | `setup` | 5 | `cargo test --locked --test auth_users setup::` |
 | `user_settings` | 2 | `cargo test --locked --test auth_users user_settings::` |
-| `users` | 39 | `cargo test --locked --test auth_users users::` |
+| `users` | 41 | `cargo test --locked --test auth_users users::` |
 | `discovery` | 3 | `cargo test --locked --test emby discovery::` |
 | `download_api` | 1 | `cargo test --locked --test emby download_api::` |
-| `emby_auth` | 15 | `cargo test --locked --test emby emby_auth::` |
+| `emby_auth` | 17 | `cargo test --locked --test emby emby_auth::` |
 | `emby_counts` | 1 | `cargo test --locked --test emby emby_counts::` |
 | `emby_global_collection_playback` | 1 | `cargo test --locked --test emby emby_global_collection_playback::` |
 | `emby_incremental_refresh` | 8 | `cargo test --locked --test emby emby_incremental_refresh::` |
+| † `emby_item_filters` | 2 | `cargo test --locked --test emby emby_item_filters::` |
 | `emby_multi_part_playback` | 1 | `cargo test --locked --test emby emby_multi_part_playback::` |
 | `emby_system` | 2 | `cargo test --locked --test emby emby_system::` |
 | `mixed_library_api` | 3 | `cargo test --locked --test emby mixed_library_api::` |
 | `search` | 3 | `cargo test --locked --test emby search::` |
+| † `emby_facets` | 1 | `cargo test --locked --test emby emby_facets::` |
+| † `emby_empty_numeric_params` | 7 | `cargo test --locked --test emby emby_empty_numeric_params::` |
+| † `emby_filter_metadata` | 5 | `cargo test --locked --test emby emby_filter_metadata::` |
+| † `emby_similar` | 6 | `cargo test --locked --test emby emby_similar::` |
+| † `emby_websocket` | 24 | `cargo test --locked --test emby emby_websocket::` |
 | `job_events_api` | 2 | `cargo test --locked --test scanner job_events_api::` |
 | `mixed_scanner` | 1 | `cargo test --locked --test scanner mixed_scanner::` |
 | `scanner` | 18 | `cargo test --locked --test scanner scanner::` |
-| `scanning_jobs` | 95 | `cargo test --locked --test scanner scanning_jobs::` |
-| `scheduled_tasks` | 9 | `cargo test --locked --test scanner scheduled_tasks::` |
+| `scanning_jobs` | 96 | `cargo test --locked --test scanner scanning_jobs::` |
+| `scheduled_tasks` | 10 | `cargo test --locked --test scanner scheduled_tasks::` |
 | `series_scanner` | 11 | `cargo test --locked --test scanner series_scanner::` |
-| `shutdown_jobs` | 1 | `cargo test --locked --test scanner shutdown_jobs::` |
-| `catalog` | 3 | `cargo test --locked --test library catalog::` |
+| `shutdown_jobs` | 14 | `cargo test --locked --test scanner shutdown_jobs::` |
+| `catalog` | 5 | `cargo test --locked --test library catalog::` |
 | `cd_movie_versions` | 2 | `cargo test --locked --test library cd_movie_versions::` |
 | `collections` | 4 | `cargo test --locked --test library collections::` |
 | `item_merge` | 1 | `cargo test --locked --test library item_merge::` |
@@ -101,6 +114,8 @@ cargo test --locked --test <新 target> <旧名>::
 | `library_order` | 1 | `cargo test --locked --test library library_order::` |
 | `media_deletion` | 3 | `cargo test --locked --test library media_deletion::` |
 | `series_api` | 1 | `cargo test --locked --test library series_api::` |
+| † `similar_api` | 6 | `cargo test --locked --test library similar_api::` |
+| † `tags_api` | 5 | `cargo test --locked --test library tags_api::` |
 | `identification` | 1 | `cargo test --locked --test metadata identification::` |
 | `media_matching` | 10 | `cargo test --locked --test metadata media_matching::` |
 | `metadata` | 22 | `cargo test --locked --test metadata metadata::` |
@@ -108,46 +123,50 @@ cargo test --locked --test <新 target> <旧名>::
 | `metadata_cancel` | 3 | `cargo test --locked --test metadata metadata_cancel::` |
 | `metadata_objects` | 4 | `cargo test --locked --test metadata metadata_objects::` |
 | `metadata_paths` | 8 | `cargo test --locked --test metadata metadata_paths::` |
-| `metadata_selection` | 38 | `cargo test --locked --test metadata metadata_selection::` |
-| `nfo_writer` | 27 | `cargo test --locked --test metadata nfo_writer::` |
+| `metadata_selection` | 46 | `cargo test --locked --test metadata metadata_selection::` |
+| `nfo_writer` | 33 | `cargo test --locked --test metadata nfo_writer::` |
 | `people_api` | 10 | `cargo test --locked --test metadata people_api::` |
 | `scanned_series_metadata` | 3 | `cargo test --locked --test metadata scanned_series_metadata::` |
 | `scraper` | 4 | `cargo test --locked --test metadata scraper::` |
 | `series_metadata` | 3 | `cargo test --locked --test metadata series_metadata::` |
 | `subtitles` | 1 | `cargo test --locked --test metadata subtitles::` |
 | `image_api` | 1 | `cargo test --locked --test images image_api::` |
-| `image_variants` | 9 | `cargo test --locked --test images image_variants::` |
-| `image_writer` | 20 | `cargo test --locked --test images image_writer::` |
+| `image_variants` | 19 | `cargo test --locked --test images image_variants::` |
+| `image_writer` | 21 | `cargo test --locked --test images image_writer::` |
 | `images` | 3 | `cargo test --locked --test images images::` |
 | `thumbnails` | 19 | `cargo test --locked --test images thumbnails::` |
+| † `image_resolve_cache` | 3 | `cargo test --locked --test images image_resolve_cache::` |
 | `chapter_detection` | 2 | `cargo test --locked --test playback chapter_detection::` |
 | `chapter_detection_api` | 1 | `cargo test --locked --test playback chapter_detection_api::` |
 | `chapters` | 1 | `cargo test --locked --test playback chapters::` |
 | `playback` | 6 | `cargo test --locked --test playback playback::` |
 | `playback_history_archive` | 5 | `cargo test --locked --test playback playback_history_archive::` |
 | `playback_strm_probe` | 1 | `cargo test --locked --test playback playback_strm_probe::` |
-| `playback_token` | 5 | `cargo test --locked --test playback playback_token::` |
+| `playback_token` | 6 | `cargo test --locked --test playback playback_token::` |
 | `playback_webhooks` | 1 | `cargo test --locked --test playback playback_webhooks::` |
 | `watch` | 5 | `cargo test --locked --test playback watch::` |
 | `watch_state_archive` | 7 | `cargo test --locked --test playback watch_state_archive::` |
 | `database_config` | 4 | `cargo test --locked --test storage database_config::` |
 | `database_maintenance` | 12 | `cargo test --locked --test storage database_maintenance::` |
 | `database_setup_api` | 4 | `cargo test --locked --test storage database_setup_api::` |
-| `database_startup_guard` | 4 | `cargo test --locked --test storage database_startup_guard::` |
+| `database_startup_guard` | 5 | `cargo test --locked --test storage database_startup_guard::` |
 | `log_migration` | 10 | `cargo test --locked --test storage log_migration::` |
 | `sqlite_wal` | 2 | `cargo test --locked --test storage sqlite_wal::` |
 | `storage` | 76 | `cargo test --locked --test storage storage::` |
-| `danmaku` | 7 | `cargo test --locked --test plugins danmaku::` |
+| † `schema_upgrade` | 2 | `cargo test --locked --test storage schema_upgrade::` |
+| † `index_audit` | 3 | `cargo test --locked --test storage index_audit::` |
+| `danmaku` | 13 | `cargo test --locked --test plugins danmaku::` |
 | `danmaku_api` | 2 | `cargo test --locked --test plugins danmaku_api::` |
+| † `danmaku_manual_api` | 19 | `cargo test --locked --test plugins danmaku_manual_api::` |
 | `danmaku_config` | 2 | `cargo test --locked --test plugins danmaku_config::` |
 | `danmaku_config_api` | 1 | `cargo test --locked --test plugins danmaku_config_api::` |
-| `danmaku_plugin` | 2 | `cargo test --locked --test plugins danmaku_plugin::` |
 | `ip_location_plugins` | 3 | `cargo test --locked --test plugins ip_location_plugins::` |
 | `media_info_config` | 2 | `cargo test --locked --test plugins media_info_config::` |
 | `media_info_config_api` | 1 | `cargo test --locked --test plugins media_info_config_api::` |
-| `plugin_protocol` | 41 | `cargo test --locked --test plugins plugin_protocol::` |
+| `plugin_protocol` | 54 | `cargo test --locked --test plugins plugin_protocol::` |
 | `plugin_runtime` | 14 | `cargo test --locked --test plugins plugin_runtime::` |
-| `plugins` | 9 | `cargo test --locked --test plugins plugins::` |
+| † `ratings_sync` | 8 | `cargo test --locked --test plugins ratings_sync::` |
+| `plugins` | 10 | `cargo test --locked --test plugins plugins::` |
 | `probe` | 21 | `cargo test --locked --test strm probe::` |
 | `strm` | 1 | `cargo test --locked --test strm strm::` |
 | `strm_allowed_roots` | 1 | `cargo test --locked --test strm strm_allowed_roots::` |
@@ -160,11 +179,12 @@ cargo test --locked --test <新 target> <旧名>::
 | `background_work_budget` | 1 | `cargo test --locked --test background_work_budget`（本来就没有合并） |
 | `image_variants_perf` | 2 | `cargo test --locked --test image_variants_perf`（本来就没有合并） |
 | `performance` | 25 | `cargo test --locked --test performance`（本来就没有合并） |
-| `postgres_database` | 34 | `cargo test --locked --test postgres_database`（本来就没有合并） |
+| `postgres_database` | 38 | `cargo test --locked --test postgres_database`（本来就没有合并） |
 | `reidentify` | 25 | `cargo test --locked --test reidentify`（本来就没有合并） |
 | `scanned_metadata` | 23 | `cargo test --locked --test scanned_metadata`（本来就没有合并） |
 | `shutdown` | 2 | `cargo test --locked --test shutdown`（本来就没有合并） |
-| **合计** | **934** |  |
+| `filmly_image_diag` | 1 | `cargo test --locked --test filmly_image_diag`（本来就没有合并） |
+| **合计** | **1153** |  |
 
 ## 3. 只跑某一个原文件的测试
 
@@ -188,6 +208,7 @@ cargo test --locked --test scanner
 | target | 原因 |
 |---|---|
 | `--test background_work_budget` | 调用 `env::set_var`/`remove_var` 修改进程级环境变量，与同 binary 的其他测试并行运行会互相污染，必须独占一个进程。 |
+| `--test filmly_image_diag` | `AppState::ready` 在构造时读取进程级 `LUX_FILMLY_IMAGE_MODE`；用例需要开启 Filmly 兼容模式，因此独占一个只含该用例的进程，避免在并行测试里改动环境变量。 |
 | `--test image_variants_perf` | 读取 `LUX_PERF_IMAGE_DIR` 指向的外部图片目录，属于需要外部素材的性能测试。 |
 | `--test performance` | 安装全局 tracing subscriber（`set_global_default`）并读取 `LUX_PERF_*` 环境变量，进程级全局状态不可共享；同时是基准脚本的入口（`scripts/run-performance.sh`）。 |
 | `--test postgres_database` | 需要本机 PostgreSQL 实例，其用例默认 `#[ignore]`。 |
@@ -223,24 +244,28 @@ cargo test --locked --test scanner
 
 **编译+链接**要分两个口径看：CPU 时间从 761 s 降到 540 s（-29%），说明总编译工作量确实减少了；但墙钟从 269 s 涨到 463 s。原因是并行度：合并前 cargo 能同时跑 127 个测试 target（本次测量中平均占用约 2.8 个核），合并后只有 19 个 unit（平均约 1.2 个核），最大的几个分组（`metadata` 143 例、`scanner` 137 例、`storage` 112 例）成为单点关键路径。同一布局重复测过一次 16 target 的中间版本，墙钟 343 s，可见墙钟差异同时受机器负载影响；以 CPU 时间判断趋势更稳。如果要同时压低链接墙钟，可以把超大分组再按子领域拆成 2~3 个 target，那是与本次目标（磁盘占用与测试执行时间）不同的取舍。
 
-### 5.1 逐组测试数对照（合并前后必须完全一致）
+### 5.1 逐组测试数对照（合并时一致；第四列按当前 `--list` 更新）
 
-| 新 target | 合并前同名文件测试数之和 | 合并后 `--test <group> -- --list` | 结果 |
+合并当时的校验标准是“合并前同名文件测试数之和 == 合并后 `--test <group> -- --list`”。合并之后各任务
+继续新增用例，因此下表保留合并前的数字，第三列改为当前值，第四列标出差异来源；第 1、2 节的合计分别
+等于表内 12 个分组行之和与表内全部行之和。
+
+| 新 target | 合并前同名文件测试数之和 | 当前 `--test <group> -- --list` | 结果 |
 |---|---|---|---|
-| `admin` | 22 | 22 | 一致 |
-| `api_web` | 39 | 39 | 一致 |
-| `auth_users` | 70 | 70 | 一致 |
-| `emby` | 38 | 38 | 一致 |
-| `scanner` | 137 | 137 | 一致 |
-| `library` | 49 | 49 | 一致 |
-| `metadata` | 143 | 143 | 一致 |
-| `images` | 52 | 52 | 一致 |
-| `playback` | 34 | 34 | 一致 |
-| `storage` | 112 | 112 | 一致 |
-| `plugins` | 84 | 84 | 一致 |
+| `admin` | 22 | 60 | 新增 38 例（LUX-894 的 `lux_websocket` 30 例、LUX-897 的实时通道相关模块 5 例、其余 3 例为先前任务） |
+| `api_web` | 39 | 57 | 新增 18 例（后续任务） |
+| `auth_users` | 70 | 73 | 新增 3 例（后续任务） |
+| `emby` | 38 | 85 | 新增 47 例（LUX-900 第五增量的 `emby_filter_metadata` 2 例、`emby_websocket` 1 例未同步，其余为先前任务） |
+| `scanner` | 137 | 152 | 新增 15 例（后续任务） |
+| `library` | 49 | 62 | 新增 13 例（LUX-899 的 `similar_api` 6 例、LUX-900 的 `tags_api` 5 例、其余 2 例为先前任务） |
+| `metadata` | 143 | 157 | 新增 14 例（LUX-886 6 例、LUX-887 1 例，其余为先前任务） |
+| `images` | 52 | 66 | 新增 14 例（LUX-887 1 例，其余为先前任务） |
+| `playback` | 34 | 35 | 新增 1 例（后续任务） |
+| `storage` | 112 | 118 | 新增 6 例（`schema_upgrade` 1 例此前未同步，其余 5 例为后续任务） |
+| `plugins` | 84 | 128 | 新增 44 例（后续任务） |
 | `strm` | 42 | 42 | 一致 |
-| 独立 binary 合计 | 112 | 112 | 一致 |
-| **合计** | **934** | **934** | 一致 |
+| 独立 binary 合计 | 112 | 117 | 新增 5 例（后续任务） |
+| **合计** | **934** | **1152** | 差异均为合并后新增用例 |
 
 ### 5.2 单个用例稳定性复核
 
@@ -276,3 +301,155 @@ cargo test --locked --test scanner
 
 优先把新文件放进现有分组的领域目录：`tests/<group>/<file>.rs`，并在 `tests/<group>/main.rs` 里加一行 `mod <file>;`。只有确定无法与任何分组共存时才新增顶层 `tests/<file>.rs`，判据是：改进程级环境变量、装全局 subscriber、关全局闸门（如 `shutdown_background_workers()`）、或需要外部服务（PostgreSQL、外部素材目录）。
 
+## 7. LUX-889 追加（2026-11-06）
+
+`tests/emby/emby_similar.rs` 是 LUX-889 新增的模块（`tests/emby/main.rs` 追加一行 `mod emby_similar;`），
+命令为 `cargo test --locked --test emby emby_similar::`，共 6 例：电影/剧集共享 Genre 排序、不含自身与
+不同类型、ACL 排除、`Limit` 与 `TotalRecordCount`、空列表、404/401、根路径与 `/emby` 前缀、
+`EnableUserData`/图片类型选择、空值与非法 `Limit`。
+
+本分支 rebase 到 `a3c0709b`（已含 LUX-888 与 LUX-890）后
+`cargo test --locked --test emby -- --list` 为 **59** 例（43 例基线 + LUX-888 的
+`emby_empty_numeric_params` 7 例 + LUX-890 的 `emby_filter_metadata` 3 例 + 本任务 6 例），整组
+`cargo test --locked --test emby` 为 59 passed、0 failed。第 1、2、5.1 节的数字保留基线/合并时的口径，
+不在本任务中改写；后续并行任务的 `emby` 新增模块合并后，需要再以合并后的 `--list` 核对本节的 59。
+
+LUX-891 合并后已按合并后的实测核对：`cargo test --locked --test emby -- --list` 为 **82** 例 / 16 个
+模块（上述 59 例 + `emby_websocket` 23 例，三轮返工补齐了推送限频、写超时、周期重校验、大文档完整推送、
+超大文档跳过、写缓冲严格大小关系、极限限额覆盖等用例），第 1、2、5.1 节的 `emby` 行与合计同时更新。
+
+## 8. LUX-894 追加（2026-11-06）
+
+`tests/admin/lux_websocket.rs` 是 LUX-894（`GET /api/v1/ws`）新增的模块（`tests/admin/main.rs` 追加一行
+`mod lux_websocket;`），命令为 `cargo test --locked --test admin lux_websocket::`，共 **30** 例：普通 GET
+`426`；Origin 七条（缺失 / `null` / 非法 / 多值按缺失处理，host 大小写与非默认端口归一化，与 `Host`
+不一致 `400`，`Sec-Fetch-Site: cross-site` `400`，转发头不参与判断，缺失 Origin 时 cookie `401` 而客户端
+令牌放行）；cookie 与客户端令牌认证；未认证 `401`、被设备/客户端规则拒绝 `403`；管理员双频道与普通用户
+只有 `user` 频道；`progress` 事件携带 `itemId`；每用户与全局预算 `429` + `Retry-After: 30`、释放与
+管理/用户预算分离；降权只停 `admin` 帧并可在恢复后继续；会话撤销 `1008`；关停 `1001` 且不阻塞、关停后
+新握手 `503`；>4 KiB `1009`、二进制 `1003`、未知 `type` 忽略；协议级 ping 保持空闲连接、空闲 `1001`；
+重校验 5xx 不断连；另外两例来自审查返工：45 s 重校验不写 `user_devices`、`drain_lux_websocket_connections`
+在连接超出排空时间时返回 `false`。
+
+同一分支的单元测试在 `src/api/lux_websocket.rs`：`cargo test --locked --lib lux_websocket::` 共 **15** 例
+（Origin 解析与归一化、信封逐字渲染、`itemId` 256 字符边界、`{"type":"ping"}` 识别、升级 token 判定、
+ADR-054 的预算与定时器默认值（用户 128/16、管理 64/8、4 KiB、25 s/120 s/45 s/10 s，以及 Emby 仍是
+32/4 与 8 KiB），以及用真实 hub 制造 `Lagged` 后降级为 `home` / `all` 的映射；第 15 例是 LUX-896 分支的
+P3 修复新增的 `origin_normalization_drops_both_default_ports_on_either_side`，锁定 `Origin` 与 `Host` 两侧
+都把 80/443 视为默认端口）。`cargo test --locked --lib websocket::` 随之从 10 例变为 **25** 例（10 例共享
+基础设施 + 本任务 15 例）。
+
+模块内的等待方式（返工后）：所有依赖时间的断言都轮询到条件成立或 `CONDITION_DEADLINE`（20 s），例如空闲关闭
+轮询连接预算空位后再读 close 码、协议 ping 保活数到足够的 ping 且超过 1.6 个空闲窗后再断言仍可通信；只有负向
+断言（“不应收到 admin 帧”“不应有 pong”）使用 400 ms 的短窗口。心跳/空闲的时钟比例与依据写在各自用例的注释里，
+因此模块在 10 个烧机进程、机器 load average 30~330 时连续 3 次 30/30。
+
+LUX-891 的 `/embywebsocket` 模块在本次审查返工中新增一例（关停后新握手 `503`），
+`cargo test --locked --test emby -- --list` 由 82 例变为 **83** 例（`emby_websocket::` 24 例）。
+
+本分支的实测：`cargo test --locked --test admin -- --list` 为 **55** 例（25 例基线 + 本任务
+30 例）；整组 `cargo test --locked --test admin` 连续 2 次均为 54 passed / 1 failed，唯一失败是 5.3 节已记录的
+环境型用例 `admin_settings::transcoding_settings_are_admin_only_validated_and_persisted`（本机 VideoToolbox
+可用，用例断言 `transcodingStatus.available == false`，与 WebSocket 无关），单跑该用例同样失败；
+`cargo test --locked --test admin lux_websocket::` 加压下连续 3 次 30/30；`cargo test --locked --test emby` 83/83；
+`LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test shutdown` 2/2。第 1、2、5.1 节的数字保留
+基线/合并时的口径，不在本任务中改写；LUX-897 删除 SSE 用例后需要再以合并后的 `--list` 核对。
+
+## 9. LUX-897 追加（2026-11-06）
+
+LUX-897 删除了两条 SSE 端点（`GET /api/v1/events`、`GET /api/v1/admin/events`），测试随之硬切：
+
+- 删除 `tests/admin/admin_events.rs`。其中 4 例只验证 SSE 帧头、ready 帧与两条流共用的 64 条信号量
+  （`admin_event_stream_requires_an_authenticated_admin`、`admin_event_stream_sends_ready_frame_to_an_admin`、
+  `user_event_stream_is_authenticated_and_does_not_expose_admin_events`、`concurrent_event_streams_are_capped`），
+  随端点一起删除；`concurrent_event_streams_are_capped` 的“预算超限 `429` + `Retry-After: 30`”由
+  `lux_websocket::the_global_budget_answers_429_and_releases_the_slot` 与
+  `the_admin_and_user_budgets_are_separate_and_classified` 覆盖。剩下的
+  `admin_scan_job_endpoints_expose_media_progress_without_changing_file_counts` 与事件流无关，原样移到新模块
+  `tests/admin/admin_jobs.rs`（断言未改，模块名不再误导）。
+- 新增 `tests/admin/removed_event_streams.rs`（2 例）：两条旧路径在未登录与被登录管理员下都返回 `404`
+  （先红后绿：删除前的实际响应是 `401`/`200`）。
+- 新增 `tests/admin/realtime_contract.rs`（7 例）钉住共享客户端的合约：非 `progress` 的 user 帧只能有
+  `type`/`channel`/`scope` 三个键（多一个键就失败，端到端也验证 `next_user_scope` 会报错），`progress`
+  允许 `itemId`（上限 256 字符），admin 帧不带 `itemId`/`libraryId`，连接被关闭/IO 结束不能算
+  `expect_user_silence` 的“静默”（到期无帧才通过）。
+- 仍有效的区域/用户事件隐私与“先持久化再通知”覆盖不删，只换传输：`tests/admin/user_event_scoping.rs`
+  2 例、`tests/admin/user_query_events.rs` 1 例、`tests/playback/playback_webhooks.rs` 的 home 失效断言
+  都改为经 `GET /api/v1/ws` 的 `user` 频道读取（共享客户端 `tests/common/realtime.rs`，由 admin 与
+  playback target 用 `#[path]` 引入）。断言范围不变：管理员连接收不到别人的用户级事件、普通用户收不到
+  `admin` 频道、目录级修改仍广播、非 `progress` 事件不带 `itemId`。
+- 服务端 `src/api/admin/admin_logs_events.rs` 的 4 个 SSE 帧单测（`user_event_frame_tests`）删除；
+  broadcast `Lagged` 降级仍由 `src/api/lux_websocket.rs` 的 `a_lagged_user_subscriber_degrades_to_home_without_an_item_id`
+  与 `a_lagged_admin_subscriber_degrades_to_all_without_an_item_id` 覆盖，hub 本身的行为用例
+  （`src/application/admin_events.rs` 的 12 例）未改动。
+
+实测：`cargo test --locked --test admin -- --list` 为 **60** 例（55 - 4 + 2 + 7；scan-job 用例保留，只换了
+模块名，另加 7 例共享客户端合约测试）。第 1、5.1 节的数字保留基线/合并时的口径；第 2 节的模块行按当前
+`--list` 更新。
+
+## 10. LUX-899 追加（2026-11-07）
+
+`tests/library/similar_api.rs` 是 LUX-899 新增的模块（`tests/library/main.rs` 追加一行 `mod similar_api;`），
+命令为 `cargo test --locked --test library similar_api::`，共 **6** 例：同一用户同一库下 Lux 原生
+`GET /api/v1/items/{item_id}/similar` 与 Emby `GET /Items/{id}/Similar` 的条目 id 顺序一致（普通用户与
+管理员，含 ACL 排除项不出现在 `items`/`total`/Emby `TotalRecordCount`）、`limit` 默认 50/上限 1000、`page`
+默认 1/边界 400、空值按未提供、`pageSize` 作为 `limit` 别名且冲突 400、`limit=1000` 接受且 1001 拒绝
+（Emby 仍拒绝 1001）、三页拼接与 `limit=5`
+一次取全的 id 顺序一致且无重复/遗漏、超界页返回 200 空列表且 `hasNext=false`、`total` 在各页相同、未知或
+不可见条目 404 与无会话 401、内容限制排除的条目不出现在 `items`/`total`、剧集只返回剧集且无相似条目时
+返回 200 空列表。
+
+- 该模块按路由所在域放在 `library` 分组（目录/媒体条目 API），与 `catalog`、`series_api` 等相邻；没有新建
+  顶层 target，也没有改其他分组的归属。
+- `src/api/media.rs` 另新增 1 例单测 `similar_limit_tests::lux_similar_limit_and_page_validation`
+  （`cargo test --locked --lib lux_similar_limit`），断言 Lux 默认值 50、接受 1000 / 拒绝 1001、page 默认 1
+  且拒绝 0；Emby 的 1000 上限由既有 `emby_similar` 用例保持。
+- 实测：`cargo test --locked --test library -- --list` 为 **57** 例（51 例基线 + 本任务 6 例），
+  `cargo test --locked --test library` 57/57 通过；`cargo test --locked --test emby -- --list` 仍为 **83**
+  例，其中 `emby_similar::` 6/6（断言未改）；`cargo test --locked --lib similar_catalog` 2/2。
+  闸门单测 `similar_endpoints_use_the_catalog_aggregation_guard` 断言 Lux 路由计入、Emby 两条路径不计入。
+- 第 1、2、5.1 节的历史数字保留基线/合并时的口径（第 2 节新增本模块一行）。
+
+## 11. LUX-900 追加（2026-11-07）
+
+`tests/library/tags_api.rs` 是 LUX-900 新增的模块（`tests/library/main.rs` 追加一行 `mod tags_api;`），
+命令为 `cargo test --locked --test library tags_api::`，共 **5** 例：`GET /api/v1/tags` 的响应只含
+`tags`（每项只有 `name`）、`page`、`pageSize`、`total`，`total` 是去重后的标签总数；`pageSize` 默认 50、
+`page=1` 起且接受 1-1000 的上限，`page<1`/负数/非整数/`pageSize=0`/`pageSize=1001`/非整数均返回 400
+`INVALID_REQUEST`，多页拼接无重复且越界页返回 200 空列表；`libraryId` 限制到单个可见库，不可见库、不存在的
+UUID 与格式非法的 ID 一律 404 `NOT_FOUND`；`itemType` 支持逗号分隔与重复参数、大小写不敏感、空值表示全部、
+全部无法识别时返回 200 空列表与 `total=0`；重复的 `page`/`pageSize`/`libraryId` 返回 400 且为统一
+JSON 错误信封（不是提取器的纯文本 400），`itemType` 仍可重复；隐藏媒体库的标签、超出用户内容限制的标签不出现在普通用户的
+列表与 `total` 中，管理员跳过内容限制并看到全部启用库；同名的 `Star Wars`/`star wars` 合并为一项；未鉴权
+返回 401 `AUTHENTICATION_REQUIRED`。
+
+- 该模块按路由所在域放在 `library` 分组（媒体库/目录查询 API），与 `similar_api`、`catalog` 等相邻；没有
+  新建顶层 target，也没有改其他分组的归属。
+- 第 1、2、5.1 节的历史数字保留基线/合并时的口径（第 2 节新增本模块一行）。
+- 实测：`cargo test --locked --test library -- --list` 为 **62** 例（57 例基线 + 本任务 5 例），
+  `cargo test --locked --test library tags_api::` 5/5 通过。
+
+## 12. LUX-900 第五增量追加（2026-11-07）
+
+Emby `GET /Tags` 改读标签投影，测试仍在既有模块 `tests/emby/emby_filter_metadata.rs` 里，没有新增文件或
+`mod` 行。该模块由 3 例扩为 **5** 例：`tags_list_the_visible_tags_and_scope_the_parent_library`（真实标签
+与去重、根路径/`/emby`/大小写、管理员与普通用户的可见范围、内容限制、`ParentId` 的 404 与空值不限库）、
+`tags_apply_include_item_types_and_pagination`（`IncludeItemTypes` 有效/全无效/混合，`StartIndex`/`Limit`
+分页、默认 50、上限 1000、非法 400）、`tags_match_the_lux_tags_endpoint`（同一库同一用户下与
+`GET /api/v1/tags` 的名称、顺序与总数一致）。
+
+- `emby` 分组的模块列表不变（仍 16 个），只有用例数变化：`cargo test --locked --test emby -- --list` 为
+  **85** 例（LUX-899 记录 83 例 + 本增量 2 例）。第 1、2、5.1 节的 `emby` 行现在同为 85 例。
+- 按 `--list` 逐行核对第 2 节的模块计数时，一并改正了四处此前未同步的数字，第 1、5.1 节随之更新，三处合计
+  重新闭合：
+  - `emby_websocket` 23 → **24**（`21c4589c` 的实时通道返工新增 1 例，文档未同步），`emby` 的模块行之和
+    因此 84 → **85**。
+  - `admin` 补上缺失的 `† lux_websocket` 一行（LUX-894 的 30 例），模块行之和 30 → **60**，与
+    `cargo test --locked --test admin -- --list` 一致。
+  - `schema_upgrade` 1 → **2**，`storage` 合计 117 → **118**，与 `--list` 一致。
+  - `library` 的模块行本就合计 62（`similar_api` 6 + `tags_api` 5 + 其余），只是第 1、5.1 节仍写 51。
+- 闭合关系（第 1、2、5.1 节现在一致）：第 1 节 12 组合计 **1035** = 60 + 57 + 73 + 85 + 152 + 62 + 157 +
+  66 + 35 + 118 + 128 + 42；第 2 节合计 **1152** = 12 组模块行之和 1035 + 8 个独立 binary 117；第 5.1 节
+  合计 **1152**，与第 2 节相同（第 5.1 节“合并前”的 934 是基线口径，不参与本次闭合）。
+- 8 个独立 binary 的数字沿用既有记录，本次未逐个重测（其中 `postgres_database` 需要外部 PostgreSQL、
+  `performance`/`image_variants_perf` 需要性能环境）；三张表对它们使用同一组 117，因此不影响上述闭合。

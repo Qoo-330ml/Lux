@@ -10,7 +10,7 @@ test("LuxPlayer reserves dynamic viewport and safe-area space for mobile control
   assert.match(styles, /\.lux-player-frame \{[^}]*top: env\(safe-area-inset-top\)/);
   assert.match(styles, /\.lux-player-topbar \{[^}]*top: calc\(24px \+ env\(safe-area-inset-top\)\)/);
   assert.match(styles, /\.lux-player-controls-wrap \{[^}]*bottom: calc\(10px \+ env\(safe-area-inset-bottom\)\)/);
-  assert.match(styles, /\.lux-player-settings-popover \{[^}]*right: calc\(2% \+ env\(safe-area-inset-right\)\)/);
+  assert.match(styles, /\.lux-player-settings-drawer \{[^}]*padding: calc\(28px \+ env\(safe-area-inset-top\)\) calc\(22px \+ env\(safe-area-inset-right\)\) calc\(22px \+ env\(safe-area-inset-bottom\)\)/);
 });
 
 test("LuxPlayer keeps danmaku out of the title and control safe zones", () => {
@@ -28,6 +28,13 @@ test("LuxPlayer mini progress stays at the edge without taking pointer focus", (
 test("LuxPlayer chapter markers overlay the shared timeline instead of adding a second rail", () => {
   assert.match(styles, /\.lux-player-chapter-rail \{[^}]*position: absolute/);
   assert.match(styles, /\.lux-player-chapter-rail \{[^}]*pointer-events: none/);
+});
+
+test("LuxPlayer does not force the keyboard shortcut entry on touch devices", () => {
+  assert.match(
+    styles,
+    /@media \(pointer: coarse\) \{\s*\.lux-player-controls \.lux-player-shortcut-help-btn \{ display: none; \}/,
+  );
 });
 
 test("LuxPlayer loading and error states center their content across the full viewport", () => {

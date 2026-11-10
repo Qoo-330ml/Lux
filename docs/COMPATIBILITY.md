@@ -1,5 +1,293 @@
 # Lux 客户端兼容性矩阵
 
+## LUX-897 SSE 端点删除（2026-11-06）
+
+分级：**服务端 404 由自动化测试固定；未在真实第三方客户端上复测**。
+
+`GET /api/v1/events` 与 `GET /api/v1/admin/events` 已由 LUX-897 在同一发布版本删除（ADR-054 硬切），现在
+两者都返回 `404`：未登录与被登录管理员完全一致，不再有 `401`、`200`、ready 帧或 `text/event-stream`。
+实时失效通知只剩 `GET /api/v1/ws`（同一条连接承载用户/管理频道）。Lux Web 已由 LUX-895 切到该端点，
+`web/src` 没有 SSE/EventSource 引用，因此浏览器端不受影响；仍连接旧路径的第三方页面或脚本会拿到 `404`，
+必须改接 `GET /api/v1/ws`。断线时的轮询兜底不变（用户面 30 秒，管理面 2/5/15 秒）。REST/Emby DTO、数据库
+schema、`/embywebsocket` 与播放协议均未改。自动化：`cargo test --locked --test admin removed_event_streams::`
+（未登录/管理员各 1 例）、`user_event_scoping::`/`user_query_events::` 改经 WebSocket 验证，
+`grep -rn "text/event-stream\|EventSource" src/ web/src` 为空。历史小节（LUX-555–560、LUX-894/895/896）
+保留当时的 SSE 描述作历史参考。
+
+## LUX-890 Emby `GET /Tags` 与 `GET /OfficialRatings`（2026-11-06）
+
+证据等级：**请求形态为真机抓包确认，响应形态为静态推断**。Hills 1.11.0 打开媒体库筛选面板时实抓
+`GET /Tags`、`GET /OfficialRatings`，当时 Lux 对两者都返回 404 空响应，筛选列表为空
+（`docs/reviews/2026-11-06-hills-yamby-capture.md`）。本次修复后的响应**没有**在 Hills 或任何第三方
+Emby 客户端上复测；`Items[]` 的 `Name`/`Id` 形状按 Emby `NameIdPair` 约定推断，Lux 侧只用自动化测试
+固定服务端合同。Yamby 本次抓包未观察到这两个请求。
+
+- `GET /OfficialRatings`：从 `media_content_restriction_index.certification_code` 聚合当前用户可见范围内
+  去重后的**归一化分级码子集**（内容限制索引识别的 MPA/TVPG/BBFC 码），按分级代码升序返回。
+  `ParentId`（媒体库）、`StartIndex`/`Limit` 与服务端上限与其他 facet 端点一致，`ParentId` 是不可见
+  媒体库时返回 404。`IncludeItemTypes` 与其他 facet 端点**不同**：本端点整组无法识别时返回空列表（与
+  `/Items` 一致），而 `/Genres`、`/Studios`、`/Years` 仍用旧的内联解析、全无效时会退化成“不过滤”，
+  待后续任务对齐。响应信封与 `/Genres` 相同：
+  `{"Items":[{"Name":"PG-13","Id":"PG-13","ServerId":…}],"TotalRecordCount":n,"StartIndex":n}`；`Id` 就是
+  分级值。
+- 与 `OfficialRating` 字段的关系：**不是同一份值**。条目 `OfficialRating` 输出 NFO 原文（可能是
+  `Rated R`、`FSK 16`、`US:PG-13`），而这个列表只包含被内容限制索引识别的归一化码：无法识别的分级不
+  出现，识别出的分级也可能与原文写法不同（例如 NFO 的 `Rated R` 在这里是 `R`）。没有 NFO 分级的条目
+  不会贡献 facet。这不是本任务新增的过滤，是既有投影的取值范围的直接结果。
+- 内容限制：非管理员用户的分级列表与 `/Items` 使用同一条内容限制谓词，超出 `maximum_rating` 的条目连同
+  其分级一起被排除；管理员不受内容限制（与既有列表一致）。库 ACL 与内容限制同时生效。
+- `GET /Tags`（LUX-900 起）：读取 `TAG` 投影（`media_item_facets`，迁移 0249 新增的 kind），调用与原生
+  `GET /api/v1/tags` 相同的 `CatalogService::list_tags`，所以同一媒体库、同一用户下两个端点返回的标签名称
+  集合与顺序一致，只有信封不同。标签按不区分大小写的 `name_key` 去重（`Star Wars` 与 `star wars` 只算
+  一项，显示名取字节序最小的写法）并按该键升序排列。可见范围与 `/OfficialRatings` 相同：非空 `ParentId`
+  指向未知或用户不可见的媒体库时返回 404，空 `ParentId=` 按“不限媒体库”处理；管理员跳过内容限制，其他
+  用户只看到内容限制后仍可见条目上的标签。`IncludeItemTypes`、`StartIndex`/`Limit` 同样复用
+  `/OfficialRatings` 的解析与分页（默认 50、上限 1000、非法 400）。响应信封为
+  `{"Items":[{"Name":…,"Id":…,"ServerId":…}],"TotalRecordCount":n,"StartIndex":n}`，`Id` 就是标签名
+  （与 `OfficialRatings` 的 `Id = Name` 一致），不返回 facet `Id`、条目数或 `name_key`。请求只读投影表，
+  不解析 NFO、不扫库。**存量库需要等待回填**：0249 迁移把所有可见条目重新入队并清掉 NFO 指纹，worker 分批
+  补写 `TAG` 行；回填完成前这些条目上的标签不会出现在筛选面板里（面板暂时仍是空列表）。
+  `Fields=TagItems` 的现有行为不变。
+- 鉴权与路径：两个端点都要求 Emby token/API key（未鉴权 401），同时支持根路径与 `/emby` 前缀；路由走
+  既有 `EmbyRouteBuilder`，因此 `/emby` 前缀与路径大小写不敏感的行为自动一致
+  （`/EMBY/officialratings` 有测试覆盖）。
+- 分页：`Limit` 默认 50（`Limit<=0` 也按默认 50 处理，与 `/Genres` 一致）、服务端上限 1000；
+  `Limit>1000` 或 `StartIndex<0` 返回 400；空的 `StartIndex=`/`Limit=` 按未提供处理（Hills 的筛选面板
+  会带空 `Limit=`；与 LUX-888 的共享 `deserialize_optional_i64` 同一实现），空的 `ParentId=` 按
+  “不限媒体库”处理。
+- `IncludeItemTypes`：与 `/Items` 使用同一份解析规则（`emby_item_types_from_value`）。整组都无法识别时
+  返回空列表（200 空信封），不会退化成“不过滤”的全量结果；混合有效与无效类型时只按有效类型过滤。
+  `/Genres`、`/Studios`、`/Years` 仍是旧的内联解析，全无效时会退化成不过滤，待后续任务对齐。
+- `Recursive` 被接受但不改变结果：与其他 facet 端点一样，分级聚合始终覆盖所选库/类型的全部可见条目。
+- **剩余缺口（分级）**：分级目前只能列出，不能用于 `/Items` 筛选——`/Items` 不接受 `OfficialRatings=` 参数，
+  所以在筛选面板里选中某个分级不会改变列表。对应后续任务待立项，本任务没有改 `/Items` 过滤。
+- **剩余缺口（标签）**：标签同样只能列出，不能用于 `/Items` 筛选。`EmbyItemsQuery` 与
+  `catalog_filter_from_values` 都没有标签字段（`CatalogFilter` 的 facet 键只有 `genre_keys`/`studio_keys`），
+  `/Items?Tags=…`、`/Items?TagIds=…` 目前被静默忽略：既不返回 400，也不改变结果，客户端无从得知过滤没有
+  生效。条目 DTO 的 `TagItems` 仍恒为 `[]`（`src/api/emby_catalog.rs` 固定输出空数组，`tests/library/catalog.rs`
+  有对应断言），Emby 详情响应也不会因此多出标签。对应后续任务待立项，本任务没有改 `/Items` 过滤，也没有改
+  条目 DTO 形状。
+- **目录并发闸门的取舍（有意）**：`GET /api/v1/tags` 是 Lux 原生目录聚合，计入目录并发闸门
+  （`is_catalog_aggregation_path` 匹配 `["api","v1","tags"]`），饱和时排队超过 2 秒返回 503
+  `CATALOG_BUSY` 并附 `Retry-After`；Emby `/Tags` 与 `/Genres`、`/OfficialRatings` 一样只是 Emby 兼容
+  适配层，不在该闸门的路径表里，因此不进闸门——与 LUX-899 对 Emby `Items/{id}/Similar` 的处理一致
+  （`similar_endpoints_use_the_catalog_aggregation_guard` 断言 Lux 的 `similar` 与 `/api/v1/tags` 计入、
+  Emby `Items/{id}/Similar` 不计入；Emby `/Tags` 没有单独的断言，行为由同一张路径表保证）。这是有意的
+  兼容取舍：Emby 端点保持接入前的失败语义，不会因为 Lux 侧排队就被改写成 503。风险在于闸门只保护 Lux 一侧：
+  Emby 筛选面板的 `/Tags` 与闸门互不影响，客户端并发或失败重试时会绕过 2 秒准入，继续占用连接池与 CPU 执行
+  同一份 `GROUP BY name_key` + `COUNT(DISTINCT name_key)` 聚合，可能拖慢已经排队的 Lux 目录请求甚至让连接池
+  饱和；单次请求的返回行数由 `Limit`（默认 50、上限 1000）与服务端 400 约束，但 `COUNT(DISTINCT name_key)`
+  仍要扫描所选可见范围内的 TAG 行，成本随范围增长而不是随页大小增长。后续若要收紧，需要为 Emby 适配层另加
+  一条有界队列并同步补测试，不能只靠把 Emby 路径塞进现有闸门。
+- 自动化：`cargo test --locked --test emby emby_filter_metadata::`（5 例）覆盖去重、库 ACL、内容限制、
+  `ParentId`、`IncludeItemTypes`（有效/全无效/混合）、分页与上限、空 `Limit=` 与 `Limit=0`、未鉴权 401、
+  根路径/`/emby`/大小写混用，以及 `Tags` 的真实标签列表、类型过滤/分页与 `/api/v1/tags` 的名称一致性。
+
+## LUX-888 Emby 查询端点容忍空的可选数值/布尔参数（2026-11-06）
+
+分级：**真机抓包确认（仅“空 `Limit=` 会 400”这一条）+ 其余静态推断**。
+
+真机依据只有一条：Hills 打开媒体库筛选面板时对 `/Genres`、`/Years`、`/Studios` 发送了**空的 `Limit=`**，
+Lux 返回 `400`（`Failed to deserialize query string: Limit: cannot parse integer from empty string`），把
+`Limit=` 去掉后 `/Genres` 返回 `200`（`docs/reviews/2026-11-06-hills-yamby-capture.md` §2 问题 3）。该报告
+没有保留完整查询串（原始 `.tmp/capture/proxy.log` 未提交），因此**空的 `StartIndex=` 与其它端点是否也发
+空值没有实抓证据**，属于静态推断：它们与 `Limit` 走同一套 `Option<i64>` 查询反序列化，客户端只要按同一
+模板拼参数就会同样 400。**本修复尚未部署，也没有在 Hills/Yamby 真机上复测修复后的筛选面板。**
+
+- 规则：Emby 查询端点里可选数值/布尔参数，**空串或纯空白按“未提供”处理**；这与 2026-08-23 AfuseKt 空的
+  `IsFavorite=` 条目是同一套做法。实现上只有一份判定逻辑：私有 `blank_optional_value<T>` 供
+  `deserialize_optional_bool`、`deserialize_optional_i64`、`deserialize_optional_i32` 三个适配器共用，
+  没有按结构体各写一份。
+- 非空值的校验基本不变：`Limit=abc`、`Limit=1.5`、`StartIndex=abc`、`Index=abc`、`Hide=abc` 仍在反序列化
+  阶段 `400`；`StartIndex=-1` 仍因负偏移 `400`；超过服务端上限仍 `400`（列表端点 `Limit` 上限 1000、
+  `Users/Query` 为 100、`Sessions` 的 `ActiveWithinSeconds` 为 30 天即 2592000 秒）；各端点对 `Limit=0` 的
+  既有规则**逐端点保持原样**（例如 `/Library/MediaFolders` 的 `Limit=0` 仍是 `400`，其他端点各按自己的默认值
+  或纯计数语义）；`Hide` 空值只表示“没提供”，查询与 JSON body 都没给出时仍然是 `400`。
+- 唯一的放宽之外的小差异：共享判定先 `trim()` 再解析，所以带前后空白的数值（如 `Limit=%2010`、
+  `StartIndex=%201`、`Hide=%20true`）此前会 `400`，现在按去空白后的值解析并生效。这是本次引入的行为变化，
+  与“空值按未提供”出自同一处实现；该放宽没有专门的回归测试，也未评估其对其他客户端的影响。
+
+### 穷尽检查清单：Emby 路由用到的查询类型
+
+逐个核对 `src/api/` 下所有 Emby 查询类型（包含 `flatten` 的共享鉴权结构体）的可选数值/布尔字段：
+
+| 查询类型 | 覆盖路由 | 可选数值/布尔参数 | 处理 |
+|---|---|---|---|
+| `EmbyItemsQuery` | `/Items`、`/Users/{userId}/Items` 及其 `Resume`/`Latest`/`NextUp`/`FavoriteItems`、`Shows/NextUp`、`Shows/{seriesId}/Seasons`、`Shows/{seriesId}/Episodes`、`Items/{itemId}/Children` | `StartIndex`、`Limit` | **改**：空值等价未传 |
+| `EmbyMediaFoldersQuery` | `/Library/MediaFolders` | `StartIndex`、`Limit` | **改** |
+| `EmbyFacetsQuery` | `/Genres`、`/Studios`、`/Years` | `StartIndex`、`Limit` | **改**（真机证据所在端点） |
+| `EmbyPersonsQuery` | `/Persons` | `StartIndex`、`Limit` | **改** |
+| `EmbyUsersQuery` | `/Users/Query` | `StartIndex`、`Limit` | **改** |
+| `EmbyTokenQuery` | `/Sessions` 以及所有 `flatten` 它的 Emby 查询 | `ActiveWithinSeconds` | **改** |
+| `EmbySearchQuery` | `/Search/Hints` | `StartIndex`、`Limit` | **改**（返工补：字段原先没有 `default`，已补上并用测试证明不传参数仍 `200`） |
+| `EmbyUserImageQuery` | `/Users/{userId}/Images/{imageType}`（GET/HEAD/POST/DELETE）与带索引变体 | `Index` | **改**（返工补：新增 `deserialize_optional_i32`） |
+| `ResumeVisibilityQuery` | `POST /Users/{userId}/Items/{itemId}/HideFromResume` | `Hide` | **改**（返工补：改用共享的 `deserialize_optional_bool`，不再手写解析） |
+| `EmbyImageDisplayQuery` | 条目/人物/用户图片路由 | `maxWidth`、`maxHeight`、`width`、`height`、`quality` | **不改**：这些参数由 `RawQuery` 手写解析，非数字、空值与 `0` 本来就按“未提供”处理，从不返回 `400` |
+| `EmbyStreamQuery` | `/Videos/.../stream*`、`original.strm` | `luxPlaybackExpires`（签名票据里的过期时间） | **不改**：`value.parse().ok()`，空值/非法值都落成 `None`；票据缺失或不匹配走既有的鉴权失败分支，不是 `400` |
+| `EmbyTranscodingQuery` | `/Videos/{itemId}/master.m3u8`、`/Videos/{itemId}/transcoding/{sessionId}/{asset}` | `luxPlaybackExpires` | **不改**：同上，`parse().ok()` |
+| `EmbyPlaybackInfoRequest` 的查询合并 | `GET`/`POST /Items/{itemId}/PlaybackInfo` 上的查询参数 | `MaxStreamingBitrate`、`StartTimeTicks`、`EnableDirectPlay`、`EnableDirectStream`、`EnableTranscoding`、`AllowVideoStreamCopy`、`AllowAudioStreamCopy` | **不改**：`apply_query_parameters` 用 `if let Ok(value) = value.parse::<i64>()` 与 `parse_emby_bool` 逐个判断，空值直接被忽略 |
+| `EmbyItemCountsQuery`、`EmbyDeleteItemQuery`、`EmbyPersonQuery`、`EmbyRefreshQuery`、`EmbyDisplayPreferencesQuery`、`EmbyCreateUserQuery`、`EmbyCollectionMutationQuery`、`DanmakuQuery` | 各自路由 | 没有自己的可选数值字段 | **不改**：无该问题；`flatten` 进来的 `ActiveWithinSeconds` 随 `EmbyTokenQuery` 一起容错 |
+| （未声明） | 任意 Emby 路由 | `ImageTypeLimit` | **不改**：Lux 的 Emby 查询类型根本没有声明这个键，`Query` 反序列化会忽略未知参数，因此空值与非空值都不会 `400` |
+
+边界：本次只改 Emby 兼容层；Lux `/api/v1` 的 `LuxPageQuery`/`LuxSearchQuery` 等查询类型保持原有严格解析。
+`/Items` 的 `Limit`/`StartIndex` 依旧不声明 camelCase 别名（既有行为，与本次空值问题无关）。
+
+- 自动化：`cargo test --locked --test emby emby_empty_numeric_params::` 7/7，逐端点覆盖“不传参数仍 200”
+  “空值等价未传”“非法值仍 400”“超过上限仍 400”，根路径与 `/emby` 前缀各一遍。该测试只证明 Lux 服务端
+  合同，不代表任何真实客户端已确认。
+
+## LUX-887 Emby `Filters=IsResumable` / `Filters=IsFavorite`（2026-11-06）
+
+分级：**推断**。依据只有两条：Hills 1.8.0 的二进制里存在 `IsResumable` 字符串，以及标准 Emby 的
+`Filters` 参数接受 `IsResumable`/`IsFavorite`。本任务只在 Lux 服务端按该语义实现并用自动化测试覆盖，
+**没有**在 Hills 或任何第三方 Emby 客户端真机上复测列表结果。
+
+- `Filters` 仍是逗号分隔、大小写不敏感，未知值继续忽略。此前 Lux 只读取 `IsPlayed`/`IsUnplayed`，
+  `IsResumable` 与 `Filters` 里的 `IsFavorite` 被静默丢弃：前者返回完整列表，后者只有独立的
+  `IsFavorite=true` 参数才生效。
+- `Filters=IsResumable` 复用 `GET /Users/{userId}/Items/Resume` 的“继续观看”判定：当前用户
+  `user_item_state` 未标记已看、未设置 `HideFromResume`、播放位置达到 `resume_min_ticks`（默认 120 秒）、
+  条目有已知时长且播放位置低于该用户的已看百分比（`played_percent`，默认 95%）。所以它不是字面意义上的
+  `PlaybackPositionTicks > 0`：刚开始播放（低于最小时长）和接近看完（超过已看百分比）的条目不会返回。
+  阈值与 Resume 端点读取同一份设置（`home_resume_settings`），没有新增配置项。
+- `Filters=IsFavorite` 等价于查询参数 `IsFavorite=true`；两者同时出现时以显式参数为准。
+- 组合规则：所有过滤器按 AND 组合。`IsResumable` 隐含未看完，因此 `Filters=IsResumable,IsPlayed`
+  返回空页，不会让其中一个值静默覆盖另一个；`Filters=IsResumable,IsUnplayed` 等价于只有 `IsResumable`。
+  `Filters` 内 `IsUnplayed` 优先于 `IsPlayed` 的旧规则保持不变。
+- 覆盖范围：`/Users/{userId}/Items` 与带 `UserId` 的 `/Items`，根路径与 `/emby` 前缀一致；过滤发生在分页
+  之前，`TotalRecordCount` 是过滤后的总数，`StartIndex`/`Limit` 与服务端上限不变；进度严格按请求的目标
+  用户读取，其他用户的进度不会泄漏，也不影响当前用户的过滤结果。
+- 未覆盖（与既有 `IsPlayed`/`IsUnplayed` 一致）：带 `SearchTerm` 的搜索分支、`Ids` 单条查找分支，以及
+  `ParentId` 指向具体条目时走系列分集/集合子项的分支都不应用 `Filters`；媒体库范围
+  （`ParentId=<libraryId>`）与全库根列表已覆盖。
+- 库范围列表复用 15 秒 TTL 的库页缓存；播放进度写入不会主动失效该缓存，因此刚续播后的下一次
+  `IsResumable` 列表最多可能滞后约 15 秒（与既有 `IsPlayed` 过滤相同）。
+- 自动化：`cargo test --locked --test emby emby_item_filters::` 覆盖有进度/已看完/无进度/接近看完/低于
+  最小时长/隐藏续播/其他用户进度的隔离、分页与总数、`IsFavorite` 等价、组合值、大小写与两种路径。
+  该记录只证明 Lux 服务端合同，不代表 Hills 或其他客户端已确认该过滤行为。
+
+## LUX-886 已有光盘图不再被海报覆盖（2026-11-05）
+
+- 行为变化：候选 JSON 里 `Primary`/`Poster` 类型的图会同时进入 `POSTER` 和 `DISC` 两个类型。
+  完整刷新（`FULL_REFRESH`）此前把这条 `DISC` 当作普通候选，按覆盖策略复用同名文件，媒体目录里
+  已有的 `disc.jpg` 会被写成海报的字节。现在先按既有覆盖策略写上游明确给出的 `Disc` 候选；只有它
+  全部下载失败、并且条目确实没有光盘图（`item_images` 记录与文件、`/config/metadata` 旁车和媒体
+  目录都没有）时，才用海报兜底填充 `DISC`。已有光盘图时海报永远不覆盖，显式候选成功时也不会追加
+  一次海报写入。
+- 探测错误：判断“是否已有光盘图”时若路径不可读（例如媒体目录里的 `disc.jpg` 是符号链接，或
+  `/config/metadata` 被替换成符号链接），只跳过这条可选兜底并记一条不含路径/URL 的 warn 日志，
+  不会让整次元数据选择或后台刷新失败；NFO 与 `POSTER` 等其他图片照常写回。
+- 不变：上游明确给出的 `Disc`/`DISC` 类型候选仍按既有覆盖策略处理（`KEEP`/`FILL`/`OVERWRITE`
+  与完整刷新的 `replace` 语义不变）；`POSTER` 本身、图片策略开关、媒体库设置、数据库 schema 和
+  插件协议都不变。
+- 判定方式：候选 JSON 形状没有改变。写入时把同时出现在 `POSTER` 桶里的 `DISC` URL 视为海报派生
+  兜底，其余 `DISC` URL 视为显式光盘候选，两组 URL 都保留：显式候选先写，兜底只在本次没有写出
+  `DISC` 时以“仅补缺”方式写入。升级前已入库的待选候选按同一规则处理，不需要迁移或重新刮削。若某个
+  上游把显式光盘图和海报给成完全相同的 URL，会被保守地当成兜底（已有光盘图时不覆盖）。
+- 未验证：未在真实网盘/Emby 客户端上复测 `disc` 图片的显示，只覆盖了元数据选择服务与图片写回路径
+  的集成测试。
+
+## LUX-884 移除服务端最小下载宽度（2026-11-05）
+
+- 行为变化：候选图不再按上游报告的宽度过滤，宽度选择完全由刮削器插件负责。主程序设置里不再有全局
+  `images.minDownloadWidth` 与层级单元格的 `minWidth`。
+- 设置兼容：旧设置 JSON 里的这两个键仍能读取并被忽略，下一次保存后消失。`ArtworkPolicySettings`
+  使用 `deny_unknown_fields`，为此保留了只反序列化、不序列化的 `legacy_min_width`，否则旧设置会整份
+  解析失败（全局策略退回默认值、媒体库覆盖退回全局值）。旧版 Web 页面或脚本提交带这些键的请求仍然成功。
+- Emby 兼容：`GET /Library/VirtualFolders` 及其 `/emby` 别名返回的
+  `LibraryOptions.TypeOptions[].ImageOptions[].MinWidth` 仍然存在，值固定为 `0`；本任务不改动媒体流
+  分辨率分档（`emby_video_resolution_label`）与插件协议。
+- 客户端可见行为不变：手动候选搜索对软删除条目、已停用媒体库中的条目仍返回 `ItemNotFound`（404），
+  且不会调用上游或写入候选；该 404 此前搭在宽度策略的媒体库查询上，现由
+  `ensure_candidate_item_available` 单独承担，携带已解析策略的自动匹配计划仍跳过这次读取；完整刷新（`FULL_REFRESH`）的自动匹配不带已解析策略，与以前一样会执行该查询。
+- 不需要数据库迁移：`media_strategy` 仍是同一列上的 JSON。
+- 未验证：未在真实第三方 Emby 客户端上复测 `MinWidth: 0` 的显示或抓图行为，只用 `emby_catalog`
+  单测与 `--test admin admin_api_key::` 覆盖响应形状；旧设置的实际升级路径用单测与
+  `--test auth_users resume_favorites::` 覆盖。
+
+## LUX-878 Emby MediaStream 显示字段与 Hills 读取行为（2026-11-03）
+
+来源：对 Hills 1.8.0（`com.mountains.hills`，Flutter release AOT，已混淆）的只读静态逆向分析，以及在
+Android 真机上对 Lux 详情页的截图核对。以下标注“确认”的结论有反汇编/交叉引用证据，“推断”的没有直接验证。
+
+- 确认：音频/字幕选择器条目文字取 `DisplayTitle → Title → DisplayLanguage → Language → "und"`；Hills
+  不自己拼“语言 + 编码 + 声道”。详情页“版本”行 = 视频流 `DisplayTitle` + ` / ` + `MediaSource.Size` +
+  ` / ` + `MediaSource.Bitrate`。因此客户端显示的信息量取决于服务端输出的 `DisplayTitle`/`Title`/`Language`。
+- 确认：“媒体信息”面板显示 17 项：Type、DisplayTitle、Title、DisplayLanguage、Language、Codec、
+  VideoRange、Profile、BitRate、BitDepth、PixelFormat、Width、Height、AspectRatio、AverageFrameRate、
+  IsDefault、IsExternal。`Channels`、`ChannelLayout`、`SampleRate`、`Level`、`RefFrames`、`TimeBase`、
+  `NalLengthSize` 被解析但不显示；`ColorSpace`、`VideoRangeType`、`IsHearingImpaired`、`CodecTag`、
+  `Comment`、`IsAVC` 完全不读取。
+- 确认：Hills 不读取 `DefaultAudioStreamIndex`/`DefaultSubtitleStreamIndex`，默认轨道按它自己的
+  偏好语言逻辑选择。
+- 推断：外挂字幕可能依赖 `DeliveryUrl`/`DeliveryMethod`/`IsExternalUrl`/`SubtitleLocationType`/流级
+  `Path`（Hills 解析这些键，且二进制里没有自己的字幕端点字面量）；本任务不输出它们，由 LUX-879 先确认。
+
+Lux 侧改动（`src/api/emby_catalog.rs`、`src/application/probe.rs`，无迁移、无新路由、不改 `/api/v1`）：
+
+- `DisplayTitle` 更有描述性：视频固定按 `分辨率 编码 动态范围 位深` 排列，有哪项显示哪项；分辨率优先取探测到的
+  `Width`/`Height`（宽屏裁切按所属档位，如 1920×800 → `1080p`、3840×1636 → `2160p`），没有探测值时回退到文件名里的
+  质量标签，且不重复叠加，音频 `语言 编码 声道`，
+  字幕 `语言 (编码)` 并带 forced/SDH 标记；旧数据里已含完整描述的旧标题保持原样，不再叠加默认标记或
+  `Unknown`/`und` 占位。
+- 新增流级 `Title`：优先使用探测保存的原始轨道名；旧数据回退为旧 `DisplayTitle` 基础部分；缺失时省略键。
+- `VideoRange` 规范化为 `SDR`/`HDR10`/`HDR10+`/`HLG`/`Dolby Vision`，无法识别的值保持原值。
+- 语言：`chs`/`cht`/`zh-cn`/`zh-tw`/`zh-hk`/`zh-hans`/`zh-hant`/`cmn`/`yue` 输出 `Language: chi`，
+  `DisplayLanguage` 区分简体、繁体与粤语；补充 `fin`、`swe`、`dan`、`gre`/`ell`、`heb`、`hun`、
+  `cze`/`ces`、`rum`/`ron`、`ukr`、`nor`/`nob`、`hrv`、`may`/`msa`、`fil`、`slo`/`slk`。
+- 空白字符串详情字段不再输出。
+
+未验证：升级后 Hills 的实际显示未在真机复测；本地为 ARM64 宿主，不外推到 NAS/x86_64。
+
+### LUX-879 外挂字幕 Delivery 字段（2026-11-04）
+
+- 字幕流新增 `DeliveryMethod`（外挂 `External` / 内嵌 `Embed`）、`SubtitleLocationType`
+  （`ExternalFile` / `InternalStream`）、`IsExternalUrl: false`；外挂字幕另有相对 `DeliveryUrl`
+  `/Videos/<item>/<source>/Subtitles/<index>/Stream.<srt|ass|vtt>`（未知编码用无后缀路由），不含 token。
+- 新增带格式后缀的字幕路由 `…/Subtitles/{index}/Stream.{format}`，与无后缀路由共用处理与 ACL。
+- 推断：Hills 解析这些键；它是否用 `DeliveryUrl` 加载外挂字幕未确认。流级 `Path` 未输出。
+
+## Emby 筛选辅助端点：Genres、Studios、Years（2026-11-02）
+
+- 新增 `GET /Genres`、`/Studios`、`/Years`（同样挂在 `/emby` 前缀下，路径大小写不敏感）。需要 Emby token，按用户的媒体库权限和内容限制收窄；支持 `UserId`、`ParentId`（仅媒体库 ID，未授权或未知返回 404）、`IncludeItemTypes`、`StartIndex`、`Limit`（上限与 `/Persons` 相同，超限 400）。返回 `{ Items, TotalRecordCount, StartIndex }`，每项含 `Name`、不透明的 `Id`、`Type`（`Genre`/`Studio`/`Year`）和 `ChildCount`（可见条目数）；`Genres`、`Studios` 按名称排序，`Years` 由新到旧。
+- `GET /Items`、`/Users/{id}/Items` 新增 `Genres`、`Studios` 筛选，值用 `|` 分隔、任一命中即匹配，大小写不敏感，最多 32 个值。`Years` 参数原本就支持。
+- **后续修订（LUX-890）**：`/Tags` 已不再是空列表——LUX-900 起改为读取 `TAG` 投影（与 `/api/v1/tags` 同一服务）；`/OfficialRatings` 已实现（归一化分级码子集）。仍**未实现**：`GenreIds`、`StudioIds` 按 ID 筛选（`Id` 仅是稳定的不透明值，客户端请用 `Genres`/`Studios` 名称筛选）；Genres/Studios 的图片。
+- 数据来源：迁移 `0245`/`0247` 新增 `media_item_facets(item_id, kind, name_key, name)`，由内容限制索引 worker 从同一份 NFO 快照写入，NFO 变化后经既有队列重建。请求路径只读该表，不解析 NFO、不扫库。升级时迁移会把所有存量条目重新入队，回填在后台分批完成；回填完成前 `/Genres`、`/Studios` 与 `Genres`/`Studios` 筛选只覆盖已索引的条目。回填会重写内容限制索引行，并触发一次 catalog outbox 更新。
+- 验证：`cargo test --locked --test emby emby_facets::`；`cargo test --locked --lib content_restriction_index`。
+
+## Web HLS 音频转码输出 AAC 声道布局规范化（2026-11-02）
+
+- 根因：AC-3 / E-AC-3 / DTS / TrueHD 的 5.1 音轨解码后是 `5.1(side)` 声道掩码，FFmpeg 的 AAC
+  编码器只对 `mono/stereo/3.0/4.0/5.0/5.1` 等「MPEG-4 `channelConfiguration` 表内」的布局写 5 字节
+  `AudioSpecificConfig`；表外布局（`5.1(side)`、`5.0(side)`、`quad`、`6.1`、`7.1(wide)`、`7.1.4`）
+  退化为 25 字节 `channelConfig=0` + Program Config Element，Chromium 的 MSE 在 append
+  init 段时直接失败（`CHUNK_DEMUXER_ERROR_APPEND_FAILED`，播放器显示“播放器引擎失败”）。
+  实测 FFmpeg 9.0.2 对 `5.1(side)` 输出
+  `11 80 04 c8 05 00 01 08 80 0c 4c61766336332e312e313032 56 e5 00`（25 字节，含 `Lavc` 注释）；
+  标准 `5.1` 布局的 ASC 只有 5 字节 `11 b0 56 e5 00`。
+- 修复：Web HLS 的三条重编码音频的档位（音频转码、硬件视频转码、软件视频转码）在 `-c:a aac` 之外
+  追加 `-af aformat=channel_layouts=mono|stereo|3.0|4.0|5.0|5.1`。mono/stereo/3.0/4.0/5.0/5.1
+  这类表内布局原样通过，其余布局（`5.1(side)`、`5.0(side)`、`quad`、`6.0`、`6.1`、`7.0`、`7.1`、
+  `7.1(wide)`、`7.1.4`、`octagonal`、`22.2` 等）被并到 ≤5.1 的表内布局，输出始终是浏览器可放的
+  标准 `channelConfiguration`。个别罕见布局会掉声道（实测 `6.0`/`octagonal`→5.0、`2.1`→stereo），
+  这些布局本来就不在浏览器能描述的范围内。源布局未知时同样安全，因为该过滤器对表内布局是 no-op。
+- 声道数 > 5.1 的音轨统一降到 5.1，而不是保留 6.1 / 7.1：FFmpeg 9.0 对 6.1 / 7.1 会写**扩展**
+  `channelConfiguration` 11 / 12（实测 `11 e0 56 e5 00`），Chromium 是否接受这些扩展值未经验证，
+  而 5.1（config 6）在所有浏览器 AAC 解码器上都可用。音频转码档位默认 192 kbps，7.1 也放不下。
+- 同一组实验里，未加过滤器的路径对 `7.1.4`（12 声道）与 `22.2`（24 声道）直接让 AAC 编码失败、
+  会话无法起播；加了规范化后它们能降到 5.1 正常输出。表外布局未规范化时一律落成 PCE（7.1 则是
+  扩展配置 12）。
+- 复制音频的档位（Remux，`-c:a copy`）不能加音频过滤器，保持现状。Emby 路径（`start_emby_vod`）
+  的 FFmpeg 参数**完全不变**：Emby 客户端接受 PCE 形式，本修复只影响 Lux Web。
+- 回归：`web_audio_transcoding_normalises_the_aac_channel_layout`、
+  `emby_audio_transcoding_keeps_the_ffmpeg_default_audio_layout`、`a_copied_audio_track_is_never_filtered`
+  断言参数构造；`five_point_one_side_audio_encodes_a_standard_aac_channel_configuration`
+  （`#[ignore]`，需要本机 FFmpeg）真转码 `5.1(side)` AC-3 并解析 `init.mp4` 的 esds
+  `DecoderSpecificInfo`，断言 5 字节 / `channelConfiguration=6`，同时用 Emby 形态的参数做反向对照
+  （仍是 `channelConfiguration=0`）。
+- 待真机复测：Chromium 156 上的 8 个 ❌ 样本（AC-3/E-AC-3/DTS/TrueHD 6 声道 `5.1(side)`，
+  档位 2 与 4）应能正常起播；7.1 / 7.1.4 源现在按 5.1 输出，需要确认听感与音轨切换。
+
 ## gzip 压缩与搜索总数快路径（2026-10-29）
 
 - JSON 响应可能带 `Content-Encoding: gzip`：只压缩“成功、`application/json`、已知长度 ≤4 MiB”的响应；
@@ -133,6 +421,9 @@ Web 库页仅挂载窗口可见行、上下各两行缓冲及聚焦卡片所在�
 相关定向测试 24/24、冻结依赖安装、TypeScript、production build 与 fmt 通过；全量 Web 检查的 2 个静态失败和 4 个 Vitest 失败均在原始基线复现，详见 LUX-DEVELOPMENT.md 的 LUX-552 验收记录。新增依赖 `@tanstack/react-virtual` 使用独立库页 chunk（约 8.42KB gzip）。
 
 ## LUX-555–560 Web 用户事件与查询策略（2026-10-15）
+
+> **后续修订（LUX-897，2026-11-06）**：本节描述的 `/api/v1/events` 已随两条 SSE 端点删除（`404`），实时
+> 通道改为 `GET /api/v1/ws`，详见文首 LUX-897 条目。以下内容保留当时的兼容性记录。
 
 同源、已登录 `/api/v1/events` 继续以 version 1 ready 帧开始，失效 scope 扩展为
 home/item/library/favorites。服务端只广播作用域，不包含用户、媒体、媒体库 ID 或业务数据；
@@ -696,8 +987,10 @@ Chrome/Chromium `151.0.7922.174`；结论不外推为飞牛 NAS/x86_64 性能、
 
 样本 SHA-256：MP4 `0cd83d944a6ca7822b4a8306cecc60a36e859b041f6702c6a1ad9ead78924451`（1,128,375 bytes，
 时长 5.055 秒），XML `34a00dfa18be71bceec4c723290ba5403dda0a99a0b9558ab1992eb69de9306e`（104 bytes）。解析/调度
-上限为 4 MiB、5,000 条、单条 200 字、时间 24 小时、字号 12-64px、同时渲染最多 80 条；支持滚动、顶部、
-底部三种模式，文本使用 React 文本节点渲染。
+上限为 16 MiB（客户端缓冲/解码预算，服务端仍可提供 50 MiB）、50,000 条（超出按均匀抽样并在播放器提示
+“已截断”）、单条 200 字、时间 24 小时、字号 12-64px、同时渲染最多 80 条；支持滚动、顶部、底部三种模式，
+文本以文本节点渲染。该阶段门当时实测的是 4 MiB / 5,000 条上限，2026-09 返工后调整为上述值，见下方
+“2026-09 Web 弹幕解析/渲染返工”。
 
 | 浏览器/viewport | 已验证能力 | 结果与边界 |
 |---|---|---|
@@ -713,8 +1006,19 @@ Web 104 个静态规则测试和 433 个 Vitest 测试通过，生产构建通�
 
 2026-08-31 真实弹幕回归：生产站点的认证播放 smoke 观察到同源弹幕元数据/raw 请求均为 200，raw
 响应为 2,937,001 bytes 的合法 Bilibili XML，包含 30,271 条 `<d>`；当时部署的 Worker 使用 5,000 条上限，
-因此解析结果为空、DOM 中没有弹幕元素。修复将 Web 解析上限提高到 50,000 条，4 MiB 文件上限、单条 200 字、
-24 小时时间上限和最多同时渲染 80 条保持不变；本次记录不包含账户、凭据、Cookie、签名 URL 或弹幕文本。
+因此解析结果为空、DOM 中没有弹幕元素。修复把 Web 解析条目上限提高到 50,000 条（超出按均匀抽样并在播放器
+显示“已截断”）；2026-09 返工进一步把客户端字节上限从 4 MiB 调整为 16 MiB（服务端上限仍为 50 MiB，浏览器不再
+整段缓冲/解码服务端允许的最大文件），单条 200 字、24 小时时间上限和最多同时渲染 80 条保持不变；本次记录
+不包含账户、凭据、Cookie、签名 URL 或弹幕文本。
+
+2026-09 Web 弹幕解析/渲染返工：解析、调度、渲染和数据加载拆为
+`web/src/features/player/danmaku/parse.ts`（纯解析）、`schedule.ts`（按播放窗口增量分配轨道）、
+`engine.ts`（`requestAnimationFrame` + `transform: translate3d` 渲染）、`load.ts` 与
+`useDanmakuTrack.ts`；`PlayerDanmakuOverlay` 的既有 props 保持兼容。现行边界为客户端 16 MiB
+（服务端仍允许 50 MiB）、50,000 条（超出按均匀抽样并提示“已截断”）、单条 200 字、24 小时时间上限、
+字号 12-64px、同时最多渲染 80 条；响应字节以 Transferable 交给同源 Worker，在 Worker 内用 fatal
+UTF-8 解码，无 Worker 环境保留主线程回退。该返工后的浏览器 smoke、低内存设备表现与性能数字待重测，
+本记录不包含账户、凭据、Cookie、签名 URL 或弹幕文本。
 
 ## LuxPlayer LUX-215 字幕/弹幕联合阶段门（2026-08-27）
 
@@ -732,8 +1036,9 @@ macOS `arm64`（`uname -m=arm64`）。浏览器运行未记录密码、Cookie、
 | HEVC SRT | `09975e9f8968df16f35fdd7d01e46eb9ef75978d524dc2f171ea73e97068b6d7` | 61 bytes | `LuxPlayer 切换字幕夹具` |
 | HEVC Bilibili XML | `070a5865046cf3f704aa858ffa6288ddc5ff3f7cf475a27010fe217d435a28f8` | 117 bytes | `HEVC switched fixture`、`HEVC fixed fixture` |
 
-解析/调度继续使用 LUX-212 至 LUX-214 记录的上限：字幕 1 MiB/5,000 cue，弹幕 4 MiB/5,000 条、
-单条 200 字、最多同时渲染 80 条；本任务没有提高上限或新增解码引擎。
+解析/调度沿用 LUX-212 至 LUX-214 的边界：字幕 1 MiB/5,000 cue、单条 200 字、最多同时渲染 80 条；
+弹幕条目上限在 2026-09 返工中由 4 MiB/5,000 条调整为 16 MiB/50,000 条（超出均匀抽样并提示“已截断”）。
+本阶段门自身没有新增解码引擎。
 
 | 路径/场景 | 结果 | 证据 |
 |---|---|---|
@@ -985,7 +1290,20 @@ Lux 原生 `PLAYBACK_*` 事件保留原始 `itemTitle`，并提供可空的 `ser
 `seriesSeasonCount`。剧集通知标题按剧名、（总季数大于一季时）季号、集名排列；第 0 季显示“特别篇”。
 电影和缺少剧集关联的事件继续使用 `itemTitle`。这些新增展示字段不会加入 Emby 风格 payload。
 
-当前只提供 Webhook 渠道；Telegram、企业微信和 Email 尚未实现。
+Emby 风格 payload 已按 Emby Webhooks 1.0.39 的字段结构对齐（2026-11-02，依据 `docs/EMBY-WEBHOOK-PAYLOAD.md` 中的真实样例）：
+顶层增加 `Title`、`Description`、`Date`（RFC 3339，7 位小数）、`Severity`；`Server` 增加 `Name`、`Version`；
+新增 `User`（`Name`、`Id`）、`Session`（`Client`、`DeviceName`、`ApplicationVersion`、`RemoteEndPoint`）和
+`PlaybackInfo`（`PositionTicks`、`PlaySessionId`）；`Item` 增加 `Type`（Emby 名称，如 `Movie`、`Episode`）、
+`MediaType`、`Overview`、`ProductionYear`、`RunTimeTicks`、`ProviderIds`。播放开始、停止、暂停的 `Title` 使用 Emby 服务端中文资源文案（暂停文案按资源键名推断，尚未抓包证实）。
+远程 IP 在所有播放事件的 `Session.RemoteEndPoint` 中提供，不再只限停止事件。这是负责人的决定：Emby 风格目标的
+用户 ID、用户名和远程 IP 会进入该目标的 outbox 与请求正文，覆盖 LUX-183 中关于不包含用户 ID 与仅停止事件携带远程 IP 的限制。
+Lux 原生 `schemaVersion: 1` 合同不变，原生白名单仍生效。
+
+`Item.Path` 为库根与库内相对路径拼接出的本地绝对路径，`Item.FileName` 为其文件名；`.strm` 条目给出本地 `.strm` 文件路径。
+`Item.MediaStreams` 与 `PlaybackInfo.MediaSource`（含 `Container`、`Size`、`Bitrate`、`RunTimeTicks`、`Path` 与流详情）来自与 Emby API 相同的流 DTO，不含任何外部地址或签名 URL。
+仍未对齐：`Session.Id`；播放继续、进度的 `Title` 文案；媒体新增/移除、扫描、元数据和后台任务事件的 Emby 文案。`.strm` 的外部 URL 不发送。
+
+渠道以插件形式提供，见 docs/PLUGIN-SDK.md。
 
 - 媒体库实时监听默认开启，也可通过 `realtimeWatchEnabled` 关闭。关闭后不会为该库根路径创建实时 watcher，但手动扫描、调和和外部刷新仍可用；开启时复制到已配置根路径中的新视频会进入局部 `INCREMENTAL_SCAN`，只处理该事件路径，通常在几秒内进入索引。
 - 2026-09-19 Symedia 媒体库发现兼容：Emby 兼容层新增管理员 `GET /Library/SelectableMediaFolders`（支持 `/emby` 前缀），按真实 Emby 的顶层数组结构返回媒体库及其 `SubFolders` 根目录，避免 Symedia 将 404 错误对象当作目录数组解析。自动化覆盖共享 API Key、两种路由形式以及媒体库和根目录字段；尚未在真实 Symedia 部署中复测。
@@ -1399,3 +1717,301 @@ DTO 与对外数据模型不变。
   `search_outbox`。**PostgreSQL 旧二进制不会重建函数**，触发器仍写 `search_outbox` 而旧消费者读
   `catalog_outbox`，回退后全文索引会停止更新；PostgreSQL 请向前发布修复版本而不是回退。
 - 已膨胀部署的清理步骤见 `docs/RUNBOOK-OUTBOX-BLOAT.md`。
+
+## Web 播放：客户端解码回退与原生直放门控（2026-11-01）
+
+背景：在 FNOS/x86_64 测试实例（Docker，`luxd` 0.7.5，本机 `test` 分支构建，6 种编码的 10 秒样本）上，
+用户在 macOS Safari 与 Win11 Edge、本机 macOS Chrome 无头模式实测发现以下问题，均已在前端修复；后端未改。
+
+| 现象 | 根因 | 修复 |
+|---|---|---|
+| 4K HEVC mkv 停在「正在准备客户端解码…」/ `MKV MSE SourceBuffer append failed` | 解封装库的 Buffer 视图被 MP4Box 按偏移 0 拷贝，init 分段里 `hvcC` 载荷是 EBML 头字节 | `matroska-demuxer.ts` 新增 `copyBytes`，remux/transcode 全部改用独立数组；`tests/mkv-remux-worker.test.ts` 逐字节断言 |
+| 上述失败不触发服务端转码 | `ERROR` 事件仅在原生引擎时回退，`load()` 的 catch 遇 `FAILED` 直接返回 | 统一 `requestDirectFallback()`，DIRECT 计划下客户端引擎任何失败只回退一次 |
+| 360p MPEG-4 mkv 有声音无画面（Chrome/Edge） | `matroskaCodecHint()` 对未知编码默认 `avc1`，走了原生 mkv，`videoWidth=0` | 原生 mkv 仅限 h264/hevc/vp9/av1；`videoWidth===0` 看门狗回退 |
+| 10-bit H.264 + ac3 在 Edge 无声 | Edge 无 Dolby 扩展却可能谎报 ac-3 可用 | 音频解码字节为 0 看门狗回退；回退请求把 ac-3/ec-3/mpeg4 视为不可复制 |
+
+规则变更：客户端 WASM 软解 HEVC 仅用于 ≤1080p（更高分辨率走服务端转码，原生 HEVC remux 路径不受限）；这取代了上文
+“4K HEVC 客户端 fallback”作为默认路径的描述，该节的 `speedX≈0.37` 结果仍是历史性能证据，不代表当前默认行为。
+
+验证：Web 冻结安装、`pnpm --dir web test`（150 个文件 / 1273 个测试）、`pnpm --dir web build` 通过。本机 arm64 Chrome
+无头实测 4K HEVC（3840×2160）、AV1 480p、10-bit H.264+ac3 起播并播放到结尾，MPEG-4 360p 回退服务端转码后有画面；
+Safari 的 4K HEVC 与 Edge 的 720p VP9、480p AV1、4K HEVC、10-bit H.264（ac3 有声）由项目所有者在同一测试实例上确认可播。
+
+未覆盖：Firefox、iOS Safari、真实 GPU 硬件转码、长时间 HLS 稳定性、B 帧 HEVC 在 remux 模式下的时间戳回序（remux
+把 Matroska PTS 同时当 dts/cts）。测试实例对“同时播放数”有上限（超出返回 429 `RateLimited`），自动化脚本异常退出后会话需等待过期。
+
+## Emby 媒体源 id：STRM 源改发 32 位十六进制（QMediaSync / Emby302 兼容，2026-11-02）
+
+背景：QMediaSync 的 Emby302 反代（`emby302/service/emby/media.go` 的 `resolveMediaSourceId`）用
+`len(MediaSourceId) <= 32` 判定“源服务器原始 id”，否则按 `[[_]]` 解析转码合成 id，两条都不命中就报
+`MediaSourceId 格式错误`。Lux 的 `media_sources.id` 是 36 字符 UUID，因此该反代在扫码解析阶段就失败，
+并按 `proxy-error-strategy: origin` 静默回源：视频能播，但 115 直链 302 失效、媒体字节全部经反代主机中转。
+本次只改 Lux，不改第三方：把 `MediaSources[].Id` 的**线上表示**收敛到 Emby 原生的 32 位小写十六进制。
+
+### 规则
+
+- **STRM 源**（`source_kind = 'STRM_URL'`，URL/Path 型目标都算）下发 `Uuid::simple()`：内部 UUID 去横线，
+  32 位小写十六进制，与内部 UUID 互为双射，不建映射表、不迁移数据库。
+- **LOCAL_FILE 源保持内部 UUID**：它们的 id 只流经 Lux 自己的 HLS/转码路径，改形态没有收益。
+- 所有客户端输入边界统一解码回存储 UUID，两种形态都接受：`PlaybackInfo` 的 query 与 body、
+  `?MediaSourceId=`、`/Videos/{item}/{source}/stream[.ext]`、字幕 `.../Subtitles/...` 路径参数、
+  `/Items?Ids=`、`/Items/{id}` 的媒体源回查、`/Sessions/Playing` 进度回调、插件 `POST /Items/SyncMediaInfo`。
+- 签名票据仍以**内部 UUID** 计算 HMAC，只在 URL 上写公有 id：升级前签发、仍在 12 小时 TTL 内的 URL 继续有效。
+- `/Sessions` 的 `MediaSourceId` 仍是内部 UUID（只读展示，不参与任何反查；客户端若回传也会被解码）。
+
+### 风险与验收（逐条必须验证）
+
+1. **漏改入口即 404，不会静默降级。** `emby_ordered_playback_sources` 用 `?` 取匹配结果，任何未解码的入口都会让
+   PlaybackInfo 直接 404。新增/修改媒体源 id 相关代码时，必须同时改“下发”和“解析”两侧。
+2. **旧 UUID 形态必须继续可用。** 覆盖：带 UUID 的 `MediaSourceId` 查询、`/Items?Ids=<UUID>`、
+   `/Items/<UUID>` 媒体源回查、升级前签发的 `DirectStreamUrl`、`/Sessions` 回传的 UUID。
+3. **混合条目会出现两种 id 形态。** 同一部片子同时有本地版与网盘版时，`MediaSources[]` 里 32 位十六进制与 UUID
+   并存；消费方必须把 id 当不透明字符串（Emby 契约本就如此），不能按长度分支。
+4. **十进制 item id 与 32 位全数字公有 id 的歧义。** `/Items?Ids=` 同时承载 item id 与媒体源 id：十进制串优先按
+   item id 解析，媒体源查找另有原始候选兜底；32 位全数字串与某个媒体源 UUID 完全相等的概率可忽略，测试已覆盖
+   “十进制 item id 原样返回”。
+5. **HLS / 转码 / 管理 API 不变。** `/Videos/{item}/master.m3u8`、`/Videos/{item}/transcoding/...` 与
+   admin 的 `mediaSourceId` 仍使用内部 UUID，LOCAL_FILE 行为零变化。
+
+### 验证
+
+- 单元测试：`emby_public_source_id`/`emby_internal_source_id` 双射与直传兼容、STRM 与 LOCAL 的 `Id` 形态、
+  `DirectStreamUrl` 与字幕 `DeliveryUrl` 使用公有 id（`cargo test --locked --lib emby_catalog::`，48 项通过）。
+- 集成测试：`--test strm`（42 项，含用公有 id 请求 PlaybackInfo/stream/`Ids=` 以及 UUID 回归）、`--test playback`
+  （33 项）、`--test emby`（43 项）、`--test api_web`（55 项通过）。
+- 已知与本改动无关的基线失败：`api_web::remote::forwarded_headers_are_only_honoured_for_trusted_proxies`、
+  `api_web::web_playback::broken_hardware_encoder_falls_back_to_software_transcoding`、
+  `plugins::danmaku::…`、`plugins::media_info_config_api::…`（在本机未改动的基线上同样失败）。
+- 真机交接（未在本机执行）：把 Emby302 的 `proxy-error-strategy` 置为 `reject` 后播放 115 STRM，日志中不应再出现
+  `解析 MediaSource 失败 … MediaSourceId 格式错误`，反代主机网卡不应出现媒体字节流量。
+
+## LUX-889 Emby `GET /Items/{id}/Similar`（2026-11-06）
+
+证据等级：端点形态为**真机抓包确认**；相似排序与参数语义为**静态推断**。Hills 1.11.0 与 Yamby 2.1.0.11
+在电影、剧集详情页都实际请求了 `/emby/Items/<id>/Similar`（Hills 带 `UserId`、`Fields`、`Limit`、
+`ImageTypeLimit`；Yamby 带 `Limit`、`UserId`、`ImageTypeLimit`、`Fields`、`EnableTotalRecordCount=false`），
+Lux 当时返回 404 空响应，客户端页面不报错、推荐区整块缺失
+（`docs/reviews/2026-11-06-hills-yamby-capture.md` 问题 3）。本任务只在 Lux 服务端实现该端点并用自动化
+测试覆盖，**没有在修复后的实例上复测客户端 UI**；“推荐区会重新出现”仍是推断，未经验证。
+
+- 路由：`GET /Items/{id}/Similar`，沿用现有 Emby 路由构建器，因此根路径与 `/emby` 前缀、大小写不敏感、
+  鉴权与播放令牌中间件都与其他 Emby item 路由一致。抓包没有出现 `/Users/{userId}/Items/{id}/Similar`，
+  所以没有新增该形态。
+- 响应：`{"Items":[...],"TotalRecordCount":n}`（不返回 `StartIndex`）。条目复用现有 Emby 列表投影，
+  `Fields` 与 `/Items` 同义，默认仍带 `UserData` 等列表字段。
+- `EnableUserData=false` 移除 `UserData`。`EnableImageTypes`（逗号或 `|` 分隔、大小写不敏感）只保留
+  请求的 `ImageTags` 键，未请求 `Backdrop` 时清空 `BackdropImageTags`；`ImageTypeLimit=0` 清空全部图片
+  tag，正数把 `BackdropImageTags` 截断到该数量，负数按“不限制”处理。显式空的 `EnableImageTypes=`
+  （以及空的 `ImageTypeLimit=`）按未提供处理，与 LUX-888 的空值规则一致：响应保留全部图片 tag，而不是
+  清空。这些参数的语义来自 Emby/Jellyfin 文档与客户端请求形态，属静态推断，没有逐项真机比对。
+- 相似规则：同类型（`Movie`/`Series`）且至少共享一个已入库 Genre；**候选池有硬上限**：最多 10 个源
+  Genre（按 `name_key` 取前 10 个），每个 Genre 最多 200 个通过 ACL、可见性与内容限制的候选；在这两个
+  上限内按共享数量降序，再按 `LOWER(title)`、条目 id 升序稳定排序，并排除自身。数据只来自
+  `media_item_facets` 的 `GENRE` 投影，不解析 NFO、不扫描媒体库、不调用 TMDb。每个 Genre 按
+  `item_id` 索引顺序取前 200 个可见条目，因此一个更相似但排在该 Genre 索引第 200 个之后的条目不会
+  出现。没有 NFO/facet 的条目不参与推荐；源条目没有 Genre 时返回 200 空列表。
+- `TotalRecordCount` 是**上述有界候选池内去重后的条目数**，不是库内所有“相似条目”的总数；客户端不应
+  把它当作全库推荐数量。Yamby 发送的 `EnableTotalRecordCount=false` 仍被忽略，响应总带该字段。
+- ACL：候选限定为请求用户可访问的已启用媒体库（管理员为全部已启用媒体库），并复用列表端点的可见性
+  谓词（已删除、已合并、无可用源）和内容限制（评级与标签策略）。被排除的库或条目不会出现在 `Items`
+  或 `TotalRecordCount` 中。
+- 错误与分页：条目不存在或对当前用户不可见都返回 404（与 `/Items/{id}` 一致）；未鉴权 401；
+  `Limit` 默认 50、上限 1000（与其他 Emby 列表一致），空值按未提供，负数、非整数或超上限 400；
+  无相似条目 200 空列表且 `TotalRecordCount=0`。
+- 性能边界：每个 Genre 的候选分支从源 Genre 的 `media_item_facets` 索引出发，`ORDER BY facet.item_id`
+  正是 `idx_media_item_facets_lookup(kind, name_key, item_id)` 的尾部，因此查询计划按索引顺序读取并在
+  `LIMIT 200` 处停止，不会先收集该 Genre 的全部条目再排序；ACL、可见性、内容限制、同类型与排除自身
+  都在分支内、`LIMIT` 之前生效，被隐藏条目不会占用候选名额。聚合与排序只处理 ≤ 10×200 行的并集，
+  `TotalRecordCount` 也只在该并集上 `COUNT(DISTINCT)`，不再对全库计数。存储测试
+  （`cargo test --locked --lib similar_catalog`）断言单个 Genre 分支的计划使用 facet 索引、没有
+  `USE TEMP B-TREE FOR ORDER BY`、没有 `SCAN media_items`，并验证候选池上限与同一请求两次结果一致。
+  热门 Genre 的请求成本仍有上界，但会随“前 200 个可见候选在该 Genre 索引中的位置”变化；没有全表
+  扫描，也没有新增索引或迁移。证据仅为本机 SQLite `arm64`，不代表 NAS/x86_64 性能。
+- 自动化：`cargo test --locked --test emby emby_similar::` 6 例覆盖电影/剧集、共享 Genre 排序、
+  不含自身与不同类型、ACL 排除、`Limit`/`TotalRecordCount`、空列表、404/401、根路径与 `/emby` 前缀、
+  `EnableUserData`/图片类型选择、空值与非法 `Limit`。该记录只证明 Lux 服务端合同，不代表客户端已确认
+  推荐区恢复。
+
+## LUX-899 Lux 原生 `GET /api/v1/items/{id}/similar`（2026-11-07）
+
+证据等级：**Lux 服务端合同**（自动化测试），不是客户端真机验证；本任务不做 Web 详情页展示，也没有在
+修复后的客户端上复测推荐区。该接口取代 LUX-889 中“不改 `/api/v1`”的约束，成为相似条目的权威实现。
+
+- 路由与鉴权：`GET /api/v1/items/{item_id}/similar`，与其他 `/api/v1/items/{item_id}/*` 一样走
+  `require_web_user`（Web session 或用户级客户端令牌），未鉴权 401
+  `AUTHENTICATION_REQUIRED`。条目不存在或对当前用户不可见（含媒体库 ACL）返回 404 `NOT_FOUND`，
+  与 `/api/v1/items/{item_id}` 一致；数据库不可用返回 503。媒体库 ACL 与内容限制由共享服务执行，被排除
+  的条目不会出现在 `items` 或 `total` 中，也不会进入 Emby 的 `TotalRecordCount` 和候选池计数。
+- 响应：Lux 自有形状 `{items,page,pageSize,hasNext,total}`，直接复用
+  `lux_catalog_page_json_for_user`。`items` 是 Lux 媒体条目（`lux_catalog_items_json_for_user`），
+  **不复用 Emby DTO**；`page` 是请求的 1 起页码，`pageSize` 是生效的 `limit`，`total` 是有界候选池内的
+  去重总数，`hasNext = offset + items.len() < total`（`offset = (page - 1) * limit`）。`offset` 超出候选池
+  时返回 200 与空 `items`，`total` 在各页相同。Emby 的 `TotalRecordCount` 与 `total` 同义，保持不变。
+- 分页参数：`limit` 默认 50、允许 1-1000；`page` 从 1 起、默认 1。显式空值（`?limit=`/`?page=`）视为
+  未提供；`limit` 的 `0`、负数、非整数（含 `1.5`）或超过 1000，以及 `page` 的 `0`、负数、非整数返回
+  400 `INVALID_REQUEST`。`offset = (page - 1) * limit`，`limit` 只决定每页条数，不改变 `total`；`0` 被
+  拒绝与 Lux 其他列表 `pageSize` 必须为正的规则一致，也避免分页信封做 `offset / limit` 时除零。
+  `pageSize` 是 `limit` 的别名，使用同一 1-1000 边界；两者同时提供且数值不同返回 400。
+- 相似规则与候选池：与 LUX-889 完全一致，由同一个 `CatalogService::list_similar_items` 提供：同类型
+  （`MOVIE`/`SERIES`）、至少共享一个已入库 Genre、最多 10 个源 Genre × 每个 200 个通过 ACL/可见性/内容
+  限制的候选，共享数量降序后再按 `LOWER(title)`、条目 id 升序，并排除自身。没有复制 SQL、没有新增
+  迁移、没有改查询逻辑；`cargo test --locked --lib similar_catalog` 的查询计划断言继续通过。
+- Emby 兼容层：`GET /Items/{id}/Similar`（根路径与 `/emby` 前缀）改为调用同一个
+  `similar_items_page` 入口，只保留 Emby 的 `Items`/`TotalRecordCount` DTO、`Fields`、`EnableUserData`、
+  `EnableImageTypes`/`ImageTypeLimit` 与 `Limit` 处理，对外状态码、字段、排序和 `TotalRecordCount`
+  不变；`emby_similar` 的 6 个用例断言未改。
+- 分页上限按协议各自定义：Lux 使用 `LUX_SIMILAR_DEFAULT_LIMIT`（50）与 `LUX_SIMILAR_MAX_LIMIT`
+  （1000），并额外支持 1 起的 `page`；Emby 适配层保留自己的 `EMBY_SIMILAR_DEFAULT_LIMIT`（50）与
+  `EMBY_MAX_PAGE_LIMIT`（1000），不接收 `page`，行为与 6 例断言不变。`src/api/media.rs` 的单测
+  `lux_similar_limit_and_page_validation` 钉住 Lux 的 1000/1001 与 page 边界。
+- 并发闸门只覆盖 Lux 路由：`/api/v1/items/{id}/similar` 计入目录聚合闸门；Emby
+  `/Items/{id}/Similar`（根路径与 `/emby` 前缀）与 Lux 共用同一聚合查询，但为了避免饱和时把 Emby
+  相似区变成 503，Emby 路径刻意不计入目录闸门。因此已鉴权用户可以通过 Emby 路径绕过新增的并发上限；
+  这是已知的性能权衡，列为后续风险。
+- 自动化：新增 `tests/library/similar_api.rs`（`cargo test --locked --test library similar_api::`，
+  6 例）：同一用户同一库下 Lux 与 Emby 的条目 id 顺序一致（普通用户与管理员、含 ACL 排除项）、
+  `limit`/`page` 默认值与 400 边界、`limit=1000` 接受、三页拼接与一次取全顺序一致且无重复/遗漏、超界页
+  200 空列表、404/401（未知条目、无权条目、无会话）、内容限制排除的条目不出现在 `items`/`total`
+  （Emby 同源端点也不进 `TotalRecordCount`）、剧集只返回剧集与无相似条目的 200 空列表。
+  `cargo test --locked --test emby emby_similar::` 6/6；本机 `uname -m` = `arm64`（macOS），
+  不代表 NAS/x86_64 性能，也未做客户端 UI 复测。
+
+## LUX-891：Emby `/embywebsocket`（Yamby 实时会话与计划任务）
+
+目标客户端：Yamby 2.1.0.11（versionCode 20010012）与 2.0.5.5。入口是「服务器状态/日志」页，
+不是 App 级常驻连接。
+
+### 证据等级
+
+| 项 | 证据 | 等级 |
+|---|---|---|
+| 连接 URL 形态 | `Y11/mc/C4000.java:86-99` 把 base URL 的 `https://`→`wss://`、`http://`→`ws://`，拼 `"{base}/embywebsocket?api_key={token}&deviceId={deviceId}"`；路径固定，不按 Emby/Jellyfin 协议加 `/emby` 前缀 | **确认**（静态分析） |
+| 握手失败后的行为 | `Y11/r8/C5326.java:543-580` 的 `onClosed`/`onFailure` 在页面存活期间**立即重连**，没有退避与次数上限；`Y11/a0/C0004.java:251-253` 的 `mo66(Exception)` 方法体为空，没有任何提示 | **确认**（静态分析） |
+| 客户端消息 | 连上后先发 `{"MessageType":"ScheduledTasksInfoStart","Data":"1000,1000"}` 与 `{"MessageType":"SessionsStart","Data":"0,1500,0,true,true"}`（`Y11/a0/C0004.java:241-247`） | **确认**（静态分析） |
+| 客户端处理的服务端消息 | 只处理 `Sessions` 与 `ScheduledTasksInfo`（`Y11/a0/C0004.java:1377-1420`）；`Sessions` 条目缺 `NowPlayingItem` 或 `PlayState` 会被丢弃；其余类型忽略 | **确认**（静态分析） |
+| `Data` 语义与响应形状 | `Data` 为 `初始延迟毫秒,轮询间隔毫秒,…`，`Data` 是会话/任务 DTO 数组；按 Emby 约定推断（其反编译代码只做 JSON 解析，未包含服务端形状定义） | **推断** |
+| 真机 | 抓包任务（`docs/reviews/2026-11-06-hills-yamby-capture.md`）中 Yamby **没有**发起 `/embywebsocket`，Lux 对普通 GET 与 Upgrade 握手都返回 404；本次实现**未做真机验证**（未在手机上复测握手、面板数据与重连行为） | **未验证** |
+
+### 已实现的契约
+
+- 路由：`GET /embywebsocket` 与 `GET /emby/embywebsocket`，路径大小写不敏感，沿用 Emby 路由构建器与
+  凭据规范化中间件；握手凭证接受 query `api_key` 与标准 Emby token 头。
+- 鉴权：无效/缺失 token 在**握手阶段**返回 `401`（不会完成 `101` 后再关闭）；播放票据 token
+  （`luxpb_{item}_{random}`）被拒绝（`401`）；非管理员可以连接。
+- 客户端消息：`SessionsStart`/`SessionsStop`、`ScheduledTasksInfoStart`/`ScheduledTasksInfoStop`
+  启停对应推送；`KeepAlive` 以同样的 `{"MessageType":"KeepAlive"}` 应答；未知类型与非法 JSON 被忽略，
+  连接保持。`ScheduledTasksInfoStart` 对非管理员静默忽略（不推送、不报错）。
+- 服务端消息：`{"MessageType":"Sessions","Data":[…]}` 与
+  `{"MessageType":"ScheduledTasksInfo","Data":[…]}`；`Data` 与同凭证下 `GET /Sessions`、
+  `GET /ScheduledTasks` 的响应**逐字节相同**（共用同一个构建函数，ACL 也相同：非管理员只看自己的会话，
+  计划任务仅管理员）。
+- 资源边界：全局 32 条、每用户 4 条并发连接（超限握手返回 `503`，不升级）；轮询间隔钳制到
+  1000–60000 ms（初始延迟钳制到 0–60000 ms）；入站帧上限 8 KiB；心跳 25 s、空闲 120 s 关闭。
+- 推送限频：`Sessions` 与 `ScheduledTasksInfo` **各自独立**地保证两次推送尝试之间至少间隔
+  `min_interval`（默认 1 s），与客户端发多少 `…Start` 帧无关。`…Start` 只重置计划：新计划的首次推送取
+  `max(now + 初始延迟, 上一次尝试 + min_interval)`，`Stop`/`Start` 也保留上一次尝试时间，因此一个
+  `Data="0,…"` 的小帧无法让服务端立即重建文档（每次重建是 3–4 次数据库查询）。这里限制的是“尝试”
+  （包含因临时错误被跳过的尝试），比只限制成功推送更严格。
+- 写超时与有界写缓冲：写缓冲初始容量 16 KiB（只是容量提示，不是文档上限）、硬上限 4 MiB；每次发送
+  （含 `KeepAlive` 应答、心跳、数据帧和关闭帧）都在 10 s 的硬超时内完成。硬上限按最大文档量级取值：
+  `MAX_LISTED_PLAYBACK_SESSIONS = 500`，实测单条会话条目约 1.3–1.5 KiB，最坏约 750 KiB，4 MiB 留了五倍
+  以上余量。序列化后的文档若达到或超过硬上限，本次推送被跳过并按每条连接 60 s 限频记一条 warn（不含
+  凭据），连接保留而不是断开（Yamby 无退避重连）；判定时预留 16 字节帧头与可能已缓冲的控制帧，避免
+  “检查通过但 `start_send` 仍返回 `WriteBufferFull`”的边界断连。读端停止消费时写入在 10 s 内失败并释放
+  槽位。公开的限额覆盖会被钳制而不是 panic：`max_connections` 至多 1024（`Semaphore::MAX_PERMITS` 只是
+  硬天花板），`max_connections_per_user` 同样至多 1024，所有时长字段至多 24 小时（`Instant::now() +` 在
+  `Duration::MAX` 这类覆盖下会溢出 panic，而该运算发生在 `101` 之后的连接任务里），初始写缓冲容量钳到
+  1 KiB–1 MiB 并强制严格小于硬上限。
+- 定时工作不受入站帧影响：心跳、空闲检查、周期重校验和两路推送都在每轮循环顶部先处理，之后才等待入站
+  帧，所以持续高速发送 `KeepAlive` 的客户端也无法把它们饿死（撤销 token 同样在有界时间内生效）。
+- 重校验失败分类：`401`/`403`（token 被撤销、账号或远程访问策略被禁）以 `1008` 关闭；`5xx`/`503`
+  （数据库或访问规则暂时不可用）**跳过本次推送并保留连接**，下次计划到期再试，日志按每条连接 60 s
+  限频记一条 warn（不含 token）。
+- 周期重校验：即使没有任何活动推送计划（刚连上未 `Start`，或已 `…Stop`），连接仍每 45 s 重新校验
+  token，所以“登出/撤销即关闭”对所有连接成立。
+- 关停：进程开始优雅停机时向所有连接发 `1001` Close 并退出，随后有 5 s 的有界排空，长连接不再拖住
+  `axum::serve` 的停机等待。
+
+### 与官方的差异
+
+- 只实现 `Sessions` 与 `ScheduledTasksInfo` 两类推送；`ForceKeepAlive`、`UserDataChanged`、
+  `LibraryChanged` 等其它 Emby WebSocket 消息一律不推送（客户端对这些类型本就忽略）。
+- `Sessions` 的条目来自 Lux 现有的 `GET /Sessions` 投影（`NowPlayingItem`/`PlayState` 完整），没有为了
+  WebSocket 增加额外字段；`ScheduledTasksInfo` 复用 `GET /ScheduledTasks` 的单一 `RefreshMediaLibrary`
+  任务项。
+- 推送是"按客户端要求的间隔轮询现有应用服务"，不是事件驱动；两个客户端请求的 1.5 s / 1 s 间隔都在
+  钳制范围内，因此行为与 Emby 原生推送在观感上一致，但延迟上限由间隔决定。
+
+### 验证
+
+- `cargo test --locked --test emby emby_websocket::`：23/23（握手 401/播放票据拒绝、根路径与 `/emby`
+  前缀及大小写、`Sessions` 与 `GET /Sessions` 一致且含 `NowPlayingItem`/`PlayState`、管理员收到
+  `ScheduledTasksInfo` 而非管理员收不到、`SessionsStop` 停止、未知/非法消息忽略、间隔上下钳制、连续
+  `…Start` 不能突破推送最小间隔（且两条流互不影响）、全局与每用户连接上限、token 撤销后关闭、无推送计划
+  时的周期重校验、空闲关闭、超大帧拒绝、读端停读时由发送超时关闭并释放槽位、超过写缓冲上限的文档被
+  跳过而连接保留、100 条会话（约 130 KiB，远超初始写缓冲）的文档完整推送、写缓冲两值相等时不 panic、
+  持续入站洪水下推送与撤销仍按时生效、极限限额覆盖（`usize::MAX`/`Duration::MAX`）下握手与收发正常、
+  关停不被打开的连接阻塞）。
+- `cargo test --locked --lib emby_websocket::`：10/10（重校验状态码分类 401/403/500/503、发送超时包装、
+  连续 `Start` 与 `Stop`/`Start` 的最小间隔下限、`Data` 钳制、写缓冲严格大小关系（相等/更小/`usize::MAX`）、
+  默认上限与最大文档的量级关系、帧头余量边界（`max-17` 发送、`max-16`/`max-1`/`max` 跳过）、极限覆盖值
+  钳制后构造连接预算与计算截止时间都不 panic）。
+- 真机：**未真机验证**。静态分析确认了请求形态与"失败即无退避重连"的行为，响应形状按 Emby 约定推断；
+  部署后需要在 Yamby 的「服务器状态」页复测握手、面板数据、离开页面后的断开与无重连风暴。
+- 真机尝试（2026-11-06）：在本 worktree 起独立实例并用 `adb reverse` 让 Yamby 2.1.0.11 连上临时服务器，
+  客户端可以正常登录、浏览媒体库；打开「管理服务器 → 系统日志」时它只请求
+  `/emby/System/Logs/embyserver.txt/Lines`（Lux 没有该端点），**没有**发起 `/embywebsocket`（服务端
+  `RUST_LOG=luxd=debug` 下无任何该路径请求，也没有新的长连接），说明 WebSocket 不在日志页启动。「服务器
+  状态」页面的入口没有在时间预算内找到，因此客户端**从未实际握手**。临时服务器、端口转发与实例数据都已
+  删除，手机设置未改动。
+
+## LUX-896 WebSocket 反向代理配置与部署文档（2026-11-06）
+
+证据等级：**样例与文档为静态检查；服务端行为由 LUX-894 的真实 socket 集成测试覆盖；真实反向代理
+握手未运行**。本分支已 rebase 到含 LUX-894 的 `test`（`a8c7928a`），但本机没有 nginx，任务禁止 Docker
+构建与安装软件，所以 `scripts/proxy-smoke.sh` 未执行。下面把“已由测试覆盖”“只有静态一致”“未验证”
+分开记录：
+
+- 服务端行为（LUX-894 已合并）：普通 GET（无 `Upgrade`）返回 `426 Upgrade Required`（集成测试
+  `a_plain_get_answers_426_upgrade_required`）；`Origin` 与 `Host` 只比较 host[:port]，80/443 在两侧
+  都视为无端口（P3 修复，见下），不比较 scheme、不读转发头；跨源 `400`、缺 `Origin` 的 cookie 握手
+  `401`、预算超限 `429`。这些是进程内真实 socket 的测试，不经过 nginx。
+- ADR-054 措辞已按实现最小修订：缺失 `Upgrade` 的「反向代理要求」由“提取器默认 `400`”改为 handler
+  显式返回 `426`；「Origin 校验」规则 2 改为 80/443 两侧都视为无端口。六条所有者决定未改。
+- nginx 样例（`docs/DEPLOYMENT.md` 的 `## Nginx 反向代理`、`scripts/proxy-smoke.nginx.conf`）：都补了
+  `proxy_set_header Upgrade $http_upgrade;` 与 `proxy_set_header Connection "upgrade";`，`Host` 由 `$host`
+  改为 `$http_host`，保留 `proxy_http_version 1.1;`、`proxy_buffering off;` 与 1 小时的
+  `proxy_read_timeout`（远大于 25 s 心跳）。`scripts/check-proxy-config.sh` 从 `docs/DEPLOYMENT.md` 抽出
+  `nginx` 代码块，与 smoke 样例一起断言这几条；`scripts/proxy-smoke.sh` 在启动容器前先跑它，
+  `scripts/check-all.sh` 也调用它，所以样例被删改时会先失败。
+- 非默认端口：smoke 监听 `18611`，只有 `Origin: https://127.0.0.1:18611` 与 `Host: $http_host` 一致时才
+  能升级；写成 `$host` 时 `Host` 变成 `127.0.0.1`，握手会因端口丢失被 `400` 拒绝。这条已写成
+  `scripts/proxy-smoke.sh` 的断言，**未实机运行**。
+- 缺头的症状：文档写明“握手以普通 GET 到达 → 不升级 → 浏览器只看到 `close 1006`，与 401 无法区分 →
+  前端静默落到轮询（用户面 30 s，管理面 2 s/5 s/15 s）”，并给出服务端日志的拒绝分类
+  （`origin-missing`/`origin-mismatch`/`sec-fetch-site`/`unauthenticated`/`budget`）与
+  `502/504 → 400/426 → 401 → 101` 的读法。
+- `Host` 改写：文档写明“反代改写 `Host` 会让所有握手被 Origin 校验拒绝，修正在反代侧，不是放宽校验”；
+  明确 Lux 没有 `LUX_ALLOWED_ORIGINS`，也不读取 `X-Forwarded-Proto`/`Forwarded`/`X-Forwarded-Host`。
+- Caddy：按 Caddy 文档，`reverse_proxy` 默认透传 `Upgrade`/`Connection` 并保留原始 `Host`；仓库里没有
+  Caddy 配置，该链路**未实机验证**（与 ADR-054 的结论一致）。
+- P3 修复（LUX-896 分支，LUX-894 审查遗留项）：① `parse_origin_authority` 原先只丢弃 Origin 自身
+  scheme 的默认端口，与 `request_authority` 丢弃 80/443 不对称，`Host: nas:443` +
+  `Origin: http://nas:443` 会被误拒；现在两侧都用 `&[80, 443]`，新增单测
+  `origin_normalization_drops_both_default_ports_on_either_side`（http:443 / https:80 与 `Host` 的组合）。
+  ② `docs/API.md` 补写传输层 64 KiB 上限（超出直接断开、无 close 帧）与“超过 4 KiB 的二进制消息先得
+  `1003` 而不是 `1009`”。③ `docs/LUX-DEVELOPMENT.md` 的 LUX-894 实施结果由 28 例改为 30 例（与验收记录、
+  `docs/TEST-TARGETS.md` 的实测一致）。
+- 冒烟探针自测（**不代表反向代理**）：用本机自签名证书的本地 TLS socket 桩（建在 `.tmp/` 内、已删除）
+  验证了两处逻辑——`curl --http1.1 --max-time` 能取到 `101` 状态与握手头，`Sec-WebSocket-Accept` 与
+  客户端 key 匹配；`openssl s_client` 能在有界轮询内读到 `{"type":"ready","version":1}` 首帧。桩同时
+  覆盖 `400`（跨源、缺 `Origin`）与 `426`（普通 GET）。这只证明探针本身可用，不证明 nginx 行为。
+- **未验证项**：真实 nginx 的 `101` 与首帧、缺头时的实测状态码、非默认端口实测、`$host` 回归实测、
+  Caddy/Tailscale Serve 链路。应在有 Docker 的机器执行
+  ``LUX_IMAGE=<含 /api/v1/ws 的镜像> ./scripts/proxy-smoke.sh`` 补跑，并把结果回填到本节。
+
+本次实际执行：`cargo test --locked --test admin lux_websocket::` 30/30、`cargo test --locked --lib
+lux_websocket::` 15/15、`cargo test --locked --lib websocket::` 25/25、`cargo fmt --all -- --check`、
+`cargo clippy --locked --all-targets --all-features -- -D warnings`、`python3
+scripts/check-backend-branches.py`、`scripts/check-proxy-config.sh`、`bash -n scripts/*.sh` 全部通过；
+`scripts/proxy-smoke.sh` **未运行**（本机无 nginx，脚本需要 Docker 构建 `lux:arm64-local`，任务禁止）。

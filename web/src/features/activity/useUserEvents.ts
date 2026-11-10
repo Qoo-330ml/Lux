@@ -2,23 +2,25 @@ import { useQueryClient, type QueryKey } from "@tanstack/react-query";
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { clearHomeCarouselCache } from "../home/carousel";
 import { queryKeys } from "../../lib/api/query-keys";
+import { realtimeConnectionState, subscribeRealtime } from "../../lib/realtime/client";
+import type { InvalidateFrame, RealtimeConnectionState } from "../../lib/realtime/types";
+
+export type { RealtimeConnectionState } from "../../lib/realtime/types";
 
 type UserEvent = {
   scope: "home" | "item" | "library" | "favorites" | "progress";
   itemId?: string;
-  libraryId?: string;
 };
 
-export type SseConnectionState = "connected" | "disconnected";
-export const SseConnectionContext = createContext<SseConnectionState>("disconnected");
+export const RealtimeConnectionContext = createContext<RealtimeConnectionState>("disconnected");
 
-export function useSseConnectionState(): SseConnectionState {
-  return useContext(SseConnectionContext);
+export function useRealtimeConnectionState(): RealtimeConnectionState {
+  return useContext(RealtimeConnectionContext);
 }
 
 export function useUserEvents() {
   const queryClient = useQueryClient();
-  const [connectionState, setConnectionState] = useState<SseConnectionState>("disconnected");
+  const [connectionState, setConnectionState] = useState<RealtimeConnectionState>(realtimeConnectionState);
   const pendingRefreshes = useRef(new Set<string>());
   const hadConnectionError = useRef(false);
   const refreshQueries = useCallback((queryKey: QueryKey) => {
@@ -56,9 +58,6 @@ export function useUserEvents() {
   }, [queryClient]);
 
   useEffect(() => {
-    if (typeof EventSource === "undefined") return undefined;
-
-    const source = new EventSource("/api/v1/events");
     const invalidate = (event: UserEvent) => {
       // Progress ticks only move the user's resume pointer and the playing
       // item's playback state; refreshing the whole media surface for every
@@ -72,18 +71,13 @@ export function useUserEvents() {
       // Legacy home notifications also cover metadata, images and user state.
       // The server may send scope-only events; IDs narrow updates when available.
       const itemId = event.scope === "item" ? event.itemId : undefined;
-      const libraryId = event.scope === "library" ? event.libraryId : undefined;
-      if (libraryId) {
-        void queryClient.invalidateQueries({
-          queryKey: ["library", libraryId],
-          refetchType: "active",
-        });
-      } else {
-        void queryClient.invalidateQueries({
-          queryKey: ["library"],
-          refetchType: "active",
-        });
-      }
+      // ADR-054 D14: the server never sends `libraryId`, so a library event always widens to
+      // the whole `["library"]` prefix. The old per-library narrowing branch was unreachable
+      // and is deleted rather than migrated.
+      void queryClient.invalidateQueries({
+        queryKey: ["library"],
+        refetchType: "active",
+      });
       const keys: QueryKey[] = [
         queryKeys.home, queryKeys.libraries,
         itemId ? queryKeys.item(itemId) : ["item"],
@@ -93,48 +87,42 @@ export function useUserEvents() {
       ];
       for (const key of keys) refreshQueries(key);
     };
-    const handleOpen = () => {
-      const reconnecting = hadConnectionError.current;
-      hadConnectionError.current = false;
-      setConnectionState("connected");
-      if (reconnecting) invalidate({ scope: "home" });
-    };
-    const handleError = () => {
-      hadConnectionError.current = true;
-      setConnectionState("disconnected");
-    };
-    const handleInvalidate = (event: Event) => {
-      const payload = parseUserEvent((event as MessageEvent<string>).data);
-      if (payload) invalidate(payload);
-    };
 
-    source.addEventListener("open", handleOpen);
-    source.addEventListener("error", handleError);
-    source.addEventListener("invalidate", handleInvalidate);
-    return () => {
-      source.removeEventListener("open", handleOpen);
-      source.removeEventListener("error", handleError);
-      source.removeEventListener("invalidate", handleInvalidate);
-      source.close();
-    };
-  }, [refreshQueries]);
+    const unsubscribe = subscribeRealtime(queryClient, {
+      // ADR-054 D15①: a first connection has nothing to catch up on. Only a connection that
+      // had dropped (and therefore may have missed invalidations) forces one full home refresh.
+      onReady: () => {
+        const reconnecting = hadConnectionError.current;
+        hadConnectionError.current = false;
+        if (reconnecting) invalidate({ scope: "home" });
+      },
+      onInvalidate: (frame) => {
+        const payload = parseUserEvent(frame);
+        if (payload) invalidate(payload);
+      },
+      // A failed attempt before the first `ready` never changes the connection state, so the
+      // "we were down, the next ready has catching up to do" flag is driven by the failure
+      // signal instead (ADR-054 D15①).
+      onConnectionFailure: () => {
+        hadConnectionError.current = true;
+      },
+      onStateChange: setConnectionState,
+    });
+    // A sibling subscriber may already own a connected socket when this hook mounts.
+    setConnectionState(realtimeConnectionState());
+    return unsubscribe;
+  }, [refreshQueries, queryClient]);
 
   return connectionState;
 }
 
-function parseUserEvent(data: string): UserEvent | null {
-  try {
-    const payload: unknown = JSON.parse(data);
-    if (!payload || typeof payload !== "object" || !("scope" in payload)) return null;
-    if (typeof payload.scope !== "string" || !["home", "item", "library", "favorites", "progress"].includes(payload.scope)) return null;
-    for (const key of ["itemId", "libraryId"] as const) {
-      if (key in payload) {
-        const value = (payload as Record<string, unknown>)[key];
-        if (typeof value !== "string" || !value.trim() || value.length > 256) return null;
-      }
-    }
-    return payload as UserEvent;
-  } catch {
+function parseUserEvent(frame: InvalidateFrame): UserEvent | null {
+  if (frame.channel !== "user") return null;
+  const scope = frame.scope;
+  if (!["home", "item", "library", "favorites", "progress"].includes(scope)) return null;
+  if (frame.itemId !== undefined
+    && (typeof frame.itemId !== "string" || !frame.itemId.trim() || frame.itemId.length > 256)) {
     return null;
   }
+  return { scope: scope as UserEvent["scope"], itemId: frame.itemId };
 }

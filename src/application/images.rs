@@ -299,6 +299,27 @@ pub struct ImageWriteService {
     resources: Option<ResourceMetrics>,
 }
 
+/// How the download writes its target path and whether an attempt owns the write.
+#[derive(Clone, Copy)]
+struct ImageTargetWrite<'a> {
+    /// Keep an existing file instead of picking a new variant path.
+    reuse_existing_path: bool,
+    /// The claimed attempt whose finish joins the image-row write, when one owns this download.
+    attempt: Option<ImageAttemptWrite<'a>>,
+}
+
+/// The download attempt whose finish joins the image-row write.
+///
+/// `docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` M5 方案 1: the successful path used to
+/// commit `item_images` and then `metadata_image_attempts`, so a crash between them left the
+/// image indexed while the attempt stayed `RUNNING` until `claimed_until` expired.
+#[derive(Clone, Copy)]
+struct ImageAttemptWrite<'a> {
+    item_id: &'a str,
+    image_type: &'a str,
+    candidate_key: &'a str,
+}
+
 impl ImageWriteService {
     pub fn new(database: Database) -> Result<Self, ImageWriteError> {
         Self::with_proxy_config(database, ImageDownloadConfig::default(), None, None)
@@ -546,24 +567,19 @@ impl ImageWriteService {
                 image_url,
                 source,
                 image_index,
-                true,
-            )
-            .await;
-        match result {
-            Ok(report) => {
-                self.database
-                    .finish_metadata_image_attempt(MetadataImageAttemptUpdate {
+                ImageTargetWrite {
+                    reuse_existing_path: true,
+                    attempt: Some(ImageAttemptWrite {
                         item_id,
                         image_type: normalized_type,
                         candidate_key: &candidate_key,
-                        status: "AVAILABLE",
-                        next_retry_at: None,
-                        error_code: None,
-                        now: current_unix_timestamp(),
-                    })
-                    .await?;
-                Ok(Some(report))
-            }
+                    }),
+                },
+            )
+            .await;
+        match result {
+            // The image row and the attempt finish already committed together.
+            Ok(report) => Ok(Some(report)),
             Err(error) => {
                 self.record_image_attempt_failure(item_id, normalized_type, &candidate_key, &error)
                     .await?;
@@ -795,7 +811,8 @@ impl ImageWriteService {
         {
             return Ok(false);
         }
-        if image_path_is_owned_by_other_type(&indexed_images, image_type, &path).await? {
+        if image_path_is_owned_by_other_row(&indexed_images, image_type, image_index, &path).await?
+        {
             return Ok(false);
         }
         if indexed_image_path_is_fallback(&indexed_images, image_type, image_index, &path).await? {
@@ -1004,8 +1021,13 @@ impl ImageWriteService {
                                 &path,
                             )
                             .await?)
-                        && !image_path_is_owned_by_other_type(indexed_images, image_type, &path)
-                            .await?
+                        && !image_path_is_owned_by_other_row(
+                            indexed_images,
+                            image_type,
+                            image_index as i64,
+                            &path,
+                        )
+                        .await?
                         && image_file_stamp(&path).await?.is_some()
                     {
                         found.insert(image_type.to_owned());
@@ -1046,7 +1068,13 @@ impl ImageWriteService {
                             &path,
                         )
                         .await?)
-                    && !image_path_is_owned_by_other_type(indexed_images, image_type, &path).await?
+                    && !image_path_is_owned_by_other_row(
+                        indexed_images,
+                        image_type,
+                        image_index as i64,
+                        &path,
+                    )
+                    .await?
                     && image_file_stamp(&path).await?.is_some()
                 {
                     found.insert(image_type.to_owned());
@@ -1067,6 +1095,10 @@ impl ImageWriteService {
             .await
     }
 
+    /// Downloads, writes and indexes one image.
+    ///
+    /// `write.attempt` is the claim an attempt-scoped caller already holds: the image row and that
+    /// attempt's `AVAILABLE` finish then commit in one transaction.
     async fn download_item_image_impl(
         &self,
         item_id: &str,
@@ -1074,8 +1106,12 @@ impl ImageWriteService {
         image_url: &str,
         source: &str,
         image_index: i64,
-        reuse_existing_path: bool,
+        write: ImageTargetWrite<'_>,
     ) -> Result<ImageWriteReport, ImageWriteError> {
+        let ImageTargetWrite {
+            reuse_existing_path,
+            attempt,
+        } = write;
         let image_type = normalize_image_type(image_type)
             .ok_or_else(|| ImageWriteError::InvalidImageType(image_type.to_owned()))?;
         let url = Url::parse(image_url)
@@ -1152,14 +1188,8 @@ impl ImageWriteService {
 
         let _image_write_lock = acquire_image_write_lock(item_id).await;
         let (root, directory, movie_stem, episode_stem) = self.writeback_paths(item_id).await?;
-        let blocked_paths = self
-            .database
-            .list_item_images(item_id)
-            .await?
-            .into_iter()
-            .filter(|image| !image.image_type.eq_ignore_ascii_case(image_type))
-            .map(|image| PathBuf::from(image.local_path))
-            .collect::<Vec<_>>();
+        let indexed_images = self.database.list_item_images(item_id).await?;
+        let blocked_paths = blocked_image_paths(&indexed_images, image_type, image_index);
         let target = image_target(ImageTargetRequest {
             directory: &directory,
             image_type,
@@ -1173,6 +1203,15 @@ impl ImageWriteService {
         .await?;
         if !target.starts_with(&root) {
             return Err(ImageWriteError::PathOutsideRoot(target));
+        }
+        // The target was chosen from a snapshot taken under the per-item write lock, which the
+        // scanner does not take. Re-read right before writing: if a scan registered the file for
+        // another index of this type in the meantime, do not overwrite it for the wrong row.
+        let latest_images = self.database.list_item_images(item_id).await?;
+        if image_path_is_owned_by_other_row(&latest_images, image_type, image_index, &target)
+            .await?
+        {
+            return Err(ImageWriteError::ConcurrentModification(target));
         }
         let metadata_target = if self.config_dir.is_some()
             && item_metadata_writeback_enabled(&self.database, item_id).await?
@@ -1223,23 +1262,49 @@ impl ImageWriteService {
                 ImageWriteError::InvalidConfiguration("image hash worker stopped".to_owned())
             })?;
         let dimensions = read_image_dimensions(&target).await;
-        let id = self
-            .database
-            .upsert_item_image_at_index(
-                item_id,
-                image_type,
-                image_index,
-                &target,
-                ItemImageMetadata {
-                    file_size,
-                    width: dimensions.map(|(width, _)| width),
-                    height: dimensions.map(|(_, height)| height),
-                    content_tag: &content_tag,
-                    source,
-                    source_url: Some(image_url),
-                },
-            )
-            .await?;
+        let image_metadata = ItemImageMetadata {
+            file_size,
+            width: dimensions.map(|(width, _)| width),
+            height: dimensions.map(|(_, height)| height),
+            content_tag: &content_tag,
+            source,
+            source_url: Some(image_url),
+        };
+        let id = match attempt {
+            Some(attempt) => self
+                .database
+                .upsert_item_image_at_index_and_finish_attempt(
+                    item_id,
+                    image_type,
+                    image_index,
+                    &target,
+                    crate::storage::ItemImageAttemptCommit {
+                        metadata: image_metadata,
+                        update: MetadataImageAttemptUpdate {
+                            item_id: attempt.item_id,
+                            image_type: attempt.image_type,
+                            candidate_key: attempt.candidate_key,
+                            status: "AVAILABLE",
+                            next_retry_at: None,
+                            error_code: None,
+                            now: current_unix_timestamp(),
+                        },
+                    },
+                )
+                .await
+                .map_err(|error| image_row_write_error(&target, error))?,
+            None => self
+                .database
+                .upsert_item_image_at_index(
+                    item_id,
+                    image_type,
+                    image_index,
+                    &target,
+                    image_metadata,
+                )
+                .await
+                .map_err(|error| image_row_write_error(&target, error))?,
+        };
         if let Some(resources) = &self.resources {
             resources.record_metadata_stage("image_write", write_started.elapsed());
             resources.record_metadata_image_bytes(size);
@@ -1402,8 +1467,18 @@ impl ImageWriteService {
         image_url: &str,
         source: &str,
     ) -> Result<ImageWriteReport, ImageWriteError> {
-        self.download_item_image_impl(item_id, image_type, image_url, source, 0, false)
-            .await
+        self.download_item_image_impl(
+            item_id,
+            image_type,
+            image_url,
+            source,
+            0,
+            ImageTargetWrite {
+                reuse_existing_path: false,
+                attempt: None,
+            },
+        )
+        .await
     }
 
     async fn writeback_paths(
@@ -1839,25 +1914,28 @@ async fn image_target(request: ImageTargetRequest<'_>) -> Result<PathBuf, ImageW
     } else {
         image_lookup_stems(image_type, movie_stem, episode_stem, image_index)?
     };
-    if reuse_existing_path {
-        if let Some(existing) = find_existing_image_path(directory, &stems, None).await?
-            && !is_blocked(&existing)
-        {
-            return Ok(existing);
-        }
-    }
-    if let Some(existing) = find_existing_image_path(directory, &stems, Some(format)).await?
-        && !is_blocked(&existing)
+    let existing_paths = find_existing_image_paths(directory, &stems, None).await?;
+    // A blocked path belongs to another row, so keep looking: this row's own previous file may
+    // still be reusable even when an alias sorts before it.
+    if reuse_existing_path
+        && let Some(existing) = existing_paths.iter().find(|path| !is_blocked(path))
     {
-        return Ok(existing);
+        return Ok(existing.clone());
+    }
+    if let Some(existing) = existing_paths
+        .iter()
+        .find(|path| format.matches_path(path) && !is_blocked(path))
+    {
+        return Ok(existing.clone());
     }
     let (prefixed_stem, generic_stem) =
         canonical_image_stems(image_type, movie_stem, episode_stem, image_index)?;
     let target_stem = if let Some(prefixed_stem) = prefixed_stem {
-        let prefixed_exists =
-            find_existing_image_path(directory, std::slice::from_ref(&prefixed_stem), None)
-                .await?
-                .is_some();
+        let prefixed_exists = existing_paths.iter().any(|path| {
+            path.file_stem()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case(&prefixed_stem))
+        });
         if prefixed_exists || directory_has_multiple_media_files(directory).await? {
             prefixed_stem
         } else {
@@ -1869,6 +1947,14 @@ async fn image_target(request: ImageTargetRequest<'_>) -> Result<PathBuf, ImageW
     let target = directory.join(format!("{target_stem}.{}", format.extension()));
     if !is_blocked(&target) {
         return Ok(target);
+    }
+    // The canonical name is already registered by another row. Use the scanning-approved alias
+    // for this index instead of sharing that row's file or failing the refresh.
+    for stem in scanning_approved_index_stems(image_type, movie_stem, episode_stem, image_index) {
+        let candidate = directory.join(format!("{stem}.{}", format.extension()));
+        if !is_blocked(&candidate) {
+            return Ok(candidate);
+        }
     }
 
     let Some(conflict_free_stem) = conflict_free_image_stem(image_type, episode_stem) else {
@@ -1889,6 +1975,48 @@ async fn image_target(request: ImageTargetRequest<'_>) -> Result<PathBuf, ImageW
     Ok(conflict_free_target)
 }
 
+/// Registered paths a write of `(image_type, image_index)` must keep away from.
+///
+/// Every other image row of the item contributes its path, including rows of the *same* type at
+/// another index: one item never registers two images on one file, so fanart 1 must not land on
+/// the file fanart 4 already owns. The row's own path stays usable so a refresh overwrites its
+/// file instead of creating a duplicate next to it.
+fn blocked_image_paths(
+    indexed_images: &[StoredItemImage],
+    image_type: &str,
+    image_index: i64,
+) -> Vec<PathBuf> {
+    indexed_images
+        .iter()
+        .filter(|image| !is_same_image_row(image, image_type, image_index))
+        .map(|image| PathBuf::from(&image.local_path))
+        .collect()
+}
+
+fn is_same_image_row(image: &StoredItemImage, image_type: &str, image_index: i64) -> bool {
+    image.image_type.eq_ignore_ascii_case(image_type) && image.image_index == image_index
+}
+
+/// `fanart{k}` / `{movie_stem}-fanart{k}`: the indexed sidecar names the local scanner derives a
+/// FANART index from (`image_type_for_stem`/`image_type_for_media`). Episode fanart already writes
+/// its canonical `{episode_stem}-fanart{k}` name, so only movie and flat naming needs the alias.
+fn scanning_approved_index_stems(
+    image_type: &str,
+    movie_stem: Option<&str>,
+    episode_stem: Option<&str>,
+    image_index: i64,
+) -> Vec<String> {
+    if !image_type.eq_ignore_ascii_case("FANART") || image_index <= 0 || episode_stem.is_some() {
+        return Vec::new();
+    }
+    let mut stems = Vec::with_capacity(2);
+    if let Some(movie_stem) = movie_stem {
+        stems.push(format!("{movie_stem}-fanart{image_index}"));
+    }
+    stems.push(format!("fanart{image_index}"));
+    stems
+}
+
 fn conflict_free_image_stem(image_type: &str, episode_stem: Option<&str>) -> Option<String> {
     let episode_stem = episode_stem?;
     let suffix = match image_type {
@@ -1899,19 +2027,25 @@ fn conflict_free_image_stem(image_type: &str, episode_stem: Option<&str>) -> Opt
     Some(format!("{episode_stem}-{suffix}"))
 }
 
-async fn image_path_is_owned_by_other_type(
+/// Whether `path` is registered to a different image row of the item.
+///
+/// A path registered by another index of the same type is foreign too, so a read for
+/// `(image_type, image_index)` must not treat a sibling index's file as its own image.
+async fn image_path_is_owned_by_other_row(
     indexed_images: &[StoredItemImage],
     image_type: &str,
+    image_index: i64,
     path: &Path,
 ) -> Result<bool, ImageWriteError> {
     let comparable_path = canonical_path_for_comparison(path).await?;
     for image in indexed_images {
-        if !image.image_type.eq_ignore_ascii_case(image_type)
-            && image_paths_conflict(
-                &canonical_path_for_comparison(Path::new(&image.local_path)).await?,
-                &comparable_path,
-            )
-        {
+        if is_same_image_row(image, image_type, image_index) {
+            continue;
+        }
+        if image_paths_conflict(
+            &canonical_path_for_comparison(Path::new(&image.local_path)).await?,
+            &comparable_path,
+        ) {
             return Ok(true);
         }
     }
@@ -2051,10 +2185,18 @@ fn image_lookup_stems(
     let (legacy_prefixed, legacy_generic) = image_file_stems(image_type, movie_stem, episode_stem)?;
     let (canonical_prefixed, canonical_generic) =
         canonical_image_stems(image_type, movie_stem, episode_stem, image_index)?;
-    let mut stems = Vec::with_capacity(6);
+    let mut stems = Vec::with_capacity(8);
     if let Some(stem) = canonical_prefixed {
         stems.push(stem);
     }
+    // Keep the scanning-approved index names next to the canonical write name so reads and
+    // writes agree on which file index k owns.
+    stems.extend(scanning_approved_index_stems(
+        image_type,
+        movie_stem,
+        episode_stem,
+        image_index,
+    ));
     if let Some(stem) = legacy_prefixed {
         stems.push(indexed_legacy_stem(&stem, image_index));
     }
@@ -2143,6 +2285,21 @@ async fn find_existing_image_path(
     stems: &[String],
     format: Option<ImageFormat>,
 ) -> Result<Option<PathBuf>, ImageWriteError> {
+    Ok(find_existing_image_paths(directory, stems, format)
+        .await?
+        .into_iter()
+        .next())
+}
+
+/// Every existing image of `directory` whose stem is one of `stems`, in stem preference order.
+///
+/// The order lets a caller skip paths another image row already owns and keep looking for a
+/// reusable file instead of falling back to a brand-new name.
+async fn find_existing_image_paths(
+    directory: &Path,
+    stems: &[String],
+    format: Option<ImageFormat>,
+) -> Result<Vec<PathBuf>, ImageWriteError> {
     let mut candidates = Vec::new();
     let mut entries = fs::read_dir(directory)
         .await
@@ -2172,16 +2329,19 @@ async fn find_existing_image_path(
         }
     }
     candidates.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+    let mut ordered = Vec::with_capacity(candidates.len());
     for stem in stems {
-        if let Some(path) = candidates.iter().find(|path| {
-            path.file_stem()
+        for path in &candidates {
+            let matches = path
+                .file_stem()
                 .and_then(|value| value.to_str())
-                .is_some_and(|value| value.eq_ignore_ascii_case(stem))
-        }) {
-            return Ok(Some(path.clone()));
+                .is_some_and(|value| value.eq_ignore_ascii_case(stem));
+            if matches && !ordered.contains(path) {
+                ordered.push(path.clone());
+            }
         }
     }
-    Ok(None)
+    Ok(ordered)
 }
 
 async fn directory_has_multiple_media_files(directory: &Path) -> Result<bool, ImageWriteError> {
@@ -2204,7 +2364,9 @@ async fn directory_has_multiple_media_files(directory: &Path) -> Result<bool, Im
                 .extension()
                 .and_then(|value| value.to_str())
                 .is_some_and(|value| {
-                    matches!(value.to_ascii_lowercase().as_str(), "mkv" | "mp4" | "strm")
+                    let value = value.to_ascii_lowercase();
+                    crate::application::scanner::SUPPORTED_MOVIE_EXTENSIONS
+                        .contains(&value.as_str())
                 })
         {
             media_count += 1;
@@ -2380,6 +2542,16 @@ fn image_attempt_failure(
         | ImageWriteError::SymlinkTarget(_)
         | ImageWriteError::AttemptInProgress
         | ImageWriteError::Storage(_) => ("FAILED", None, "PERMANENT_FAILURE"),
+    }
+}
+
+/// A registration path taken by another index of the same type is a concurrent modification: the
+/// next refresh re-reads the blocked paths and picks another file, so it stays retryable instead
+/// of being recorded as a permanent storage failure.
+fn image_row_write_error(target: &Path, error: StorageError) -> ImageWriteError {
+    match error {
+        StorageError::Conflict(_) => ImageWriteError::ConcurrentModification(target.to_owned()),
+        other => ImageWriteError::Storage(other),
     }
 }
 
@@ -3197,12 +3369,13 @@ fn image_download_retry_delay(retry_count: u32) -> Duration {
 mod tests {
     use super::{
         IMAGE_GLOBAL_CONCURRENCY, IMAGE_RESOLUTION_CACHE_CAPACITY, IMAGE_RETRY_BASE_DELAY,
-        IMAGE_RETRY_MAX_DELAY, ImageError, ImagePermitPool, ImageResolutionCache,
-        ImageResolutionKey, ImageService, ImageWriteError,
-        background_image_content_tag_and_dimensions_from_bytes, canonical_image_stems,
-        ensure_public_image_host, global_image_download_permits, global_image_write_permits,
-        image_attempt_failure, image_content_tag_and_dimensions_from_bytes,
-        image_download_retry_delay, image_language_matches, image_lookup_stems,
+        IMAGE_RETRY_MAX_DELAY, ImageDownloadConfig, ImageError, ImageFormat, ImagePermitPool,
+        ImageResolutionCache, ImageResolutionKey, ImageService, ImageTargetRequest,
+        ImageWriteError, ImageWriteService, background_image_content_tag_and_dimensions_from_bytes,
+        canonical_image_stems, ensure_public_image_host, global_image_download_permits,
+        global_image_write_permits, image_attempt_failure,
+        image_content_tag_and_dimensions_from_bytes, image_download_retry_delay,
+        image_language_matches, image_lookup_stems, image_row_write_error, image_target,
         is_allowed_scraper_image_url, retryable_image_status, should_suppress_internal_image_write,
         write_image_atomically,
     };
@@ -3443,7 +3616,12 @@ mod tests {
         );
         let lookup = image_lookup_stems("FANART", None, None, 1).expect("fanart type");
         assert!(lookup.iter().any(|stem| stem == "backdrop1"));
+        assert!(lookup.iter().any(|stem| stem == "fanart1"));
         assert!(lookup.iter().any(|stem| stem == "fanart-1"));
+        let prefixed = image_lookup_stems("FANART", Some("Movie"), None, 2).expect("fanart type");
+        assert!(prefixed.iter().any(|stem| stem == "Movie-backdrop2"));
+        assert!(prefixed.iter().any(|stem| stem == "Movie-fanart2"));
+        assert!(prefixed.iter().any(|stem| stem == "fanart2"));
     }
 
     #[test]
@@ -3457,6 +3635,114 @@ mod tests {
         assert!(lookup.iter().any(|stem| stem == "Example.S01E01-fanart1"));
         assert!(lookup.iter().any(|stem| stem == "Example.S01E01-thumb1"));
         assert!(lookup.iter().any(|stem| stem == "Example.S01E01-thumb-1"));
+    }
+
+    #[tokio::test]
+    async fn indexed_fanart_never_reuses_a_path_registered_by_another_index() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let directory = tokio::fs::canonicalize(root.path())
+            .await
+            .expect("canonical image directory");
+        let shared = directory.join("Fanart.Movie.2020-backdrop1.png");
+        tokio::fs::write(&shared, b"registered by fanart 4")
+            .await
+            .expect("shared fanart file");
+        fn request<'a>(
+            directory: &'a std::path::Path,
+            blocked_paths: &'a [PathBuf],
+        ) -> ImageTargetRequest<'a> {
+            ImageTargetRequest {
+                directory,
+                image_type: "FANART",
+                format: ImageFormat::Png,
+                movie_stem: Some("Fanart.Movie.2020"),
+                episode_stem: None,
+                image_index: 1,
+                reuse_existing_path: true,
+                blocked_paths,
+            }
+        }
+
+        let blocked = [shared.clone()];
+        let target = image_target(request(&directory, &blocked))
+            .await
+            .expect("fanart target with a blocked sibling");
+        assert_ne!(
+            target, shared,
+            "index 1 must not take the file index 4 owns"
+        );
+        assert_eq!(target, directory.join("Fanart.Movie.2020-fanart1.png"));
+        assert_eq!(
+            tokio::fs::read(&shared).await.expect("shared file"),
+            b"registered by fanart 4"
+        );
+
+        // The row's own path is not blocked, so a refresh keeps reusing its file.
+        let target = image_target(request(&directory, &[]))
+            .await
+            .expect("fanart target reusing its own path");
+        assert_eq!(target, shared);
+    }
+
+    #[test]
+    fn a_registration_path_owned_by_another_index_stays_retryable() {
+        let target = PathBuf::from("/media/backdrop1.png");
+        let conflict = image_row_write_error(
+            &target,
+            crate::storage::StorageError::Conflict("path already registered".to_owned()),
+        );
+        assert!(matches!(
+            &conflict,
+            ImageWriteError::ConcurrentModification(path) if path == &target
+        ));
+        assert!(matches!(
+            image_attempt_failure(&conflict, 100, 1),
+            ("FAILED", Some(_), "TRANSIENT_FAILURE")
+        ));
+        assert!(matches!(
+            image_row_write_error(&target, crate::storage::StorageError::LastManager),
+            ImageWriteError::Storage(crate::storage::StorageError::LastManager)
+        ));
+    }
+
+    #[tokio::test]
+    async fn movie_fanart_reuses_the_scanning_approved_index_sidecar() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let directory = tokio::fs::canonicalize(root.path())
+            .await
+            .expect("canonical image directory");
+        let sidecar = directory.join("fanart2.jpg");
+        tokio::fs::write(&sidecar, b"local fanart 2")
+            .await
+            .expect("local fanart sidecar");
+        fn request<'a>(
+            directory: &'a std::path::Path,
+            blocked_paths: &'a [PathBuf],
+        ) -> ImageTargetRequest<'a> {
+            ImageTargetRequest {
+                directory,
+                image_type: "FANART",
+                format: ImageFormat::Png,
+                movie_stem: Some("Movie"),
+                episode_stem: None,
+                image_index: 2,
+                reuse_existing_path: true,
+                blocked_paths,
+            }
+        }
+
+        let target = image_target(request(&directory, &[]))
+            .await
+            .expect("fanart target reusing fanart2.jpg");
+        assert_eq!(target, sidecar);
+
+        // A different row owns fanart2.jpg: the refresh writes the canonical name instead of
+        // sharing that file.
+        let blocked = [sidecar.clone()];
+        let target = image_target(request(&directory, &blocked))
+            .await
+            .expect("fanart target with an owned sidecar");
+        assert_eq!(target, directory.join("backdrop2.png"));
     }
 
     fn stored_image_candidate(
@@ -3502,6 +3788,310 @@ mod tests {
             image_id: id.to_owned(),
             content_tag: Some(content_tag.to_owned()),
         }
+    }
+
+    const TEST_PNG_1X1: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    /// Serves `body` with `content_type` for every request until the test drops its handle.
+    async fn spawn_image_stub(
+        content_type: &'static str,
+        body: &'static [u8],
+    ) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("image stub listener");
+        let address = listener.local_addr().expect("image stub address");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 2048];
+                    let _ = stream.read(&mut request).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        address
+    }
+
+    /// A scanned movie library plus the database a download attempt needs.
+    async fn image_download_fixture()
+    -> Result<(Database, String, tempfile::TempDir), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{libraries::LibraryService, scanner::LibraryScanner},
+            library::LibraryKind,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("Movies");
+        let movie_dir = root.join("Image Movie (2020)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(movie_dir.join("Image.Movie.2020.mkv"), b"movie").await?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(library.id, root.to_str().ok_or("non-UTF8 media root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let item_id: String =
+            sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+                .fetch_one(database.pool())
+                .await?;
+        Ok((database, item_id, directory))
+    }
+
+    #[tokio::test]
+    async fn image_row_and_attempt_finish_commit_in_one_transaction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, item_id, _directory) = image_download_fixture().await?;
+        let address = spawn_image_stub("image/png", TEST_PNG_1X1).await;
+        let service = ImageWriteService::with_config(
+            database.clone(),
+            ImageDownloadConfig {
+                max_bytes: 1024 * 1024,
+                allow_loopback_http: true,
+                direct_connection_only: true,
+                ..ImageDownloadConfig::default()
+            },
+        )?;
+
+        database.reset_metadata_write_transaction_count();
+        let report = service
+            .download_item_image_attempt_at_index(
+                &item_id,
+                "POSTER",
+                &format!("http://{address}/poster.png"),
+                "SCRAPER",
+                0,
+                true,
+            )
+            .await?
+            .expect("claimed image download");
+
+        assert_eq!(report.content_type, "image/png");
+        // M5 方案 1: claim, then one transaction for the image row and the attempt finish.
+        assert_eq!(
+            database.metadata_write_transaction_count(),
+            2,
+            "the image row and its attempt finish must share one commit"
+        );
+        let attempts: Vec<(String, Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT status, claimed_until, error_code FROM metadata_image_attempts
+             WHERE item_id = ? AND image_type = 'POSTER'",
+        )
+        .bind(&item_id)
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].0, "AVAILABLE");
+        assert_eq!(
+            attempts[0].1, None,
+            "a finished attempt must not keep its claim"
+        );
+        assert_eq!(attempts[0].2, None);
+        let images: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+        )
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(images, 1);
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_image_download_releases_its_claim() -> Result<(), Box<dyn std::error::Error>> {
+        let (database, item_id, _directory) = image_download_fixture().await?;
+        let address = spawn_image_stub("text/plain", b"not an image").await;
+        let service = ImageWriteService::with_config(
+            database.clone(),
+            ImageDownloadConfig {
+                max_bytes: 1024 * 1024,
+                allow_loopback_http: true,
+                direct_connection_only: true,
+                ..ImageDownloadConfig::default()
+            },
+        )?;
+
+        database.reset_metadata_write_transaction_count();
+        let error = service
+            .download_item_image_attempt_at_index(
+                &item_id,
+                "POSTER",
+                &format!("http://{address}/poster.txt"),
+                "SCRAPER",
+                0,
+                true,
+            )
+            .await
+            .expect_err("an unsupported content type must fail the download");
+        assert!(matches!(
+            error,
+            ImageWriteError::UnsupportedContentType { .. }
+        ));
+        // The claim transaction plus the failure finish; no transaction may be left open.
+        assert_eq!(database.metadata_write_transaction_count(), 2);
+        let attempts: Vec<(String, Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT status, claimed_until, error_code FROM metadata_image_attempts
+             WHERE item_id = ? AND image_type = 'POSTER'",
+        )
+        .bind(&item_id)
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(attempts.len(), 1);
+        assert_ne!(
+            attempts[0].0, "RUNNING",
+            "a failed download must not leave the attempt claimed"
+        );
+        assert_eq!(
+            attempts[0].1, None,
+            "a failed download must not leave the claim behind"
+        );
+        assert!(attempts[0].2.is_some());
+        let images: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+        )
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(images, 0);
+        database.close().await;
+        Ok(())
+    }
+
+    /// LUX-887: fanart indexes of one item never share a file. A sibling index's file is neither
+    /// reused nor overwritten, while the row's own index keeps reusing its canonical path.
+    #[tokio::test]
+    async fn refreshing_one_fanart_index_leaves_a_sibling_indexes_file_alone()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use sha2::{Digest, Sha256};
+
+        let (database, item_id, directory) = image_download_fixture().await?;
+        let movie_directory = directory.path().join("Movies").join("Image Movie (2020)");
+        let address = spawn_image_stub("image/png", TEST_PNG_1X1).await;
+        let service = ImageWriteService::with_config(
+            database.clone(),
+            ImageDownloadConfig {
+                max_bytes: 1024 * 1024,
+                allow_loopback_http: true,
+                direct_connection_only: true,
+                ..ImageDownloadConfig::default()
+            },
+        )?;
+        let insert_indexed_fanart =
+            |image_index: i64, local_path: &std::path::Path, content_tag: &'static str| {
+                let database = database.clone();
+                let item_id = item_id.clone();
+                let local_path = local_path.to_path_buf();
+                async move {
+                    sqlx::query(
+                        "INSERT INTO item_images (
+                            id, item_id, image_type, image_index, local_path, file_size,
+                            content_tag, source
+                         ) VALUES (?, ?, 'FANART', ?, ?, 12, ?, 'TMDB')",
+                    )
+                    .bind(uuid::Uuid::now_v7().to_string())
+                    .bind(item_id)
+                    .bind(image_index)
+                    .bind(local_path.to_string_lossy().as_ref())
+                    .bind(content_tag)
+                    .execute(database.pool())
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
+                }
+            };
+
+        // FANART/1 owns the canonical index-1 name and a refresh overwrites it in place.
+        let own_path = movie_directory.join("backdrop1.png");
+        tokio::fs::write(&own_path, b"fanart one").await?;
+        insert_indexed_fanart(1, &own_path, "fanart-one").await?;
+        let reused = service
+            .download_item_image_attempt_at_index(
+                &item_id,
+                "FANART",
+                &format!("http://{address}/fanart-one"),
+                "SCRAPER",
+                1,
+                true,
+            )
+            .await?
+            .ok_or("fanart 1 refresh was skipped")?;
+        assert_eq!(reused.path, own_path);
+        assert_eq!(tokio::fs::read(&own_path).await?, TEST_PNG_1X1);
+        let own_tag: Option<String> = sqlx::query_scalar(
+            "SELECT content_tag FROM item_images
+             WHERE item_id = ? AND image_type = 'FANART' AND image_index = 1",
+        )
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(
+            own_tag.as_deref(),
+            Some(format!("{:x}", Sha256::digest(TEST_PNG_1X1)).as_str())
+        );
+
+        // FANART/3 already registers the canonical index-2 file: neither the write nor the
+        // read-side existence check may treat that file as FANART/2's image.
+        let sibling_path = movie_directory.join("backdrop2.png");
+        tokio::fs::write(&sibling_path, b"fanart three").await?;
+        insert_indexed_fanart(3, &sibling_path, "fanart-three").await?;
+        assert!(
+            !service
+                .local_image_exists_at_index(&item_id, "FANART", 2)
+                .await?,
+            "index 2 has no image while index 3 registers the canonical index-2 file"
+        );
+        let written = service
+            .download_item_image_attempt_at_index(
+                &item_id,
+                "FANART",
+                &format!("http://{address}/fanart-two"),
+                "SCRAPER",
+                2,
+                true,
+            )
+            .await?
+            .ok_or("fanart 2 refresh was skipped")?;
+        assert_ne!(written.path, sibling_path);
+        assert_eq!(tokio::fs::read(&sibling_path).await?, b"fanart three");
+        let sibling: (String, Option<String>) = sqlx::query_as(
+            "SELECT local_path, content_tag FROM item_images
+             WHERE item_id = ? AND image_type = 'FANART' AND image_index = 3",
+        )
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(sibling.0, sibling_path.to_string_lossy());
+        assert_eq!(sibling.1.as_deref(), Some("fanart-three"));
+        database.close().await;
+        Ok(())
     }
 
     #[tokio::test]

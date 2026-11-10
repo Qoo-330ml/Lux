@@ -29,7 +29,10 @@
 - `admin_settings::transcoding_settings_are_admin_only_validated_and_persisted` 与
   `web_playback::broken_hardware_encoder_falls_back_to_software_transcoding`：对 `transcodingStatus.available` 的期望互相
   矛盾，在装了 VideoToolbox 的开发机上必有一个失败，与优化无关。
-- `web_static::*`：需要先 `pnpm --dir web build` 生成 `web/dist`。
+- `web_static::*`：需要先 `pnpm --dir web build` 生成 `web/dist`（本机未构建，实测为 404 → 400/200 断言失败）。
+- `api_web` 的 `remote::forwarded_headers_are_only_honoured_for_trusted_proxies`：2026-10-31 在本机
+  单独串行也是失败（`X-Forwarded-For` 未被采信，落库仍是 peer `127.0.0.1`），并在**未改动的 `test`
+  基线**（`7cf5f223`）上复现，属既有失败，与本轮后台唤醒改造无关；查明原因前不要当成回归。
 - 并发高负载时会随机失败，**单独串行跑稳定通过**：登录请求超时（argon2 在负载下）、`danmaku::…`、
   `image_writer::manual_scraper…`、`media_info_config_api::…`。
 
@@ -106,7 +109,17 @@ Emby 客户端与 Lux Web 播放器每 10 秒上报一次进度（`web/src/featu
 
 ## 6. 后台任务唤醒
 
-第一轮已把这一项做成了盘点与实测，完整数据见 `docs/BACKGROUND-TASKS-AUDIT.md`。要点：
+第一轮已把这一项做成了盘点与实测，完整数据见 `docs/BACKGROUND-TASKS-AUDIT.md`。
+
+**状态（2026-10-31，第三轮任务 A 已实施）**：前 4 项（占 88% 的 250 ms 本地元数据 outbox 兜底 +
+`catalog_items` 增量 + 搜索重建 + 全局合集同步）已改成"写侧 `Notify` 事件驱动 + 10 s 低频兜底"，
+其中 3 个原本没有 `watch` 信号的循环（本地元数据 outbox、`catalog_items` 增量、搜索重建）同时补上了
+shutdown 并接入 `shutdown_background_workers_checked`。静态估算空闲唤醒 **476 → 约 80 次/分**，
+空闲查询 **980 → 约 132 条/分**；本机 arm64 复测上下文切换 **16 051 → 约 3 066 次/分（−81 %）**、
+CPU **0.39 → 0.08 s/分（−79 %）**，空闲仍零写入（方法与口径见审计文档 §6.8，含噪声说明）。
+新鲜度：进程内写入由写侧 `Notify` 立即唤醒；写侧未挂 signal 的存储写路径（多数不经过 metadata 写锁的
+单语句写）最坏由 10 s 兜底覆盖。搜索请求路径本身会先 drain 队列，搜索可见性不依赖后台循环；
+读模型默认开启（`LUX_READ_MODEL_MODE` 缺省为 `on`，见 `ReadModelMode::from_env`；提交 `ce0d8f63` 起）。其余要点仍是改造前的数据：
 
 - 静态估算空闲唤醒约 **476 次/分**，前 4 项占 88%：本地元数据 outbox 兜底 250 ms（240 次/分）、`catalog_items` 增量 1 s、
   搜索重建 1 s、全局合集同步 1 s（各 60 次/分）。
@@ -116,17 +129,25 @@ Emby 客户端与 Lux Web 播放器每 10 秒上报一次进度（`web/src/featu
 - 文档里的 A 类零风险调整（预计 476 → 约 60 次/分）：outbox 兜底改 5 到 10 s、catalog/搜索改 5 s 或写侧 Notify、
   合集同步改 5 s、播放会话回收和邮件/webhook 改事件驱动。**这些会改变读模型、搜索、合集的新鲜度语义，需要先确认。**
 - 另有 8 个后台循环没有保存 `JoinHandle`，关停时不能被 drain。
+- **已实施（后续任务 B）**：其余 8 个空闲周期循环收敛完成，明细与前后对比见
+  `docs/BACKGROUND-TASKS-AUDIT.md` §2.5。要点：Web 播放会话回收改为按最近到期时间睡眠（无会话时
+  60 s 兜底）、webhook 与邮件改为入队 `Notify` + 30 s 兜底（重试仍 5 s）、扫描指纹迁移在全部库完成后
+  转入 600 s 库列表兜底、用户清理 60 s → 3600 s、库根目录刷新 30 s → 300 s；游离状态重挂保持 300 s。
+  这八项合计空闲唤醒 45.4 → 5.7 次/分。关停方面新增 `UserCleanupWorker`、`LibraryWatchService`、
+  `DetachedStateReconcileWorker`、`WebPlaybackSessionService` 与 `PluginService` 的 drain 路径，
+  §2.3 里剩下的 3 个未接入关停的循环属于任务 A 的范围。读模型、搜索、合集三项的新鲜度语义
+  （A1–A3）本任务未动。
 
 ## 7. 其他线索（未验证或已评估后决定不做）
 
 | 线索 | 说明 |
 |---|---|
-| 读模型默认关闭 | `LUX_READ_MODEL_MODE` 默认 `off`（读取点在 `src/application/catalog.rs` 约 103 行）。读模型已实现；文档里首页读模型的 A/B 数据是 CPU 密集的主要出路。是否默认打开需要决定，并要在 NAS 上实测 |
-| 库页缓存刷新走慢路径？（**未验证**） | `src/application/catalog.rs` 约 304 行，库页缓存后台刷新服务构造时硬编码了 `read_model_mode: ReadModelMode::Off`。即使环境变量设为 `on`，后台刷新可能仍走慢路径。当时没有深究，需要确认是不是有意的 |
+| 读模型默认开启（**已确认**） | `LUX_READ_MODEL_MODE` 缺省即 `on`：`ReadModelMode::from_env` 的兜底分支是 `On`（`src/application/catalog.rs`），生产接线在 `src/api/legacy.rs` 用它构造 `CatalogService`；只有显式设为 `off` / `shadow` 才改变。此前本表写“默认 off”是过期信息。NAS 上的 A/B 实测仍未做 |
+| 库页缓存刷新走慢路径？（**已确认并修复**） | 结论：**不是有意设计**。`read_model_mode: ReadModelMode::Off` 是 LUX-865（`690839e8`）给 `CatalogService` 新增该字段时，为刷新线程那个结构体字面量补的默认值；此后 `with_read_model_mode` 只改请求路径那一个实例，两边的模式必然分叉。**已实施**：库页缓存以 `AtomicU8` 持有属主的模式，`with_read_model_mode` 同时写入，后台刷新按批读取并用它构造服务（`5dfbc113` 重构、`15594afe` 修复）；`shadow` 在刷新里**有意降级为 `off`**——shadow 服务的权威页与 off 相同，只多一次对比查询，刷新结果无人对比，理由写在 `LibraryPageCache::refresh_read_model_mode` 的注释里。回归测试 `library_page_refresh_uses_the_configured_read_model_mode`（夹具里权威行与派生行标题不同，刷新后仍读派生行）与 `library_page_refresh_skips_the_shadow_comparison` |
 | 管理员批量操作的 N+1 | `user_account_preferences`、`user_permission_copy`、`user_presets` 的循环逐个查。第一轮评估后**决定不改**：循环体是读后写，需要保留每用户事务和错误隔离。若要降到常数，需新增 `storage/users.rs` 的批量读接口（`find_users_by_ids` 与偏好版本批量读） |
 | 旧身份键修复逐集查询 | `repair_legacy_identity_keys`（`src/application/scanner/library.rs` 约 426 行）首次执行 5 万条语句、约 3.4 秒，在后台跑不阻塞监听，已有完成标记，只在首次升级时付一次。可考虑批量化 |
 | HLS 转码、刮削、元数据写入的数据库行为 | 第二轮**没有覆盖**，值得单独审计 |
-| 搜索 | 文档记录搜索 CPU 21 ms，成本在"匹配 5.6 万行 + 计算总数 + 排序"那条查询，不在 DTO 装配 |
+| 搜索 | 文档记录搜索 CPU 21 ms，成本在"匹配 5.6 万行 + 计算总数 + 排序"那条查询，不在 DTO 装配。**2026-10-31 已分析并实施 LUX-876**：`EXPLAIN` 与分步测量显示主要成本是 66k 个 FTS 候选行的回表（约 62 ms），总数只占 5%（11k 命中）到 19%（61k 命中）；已去掉取页查询里多余的第二次 `JOIN media_items`（61k 形状 −18%），详见 `docs/PERFORMANCE-SEARCH-ANALYSIS.md` |
 
 ## 8. 建议的推进顺序
 
@@ -151,6 +172,20 @@ Emby 客户端与 Lux Web 播放器每 10 秒上报一次进度（`web/src/featu
   - B1（`Database` 拆分试点，`docs/DATABASE-SPLIT.md`）：结论是**不全面推广**，仅对新代码采用；仓库对象无法参与调用方事务，对 metadata/media/catalog 这类事务密集的域风险高。W2 如果要做，需要考虑这一点。
 - **未做、但和本文有关的第一轮遗留：**
   - B4 行解码：存储层按列名取值约 1500 → 546 处，未做完的主要是 `catalog.rs` 约 179 处、`jobs/scan/manifest/state.rs` 55、`database_diagnostics.rs` 34 等。属于 panic 面清理，不影响性能。
+    **已实施（`catalog.rs` 与 `database_diagnostics.rs`，2026-11-01）**：12 个原子提交（`81dbfac8`、`dee5e204`、
+    `a8fbbaa3`、`f01a9580`、`79f4d55c`、`32b82766`、`9c164945`、`fead4cbd`、`542ff8ee`、`75607db1`、
+    `1af34658`、`c77ee7b6`），按域改成具名 `#[derive(sqlx::FromRow)]` 行结构体或类型元组 + 集中转换：
+    缩略图重试队列与本地缩略图源、库/目录计数与仪表盘、媒体章节、系列元数据源、章节检测源与待处理项、
+    全局合集卡片/源/成员、NFO 缓存、内容限制分类、图片候选/冲突/标签/库海报、Web 会话。
+    生产代码（`#[cfg(test)]` 模块之外）按列名取值计数：`catalog.rs` **176 → 4**、`database_diagnostics.rs`
+    **34 → 0**（口径：`.get("…")` / `.try_get("…")` 字面量读取，基线 `3dcf3c18`）。剩下的 4 处：
+    `fetch_catalog_search_page` 里的 3 处 `id`/`total`（搜索路径本任务约定不动，且 `total` 列只在
+    `include_total` 时出现，单一结构体需要两种查询形状），以及 `#[cfg(test)] explain_filtered_catalog_rows`
+    里已用 `try_get` + 错误映射的 1 处。
+    查询文本、列顺序、绑定顺序和查询结果均不变；投影漂移由 `row.get` 的 panic 变成 `StorageError`。
+    验收：`cargo test --locked --lib storage::` 544 passed / 0 failed / 37 ignored，`cargo fmt --all -- --check`、
+    `cargo clippy --locked --all-targets --all-features -- -D warnings`、`scripts/check-backend-branches.py`、
+    `scripts/check-migration-parity.py` 全绿。PostgreSQL 实机仍未跑（见第 10 节）。
   - 方案 B（setup 与业务路由分离）仍在进行，与性能无关，但改动 `src/api` 的路由与 `AppState`，新会话如果也改 `src/api/**` 要注意冲突，先看 `docs/SETUP-READY-SPLIT-DESIGN.md` 与 `git log`。
 
 ## 10. 未验证项汇总

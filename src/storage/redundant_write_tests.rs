@@ -733,3 +733,223 @@ async fn global_collection_resync_without_changes_does_not_rewrite_the_work_item
     assert_eq!(work_title, "Renamed");
     Ok(())
 }
+
+/// The collection reference row a repeated NFO rescan must leave alone.
+async fn collection_reference_stamp(
+    database: &Database,
+    item_id: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let stamp = sqlx::query_scalar::<_, i64>(
+        "SELECT updated_at FROM collection_item_references WHERE item_id = ?",
+    )
+    .bind(item_id)
+    .fetch_one(database.pool())
+    .await?;
+    Ok(stamp)
+}
+
+/// The collection sync generation a reference write queues; one DELETE+INSERT bumps it twice.
+async fn collection_sync_generation(
+    database: &Database,
+    collection_provider_id: &str,
+) -> Result<Option<i64>, Box<dyn std::error::Error>> {
+    let generation = sqlx::query_scalar::<_, i64>(
+        "SELECT generation FROM collection_sync_outbox
+         WHERE collection_provider = 'tmdb' AND collection_provider_id = ?",
+    )
+    .bind(collection_provider_id)
+    .fetch_optional(database.pool())
+    .await?;
+    Ok(generation)
+}
+
+fn movie_collection_reference(collection_provider_id: &str) -> GlobalMovieCollectionReference {
+    GlobalMovieCollectionReference {
+        movie_provider: "tmdb".to_owned(),
+        movie_provider_id: "movie-1".to_owned(),
+        collection_provider: "tmdb".to_owned(),
+        collection_provider_id: collection_provider_id.to_owned(),
+        collection_title: "Series".to_owned(),
+        sort_order: Some(2020),
+    }
+}
+
+#[tokio::test]
+async fn repeating_an_unchanged_collection_reference_does_not_rewrite_the_reference_row()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = movie_library_fixture().await?;
+    let database = &fixture.database;
+    insert_local_movie_source(&fixture, "ref-entry", "ref-source", "ref-item").await?;
+
+    let reference = movie_collection_reference("series-1");
+    database
+        .update_movie_collection_reference("ref-item", Some(&reference), None)
+        .await?;
+    // A DELETE+INSERT re-creates the row, so it resets this column to `unixepoch()`.
+    sqlx::query("UPDATE collection_item_references SET updated_at = ? WHERE item_id = ?")
+        .bind(WRITE_STAMP)
+        .bind("ref-item")
+        .execute(database.pool())
+        .await?;
+    let generation_before = collection_sync_generation(database, "series-1").await?;
+
+    database.reset_query_count();
+    database
+        .update_movie_collection_reference("ref-item", Some(&reference), None)
+        .await?;
+    assert_eq!(
+        database.query_count(),
+        1,
+        "an unchanged reference must cost one read and no DELETE/INSERT"
+    );
+    assert_eq!(
+        collection_reference_stamp(database, "ref-item").await?,
+        WRITE_STAMP,
+        "an unchanged reference must not be deleted and re-inserted"
+    );
+    assert_eq!(
+        collection_sync_generation(database, "series-1").await?,
+        generation_before,
+        "an unchanged reference must not queue another collection sync"
+    );
+
+    let changed = movie_collection_reference("series-2");
+    database
+        .update_movie_collection_reference("ref-item", Some(&changed), None)
+        .await?;
+    assert_ne!(
+        collection_reference_stamp(database, "ref-item").await?,
+        WRITE_STAMP,
+        "a changed reference must still be written"
+    );
+    assert!(
+        collection_sync_generation(database, "series-2")
+            .await?
+            .is_some(),
+        "a changed reference must still queue the new collection"
+    );
+    let stored_collection: String = sqlx::query_scalar::<_, _>(
+        "SELECT collection_provider_id FROM collection_item_references WHERE item_id = ?",
+    )
+    .bind("ref-item")
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stored_collection, "series-2");
+
+    // Dropping the reference must still delete the stored row.
+    database
+        .update_movie_collection_reference("ref-item", None, None)
+        .await?;
+    let remaining: i64 = sqlx::query_scalar::<_, _>(
+        "SELECT COUNT(*) FROM collection_item_references WHERE item_id = ?",
+    )
+    .bind("ref-item")
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        remaining, 0,
+        "a dropped reference must still delete the stored row"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_movie_without_a_collection_reference_does_not_open_a_write_transaction()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = movie_library_fixture().await?;
+    let database = &fixture.database;
+    insert_local_movie_source(&fixture, "plain-entry", "plain-source", "plain-item").await?;
+
+    database.reset_query_count();
+    database
+        .update_movie_collection_reference("plain-item", None, None)
+        .await?;
+    assert_eq!(
+        database.query_count(),
+        1,
+        "an item without a stored reference must cost one read and no write transaction"
+    );
+    let rows: i64 = sqlx::query_scalar::<_, _>(
+        "SELECT COUNT(*) FROM collection_item_references WHERE item_id = ?",
+    )
+    .bind("plain-item")
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(rows, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn repeating_an_unchanged_metadata_selection_does_not_rewrite_the_item()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = movie_library_fixture().await?;
+    let database = &fixture.database;
+    insert_local_movie_source(&fixture, "select-entry", "select-source", "select-item").await?;
+    sqlx::query(
+        "INSERT INTO metadata_candidates (
+             id, item_id, provider, provider_id, candidate_json, score, status
+         ) VALUES ('select-candidate', 'select-item', 'TMDB', 'movie-1', '{}', 100, 'PENDING')",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let update = |overview: Option<&'static str>| SelectedMetadataUpdate {
+        item_id: "select-item",
+        candidate_id: "select-candidate",
+        title: "Movie",
+        original_title: Some("Movie"),
+        overview,
+        production_year: Some(2020),
+        premiere_date: None,
+        last_air_date: None,
+        status: None,
+        original_language: None,
+        rating: None,
+        rating_source: None,
+        provider_ids_json: r#"{"tmdb":"movie-1"}"#,
+        metadata_scraper_id: Some("tmdb"),
+        metadata_fingerprint: b"metadata-1",
+        provenance_json: "{}",
+        locked_fields_json: "[]",
+        poster_fallback_required: false,
+        // The candidate stays PENDING, so a background refresh can select it again.
+        keep_pending: true,
+    };
+
+    assert!(database.select_metadata_candidate(update(None)).await?);
+    stamp_media_item(database, "select-item").await?;
+    let outbox_before = outbox_rows(database, "select-item").await?;
+
+    assert!(database.select_metadata_candidate(update(None)).await?);
+    assert_eq!(
+        media_item_updated_at(database, "select-item").await?,
+        WRITE_STAMP,
+        "re-selecting identical metadata must not rewrite the item row"
+    );
+    assert_eq!(
+        outbox_rows(database, "select-item").await?,
+        outbox_before,
+        "re-selecting identical metadata must not fire the catalog outbox trigger"
+    );
+
+    assert!(
+        database
+            .select_metadata_candidate(update(Some("A new overview")))
+            .await?
+    );
+    assert_ne!(
+        media_item_updated_at(database, "select-item").await?,
+        WRITE_STAMP,
+        "changed metadata must still be written"
+    );
+    assert!(
+        outbox_rows(database, "select-item").await? > outbox_before,
+        "changed metadata must still fire the catalog outbox trigger"
+    );
+    let stored_overview: Option<String> =
+        sqlx::query_scalar::<_, _>("SELECT overview FROM media_items WHERE id = 'select-item'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(stored_overview.as_deref(), Some("A new overview"));
+    Ok(())
+}

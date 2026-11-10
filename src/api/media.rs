@@ -1,4 +1,8 @@
 use super::*;
+use crate::application::image_variants::{
+    ImageVariantIntent, ImageVariantRequest, ImageVariantSelection, ImageVariantService,
+    OriginalImageReason, source_pixel_dimensions,
+};
 use crate::application::playback::session::EMBY_DIRECT_STREAM_TICKET_VERSION;
 
 const LUX_SEARCH_ITEM_TYPES: [&str; 3] = ["MOVIE", "SERIES", "VIDEO"];
@@ -444,6 +448,54 @@ pub(super) async fn lux_list_continue_watching(
     }
 }
 
+pub(super) async fn lux_list_watch_history(
+    headers: HeaderMap,
+    Query(query): Query<LuxPageQuery>,
+    State(state): State<ReadyAppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let (offset, limit) = match page_params(
+        Some(query.page.unwrap_or(1)),
+        Some(query.page_size.unwrap_or(24)),
+    ) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let catalog = state.catalog();
+    let database = state.database();
+    match catalog
+        .list_watch_history(
+            AccessPrincipal::new(user.id, user.is_admin),
+            &user.id.to_string(),
+            offset,
+            limit,
+        )
+        .await
+    {
+        Ok(page) => {
+            match lux_catalog_page_json_for_user(database, &user.id.to_string(), &page).await {
+                Ok(body) => Json(body).into_response(),
+                Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
+        }
+        Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+            StatusCode::FORBIDDEN.into_response()
+        }
+    }
+}
+
 pub(super) async fn lux_list_library_latest(
     headers: HeaderMap,
     Path(library_id): Path<String>,
@@ -519,9 +571,19 @@ pub(super) struct EmbySearchQuery {
     api_key: Option<String>,
     #[serde(rename = "SearchTerm", alias = "searchTerm")]
     search_term: Option<String>,
-    #[serde(rename = "StartIndex", alias = "startIndex")]
+    #[serde(
+        rename = "StartIndex",
+        alias = "startIndex",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     start_index: Option<i64>,
-    #[serde(rename = "Limit", alias = "limit")]
+    #[serde(
+        rename = "Limit",
+        alias = "limit",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     limit: Option<i64>,
 }
 
@@ -1062,6 +1124,450 @@ pub(super) async fn lux_get_item(
     }
 }
 
+/// Page bounds of the native Lux similar-items route: 50 items by default, at most 1000 per
+/// page, with a separate 1-based `page` parameter. The candidate pool itself stays bounded at
+/// 10 source genres x 200 candidates; paging reaches the rest of it instead of raising `limit`.
+const LUX_SIMILAR_DEFAULT_LIMIT: i64 = 50;
+const LUX_SIMILAR_MAX_LIMIT: i64 = 1_000;
+
+#[derive(Deserialize, Default)]
+pub(super) struct LuxSimilarQuery {
+    /// Read as a raw string so an explicit empty value (`?limit=`) means "not provided" instead of
+    /// a deserialization error; non-integers still answer 400. Like the other Lux list endpoints a
+    /// page size must be positive, hence `0` is rejected together with negatives and values above
+    /// the cap.
+    #[serde(default)]
+    limit: Option<String>,
+    /// Accepted as an alias for `limit` (the Web client sends `pageSize`); when both are present
+    /// they must agree, otherwise the request answers 400.
+    #[serde(rename = "pageSize", alias = "page_size", default)]
+    page_size: Option<String>,
+    /// 1-based page; an empty value is treated as absent (page 1). The offset is `(page - 1) *
+    /// limit`, computed with `checked_mul` so an absurd page answers 400 instead of overflowing.
+    #[serde(default)]
+    page: Option<String>,
+}
+
+fn optional_similar_page_size(raw: Option<&str>) -> Result<Option<i64>, &'static str> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    raw.parse::<i64>()
+        .map(Some)
+        .map_err(|_| "相似条目分页参数无效")
+}
+
+/// Resolves the page size from `limit` and its `pageSize` alias. Empty values are absent; if both
+/// are present they must agree. The bounds stay the single `limit` contract (50 default, 1-1000);
+/// `pageSize` adds no separate 1-100 rule.
+fn lux_similar_limit(limit: Option<&str>, page_size: Option<&str>) -> Result<i64, &'static str> {
+    let limit = optional_similar_page_size(limit)?;
+    let page_size = optional_similar_page_size(page_size)?;
+    let limit = match (limit, page_size) {
+        (Some(limit), Some(page_size)) if limit != page_size => {
+            return Err("相似条目分页参数无效");
+        }
+        (Some(limit), _) => limit,
+        (None, Some(page_size)) => page_size,
+        (None, None) => LUX_SIMILAR_DEFAULT_LIMIT,
+    };
+    if !(1..=LUX_SIMILAR_MAX_LIMIT).contains(&limit) {
+        return Err("相似条目分页参数无效");
+    }
+    Ok(limit)
+}
+
+fn lux_similar_page(raw: Option<&str>) -> Result<i64, &'static str> {
+    let Some(raw) = raw else {
+        return Ok(1);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(1);
+    }
+    let page = raw.parse::<i64>().map_err(|_| "相似条目分页参数无效")?;
+    if page < 1 {
+        return Err("相似条目分页参数无效");
+    }
+    Ok(page)
+}
+
+/// Authoritative similar-items lookup shared by the native Lux route and the Emby compatibility
+/// adapter. `CatalogService::list_similar_items` owns the ranking, the ACL and content-restriction
+/// filtering, the bounded candidate pool and `total`; neither protocol re-implements that query.
+///
+/// `None` means the item does not exist or the principal cannot see it, exactly like
+/// `GET /api/v1/items/{item_id}`.
+pub(super) async fn similar_items_page(
+    state: &ReadyAppState,
+    principal: AccessPrincipal,
+    item_id: &str,
+    offset: i64,
+    limit: i64,
+) -> Result<Option<CatalogPage>, CatalogError> {
+    state
+        .catalog()
+        .list_similar_items(principal, item_id, offset, limit)
+        .await
+}
+
+/// `GET /api/v1/items/{item_id}/similar?limit=50&page=1`.
+///
+/// The response uses the regular Lux list envelope `{items,page,pageSize,hasNext,total}` and the
+/// Lux item DTO, never the Emby one. `page` is the requested 1-based page and `pageSize` is the
+/// effective `limit`; `total` is the bounded candidate-pool count returned by the shared service
+/// (at most 10 source genres x 200 candidates, i.e. 2000). `offset = (page - 1) * limit` is
+/// applied after the bounded union has been ranked, and `hasNext` uses the standard
+/// `offset + items.len() < total` rule. An offset past the pool answers 200 with an empty page.
+/// The endpoint accepts `limit` (or its alias `pageSize`) and `page`; see `LuxSimilarQuery`.
+pub(super) async fn lux_get_similar(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Query(query): Query<LuxSimilarQuery>,
+    State(state): State<ReadyAppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let limit = match lux_similar_limit(query.limit.as_deref(), query.page_size.as_deref()) {
+        Ok(limit) => limit,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let page_number = match lux_similar_page(query.page.as_deref()) {
+        Ok(page) => page,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(offset) = page_number
+        .checked_sub(1)
+        .and_then(|pages| pages.checked_mul(limit))
+    else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "相似条目分页参数无效",
+        )
+        .into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let database = state.database();
+    match similar_items_page(&state, principal, &item_id, offset, limit).await {
+        Ok(Some(page)) => {
+            match lux_catalog_page_json_for_user(database, &user.id.to_string(), &page).await {
+                Ok(body) => Json(body).into_response(),
+                Err(_) => api_error(
+                    &headers,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    lux::ApiErrorCode::DatabaseUnavailable,
+                    "数据库暂时不可用",
+                )
+                .into_response(),
+            }
+        }
+        Ok(None) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "媒体条目不存在",
+        )
+        .into_response(),
+        Err(CatalogError::Storage(_)) => api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "数据库暂时不可用",
+        )
+        .into_response(),
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "媒体条目不存在",
+        )
+        .into_response(),
+    }
+}
+
+/// One distinct tag of `GET /api/v1/tags`.
+///
+/// Only the display name is public: the storage projection also carries the `name_key` and the
+/// visible item count, and neither is part of the contract.
+#[derive(Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-bindings",
+    ts(export, export_to = "web/src/lib/api/generated/")
+)]
+pub(super) struct LuxTag {
+    pub(super) name: String,
+}
+
+/// Body of `GET /api/v1/tags`.
+///
+/// The pagination field names follow the other `/api/v1` lists (`page`, `pageSize`, `total`); the
+/// collection is `tags` because the endpoint returns tags rather than catalog items.
+#[derive(Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-bindings",
+    ts(export, export_to = "web/src/lib/api/generated/")
+)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct LuxTagsResponse {
+    pub(super) tags: Vec<LuxTag>,
+    pub(super) page: i64,
+    pub(super) page_size: i64,
+    pub(super) total: i64,
+}
+
+/// Page bounds of the native Lux tags route: 50 tags by default, at most 1000 per page.
+const LUX_TAGS_DEFAULT_PAGE_SIZE: i64 = 50;
+
+/// Single-valued query parameters of `GET /api/v1/tags`.
+///
+/// `page`, `pageSize` and `libraryId` are parsed from the raw query string rather than through
+/// axum's `Query` extractor, so a repeated parameter answers the regular `400 INVALID_REQUEST`
+/// JSON envelope instead of a plain-text extractor rejection. `itemType` is the one multi-valued
+/// parameter and is collected separately by [`lux_tags_item_types`].
+#[derive(Default)]
+pub(super) struct LuxTagsQuery {
+    /// 1-based page; an empty value is treated as absent (page 1).
+    page: Option<String>,
+    page_size: Option<String>,
+    /// Restricts the list to one library; empty means every visible library.
+    library_id: Option<String>,
+}
+
+impl LuxTagsQuery {
+    /// Parses the raw query and rejects a single-valued parameter that appears more than once.
+    fn parse(raw_query: &RawQuery) -> Result<Self, &'static str> {
+        let mut query = Self::default();
+        let Some(raw) = raw_query.0.as_deref() else {
+            return Ok(query);
+        };
+        for (name, value) in url::form_urlencoded::parse(raw.as_bytes()) {
+            let slot = match name.as_ref() {
+                "page" => &mut query.page,
+                "pageSize" => &mut query.page_size,
+                "libraryId" => &mut query.library_id,
+                // `itemType` may repeat and unknown parameters are ignored, like the other Lux
+                // list endpoints.
+                _ => continue,
+            };
+            if slot.is_some() {
+                return Err("标签查询参数重复");
+            }
+            *slot = Some(value.into_owned());
+        }
+        Ok(query)
+    }
+}
+
+fn lux_tags_page_size(raw: Option<&str>) -> Result<i64, &'static str> {
+    let Some(raw) = raw else {
+        return Ok(LUX_TAGS_DEFAULT_PAGE_SIZE);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(LUX_TAGS_DEFAULT_PAGE_SIZE);
+    }
+    let page_size = raw.parse::<i64>().map_err(|_| "标签分页参数无效")?;
+    // The service clamps an oversized limit; the route rejects it instead, so a client cannot
+    // believe it received 1000 tags while asking for more.
+    if !(1..=crate::application::catalog::TAGS_MAX_PAGE_LIMIT).contains(&page_size) {
+        return Err("标签分页参数无效");
+    }
+    Ok(page_size)
+}
+
+fn lux_tags_page(raw: Option<&str>) -> Result<i64, &'static str> {
+    let Some(raw) = raw else {
+        return Ok(1);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(1);
+    }
+    let page = raw.parse::<i64>().map_err(|_| "标签分页参数无效")?;
+    if page < 1 {
+        return Err("标签分页参数无效");
+    }
+    Ok(page)
+}
+
+/// Canonicalizes the optional `libraryId`. A malformed value is answered as not found (never as a
+/// 400), because the contract only distinguishes "not visible" from "visible".
+fn lux_tags_library_id(raw: Option<&str>) -> Result<Option<String>, ()> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    raw.parse::<crate::domain::ids::LibraryId>()
+        .map(|id| Some(id.to_string()))
+        .map_err(|_| ())
+}
+
+/// Collects every `itemType` value, so the parameter may repeat (`itemType=A&itemType=B`) or use
+/// commas (`itemType=A,B`), then applies the same normalization as
+/// `/api/v1/libraries/{library_id}/items`: names are case-insensitive, unknown values are ignored,
+/// an empty value means every type and an all-unknown value matches no rows.
+fn lux_tags_item_types(raw_query: &RawQuery) -> Vec<String> {
+    let mut values = Vec::new();
+    if let Some(query) = raw_query.0.as_deref() {
+        for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            if name == "itemType" {
+                values.push(value.into_owned());
+            }
+        }
+    }
+    emby_item_types_from_value(Some(values.join(",").as_str()))
+}
+
+/// `GET /api/v1/tags?libraryId=...&itemType=...&page=1&pageSize=50`.
+///
+/// Returns the distinct tags of the items the caller can see, ordered by the case-insensitive
+/// name key, so `Star Wars` and `star wars` are one entry. `CatalogService::list_tags` owns the
+/// library ACL, the content restrictions, the projection query and the total; the handler only
+/// parses the query, converts `page` into an offset and maps the storage rows to the Lux DTO.
+///
+/// An unknown or inaccessible `libraryId` answers 404. Invalid pagination answers 400, and an
+/// oversized `pageSize` is rejected instead of being clamped. A repeated `page`, `pageSize` or
+/// `libraryId` also answers 400 with the same envelope, while `itemType` may repeat.
+pub(super) async fn lux_list_tags(
+    headers: HeaderMap,
+    raw_query: RawQuery,
+    State(state): State<ReadyAppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let query = match LuxTagsQuery::parse(&raw_query) {
+        Ok(query) => query,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let page_size = match lux_tags_page_size(query.page_size.as_deref()) {
+        Ok(page_size) => page_size,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let page = match lux_tags_page(query.page.as_deref()) {
+        Ok(page) => page,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(offset) = page
+        .checked_sub(1)
+        .and_then(|pages| pages.checked_mul(page_size))
+    else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "标签分页参数无效",
+        )
+        .into_response();
+    };
+    let library_id = match lux_tags_library_id(query.library_id.as_deref()) {
+        Ok(library_id) => library_id,
+        Err(()) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "媒体库不存在或不可访问",
+            )
+            .into_response();
+        }
+    };
+    let item_types = lux_tags_item_types(&raw_query);
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    match state
+        .catalog()
+        .list_tags(
+            principal,
+            library_id.as_deref(),
+            &item_types,
+            offset,
+            page_size,
+        )
+        .await
+    {
+        Ok((tags, total)) => Json(LuxTagsResponse {
+            tags: tags
+                .into_iter()
+                .map(|tag| LuxTag { name: tag.name })
+                .collect(),
+            page,
+            page_size,
+            total,
+        })
+        .into_response(),
+        Err(CatalogError::Storage(_)) => api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "数据库暂时不可用",
+        )
+        .into_response(),
+        // Unknown, disabled, inaccessible and malformed library ids all look the same, so the
+        // response never reveals whether a library exists.
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "媒体库不存在或不可访问",
+        )
+        .into_response(),
+    }
+}
+
 pub(super) struct LuxItemDetail {
     pub(super) body: Value,
     pub(super) user_state: Option<crate::storage::StoredUserItemState>,
@@ -1596,7 +2102,7 @@ pub(super) async fn lux_image(
     let images = state.images();
     serve_image(
         images,
-        Some(state.image_variants()),
+        state.image_variants(),
         principal,
         &headers,
         &method,
@@ -1605,9 +2111,12 @@ pub(super) async fn lux_image(
             image_type: &image_type,
             image_index: 0,
         },
-        width,
+        ImageVariantIntent::exact(
+            width.map_or(ImageVariantRequest::Original, ImageVariantRequest::Width),
+        ),
     )
     .await
+    .response
 }
 
 pub(super) async fn lux_image_at_index(
@@ -1632,7 +2141,7 @@ pub(super) async fn lux_image_at_index(
     let images = state.images();
     serve_image(
         images,
-        Some(state.image_variants()),
+        state.image_variants(),
         principal,
         &headers,
         &method,
@@ -1641,9 +2150,12 @@ pub(super) async fn lux_image_at_index(
             image_type: &image_type,
             image_index,
         },
-        width,
+        ImageVariantIntent::exact(
+            width.map_or(ImageVariantRequest::Original, ImageVariantRequest::Width),
+        ),
     )
     .await
+    .response
 }
 
 fn lux_image_variant_width(
@@ -1915,7 +2427,11 @@ pub(super) async fn lux_danmaku_info(
     }
     let service = state.danmaku();
     match service
-        .read_registered_sidecar_for_source(&item_id, query.source_id.as_deref())
+        .read_for_playback(
+            &item_id,
+            query.source_id.as_deref(),
+            DanmakuSidecarScope::RegisteredTrack,
+        )
         .await
     {
         Ok(Some(_)) => Json(danmaku_info_json(
@@ -1943,7 +2459,11 @@ pub(super) async fn lux_danmaku_raw(
     }
     let service = state.danmaku();
     match service
-        .read_registered_sidecar_for_source(&item_id, query.source_id.as_deref())
+        .read_for_playback(
+            &item_id,
+            query.source_id.as_deref(),
+            DanmakuSidecarScope::RegisteredTrack,
+        )
         .await
     {
         Ok(Some(bytes)) => Response::builder()
@@ -2130,9 +2650,14 @@ pub(super) async fn emby_image(
     method: Method,
     Path((item_id, image_type)): Path<(String, String)>,
     Query(query): Query<EmbyTokenQuery>,
+    RawQuery(raw_query): RawQuery,
     State(state): State<ReadyAppState>,
 ) -> Response {
     let internal_item_id = emby_internal_id(&item_id);
+    // Emby clients describe the size they render instead of the exact variant width the Web
+    // client sends; the parsed box only ever narrows the answer to a cached variant.
+    let display = emby_handlers::EmbyImageDisplayQuery::parse(raw_query.as_deref());
+    let variant_intent = display.variant_intent();
     let filmly_compat = state.filmly_image_compat_mode == FilmlyImageCompatMode::Compat
         && is_filmly_image_request(&headers)
         && query.tag.is_none();
@@ -2140,6 +2665,23 @@ pub(super) async fn emby_image(
         Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
+    // Filmly's native image loader drops Emby auth headers and image tags. Its Windows
+    // WebView can also issue the backdrop request with a browser UA, so keep the exception
+    // limited to untagged backdrop artwork; media streams and tagged images remain gated.
+    let untagged_backdrop_compat = state.filmly_image_compat_mode == FilmlyImageCompatMode::Compat
+        && principal.is_none()
+        && query.tag.is_none()
+        && normalize_image_type(&image_type) == Some("FANART");
+    let filmly_branch = (filmly_compat || untagged_backdrop_compat) && principal.is_none();
+    // One desensitized record per served image request; it reports the answer and never the
+    // caller's token, URL, query string, Cookie, IP, full User-Agent or item id.
+    let diagnostics = emby_image_diag::EmbyImageDiagnostics::for_request(
+        &headers,
+        &display,
+        &image_type,
+        query.tag.is_some(),
+        emby_image_diag::EmbyImageAuthMode::for_request(principal.is_some(), filmly_branch),
+    );
     if normalize_image_type(&image_type) == Some("POSTER")
         && let Some(response) = serve_emby_library_cover(
             &state,
@@ -2152,7 +2694,7 @@ pub(super) async fn emby_image(
         )
         .await
     {
-        return response;
+        return record_served_image(&diagnostics, ServedImage::uncached(response));
     }
     if (principal.is_some() || query.tag.is_some())
         && let Some(response) = serve_emby_person_item_image(
@@ -2166,32 +2708,20 @@ pub(super) async fn emby_image(
         )
         .await
     {
-        return response;
+        return record_served_image(&diagnostics, ServedImage::uncached(response));
     }
     let images = state.images();
-    // Filmly's native image loader drops Emby auth headers and image tags. Its Windows
-    // WebView can also issue the backdrop request with a browser UA, so keep the exception
-    // limited to untagged backdrop artwork; media streams and tagged images remain gated.
-    let untagged_backdrop_compat = state.filmly_image_compat_mode == FilmlyImageCompatMode::Compat
-        && principal.is_none()
-        && query.tag.is_none()
-        && normalize_image_type(&image_type) == Some("FANART");
-    if (filmly_compat || untagged_backdrop_compat) && principal.is_none() {
-        return serve_filmly_compat_image(
-            images,
-            &headers,
-            &method,
-            &internal_item_id,
-            &image_type,
-            0,
-        )
-        .await;
+    if filmly_branch {
+        let response =
+            serve_filmly_compat_image(images, &headers, &method, &internal_item_id, &image_type, 0)
+                .await;
+        return record_served_image(&diagnostics, ServedImage::uncached(response));
     }
-    match principal {
+    let served = match principal {
         Some(principal) => {
             serve_image(
                 images,
-                None,
+                state.image_variants(),
                 principal,
                 &headers,
                 &method,
@@ -2200,23 +2730,28 @@ pub(super) async fn emby_image(
                     image_type: &image_type,
                     image_index: 0,
                 },
-                None,
+                variant_intent,
             )
             .await
         }
         None => {
             serve_tagged_image(
                 images,
+                state.image_variants(),
                 &headers,
                 &method,
-                &internal_item_id,
-                &image_type,
-                0,
-                query.tag.as_deref(),
+                ServeTaggedImageTarget {
+                    item_id: &internal_item_id,
+                    image_type: &image_type,
+                    image_index: 0,
+                    tag: query.tag.as_deref(),
+                },
+                variant_intent,
             )
             .await
         }
-    }
+    };
+    record_served_image(&diagnostics, served)
 }
 
 pub(super) fn is_filmly_image_request(headers: &HeaderMap) -> bool {
@@ -2256,12 +2791,15 @@ pub(super) async fn emby_image_at_index(
     method: Method,
     Path((item_id, image_type, image_index)): Path<(String, String, String)>,
     Query(query): Query<EmbyTokenQuery>,
+    RawQuery(raw_query): RawQuery,
     State(state): State<ReadyAppState>,
 ) -> Response {
     let Ok(image_index) = image_index.parse::<i64>() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let internal_item_id = emby_internal_id(&item_id);
+    let display = emby_handlers::EmbyImageDisplayQuery::parse(raw_query.as_deref());
+    let variant_intent = display.variant_intent();
     let filmly_compat = state.filmly_image_compat_mode == FilmlyImageCompatMode::Compat
         && is_filmly_image_request(&headers)
         && query.tag.is_none();
@@ -2269,6 +2807,14 @@ pub(super) async fn emby_image_at_index(
         Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
+    let filmly_branch = filmly_compat && principal.is_none();
+    let diagnostics = emby_image_diag::EmbyImageDiagnostics::for_request(
+        &headers,
+        &display,
+        &image_type,
+        query.tag.is_some(),
+        emby_image_diag::EmbyImageAuthMode::for_request(principal.is_some(), filmly_branch),
+    );
     if normalize_image_type(&image_type) == Some("POSTER")
         && let Some(response) = serve_emby_library_cover(
             &state,
@@ -2281,7 +2827,7 @@ pub(super) async fn emby_image_at_index(
         )
         .await
     {
-        return response;
+        return record_served_image(&diagnostics, ServedImage::uncached(response));
     }
     if (principal.is_some() || query.tag.is_some())
         && let Some(response) = serve_emby_person_item_image(
@@ -2295,11 +2841,11 @@ pub(super) async fn emby_image_at_index(
         )
         .await
     {
-        return response;
+        return record_served_image(&diagnostics, ServedImage::uncached(response));
     }
     let images = state.images();
-    if filmly_compat && principal.is_none() {
-        return serve_filmly_compat_image(
+    if filmly_branch {
+        let response = serve_filmly_compat_image(
             images,
             &headers,
             &method,
@@ -2308,12 +2854,13 @@ pub(super) async fn emby_image_at_index(
             image_index,
         )
         .await;
+        return record_served_image(&diagnostics, ServedImage::uncached(response));
     }
-    match principal {
+    let served = match principal {
         Some(principal) => {
             serve_image(
                 images,
-                None,
+                state.image_variants(),
                 principal,
                 &headers,
                 &method,
@@ -2322,23 +2869,28 @@ pub(super) async fn emby_image_at_index(
                     image_type: &image_type,
                     image_index,
                 },
-                None,
+                variant_intent,
             )
             .await
         }
         None => {
             serve_tagged_image(
                 images,
+                state.image_variants(),
                 &headers,
                 &method,
-                &internal_item_id,
-                &image_type,
-                image_index,
-                query.tag.as_deref(),
+                ServeTaggedImageTarget {
+                    item_id: &internal_item_id,
+                    image_type: &image_type,
+                    image_index,
+                    tag: query.tag.as_deref(),
+                },
+                variant_intent,
             )
             .await
         }
-    }
+    };
+    record_served_image(&diagnostics, served)
 }
 
 async fn optional_emby_access_principal(
@@ -2492,6 +3044,7 @@ pub(super) async fn emby_subtitle_with_source(
         return StatusCode::BAD_REQUEST.into_response();
     };
     let item_id = emby_internal_id(&item_id);
+    let media_source_id = emby_internal_source_id(&media_source_id);
     serve_subtitle(
         &state,
         principal,
@@ -2499,6 +3052,25 @@ pub(super) async fn emby_subtitle_with_source(
         &item_id,
         Some(&media_source_id),
         stream_index,
+    )
+    .await
+}
+
+/// `Stream.<format>` variant advertised in `DeliveryUrl`. The suffix is only a format hint for
+/// clients; the track is served exactly like the extensionless route.
+pub(super) async fn emby_subtitle_with_source_and_format(
+    headers: HeaderMap,
+    method: Method,
+    Path((item_id, media_source_id, stream_index, _format)): Path<(String, String, String, String)>,
+    query: Query<EmbyTokenQuery>,
+    state: State<ReadyAppState>,
+) -> Response {
+    emby_subtitle_with_source(
+        headers,
+        method,
+        Path((item_id, media_source_id, stream_index)),
+        query,
+        state,
     )
     .await
 }
@@ -2595,6 +3167,12 @@ pub(super) fn emby_stream_query_from_raw(raw_query: RawQuery) -> EmbyStreamQuery
         }
     }
 
+    // External proxies echo whatever id PlaybackInfo returned. Resolve it once here so every
+    // downstream lookup (authorization, signed-ticket verification, subtitle routes) sees the
+    // stored identifier, while UUIDs from older clients and cached payloads keep working.
+    query.media_source_id = query
+        .media_source_id
+        .map(|source_id| emby_internal_source_id(&source_id));
     query
 }
 
@@ -2833,6 +3411,7 @@ pub(super) async fn emby_stream_with_source(
 ) -> Response {
     let query = emby_stream_query_from_raw(raw_query);
     let item_id = emby_internal_id(&item_id);
+    let media_source_id = emby_internal_source_id(&media_source_id);
     let principal =
         match emby_stream_principal(&headers, &state, &query, &item_id, Some(&media_source_id))
             .await
@@ -2863,6 +3442,7 @@ pub(super) async fn emby_stream_with_source_and_container(
     let query = emby_stream_query_from_raw(raw_query);
     let (container, query) = emby_stream_query_from_path(query, &container);
     let item_id = emby_internal_id(&item_id);
+    let media_source_id = emby_internal_source_id(&media_source_id);
     let principal =
         match emby_stream_principal(&headers, &state, &query, &item_id, Some(&media_source_id))
             .await
@@ -3595,22 +4175,67 @@ pub(super) struct ServeImageTarget<'a> {
     pub image_index: i64,
 }
 
+/// One served image response plus the variant decision the Emby diagnostic log reports.
+///
+/// `selection` stays `None` when the request ended without an image (401/404/403/503): no stored
+/// bytes were served in that case, so there is no original-image reason to report.
+pub(super) struct ServedImage {
+    pub response: Response,
+    pub selection: Option<ImageVariantSelection>,
+}
+
+/// Whether a response from a path that never consults the variant cache actually carries an image.
+///
+/// Error answers (401/403/404/5xx) resolved no image at all, so the diagnostic must stay silent;
+/// 2xx and 304 carry the stored bytes or their validator.
+fn response_carries_image(status: StatusCode) -> bool {
+    status.is_success() || status == StatusCode::NOT_MODIFIED
+}
+
+impl ServedImage {
+    /// Response from a path that never consults the variant cache (library cover, person image,
+    /// Filmly compatibility). It reports the stored original only when it really served one.
+    fn uncached(response: Response) -> Self {
+        let selection = response_carries_image(response.status()).then_some(
+            ImageVariantSelection::Original(OriginalImageReason::VariantUnavailable),
+        );
+        Self {
+            response,
+            selection,
+        }
+    }
+
+    fn status(response: Response) -> Self {
+        Self {
+            response,
+            selection: None,
+        }
+    }
+
+    fn variant(response: Response, width: u32) -> Self {
+        Self {
+            response,
+            selection: Some(ImageVariantSelection::Variant(width)),
+        }
+    }
+}
+
 pub(super) async fn serve_image(
     images: &ImageService,
-    variants: Option<&Arc<crate::application::image_variants::ImageVariantService>>,
+    variants: &Arc<ImageVariantService>,
     principal: AccessPrincipal,
     headers: &HeaderMap,
     method: &Method,
     target: ServeImageTarget<'_>,
-    width: Option<u32>,
-) -> Response {
+    intent: ImageVariantIntent,
+) -> ServedImage {
     let ServeImageTarget {
         item_id,
         image_type,
         image_index,
     } = target;
     let Some(image_type) = normalize_image_type(image_type) else {
-        return StatusCode::NOT_FOUND.into_response();
+        return ServedImage::status(StatusCode::NOT_FOUND.into_response());
     };
     let image = match images
         .resolve(principal, item_id, image_type, image_index)
@@ -3622,53 +4247,93 @@ pub(super) async fn serve_image(
             .await
         {
             Ok(Some(image)) => image,
-            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Ok(None) => return ServedImage::status(StatusCode::NOT_FOUND.into_response()),
             Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
-                return StatusCode::FORBIDDEN.into_response();
+                return ServedImage::status(StatusCode::FORBIDDEN.into_response());
             }
-            Err(ImageError::Io { .. }) => return StatusCode::NOT_FOUND.into_response(),
+            Err(ImageError::Io { .. }) => {
+                return ServedImage::status(StatusCode::NOT_FOUND.into_response());
+            }
             Err(ImageError::Storage(_)) => {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                return ServedImage::status(StatusCode::SERVICE_UNAVAILABLE.into_response());
             }
         },
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => return ServedImage::status(StatusCode::NOT_FOUND.into_response()),
         Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
-            return StatusCode::FORBIDDEN.into_response();
+            return ServedImage::status(StatusCode::FORBIDDEN.into_response());
         }
-        Err(ImageError::Io { .. }) => return StatusCode::NOT_FOUND.into_response(),
-        Err(ImageError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(ImageError::Io { .. }) => {
+            return ServedImage::status(StatusCode::NOT_FOUND.into_response());
+        }
+        Err(ImageError::Storage(_)) => {
+            return ServedImage::status(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        }
     };
-    if let (Some(width), Some(variants)) = (width, variants)
-        && let Some(variant) = variants.resolve_variant(item_id, &image, width).await
-        && let Some(response) = serve_variant_file(&variant, headers, method).await
-    {
-        return response;
+    let selection = match intent.selection(source_pixel_dimensions(&image)) {
+        ImageVariantSelection::Variant(width) => {
+            match variants.resolve_variant(item_id, &image, width).await {
+                Some(variant) => {
+                    if let Some(response) = serve_variant_file(&variant, headers, method).await {
+                        return ServedImage::variant(response, width);
+                    }
+                    ImageVariantSelection::Original(OriginalImageReason::VariantUnavailable)
+                }
+                None => ImageVariantSelection::Original(OriginalImageReason::VariantUnavailable),
+            }
+        }
+        original => original,
+    };
+    ServedImage {
+        response: serve_image_file(
+            &image.path,
+            image.content_type,
+            image.content_length,
+            &image.etag,
+            headers,
+            method,
+        )
+        .await,
+        selection: Some(selection),
     }
-    serve_image_file(
-        &image.path,
-        image.content_type,
-        image.content_length,
-        &image.etag,
-        headers,
-        method,
-    )
-    .await
+}
+
+/// Emits the one diagnostic event for a served image and returns the response untouched.
+fn record_served_image(
+    diagnostics: &emby_image_diag::EmbyImageDiagnostics,
+    served: ServedImage,
+) -> Response {
+    if let Some(selection) = served.selection {
+        diagnostics.record(selection);
+    }
+    served.response
+}
+
+pub(super) struct ServeTaggedImageTarget<'a> {
+    pub item_id: &'a str,
+    pub image_type: &'a str,
+    pub image_index: i64,
+    pub tag: Option<&'a str>,
 }
 
 pub(super) async fn serve_tagged_image(
     images: &ImageService,
+    variants: &Arc<ImageVariantService>,
     headers: &HeaderMap,
     method: &Method,
-    item_id: &str,
-    image_type: &str,
-    image_index: i64,
-    tag: Option<&str>,
-) -> Response {
+    target: ServeTaggedImageTarget<'_>,
+    intent: ImageVariantIntent,
+) -> ServedImage {
+    let ServeTaggedImageTarget {
+        item_id,
+        image_type,
+        image_index,
+        tag,
+    } = target;
     let Some(tag) = tag.filter(|tag| !tag.is_empty()) else {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return ServedImage::status(StatusCode::UNAUTHORIZED.into_response());
     };
     let Some(image_type) = normalize_image_type(image_type) else {
-        return StatusCode::NOT_FOUND.into_response();
+        return ServedImage::status(StatusCode::NOT_FOUND.into_response());
     };
     let image = match images
         .resolve_tagged(item_id, image_type, image_index, tag)
@@ -3680,31 +4345,54 @@ pub(super) async fn serve_tagged_image(
             .await
         {
             Ok(Some(image)) => image,
-            Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+            Ok(None) => return ServedImage::status(StatusCode::UNAUTHORIZED.into_response()),
             Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
-                return StatusCode::FORBIDDEN.into_response();
+                return ServedImage::status(StatusCode::FORBIDDEN.into_response());
             }
-            Err(ImageError::Io { .. }) => return StatusCode::NOT_FOUND.into_response(),
+            Err(ImageError::Io { .. }) => {
+                return ServedImage::status(StatusCode::NOT_FOUND.into_response());
+            }
             Err(ImageError::Storage(_)) => {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                return ServedImage::status(StatusCode::SERVICE_UNAVAILABLE.into_response());
             }
         },
-        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+        Ok(None) => return ServedImage::status(StatusCode::UNAUTHORIZED.into_response()),
         Err(ImageError::Forbidden | ImageError::TooLarge { .. }) => {
-            return StatusCode::FORBIDDEN.into_response();
+            return ServedImage::status(StatusCode::FORBIDDEN.into_response());
         }
-        Err(ImageError::Io { .. }) => return StatusCode::NOT_FOUND.into_response(),
-        Err(ImageError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(ImageError::Io { .. }) => {
+            return ServedImage::status(StatusCode::NOT_FOUND.into_response());
+        }
+        Err(ImageError::Storage(_)) => {
+            return ServedImage::status(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        }
     };
-    serve_image_file(
-        &image.path,
-        image.content_type,
-        image.content_length,
-        &image.etag,
-        headers,
-        method,
-    )
-    .await
+    let selection = match intent.selection(source_pixel_dimensions(&image)) {
+        ImageVariantSelection::Variant(width) => {
+            match variants.resolve_variant(item_id, &image, width).await {
+                Some(variant) => {
+                    if let Some(response) = serve_variant_file(&variant, headers, method).await {
+                        return ServedImage::variant(response, width);
+                    }
+                    ImageVariantSelection::Original(OriginalImageReason::VariantUnavailable)
+                }
+                None => ImageVariantSelection::Original(OriginalImageReason::VariantUnavailable),
+            }
+        }
+        original => original,
+    };
+    ServedImage {
+        response: serve_image_file(
+            &image.path,
+            image.content_type,
+            image.content_length,
+            &image.etag,
+            headers,
+            method,
+        )
+        .await,
+        selection: Some(selection),
+    }
 }
 
 pub(super) async fn serve_filmly_compat_image(
@@ -4337,6 +5025,28 @@ pub(super) fn lux_catalog_chapter_json(
 }
 
 #[cfg(test)]
+mod served_image_tests {
+    use super::response_carries_image;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn only_responses_that_carry_an_image_report_a_served_original() {
+        for status in [200, 201, 206, 304] {
+            assert!(
+                response_carries_image(StatusCode::from_u16(status).expect("status")),
+                "{status} carries an image"
+            );
+        }
+        for status in [301, 400, 401, 403, 404, 416, 500, 503] {
+            assert!(
+                !response_carries_image(StatusCode::from_u16(status).expect("status")),
+                "{status} resolved no image"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod direct_ticket_tests {
     use super::*;
     use crate::{
@@ -4684,5 +5394,32 @@ mod lux_dto_tests {
             .unwrap(),
             r#"{"image":{"contentTag":"tag-1","fileSize":1234,"id":"img-1","imageIndex":0,"imageType":"POSTER","itemId":"item-1","language":null,"source":"TMDB","url":"/api/v1/items/item-1/images/poster"}}"#
         );
+    }
+}
+
+#[cfg(test)]
+mod similar_limit_tests {
+    use super::*;
+
+    #[test]
+    fn lux_similar_limit_and_page_validation() {
+        assert_eq!(lux_similar_limit(None, None), Ok(LUX_SIMILAR_DEFAULT_LIMIT));
+        assert_eq!(
+            lux_similar_limit(Some("1000"), None),
+            Ok(LUX_SIMILAR_MAX_LIMIT)
+        );
+        assert_eq!(
+            lux_similar_limit(Some("1001"), None),
+            Err("相似条目分页参数无效")
+        );
+        assert_eq!(lux_similar_limit(None, Some("20")), Ok(20));
+        assert_eq!(lux_similar_limit(Some("20"), Some("20")), Ok(20));
+        assert_eq!(
+            lux_similar_limit(Some("20"), Some("10")),
+            Err("相似条目分页参数无效")
+        );
+        assert_eq!(lux_similar_page(None), Ok(1));
+        assert_eq!(lux_similar_page(Some("2")), Ok(2));
+        assert_eq!(lux_similar_page(Some("0")), Err("相似条目分页参数无效"));
     }
 }

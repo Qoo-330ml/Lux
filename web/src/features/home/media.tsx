@@ -1,4 +1,4 @@
-import { Database, MoreHorizontal, Play, ScanLine, ScanSearch } from "lucide-react";
+import { Database, MessageSquareText, MoreHorizontal, Play, ScanLine, ScanSearch } from "lucide-react";
 import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
 import { memo, useCallback, useMemo, useRef, useState, type MouseEvent } from "react";
@@ -10,13 +10,16 @@ import { MediaCardEditors } from "./media-card-editors";
 import { MediaCardVisual, MediaCardCopy } from "./media-card-visual";
 import { useImageVariants } from "./image-variants";
 import { MediaCardOverlay } from "./media-card-overlay";
+import { useItemMetadataRefreshMode } from "../media/useItemMetadataRefreshMode";
 import { usePopoverPosition } from "../media/usePopoverPosition";
 import type { MediaCardEditor } from "./media-card-editors";
 import { EpisodeCount, MediaPlaceholder, episodeTitle, imageUrl, mediaTitle, mediaTypeLabel, playbackProgress, playbackPositionTicks, remainingRuntimeLabel } from "./media-display";
 export { EpisodeCount, Rating, episodeTitle, imageUrl, mediaTitle, mediaTypeLabel, playbackPositionTicks, playbackProgress, posterUrlWithFallback, remainingRuntimeLabel, runtimeLabel } from "./media-display";
 
 export const MediaCard = memo(function MediaCard({ item, landscape = false, metadataAttention = false, detailSearch, selectionMode = false, selected = false, folderHref, detailHref: detailHrefOverride, readOnly = false, onSelectionChange }: { item: MediaItem; landscape?: boolean; metadataAttention?: boolean; detailSearch?: string; selectionMode?: boolean; selected?: boolean; folderHref?: string; detailHref?: string; readOnly?: boolean; onSelectionChange?: (itemId: string, selected: boolean) => void }) {
-  const [editor, setEditor] = useState<"metadata" | "images" | "subtitles" | "identify">();
+  const metadataRefreshMode = useItemMetadataRefreshMode(item, !readOnly);
+  const [editor, setEditor] = useState<MediaCardEditor>();
+  const [contextPoint, setContextPoint] = useState<{ x: number; y: number } | null>(null);
   const [actionError, setActionError] = useState<string>();
   const [actionNotice, setActionNotice] = useState<string>();
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -36,12 +39,12 @@ export const MediaCard = memo(function MediaCard({ item, landscape = false, meta
     setActionError(undefined);
     setActionNotice(undefined);
     try {
-      await api.startItemMetadataRefresh(item.id);
+      await api.startItemMetadataRefresh(item.id, metadataRefreshMode ?? "FILL_MISSING");
       setActionNotice("刷新任务已提交");
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "元数据刷新任务提交失败，请重试。");
     }
-  }, [item.id]);
+  }, [item.id, metadataRefreshMode]);
 
   const scanLibrary = useCallback(async () => {
     setActionError(undefined);
@@ -56,8 +59,10 @@ export const MediaCard = memo(function MediaCard({ item, landscape = false, meta
 
   const detailHref = detailHrefOverride ?? `/items/${item.id}${detailSearch ?? ""}`;
   const openEditor = useCallback((next: MediaCardEditor) => setEditor(next), []);
+  const openDanmaku = useCallback(() => setEditor("danmaku"), []);
   const openDeleteDialog = useCallback(() => setDeleteOpen(true), []);
   const closeEditor = useCallback(() => setEditor(undefined), []);
+  const noteDanmakuSubmitted = useCallback(() => setActionNotice("弹幕匹配任务已提交，可在管理任务中查看进度。"), []);
   const closeDeleteDialog = useCallback(() => setDeleteOpen(false), []);
   const markDeleted = useCallback(() => setDeleted(true), []);
   const refresh = useCallback(() => void refreshMetadata(), [refreshMetadata]);
@@ -67,17 +72,23 @@ export const MediaCard = memo(function MediaCard({ item, landscape = false, meta
   const visual = useMemo(() => <MediaCardVisual item={item} landscape={landscape} href={item.itemType === "FOLDER" ? folderHref : detailHref} />, [detailHref, folderHref, item, landscape]);
   if (deleted) return null;
 
+  function openContextMenu(event: MouseEvent<HTMLElement>) {
+    if (readOnly || item.itemType === "FOLDER") return;
+    event.preventDefault();
+    setContextPoint({ x: event.clientX, y: event.clientY });
+  }
+
   return (
     <>
-      <article className={[landscape ? "lux-media-card lux-media-card-landscape" : "lux-media-card", selected ? "is-selected" : ""].filter(Boolean).join(" ")}>
-        <MediaCardOverlay item={item} selectionMode={selectionMode} selected={selected} readOnly={readOnly} onSelectionChange={onSelectionChange} onEditorChange={openEditor} onDelete={openDeleteDialog} onRefreshMetadata={refresh} onScanFolder={scan} onLockMetadata={lockMetadata} onUnlockMetadata={unlockMetadata}>
+      <article className={[landscape ? "lux-media-card lux-media-card-landscape" : "lux-media-card", selected ? "is-selected" : ""].filter(Boolean).join(" ")} onContextMenu={openContextMenu}>
+        <MediaCardOverlay item={item} selectionMode={selectionMode} selected={selected} readOnly={readOnly} onSelectionChange={onSelectionChange} onEditorChange={openEditor} onScrapeDanmaku={openDanmaku} contextPoint={contextPoint} onDelete={openDeleteDialog} onRefreshMetadata={refresh} refreshMode={metadataRefreshMode} onScanFolder={scan} onLockMetadata={lockMetadata} onUnlockMetadata={unlockMetadata}>
           {visual}
         </MediaCardOverlay>
         <MediaCardCopy item={item} metadataAttention={metadataAttention} href={item.itemType === "FOLDER" ? folderHref : detailHref} />
         {actionNotice ? <p className="lux-muted-copy lux-card-action-error" role="status">{actionNotice}</p> : null}
         {actionError ? <p className="lux-editor-error lux-card-action-error" role="alert">{actionError}</p> : null}
       </article>
-      <MediaCardEditors item={item} editor={editor} deleteOpen={deleteOpen} onClose={closeEditor} onDeleteClose={closeDeleteDialog} onDeleted={markDeleted} />
+      <MediaCardEditors item={item} editor={editor} deleteOpen={deleteOpen} onClose={closeEditor} onDanmakuSubmitted={noteDanmakuSubmitted} onDeleteClose={closeDeleteDialog} onDeleted={markDeleted} />
     </>
   );
 });
@@ -187,7 +198,7 @@ export function MediaRail({ title, items, landscape = false, linkTo }: { title: 
   );
 }
 
-type LibraryAction = "reidentify" | "scan";
+type LibraryAction = "reidentify" | "scan" | "danmaku";
 
 type LibraryMenuPosition = {
   left: number;
@@ -266,6 +277,9 @@ export function LibraryCard({ library, coverItems, onPrefetch }: { library: Libr
       if (action === "reidentify") {
         const task = await api.startLibraryMetadataReidentify(library.id);
         setActionNotice(`整库元数据匹配任务已提交 · ${task.totalCount} 项，单个后台任务处理中`);
+      } else if (action === "danmaku") {
+        const task = await api.startLibraryDanmakuMatch(library.id, { overwrite: false });
+        setActionNotice(`整库弹幕匹配任务已提交 · ${task.job.totalCount} 项`);
       } else {
         await api.startAdminScan(library.id);
         setActionNotice("扫描媒体库文件任务已提交");
@@ -302,7 +316,7 @@ export function LibraryCard({ library, coverItems, onPrefetch }: { library: Libr
       </Link>
       {actionNotice ? <p className="lux-library-card-action-feedback" role="status">{actionNotice}</p> : null}
       {actionError ? <p className="lux-library-card-action-feedback is-error" role="alert">{actionError}</p> : null}
-      {pendingAction ? <span className="lux-visually-hidden" role="status">{pendingAction === "reidentify" ? "正在提交整库元数据匹配任务" : "正在提交扫描任务"}</span> : null}
+      {pendingAction ? <span className="lux-visually-hidden" role="status">{pendingAction === "reidentify" ? "正在提交整库元数据匹配任务" : pendingAction === "danmaku" ? "正在提交整库弹幕匹配任务" : "正在提交扫描任务"}</span> : null}
       {menuOpen && !isSystemCollection ? createPortal(
         <div
           ref={menuRef}
@@ -323,6 +337,10 @@ export function LibraryCard({ library, coverItems, onPrefetch }: { library: Libr
           <button type="button" role="menuitem" data-library-action="scan" disabled={Boolean(pendingAction)} onClick={() => void runAction("scan")}>
             <ScanLine size={18} aria-hidden="true" />
             <span>{pendingAction === "scan" ? "提交扫描中…" : "扫描媒体库文件"}</span>
+          </button>
+          <button type="button" role="menuitem" data-library-action="danmaku" disabled={Boolean(pendingAction)} onClick={() => void runAction("danmaku")}>
+            <MessageSquareText size={18} aria-hidden="true" />
+            <span>{pendingAction === "danmaku" ? "提交弹幕刮削中…" : "刮削弹幕"}</span>
           </button>
         </div>,
         document.body,

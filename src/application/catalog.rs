@@ -4,7 +4,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -15,14 +15,16 @@ use crate::{
     application::access::{AccessError, AccessPrincipal, MediaAccessService},
     application::catalog_read_model::{catalog_items_consumer, user_series_next_consumer},
     application::recommendations::{
-        RECOMMENDATION_CANDIDATE_POOL, current_recommendation_batch_key,
-        daily_recommendation_items, recommendation_library_scope_key,
+        RECOMMENDATION_CANDIDATE_POOL, RECOMMENDATION_FEATURED_LIMIT, RecommendationCandidate,
+        current_recommendation_batch_key, daily_recommendation_items,
+        recommendation_library_scope_key,
     },
     storage::{
         CatalogFilterQuery, CatalogSearchQuery, CatalogSort as StorageCatalogSort, Database,
-        GLOBAL_COLLECTION_LIBRARY_ID, RecentByLibraryReadModelQuery, RecentReadModelQuery,
-        ResumeItemsQuery, ResumePointerQuery, StorageError, StoredCatalogDetail, StoredCatalogRow,
-        StoredMediaChapter, UserContentRestrictions,
+        GLOBAL_COLLECTION_LIBRARY_ID, MediaFacetKind, RecentByLibraryReadModelQuery,
+        RecentReadModelQuery, ResumeItemsQuery, ResumePointerQuery, ResumeThresholds, StorageError,
+        StoredCatalogDetail, StoredCatalogRow, StoredMediaCertification, StoredMediaChapter,
+        StoredMediaFacet, UserContentRestrictions, WatchHistoryQuery,
     },
 };
 
@@ -35,8 +37,13 @@ pub struct CatalogFilter {
     pub media_source_ids: Option<Vec<String>>,
     pub provider_id_equals: Option<Vec<(String, String)>>,
     pub years: Vec<i64>,
+    /// Lower-cased genre keys (any-of), matched against `media_item_facets`.
+    pub genre_keys: Vec<String>,
+    pub studio_keys: Vec<String>,
     pub is_played: Option<bool>,
     pub is_favorite: Option<bool>,
+    /// Emby `Filters=IsResumable`: keep what the continue-watching list would offer the user.
+    pub is_resumable: bool,
     pub min_date_last_saved: Option<i64>,
     pub metadata_pending: bool,
     pub sort_by: CatalogSort,
@@ -54,8 +61,11 @@ impl Default for CatalogFilter {
             media_source_ids: None,
             provider_id_equals: None,
             years: Vec::new(),
+            genre_keys: Vec::new(),
+            studio_keys: Vec::new(),
             is_played: None,
             is_favorite: None,
+            is_resumable: false,
             min_date_last_saved: None,
             metadata_pending: false,
             sort_by: CatalogSort::default(),
@@ -121,6 +131,23 @@ impl ReadModelMode {
             _ => Self::On,
         }
     }
+
+    /// Compact form for the shared atomic the library page cache keeps next to its owner.
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Shadow => 1,
+            Self::On => 2,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            2 => Self::On,
+            1 => Self::Shadow,
+            _ => Self::Off,
+        }
+    }
 }
 
 const LIBRARY_PAGE_CACHE_TTL: Duration = Duration::from_secs(15);
@@ -130,6 +157,24 @@ const MAX_LIBRARY_PAGE_CACHE_ENTRIES: usize = 256;
 const MAX_LIBRARY_PAGE_REFRESH_ENTRIES: usize = 64;
 const MAX_SEARCH_FLIGHTS: usize = 256;
 const DEFAULT_SEARCH_ITEM_TYPES: [&str; 2] = ["MOVIE", "SERIES"];
+/// Item kinds that can carry playback progress, so the watch history only lists playable leaves.
+const WATCH_HISTORY_ITEM_TYPES: [&str; 3] = ["MOVIE", "EPISODE", "VIDEO"];
+
+/// Server-side upper bound for one tag page.
+///
+/// The Lux tags endpoint uses this cap directly (`GET /api/v1/tags` accepts `pageSize` in
+/// `1..=TAGS_MAX_PAGE_LIMIT`), so 1000 is the effective page size of that route. The clamp below
+/// only protects a caller that skips its own validation and keeps the service entry point
+/// bounded.
+pub(crate) const TAGS_MAX_PAGE_LIMIT: i64 = 1_000;
+
+/// Keeps a tag page request inside `0..=TAGS_MAX_PAGE_LIMIT`.
+///
+/// Clamped instead of asserted: an out-of-range value from a caller that skipped its own
+/// validation costs a bounded query and a short page, never a panic in a request path.
+pub(crate) fn clamped_tags_page_limit(limit: i64) -> i64 {
+    limit.clamp(0, TAGS_MAX_PAGE_LIMIT)
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct SearchFlightKey {
@@ -272,6 +317,17 @@ struct LibraryPageCache {
     entries: Mutex<HashMap<LibraryPageCacheKey, Arc<LibraryPageCacheEntry>>>,
     refresh_tx: mpsc::Sender<()>,
     refresh_pending: AtomicBool,
+    /// The warm-up runs on its own [`CatalogService`], so the cache keeps the pieces it needs to
+    /// build that service with the owner's current configuration.
+    database: Database,
+    access: MediaAccessService,
+    search_flights: Arc<SearchFlightRegistry>,
+    read_model_ready: Arc<AtomicBool>,
+    /// The owner's read-model switch, as registered by [`CatalogService::with_read_model_mode`].
+    ///
+    /// The cache is shared through an `Arc`, so the last call wins for every handle of the same
+    /// service tree — which is what the app wiring does once at startup.
+    read_model_mode: AtomicU8,
 }
 
 impl LibraryPageCache {
@@ -287,6 +343,11 @@ impl LibraryPageCache {
             entries: Mutex::new(HashMap::new()),
             refresh_tx,
             refresh_pending: AtomicBool::new(false),
+            database,
+            access,
+            search_flights,
+            read_model_ready,
+            read_model_mode: AtomicU8::new(ReadModelMode::Off.as_u8()),
         });
         let worker_cache = Arc::downgrade(&cache);
         tokio::spawn(async move {
@@ -299,19 +360,45 @@ impl LibraryPageCache {
                     break;
                 };
                 cache.refresh_pending.store(false, Ordering::Release);
-                let service = CatalogService {
-                    database: database.clone(),
-                    access: access.clone(),
-                    library_page_cache: cache.clone(),
-                    search_flights: search_flights.clone(),
-                    recommendation_compute_lock: Arc::new(Mutex::new(())),
-                    read_model_mode: ReadModelMode::Off,
-                    read_model_ready: read_model_ready.clone(),
-                };
-                cache.refresh_entries(&service).await;
+                cache.refresh_all().await;
             }
         });
         cache
+    }
+
+    /// Recompute the hot entries with a service built from the cache's own configuration.
+    ///
+    /// The worker used to build that service inline, which is how its read-model mode drifted
+    /// away from the owning service's (see `refresh_read_model_mode`).
+    async fn refresh_all(self: &Arc<Self>) {
+        let service = CatalogService {
+            database: self.database.clone(),
+            access: self.access.clone(),
+            library_page_cache: self.clone(),
+            search_flights: self.search_flights.clone(),
+            recommendation_compute_lock: Arc::new(Mutex::new(())),
+            read_model_mode: self.refresh_read_model_mode(),
+            read_model_ready: self.read_model_ready.clone(),
+        };
+        self.refresh_entries(&service).await;
+    }
+
+    fn set_read_model_mode(&self, mode: ReadModelMode) {
+        self.read_model_mode.store(mode.as_u8(), Ordering::Release);
+    }
+
+    /// The read-model mode the warm-up runs with.
+    ///
+    /// `on` and `off` are taken as-is so a warm page has the same source as the request path that
+    /// will read it. `shadow` is deliberately downgraded to `off`: shadow serves exactly the
+    /// authoritative page `off` serves, and only adds the comparison query plus the mismatch log.
+    /// A warm-up result is never compared by anyone, so running shadow here would pay a second
+    /// page query per warmed entry for a log line about a page that is then thrown away.
+    fn refresh_read_model_mode(&self) -> ReadModelMode {
+        match ReadModelMode::from_u8(self.read_model_mode.load(Ordering::Acquire)) {
+            ReadModelMode::Shadow => ReadModelMode::Off,
+            mode => mode,
+        }
     }
 
     async fn entry(
@@ -468,8 +555,13 @@ pub struct CatalogItemCounts {
 }
 
 impl CatalogService {
+    /// Switch the read model for this service *and* for its library page warm-up.
+    ///
+    /// The cache owns the warm-up service and is shared through an `Arc`, so this is the single
+    /// place that keeps the request path and the background refresh on the same source.
     pub fn with_read_model_mode(mut self, mode: ReadModelMode) -> Self {
         self.read_model_mode = mode;
+        self.library_page_cache.set_read_model_mode(mode);
         self
     }
 
@@ -1100,8 +1192,11 @@ impl CatalogService {
             || query.media_source_ids.is_some()
             || query.provider_id_equals.is_some()
             || !query.years.is_empty()
+            || !query.genre_keys.is_empty()
+            || !query.studio_keys.is_empty()
             || query.is_played.is_some()
             || query.is_favorite.is_some()
+            || query.is_resumable.is_some()
             || query.min_date_last_saved.is_some()
             || query.metadata_pending
             || query.parent_id_scope.is_some()
@@ -1184,6 +1279,26 @@ impl CatalogService {
         }
     }
 
+    /// Thresholds of the continue-watching decision used by `Filters=IsResumable`.
+    ///
+    /// The settings read is skipped unless the filter asks for it, so ordinary list requests keep
+    /// their existing query count. `home_resume_settings` is the same read `Items/Resume` uses, so
+    /// the filter cannot drift into a second set of thresholds.
+    async fn resume_thresholds(
+        &self,
+        user_id: &str,
+        is_resumable: bool,
+    ) -> Result<Option<ResumeThresholds>, CatalogError> {
+        if !is_resumable {
+            return Ok(None);
+        }
+        let (played_percent, minimum_ticks) = self.database.home_resume_settings(user_id).await?;
+        Ok(Some(ResumeThresholds {
+            played_percent,
+            minimum_ticks,
+        }))
+    }
+
     async fn load_library_page(
         &self,
         request: &LibraryPageRequest,
@@ -1191,6 +1306,9 @@ impl CatalogService {
         let library_ids = vec![request.library_id.clone()];
         let user_id = request.principal.user_id_string();
         let filter = &request.filter;
+        let is_resumable = self
+            .resume_thresholds(&user_id, filter.is_resumable)
+            .await?;
         let query = CatalogFilterQuery {
             library_ids: &library_ids,
             user_id: &user_id,
@@ -1201,8 +1319,11 @@ impl CatalogService {
             media_source_ids: filter.media_source_ids.as_deref(),
             provider_id_equals: filter.provider_id_equals.as_deref(),
             years: &filter.years,
+            genre_keys: &filter.genre_keys,
+            studio_keys: &filter.studio_keys,
             is_played: filter.is_played,
             is_favorite: filter.is_favorite,
+            is_resumable,
             min_date_last_saved: filter.min_date_last_saved,
             metadata_pending: filter.metadata_pending,
             parent_id_scope: request.parent_scope.as_ref().map(|scope| match scope {
@@ -1290,6 +1411,271 @@ impl CatalogService {
         }
     }
 
+    /// Resolves an optional library scope for a request.
+    ///
+    /// `None` means every library `principal` can open; a `Some(id)` that is unknown or not
+    /// accessible is answered as not found, so callers cannot use a filter parameter to reach a
+    /// library the user cannot see. Shared by the facet, year and official-rating reads and by the
+    /// `/Tags` route, which has no data yet but must not become an ACL shortcut once it does.
+    pub(crate) async fn library_scope_for_principal(
+        &self,
+        principal: AccessPrincipal,
+        library_id: Option<&str>,
+    ) -> Result<Vec<String>, CatalogError> {
+        let accessible = self.access.accessible_library_ids(principal).await?;
+        match library_id {
+            Some(library_id) if accessible.iter().any(|id| id == library_id) => {
+                Ok(vec![library_id.to_owned()])
+            }
+            Some(_) => Err(CatalogError::LibraryNotFound),
+            None => Ok(accessible),
+        }
+    }
+
+    /// Distinct genres or studios (`kind`) or production years (`None`) visible to `principal`,
+    /// optionally narrowed to one library and to item types. Served from the `media_item_facets`
+    /// projection.
+    pub(crate) async fn list_facets(
+        &self,
+        principal: AccessPrincipal,
+        library_id: Option<&str>,
+        kind: Option<MediaFacetKind>,
+        item_types: &[String],
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredMediaFacet>, i64), CatalogError> {
+        let library_ids = self
+            .library_scope_for_principal(principal, library_id)
+            .await?;
+        let user_id = principal.user_id_string();
+        let content_restrictions = if principal.is_admin {
+            None
+        } else {
+            self.database.user_content_restrictions(&user_id).await?
+        };
+        let no_values: [String; 0] = [];
+        let query = CatalogFilterQuery {
+            library_ids: &library_ids,
+            user_id: &user_id,
+            item_types,
+            excluded_item_types: &no_values,
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            provider_id_equals: None,
+            years: &[],
+            genre_keys: &no_values,
+            studio_keys: &no_values,
+            is_played: None,
+            is_favorite: None,
+            is_resumable: None,
+            min_date_last_saved: None,
+            metadata_pending: false,
+            parent_id_scope: None,
+            content_restrictions: content_restrictions.as_ref(),
+            sort_by: StorageCatalogSort::Name,
+            descending: false,
+            offset,
+            limit,
+            include_total: true,
+        };
+        Ok(match kind {
+            Some(kind) => {
+                self.database
+                    .list_catalog_facets(&query, kind, offset, limit)
+                    .await?
+            }
+            None => {
+                self.database
+                    .list_catalog_years(&query, offset, limit)
+                    .await?
+            }
+        })
+    }
+
+    /// Distinct official rating codes visible to `principal`, optionally narrowed to one library
+    /// and to item types. Served from the content restriction index, which already stores the
+    /// normalized certification code of each item.
+    pub(crate) async fn list_official_ratings(
+        &self,
+        principal: AccessPrincipal,
+        library_id: Option<&str>,
+        item_types: &[String],
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredMediaCertification>, i64), CatalogError> {
+        let library_ids = self
+            .library_scope_for_principal(principal, library_id)
+            .await?;
+        let user_id = principal.user_id_string();
+        let content_restrictions = if principal.is_admin {
+            None
+        } else {
+            self.database.user_content_restrictions(&user_id).await?
+        };
+        let no_values: [String; 0] = [];
+        let query = CatalogFilterQuery {
+            library_ids: &library_ids,
+            user_id: &user_id,
+            item_types,
+            excluded_item_types: &no_values,
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            provider_id_equals: None,
+            years: &[],
+            genre_keys: &no_values,
+            studio_keys: &no_values,
+            is_played: None,
+            is_favorite: None,
+            is_resumable: None,
+            min_date_last_saved: None,
+            metadata_pending: false,
+            parent_id_scope: None,
+            content_restrictions: content_restrictions.as_ref(),
+            sort_by: StorageCatalogSort::Name,
+            descending: false,
+            offset,
+            limit,
+            include_total: true,
+        };
+        Ok(self
+            .database
+            .list_catalog_certifications(&query, offset, limit)
+            .await?)
+    }
+
+    /// Distinct tags visible to `principal`, optionally narrowed to one library and to item
+    /// types, ordered by their case-insensitive `name_key`.
+    ///
+    /// The list is de-duplicated on `name_key`, so `Star Wars` and `star wars` are one entry. A
+    /// name key can be projected with more than one spelling, so the display name is the
+    /// byte-order smallest one (`COLLATE BINARY` on SQLite, `COLLATE "C"` on PostgreSQL): the same
+    /// rule on both backends, independent of insertion order, so re-projecting an item never
+    /// renames a tag. Visibility follows [`Self::list_official_ratings`]: an unknown or
+    /// inaccessible `library_id` is answered as not found, an admin skips the content
+    /// restrictions, and every other principal only sees the tags of the items the restriction
+    /// policy leaves visible. Served from the `media_item_facets` projection, so a request never
+    /// parses NFO JSON or loads a catalog page.
+    ///
+    /// `limit` is clamped to [`TAGS_MAX_PAGE_LIMIT`]; the routes validate their own bounds first.
+    pub(crate) async fn list_tags(
+        &self,
+        principal: AccessPrincipal,
+        library_id: Option<&str>,
+        item_types: &[String],
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredMediaFacet>, i64), CatalogError> {
+        let library_ids = self
+            .library_scope_for_principal(principal, library_id)
+            .await?;
+        let user_id = principal.user_id_string();
+        let content_restrictions = if principal.is_admin {
+            None
+        } else {
+            self.database.user_content_restrictions(&user_id).await?
+        };
+        let offset = offset.max(0);
+        let limit = clamped_tags_page_limit(limit);
+        let no_values: [String; 0] = [];
+        let query = CatalogFilterQuery {
+            library_ids: &library_ids,
+            user_id: &user_id,
+            item_types,
+            excluded_item_types: &no_values,
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            provider_id_equals: None,
+            years: &[],
+            genre_keys: &no_values,
+            studio_keys: &no_values,
+            is_played: None,
+            is_favorite: None,
+            is_resumable: None,
+            min_date_last_saved: None,
+            metadata_pending: false,
+            parent_id_scope: None,
+            content_restrictions: content_restrictions.as_ref(),
+            sort_by: StorageCatalogSort::Name,
+            descending: false,
+            offset,
+            limit,
+            include_total: true,
+        };
+        Ok(self
+            .database
+            .list_catalog_tags(&query, offset, limit)
+            .await?)
+    }
+
+    /// Same-type items that share at least one stored genre with `item_id`, most shared genres
+    /// first and then by title.
+    ///
+    /// Returns `None` when the item does not exist or the principal cannot see it, matching the
+    /// item detail endpoint's 404. The caller must already have validated `offset` and `limit`.
+    /// The storage query caps the candidate pool before ranking (ten source genres, at most 200
+    /// visible candidates each), ranks that bounded union and only then applies `LIMIT`/`OFFSET`,
+    /// so paging never re-sorts or scans the catalog. `page.total` is therefore the number of
+    /// distinct items in that bounded pool, not the catalog-wide number of similar items. Only the
+    /// `media_item_facets` projection is read, so a request never parses NFO JSON or scans the
+    /// catalog.
+    pub(crate) async fn list_similar_items(
+        &self,
+        principal: AccessPrincipal,
+        item_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Option<CatalogPage>, CatalogError> {
+        let Some(source_item) = self.find_item(principal, item_id).await? else {
+            return Ok(None);
+        };
+        // Emby's Similar endpoint is a movie/series recommendation surface. Any other type has no
+        // meaningful same-type genre neighbourhood, so it answers with an empty page.
+        if !matches!(source_item.item_type.as_str(), "MOVIE" | "SERIES") {
+            return Ok(Some(CatalogPage::new(Vec::new(), 0, offset, limit)));
+        }
+        let library_ids = self.access.accessible_library_ids(principal).await?;
+        let user_id = principal.user_id_string();
+        let content_restrictions = self.content_restrictions_for_principal(principal).await?;
+        let item_types = vec![source_item.item_type.clone()];
+        let no_values: [String; 0] = [];
+        let query = CatalogFilterQuery {
+            library_ids: &library_ids,
+            user_id: &user_id,
+            item_types: &item_types,
+            excluded_item_types: &no_values,
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            provider_id_equals: None,
+            years: &[],
+            genre_keys: &no_values,
+            studio_keys: &no_values,
+            is_played: None,
+            is_favorite: None,
+            is_resumable: None,
+            min_date_last_saved: None,
+            metadata_pending: false,
+            parent_id_scope: None,
+            content_restrictions: content_restrictions.as_ref(),
+            sort_by: StorageCatalogSort::Name,
+            descending: false,
+            offset,
+            limit,
+            include_total: true,
+        };
+        let (rows, total) = self
+            .database
+            .list_similar_catalog_rows(&query, &source_item.id)
+            .await?;
+        let mut items = assemble_items(rows);
+        self.populate_item_details_and_episode_counts(&mut items, content_restrictions.as_ref())
+            .await?;
+        Ok(Some(CatalogPage::new(items, total, offset, limit)))
+    }
+
     pub async fn list_all_items_filtered(
         &self,
         principal: AccessPrincipal,
@@ -1304,6 +1690,9 @@ impl CatalogService {
         } else {
             self.database.user_content_restrictions(&user_id).await?
         };
+        let is_resumable = self
+            .resume_thresholds(&user_id, filter.is_resumable)
+            .await?;
         let query = CatalogFilterQuery {
             library_ids: &library_ids,
             user_id: &user_id,
@@ -1314,8 +1703,11 @@ impl CatalogService {
             media_source_ids: filter.media_source_ids.as_deref(),
             provider_id_equals: filter.provider_id_equals.as_deref(),
             years: &filter.years,
+            genre_keys: &filter.genre_keys,
+            studio_keys: &filter.studio_keys,
             is_played: filter.is_played,
             is_favorite: filter.is_favorite,
+            is_resumable,
             min_date_last_saved: filter.min_date_last_saved,
             metadata_pending: filter.metadata_pending,
             parent_id_scope: None,
@@ -1675,6 +2067,32 @@ impl CatalogService {
             content_restrictions.as_ref(),
         )
         .await
+    }
+
+    /// One page of the current user's watch history: seen movies, episodes and videos, newest
+    /// play first.
+    ///
+    /// The page is scoped to the caller (`user_id`), filtered by the same library ACL and content
+    /// restrictions as the other catalog lists, and paginated in SQL.
+    pub async fn list_watch_history(
+        &self,
+        principal: AccessPrincipal,
+        user_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<CatalogPage, CatalogError> {
+        let library_ids = self.access.accessible_library_ids(principal).await?;
+        let content_restrictions = self.content_restrictions_for_principal(principal).await?;
+        let query = WatchHistoryQuery {
+            user_id,
+            library_ids: &library_ids,
+            item_types: &WATCH_HISTORY_ITEM_TYPES,
+            content_restrictions: content_restrictions.as_ref(),
+            offset,
+            limit,
+        };
+        let (rows, total) = self.database.list_watch_history_items(&query).await?;
+        Ok(CatalogPage::new(assemble_items(rows), total, offset, limit))
     }
 
     pub(crate) async fn list_continue_watching_for_library_ids(
@@ -2297,6 +2715,7 @@ impl CatalogService {
                 assemble_items(rows),
                 &user_id,
                 batch_key,
+                RECOMMENDATION_FEATURED_LIMIT,
                 RECOMMENDATION_CANDIDATE_POOL as usize,
             );
             let item_ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
@@ -2566,6 +2985,31 @@ impl CatalogService {
         self.populate_item_details(&mut items).await?;
         self.populate_image_tags(&mut items).await?;
         self.populate_chapters(&mut items).await?;
+        Ok(items
+            .into_iter()
+            .map(|item| (item.id.clone(), item))
+            .collect())
+    }
+
+    /// Like [`Self::find_items`] for callers that only need titles, hierarchy ids, season
+    /// numbers and season counts (the admin activity feed). It skips the ACL filter, the
+    /// image-tag query and the chapter query; the last two dominate the cost of hydrating items
+    /// the caller never renders artwork or chapter lists for.
+    ///
+    /// The admin activity feed is the only caller, and it runs in the server-management context,
+    /// so this method does not accept a principal: a caller that must respect per-user library
+    /// access has to use [`Self::find_items`]. Items returned here carry empty image tags and
+    /// chapters, so a caller that renders cards or detail views must use [`Self::find_items`]
+    /// as well.
+    pub(crate) async fn find_item_summaries(
+        &self,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, CatalogItem>, CatalogError> {
+        if item_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut items = assemble_items(self.database.list_catalog_rows_by_ids(item_ids).await?);
+        self.populate_item_details(&mut items).await?;
         Ok(items
             .into_iter()
             .map(|item| (item.id.clone(), item))
@@ -3069,6 +3513,16 @@ pub struct CatalogItem {
     pub media_sources: Vec<CatalogSource>,
 }
 
+impl RecommendationCandidate for CatalogItem {
+    fn candidate_key(&self) -> &str {
+        &self.id
+    }
+
+    fn candidate_kind(&self) -> &str {
+        &self.item_type
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogSource {
     pub id: String,
@@ -3439,7 +3893,10 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use crate::application::recommendations::daily_recommendation_items;
+    use crate::{
+        application::access::AccessPrincipal,
+        application::recommendations::daily_recommendation_items, storage::Database,
+    };
 
     use super::{
         CatalogItem, CatalogSource, MAX_LIBRARY_PAGE_REFRESH_ENTRIES, SearchFlightHandle,
@@ -3694,14 +4151,36 @@ mod tests {
 
     #[test]
     fn daily_recommendations_are_stable_for_one_day_and_change_next_day() {
-        let items = || (1..=6).collect::<Vec<_>>();
+        let items = || {
+            (0..6)
+                .map(|index| catalog_item(&format!("item-{index}")))
+                .collect::<Vec<_>>()
+        };
 
-        let day_one = daily_recommendation_items(items(), "user-1", 20, 3);
-        let same_day = daily_recommendation_items(items(), "user-1", 20, 3);
-        let next_day = daily_recommendation_items(items(), "user-1", 21, 3);
-
+        let day_one = daily_recommendation_items(items(), "user-1", 20, 3, 6);
+        let same_day = daily_recommendation_items(items(), "user-1", 20, 3, 6);
         assert_eq!(day_one, same_day);
-        assert_ne!(day_one, next_day);
+        // The anchored leaders lead every batch; the weighted draw behind them is what rotates.
+        assert_eq!(
+            day_one
+                .iter()
+                .take(2)
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["item-0", "item-1"]
+        );
+        let distinct = (20..30)
+            .map(|batch_key| {
+                daily_recommendation_items(items(), "user-1", batch_key, 3, 6)
+                    .iter()
+                    .map(|item| item.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            distinct.windows(2).any(|pair| pair[0] != pair[1]),
+            "a new batch must change the recommendation"
+        );
     }
 
     #[test]
@@ -6234,6 +6713,687 @@ mod tests {
             Some("1920"),
             "the read-model full page keeps details_json"
         );
+        Ok(())
+    }
+
+    /// One movie in one library with a built read model and the consumer watermark advanced.
+    ///
+    /// The authoritative row and the derived row carry different titles, so a page that renders
+    /// one of them names the source it was read from.
+    async fn read_model_library_page_fixture()
+    -> Result<(tempfile::TempDir, Database, AccessPrincipal, String), Box<dyn std::error::Error>>
+    {
+        use crate::{
+            application::libraries::LibraryService, auth::users::UserStore, config::Config,
+            library::LibraryKind,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let user = UserStore::new(database.clone())?
+            .create_user(
+                "refresh-mode-viewer",
+                "Refresh Mode Viewer",
+                "test password",
+                false,
+            )
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Refresh mode", LibraryKind::Movie, false)
+            .await?;
+        let user_id = user.id.to_string();
+        let library_id = library.id.to_string();
+        database
+            .set_user_library_access(&user_id, &library_id, true)
+            .await?;
+        sqlx::query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('refresh-mode-root', ?, '/refresh', '/refresh', 1, 1)",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 device, inode, fingerprint, last_seen_generation, last_seen_change_kind
+             ) VALUES ('refresh-mode-fe', 'refresh-mode-root', 'Refresh.mkv', 'FILE', 1, 1,
+                       1, 1, X'00', 'g1', 'NEW')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, added_at, runtime_ticks,
+                 identification_status, has_available_source
+             ) VALUES ('refresh-mode-item', ?, 'MOVIE', 'Authoritative title', 'refresh mode',
+                       10, 7200000000, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_sources (
+                 id, item_id, source_kind, filesystem_entry_id, quality_label, container,
+                 size, bitrate, duration_ticks, is_default, probe_status
+             ) VALUES ('refresh-mode-source', 'refresh-mode-item', 'LOCAL_FILE',
+                       'refresh-mode-fe', '1080p', 'mkv', 1000, 8000000, 7200000000, 1, 'READY')",
+        )
+        .execute(database.pool())
+        .await?;
+        database.rebuild_catalog_items_batch(None, 100).await?;
+        // The `on` switch only serves the derived page once the consumer watermark exists.
+        database
+            .advance_catalog_consumer(
+                &crate::application::catalog_read_model::catalog_items_consumer(),
+                0,
+            )
+            .await?;
+        sqlx::query(
+            "UPDATE catalog_items SET title = 'Derived title'
+             WHERE item_id = 'refresh-mode-item'",
+        )
+        .execute(database.pool())
+        .await?;
+        Ok((
+            directory,
+            database,
+            AccessPrincipal::new(user.id, false),
+            library_id,
+        ))
+    }
+
+    fn refresh_mode_filter() -> super::CatalogFilter {
+        super::CatalogFilter {
+            sort_by: super::CatalogSort::Name,
+            include_total: false,
+            ..super::CatalogFilter::default()
+        }
+    }
+
+    /// The library page cache warms pages from a service of its own. That service has to run with
+    /// the mode its owner was configured with, otherwise `LUX_READ_MODEL_MODE=on` serves the
+    /// derived page on the request path and then quietly replaces it with the authoritative page
+    /// on the next background refresh.
+    #[tokio::test]
+    async fn library_page_refresh_uses_the_configured_read_model_mode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database, principal, library_id) =
+            read_model_library_page_fixture().await?;
+        let catalog = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database.clone()),
+        )
+        .with_read_model_mode(super::ReadModelMode::On);
+        let cache = catalog.library_page_cache.clone();
+        let filter = refresh_mode_filter();
+
+        let seeded = catalog
+            .list_library_items_in_scope_with_projection(
+                principal,
+                &library_id,
+                &filter,
+                None,
+                0,
+                10,
+                super::CatalogItemProjection::Full,
+            )
+            .await?;
+        assert_eq!(
+            seeded.items[0].title, "Derived title",
+            "the request path must serve the read-model page"
+        );
+
+        // Rename both sources so the refreshed page names the source it was read from.
+        sqlx::query(
+            "UPDATE media_items SET title = 'Authoritative v2' WHERE id = 'refresh-mode-item'",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE catalog_items SET title = 'Derived v2'
+             WHERE item_id = 'refresh-mode-item'",
+        )
+        .execute(database.pool())
+        .await?;
+
+        catalog.invalidate_library_pages();
+        cache.refresh_all().await;
+
+        let refreshed = catalog
+            .list_library_items_in_scope_with_projection(
+                principal,
+                &library_id,
+                &filter,
+                None,
+                0,
+                10,
+                super::CatalogItemProjection::Full,
+            )
+            .await?;
+        assert_eq!(
+            refreshed.items[0].title, "Derived v2",
+            "the background refresh must keep reading the read model when the service runs with mode=on"
+        );
+        Ok(())
+    }
+
+    /// `shadow` serves the authoritative page, so the warm-up keeps that same source; running the
+    /// comparison there would add a second page query per warmed entry for a log nobody reads.
+    #[tokio::test]
+    async fn library_page_refresh_skips_the_shadow_comparison()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database, principal, library_id) =
+            read_model_library_page_fixture().await?;
+        let catalog = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database.clone()),
+        )
+        .with_read_model_mode(super::ReadModelMode::Shadow);
+        let cache = catalog.library_page_cache.clone();
+        assert_eq!(
+            cache.refresh_read_model_mode(),
+            super::ReadModelMode::Off,
+            "the warm-up must not pay the shadow comparison query"
+        );
+        let filter = refresh_mode_filter();
+
+        let seeded = catalog
+            .list_library_items_in_scope_with_projection(
+                principal,
+                &library_id,
+                &filter,
+                None,
+                0,
+                10,
+                super::CatalogItemProjection::Full,
+            )
+            .await?;
+        assert_eq!(
+            seeded.items[0].title, "Authoritative title",
+            "shadow serves the authoritative page"
+        );
+
+        sqlx::query(
+            "UPDATE media_items SET title = 'Authoritative v2' WHERE id = 'refresh-mode-item'",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE catalog_items SET title = 'Derived v2'
+             WHERE item_id = 'refresh-mode-item'",
+        )
+        .execute(database.pool())
+        .await?;
+
+        catalog.invalidate_library_pages();
+        cache.refresh_all().await;
+
+        let refreshed = catalog
+            .list_library_items_in_scope_with_projection(
+                principal,
+                &library_id,
+                &filter,
+                None,
+                0,
+                10,
+                super::CatalogItemProjection::Full,
+            )
+            .await?;
+        assert_eq!(
+            refreshed.items[0].title, "Authoritative v2",
+            "a shadow warm-up keeps the authoritative page and skips the comparison"
+        );
+        Ok(())
+    }
+
+    /// Yamby's home screen asks each library for its newest items as
+    /// `Items/Latest?ParentId=<library>&GroupItems=true&MediaTypes=Video&Limit=16`, which Lux turns
+    /// into `item_types = [MOVIE, SERIES]` ordered by `DateCreated` descending. A series owns no
+    /// media source, so the read-model page has to keep it through its visible children.
+    #[tokio::test]
+    async fn read_model_library_page_returns_series_for_the_latest_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::libraries::LibraryService, auth::users::UserStore, config::Config,
+            library::LibraryKind,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let user = UserStore::new(database.clone())?
+            .create_user("latest-viewer", "Latest Viewer", "test password", false)
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Latest TV", LibraryKind::Series, false)
+            .await?;
+        let library_id = library.id.to_string();
+        database
+            .set_user_library_access(&user.id.to_string(), &library_id, true)
+            .await?;
+        sqlx::query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('latest-root', ?, '/tv', '/tv', 1, 1)",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 device, inode, fingerprint, last_seen_generation, last_seen_change_kind
+             ) VALUES ('latest-fe', 'latest-root', 'Show/S01E01.mkv', 'FILE', 1, 1,
+                       1, 1, X'00', 'g1', 'NEW')",
+        )
+        .execute(database.pool())
+        .await?;
+        for (id, item_type, parent_id, series_id, added_at, has_source) in [
+            ("latest-series", "SERIES", None, None, 10_i64, 0_i64),
+            (
+                "latest-season",
+                "SEASON",
+                Some("latest-series"),
+                Some("latest-series"),
+                11,
+                0,
+            ),
+            (
+                "latest-episode",
+                "EPISODE",
+                Some("latest-season"),
+                Some("latest-series"),
+                12,
+                1,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, parent_id, series_id, title, sort_title,
+                     added_at, identification_status, has_available_source
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?)",
+            )
+            .bind(id)
+            .bind(&library_id)
+            .bind(item_type)
+            .bind(parent_id)
+            .bind(series_id)
+            .bind(id)
+            .bind(id)
+            .bind(added_at)
+            .bind(has_source)
+            .execute(database.pool())
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO media_sources (
+                 id, item_id, source_kind, filesystem_entry_id, quality_label, container,
+                 size, bitrate, duration_ticks, is_default, probe_status
+             ) VALUES ('latest-source', 'latest-episode', 'LOCAL_FILE', 'latest-fe',
+                       '1080p', 'mkv', 1000, 8000000, 7200000000, 1, 'READY')",
+        )
+        .execute(database.pool())
+        .await?;
+        database.rebuild_catalog_items_batch(None, 100).await?;
+        database
+            .advance_catalog_consumer(
+                &crate::application::catalog_read_model::catalog_items_consumer(),
+                0,
+            )
+            .await?;
+
+        let filter = super::CatalogFilter {
+            item_types: vec!["MOVIE".to_owned(), "SERIES".to_owned()],
+            sort_by: super::CatalogSort::DateCreated,
+            descending: true,
+            include_total: true,
+            ..super::CatalogFilter::default()
+        };
+        let principal = AccessPrincipal::new(user.id, false);
+        let read_model_page = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database.clone()),
+        )
+        .with_read_model_mode(super::ReadModelMode::On)
+        .list_library_items_filtered(principal, &library_id, &filter, 0, 16)
+        .await?;
+        let authoritative_page = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database),
+        )
+        .with_read_model_mode(super::ReadModelMode::Off)
+        .list_library_items_filtered(principal, &library_id, &filter, 0, 16)
+        .await?;
+
+        assert_eq!(
+            authoritative_page
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["latest-series"],
+            "the authoritative page lists the series through its episode"
+        );
+        assert_eq!(
+            read_model_page
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["latest-series"],
+            "the read-model page must answer the Latest request like the authoritative query"
+        );
+        assert_eq!(read_model_page.total, authoritative_page.total);
+        Ok(())
+    }
+
+    #[test]
+    fn tag_page_limit_is_clamped_to_the_server_bound() {
+        // The service clamps instead of asserting: a caller that forgot its own validation gets a
+        // bounded page rather than an unbounded storage query or a panic.
+        assert_eq!(super::clamped_tags_page_limit(-1), 0);
+        assert_eq!(super::clamped_tags_page_limit(0), 0);
+        assert_eq!(super::clamped_tags_page_limit(25), 25);
+        assert_eq!(
+            super::clamped_tags_page_limit(super::TAGS_MAX_PAGE_LIMIT),
+            super::TAGS_MAX_PAGE_LIMIT
+        );
+        assert_eq!(
+            super::clamped_tags_page_limit(super::TAGS_MAX_PAGE_LIMIT * 4),
+            super::TAGS_MAX_PAGE_LIMIT,
+            "an oversized limit never reaches the storage query"
+        );
+    }
+
+    async fn tag_test_setup() -> Result<
+        (
+            tempfile::TempDir,
+            Database,
+            super::CatalogService,
+            AccessPrincipal,
+            String,
+            String,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        use crate::{
+            application::libraries::LibraryService, auth::users::UserStore, config::Config,
+            library::LibraryKind,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let libraries = LibraryService::new(database.clone());
+        let visible_library = libraries
+            .create_library("Tag Visible", LibraryKind::Movie, false)
+            .await?;
+        let hidden_library = libraries
+            .create_library("Tag Hidden", LibraryKind::Movie, false)
+            .await?;
+        let user = UserStore::new(database.clone())?
+            .create_user("tag-viewer", "Tag Viewer", "test password", false)
+            .await?;
+        database
+            .set_user_library_access(&user.id.to_string(), &visible_library.id.to_string(), true)
+            .await?;
+        let catalog = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database.clone()),
+        );
+        Ok((
+            directory,
+            database,
+            catalog,
+            AccessPrincipal::new(user.id, false),
+            visible_library.id.to_string(),
+            hidden_library.id.to_string(),
+        ))
+    }
+
+    /// One visible movie per entry, each with one TAG facet and one content-restriction rating.
+    async fn insert_tag_item(
+        database: &Database,
+        item_id: &str,
+        library_id: &str,
+        tag: &str,
+        certification_code: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        insert_tag_item_of_type(
+            database,
+            item_id,
+            library_id,
+            "MOVIE",
+            tag,
+            certification_code,
+        )
+        .await
+    }
+
+    /// The same projection for an explicit `item_type`, so type filters can be exercised.
+    async fn insert_tag_item_of_type(
+        database: &Database,
+        item_id: &str,
+        library_id: &str,
+        item_type: &str,
+        tag: &str,
+        certification_code: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        sqlx::query(
+            "INSERT INTO media_items
+             (id, library_id, item_type, title, sort_title, identification_status,
+              has_available_source)
+             VALUES (?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(item_id)
+        .bind(library_id)
+        .bind(item_type)
+        .bind(item_id)
+        .bind(item_id.to_lowercase())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_item_facets (item_id, kind, name_key, name)
+             VALUES (?, 'TAG', ?, ?)",
+        )
+        .bind(item_id)
+        .bind(tag.to_lowercase())
+        .bind(tag)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_content_restriction_index (item_id, certification_code)
+             VALUES (?, ?)",
+        )
+        .bind(item_id)
+        .bind(certification_code)
+        .execute(database.pool())
+        .await?;
+        Ok(())
+    }
+
+    fn tag_names(tags: &[crate::storage::StoredMediaFacet]) -> Vec<&str> {
+        tags.iter().map(|tag| tag.name.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn list_tags_applies_library_acl_and_content_restrictions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::storage::NewUserContentRestrictions;
+
+        let (_directory, database, catalog, principal, visible_library_id, hidden_library_id) =
+            tag_test_setup().await?;
+        insert_tag_item(&database, "tag-visible", &visible_library_id, "Space", "PG").await?;
+        insert_tag_item(
+            &database,
+            "tag-restricted",
+            &visible_library_id,
+            "Gore",
+            "R",
+        )
+        .await?;
+        insert_tag_item(
+            &database,
+            "tag-elsewhere",
+            &hidden_library_id,
+            "Elsewhere",
+            "PG",
+        )
+        .await?;
+        database
+            .compare_and_swap_user_content_restrictions(
+                &principal.user_id_string(),
+                0,
+                NewUserContentRestrictions {
+                    rating_system: "MPA",
+                    maximum_rating: Some("PG-13"),
+                    allow_unrated: false,
+                    allowed_tags: &[],
+                    blocked_tags: &[],
+                },
+            )
+            .await?;
+
+        let (unscoped, unscoped_total) = catalog.list_tags(principal, None, &[], 0, 10).await?;
+        assert_eq!(
+            tag_names(&unscoped),
+            ["Space"],
+            "the hidden library and the R-rated item contribute no tags"
+        );
+        assert_eq!(unscoped_total, 1);
+
+        let (scoped, scoped_total) = catalog
+            .list_tags(principal, Some(&visible_library_id), &[], 0, 10)
+            .await?;
+        assert_eq!(tag_names(&scoped), ["Space"]);
+        assert_eq!(scoped_total, 1);
+
+        assert!(
+            matches!(
+                catalog
+                    .list_tags(principal, Some(&hidden_library_id), &[], 0, 10)
+                    .await,
+                Err(super::CatalogError::LibraryNotFound)
+            ),
+            "an inaccessible library is answered as not found, not as an empty page"
+        );
+        assert!(matches!(
+            catalog
+                .list_tags(principal, Some("missing-library"), &[], 0, 10)
+                .await,
+            Err(super::CatalogError::LibraryNotFound)
+        ));
+
+        let admin_principal = AccessPrincipal::new(
+            principal
+                .user_id
+                .ok_or("the test principal has a user id")?,
+            true,
+        );
+        let (admin_tags, admin_total) =
+            catalog.list_tags(admin_principal, None, &[], 0, 10).await?;
+        assert_eq!(
+            tag_names(&admin_tags),
+            ["Elsewhere", "Gore", "Space"],
+            "an admin sees every enabled library and ignores content restrictions"
+        );
+        assert_eq!(admin_total, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_tags_pages_and_clamps_an_oversized_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database, catalog, principal, visible_library_id, _hidden) =
+            tag_test_setup().await?;
+        insert_tag_item(&database, "tag-alpha", &visible_library_id, "Alpha", "PG").await?;
+        insert_tag_item(&database, "tag-bravo", &visible_library_id, "Bravo", "PG").await?;
+        insert_tag_item(
+            &database,
+            "tag-charlie",
+            &visible_library_id,
+            "Charlie",
+            "PG",
+        )
+        .await?;
+
+        let (first_page, total) = catalog.list_tags(principal, None, &[], 0, 2).await?;
+        assert_eq!(
+            total, 3,
+            "the total describes the whole tag list, not the page"
+        );
+        assert_eq!(tag_names(&first_page), ["Alpha", "Bravo"]);
+        let (second_page, second_total) = catalog.list_tags(principal, None, &[], 2, 2).await?;
+        assert_eq!(second_total, 3);
+        assert_eq!(tag_names(&second_page), ["Charlie"]);
+
+        // An oversized limit is clamped by the service (see `clamped_tags_page_limit`): the
+        // request still answers, bounded to `TAGS_MAX_PAGE_LIMIT`.
+        let (clamped, clamped_total) = catalog
+            .list_tags(principal, None, &[], 0, super::TAGS_MAX_PAGE_LIMIT * 4)
+            .await?;
+        assert_eq!(clamped_total, 3);
+        assert_eq!(clamped.len(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_tags_filters_by_item_type() -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database, catalog, principal, visible_library_id, _hidden) =
+            tag_test_setup().await?;
+        insert_tag_item_of_type(
+            &database,
+            "tag-movie",
+            &visible_library_id,
+            "MOVIE",
+            "Movie Only",
+            "PG",
+        )
+        .await?;
+        insert_tag_item_of_type(
+            &database,
+            "tag-series",
+            &visible_library_id,
+            "SERIES",
+            "Series Only",
+            "PG",
+        )
+        .await?;
+
+        let all = vec!["MOVIE".to_owned(), "SERIES".to_owned()];
+        let (tags, total) = catalog.list_tags(principal, None, &all, 0, 10).await?;
+        assert_eq!(tag_names(&tags), ["Movie Only", "Series Only"]);
+        assert_eq!(total, 2);
+
+        let only_movies = vec!["MOVIE".to_owned()];
+        let (tags, total) = catalog
+            .list_tags(principal, None, &only_movies, 0, 10)
+            .await?;
+        assert_eq!(
+            tag_names(&tags),
+            ["Movie Only"],
+            "`IncludeItemTypes` narrows the tag list through the shared item-type predicate"
+        );
+        assert_eq!(total, 1);
+
+        let only_series = vec!["SERIES".to_owned()];
+        let (tags, total) = catalog
+            .list_tags(principal, None, &only_series, 0, 10)
+            .await?;
+        assert_eq!(tag_names(&tags), ["Series Only"]);
+        assert_eq!(total, 1);
         Ok(())
     }
 }

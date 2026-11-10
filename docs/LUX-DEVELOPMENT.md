@@ -111,10 +111,10 @@ Lux 的核心价值不是功能数量，而是：
 - 剧集库和混合库可各自选择一个已安装、已启用且可用的片头片尾数据源；未选择表示不为该库生成或输出片头片尾标记。
   片头片尾数据源必须声明 chapters.detect 或 chapters.lookup；电影库不能选择该来源。混合库只对其中的剧集/分集参与检测。
 - 管理员可在“全局策略”中设置媒体库的默认元数据、图像和字幕策略；媒体库可以继承全局默认值，也可以单独覆盖。
-- 全局图像策略包括海报、背景图（FANART/backdrop）、艺术图（Emby `Art`）、横幅图、徽标、缩略图、光盘封面、壁纸开关、每项最大背景图数量和最小下载宽度；媒体库可覆盖这些开关。
-- 图像策略支持“层级 × 类型”覆盖：电影、剧集、季度、单集四个层级都可以为每种图片类型单独设置是否抓取、允许来源（在线刮削 / 本地截图）、允许的刮削器角色（主 / 备用 / 补充）、覆盖策略（继承 / 保留 / 仅补缺 / 覆盖）、张数上限和最小宽度；单集另有“在线剧照 / 本地截图 / 都不要”三选一。未设置的字段逐级继承上层默认值。本地已有图片始终优先，任何配置都不能让“仅补全”覆盖本地图片。
+- 全局图像策略包括海报、背景图（FANART/backdrop）、艺术图（Emby `Art`）、横幅图、徽标、缩略图、光盘封面、壁纸开关和每项最大背景图数量；媒体库可覆盖这些开关。图片最小宽度不再由主程序设置，改由刮削器插件按图片类型负责（LUX-884）。
+- 图像策略支持“层级 × 类型”覆盖：电影、剧集、季度、单集四个层级都可以为每种图片类型单独设置是否抓取、允许来源（在线刮削 / 本地截图）、允许的刮削器角色（主 / 备用 / 补充）、覆盖策略（继承 / 保留 / 仅补缺 / 覆盖）和张数上限；单集另有“在线剧照 / 本地截图 / 都不要”三选一。未设置的字段逐级继承上层默认值。本地已有图片始终优先，任何配置都不能让“仅补全”覆盖本地图片。
 - 全局策略支持保守的存储预估，并明确应用范围：仅新内容、刷新选中内容或后台刷新全部内容；全局刮削可选择仅补全或完整刮削，批量刷新必须进入任务队列。
-- 不在用户请求路径中扫描目录、读取 NFO、调用 ffprobe 或访问 TMDb。
+- 不在用户请求路径中扫描目录、读取 NFO、调用 ffprobe 或访问 TMDb。唯一例外见 3.3：本地媒体源缺少媒体信息（`PENDING`）时，首次 `PlaybackInfo` 允许同步执行一次单源 `ffprobe`。
 
 ### 3.2 媒体来源
 
@@ -127,6 +127,7 @@ Lux 的核心价值不是功能数量，而是：
 ### 3.3 播放
 
 - 本地媒体的 Web 播放使用 0～4 档服务端计划：档位 0 为 Direct Play，档位 1 为视频/音频 copy 的 Remux，档位 2 为视频 copy、音频转码，档位 3 为硬件转码，档位 4 为软件转码。决策始终优先选择较低档位。
+- 本地媒体源缺少媒体信息时（`probe_status=PENDING`，扫描已建源但尚无探测结果），首次 `PlaybackInfo` 在构造响应前同步执行一次单源 `ffprobe` 并落库，使响应直接带上总时长、码率、容器和媒体轨；源已有探测结果（`READY`、`FAILED`、`NOT_CONFIGURED`）时只读取已存值，不重复探测。该探测受现有 ffprobe 进程预算约束，等待准入最多 10 秒，同一 source 的并发播放合并为一次探测；失败或超时只回退到已存值（失败状态记为 `FAILED`），仍返回可播放的源，不阻止播放。`.strm` 源、`/Videos/...` 媒体字节请求和 Web HLS 会话都不触发该探测。
 - Lux Web 的档位 1～4 输出会话级 fMP4/CMAF HLS；Emby 第三方客户端按会话容器协商，默认使用 MPEG-TS，
   仅在客户端明确声明 `mp4`/`fmp4` 时使用 fMP4。两类 HLS 清单和分片都只存在于播放会话临时目录，不生成永久媒体副本。
 - `.strm` 只能使用档位 0。直连或重定向失败时直接返回不支持，不允许 Remux、音频转码、视频转码、HLS、代理媒体字节或在用户请求中对远程目标运行 ffprobe/ffmpeg。
@@ -203,7 +204,7 @@ Lux 的核心价值不是功能数量，而是：
   /config/metadata/library/<shard>/<item-id>/。媒体目录已有 NFO 和图片仍保留且优先，历史
   metadata 资源不自动搬迁。
 - 新建媒体库首次添加可用根路径并完成扫描后，若媒体库配置了刮削器，自动按主/备用角色和高置信度选择最佳候选，再按补充角色补齐缺失元数据，写回元数据并按该媒体库的图像策略下载所需图片；用户无需逐条进入管理后台确认。
-- 手动“扫描媒体库文件”只做文件系统调和、媒体探测和本地 NFO/图片索引，不自动发起在线刮削；管理员可以单独执行“元数据匹配/刷新元数据”。全量扫描期间首页继续读取上一份稳定快照；所有可用根路径的 Manifest 索引及缺失确认提交后立即切换首页快照，不等待本地 NFO、probe、封面或缩略图等后处理完成。NFO/图片登记由独立有界后台 worker 并行补齐。
+- 手动“扫描媒体库文件”只做文件系统调和、媒体探测和本地 NFO/图片索引，不自动发起在线刮削；管理员可以单独执行“元数据匹配/刷新元数据”。条目的“刷新元数据”按条目所在媒体库生效的刮削模式执行：媒体库策略优先，其次全局策略，默认仅补全；菜单文字与提交的模式一致，模式尚未读取完成时保留中性的“刷新元数据”并按仅补全提交。全量扫描期间首页继续读取上一份稳定快照；所有可用根路径的 Manifest 索引及缺失确认提交后立即切换首页快照，不等待本地 NFO、probe、封面或缩略图等后处理完成。NFO/图片登记由独立有界后台 worker 并行补齐。
 - 媒体详情页或媒体卡片上的“扫描所在文件夹”只扫描该媒体现有媒体源所在的文件夹；媒体库管理页上的“扫描媒体库文件”才扫描整个媒体库。两者都只做文件系统调和、媒体探测和本地 NFO/图片索引，不自动发起在线刮削。
 - 管理员从媒体库入口手动执行“整库元数据匹配”时，使用与新库首次处理相同的自动选择、NFO 写回和图片下载流程；低置信度条目仍进入待处理队列。
 - 回写使用临时文件、刷盘和原子重命名；失败时显示可重试状态，不谎报成功。
@@ -220,7 +221,7 @@ Lux 的核心价值不是功能数量，而是：
 
 - 弹幕使用独立的 Lux 弹幕服务和 Emby 兼容弹幕路由，不伪装成普通字幕轨。
 - 管理员可以配置一个 Dandanplay 兼容 API 基地址，也可以配置 `huangxd-/danmu_api` 的 API 基地址；地址可包含部署 token 路径。
-- 管理员可以在弹幕插件配置中选择允许匹配的媒体库；未选择的媒体库不能创建弹幕匹配任务，空选择表示不匹配任何媒体库。
+- 管理员可以在弹幕插件配置中选择允许匹配的媒体库；未选择的媒体库不能创建**自动**弹幕匹配任务（整库扫描与按计划执行），空选择表示不自动匹配任何媒体库。管理员对单个条目的**手动匹配**（先搜索候选、再选定某一集）是显式操作，不受该选择限制（ADR-052 P5）。
 - 弹幕匹配策略支持使用原始文件名、尝试本地已登记的简体/繁体标题、尝试本地已登记的英文/原始标题；按原始文件名、简繁标题、英文/原始标题的顺序逐个回退，仅在前一个候选没有匹配时请求下一个候选。
 - 弹幕文字的简繁转换由上游 `danmu_api` 的部署配置负责；Lux 不引入 OpenCC、不把简繁转换伪装成所有 Dandanplay 兼容服务都支持的请求参数，也不在首版筛选弹幕语言。
 - 后台匹配任务优先使用上游 `/api/v2/match`，不支持时回退到 Dandanplay 兼容的搜索、详情和弹幕接口。
@@ -258,7 +259,10 @@ Lux 的核心价值不是功能数量，而是：
   完整刮削替换）。
 - 张数上限只作用于背景图、艺术图和壁纸；上限为 4 张，0 表示该类型不下载。补充来源追加时按
   剩余名额截断。
-- 最小宽度在候选入库前按层级/类型过滤；上游未提供宽度时保留该候选，避免误删。
+- 最小宽度不再由 Lux 主程序设置或过滤：候选入库前只按类型归并，不读取上游宽度；宽度筛选由刮削器插件负责（LUX-884）。
+- 海报候选（`Primary`/`Poster`）在没有独立光盘图时也用于填充 `DISC`；条目已经有光盘图（本地文件、
+  已登记图片或写入目录）时，刷新不会用海报覆盖它，上游明确给出的 `Disc` 候选仍按覆盖策略处理
+  （LUX-886）。
 - 刮削器角色过滤只在配置了具体角色时查询一次条目所属媒体库的角色；来源角色未知时保持原有放行
   行为。本地图始终优先，因此不提供“不使用本地图”的开关。
 - 单集图片三选一：`SCRAPER_STILL` 使用在线剧照（写入 FANART），`LOCAL_SCREENSHOT` 使用 ffmpeg
@@ -492,7 +496,7 @@ Lux 的核心价值不是功能数量，而是：
   `available_parallelism`，Linux 可见的 v1/v2 quota 与 cpuset 共同取较小容量。新库将自动预算写入每库设置；
   已有每库配置保留，但运行时不能超过进程预算。`LUX_PROBE_CONCURRENCY` 数值覆盖自动进程预算。
   本地 ffprobe 的活动并发从约有效 CPU 核数起步，后续仅依据成功完成速率试探和回退，并结合近期前台延迟及内存保护；
-  CPU 使用率不参与 probe 控制，进程全局硬上限为 512。ffprobe 只处理本轮 fingerprint 变化或新增的 source，未变化 source 不得重复探测。
+  CPU 使用率不参与 probe 控制，进程全局硬上限为 512。ffprobe 只处理本轮 fingerprint 变化或新增的 source，未变化 source 不得重复探测；首次播放触发的单源探测只针对仍为 `PENDING` 的本地 source，成功后状态变为 `READY`，不会再次探测。
 - TMDb 请求必须经过 `org.lux.tmdb` 插件；插件统一限制最多 16 个并发请求、每秒最多发起 32 次请求，并实现指数退避和抖动。
 - SQLite 写事务短小，批次默认 100 至 500 项；禁止把整个库放入单个事务。
 
@@ -754,6 +758,23 @@ docker compose up
 ~~~
 
 scripts/check-all.sh 应只是上述命令的可移植封装，不隐藏错误、不自动修改文件。
+
+### 9.1 构建产物和临时文件位置
+
+本项目位于外置盘 `/Volumes/Toshiba/mywork/Lux`，构建空间充足；内置 SSD 长期只剩 20–30 GiB，
+承载 GB 级增量构建和测试临时数据时会持续高 I/O 并令整机卡死。因此：
+
+- 所有构建产物、缓存、测试 fixture、基准工作目录、日志和截图必须写在项目文件夹内：
+  Rust 用 `target/`，Web 用 `web/node_modules/`、`web/dist/`，临时数据统一用 `.tmp/`。
+- 禁止把项目文件、构建输出或实验目录写到 `/tmp`、`/private/tmp`、`/var/tmp`、
+  `/var/folders`、`~/Library/Caches`、`~/.cache` 等内置盘位置。
+- 运行上述任何命令前先加载 `scripts/lux-env.sh`，它导出 `CARGO_TARGET_DIR`、`TMPDIR`、
+  `SQLITE_TMPDIR`、`XDG_CACHE_HOME`、`PNPM_HOME`、`PLAYWRIGHT_BROWSERS_PATH` 到项目目录。
+- 新建脚本的临时目录使用 `mktemp -d "${LUX_ROOT}/.tmp/<用途>.XXXXXX"`，不用裸 `mktemp -d`。
+- Docker 构建缓存位于 Docker Desktop 虚拟磁盘映像内，大规模构建前先把映像迁到外置盘或构建后
+  `docker builder prune -af`，不要用 `/private/tmp` 存放 build context 或导出镜像。
+
+完整规则、各工具落盘位置、验证命令和清理流程见 `docs/BUILD-OUTPUT-LOCATIONS.md`。
 
 ---
 
@@ -1538,10 +1559,10 @@ COMPATIBILITY.md 是唯一兼容性事实来源。不能因为实现了官方 Sw
 #### P2：体验完善
 
 - DisplayPreferences 相关端点。
-- Years、Genres、Tags 等筛选辅助端点。
+- Years、Genres、Tags 等筛选辅助端点。（Years、Genres、Studios、OfficialRatings 已实现，见 `docs/COMPATIBILITY.md`；Tags 已由 LUX-900 的 TAG 投影提供，Lux 原生 `GET /api/v1/tags` 与 Emby `/Tags` 读取同一数据；`/Items` 的标签筛选仍未实现。）
 - Collections 与合集成员。
 - 多版本选择所需的 AlternateSources 等端点。
-- Sessions WebSocket 或实时消息，仅在目标客户端确有依赖时实现。
+- Sessions WebSocket 或实时消息，仅在目标客户端确有依赖时实现。（**已因 Yamby 实现**：Yamby 2.1.0.11 的「服务器状态」页固定连接 `/embywebsocket` 并依赖 `Sessions`/`ScheduledTasksInfo` 推送，失败后无退避重连，见 `docs/COMPATIBILITY.md` 的 LUX-891 一节与 `docs/reviews/2026-11-06-hills-yamby-static-analysis.md` §9.6。其余实时消息类型仍按"仅在有依赖时实现"处理。）
 - 图片变体、尺寸和索引端点。
 
 #### 明确不实现
@@ -3075,7 +3096,9 @@ SQLite 0225 / PostgreSQL 0227 增加 `merge_suppressions`：手动拆分时把�
 - `backdrop` 开关控制 FANART 下载；`artwork` 只控制 Emby `Art`。关闭“艺术图”不再被误解为关闭背景图。
 - 覆盖策略与任务模式取更保守的一方：仅补全永不覆盖本地图片；`OVERWRITE` 只在完整刮削生效。
 - `maxBackdropCount` / 每格 `maxCount` 真正限制多图类型下载张数，0 表示不下载；上限 4 张。
-- 每格 `minWidth` 在候选入库前过滤低于阈值的上游图片；上游无宽度信息时保留。
+- ~~每格 `minWidth` 在候选入库前过滤低于阈值的上游图片~~ 已由 LUX-884 移除：全局 `minDownloadWidth`
+  与每格 `minWidth` 都不再存在，候选图不按上游宽度过滤（宽度选择归刮削器插件）；旧设置里的这两个键
+  仍能加载并被忽略。
 - 每格 `scraperRoles` 按条目所属媒体库的刮削器角色过滤；角色未知时保持原有放行行为。
 - 单集三选一分别控制在线剧照、ffmpeg 截图与两者都不要。
 - Web 全局策略与媒体库覆盖面板提供同一矩阵编辑器，未设置项显示“继承”并在清空后自动剪枝；
@@ -3659,7 +3682,7 @@ Web 侧 `node --test tests/*.test.mjs`（150 项）、`vitest run`（861 项，�
 - [x] 本地视频在扫描完成后的后台阶段从默认 `00:03:01` 画面生成独立的 `POSTER`（2:3）和 `THUMB`（16:9），分别通过现有图片接口提供。
 - [x] 同一逻辑媒体项优先使用默认本地来源；已有有效本地图片和刮削器图片不被截图覆盖；缺少或失效的登记路径可以重建。
 - [x] 截图使用低优先级 `FFMPEG` 回退来源：没有选择刮削器、刮削器没有返回对应图片或截图先完成时，保留截图；刮削器后来获得对应图片时可以替换截图回退图；截图不能替换已经存在的非回退图片。
-- [x] `POSTER` 和 `THUMB` 独立判断：刮削器只返回其中一种图片时，另一种可以单独由截图补全；两种图片不共享登记路径。
+- [x] `POSTER` 和 `THUMB` 独立判断：刮削器只返回其中一种图片时，另一种可以单独由截图补全；两种图片不共享登记路径。LUX-887 起该规则覆盖同一媒体的所有图片行：同类型的不同索引（如 `FANART/1` 与 `FANART/4`）也不共享登记路径。
 - [x] `STRM_URL` 不进入候选查询或 ffmpeg 参数；纯 `.strm` 条目不会生成缩略图。
 - [x] ffmpeg 使用参数数组、路径根目录约束、原子输出和超时控制；单个文件失败不导致扫描任务失败。
 - [x] 扫描任务事件记录缩略图阶段的完成/失败计数；容器重启取消未完成任务后，下一次扫描仍可重试缺失项。
@@ -3792,7 +3815,14 @@ STRM 来源状态区分“尚未配置”和“已经排队”：未被插件选
 受限的旁车写入能力和 Emby 兼容弹幕端点。
 
 插件声明 `type: "danmaku"`、`category: "MEDIA"`、`danmaku.match` 能力和统一 RPC 方法
-`danmaku.match`。主进程向插件发送已经过路径和媒体库 ACL 校验的本地视频或 `.strm` 索引文件描述及任务选项，
+`danmaku.match`。ADR-052 P4（LUX-877）之后，弹幕插件还可以**同时**声明可选的
+`danmaku.search`/`danmaku.fetch` 能力与方法：宿主用前者按关键词取候选动画与分集，用后者按
+`episodeId` 取回受大小限制的 XML；两个能力必须同时声明或同时不声明，声明其他未知
+`danmaku.*` 能力视为无效 manifest。旧插件只声明 `danmaku.match`，行为与宿主侧调用路径完全
+不变；只有声明了这两个能力的插件才具备手动匹配能力，宿主对其暴露
+`PluginService::search_danmaku`、`fetch_danmaku` 与 `danmaku_manual_match_supported`。
+宿主仍不向插件传路径、上游地址或用户信息，插件不能写文件，XML 写盘与 `validate_danmaku_xml`
+最终校验仍由宿主的调用方负责。主进程向插件发送已经过路径和媒体库 ACL 校验的本地视频或 `.strm` 索引文件描述及任务选项，
 插件返回结构化匹配状态和受大小限制的 XML；插件不得接收或执行用户直接提供的上游 URL，
 不得访问主进程配置目录以外的凭据。管理员配置 Dandanplay 兼容 API 基地址，或配置
 `huangxd-/danmu_api` 的 API 基地址，配置由插件 manifest 声明并通过插件配置界面保存。
@@ -5350,6 +5380,8 @@ Rust/WASM 播放增强任务。
 检查视觉、可访问名称、console 和网络；更新 `docs/COMPATIBILITY.md`。
 
 依赖：LUX-208。
+
+修订（2026-11-02，项目所有者确认）：控件布局改为 Lux 自有原型：进度条上方左侧为当前时间、右侧为总时长，进度条满宽；底栏左侧为播放、上一集、下一集、后退/前进 10 秒、音量、字幕，右侧为音轨、倍速、弹幕、AirPlay（移动端）、设置、全屏；画中画位于顶栏右侧；截图和键盘快捷键按钮移除（快捷键仍由 `?` 打开）；设置改为右侧抽屉，标签页为画质、长宽比、弹幕（仅在页面有弹幕设置时显示）、播放信息，循环播放与自动连播在画质页，画面翻转在长宽比页；字幕与音轨为底栏弹窗，选项均为列表样式（不再使用下拉框），字幕偏移随字幕弹窗保留；倍速按钮仅显示图标，按 1、1.25、1.5、2、0.75 循环；点击抽屉或弹窗以外区域会收起；中间标识在媒体就绪前和缓冲时呼吸；进度条悬停提示显示章节名；窄屏隐藏 10 秒按钮；长宽比新增“填充”。原“46px ArtPlayer 密度”和截图、快捷键按钮的验收条件不再适用；强调色跟随用户页的强调色设置（`--lux-accent`），不使用固定色。ArtPlayer 仍只作为参考，不复制其代码或视觉资产。
 
 阶段门：
 
@@ -19127,6 +19159,2490 @@ setup 启动的首轮 `RECONCILE_LIBRARY` 扫描，因此启动流程新增“�
       重新排队并跑完。CI 不覆盖该路径，因为重启会把测试进程自身 `exec` 掉。
 
 依赖：`docs/APP-STATE-NEXT.md` 方案 B 第 ① 步（路由保持单一、setup/ready 双状态）已完成。
+
+#### LUX-876：搜索取页查询去掉冗余回表（交接清单第 7 节搜索线索）
+
+范围：只改 `src/storage/catalog.rs` 的搜索取页 SQL 与一个上界检查，不改公共模型、不新增依赖、
+不新增迁移、不改返回的结果、顺序或总数。分析与取舍见 `docs/PERFORMANCE-SEARCH-ANALYSIS.md`。
+
+- `search_catalog_item_ids`（SQLite）的 `fts_query`、`like_query_sql` 投影 `mi.sort_title`，
+  `fts_page_query`、`like_page_query`、`union_page_query` 改为 `ORDER BY matches.sort_title,
+  matches.id`，删掉只为取该列而做的第二次 `JOIN media_items`；`search_catalog_item_ids_postgres`
+  的 LIKE 分支同步同一形状（静态核对，本机无 PG 实机）。匹配集的 id 唯一且 `sort_title` 是其函数，
+  因此顺序、`UNION` 去重与总数都不变。
+- `SEARCH_MAX_PAGE_LIMIT = 1_000` + `clamped_search_page_limit`，在 `fetch_catalog_search_page`
+  绑定时生效；对现有调用方是空操作（Lux 上限 100、Emby 上限 1000 已在 `api` 层校验），只是把
+  “列表必须有服务端上界”落到存储层，`limit = 0` 的 count-only 语义保持不变。
+- 结论记录：交接清单里“成本在计算总数”只对命中集很大的形状成立。66k 夹具上 `COUNT(*) OVER()`
+  在 11k 命中时占 5.4 ms（约 5%）、61k 命中时占 31.5 ms（约 19%）；主要成本是 66k 个 FTS 候选行的
+  回表（约 62 ms）。本次改动对 61k 命中形状 −17.8%（交替 20 轮中位数），对 Lux 自己的
+  `MOVIE/SERIES` 形状 −4.9%（噪声边缘）。
+- 未做（写在分析文档里）：FTS/派生表复制过滤列、连接级 PRAGMA、trigram、近似/延后总数，均需要
+  迁移、全局取舍或改变 `total` 语义。
+
+验收（2026-10-31，本机 `uname -m` = `arm64`）：
+
+- [x] `cargo test --locked --lib search` 21/21（含新增 `search_page_keeps_sort_title_order_and_total_across_pages`、
+      `search_page_union_keeps_like_only_matches_sorted_and_counted_once`、
+      `search_page_limit_is_clamped_to_the_server_upper_bound`；三个测试在改动前即为绿）。
+- [x] `cargo test --locked --test emby search::` 3/3。
+- [x] `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+      `scripts/check-migration-parity.py`、`scripts/check-backend-branches.py` 通过（无迁移、无新增
+      `DatabaseBackend::` 分支）。
+- [ ] 未验证：PostgreSQL 实机（形状已对齐，没有 PG 环境）；NAS/x86_64 上的绝对收益（本机 arm64、
+      测量期间同机有其它 worktree 的编译/测试负载）。
+
+#### LUX-877：弹幕插件协议 v2 宿主侧（`danmaku.search` / `danmaku.fetch` 与调用层）
+
+范围（ADR-052 P4，已获批准；插件本体在 Lux-plugins 仓库另行升级）：只做宿主协议与插件调用层。
+**不加任何 HTTP 路由/API、不改数据库与迁移、不动 `web/`**；D2 的手动匹配端点依赖本任务的两个
+宿主方法。
+
+- 能力与 manifest 校验：新增可选能力/方法常量 `danmaku.search`、`danmaku.fetch`。弹幕插件仍必须
+  声明 `danmaku.match`；`danmaku.search` 与 `danmaku.fetch` 必须**同时声明或同时不声明**，声明其他
+  未知 `danmaku.*` 能力使 manifest 无效。只声明 `danmaku.match` 的旧插件行为完全不变。
+- `danmaku.search`：请求 `{ "query": string, "limit": number }`（camelCase、`deny_unknown_fields`），
+  宿主发送前校验 `query` trim 后 1–200 字符且无控制字符、`limit` 1–50；结果
+  `{ "candidates": [{ "provider"?, "animeId", "animeTitle", "episodes": [{ "episodeId", "title" }] }] }`。
+  插件应只返回不超过请求 `limit` 的候选且单条响应 ≤ 4 MiB，宿主仍按请求 `limit`（≤50）与每候选
+  180 集裁剪；180 集的上限是算出来的：50 候选 × 180 集 × （128 字符 ID + 300 字符标题）的绝对上界
+  仍在 4 MiB 单行预算内，因此文档化的“最大合法搜索”是插件可实际交付的形状。宿主对保留页内的
+  `animeId`/`episodeId` >128 字符、`provider` >64、标题 >300，或任一字符串 trim 后为空/含控制字符
+  的候选判为 `PluginInvalidResponse`；保留页之外的语义坏候选被直接丢弃。**形状**错误（未知/多余
+  字段、类型错误、非 JSON）不享受该裁剪：反序列化在前，整条响应无效。
+- 响应体积：单行 4 MiB 上限由插件运行时统一执行（`plugin_runtime::MAX_PLUGIN_RESPONSE_BYTES`），
+  搜索/获取调用把它映射成 `PluginServiceError::InvalidResponse`（作业层码
+  `PLUGIN_INVALID_RESPONSE`），不再落到 `Runtime`/503 `PLUGIN_UNAVAILABLE`；协议层不再重复一份
+  不可达的体积检查。
+- `danmaku.fetch`：请求 `{ "provider"?, "episodeId" }`（`episodeId` 1–128；`provider` 缺省、空串或
+  纯空白都按“未设置”处理，非空时 1–64），结果
+  `{ "xmlBase64": string }`；沿用 `danmaku.match` 的响应上限，`xmlBase64` 为空即无效。宿主在返回前
+  通过 `DanmakuFetchResult::decode_xml` 解码并执行 `validate_danmaku_xml`（含 50 MiB XML 上限），
+  因此调用方拿到的一定是结构合法的文档，但本层不写盘。
+- 宿主 API：`PluginService::search_danmaku(query, limit)`、`fetch_danmaku(provider, episode_id)`、
+  `danmaku_manual_match_supported()`。插件未安装 → `UnknownPlugin`；未启用/不可用 → `Unavailable`；
+  未声明能力 → 新增 `Unsupported`；配置未完成 → `InvalidConfig`；宿主侧参数越界 → 新增
+  `InvalidRequest`。不 panic、不泛化为 Internal。作业层 `danmaku_plugin_error_code` 与 scraper 的
+  `scraper_failure_reason` 覆盖新错误，产出 `PLUGIN_UNSUPPORTED`/`PLUGIN_INVALID_REQUEST`；管理 API
+  **不新增错误码**，`Unsupported` 仍映射为 409 `PLUGIN_UNAVAILABLE`、`InvalidRequest` 为 400
+  `INVALID_REQUEST`。
+- 超时、隔离进程与脱敏沿用现有弹幕 RPC 路径：新增 `PluginService::with_danmaku_call_timeout`
+  （生产默认取 supervisor 的 30 s，`danmaku.match` 与 search/fetch 共用同一调用封装），日志与错误
+  只含能力名和宿主自有文案，不含上游 URL 或 token。
+- 文档：`docs/PLUGIN-SDK.md` 新增「弹幕手动匹配合同（可选能力）」小节、两个 RPC 方法条目与版本
+  兼容说明；插件章节补充能力声明规则。`docs/API-TYPES-SYNC.md` 不涉及（无 `/api/v1` 路由与 DTO
+  变化）。
+
+验收（2026-11-03，本机 `uname -m` = `arm64`）：
+
+- [x] `cargo test --locked --test plugins plugin_protocol::` 54/54：新增 manifest 用例（仅 match 通过、
+  match+search+fetch 通过、仅 search/仅 fetch/缺 match/未知 `danmaku.*` 均失败）、请求 JSON 形状与
+  路径/URL 字段拒绝、宿主侧 query/limit/episodeId 边界、`provider` 缺省/空串/纯空白等价、候选与分集
+  裁剪、空/超长/未知字段拒绝、fetch 解码与 `validate_danmaku_xml`，以及
+  `the_largest_allowed_search_shape_fits_the_transport_budget`（50 × 180 × 各字段上限的形状 ≤ 4 MiB
+  且被接受）。
+- [x] `cargo test --locked --test plugins danmaku::` 13/13：新增假插件覆盖正常 search+fetch（含空串/
+  纯空白 `provider` 成功）、空标题候选与坏 XML → `InvalidResponse`、超过 4 MiB 的 search/fetch 应答
+  → `InvalidResponse`（而非 `Runtime`/不可用）、仅 match 旧插件 → `Unsupported`（且 `danmaku.match`
+  仍可用）、300 ms 截止时间下的 `Runtime(Timeout)`、参数越界先于插件调用被拒绝（无插件时为
+  `UnknownPlugin`）。
+- [x] `cargo test --locked --lib plugin` 55/55。
+- [x] `cargo test --locked --test plugins -- --test-threads=2` 101/101；默认并行全组运行两次分别在
+  既有用例 `danmaku_service_matches_local_and_strm_sources_and_writes_sidecars`（10,000 源
+  `create_job` 的 250 ms 预算，见 `docs/TEST-TARGETS.md` §5.2）与无关的
+  `media_info_config_api::media_info_plugin_config_api_drives_a_background_run` 上超时，单独复跑
+  均通过，属同机高负载抖动（load average ≈ 6）。
+- [x] `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+  `scripts/check-migration-parity.py`、`scripts/check-backend-branches.py` 通过（无迁移、无新增
+  `DatabaseBackend::` 分支）。
+- [x] 完成门 `cargo test --locked --all-targets --no-fail-fast`（同机 load average ≈ 12）：lib 1810/3、
+  `plugins` 97/2、`admin` 24/1、`api_web` 53/4、`images` 54/1；`scanned_metadata` 与上述其余 target 通过。
+  逐条复核后没有一条与本改动相关：`probe::playback_probe_runs_once_…`、`watch::realtime_…`、
+  `plugins::admin_can_discover_…`、`image_writer::manual_scraper_image_selection_…` 单独复跑通过（高负载
+  抖动）；`danmaku_service_matches_…` 是 `docs/TEST-TARGETS.md` §5.2 记录的 250 ms 预算用例；
+  `scanner::local_metadata_worker_persists_capability_missing`、`admin_settings::transcoding_settings_…`、
+  `remote::forwarded_headers_…`、`web_playback::broken_hardware_encoder_…` 与两个 `web_static::*` 在
+  基线提交 `02830e0d` 的 `src` 上同样失败（环境/本机缺 `web/dist` 等），属既有基线失败。
+- [ ] 未验证：真实 `org.lux.danmaku` 插件（Lux-plugins 仓库另行升级）的 search/fetch 往返；本任务只用
+  假插件夹具覆盖 RPC 边界。
+
+第 1 轮审查返工（2026-11-03）：
+
+- 搜索响应体积：运行时 4 MiB 单行上限原先报成 `Runtime`/503 `PLUGIN_UNAVAILABLE`，协议层那份体积检查
+  因此不可达且与文档矛盾。改为：运行时超限在搜索/获取调用中映射为
+  `PluginServiceError::InvalidResponse`（`PLUGIN_INVALID_RESPONSE`），删掉协议层重复且不可达的
+  `ResultTooLarge` 分支，每候选 `episodes` 上限 500 → 180，使“50 候选 × 180 集 × 各字段取上限”的形状
+  确实落在 4 MiB 内（新增 `the_largest_allowed_search_shape_fits_the_transport_budget` 固定该契约）。
+  语义写进 `docs/PLUGIN-SDK.md`：插件应只返回不超过请求 `limit` 的候选且响应 ≤ 4 MiB，宿主仍裁剪。
+- `danmaku.fetch` 的 `provider`：空串/纯空白按“未设置”（`None`）处理，非空时仍按 1–64 校验；协议层与
+  服务层测试覆盖 `None`/`Some("")`/`Some("  ")` 成功与超长/控制字符失败。
+- 裁剪范围措辞：明确“页内裁剪”只覆盖语义坏候选（空/超长/控制字符），未知字段、多余字段与类型错误在
+  反序列化阶段即使整条响应无效（`deny_unknown_fields`），不再笼统声称“坏候选不会毁掉整次搜索”。
+- 错误码措辞：管理 API 不新增错误码（`Unsupported` → 409 `PLUGIN_UNAVAILABLE`、`InvalidRequest` →
+  400 `INVALID_REQUEST`）；`PLUGIN_UNSUPPORTED`/`PLUGIN_INVALID_REQUEST` 只来自作业层与 scraper
+  失败原因。
+
+返工验收（2026-11-03，`arm64`）：`cargo test --locked --test plugins plugin_protocol::` 54/54、
+`danmaku::` 13/13、`--test plugins -- --test-threads=2` 101/101、`cargo test --locked --lib plugin`
+55/55；`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+`scripts/check-migration-parity.py`、`scripts/check-backend-branches.py` 通过。
+
+依赖：ADR-052 P4；D2（手动匹配 API）依赖本任务的宿主方法。
+
+#### LUX-878：Emby MediaStream 对 Hills 等客户端的显示信息补全（Title、DisplayTitle、VideoRange、中文语言别名）
+
+背景：对 Hills（`com.mountains.hills`）的静态逆向分析（2026-11-03）确认：音频/字幕条目文字取
+`DisplayTitle → Title → DisplayLanguage → Language → "und"`，详情页“版本”行 = 视频流 `DisplayTitle` +
+`Size` + `Bitrate`；Hills 不自己拼“语言+编码+声道”，也不读 `DefaultAudioStreamIndex`。因此客户端显示
+的信息量完全取决于服务端输出的 `DisplayTitle`/`Title`/`Language`。
+
+范围：只改 Emby 兼容层的流 DTO 输出（`src/api/emby_catalog.rs` 的 `emby_media_stream_json`、
+`emby_media_source_stream_json`、`emby_media_stream_display_title`、`EMBY_LANGUAGE_TABLE` 等）以及必要时
+`src/application/probe.rs` 的字段白名单。**不改数据库与迁移、不改 Lux 自己的 `/api/v1` DTO 与 `web/`、
+不加路由**；不要求重新探测已入库数据（旧数据必须有合理回退）。
+
+- `DisplayTitle` 更有描述性（Emby 约定写法）：
+  - 视频：固定按 `<分辨率> <编码> <动态范围> <位深>` 排列，如 `2160p HEVC HDR10 10bit`，有哪项显示哪项，
+    不论某项来自探测值还是回退值。分辨率优先取探测到的 `Width`/`Height`（宽屏裁切按所属档位），没有探测值时
+    回退到 `quality_label`；已含分辨率时不得再叠加 `quality_label`；缺失的部分直接省略，不出现多余空格或
+    `Video` 占位拼接。（2026-11-04 补丁）
+  - 音频：`语言 编码 声道布局`（沿用现有规则）；缺 `ChannelLayout` 时用 `Channels`；缺编码时不出现
+    `10 channels` 之外的杂项；`默认`/`Default` 等标记由流自身 title 带来时不得重复叠加。
+  - 字幕：`语言 (编码)` 并带 forced / SDH 标记；语言未知时不得只剩 `und`。
+- 新增流级 `Title`：输出流的人工可读轨道名。优先来自探测保存的原始轨道名；没有原始值的已入库旧数据，
+  回退为不含 `quality_label` 前缀的 `DisplayTitle` 基础部分。不得出现空字符串（缺失则省略键）。
+- `VideoRange` 规范化输出为 Emby 词表：`SDR` / `HDR10` / `HDR10+` / `HLG` / `Dolby Vision`；无法识别
+  的值保持原值，不猜测。
+- `Language`/`DisplayLanguage`：`EMBY_LANGUAGE_TABLE` 补中文变体 `chs`/`cht`/`zh-cn`/`zh-tw`/`zh-hk`/
+  `zh-hans`/`zh-hant`/`cmn`/`yue`，`Language` 统一输出 `chi`，`DisplayLanguage` 区分“中文（简体）/
+  中文（繁体）/ 粤语”等；同时补充常见的欧洲语言码（`fin`、`swe`、`dan`、`gre`/`ell`、`heb`、`hun`、
+  `cze`/`ces`、`rum`/`ron`、`ukr`、`nor`/`nob`、`hrv`、`may`/`msa`、`fil`、`slo`/`slk`）。
+- 每条行为变化先写失败测试再实现；既有 `emby_media_stream_title_includes_available_audio_and_subtitle_details`
+  等断言若与新规则冲突，必须在提交说明里逐条解释，而不是静默改测试。
+
+验收（2026-11-03，本机 `uname -m` = `arm64`）：
+- [x] `cargo test --locked --lib emby_catalog::` 33/33：视频/音频/字幕 DisplayTitle 新旧数据、无重复叠加、
+  `Title` 回退与省略、VideoRange 规范化、中文及新增语言别名、空白详情字符串省略。
+- [x] 不含新字段的旧 `CatalogStream`（`title`=旧 DisplayTitle、无详情）输出合理且不 panic
+  （`legacy_rows_without_details_still_render_useful_titles`）。
+- [x] `cargo test --locked --test emby` 39/39（PlaybackInfo / Items 相邻用例无回归）；
+  `cargo test --locked --test library series_api::` 1/1。`series_api` 里原先断言视频 `DisplayTitle` 为
+  `2160p` 的三处（VidHub 与 Filmly 的剧集 `MediaSources` 各一处、`Fields=MediaStreams` 投影一处）
+  按新规则改为 `2160p H264`：夹具的视频流是 H264 + 2160p 标签，规格要求视频 DisplayTitle 带编码，
+  属预期行为变化，不是回归。
+- [x] `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+  `scripts/check-migration-parity.py`、`scripts/check-backend-branches.py` 通过（无迁移、无新增
+  `DatabaseBackend::` 分支）。
+- [x] `docs/COMPATIBILITY.md` 记录 Hills 对这些字段的读取行为（确认/推断分级）。
+- 完成门 `cargo test --locked --all-targets --no-fail-fast -- --test-threads=4`（21 个 target，
+  load average 13–30）：通过 2775，失败 11。逐条复核：`series_api` 一条见上，已修复并复跑通过；
+  `media_info_config_api::media_info_plugin_config_api_drives_a_background_run`、
+  `web_playback::web_playback_bootstrap_accepts_the_max_height`、
+  `application::probe::tests::playback_probe_runs_once_for_a_pending_local_source`、
+  `application::watch::tests::realtime_incremental_scan_probes_the_source_it_indexes` 单独复跑通过
+  （高负载抖动）；其余 6 条单独复跑仍失败：`admin_settings::transcoding_settings_are_admin_only_validated_and_persisted`、
+  `remote::forwarded_headers_are_only_honoured_for_trusted_proxies`、
+  `web_playback::broken_hardware_encoder_falls_back_to_software_transcoding`、
+  `application::scanner::tests::local_metadata_worker_persists_capability_missing` 与两个 `web_static::*`
+  （本机缺 `web/dist`）。这 6 条与 LUX-877 验收记录的基线失败清单完全一致（基线提交 `02830e0d`
+  的 `src` 上同样失败），本任务未触及相关代码；本次没有在基线上重新复现它们。
+- [ ] 未验证：升级后 Hills 在真机上的实际显示；本地为 ARM64 宿主，不外推到 NAS/x86_64。
+
+依赖：无。LUX-879 依赖本任务（同一文件，串行）。
+
+#### LUX-879：外挂字幕的 Emby Delivery 字段（`DeliveryMethod`/`DeliveryUrl`/`IsExternalUrl`/`SubtitleLocationType`/流级 `Path`）
+
+背景：Hills 的 `MediaStream` 模型解析这 5 个键，二进制里没有自己的字幕端点字面量，推测外挂字幕依赖
+服务端给出的 Delivery 信息（**推断**，逆向未完全展开）。Lux 现在一个都不输出。
+
+范围：仅 Emby 流 DTO。对 `is_external` 的字幕流输出 `DeliveryMethod: "External"`、
+`SubtitleLocationType: "ExternalFile"`、`IsExternalUrl: false`，以及指向既有路由
+`/Videos/{item_id}/{media_source_id}/Subtitles/{stream_index}/Stream.{codec}` 的**相对** `DeliveryUrl`
+（不含 token、不含完整外部 URL、不带查询串中的凭据）；内嵌字幕输出 `DeliveryMethod: "Embed"`、
+`SubtitleLocationType: "InternalStream"`，不输出 `DeliveryUrl`。流级 `Path` 只对本地外挂字幕输出
+文件名（不输出绝对路径，遵守“不记录/不泄露完整路径”）。不新增路由，不改字幕下载行为。
+
+实现结论与验收（2026-11-04，本机 `uname -m` = `arm64`）：
+
+- Hills 是否使用 Delivery* 字段：逆向只确认它**解析**这 5 个键，使用方式仍是推断；项目所有者明确要求实现，
+  这些是标准 Emby 字段，对不读取它们的客户端无影响，因此照规格实现。
+- 既有字幕路由原先**只有无后缀的 `…/Stream`**，带 `.srt/.ass/.vtt` 后缀会 404，所以本任务新增
+  `/Videos/{item}/{source}/Subtitles/{index}/Stream.{format}` 路由（后缀仅是格式提示，处理函数与无后缀路由
+  共用，ACL/鉴权不变），并让 `is_emby_subtitle_path` 接受 `Stream` 或 `Stream.<1–8 位字母数字>`。
+- 字幕流输出：外挂 → `DeliveryMethod: "External"`、`SubtitleLocationType: "ExternalFile"`、
+  `IsExternalUrl: false`、相对 `DeliveryUrl`（`/Videos/<item>/<source>/Subtitles/<index>/Stream.<ext>`，
+  `srt/subrip→srt`、`ass/ssa→ass`、`vtt/webvtt→vtt`，未知编码用无后缀路由；id 经百分号编码，不含 token、
+  查询串或外部 URL）；内嵌 → `Embed`、`InternalStream`，无 `DeliveryUrl`。视频/音频流不输出这些键。
+- 流级 `Path` **未实现**：`CatalogStream` 没有外挂文件路径字段，补它需要改存储读取层；且没有证据表明 Hills
+  使用它，也不应向客户端暴露路径。留待有证据时再做。
+- [x] `cargo test --locked --lib emby_catalog::` 43/43（外挂各编码、未知编码、内嵌、非字幕流无字段、
+  id 编码与无凭据）；`--lib api::` 180/180（含 `is_emby_subtitle_path` 后缀用例）。
+- [x] `cargo test --locked --test metadata subtitles::` 1/1：`DeliveryUrl` 无凭据，用该 URL 与
+  `Stream.srt` 都能取到字幕文件，无权限用户对带后缀路径同样 404；`--test emby` 39/39、
+  `--test playback` 33/33、`--test api_web acl::` 1/1、`--test library series_api::` 1/1。
+- [x] `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+  `scripts/check-migration-parity.py`、`scripts/check-backend-branches.py` 通过。本次没有重跑完整的
+  `--all-targets` 完成门；LUX-878 的完成门结果见上，6 条基线失败与本任务无关。
+- [ ] 未验证：Hills 是否真的使用 `DeliveryUrl` 加载外挂字幕；需要在真机上带外挂字幕的资源上复测。
+
+依赖：LUX-878。
+
+#### LUX-880：管理员手动弹幕匹配 API（ADR-052 P5）
+
+范围（ADR-052 P5，已获批准）：只做后端三个管理端点与它们的应用层服务，**迁移只限第 2 轮返工批准的两列（见下）、不动
+Emby 路由、不改 `web/` 的界面**（D3 另做）。依赖 LUX-877 的 `search_danmaku`/`fetch_danmaku`/
+`danmaku_manual_match_supported`。
+
+- `GET /api/v1/admin/items/{itemId}/danmaku/search?query=&sourceId=&limit=`：经插件搜索候选。`query`
+  缺省用条目标题（剧集用剧名），trim 后 1–200 字符且不得含控制字符；`limit` 默认 20、上限 50。
+  条目必须是 `MOVIE`/`EPISODE` 且有可用媒体源，否则 404/400。响应
+  `{ items: [{ provider, animeId, animeTitle, episodes: [{ episodeId, title }] }], supported: true }`。
+  插件未安装/未启用/配置未完成/未声明 `danmaku.search`+`danmaku.fetch` → 409 `PLUGIN_UNAVAILABLE`
+  （“不支持手动匹配”单独措辞，不落到 500/503）；插件返回无效数据 → 503 `PLUGIN_UNAVAILABLE`。
+  仅管理员 Web session 可用（普通用户 403），并按管理员会话限流：生产默认每秒 2 次
+  （`security::DanmakuSearchRateLimiter`，键为会话材料，存储前哈希），超限 429 `RATE_LIMITED` +
+  `Retry-After: 1`。普通用户请求永远不会触发上游请求。
+- `POST /api/v1/admin/items/{itemId}/danmaku/match`：`{ sourceId?, provider?, animeId?, episodeId,
+  overwrite }`，创建**单条**持久化作业（复用 `danmaku_match_jobs`/`danmaku_match_job_items` 与现有
+  Worker 池，`total_count = 1`，`library_id` 取条目所属库），返回 202 与现有 match-jobs DTO。
+  作业标记为 `danmaku_match_jobs.kind = 'MANUAL'`（自动整库作业为默认值 `'SWEEP'`），作业项记录
+  `provider_anime_id`/`provider_episode_id` 与管理员所选 `danmaku_match_job_items.provider`。Worker
+  **只看 `job.kind`**：`MANUAL` 作业对每个条目跳过 `danmaku.match`，直接用作业项的 provider 与分集
+  `danmaku.fetch` → `decode_xml`（含 `validate_danmaku_xml`）→ `atomic_write_danmaku_xml`，写入成功后
+  才登记 `danmaku_tracks` 并记下 provider；不再从 `provider_episode_id` 或 track 行推断。`provider` 是
+  插件返回的不透明标签，缺省/空串/纯空白按“未设置”处理。**创建作业不触碰任何 `danmaku_tracks` 行**；
+  跳过（`SKIPPED`）、失败、取消时 track 行保持原状（跳过时登记的 track 不带 provider，不把用户自带旁车
+  声明为 Lux 写入）。`overwrite=false` 且已有有效同名 `.xml` →
+  作业项 `SKIPPED` 且保留原文件；`overwrite=true` 覆盖。库内已有活动弹幕作业 → 409
+  （`AlreadyActive`）。媒体库无需在插件配置的“允许匹配的媒体库”中（见下）。`FAILED`/`CANCELLED`
+  的手动作业可 `/retry`：新建同样只含一个目标的 `MANUAL` 作业，沿用作业项记录的 provider 与分集继续
+  fetch；作业项已被级联删除（如媒体文件被删后重扫）时返回 409，不会退化成整库作业。自动作业的重试
+  不预填分集，仍受“媒体库须已选择”约束。
+- `DELETE /api/v1/admin/items/{itemId}/danmaku?sourceId=&confirmUserSidecar=`：删除已登记的旁车
+  `.xml` 与 `danmaku_tracks` 行，成功 204。仅当路径通过现有媒体根/符号链接校验时删文件；越界、符号
+  链接或非普通文件 → 400 且不删任何东西；媒体文件已不存在导致无法确认路径安全 → 只清理登记，同样
+  204；未登记 → 404；旁车文件已不存在但登记仍在 → 只清理登记。
+  `danmaku_tracks.provider` 为空（用户自带旁车）必须带 `confirmUserSidecar=true`，否则 409。文件删除
+  走 `tokio::fs`（异步 fs，不在 Tokio 核心线程做阻塞 IO）。
+- 日志与审计：沿用 `record_audit_event`，新增 `DANMAKU_MANUAL_MATCH_STARTED`（只记条目、媒体源、
+  `overwrite`）与 `DANMAKU_SIDECAR_DELETED`；两个事件的 `metadata.sourceId` 都是服务实际解析出的媒体源
+  ID（不是请求里可能缺省的 `sourceId`），删除事件的 `targetId` 也是该源 ID；不记录搜索文本、插件返回、
+  完整上游 URL 或 token。搜索端点本身不写审计，避免把管理员输入落盘。
+- 插件错误分类：搜索/创建不再用 `danmaku_manual_match_supported()` 的布尔值把“未配置”说成“不支持”。
+  创建路径先调用 `require_danmaku_manual_match_plugin()`，`Unsupported` → “弹幕插件不支持手动匹配”，
+  `UnknownPlugin`/`Unavailable`/`InvalidConfig` → “弹幕插件未启用或配置未完成”（两者都是 409
+  `PLUGIN_UNAVAILABLE`）；搜索路径直接映射 `danmaku.search` 的同类错误。
+- 文档与类型：`docs/API.md` 三个端点；`docs/API-TYPES-SYNC.md` 记录三个新 ts-rs DTO 与请求体的手写
+  镜像；`web/src/lib/api/generated/` 新增 `ManualDanmakuSearchResponse`/`ManualDanmakuCandidate`/
+  `ManualDanmakuEpisode`，`types.ts` 转出同名类型，`client.ts` 新增 `manualDanmakuSearch`/
+  `startManualDanmakuMatch`/`deleteItemDanmaku`，`query-keys.ts` 新增
+  `adminItemDanmakuSearch`（仅 API 层，无 UI）。
+- 迁移（第 2 轮返工，负责人已批准，加性）：`danmaku_match_jobs.kind`（`SWEEP`/`MANUAL`，默认 `SWEEP`）与
+  `danmaku_match_job_items.provider`（可空），SQLite 0246、PostgreSQL 0248；未动 `danmaku_tracks`。
+- 未改：`src/api/emby*`、`web/src/features/**`。
+
+**规格裁决（已由负责人放宽）**：§3.7 原文“未选择的媒体库不能创建弹幕匹配任务”与手动匹配“由管理员
+显式触发、不受允许媒体库限制”冲突，已上报；负责人裁决放宽手动匹配。现 §3.7 改为“未选择的媒体库不能
+创建**自动**弹幕匹配任务”，手动匹配不受该限制：`create_manual_job` 不再检查 `library_ids`，Worker
+（`run_claimed`）对“每个条目都带管理员选定分集”的作业跳过 `LIBRARY_NOT_SELECTED`，自动整库匹配的
+校验保持不变（`POST /api/v1/admin/libraries/{libraryId}/danmaku/match` 对未选择库仍返回 400）。
+
+验收（2026-11-03，本机 `uname -m` = `arm64`）：
+
+- [x] `cargo test --locked --test plugins danmaku_manual_api::` 16/16（第 1 轮返工后）：非管理员 403 与
+      缺 CSRF 被拒（且不排队作业）、搜索成功与上限/越界参数、仅 match 插件 → 409 且提示“不支持手动
+      匹配”、已启用但未配置 → 409 且提示“配置未完成”、速率限制 429 + `Retry-After: 1`、手动匹配建单条
+      作业且 Worker 走 fetch 路径写旁车（写入的是 fetch XML 而非 match XML，track provider/
+      `provider_episode_id` 正确）、`overwrite` 的 SKIPPED/覆盖语义、库内活动作业 409、未选媒体库的
+      手动匹配仍成功且走 fetch、未选媒体库的自动整库匹配仍 400、整库作业 `/retry` → 202、手动作业
+      `/retry` → 202 且再次 fetch 同一集、用户自带旁车在 SKIPPED/覆盖后仍不被改记为 Lux 写入（DELETE
+      仍需确认）、删除（Lux 写入的无需确认 / 用户自带需 `confirmUserSidecar` / 未登记 404 / 越界路径
+      400 / 媒体文件已消失时只清理登记 204）。
+- [x] `cargo test --locked --test plugins danmaku::` 13/13、`plugin_protocol::` 54/54、
+      `danmaku_api::` 2/2、`danmaku_config::`+`danmaku_config_api::` 3/3；
+      `cargo test --locked --lib danmaku` 13/13、`--lib security` 6/6（含每秒 2 次与窗口恢复）。
+- [x] `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`
+      通过；`scripts/check-migration-parity.py`、`scripts/check-backend-branches.py` 通过
+      （无迁移、无新增 `DatabaseBackend::` 分支）；`scripts/check-api-types.sh` 通过（生成物与 Rust
+      DTO 一致）。
+- [x] `pnpm --dir web build`、`pnpm --dir web test` 161 文件 / 1441 用例通过。
+- [x] 返工后复跑 `--test storage` 115/115（`finish_danmaku_match_item` 的 `COALESCE` 与新增查询不影响
+      既有断言）。
+- [ ] 未验证：真实 `org.lux.danmaku` 插件（Lux-plugins 仓库另行升级）的 search/fetch 往返；PostgreSQL
+      实机；本机 `--test admin` 中 `admin_settings::transcoding_settings_…` 仍失败（断言本机没有可用
+      VideoToolbox 编码器，本机实际可用，属既有环境相关失败，与本任务无关）。
+
+第 1 轮审查返工（2026-11-03）：
+
+- **A（规格裁决：放宽）**：删除 `create_manual_job` 的 `library_ids` 校验；`run_claimed` 通过
+  `danmaku_match_job_is_manual_only` 判断“每个条目都带管理员选定分集”，此类作业跳过
+  `LIBRARY_NOT_SELECTED`，自动整库匹配的校验不变。§3.7 改为“未选择的媒体库不能创建**自动**弹幕匹配
+  任务”；`docs/API.md` 同步。测试：未选库 → 手动匹配成功并走 fetch；未选库 → 自动整库匹配仍 400。
+- **B（整库作业 `/retry` 回归）**：删除“手动作业不可重试”守卫与 `danmaku_match_job_has_manual_items`。
+  `retry` 现在按**目标数量**而不是字段分流：`total_count = 1` 且只有一条作业项的作业用
+  `retry_single_item` 重建同目标作业（复制已记录的 provider/anime/episode，因此手动作业继续 fetch；
+  一源的整库作业等价于逐条重跑），其余作业仍走整库 `create_job`。`finish_danmaku_match_item` 改为
+  `COALESCE`，失败/跳过不再清空已知的 provider 标识，否则重试会退回 `danmaku.match`。
+  `NotRetryable` 仍只由“状态不是 FAILED/CANCELLED”触发，其他作业类型的判定未改。测试：整库作业
+  WRITTEN+FAILED → `/retry` 202 且新作业 `totalCount=2`；手动作业 FAILED → `/retry` 202、新作业仍带
+  预填分集并再次 fetch 同一集。
+- **C（不得改写用户自带旁车的来源）**：创建作业时的 track 写入改为 `ON CONFLICT(media_source_id) DO
+  NOTHING`，且只在作业带选定分集时插入；已有 track 行（含 `provider` 为空）永不改写。测试：用户自带
+  旁车 + `overwrite=false` → `SKIPPED` 且 track 保持 `provider = NULL`、DELETE 不带确认仍 409；随后
+  `overwrite=true` 覆盖写入后 track 仍为 `NULL`、DELETE 仍需确认（在 `docs/API.md` 里如实记录该保守
+  限制；扫描器重置 provider 的既有行为未改）。
+- **D（媒体文件缺失时的清理）**：`safe_danmaku_source_paths` 区分 `UnsafePath` 与 `Missing`；`Missing`
+  时只删除 `danmaku_tracks` 登记并返回 204（不动磁盘文件），`UnsafePath` 仍 400。测试：删除媒体文件后
+  DELETE → 204、登记消失、旁车文件保留；越界路径仍 400。
+- **E**：删除审计的 `targetId`/`metadata.sourceId`、创建审计的 `metadata.sourceId` 改用实际解析出的
+  媒体源 ID；搜索/创建改用
+  `require_danmaku_manual_match_plugin()` 的错误分类（`Unsupported` → “不支持手动匹配”，
+  `UnknownPlugin`/`Unavailable`/`InvalidConfig` → “未启用或配置未完成”），并补“已启用但未配置”的测试；
+  `docs/TEST-TARGETS.md` 第 1、2、5.1 节的逐组/逐模块测试数与两处合计按当前 `--list` 重新计算
+  （12 组 900 例 + 7 个独立 binary 114 例 = 1014 例），并标出合并后新增的模块。
+
+返工验收（2026-11-03，`arm64`）：`cargo test --locked --test plugins danmaku_manual_api::` 16/16、
+`danmaku::` 13/13、`plugin_protocol::` 54/54、`cargo test --locked --lib danmaku` 13/13、
+`--test storage` 115/115；`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets
+--all-features -- -D warnings`、`scripts/check-migration-parity.py`、`scripts/check-backend-branches.py`、
+`scripts/check-api-types.sh` 通过；`pnpm --dir web build` 与 `pnpm --dir web test`（161 文件 / 1441
+用例）通过。第 1 轮无迁移、无新列。
+
+第 2 轮返工：新增上述两列迁移，创建手动作业不再写 `danmaku_tracks`；provider 取自作业项；手动/自动
+只看 `job.kind`；手动作业重试按 `kind` 分支。
+
+#### LUX-881：Emby 图片路由接入派生图片变体缓存
+
+背景：LUX-826 的 `ImageVariantService` 只有 Lux API（`/api/v1/items/{id}/images/{type}`）在用。Emby 的
+`/Items/{id}/Images/{type}` 与 `/Items/{id}/Images/{type}/{index}` 调用 `serve_image` 时 variants 与
+width 都传 `None`，第三方 Emby 客户端一直拿原图。
+
+范围：让 Emby 客户端按其请求的尺寸参数命中 LUX-826 已经存在的同一份变体缓存（档位
+`IMAGE_VARIANT_WIDTHS = [360, 720, 1280]`，按长边，缓存目录 `/config/image-cache/v1/`）。不改客户端、
+不新增配置项、不改 Web 前端、不动数据库与迁移、不新增依赖；仍只由管理员全局
+`variantCache.enabled` 控制，关闭时响应字节、ETag 与 `Cache-Control` 与实施前完全一致。
+
+- 尺寸解析放在 Emby 层：新增 `EmbyImageDisplayQuery`（`src/api/emby_handlers.rs`），从原始查询串按
+  大小写不敏感匹配 `maxWidth`/`maxHeight`/`width`/`height`，`maxWidth`/`maxHeight` 优先于
+  `width`/`height`；`0` 与无法解析的值视为未提供。`format` 存在且不是 `jpg`/`jpeg`，或出现
+  `blur`、`percentPlayed`、`unplayedCount`、`addPlayedIndicator` 任一叠加参数时保持原图（缓存变体是
+  无叠加的 JPEG）。Lux API 的 `LuxImageQuery` 与 DTO 未改动。
+- 选档纯函数 `variant_width_for_display_size`（`src/application/image_variants.rs`）：按“客户端把图片
+  等比缩放进 `maxWidth`×`maxHeight` 框”的语义，两条提示各自换算出的所需长边取较小者，返回不小于该
+  长边的最小档位；两者都不给、原图尺寸未知、所需长边 ≥ 原图长边（不放大）或 > 1280 时返回 `None`
+  即原图。换算向上取整，避免差一个像素掉到更小档位。竖版 2:3 海报 `maxWidth=300` → 所需长边 450 →
+  返回 720。图片行的 `width`/`height` 来自文件头（未旋转），而生成变体时会 `apply_orientation`，方向
+  只有在解码时才知道、请求路径上拿不到，因此选档同时按「已存宽高」和「交换宽高」两种读法各算一次所需
+  长边并取**较大**者：方向未知只会让档位偏保守（更大或回退原图），不会给出客户端还得放大的小档位。
+  例：存为 2400×1600 且方向需旋转的海报，`maxWidth=1000` 按旋转后的 1600×2400 需要 1500 长边，
+  超过 1280，直接返回原图而不是 1280 档。
+- 接入：`serve_image` 的最后一个参数由 `Option<u32>` 换成 `ImageVariantRequest`（`Original` /
+  `Width` / `DisplaySize`），Lux API 继续传精确宽度，Emby 传显示框；`serve_tagged_image` 的参数收敛为
+  `ServeTaggedImageTarget` 结构体并接收同一请求类型。Emby 带 principal 的两个分支与
+  `serve_tagged_image`（带 tag、无登录）都对解析结果调用 `resolve_variant`。`serve_filmly_compat_image`、
+  媒体库封面与人物头像路径未改，鉴权/权限顺序未动；未命中、生成失败、缓存不可写、超时仍回退原图，
+  响应与现状一致。类型限制仍由 `resolve_variant` 负责（只处理 POSTER/THUMB/FANART）。
+
+预计文件：`src/application/image_variants.rs`、`src/api/emby_handlers.rs`、`src/api/media.rs`、
+`tests/images/image_variants.rs`、`docs/TEST-TARGETS.md`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`、
+`docs/CHANGELOG.md`。
+
+验收：
+
+- [x] 选档纯函数覆盖竖版、横版、仅宽、仅高、两个提示取较小、超 1280、原图较小、缺尺寸、零值、
+      原图尺寸未知，以及 EXIF 方向未知时按两种宽高读法取较大所需长边（2400×1600 + `maxWidth=1000`
+      不得选 1280，返回原图）。
+- [x] 开启时 Emby 带 `maxWidth=300` 返回 JPEG 变体（1600×2400 夹具 → 480×720）、ETag 以 `-w720"`
+      结尾、`Cache-Control` 为 `private, max-age=31536000, immutable`，文件落在
+      `/config/image-cache/v1/<shard>/<item>/<content_tag>-w720.jpg`。
+- [x] `MaxWidth`/`maxwidth`、仅 `maxHeight`、`width`+`format=jpg`、`height`+`format=JPEG` 都命中同一档。
+- [x] 全局开关关闭时带尺寸参数返回与原图逐字节相同的响应、`Cache-Control: private, max-age=3600`，
+      且不创建缓存目录。
+- [x] 开启但无尺寸参数、`format=png`、带 `blur`/`percentPlayed`/`unplayedCount`/`addPlayedIndicator`
+      时返回原图。
+- [x] tagged 路径（`?tag=<item_images.id>&maxWidth=300`，无登录）同样返回宽度 720 的变体。
+- [x] 带索引的 `/Items/{id}/Images/Primary/0?maxWidth=300` 同样命中：带 principal 与 tagged
+      （无登录）两条都返回 480×720 的 JPEG 变体，ETag 以 `-w720"` 结尾。
+- [x] 越权行为不变：匿名无 tag 仍 401，无媒体库访问权限的用户仍 404，不存在的条目仍 404，且这些请求
+      不会创建缓存文件。
+
+实施结果（2026-11-04，本机 `uname -m` = `arm64`）：按 TDD 分两次提交——先加选档纯函数与单测
+（失败编译 → 通过），再加 Emby 尺寸解析、`ImageVariantRequest` 与三条路由的接入。`serve_image` 参数
+数量保持 7 个，`serve_tagged_image` 由 7 个收敛到 6 个。`resolve_variant` 改为复用新的
+`source_pixel_dimensions`（与原实现一致，另把超过 `u32::MAX` 的尺寸按未知处理）。集成测试新增 6 条
+Emby 用例放在既有 `image_variants` 模块（`--test images image_variants::`），`docs/TEST-TARGETS.md`
+的 `image_variants` 模块（9 → 16）、`--test images` 组（55 → 62）与两处合计（904 → 911、1018 → 1025）
+按当前 `--list` 同步。
+
+返工（2026-11-04，审查提出的两个 P3）：① EXIF 方向——选档改用「两种宽高读法取较大所需长边」的保守
+规则（见范围第二条），并补 `display_box_covers_both_exif_orientations`（原始 2400×1600 且方向需旋转、
+`maxWidth=1000` 返回 `None`；600 px 宽时取较粗的 1280 档；方图两读法一致）。原「仅高 300 → 360」用例
+因同一原因改为 720，并新增「短边上的宽度换算两读法一致」断言。② 带索引路由——新增
+`emby_image_index_route_hits_the_cached_variant`，覆盖 `/Images/Primary/0?maxWidth=300` 的带 principal
+与 tagged（无登录）两条路径。两次返工分别独立提交，`serve_image` / 选档函数签名未变。
+
+验证命令与结果（本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 上验证）：
+
+- `cargo build --locked` 通过。
+- `cargo test --locked --lib application::image_variants` 22/22 通过（含 5 条选档/请求形态用例与
+  返工新增的方向保守用例）。
+- `cargo test --locked --lib emby_image_display_query` 4/4 通过（大小写别名、缺省/零值/越界值、非 JPEG
+  `format`、叠加参数）。
+- `cargo test --locked --test images image_variants::` 16/16 通过（含带索引路由用例）。
+- `cargo test --locked --test emby` 39/39 通过（Emby 兼容层回归）。
+- `cargo test --locked --test images` 61 通过 / 1 失败（返工后重跑），失败项为
+  `image_writer::manual_scraper_image_selection_claims_one_attempt_for_the_same_image`。该用例在
+  `docs/TEST-TARGETS.md` 已记录为“两个并发任务需落在同一 40 ms 窗口、高负载下退化成串行”的时序敏感
+  用例；单独重跑该用例 1/1 通过，与本任务无关。
+- 变异验证：临时把两条 Emby 图片路由的 `variant_request` 固定为 `ImageVariantRequest::Original`
+  后，`emby_max_width_serves_the_cached_variant`、`emby_size_hint_aliases_and_jpeg_formats_hit_the_cache`
+  与 `emby_tagged_image_hits_the_cached_variant` 三条断言失败，另外三条“保持原图/鉴权不变”用例仍通过；
+  恢复实现后 `--test images image_variants::` 15/15 通过，说明新用例不是空转。
+- `cargo fmt --all -- --check` 通过；`git diff --check` 通过。
+- `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过，本次运行没有告警输出
+  （当前基线上 LUX-826/LUX-880 记录的既有 `too_many_arguments`、`type_complexity` 等诊断在并行改动
+  合并后已不再出现）；本任务没有新增 lint 抑制，`serve_image` 仍为 7 个参数。
+
+限制与剩余风险：冷缓存首次请求仍按 LUX-826 的 300 ms 响应预算回退原图，变体在后台生成，客户端下一次
+刷新才会命中；Emby 客户端若在 URL 上带 `EnableImageEnhancers=true` 以外的裁剪/圆角要求，Lux 仍只按
+尺寸命中，不做裁剪（与 LUX-826 一致）；Emby 的 `quality` 参数未参与选档；未在真实第三方 Emby 客户端
+（如 VidHub、Hills）上实测，仅用 HTTP 回归覆盖请求形状。变体缓存默认关闭，未开启时行为与字节完全不变。
+
+#### LUX-882：Emby 图片请求的脱敏诊断日志
+
+背景：LUX-881 让 Emby 图片路由按 `maxWidth`/`maxHeight` 命中变体缓存，但现有请求日志只记路径，管理员
+在真实 NAS 上无法判断 Infuse、Emby 官方、Hills、Filmly、Fileball 等第三方客户端是否发送尺寸参数，
+也无法判断某次响应是命中变体，还是因 `format`/叠加参数/超限等原因回退原图。
+
+范围：每个到达图片服务路径的 Emby 图片请求（`/Items/{id}/Images/{type}` 与 `/{type}/{index}` 的
+principal、tagged 无登录、Filmly 兼容分支，以及媒体库封面与人物头像两条不走缓存的路径）记录一条
+`tracing::info!`，target 固定为 `luxd::emby_image_diag`：
+
+- 请求形状：`client`、`device`（先取 `X-Emby-Client` / `X-Emby-Device-Name`，其次
+  `Authorization`/`X-Emby-Authorization` 里的 `Client=`/`Device=`，client 最后回退 `User-Agent` 的
+  产品名即第一个 `/` 或空白前的一段；都只保留 ASCII 字母数字与 `-_.` 并截断到 32 字符，`format` 只保留
+  字母数字并截断到 8 字符）、`image_type`（`normalize_image_type` 之后）、`has_tag`、`auth_mode`
+  （`principal` / `tag` / `filmly_compat`），以及 `max_width`、`max_height`、`width`、`height`、
+  `quality`、`format`、`overlay`。
+- 结果：`outcome=variant` 附 `variant_width`，或 `outcome=original` 附 `reason` ∈
+  `no_size_hint` / `non_jpeg_format` / `overlay` / `source_size_unknown` / `needs_original` /
+  `variant_unavailable`（`variant_unavailable` 覆盖开关关闭、不支持的类型、生成中、失败冷却、变体文件
+  读取失败，以及媒体库封面/人物头像/Filmly 兼容这些不查缓存的路径）。客户端未提供或无法解析的数值
+  字段不出现在事件里，而不是写 0 占位。
+- 严禁记录 token/api_key、完整 URL、完整查询串、Cookie、IP、完整 User-Agent、item_id；鉴权失败或
+  404 等没有解析到图片的请求不产生这条日志（已有请求日志覆盖）。
+
+实现：`EmbyImageDisplayQuery`（`src/api/emby_handlers.rs`）增解析 `quality`（只进日志、不参与选档，
+非数字忽略）并暴露 `variant_intent()`；`src/application/image_variants.rs` 新增纯函数
+`ImageVariantIntent::selection`，把请求形态（Web 精确宽度或 Emby 显示框，加叠加/非 JPEG 反对项）与
+原图尺寸映射为命中档位或 `OriginalImageReason`，`serve_image` / `serve_tagged_image` 改为返回
+`ServedImage`（响应 + 实际去向），Lux API 取 `.response`，行为不变。日志字段构造、客户端名清洗与限长
+集中在新增的 `src/api/emby_image_diag.rs`；两条 Emby 路由在 principal 与 Filmly 分支确定后构造一次
+记录，并在返回前写入。不新增依赖、migration、配置项，不改 Web，不改响应字节/状态码/头，不增加阻塞或
+I/O。
+
+预计文件：`src/application/image_variants.rs`、`src/api/emby_handlers.rs`、`src/api/emby_image_diag.rs`、
+`src/api/legacy.rs`、`src/api/media.rs`、`tests/images/image_variants.rs`、`docs/LUX-DEVELOPMENT.md`、
+`docs/CHANGELOG.md`、`docs/TEST-TARGETS.md`、`docs/DEPLOYMENT.md`。
+
+验收：
+
+- [x] 选档/回退纯函数覆盖六种 reason：缺尺寸、非 JPEG `format`、叠加参数、原图尺寸未知、所需长边
+      不小于原图或超过 1280；叠加参数优先于 `format`，两者都优先于尺寸提示。
+- [x] 客户端名清洗与限长单测覆盖：`X-Emby-Client` 优先于 UA、`Authorization` 的 `Client=`/`Device=`、
+      UA 产品名回退、超长截断到 32、控制字符剥离、含 token 的 UA 只保留产品名、纯符号/非 ASCII 名称
+      回退而不是记空串或原串。
+- [x] `quality` 被解析且大小写不敏感，非数字/空/负数忽略，不改变选档。
+- [x] 集成测试：开启变体后带 `maxWidth=300` 且把 `api_key` 放进查询串的 Emby 请求输出
+      `outcome=variant`、`variant_width=720`、`client=Infuse`、`auth_mode=principal`，
+      `format=png` 请求输出 `reason=non_jpeg_format`，捕获文本不含 access token 与 `api_key`。
+- [x] principal、tagged（无登录）、Filmly 兼容三条分支各记录一条；媒体库封面/人物头像按
+      `variant_unavailable` 记录（这两条路径本就不查缓存）。
+- [x] 响应字节、状态码、头与实施前一致：既有 `--test images image_variants::` 用例全部通过。
+- [x] 未新增依赖、migration、配置项；未改 Web。
+
+实施结果（2026-11-04，本机 `uname -m` = `arm64`，macOS 26.5）：按 TDD 分五次提交——纯选档/回退函数与
+单测、诊断字段构造与单测、两条路由接入并让 `serve_image`/`serve_tagged_image` 返回 `ServedImage`、
+日志捕获集成测试、集成测试在并行测试下的稳定性修复。`serve_image` 参数数量保持 7 个、
+`serve_tagged_image` 仍为 6 个，除 `ServedImage` 外没有新增服务或状态。集成测试把捕获订阅者装成
+进程默认（`tracing` 的 callsite 兴趣是进程级缓存，线程内订阅者会被并行测试先触发的同一条 callsite
+静音），断言只认本测试独有的 `client` 标签，因此不会误读其他用例的请求。`docs/TEST-TARGETS.md`
+的 `image_variants` 模块（16 → 17）、`--test images` 组（62 → 63）与两处合计（911 → 912、1025 → 1026）
+按当前 `--list` 同步。
+
+返工（2026-11-04，审查提出的 P2）：库封面、人物头像、Filmly 兼容三条分支此前无条件 `record`，而
+这些 `serve_*` 会返回 404/403/503，于是“没有解析到图片”的请求也被记成 `outcome=original
+reason=variant_unavailable`，与上面的约定和 `ServedImage` 注释矛盾。改为按响应状态门控：新增纯函数
+`response_carries_image`（2xx 或 304 才算真的送出了图片）与 `ServedImage::uncached`，两条路由的三条
+分支统一经 `record_served_image` 记录；成功路径（含 304）行为不变，错误响应不再产生该日志。先写失败
+测试再修：`emby_library_cover_errors_do_not_log_a_served_image`（无库权限的封面 404 不记录、管理员
+200 仍记录）、`emby_person_image_errors_do_not_log_a_served_image`（人物索引不可读导致 503 不记录），
+以及独立 binary `--test filmly_image_diag` 的 `filmly_compat_image_errors_do_not_log_a_served_image`
+（Filmly 兼容分支对不存在条目的 404 不记录、对已存在海报的 200 仍记录）。Filmly 兼容模式来自进程级
+env `LUX_FILMLY_IMAGE_MODE`，因此该用例单独成一个只含一条测试的 binary，避免在并行测试进程里改动
+环境变量。重跑计数：`image_variants` 模块 17 → 19、`--test images` 组 63 → 65、独立 binary 7 → 8、
+两处合计 912 → 914、1026 → 1029。
+
+验证命令与结果（本机 `uname -m` = `arm64`；未在 NAS/x86_64 上验证）：
+
+- `cargo build --locked` 通过。
+- `cargo test --locked --lib application::image_variants` 25/25 通过（含 3 条新的选档/回退用例）。
+- `cargo test --locked --lib emby_image_diag` 8/8 通过（客户端名清洗/限长、恶意输入、auth_mode、
+  结构化字段与捕获日志）。
+- `cargo test --locked --lib emby_image_display_query` 6/6 通过（含 `quality` 解析与 `variant_intent`）。
+- `cargo test --locked --lib served_image_tests` 1/1 通过（返工新增：只有 2xx/304 才算送出图片）。
+- `cargo test --locked --test images image_variants::` 19/19 通过；并行跑 3 次结果一致。
+- `cargo test --locked --test filmly_image_diag` 1/1 通过（返工新增的独立 binary）。
+- `cargo test --locked --test emby` 39/39 通过（Emby 兼容层回归）。
+- `cargo fmt --all -- --check` 通过；`git diff --check` 通过。
+- `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过（无新增 lint 抑制）。
+
+限制与剩余风险：日志是 INFO 级，默认 `luxd=info` 过滤下会为每张 Emby 图片写一行，浏览大库时日志量
+随图片请求数增长（管理员可用 `RUST_LOG`/导出过滤），这是“默认可诊断”的取舍；客户端名是启发式清洗，
+只能保证不泄露、不可注入，不能保证与客户端显示名一致；`auth_mode=tag` 的请求若没有 tag 会直接 401、
+不产生该日志；日志无法区分冷缓存首次回退（记为 `variant_unavailable`）与开关关闭，需要结合设置判断；
+未在真实第三方 Emby 客户端上实测，只用 HTTP 回归覆盖请求形状。
+
+#### LUX-883：`Season N <标签>` 季目录合并为多版本剧集
+
+范围：季目录名为 `Season N`/`SN` 后跟恰好一个无空格词（如 `Season 1 DV`、`Season 1 HDR`、`Season 2 国语`）时，
+按季号 N 归入同一季；该词作为媒体源版本标签（`edition_name`）。文件名自带 edition 时以文件名为准。
+标签不进入集条目 identity，因此不同标签目录下的同一集合并为一个集条目的多个媒体源。多个词的目录
+（`Season 1 Part Two`）、`Season 1DV` 仍不识别为季目录；`Season N (数字)`、`Specials` 行为不变。
+Emby 官方只约定 `Show - S01E01 - 标签` 文件名形式，目录标签是 Lux 对网盘整理习惯的扩展。
+
+预计文件：`src/application/scanner/names.rs`、`src/application/scanner/library.rs`、`src/application/scanner/library/prepare.rs`、`src/application/scanner/tests.rs`、本文档。
+
+验证：`cargo test --locked --lib application::scanner` 76 passed；fmt 通过。限制：已被旧版本拆成多部"剧"的库需重扫才能并回，未验证迁移路径；未跑 all-targets/clippy。
+
+#### LUX-884：移除主程序的“最小下载宽度”设置
+
+背景：图片最小宽度此前由 Lux 主程序统一配置（全局 `images.minDownloadWidth` 和每层每格的
+`minWidth`），并在候选图入库前按上游报告的宽度丢弃过小的图。插件协议已经能让刮削器按自己的图片
+类型分别决定尺寸与选图（TMDb 等插件端负责），同一套阈值放在主程序既重复又无法表达各来源的差异，
+因此把这项设置和宽度过滤从主程序移除。
+
+移除内容：
+
+- 设置模型：删除 `MediaImageStrategySettings.min_download_width`、
+  `ArtworkPolicySettings.min_width`（改为只接收、不输出的 `legacy_min_width` 兼容字段）、
+  对应的默认值与 `0..=8192` 校验。
+- 候选图：`ImageSelectionPolicy` / `ImageTypePolicy` 与候选 JSON 解析结构不再携带宽度；
+  `filtered_candidate_images` 改为只按类型归并的 `candidate_images_by_type`，任何上游宽度的候选 URL
+  都会入库；原先兼作宽度策略来源的媒体库查询保留下来作为条目可用性检查（见兼容性处理），不再携带任何
+  宽度逻辑。
+- Web：全局策略、媒体库覆盖与分层矩阵不再提供“最小下载宽度/最小宽度”控件，`MediaArtworkPolicySettings`
+  与 `MediaImageStrategySettings` 类型同步删除该字段，预设里不再有宽度档位。
+- Emby：`LibraryOptions.TypeOptions[].ImageOptions[].MinWidth` 保留，值固定为 `0`。
+
+兼容性处理：
+
+- 已保存的设置 JSON 里仍可能有 `minDownloadWidth` / `minWidth`（全局、媒体库覆盖、层级覆盖）。主程序的
+  设置结构不 `deny_unknown_fields`，这两个键按普通未知字段忽略；`ArtworkPolicySettings` 是
+  `deny_unknown_fields`，因此保留了一个只反序列化、不序列化的 `legacy_min_width` 字段，避免旧设置整份
+  解析失败（那会让全局策略退回默认值、媒体库覆盖退回全局值）。
+- 旧版 Web 页面或脚本提交带这些键的设置请求仍返回成功，键被忽略；下一次保存后它们自然消失。
+- 手动候选搜索的 404 语义不变：软删除条目、已停用媒体库中的条目仍返回 `ItemNotFound`。这条校验此前
+  搭在宽度策略的媒体库查询上，移除宽度后改为独立的 `ensure_candidate_item_available`，只丢弃策略内容；
+  自动匹配请求自带已解析策略，仍和以前一样跳过这次读取。
+- 不需要数据库迁移：`media_strategy` 仍是同一列上的 JSON。
+
+验收：
+
+- [x] 带 `minDownloadWidth` / `minWidth` 的旧 JSON 能加载，`validate_media_strategy` 通过（包括旧的越界值
+      8193），序列化结果不再包含这两个键，同格其他字段保持不变。
+- [x] 低宽度（如 640px 海报、1280px 背景图）候选不再被丢弃，电影与单集宿主都保留全部 URL；按类型归并
+      与“单集剧照不扩散到其他背景图类型”的既有行为不变。
+- [x] Emby `ImageOptions` 仍包含 `MinWidth` 且值为 `0`（单测 + `--test admin admin_api_key::` 集成断言）。
+- [x] Web 全局策略、媒体库覆盖和分层矩阵不再出现宽度控件或文案，相关组件测试通过。
+- [x] 手动候选搜索对软删除条目、停用媒体库条目仍返回 `ItemNotFound`（电影/剧集与季度/单集两条路径各
+      有单测）。
+- [x] 未新增依赖、migration 或配置项；未改插件协议与媒体流分辨率分档逻辑。
+
+预计文件：`src/application/settings.rs`、`src/application/candidates.rs`、`src/api/emby_catalog.rs`、
+`web/src/features/admin/AdminLibrariesPage.tsx`、`web/src/features/admin/ImageLevelPolicyEditor.tsx`、
+`web/src/features/admin/admin.css`、`web/src/features/admin/image-policy-presets.ts`、
+`web/src/lib/api/types.ts`、相关测试与 `docs/CHANGELOG.md`、`docs/API.md`、`docs/COMPATIBILITY.md`。
+
+实施结果（2026-11-05，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 验证）：按 TDD 分三个提交——
+设置模型与 Emby 输出、候选图宽度过滤、Web 与文档。任务编号用 `LUX-884`：基线上 `LUX-883` 已被
+“`Season N <标签>` 季目录合并”占用（本任务接到的说明里最大编号是 `LUX-882`）。
+
+- 兼容字段：`ArtworkPolicySettings` 的 `legacy_min_width`（`rename = "minWidth"`、`skip_serializing`）
+  只用于反序列化；全局 `images.minDownloadWidth` 因该结构不 `deny_unknown_fields` 直接按未知字段忽略。
+- Emby 值用常量 `EMBY_IMAGE_OPTION_MIN_WIDTH: i64 = 0`，没有改 `emby_video_resolution_label` 的分档。
+- 可用性校验：`candidate_image_policy_for` 换成 `ensure_candidate_item_available(item_id, plan)`，仍在
+  `plan.image_policy.is_none()`（手动搜索）时调用 `find_item_media_strategy_settings`，`None` 映射为
+  `ItemNotFound`；电影/剧集分支与季度/单集分支各调用一次。候选搜索的查询次数与实施前一致，不涉及迁移。
+
+验证命令与结果：
+
+- `cargo test --locked --lib application::settings` 12/12、`--lib candidates::` 44/44、
+  `--lib api::legacy::emby_catalog` 44/44（含新增的 `image_options_keep_min_width_at_zero_for_emby_clients`）。
+- `cargo test --locked --test auth_users resume_favorites::` 6/6、`--test library libraries_api::` 14/14、
+  `--test admin admin_api_key::` 4/4、`--test metadata metadata_selection::` 39/39、
+  `--test emby` 41/41、`--test images image_writer::` 20/20。
+- `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+  `python3 scripts/check-backend-branches.py`、`python3 scripts/check-migration-parity.py` 通过。
+- Web：`tsc --noEmit`、`vite build`（含 `scripts/build-web.mjs` 预压缩）、`vitest run`
+  （165 文件 / 1501 用例）、`node --test tests/*.test.mjs`（165 用例）通过。本机 `pnpm` 是
+  `npx -y pnpm` 包装脚本、无网络时会挂起，因此用 `web/node_modules/.bin` 下的同一套工具执行。
+
+限制与剩余风险：旧设置里的宽度值会被静默丢弃（不提示管理员），已在 `docs/CHANGELOG.md` 与本文档说明；
+没有为 `minDownloadWidth` 保留只读字段，因此极老的第三方客户端若依赖响应回传该键，会看到它消失（Emby
+的 `MinWidth` 不受影响）；未在真实第三方 Emby 客户端上复测 `MinWidth: 0`。
+
+返工（独立审查后，2026-11-05）：
+
+- 手动候选搜索的条目可用性 404 恢复：`candidate_image_policy_for` 换成
+  `ensure_candidate_item_available(item_id, plan)`，仍在 `plan.image_policy.is_none()` 时调用
+  `find_item_media_strategy_settings` 并只取“能否查到”的结果，电影/剧集与季度/单集两条路径各一次调用。
+  新增 4 条单测：`manual_movie_search_rejects_a_soft_deleted_item`、
+  `manual_movie_search_rejects_an_item_in_a_disabled_library`、
+  `manual_child_search_rejects_a_soft_deleted_item`、
+  `manual_child_search_rejects_an_item_in_a_disabled_library`；四条都先确认在修复前失败，并断言没有写入
+  `metadata_candidates`。此前“候选搜索少一次条目媒体策略查询”的说法作废，查询次数与实施前一致。
+- 样式补齐：矩阵表的 `td:nth-child(6)` 只属于已删除的宽度列，从基础规则和窄屏覆盖里去掉，张数列的
+  `td:nth-child(5)` 保留；`.lux-library-strategy-image-limits` 由 2 列改为 1 列，
+  `.lux-library-override-fields` 由 3 列改为 2 列（`1.2fr .8fr`）。Web 测试新增矩阵表头/单元格数量一致
+  断言、两处网格子项数量断言和 CSS 轨道断言；把 CSS 回退到修改前时该用例失败，说明断言有效。
+- 返工后复跑：`--lib candidates::` 44/44、`--lib application::settings` 12/12、`vitest run`
+  `admin-libraries`（39 例）与 `image-level-policy`（15 例）全部通过。
+
+#### LUX-885：插件配置变更后刮削必须使用新配置（修复响应缓存不失效）
+
+背景：刮削响应缓存（`config_dir/metadata/provider-responses.json`）的键是
+`"{plugin_id}\n{method}\n{params}"`，不含插件配置；`metadata.get` / `metadata.images` /
+`metadata.credits` 的 TTL 是 24 小时。插件配置保存只推进刮削客户端版本，不清理该缓存，因此改最小宽度、
+语言、回退顺序或 API 地址后，下一次刮削仍读旧响应，最长 24 小时不生效。`FULL_REFRESH` 虽然调用
+`clear_response_cache()`，但真实装配（`src/api/legacy.rs`）传给 `MetadataReidentifyService` 的是
+`ScraperProvider::unconfigured()`，真正带缓存的客户端由 `ScraperResolver` 按条目创建，所以那次清理
+一直是空操作。
+
+实现：
+
+- `ProviderResponseCache::clear_provider(plugin_id)`：按 `cache_key` 的插件 id 前缀精确删除，内存
+  `entries` / `expiry_order` 同步维护，并立即同步落盘（不再等 2 秒防抖）；即使没有条目被删也推进该插件的
+  generation。`cache_key` 的 `provider` 参数确认取的是插件 id（`ScraperPluginClient` 传入
+  `self.plugin_id`），因此不需要把配置哈希塞进缓存键，也不需要清空整个 provider 缓存。
+- 并发：`CacheState` 增加全局 `generation` 和按插件的 `provider_generations`；`begin` 返回的
+  `CacheOwner` 记录当时的两个值，`store_shared_for_owner` / `store_negative_for_owner` 在写入前比对，
+  清理之后旧请求的结果不会写回。锁仍只在同步代码段持有，没有跨 `await` 持锁，`begin`/`store_shared`
+  路径不会 panic 或死锁；清理其他插件不会丢弃无关插件的 in-flight 结果。
+- 调用点：`write_plugin_config` 覆盖配置更新、配置迁移、计划/库范围写入；`install`、`set_enabled`、
+  `uninstall`（清配置/卸载）、`install_remote_package`（升级）在现有 `invalidate_scraper_client_cache()`
+  旁清理该插件；上传登录背景图走 `write_plugin_config` 自动覆盖。
+- 进程重启顺序：配置写入后的第一次清理会先删旧条目，但旧插件进程要到上层 `admin_update_plugin_config`
+  调用 `restart()` 才换成新配置，这段时间仍可能产出旧响应并写回。`restart()` 在 `supervisor.stop()`
+  之后再清一次该插件；`uninstall`、`set_enabled(false)`、上传登录背景图也在各自 `supervisor.stop()`
+  之后补一次清理。进程换成新配置后缓存为空，下一次刮削重新向插件取数。
+- 持久化：`clear` / `clear_provider` 复用非 `#[cfg(test)]` 的 `persist_now()` 立即写盘，避免配置保存后
+  2 秒内重启进程又从文件读回旧条目；写盘失败只记不含路径和内容的 warn 日志，不影响配置保存结果，
+  内存中的清理仍然生效，后续正常持久化会再次尝试。测试用 `flush()` 语义不变。
+- `FULL_REFRESH`：新增 `ScraperResolver::clear_response_cache()` 清理其 `PluginService` 的响应缓存；
+  `MetadataReidentifyService` 保留原 `self.scraper.clear_response_cache()`，装配了 resolver 时再清
+  resolver 的缓存。未重构装配，`src/api/legacy.rs` 不变。
+- 缓存键格式、TTL、命中语义、插件协议、数据库 schema 均未改变；未改 `Lux-plugins`，未碰 TMDb 选图排序。
+
+验收：
+
+- [x] 单元：同一缓存中放入某插件的多条记录和另一个插件的记录，`clear_provider` 后前者消失、后者保留；
+  持久化文件内容一致，重建缓存后结论相同。
+- [x] 单元：清理插件会丢弃该插件的 in-flight 写入，但不影响另一个插件的 in-flight 写入。
+- [x] 服务层：stub 刮削器从 `LUX_PLUGIN_CONFIG_PATH` 读取 `minWidth`；保存 `1500` 后同参数调用重新走
+  插件（调用日志 1 → 2，宽度 1000 → 1500）。修复前该用例的第二次调用命中 24 小时响应缓存。
+- [x] 进程重启顺序：stub 在进程启动时快照配置；配置保存后、`restart()` 前用旧进程再取一次响应（宽度
+  1000），`restart()` 后下一次调用重新取数并得到 1500。修复前该用例返回缓存的 1000。
+- [x] 立即落盘：清理后不调用 `flush()`、不等待防抖，直接用同一路径新建缓存，被清条目不在，其他插件
+  条目仍在；`clear()` 全量清理同样立即落盘。
+- [x] `FULL_REFRESH`：用 resolver + `unconfigured()` 的真实装配创建并运行完整刷新任务，预热的缓存被清；
+  修复前该用例失败（缓存仍命中），复现真机现象。
+- [x] 现有缓存单测（复用、负缓存、单飞、取消 owner、文件恢复、持久化指标）保持通过。
+
+预计文件：`src/application/provider_cache.rs`、`src/application/scraper.rs`、
+`src/application/plugins.rs`、`src/application/reidentify.rs`、`docs/LUX-DEVELOPMENT.md`、
+`docs/CHANGELOG.md`。
+
+实施结果（2026-11-05，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 验证）：按 TDD 先补测试再实现。
+任务编号接 `LUX-884`。
+
+- `clear_provider` 只删 `"{plugin_id}\n"` 前缀的键；`clear()` 仍用于全量清理（如数据库维护语义）。
+- 配置保存、启停、安装、升级、卸载五条路径均接入；`install_remote_package` 用下载条目的 id 清理，
+  覆盖升级后插件行为变化。
+- `FULL_REFRESH` 的清理发生在 `run` 开头，和原来同一位置，没有改变任务状态机。
+
+返工（独立审查后，2026-11-05）：
+
+- 顺序问题：审查指出“写入后立即清理”到 `admin_update_plugin_config` 的 `restart()` 之间存在窗口，旧进程
+  在窗口内产出的响应会以清理后的代际写回。现在 `restart()` 在 `supervisor.stop()` 之后补一次
+  `clear_provider`；`uninstall`、`set_enabled(false)`、上传登录背景图也在各自 stop 之后补一次。新增
+  `restart_clears_responses_produced_between_config_save_and_restart`：stub 在进程启动时快照配置，保存
+  `1500` 后先用旧进程取到 `1000` 并写入缓存，`restart()` 后下一次调用必须重新取数得到 `1500`；修复前
+  该用例返回 `1000`。
+- 落盘问题：审查指出清理只走 2 秒防抖，保存配置后 2 秒内重启进程会从 `provider-responses.json` 读回旧
+  条目。`clear` / `clear_provider` 改为复用 `persist_now()` 立即同步写盘，写盘失败只记不含路径和内容的
+  warn 日志；`flush()` 保持测试语义不变。新增
+  `clearing_a_provider_persists_immediately_without_waiting_for_the_debounce` 和
+  `clearing_the_whole_cache_persists_immediately_without_waiting_for_the_debounce`：清理后不调用
+  `flush()`、不等待防抖，直接用同一路径重建缓存验证结果；修复前两条都会读到旧条目。
+
+验证命令与结果：
+
+- `cargo test --locked --lib provider_cache::` 13/13（含 5 条新增：按插件清理与持久化、清理丢弃本插件
+  in-flight 写入、不影响其他插件 in-flight 写入、按插件清理立即落盘、全量清理立即落盘）。
+- `cargo test --locked --lib plugins::` 14/14（含新增
+  `saving_scraper_config_invalidates_the_plugin_response_cache` 与
+  `restart_clears_responses_produced_between_config_save_and_restart`）。
+- `cargo test --locked --lib scraper::` 12/12、`cargo test --locked --lib reidentify::` 48/48（含新增
+  `full_refresh_clears_the_resolver_provider_response_cache`）。
+- 修复前失败复现：临时移除 `write_plugin_config` 的清理后，插件配置用例报
+  `left: Some(1000) right: Some(1500)`；临时移除 reidentify 的 resolver 清理后，完整刷新用例报
+  “FULL_REFRESH must drop the responses the resolver clients cached”；在实现前，重启顺序用例报
+  `restart must clear the response cached by the old process after it stops`（`left: Some(1000)`），
+  两条立即落盘用例在重建缓存时仍读到旧条目。恢复/实现后均通过。
+- `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+  `python3 scripts/check-backend-branches.py` 通过。
+- 集成测试未新增或改动用例，`docs/TEST-TARGETS.md` 的计数不变；相关分组回归：
+  `cargo test --locked --test plugins plugins::` 12/12、`cargo test --locked --test reidentify` 25/25。
+
+限制与剩余风险：
+
+- 清理是精确到插件 id 的；若某个插件通过别的插件 id 共享缓存（当前协议没有这种用法），不会被连带清理。
+- `unconfigured()` 占位 provider 自己的 `clear_response_cache()` 仍然保留为空实现，真实缓存由 resolver
+  清理；其他把 `unconfigured()` 当刮削器、又没有 resolver 的装配本来就无法刮削，不受影响。
+- in-flight 响应在清理后会被丢弃而不是写回，调用方仍会拿到它，但下一次请求会重新向插件取数。
+- 重启顺序由 `restart()` / stop 之后的第二次清理兜底；若调用方直接调用 `update_dynamic_config` 却既不
+  重启进程也不结束插件会话，插件是否读取新配置取决于插件自身实现（本任务未改插件协议）。
+- 清理路径现在每次同步写一次 JSON（最多 `MAX_CACHE_ENTRIES` 条），配置保存会多一次有界磁盘写；写盘失败
+  只记 warn，内存清理仍生效，但若紧接着重启进程，磁盘上可能仍是旧文件，旧条目会被读回，需要等下一次
+  成功持久化。
+- 本机只验证了 stub 插件与 resolver 装配；未在真实 TMDb 插件上复测语言/最小宽度变更后的即时生效。
+
+#### LUX-886：已有光盘图时海报候选不再覆盖 DISC
+
+背景：`candidate_image_targets` 把 `Primary`/`Poster` 类型的刮削图同时映射到本地 `POSTER` 和
+`DISC`（`src/application/candidates.rs`）。这条映射本身是“没有光盘图时用海报兜底”的设计，但写入
+路径分不清“兜底”和“显式光盘候选”：`write_selected_images` 把候选 JSON 里 `DISC` 桶的 URL 按普通
+类型处理，`FULL_REFRESH` 时 `replace=true`，`images.rs` 的 `image_target` 又会复用媒体目录里同名的
+`disc.jpg`，于是海报字节覆盖了已有光盘图，POSTER 与 DISC 变成同一张。
+
+实现（只改 `src/application/candidates.rs`，未动 `src/application/images.rs`、
+`src/application/metadata.rs`、`src/storage/catalog.rs`）：
+
+- 新增 `candidate_disc_urls`：把候选 `DISC` 桶拆成 `explicit` 与 `poster_fallback`。同时出现在
+  `POSTER` 桶里的 URL 是海报派生兜底，其余是上游显式给出的光盘候选；两组 URL 都保留，显式候选先写，
+  兜底只在显式候选全部失败时才有机会使用。
+- `write_selected_images` 的类型循环只写显式 `DISC`（原有覆盖语义不变）；全部图片任务结束后再做最后
+  一次兜底尝试：仅当 `DISC` 在策略里启用、允许刮削来源、未命中截图回退、本次没有写出 `DISC`，且
+  `disc_artwork_present(item_id)` 为 false 时，才用海报 URL 以“仅补缺”方式写入 `DISC`。该探测覆盖
+  `item_images` 记录与文件、`/config/metadata` 旁车和媒体目录；探测出错（例如符号链接）按“已有光盘图”
+  处理，只记一条不含路径/URL 的 warn 并跳过兜底，不向上抛错。
+- `explicitly_unavailable_image_types` 逻辑不变，只更新注释：海报 URL 仍覆盖 `POSTER`/`DISC`
+  （`DISC` 仅作为没有光盘图时的兜底），不新增“误判为不可用”。
+- 候选 JSON 形状、图片策略、数据库 schema、插件协议均未改变；升级前入库的候选按同一规则处理。
+
+验收：
+
+- [x] 条目已有 `disc.jpg`：`FULL_REFRESH` 选海报候选后 `disc.jpg` 字节不变，`POSTER` 写入候选海报，
+      `report.image_types` 只有 `POSTER`。修复前该用例失败（`["POSTER", "DISC"]`）。
+- [x] 条目没有光盘图：同一候选刷新后仍生成 `disc.png`，`item_images.source_url` 为海报 URL。
+- [x] 上游显式提供 `Disc` 候选（与海报 URL 不同）：`FULL_REFRESH` 仍按覆盖语义替换已有 `disc.jpg`，
+      `item_images.source_url` 为该候选 URL。
+- [x] 显式 `Disc` URL 全部失败、条目没有光盘图：仍由海报兜底写入 `DISC`；显式成功时不追加海报写入。
+- [x] 已有光盘图探测出错（`disc.jpg` 为符号链接）：整次选择仍成功，NFO 与 `POSTER` 正常写回，
+      符号链接保持原样。
+- [x] `explicitly_unavailable_image_types` 现有用例保持通过。
+- [x] `candidates.rs` 单测覆盖拆分规则（海报派生、显式候选保留兜底、空映射）。
+
+预计文件：`src/application/candidates.rs`、`tests/metadata/metadata_selection.rs`、
+`docs/LUX-DEVELOPMENT.md`、`docs/CHANGELOG.md`、`docs/COMPATIBILITY.md`、`docs/TEST-TARGETS.md`。
+
+实施结果（2026-11-05，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 验证）：按 TDD 先加失败
+测试再实现，分两个提交（测试、实现+文档）。任务编号接 `LUX-885`。
+
+验证命令与结果：
+
+- `cargo test --locked --test metadata metadata_selection::full_refresh_` 8/8（含 5 条新增）。
+- `cargo test --locked --test metadata metadata_selection::` 45/45。
+- `cargo test --locked --lib candidates::` 45/45（改写拆分单测，并扩展既有低宽度用例）。
+- `cargo test --locked --test images image_writer::` 20/20、`cargo test --locked --test reidentify`
+  25/25（完整刷新路径回归）。
+- `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+  `python3 scripts/check-backend-branches.py` 通过。
+- `docs/TEST-TARGETS.md` 的 `metadata_selection`（38→45）、`metadata` 分组（143→156）与第 2 节合计
+  按实际 `cargo test -- --list` 重测更新；同组 `nfo_writer`（27→33）的基线漂移一并修正。
+
+限制与剩余风险：
+
+- 判定依赖“海报 URL 同时出现在 `POSTER` 和 `DISC` 桶”这一现有映射事实；若某个上游把显式光盘图和
+  海报给成完全相同的 URL，会被保守当成兜底，已有光盘图时不覆盖（不会丢图）。
+- 兜底尝试在本次所有图片任务结束后执行，需要一次 `has_local_image`（图片记录查询 + 文件检查）；只在
+  `DISC` 启用、存在海报派生 DISC、本次没有写出 `DISC` 时执行。探测出错只记 warn 并跳过兜底。
+- 未改 `images.rs` 的目标路径选择，已有 `disc.jpg` 被复用的行为保持原样；本任务只保证不复用海报字节
+  覆盖它。
+- 未在真实 Emby 客户端/网盘媒体库上复测光盘图显示。
+
+返工（独立审查后，2026-11-05）：
+
+- 显式 `Disc` 失败时兜底被丢掉：`candidate_disc_urls` 之前在 `explicit` 非空时清空
+  `poster_fallback`，对“条目没有光盘图、显式 `Disc` URL 全部 404/超限”的条目，基线会继续用海报
+  填一张，返工前一张都不写。现在两组 URL 都保留：显式候选照旧先写；兜底改为全部任务结束后的最后
+  尝试，只有本次没有写出 `DISC`、且 `disc_artwork_present` 为 false 时才用海报 URL 以“仅补缺”
+  方式写入（`try_download_item_image_if_missing_from_scraper_at_index`），显式成功时不会多写一次。
+  单测 `explicit_disc_candidates_keep_their_urls_and_suppress_the_poster_fallback` 改写为
+  `explicit_disc_candidates_keep_the_poster_fallback_for_a_later_attempt`；新增集成用例
+  `full_refresh_falls_back_to_the_poster_when_the_explicit_disc_candidate_fails`（返工前失败）和
+  `full_refresh_does_not_add_a_poster_disc_when_the_explicit_disc_succeeds`。
+- 预检查报错让整次选择失败：`has_local_image(DISC).await?` 遇到符号链接或不可读路径会返回
+  `SymlinkTarget` 等错误，媒体目录里 `disc.jpg` 是符号链接的条目因此从“能刷新”变成失败。现在改为
+  `disc_artwork_present`：出错按“已有光盘图”处理（跳过兜底）并记一条不含路径/URL 的 warn，不向
+  调用方抛错。新增 `full_refresh_survives_a_symlinked_disc_artwork_probe`（返工前返回
+  `Image(SymlinkTarget(...))`，返工后刷新成功、NFO 与 `POSTER` 正常写回、符号链接原样保留）。
+- 复跑：`--lib candidates::` 45/45、`--test metadata metadata_selection::` 45/45、
+  `--test images image_writer::` 20/20、`--test reidentify` 25/25、fmt / clippy /
+  `check-backend-branches.py` 通过。
+
+#### LUX-887：图片写入的路径冲突检测与索引一致性（同类型多索引不再共用一个文件）
+
+背景：真机调查（调查者已在本地复现）发现同一条目的两个图片行指向同一个物理文件，旧行的
+`contentTag`/`fileSize` 与文件内容不符，图片缓存与 ETag 随之失效。原因是三层叠加：
+
+1. 写入侧只查 `…-fanart-{k}`、`…-backdrop{k}` 这类旧名，不查扫描侧认可的 `fanart{k}`，带索引的旁车永远
+   不会被复用，每次刷新另建 `{movie_stem}-backdrop{k}.<ext>`，原来的 `fanart{k}.jpg` 变成孤儿。
+2. `next_local_image_index` 每批从 0 重新发号，不看库里已有索引；重扫把孤儿旁车塞回 `FANART/1..n`，把上一
+   轮写入的文件挤到更高的索引。
+3. 真正的漏洞：写入的冲突检测只收集**其它类型**的行（`blocked_paths` 的
+   `filter(|image| !image.image_type.eq_ignore_ascii_case(image_type))`），`FANART/1` 的写入因此可以合法落
+   到 `FANART/4` 正在引用的 `-backdrop1.png`，写完只更新 `(FANART,1)`，`FANART/4` 保留旧 tag。数据库只有
+   `UNIQUE (item_id, image_type, image_index)`，`local_path` 没有约束，登记 upsert 也不检测路径冲突。
+
+实现：
+
+- 冲突检测覆盖同类型：`download_item_image_impl` 改用 `blocked_image_paths`，收集除本行（同 type 同 index）
+  以外**所有**行的路径。写 `FANART/1` 时 `FANART/4` 的文件被挡住；本行上一次的路径仍可复用，重复刷新不会
+  误判或重下。
+- 写入侧复用扫描命名（选 2a：只扩展写入/查找的命名集合，不改扫描侧命名）。`image_lookup_stems` 为 FANART
+  索引 k 增加 `fanart{k}` 与 `{movie_stem}-fanart{k}`；`image_target` 改用
+  `find_existing_image_paths`（按 stem 优先序列出全部候选）并跳过被其它行占用的路径，因此盘上已有的
+  `fanart2.jpg` 会被 `FANART/2` 直接复用；只有该索引的所有已知名字都被占用时，才新建文件（而不是返回
+  `ConcurrentModification`）。episode 的 `{episode_stem}-fanart{k}` 命名、`is_legacy_episode_fanart_path`
+  与历史 `…-thumb{k}` 兼容语义保持不变；写侧默认命名仍是 `backdrop{k}`，外部读取方看到的文件名不变。
+- 读取侧对齐：`image_path_is_owned_by_other_row` 取代 `image_path_is_owned_by_other_type`，把「同类型其它
+  索引」也算作别人的行；`local_image_exists_at_index` 与 `local_image_types_impl` 都传入索引。索引 k 不会
+  因为邻居索引登记的文件而误判「已有图」。`fallback_image_types` 只判断索引 0 的回退行与文件是否存在，
+  语义不变。
+- 索引分配避开已占用索引：`next_local_image_index` 改为「同一路径已登记的索引优先（重扫不换号），否则取
+  最小空闲索引」，并按 (type, index) 与其它路径比对；`prepare_local_image_batch_item`、
+  `prepare_scan_local_movie_image_batch_item` 和文件变化登记共用该分配器。电影扫描页为此每页多读一次
+  `list_item_images_by_ids`（`enrich_movie_library` 的语句数 2 → 3）。
+- 登记兜底：`insert_item_images_batch_at_indices` 在同一事务内用 `NOT EXISTS` 跳过「`local_path` 已属于同
+  条目**同类型其它索引**」的记录，并在 Rust 侧按 `(item_id, image_type, local_path)` 丢弃同一页里重复的
+  后一条；**跨类型共用路径仍然合法**（STRM 缩略图刻意把 `POSTER/0` 与 `THUMB/0` 登记到同一个
+  `{stem}-thumbnail.jpg`，该批次必须两行都写入、重复探测时 THUMB 行照常更新 tag）。语句数不变，未加唯一
+  约束、未加迁移。
+- 写侧并发兜底：`write_item_image_at_index_in_transaction`（下载/刮削写入的 upsert）在同一事务内再做一次
+  「同类型其它索引是否已登记该路径」检查（`WITH candidate … WHERE NOT EXISTS`）。写路径与扫描登记分别持有
+  `image_write_lock` 与 `metadata_write_lock`，扫描可能在写侧取快照之后、upsert 之前把同一路径登记到同类型
+  另一索引；此前纯 upsert 会静默造成两行同路径。冲突时返回 `StorageError::Conflict`（上层记为该次图片尝试
+  失败，下次刷新重新选路径），本行自己的路径仍可正常更新。
+- 未改 `candidates.rs` 的类型映射与 DISC 逻辑、未改插件与 Web、未做存量脏数据的一次性修复。
+
+验收：
+
+- [x] 两轮刷新 + 中间重扫（本地 HTTP stub：2 张海报候选、4 张背景、1 个 logo；本地旁车
+      `poster/disc/logo/fanart/fanart1..3/thumb/banner/art/wallpaper`）：修复后任意两行不共享 `local_path`，
+      每行 `content_tag` 等于文件内容的 SHA-256；FANART 行数保持 4（索引 0..3）。
+- [x] 写入侧复用：刷新 `FANART/{1,2,3}` 后不再出现 `Example.Movie.2020-backdrop{1,2,3}.*`，三行仍指向
+      `fanart{1,2,3}.jpg`。
+- [x] 单元：同类型 index A 占用路径 P 时写 index B 不落到 P（`image_target` 与 `ImageWriteService` 两层各
+      一条），写 index A 自己可复用 P。
+- [x] 单元：盘上有 `fanart2.jpg` 时写 `FANART/2` 复用它；`fanart2.jpg` 已被别的行占用时不复用。
+- [x] 单元：`next_local_image_index` 在库里已有 0..3 时不再发出 0..3，已登记同一路径的文件保留原索引。
+- [x] 登记层：同一页里重复的 `local_path`（同类型不同索引）只登记一次；路径已被同类型其它索引占用时
+      跳过而不是改号；跨类型共用路径（STRM 缩略图 `POSTER/0` + `THUMB/0` 同一文件）两行都写入，重复登记
+      更新 tag。
+- [x] 写侧并发：模拟「写侧取快照之后、upsert 之前」扫描把同一路径登记到同类型另一索引，upsert 返回
+      `StorageError::Conflict`，占位行不被改写；本行自己的路径仍可正常刷新。
+- [x] 回归：ART/BANNER/THUMB/WALLPAPER 用同一个上游 URL 时仍落成四个独立文件与四行登记
+      （`artwork_types_fed_by_one_source_write_distinct_files`）、episode 的 THUMB/FANART 隔离、
+      `image_repairs` 现有用例保持通过。
+
+预计文件：`src/application/images.rs`、`src/application/metadata.rs`、`src/storage/catalog.rs`、
+`src/storage/repository_tests.rs`、`tests/metadata/metadata_selection.rs`、`docs/LUX-DEVELOPMENT.md`、
+`docs/CHANGELOG.md`、`docs/TEST-TARGETS.md`。
+
+实施结果（2026-11-05，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 验证）：按 TDD 先写失败用例
+（`rescan_between_image_refreshes_keeps_indexes_on_their_own_files` 在修复前报
+`FANART/1 should stay on fanart1.jpg, got …-backdrop1.png`），再实现到全绿。任务编号接 `LUX-885`（并行任务
+取 `LUX-886`）。合并基线：起初 `test` 还没有 LUX-886，先合入 `tspace/keep-existing-disc` 并解决文档冲突
+（两条任务条目并存、TEST-TARGETS 计数按两任务叠加）；返工收尾时 `test` 已包含 LUX-886 与 NFO 评分任务，
+再 `git merge test`（`0d529e17` 等 2 个提交，无冲突，仅带入 `nfo`/`ratings` 相关代码），随后复跑受影响的
+分组。
+
+返工（独立审查后，2026-11-05）：
+
+- P1：初版把批量登记去重键写成 `(item_id, local_path)`，会连同**跨类型**共用路径的第二行一起跳过，破坏
+  STRM 缩略图 `POSTER/0` + `THUMB/0` 同文件的既定行为（`--test strm` 的
+  `strm_probe_plugin_persists_media_info_and_compatible_sidecar` 由 2 行变 1 行）。现在去重键与 SQL
+  `NOT EXISTS` 都限定为同类型其它索引；先复现失败（`assert_eq!(left: 1, right: 2)`），再修到通过，并在
+  `repository_tests` 增加跨类型共用路径两行写入 + 重复登记更新 tag 的断言。
+- P2：写侧 upsert 原文没有事务内兜底，快照与 upsert 之间扫描把同一路径登记到同类型另一索引时仍会共用。
+  现在加事务内 `NOT EXISTS` 检查并返回 `StorageError::Conflict`，用「手工插入占位行模拟交错」的用例锁定。
+- 复核 `insert_item_images_batch_at_indices` 的全部调用方：`metadata.rs` 的文件变化登记、电影扫描页（含
+  逐项重试）、series 批量/单项登记，以及 `strm_probe.rs` 的缩略图批次；前四者都是同类型路径唯一的本地登记，
+  只有 STRM 缩略图刻意跨类型共用，本次按类型限定后行为恢复。
+
+验证命令与结果（返工后，合并 LUX-886 基线）：
+
+- `cargo test --locked --lib`（返工后、同步 `test` 前）：1954 通过 / 40 跳过 / 2 条既有偶发失败（`probe` 与
+  `watch` 各一条，与图片无关，单独重跑均通过；与本任务返工前同一组偶发用例）。同步 `test` 后受影响分组复跑
+  通过（下一条）。
+- `cargo test --locked --lib images::` 36/36、`--lib metadata::` 35/35、`--lib candidates::` 45/45
+  （含 LUX-886 的用例，仅确认未被牵连）、`--lib image_repairs::` 1/1、`--lib nfo::` 30/30（同步 `test` 后）。
+- `cargo test --locked --test images` 66/66（新增 1 条同源异文件回归）、`cargo test --locked --test metadata`
+  157/157（`metadata_selection` 新增 1 条；总数含 LUX-886 的 6 条）、`cargo test --locked --test strm` 42/42
+  （含 STRM 缩略图 `POSTER/0` + `THUMB/0` 同文件用例；返工前该用例因跨类型去重失败为
+  `left: 1, right: 2`）。
+- 库内新增 6 条用例：图片写入冲突、旁车复用、服务层同类型隔离、索引分配、交错 upsert 拒绝、冲突错误保持可重试；
+  另扩展批量登记与旁车命名两条既有用例（跨类型共用路径两行写入 + 重复登记更新 tag）。
+- `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+  `python3 scripts/check-backend-branches.py`、`python3 scripts/check-migration-parity.py` 通过。
+
+限制与剩余风险：
+
+- **已经存在的共用路径脏数据不会自动修复**：本次只保证新的写入、重扫与登记不再制造或扩大共用路径。库里已经
+  有两行（同类型不同索引）指向同一文件时，重扫会为该文件算出其中一个已登记索引，但批量登记的 `NOT EXISTS`
+  发现另一索引也登记着同一路径，于是**该记录被整条跳过**（同一页的其他图片照常登记）：两行都不更新，tag
+  保持原样（不会刷新、也不会让最小索引行"接管"文件）。写侧会在写文件前重读登记再校验一次，遇到同一路径
+  返回 `ConcurrentModification`（可重试），不会改写该文件。要彻底清理需要单独的一次性修复任务（评估后另行
+  处理，本次不做），`image_repairs` 的 episode THUMB/FANART 修复范围也未扩大。
+- 写文件与 upsert 之间仍有极窄窗口：若扫描恰好在这段时间把该路径登记到同类型另一索引，文件已被覆盖，而
+  upsert 会返回 `StorageError::Conflict`（上层转为 `ConcurrentModification`）。由于本索引行没有写入，下一次
+  重扫会按该路径刷新占用行的 tag，不会留下"两行同路径"的登记。
+- 跨类型共用登记路径是既定合法行为（STRM 缩略图），本次**不**拦截；数据库里已有的跨类型同路径行既不会被跳过
+  也不会被改写。同类型不同索引的已有共用行同样保留，未加唯一约束（按要求不改 schema）。
+- 写入侧优先复用扫描认可的 `fanart{k}` 会把在线图片内容写进 `.jpg` 扩展名的旁车（索引 0 早已如此）；这是既有
+  行为，本次没有统一扩展名。副作用是「完整刷新」现在会**覆盖**用户放在 `fanart2.jpg` 这类带索引旁车里的文件
+  （修复前这类旁车会被当成孤儿留下，刷新另建 `-backdrop{k}`）；这是让「索引 k ↔ 文件名」成立所必需的，但
+  用户自定义的多背景图会被在线图替换，需要保留时请关闭对应类型的覆盖策略。
+- 批量登记与单行 upsert 的新 SQL 都用 `WITH … VALUES … INSERT … SELECT … WHERE NOT EXISTS`（SQLite 与
+  PostgreSQL 共用）；本机只跑了 SQLite，PostgreSQL 用例按仓库惯例需要本地实例，未执行。单行 upsert 用
+  `rows_affected() == 0` 判定冲突，依赖两个后端都把被 `NOT EXISTS` 过滤掉的语句计为 0 行。
+- 电影扫描每页多一次 `list_item_images_by_ids` 读取（有索引、每页最多 16 项）；`enrich_movie_library` 的语句数
+  2 → 3，已同步更新对应单测断言。
+- 未在真实 TMDb 刮削与第三方 Emby 客户端上复测图片刷新后的 ETag/cache 行为，只用 stub 与集成用例覆盖。
+
+#### LUX-887：Emby `Filters=IsResumable` / `Filters=IsFavorite` 语义
+
+背景：Hills 1.8.0 二进制含 `IsResumable` 字符串，标准 Emby 的 `Filters` 参数支持 `IsResumable`
+（有未看完播放进度的条目）；同一参数也接受 `IsFavorite`，而 Lux 只支持独立的 `IsFavorite=true` 查询
+参数。Lux 的 Emby 列表查询只在 `Filters` 里读 `IsUnplayed`/`IsPlayed`，`IsResumable` 与 `Filters` 里的
+`IsFavorite` 被静默忽略：前者返回完整列表而不是“可继续观看”的条目。
+
+实现（`src/api/emby_catalog.rs`、`src/application/catalog.rs`、`src/storage/repository.rs`、
+`src/storage/catalog.rs`、`src/storage/mod.rs`；无迁移、无新路由、不改 `/api/v1` DTO 与 `web/`）：
+
+- `Filters` 解析改为一次遍历的大小写不敏感集合，新增 `IsResumable`、`IsFavorite`；未知值仍忽略，
+  `Filters` 内 `IsUnplayed` 优先于 `IsPlayed` 的旧规则保持不变。
+- `Filters=IsFavorite` 等价于 `IsFavorite=true`；两者同时出现时以显式查询参数为准。
+- `Filters=IsResumable` 新增 `CatalogFilter::is_resumable`，在 `storage` 落成相关子查询：
+  `user_item_state` 属于当前请求的目标用户、`is_played = 0`、`hide_from_resume = 0`、
+  `position_ticks >= resume_min_ticks`、条目有已知时长且 `position_ticks * 100 < runtime * played_percent`。
+  因此它不是字面意义上的 `PlaybackPositionTicks > 0`：低于最小时长和超过已看百分比的条目都不返回。
+- 判定复用：把 `Items/Resume` 的两个条件抽成 `resumable_state_predicate` /
+  `resumable_progress_predicate`，`list_resume_items_with_next_episode`、`count_resume_items` 与新的
+  列表过滤共用同一段 SQL；阈值来自 `home_resume_settings`（与 Resume 端点同一次读取），没有新增配置或
+  阈值。运行时长的兜底表达式仍复用 `resume_runtime_ticks_sql()`。
+- 组合规则：所有过滤器按 AND 组合。`IsResumable` 隐含未看完，`Filters=IsResumable,IsPlayed` 因此返回
+  空页，而不是让其中一个值静默覆盖另一个；`Filters=IsResumable,IsUnplayed` 等价于只有 `IsResumable`。
+- 分页与总数：过滤进入同一条 `catalog_filter_where_clause`，列表、`TotalRecordCount` 与分页共用，
+  服务端上限不变；多库 union 列表与读模型路径按既有规则对未覆盖的过滤集回退权威查询（新增
+  `is_resumable` 条件）。
+- 未覆盖：`SearchTerm` 搜索分支、`Ids` 单条查找分支与 `ParentId` 指向具体条目的系列分集/集合子项
+  分支不应用 `Filters`（与既有 `IsPlayed`/`IsUnplayed` 一致）；库页缓存 15 秒 TTL 不因播放进度写入
+  失效，刚续播后的列表最多滞后约 15 秒。
+
+验收：
+
+- [x] `Filters=IsResumable` 只返回有进度且未看完的条目；已看完、无任何进度、低于最小时长、超过已看
+      百分比与 `HideFromResume` 的条目都不返回。
+- [x] 进度按请求目标用户读取：另一个用户的进度不出现在响应中，也不影响当前用户的过滤结果。
+- [x] 分页与 `TotalRecordCount` 一致：`Limit=2` 的第 1 页返回 2 条、第 2 页返回 1 条，两页总数都是
+      过滤后的 3。
+- [x] `Filters=IsFavorite` 与 `IsFavorite=true` 返回同一组条目；`Filters=IsFavorite,IsResumable` 取交集。
+- [x] `/Users/{userId}/Items` 根路径与 `/emby` 前缀、大小写混用与逗号组合值均有覆盖。
+- [x] `Filters=IsResumable,IsPlayed` 返回空页；`Filters=IsResumable,IsUnplayed` 等价于 `IsResumable`。
+- [x] `Filters=IsUnplayed` 单独使用时行为不变，`IsResumable` 是它的严格子集。
+
+预计文件：`src/api/emby_catalog.rs`、`src/application/catalog.rs`、`src/storage/repository.rs`、
+`src/storage/catalog.rs`、`src/storage/mod.rs`、`tests/emby/emby_item_filters.rs`、
+`tests/emby/main.rs`、`docs/COMPATIBILITY.md`、`docs/LUX-DEVELOPMENT.md`。rebase 到当前 `test` 后
+另按审查要求补了 `docs/CHANGELOG.md`（Unreleased 修复条目）与 `docs/TEST-TARGETS.md`（`--test emby`
+与模块计数）。
+
+实施结果（2026-11-06，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 验证）：按 TDD 先提交失败的
+集成测试（`Filters` 里的两个新值被忽略时用 7 条/5 条全量结果复现），再实现使其通过。Hills 只确认到
+`IsResumable` 字符串存在，没有真机复测列表结果。任务编号用 `LUX-887`：基线上 `LUX-886` 已被“已有
+光盘图不再被海报覆盖”占用（本任务接到的说明里写的是 LUX-886）。
+
+验证命令与结果：
+
+- `cargo test --locked --test emby emby_item_filters::` 2/2（新增）。
+- `cargo test --locked --test emby emby_counts::` 1/1；`cargo test --locked --lib resume` 16/16
+  （含 `resume_items_apply_content_restrictions_before_ranking`、`home_resume_settings_are_read_with_one_query`）。
+- `cargo test --locked --test auth_users resume_favorites::` 6/6；`cargo test --locked --test library
+  catalog::` 5/5；`cargo test --locked --test library series_api::` 1/1。
+- `cargo fmt --all -- --check` 通过；`cargo clippy --locked --all-targets --all-features -- -D warnings`
+  通过（0 警告）。
+
+限制与剩余风险：
+
+- `IsResumable` 与 Resume 端点一样受 `resume_min_ticks`（默认 120 秒）和 `played_percent`（默认 95%）
+  约束；第三方客户端如果期望字面意义上的“任意进度 > 0”会看到更少的条目，需要所有者确认是否接受。
+- 播放进度写入不会失效库页缓存（15 秒 TTL），刚续播后紧接的列表请求可能读到旧页；与既有 `IsPlayed`
+  过滤相同，本任务未改缓存失效策略。
+- 搜索、`Ids` 单条查找与具体条目子项分支仍不应用 `Filters`；这些路径在改动前也不支持
+  `IsPlayed`/`IsUnplayed`，属于既有边界而非本任务新增缺口。
+- 没有在 Hills、SenPlayer、VidHub、Infuse 等真实客户端上验证该过滤参数的 UI 结果；Hills 只确认到
+  二进制字符串存在。
+
+#### LUX-888：Emby 列表端点容忍空的可选数值参数
+
+背景：Hills 打开媒体库筛选面板时会向 `/Genres`、`/Years`、`/Studios` 发送**空的** `Limit=`，Lux 的
+`Option<i64>` 查询反序列化把它当成非法整数并返回 400
+（`Failed to deserialize query string: Limit: cannot parse integer from empty string`），筛选面板因此
+为空（`docs/reviews/2026-11-06-hills-yamby-capture.md` §2 问题 3）。此前空的 `IsFavorite=` 出过同类问题，
+已按“空值按未提供处理”修好（`deserialize_optional_bool`），本次沿用同一做法补上数值版本。
+
+实现（`src/api/emby_catalog.rs`、`src/api/emby_handlers.rs`；无迁移、无新路由、不改 `/api/v1` DTO 与
+`web/`）：
+
+- 新增共享辅助函数 `deserialize_optional_i64`（`src/api/emby_catalog.rs`，紧邻既有的
+  `deserialize_optional_bool`）：把查询值按字符串读取，`trim()` 后为空（含纯空白）返回 `None`，否则按
+  `i64` 解析；解析失败仍是反序列化错误，由 axum 映射成 400。六个 Query 结构体共用这一份实现，没有各写
+  一份。
+- 接入字段：`EmbyItemsQuery`、`EmbyMediaFoldersQuery`、`EmbyFacetsQuery`、`EmbyPersonsQuery`、
+  `EmbyUsersQuery`、`EmbySearchQuery` 的 `StartIndex`/`Limit`（含已声明的 `startIndex`/`limit` 别名）、
+  `EmbyTokenQuery` 的 `ActiveWithinSeconds`（`Sessions` 使用）、`EmbyUserImageQuery` 的 `Index`
+  （`i32`，返工补）以及 `ResumeVisibilityQuery` 的 `Hide`（返工补，改用共享的布尔 helper）。
+- 这些结构体由路由共用，因此覆盖到 `/Items`、`/Users/{userId}/Items` 及其 `Resume`/`Latest`/`NextUp`/
+  `FavoriteItems` 子路径、`Shows/NextUp`、`Shows/{seriesId}/Seasons`、`Shows/{seriesId}/Episodes`、
+  `Persons`、`Genres`/`Studios`/`Years`、`Library/MediaFolders`、`Users/Query`、`Sessions`、
+  `Search/Hints`、`Users/{userId}/Images/{imageType}` 与 `POST .../HideFromResume`；根路径与 `/emby` 前缀
+  挂载同一棵路由树。
+- 穷尽检查：`src/api/` 下所有 Emby 查询类型的可选数值/布尔字段逐个核对，逐条决定写进
+  `docs/COMPATIBILITY.md` 的检查清单。`EmbyImageDisplayQuery`、`EmbyStreamQuery`、`EmbyTranscodingQuery`
+  与 `PlaybackInfo` 的查询合并本来就用手写解析（`parse().ok()` / `if let Ok(..)`），空值与非数字从不 `400`，
+  因此不改；`ImageTypeLimit` 在 Lux 的 Emby 查询类型里根本没有声明，未知参数被忽略，也不会 `400`。
+- 校验与上限不变：`Limit=abc`、`Limit=1.5`、`StartIndex=abc` 仍在反序列化阶段 400；`StartIndex=-1` 仍因
+  负偏移 400；`Limit` 超上限（列表 1000、`Users/Query` 100）仍 400；`Sessions` 的 `ActiveWithinSeconds`
+  仍限制在 1..=2592000；`Limit=0` 的既有规则未改。
+- 有意未改：`/Items` 的 `Limit`/`StartIndex` 仍然不声明 camelCase 别名（既有行为，与本次空值问题无关）。
+  （`/Users/{userId}/Images/{imageType}?Index=` 在首轮实现中曾被列为未改，返工后已接入
+  `deserialize_optional_i32`，见下方返工记录。）
+
+验收：
+
+- [x] `Genres`/`Years`/`Studios`：`Limit=`、`StartIndex=`、两者同时为空、纯空白值 → 200，且响应体与
+      不传该参数完全一致。
+- [x] 同上：`Limit=abc`、`Limit=1.5`、`StartIndex=abc` → 400；`Limit=1001` → 400；`StartIndex=-1` → 400。
+- [x] `Items`、`Users/{id}/Items`、`Items/Resume`、`Items/Latest`、`Items/NextUp`、`FavoriteItems`、
+      `Shows/NextUp`、`Shows/{id}/Seasons`、`Shows/{id}/Episodes` 的空 `Limit`/`StartIndex` → 200 且等价
+      未传，非法值与超上限仍 400。
+- [x] `Persons`、`Library/MediaFolders`、`Users/Query` 同上；`Users/Query` 的 100 上限单独覆盖。
+- [x] `Sessions` 的 `ActiveWithinSeconds` 空值 → 200 且等价未传；`abc`、`0`、`2592001` 仍 400。
+- [x] `Search/Hints` 的 `Limit`/`StartIndex` 空值 → 200 且与“完全不传分页参数”的响应一致（同时证明接入
+      `deserialize_with` 后字段没有变成必填，为此补了 `default`）；`abc`、`1.5`、`1001`、`-1` 仍 400。
+- [x] `Users/{userId}/Images/Primary?Index=`（含 `index` 别名与纯空白）与不传 `Index` 的响应一致；
+      `Index=abc`、`Index=-1` 仍 400。
+- [x] `HideFromResume?Hide=` 空值等价未传（由 JSON body 决定）；空值且 body 也没给仍是 400；
+      `Hide=abc` 即使 body 给了值也仍是 400。
+- [x] 根路径与 `/emby` 前缀都覆盖。
+- [x] `cargo test --locked --test emby` 50/50；`cargo fmt --all -- --check`、`cargo clippy --locked
+      --all-targets --all-features -- -D warnings`、`python3 scripts/check-backend-branches.py` 通过。
+
+预计文件：`src/api/emby_catalog.rs`、`src/api/emby_handlers.rs`、`src/api/media.rs`、
+`src/api/emby_resume_visibility.rs`、`tests/emby/emby_empty_numeric_params.rs`、`tests/emby/main.rs`、
+`docs/COMPATIBILITY.md`、`docs/CHANGELOG.md`、`docs/LUX-DEVELOPMENT.md`、`docs/TEST-TARGETS.md`。
+任务编号用 `LUX-888`：基线上 `LUX-887` 已被 `Filters=IsResumable`/`IsFavorite`
+占用。
+
+实施结果（2026-11-06，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 验证）：按 TDD 先提交失败的集成
+测试（空 `Limit=` 时 4 条用例全部以 400 复现），再实现使其通过。抓包只确认了 `/Genres`、`/Years`、
+`/Studios` 的空 `Limit=`；空 `StartIndex=` 与其它端点是静态推断，修复后**没有**在 Hills/Yamby 真机上复测
+筛选面板。
+
+返工（同日，按审查意见）：首轮只改了 `emby_catalog.rs`/`emby_handlers.rs` 里的结构体，漏掉
+`src/api/media.rs` 的 `EmbySearchQuery`（`/Search/Hints`）。返工做三件事：
+
+1. 穷尽检查 `src/api/` 下所有 Emby 查询类型，结论表写进 `docs/COMPATIBILITY.md`；本轮补了三个结构体：
+   `EmbySearchQuery`（`StartIndex`/`Limit`，同时补上缺失的 `default`）、`EmbyUserImageQuery.Index`
+   （新增 `deserialize_optional_i32`）、`ResumeVisibilityQuery.Hide`（改用共享布尔 helper，删除手写解析）。
+2. 把判定逻辑收敛成一份：私有 `blank_optional_value<T>` 同时支撑 `deserialize_optional_bool`、
+   `deserialize_optional_i64`、`deserialize_optional_i32`，`#[serde(deserialize_with)]` 只做类型适配。
+   既有布尔 helper 的对外行为不变（原函数体就是这套逻辑，改后委托给同一份实现）。
+3. 新增 3 条回归（`/Search/Hints`、头像 `Index`、`HideFromResume` 的 `Hide`），先跑红：分别是 `400 vs 200`、
+   `400 vs 404`（无头像的基线）、`400 vs 200`，实现后转绿。
+
+验证命令与结果：
+
+- `cargo test --locked --test emby emby_empty_numeric_params::` 7/7（新增；首轮 4 条 + 返工 3 条）。
+- `cargo test --locked --test emby` 50/50（整组，含 `emby_facets`、`emby_item_filters`、`emby_auth`、
+  `emby_incremental_refresh`、`mixed_library_api` 等既有用例）。
+- `cargo fmt --all -- --check` 通过；`cargo clippy --locked --all-targets --all-features -- -D warnings`
+  通过（0 警告）；`python3 scripts/check-backend-branches.py` 通过（28 files，266 branches）。
+
+rebase 复核：合并前本地 `test` 前进到 `a7c3cdc5`（含 `feb8834d` STRM 媒体源 ID 改为 32 位十六进制、
+`a7c3cdc5` 的兼容记录），已 rebase 且无冲突（两条文档记录分别位于文件不同位置，双方内容都保留）。
+rebase 后重跑：`cargo test --locked --test emby` 50/50（`-- --list` 为 50，本模块 7 条）、
+`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+`python3 scripts/check-backend-branches.py` 全部通过；`docs/TEST-TARGETS.md` 的 `--test emby` 计数与
+rebase 后的 `--list` 一致。
+
+限制与剩余风险：
+
+- 抓包报告没有保留完整查询串，所以“客户端是否也发空 `StartIndex=`”“除这三个端点外是否还有空值”没有
+  直接证据；本修复按同类反序列化覆盖全部 Emby 列表端点，属于预防性而非逐条实抓的修复。
+- 空值按未提供处理之后，`Limit=` 与“没有 `Limit` 参数”完全等价；它与 `Limit=0` 仍是不同语义（`Items`
+  在请求总数时把 `Limit=0` 当纯计数请求），两者都保留原有行为。
+- 修复未部署，Hills/Yamby 筛选面板在真机上的最终表现（列表是否有内容、分页是否正确）待部署后复测；
+  本次没有声称真机验证通过。
+- 返工后只剩 Lux 自己签发的票据参数（`luxPlaybackExpires`）与 `ImageTypeLimit` 这类不存在的键不在
+  显式处理范围内：前者解析失败落成 `None`、走既有鉴权失败分支，后者 Lux 根本不声明，都不会产生 `400`。
+  若将来新增 Emby 查询结构体，需要按同一规则接入共享 helper；这一点只体现在代码约定里，没有编译期约束。
+#### LUX-890：Emby `GET /Tags` 与 `GET /OfficialRatings`（筛选面板元数据）
+
+背景：Hills 1.11.0 打开媒体库筛选面板时实抓 `GET /Tags`、`GET /OfficialRatings`，Lux 对两者都是 404，
+筛选列表为空（`docs/reviews/2026-11-06-hills-yamby-capture.md`）。`/Tags` 此前在 `docs/COMPATIBILITY.md`
+被记为“有意未实现”，因为 NFO 缓存里没有 tags 数据；`/Genres`、`/Studios`、`/Years` 已实现，是本次的
+路由/DTO/ACL/分页/`ParentId`/`Recursive`/`IncludeItemTypes` 样板。
+
+调查结论（先查存储，再决定实现范围）：
+
+- 分级：`media_content_restriction_index.certification_code` 已按条目存有归一化后的分级（大写，MPA/TVPG/
+  BBFC 之一），并带 `(certification_code, item_id)` 索引。注意它与条目 `OfficialRating` 字段**不是同一份
+  值**：字段输出 NFO 原文，索引只保留归一化后能识别的码，所以列表是原文的子集/改写（无法识别的分级不
+  出现，`Rated R` 会变成 `R`）。因此 `/OfficialRatings` 可以在 `storage` 里做一次分组聚合，不需要迁移，
+  不需要在请求里解析 NFO 或扫全库。
+- tags：没有数据源。`LocalNfoDetails` 没有条目级 tags，`media_item_facets.kind` 只允许 `GENRE`/`STUDIO`，
+  `media_content_restriction_tags` 是 genre 的小写投影（家长控制用），不能当 Emby tags 返回。按任务约定
+  返回 200 空信封，不新增迁移、不改扫描器，也不在请求里解析 NFO。
+
+实现（新增 `src/api/emby_filter_metadata.rs`；改 `src/api/legacy.rs`、`src/api/emby.rs`、
+`src/api/emby_catalog.rs`（把 `EMBY_MAX_PAGE_LIMIT` 改为 `pub(super)`，并把 `IncludeItemTypes` 的解析
+抽成 `emby_item_types_from_value` 供 `/Items` 与新端点共用）、`src/application/catalog.rs`、
+`src/storage/catalog.rs`、`src/storage/mod.rs`；无迁移、不改 `/api/v1` DTO 与 `web/`）：
+
+- `GET /OfficialRatings`：新增 `CatalogService::list_official_ratings` 与
+  `Database::list_catalog_certifications`。后者复用 `catalog_filter_where_clause`（库 ACL、内容限制、
+  可见性、`IncludeItemTypes` 都在同一个谓词里），按 `certification_code` 分组计数、按代码升序分页；
+  `TotalRecordCount` 是去重后的分级个数。`ParentId` 的解析与 `/Genres` 相同（数字 id 经
+  `emby_internal_id` 还原，不可见库返回 404）。`IncludeItemTypes` 复用 `emby_item_types_from_value`：
+  整组都无法识别时得到 `__NO_MATCH__`（与 `/Items` 一致，返回空列表而不是全量），混合有效/无效值只按
+  有效类型过滤。
+- 响应：与 `/Genres` 相同的信封，条目为 `{"Name": <code>, "Id": <code>, "ServerId": …}`；Emby
+  `NameIdPair` 里 `Id` 就是分级值，因此不另造合成 id。
+- `GET /Tags`：鉴权、目标用户校验、`ParentId` 库权限与分页校验都与 `/OfficialRatings` 相同，然后返回
+  `{"Items":[],"TotalRecordCount":0}`。它不读 tags 数据（没有任何 tags 表或投影），但会用
+  `library_scope_for_principal` 校验非空 `ParentId` 的库权限（未知/不可见库 404），这样以后填数据源时
+  不会留下越权捷径。
+- 查询解析：新端点用 `EmbyFilterMetadataQuery`，空的 `StartIndex=`/`Limit=` 复用 LUX-888 合并后的共享
+  `deserialize_optional_i64`（同样是先 `trim()` 再解析；本任务原先的私有 `empty_query_number` 已删除，
+  不保留两份实现），空的 `ParentId=` 按“不限媒体库”处理。`Limit<=0` 与 `/Genres` 一样按默认 50 处理，
+  `Limit>1000` 或 `StartIndex<0` 返回 400。
+- 路由：在 `EmbyRouteBuilder` 里追加 `/OfficialRatings`、`/Tags` 两行；根路径、`/emby` 前缀与路径大小写
+  不敏感由既有 builder 与请求路径归一化覆盖（`/EMBY/officialratings` 有测试）。
+
+验收：
+
+- [x] `/OfficialRatings` 对同一分级去重（两条 PG-13 条目只返回一条），`TotalRecordCount` 是分级数。
+- [x] 用户看不到被限制媒体库里的分级（viewer 只看得到 Movies，不返回 Private 的 NC-17）；不可见媒体库的
+      `ParentId` 返回 404。
+- [x] 内容限制生效：MPA PG-13 的用户在同一媒体库里看不到 R 分级。
+- [x] `ParentId` 只返回该库的分级；`IncludeItemTypes=Series` 只返回剧集的分级。
+- [x] `IncludeItemTypes` 与 `/Items` 对齐：`Photo`（全无效）返回 200 空列表，`Photo,Series` 只按
+      `SERIES` 过滤。
+- [x] 分页：`StartIndex`/`Limit` 生效且总数不受分页影响；`Limit=`（空）按未提供处理；`Limit=0` 按默认
+      50；`Limit>1000` 与 `StartIndex<0` 返回 400。
+- [x] `/Tags` 返回 200 与 `{"Items":[],"TotalRecordCount":0}`（根路径、`/emby` 前缀与空参数）。
+- [x] `/Tags` 的 `ParentId` 库权限与 `/OfficialRatings` 一致：不可见库与未知 id 返回 404，可见库与空
+      `ParentId=` 返回 200 空信封。
+- [x] 未鉴权两个端点都返回 401；`/EMBY/officialratings` 大小写混用可用。
+- [x] 最窄测试、fmt、clippy、`check-backend-branches.py` 通过。
+
+预计文件：`src/api/emby_filter_metadata.rs`、`src/api/legacy.rs`、`src/api/emby.rs`、
+`src/api/emby_catalog.rs`、`src/application/catalog.rs`、`src/storage/catalog.rs`、`src/storage/mod.rs`、
+`tests/emby/emby_filter_metadata.rs`、`tests/emby/main.rs`、`docs/COMPATIBILITY.md`、`docs/CHANGELOG.md`、
+`docs/LUX-DEVELOPMENT.md`、`docs/TEST-TARGETS.md`。
+
+实施结果（2026-11-06，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 验证）：按 TDD 先提交失败的
+集成测试（两个端点都是 404，断言 200/401 失败），再实现使其通过；最后 rebase 到最新的本地 `test`
+（`feb8834d`、`a7c3cdc5`）后重跑相关检查。真机抓包只确认了请求形态与旧的 404，修复后的响应没有在
+Hills 或任何第三方客户端上复测。
+
+验证命令与结果：
+
+- `cargo test --locked --test emby emby_filter_metadata::` 3/3（新增）。
+- `cargo test --locked --test emby emby_facets::` 1/1；rebase 后 `cargo test --locked --test emby`
+  整个分组 46/46 通过。
+- `cargo test --locked --test emby -- --list`：46 tests / 13 个模块（本任务新增 `emby_filter_metadata`
+  3 例；`docs/TEST-TARGETS.md` 的 `--test emby` 与模块计数按此更新）。
+- `cargo fmt --all -- --check` 通过。
+- `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过（0 警告），并对
+  `cargo clippy --locked --test emby -- -D warnings` 单独确认新增测试目标无警告。
+- `python3 scripts/check-backend-branches.py` 通过（28 个文件、266 处，未新增 `DatabaseBackend::` 分支）。
+
+返工（独立审查后，2026-11-06）：
+
+- 措辞纠正：分级列表是内容限制索引识别出的**归一化分级码子集**，不是 `OfficialRating` 字段的同一份值。
+  `src/storage/catalog.rs` 的 `list_catalog_certifications` 文档、`src/api/emby_filter_metadata.rs` 的模块
+  文档，以及 COMPATIBILITY / CHANGELOG / 本文的说法全部改成准确表述；返回的值不变（仍是归一化码，没有
+  改成扫 NFO 原文）。
+- `IncludeItemTypes` 与 `/Items` 对齐：把既有 `catalog_filter_from_values` 里的解析抽成
+  `emby_item_types_from_value`，`/Items` 与新端点共用。整组无法识别时得到 `__NO_MATCH__`，返回 200 空
+  列表而不是退化成全量；混合有效/无效值只按有效类型过滤。返工前 `IncludeItemTypes=Photo` 返回全部分级
+  （测试失败），返工后为空。
+- 补测试与文档：`Limit=0` 固定为 200 且按默认页大小；空 `Limit=`、`Limit>1000`、`StartIndex<0` 的语义
+  分别写清楚（“`Limit<=0` 按默认 50，`Limit>1000`/`StartIndex<0` 返回 400”）。`/Items` 暂不支持
+  `OfficialRatings=` 筛选的缺口写进 COMPATIBILITY 与本文的剩余风险，另立后续任务。
+- 就地修订两处与新行为矛盾的旧文本：`docs/COMPATIBILITY.md`
+  “Emby 筛选辅助端点：Genres、Studios、Years”一节的未实现列表，以及本文 P2 清单里的
+  “Tags 因 NFO 缓存无该数据而未实现”。
+
+合并 LUX-888（本地 `test` 头 `8ca9b0aa`）后：
+
+- rebase 到最新 `test`，`docs/COMPATIBILITY.md` 与 `docs/TEST-TARGETS.md` 的冲突按“保留双方内容”解决：
+  LUX-888 与 LUX-890 两个兼容记录都在，`TEST-TARGETS.md` 同时保留 `emby_empty_numeric_params`（7 例）与
+  `emby_filter_metadata`（3 例）两行；`--test emby` 计数按 rebase 后实测更新为 14 个模块 / 53 个测试。
+- 删除私有 `empty_query_number`，`EmbyFilterMetadataQuery` 的 `StartIndex`/`Limit` 改用
+  `deserialize_optional_i64`；空值与空白值语义不变（先 `trim()` 再解析），仍只有一份实现。
+- 复跑：`cargo test --locked --test emby -- --list` 53 tests / 14 模块；
+  `cargo test --locked --test emby emby_filter_metadata::` 3/3；
+  `cargo test --locked --test emby emby_empty_numeric_params::` 7/7；`cargo fmt --all -- --check` 通过；
+  `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过；
+  `python3 scripts/check-backend-branches.py` 通过（28 个文件、266 处）。
+
+返工（第二轮审查后，2026-11-06）：
+
+- `/Tags` 现在与 `/OfficialRatings` 一样校验 `ParentId` 的库权限：把两侧重复的判断抽成
+  `CatalogService::library_scope_for_principal`（`src/application/catalog.rs`），`list_facets`、
+  `list_official_ratings` 与 `/Tags` 共用同一份实现；非空 `ParentId` 指向未知或不可见库返回 404，空
+  `ParentId=` 仍按“不限媒体库”。测试覆盖不可见库、未知 id、可见库与空值四种情况。处理器注释不再声称空
+  响应可以省略授权检查，COMPATIBILITY 同步改写。
+- COMPATIBILITY 明确 `IncludeItemTypes` 与其他 facet 端点不同：只有 `/OfficialRatings` 与 `/Items` 用
+  `__NO_MATCH__`；`/Genres`、`/Studios`、`/Years` 仍是旧的内联解析，全无效时退化成不过滤，待后续任务
+  对齐（本任务未改这三个端点）。
+- 模块数纠正：`tests/emby/main.rs` 实际声明 14 个模块（53 个测试），本任务条目与 `TEST-TARGETS.md` 的
+  文件数由 13 改为 14（合计 128 → 129）。
+- 复跑：`cargo test --locked --test emby -- --list` 53 tests / 14 模块；
+  `cargo test --locked --test emby emby_filter_metadata::` 3/3；
+  `cargo test --locked --test emby emby_facets::` 1/1；`cargo fmt --all -- --check` 通过；
+  `cargo clippy --locked --all-targets --all-features -- -D warnings` 与
+  `cargo clippy --locked --test emby -- -D warnings` 通过；
+  `python3 scripts/check-backend-branches.py` 通过（28 个文件、266 处）。
+
+限制与剩余风险：
+
+- `/Tags` 恒空是**有意**的：Lux 没有条目级 tags 数据源。要把筛选面板的标签填上，需要先在扫描/索引侧
+  投影 tags（新迁移或扫描器改动），属于后续任务；本任务按约束没有做。
+- `/OfficialRatings` 只列出被既有投影识别为 MPA/TVPG/BBFC 的**归一化分级码子集**，与条目
+  `OfficialRating` 字段的 NFO 原文可能不同：无法识别的原文（`FSK 16` 之类）仍会出现在 `OfficialRating`
+  字段，但不会出现在这个列表里；能识别的原文也可能被改写（`Rated R` → `R`）。如果客户端期望列出原始
+  字符串，需要另开任务改归一化范围（会影响家长控制语义）。
+- 分级目前只能列出，**不能用于 `/Items` 筛选**：`/Items` 不接受 `OfficialRatings=` 参数，筛选面板里
+  选中分级不会改变列表；对应后续任务待立项，本任务没有改 `/Items` 过滤。
+- 大媒体库上这是一次 `GROUP BY certification_code` 聚合查询，走 `idx_media_content_restriction_index_certification`
+  的索引列，但结果集大小取决于不同分级值的数量；`Limit` 上限 1000，远大于真实分级数。
+- 响应条目形态按 Emby `NameIdPair` 推断（`Name`/`Id` 都是分级值，另带 `ServerId`），没有对照真实
+  Emby 服务器的响应对拍；Hills 只读其中的名字时不受影响，若某个客户端依赖 GUID 形态的 `Id` 则需要再确认。
+- `Tags` 与 `/OfficialRatings` 一样校验 `ParentId` 的库权限（不可见库/未知 id → 404，空 `ParentId=` →
+  不限媒体库），代价是空列表请求也会做一次媒体库访问查询；它仍然没有任何 tags 数据源。
+- 本机为 ARM64 宿主，不外推到 NAS/x86_64 的性能结论。
+
+#### LUX-889：Emby `GET /Items/{id}/Similar`
+
+> 约束修订（2026-11-07）：本任务中“不改 `/api/v1` DTO 与 `web/`”仅对 LUX-889 当时的范围有效；`/api/v1` 相似接口见 LUX-899。
+
+背景：真机抓包（2026-11-06）确认 Hills 1.11.0 与 Yamby 2.1.0.11 每次进入电影/剧集详情页都会请求
+`/emby/Items/<id>/Similar`（Hills 带 `UserId`、`Fields`、`Limit`、`ImageTypeLimit`；Yamby 另带
+`EnableTotalRecordCount=false`），Lux 返回 404 空响应，详情页的相似/推荐区整块缺失且页面不报错
+（`docs/reviews/2026-11-06-hills-yamby-capture.md` 问题 3）。静态分析
+（`docs/reviews/2026-11-06-hills-yamby-static-analysis.md` §9.1）确认 Yamby 的详情页与播放器“推荐”
+两处调用点都对该端点做 `catch (Throwable)` 静默降级。
+
+实现（`src/api/emby_similar.rs`（新）、`src/api/legacy.rs`、`src/api/emby.rs`、
+`src/application/catalog.rs`、`src/storage/catalog.rs`；无迁移、不改 `/api/v1` DTO 与 `web/`）：
+
+- 路由：`GET /Items/{id}/Similar`，沿用 `EmbyRouteBuilder`，因此根路径与 `/emby` 前缀、大小写不敏感
+  和现有鉴权/播放令牌中间件一致。抓包只出现根 `Items` 形态，没有新增
+  `/Users/{userId}/Items/{id}/Similar`。
+- DTO：`{"Items":[...],"TotalRecordCount":n}`，条目由现有列表投影生成，`Fields` 与列表端点同义；
+  `EnableUserData=false` 去掉 `UserData`，`EnableImageTypes`/`ImageTypeLimit` 过滤图片 tag。显式空的
+  `EnableImageTypes=` 与未提供等价（保留全部图片 tag），与 LUX-888 的空值规则一致。
+- 相似规则：新增 `CatalogService::list_similar_items` 与存储层 `list_similar_catalog_rows`。候选必须是
+  同类型（MOVIE/SERIES）、与源条目至少共享一个 `media_item_facets(kind='GENRE')` 键。**候选池先设硬
+  上限再排序**：源条目的 Genre 按 `name_key` 取前 10 个，每个 Genre 的候选分支最多取 200 个通过 ACL、
+  可见性、内容限制、同类型和排除自身谓词的条目；只在这个 ≤10×200 的并集上按共享数量降序、再按
+  `LOWER(title)`、`id` 升序排序。被排除的库或条目不会进入 `Items` 或候选池计数。
+- 查询形状：源 Genre 用 `media_item_facets` 主键查询（`name_key` 排序、`LIMIT 10`）；每个 Genre 一个
+  分支，`ORDER BY facet.item_id` 命中 `idx_media_item_facets_lookup(kind, name_key, item_id)` 的索引
+  顺序并 `LIMIT 200`，不会先收集整个 Genre 再排序。分支的 `UNION ALL` 只包住有界并集，外层聚合/排序
+  与 `COUNT(DISTINCT item_id)` 都只处理这个并集；`TotalRecordCount` 因此是候选池内的去重数量，不是
+  全库相似条目总数。
+- 错误与分页：条目不存在或不可见 404（与 `/Items/{id}` 一致），未鉴权 401；`Limit` 默认 50、上限 1000，
+  空值按未提供（`Limit`/`ImageTypeLimit` 复用 LUX-888 的共享 `deserialize_optional_i64`），负数、非整数
+  或超上限 400；无相似条目 200 空列表。响应不返回 `StartIndex`（规格只要求 `Items`/`TotalRecordCount`）。
+
+验收：
+
+- [x] 同类型且共享 Genre 的条目按共享数量降序返回，不含自身、不同类型或不同 Genre 的条目。
+- [x] 电影与剧集均覆盖；根路径与 `/emby` 前缀一致。
+- [x] 被用户媒体库 ACL 排除的条目不出现在 `Items` 或 `TotalRecordCount`。
+- [x] `Limit` 生效且 `TotalRecordCount` 是候选池内的相似条目总数；空值按未提供，非法值 400。
+- [x] 无相似条目 200 空列表；不存在的 ID 404；未鉴权 401。
+- [x] 存储层测试插入 ≥ 2×K 个同 Genre 条目，断言计划按索引读且没有候选排序/`media_items` 扫描、返回
+      条数 ≤ Limit、`TotalRecordCount` ≤ 候选池上限、共享 Genre 更多的排前、两次请求结果一致；另有一例
+      覆盖源 Genre 数量上限（12 个 Genre 只取前 10 个）。
+- [x] `Fields`、`EnableUserData`、`ImageTypeLimit`、`EnableImageTypes` 生效。
+
+预计文件：`src/api/emby_similar.rs`、`src/api/legacy.rs`、`src/api/emby.rs`、`src/application/catalog.rs`、
+`src/storage/catalog.rs`、`tests/emby/emby_similar.rs`、`tests/emby/main.rs`、`docs/COMPATIBILITY.md`、
+`docs/CHANGELOG.md`、`docs/LUX-DEVELOPMENT.md`、`docs/TEST-TARGETS.md`。rebase 到 `8ca9b0aa`（含
+LUX-888 与 STRM 媒体源 id 改动）时只有 `docs/LUX-DEVELOPMENT.md` 的两段任务记录落在同一插入点；再
+rebase 到 `a3c0709b`（含 LUX-890）时 `src/storage/catalog.rs`、`src/application/catalog.rs` 的插入点
+又和 LUX-890 的方法重叠。两次都在解决时保留双方内容（任务记录两边都在，代码里两套方法都在）。
+
+实施结果（2026-11-06，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 或修复后的客户端上复测）：
+
+- `cargo test --locked --test emby emby_similar::` 6/6 通过（新增；实现前先以 404/401 失败复现）。
+- `cargo test --locked --lib similar_catalog` 2/2 通过；单 Genre 分支计划为
+  `SEARCH facet USING COVERING INDEX idx_media_item_facets_lookup (kind=? AND name_key=?)`，没有
+  `USE TEMP B-TREE FOR ORDER BY` 或 `SCAN media_items`；列表与总数语句只在有界并集上聚合。
+- `cargo fmt --all -- --check` 通过。
+- `cargo test --locked --test emby` 整组 56/56 通过（`-- --list` 为 56 例：43 例基线 + LUX-888 的 7 例 +
+  本任务 6 例）。
+
+返工（2026-11-06，独立审查后）：
+
+- 原实现把“所有共享至少一个 Genre 的条目”整体 `GROUP BY`/`ORDER BY` 后再 `LIMIT`，并单独跑一次全量
+  `COUNT(DISTINCT mi.id)`；`LIMIT` 只限制返回页，排序前仍枚举全部候选，热门 Genre 下请求成本与库大小
+  成正比。现改为每个源 Genre 先取至多 200 个可见候选（`ORDER BY facet.item_id` 命中索引尾部后
+  `LIMIT`），源 Genre 最多 10 个，聚合、排序与 `TotalRecordCount` 都只作用于 ≤2000 行的并集；不再有
+  全库计数查询。
+- 新增测试：插入 2×(K+50) 条同 Genre 条目，断言页 ≤ Limit、总数 = 2K-1（两个 Genre 共用同一个条目）、
+  第 200 个之后的条目不在池内、两次请求结果一致，以及单分支计划使用 `idx_media_item_facets_lookup`、
+  无 `USE TEMP B-TREE FOR ORDER BY`、无 `SCAN media_items`；另一用例验证 12 个源 Genre 只取前 10 个。
+- 复跑：`cargo test --locked --test emby emby_similar::` 6/6；rebase 到 `8ca9b0aa` 后整组
+  `cargo test --locked --test emby` 56/56、`cargo test --locked --lib similar_catalog` 2/2、fmt、clippy、
+  `check-backend-branches.py` 通过。
+
+LUX-890 合并后的去重与 P3 修正（2026-11-06）：
+
+- 去重：删除 `src/api/emby_similar.rs` 里的 `deserialize_optional_similar_integer`，`Limit`/`ImageTypeLimit`
+  改用 `src/api/emby_catalog.rs` 的共享 `deserialize_optional_i64`；删除镜像常量
+  `EMBY_SIMILAR_MAX_PAGE_LIMIT`，改用共享的 `EMBY_MAX_PAGE_LIMIT`（LUX-890 已改为 `pub(super)`）。
+  默认值（50）与上限（1000）行为不变。
+- P3 测试有效性：电影 Similar 用例此前断言 `"Drama Mystery Movie"` 不在结果里，但该标题从未入库，断言
+  恒真。现在改为真实种子标题 `"Mystery Movie"`，并先请求 `/emby/Items/sim-movie-mystery` 确认条目存在
+  且可见，再断言它因不与源条目共享 Genre 而被排除。
+- P3 空 `EnableImageTypes=`：保持“显式空值按未提供、返回全部图片 tag”的行为（与 LUX-888 的空值规则
+  一致），在 `EmbySimilarQuery` 注释与 `docs/COMPATIBILITY.md` 写明，并新增“`EnableImageTypes=` 空值
+  与不传该参数的响应逐项相同”的断言。
+- rebase：第二次 rebase 到 `a3c0709b`（含 LUX-890）时，`src/storage/catalog.rs` 与
+  `src/application/catalog.rs` 的插入点与 LUX-890 的 OfficialRatings/Tags 方法重叠，按“两边方法都保留”
+  解决；文档冲突同样保留双方内容。
+- 复跑：`cargo test --locked --test emby emby_similar::` 6/6、`cargo test --locked --lib similar` 2/2、
+  `cargo test --locked --test emby emby_filter_metadata::` 3/3、
+  `cargo test --locked --test emby emby_empty_numeric_params::` 7/7、整组 `cargo test --locked --test emby`
+  59/59（`-- --list` 为 59：43 基线 + LUX-888 7 + LUX-890 3 + 本任务 6）、fmt、clippy、
+  `check-backend-branches.py` 通过。
+
+限制与剩余风险：
+
+- 相似度只按 Genre 交集计数，不是 Emby 的完整推荐算法；候选池是“每个 Genre 按 item_id 顺序的前 200 个
+  可见条目”，不是全库全部同 Genre 条目：一个更相似但排在索引第 200 之后的条目不会出现。没有 NFO/facet
+  的条目、没有 Genre 的源条目只能得到空推荐。客户端 UI 是否重新显示推荐区没有在修复后的实例上验证。
+- 请求成本有上界（≤10 个源 Genre × 200 条候选），但每个分支仍需沿该 Genre 的 facet 索引向前扫描直到
+  凑够 200 个可见候选；热门 Genre 下这部分工作随 Genre 规模增长，到达上限后停止。没有 `media_items`
+  全表扫描、没有候选全集排序、没有新增索引或迁移；证据仅为本机 SQLite `arm64`。
+- `TotalRecordCount` 是候选池内去重数量，可能小于库内实际同 Genre 条目数；没有 `StartIndex` 分页
+  （抓包未见客户端使用）；`EnableTotalRecordCount=false` 被忽略。
+- `EnableImageTypes`/`ImageTypeLimit` 的语义按 Emby/Jellyfin 文档推断，未真机逐项比对；其他列表端点
+  仍不实现这两个参数。
+- 本机多 agent 并行编译，单次 `cargo test` 墙钟明显偏长（10–26 分钟）；上述结果只说明测试通过，不代表
+  性能。
+
+#### LUX-891：Emby `GET /embywebsocket`（Yamby 的实时会话与计划任务面板）
+
+背景：Yamby 2.1.0.11 / 2.0.5.5 的「服务器状态/日志」页连接
+`ws(s)://{host}/embywebsocket?api_key={token}&deviceId={deviceId}`，路径固定且**不带** `/emby` 前缀，
+连上后发送 `SessionsStart`（`Data="0,1500,0,true,true"`）与 `ScheduledTasksInfoStart`
+（`Data="1000,1000"`），只处理 `Sessions` 与 `ScheduledTasksInfo` 两类服务端消息。Lux 此前对该路径返回
+404，而客户端的 `onClosed`/`onFailure` 会**无退避立即重连**、没有任何用户提示，于是该页面会形成紧凑的
+重连循环（`docs/reviews/2026-11-06-hills-yamby-static-analysis.md` §9.6）。项目所有者因此明确要求实现
+它，`docs/LUX-DEVELOPMENT.md` §15.3 的 P2 条目"仅在目标客户端确有依赖时实现"就此满足条件。
+
+实现（新增 `src/api/emby_websocket.rs`；改 `src/api/emby.rs`、`src/api/legacy.rs`、`src/api/mod.rs`、
+`src/api/playback.rs`、`src/api/emby_handlers.rs`、`src/main.rs`、`tests/emby/emby_websocket.rs`、
+`tests/emby/main.rs`；依赖只加 axum 的 `ws` 特性与测试用 dev-dependency；无迁移、不改 `/api/v1` 与 `web/`）：
+
+- 路由：在 `EmbyRouteBuilder` 追加 `/embywebsocket`，因此根路径与 `/emby` 前缀同时可用，大小写不敏感由
+  既有请求路径归一化覆盖（`/EmbyWebSocket`、`/EMBY/EmbyWebSocket` 都有测试）；凭据规范化中间件照旧
+  处理 query `api_key` 与标准 Emby token 头。
+- 鉴权顺序：`require_emby_principal` 在调用 `WebSocketUpgrade::on_upgrade` **之前**执行，所以无效/缺失
+  token 与播放票据 token 都在握手阶段得到 `401`，不会先完成 `101` 再关闭。非管理员可以连接，但
+  `ScheduledTasksInfoStart` 被静默忽略。
+- 复用而不是复制：`emby_sessions` 与 `emby_scheduled_tasks` 里构建单条 JSON 的逻辑抽成
+  `emby_session_entries`（`src/api/playback.rs`）与 `emby_scheduled_task_entries`
+  （`src/api/emby_handlers.rs`），HTTP handler 与 WebSocket 共用同一函数，所以推送的 `Data` 与同凭证下
+  `GET /Sessions`、`GET /ScheduledTasks` 的响应逐字节一致，ACL 也只有一份实现。handler 里没有 SQL。
+- 推送循环：每条连接一个任务，`tokio::select!` 同时等待入站帧、下一次推送、心跳与空闲截止时间，
+  不额外 spawn 推送任务。收到 `SessionsStart`/`ScheduledTasksInfoStart` 后解析
+  `Data="初始延迟,间隔,…"`，`Stop` 停止，`KeepAlive` 用同样的消息应答，未知类型与非法 JSON 忽略且不断开。
+- 边界：全局 32 条、每用户 4 条并发连接（`Semaphore` + 每用户计数，超限握手返回 `503` 且不升级）；
+  间隔钳制到 1000–60000 ms（初始延迟 0–60000 ms）；入站帧上限 8 KiB（`max_message_size`/`max_frame_size`，
+  超限由 tungstenite 关闭连接）；25 s 心跳 ping、120 s 无入站帧关闭。
+- 推送限频（返工后）：`StreamState` 为每一路推送（`Sessions`、`ScheduledTasksInfo` 各自独立）保留
+  `last_attempt`，`…Start` 只重置计划，新的 `next_push` 取 `max(now + 初始延迟, last_attempt + min_interval)`，
+  且 `Stop`/`Start` 不丢 `last_attempt`。`record_attempt` 在每次尝试（成功发送或因临时错误跳过）后把
+  `next_push` 推到 `now + interval`（interval 已被钳制到 ≥ `min_interval`）。因此一个 `Data="0,…"` 的
+  小帧无法让服务端立即重建文档。
+- 写边界（第 2 轮返工后）：`WebSocketUpgrade` 设置 `write_buffer_size`（16 KiB，仅容量提示）与
+  `max_write_buffer_size`（4 MiB），所有发送（`KeepAlive` 应答、心跳、数据帧、关闭帧）都经
+  `send_bounded`/`bounded` 包在 10 s 硬超时里；发送超时或失败立即结束循环并释放槽位。4 MiB 的依据：
+  `MAX_LISTED_PLAYBACK_SESSIONS = 500`，实测单条会话条目约 1.3–1.5 KiB，最坏文档约 750 KiB，留五倍余量；
+  序列化后达到或超过上限的文档会被 `payload_fits` 拦下（跳过本次推送 + 限频 warn），不再依赖 tungstenite
+  的 `WriteBufferFull` 去断连。
+- 重校验（返工后）：`revalidated_principal` 透传 `StatusCode`，`revalidation_outcome` 把
+  `401`/`403` 归为关闭（`1008`）、其余（`5xx`/`503`）归为临时失败：跳过本次推送、保留连接、下次计划
+  到期再试，并用每条连接 60 s 限频的 warn 记录（不含 token）。另有与推送无关的 45 s 周期重校验，使
+  没有活动计划（未 `Start` 或已 `…Stop`）的连接也能在被撤销后关闭。
+- 关停：`CoreState` 新增 `EmbyWebsocketShutdown`（`watch` 通道）与连接预算；`src/main.rs` 的
+  `shutdown_signal` 在请求 axum 停机前排空（先发 Close），`serve` 返回后再做一次
+  `shutdown_emby_websocket_connections()`（5 s 有界排空），且这一步在 `serve_result?` **之前**执行，
+  所以 `serve` 出错时同样先排空连接再返回错误。
+- 日志：只记录连接计数与用户 id，不记录 `api_key`、完整 query 或 token。
+
+验收：
+
+- [x] 握手成功并收到 `Sessions` 推送，`Data` 与同凭证 `GET /Sessions` 完全一致，条目含 `NowPlayingItem`
+      与 `PlayState`。
+- [x] 管理员收到 `ScheduledTasksInfo` 且 `Data` 与 `GET /ScheduledTasks` 一致；非管理员发送
+      `ScheduledTasksInfoStart` 后 1.6 s 内收不到任何推送，连接仍可用（随后 `KeepAlive` 有应答）。
+- [x] 无效 token 握手 401；播放票据 token 401；根路径、`/emby` 前缀与大小写混用都能握手。
+- [x] `SessionsStop` 之后停止推送；未知消息类型与非法 JSON 被忽略且不断开。
+- [x] 间隔钳制：请求 1 ms 时按 200 ms 下限推送（测试把下限调小以便观测），请求 100000 ms 时按上限推送。
+- [x] 连接上限：每用户上限与全局上限都在升级前返回 503，且客户端断开后槽位被释放。
+- [x] token 被 `/Sessions/Logout` 撤销后连接以 `1008` 关闭。
+- [x] 空闲超时关闭（`1001`）；64 KiB 入站帧在 8 KiB 上限下被拒绝且服务端继续服务其它连接。
+- [x] 已打开的连接不阻塞优雅关停（服务端 3 s 内停止，连接槽位在排空时释放）。
+- [x] 连续 `…Start` 帧不能突破推送最小间隔：1.2 s 观察窗内相邻推送 ≥ 200 ms（测试下限），条数有上界，
+      且两条流互不影响。
+- [x] 读端停止消费时，写缓冲上限让发送在有界时间内失败，连接被关闭且槽位被释放。
+- [x] 重校验状态码分类：401/403 关闭、500/503 只跳过本次推送并保留连接（单元测试直接覆盖四种状态）。
+- [x] 没有活动推送计划的连接仍会周期重校验，`SessionsStop` 后撤销 token 也会在有界时间内关闭。
+- [x] 现有 HTTP 行为不变：`--test emby` 整组 77/77 通过（含原有的 `GET /Sessions`、
+      `GET /ScheduledTasks` 用例）。
+
+实施结果（2026-11-06，本机 `uname -m` = `arm64`，macOS；未在 NAS/x86_64 验证）：先按 TDD 写集成测试，
+在临时移除路由后确认 15 条用例全部失败（`404` / 握手失败），恢复路由后全部通过。
+
+验证命令与结果：
+
+- `cargo test --locked --test emby emby_websocket::` 23/23（新增模块，第 3 轮返工后）。
+- `cargo test --locked --lib emby_websocket::` 10/10（新增单元测试）。
+- `cargo test --locked --test emby` 82/82（16 个模块，第 3 轮返工后实测，连续 3 次）。
+- `cargo test --locked --test emby -- --list`：82 tests / 16 模块（`docs/TEST-TARGETS.md` 按此更新）。
+- `cargo fmt --all -- --check` 通过。
+- `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。
+- `python3 scripts/check-backend-branches.py` 通过（28 个文件、266 处，未新增 `DatabaseBackend::` 分支）。
+- `cargo build --locked` 通过（依赖只增加 axum 的 `ws` 特性；`cargo tree -i tokio-tungstenite` 显示它只被
+  axum 与 dev-dependency 引用，未引入第二套 WebSocket 实现）。
+
+合并 LUX-889（本地 `test` 头 `ee6f61f2`）后：
+
+- rebase 到最新 `test`；`docs/CHANGELOG.md`、`docs/COMPATIBILITY.md`、`docs/LUX-DEVELOPMENT.md`、
+  `docs/TEST-TARGETS.md` 的冲突按“保留双方内容、文档只追加”解决：LUX-889 的 Similar 记录/任务条目在前，
+  LUX-891 的记录/任务条目紧随其后；`src/api/emby.rs` 与 `src/api/legacy.rs` 的两条路由/模块声明并存
+  （`/Items/{id}/Similar` 与 `/embywebsocket`，无重复注册）。
+- `docs/TEST-TARGETS.md` 按 rebase 后的 `--list` 重新核对：`--test emby` 为 74 例 / 16 个模块
+  （LUX-889 后的 59 例 + 本任务 15 例），第 1、2、5.1 节的 `emby` 行与合计同步更新；同时补上 LUX-889
+  没有单独列出的 `emby_similar`（6 例）一行。
+- 复跑：`cargo test --locked --test emby` 74/74；`cargo fmt --all -- --check` 通过；
+  `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过；
+  `python3 scripts/check-backend-branches.py` 通过；`cargo build --locked` 通过。
+- 整组第一次运行时 `emby_incremental_refresh::emby_media_updated_queues_incremental_scan_for_absolute_path`
+  失败一次（与本任务代码无关的既有用例，`/Library/Media/Updated` 路径）；单独运行与随后整组复跑都通过，
+  判定为高负载下的偶发抖动，未改动该用例。
+
+真机尝试（2026-11-06，未完成，结论仍是“未真机验证”）：
+
+- 按抓包任务 §1 的做法，在本 worktree 起独立实例（`LUX_CONFIG_DIR=.tmp/device-lux/config`，
+  `LUX_HTTP_ADDR=127.0.0.1:8097`，独立 SQLite 与媒体目录），用 `adb reverse tcp:8097 tcp:8097` 让手机
+  访问；在 Yamby 2.1.0.11 里临时新增该服务器、用临时账号登录并进入媒体库，确认实例可达（登录、库列表、
+  条目都正常）。
+- 打开「管理服务器 → 系统日志」时，客户端只请求了 `/emby/System/Logs/embyserver.txt/Lines`（Lux 没有
+  该端点），**没有**发起 `/embywebsocket`：以 `RUST_LOG=info,luxd=debug` 复跑的日志里没有任何
+  `embywebsocket` 请求或握手，也没有新的长连接。说明 WebSocket 不在日志页启动。
+- 创建它的「服务器状态」Compose 页面（静态分析里的 `hc/AbstractC2788.m6033`）在 Yamby 2.1.0.11 的
+  UI 里没有在时间预算内找到入口（服务器卡菜单只有显示名称/编辑/自定义图标/用户名/上次播放时间/备选
+  地址/修改密码/删除，「管理服务器」页只有重启与系统日志），因此**握手没有被客户端实际发起过**。
+- 清理：删除临时服务器条目（服务器列表恢复为原来的一条）、`adb reverse --remove tcp:8097`、停止实例并
+  删除 `.tmp/device-lux`；未清应用数据、未安装/卸载、未 root、未装证书、未改系统设置，结束状态与开始时
+  一致（锁屏 `mWakefulness=Dozing`）。临时账号只存在于已删除的实例里，凭据没有写入任何文件或提交。
+
+限制与剩余风险：
+
+- **未做真机验证**：静态分析确认了请求形态、两条客户端消息与"失败即无退避重连"，响应形状按 Emby 约定
+  推断；抓包任务里 Yamby 没有进入该页面，本次也没有在手机上复测。部署后需在 Yamby「服务器状态」页
+  确认握手、面板数据、离开页面后的断开与无重连风暴。
+- 只实现 `Sessions` 与 `ScheduledTasksInfo` 两类推送；`ForceKeepAlive`、`UserDataChanged`、
+  `LibraryChanged` 等不推送（客户端对这些类型本就忽略）。若将来某个客户端依赖它们，需要另开任务。
+- 推送是"按客户端要求的间隔轮询现有应用服务"，不是事件驱动：最小间隔 1 s，因此最多 1 s 的额外延迟；
+  每次推送还会做一次 token 校验（一次或两次数据库读），在 32 条连接、1 s 间隔的上限下属于可接受量级。
+- `ScheduledTasksInfo` 只有一个 `RefreshMediaLibrary` 任务项（与 HTTP 端点一致），不是 Emby 的完整任务
+  列表；`Sessions` 条目来自 Lux 的现有投影，没有为 WebSocket 增加字段。
+- 空闲超时依赖客户端回应心跳 ping（Yamby 用 OkHttp，读取线程会自动回 pong）；如果某个客户端完全不读
+  连接，120 s 后会被关闭——这是有意的资源保护。
+
+返工（独立审查后，2026-11-06）：
+
+审查结论 1 个 P1、2 个 P2、2 个 P3 全部成立，逐条先写失败测试再修（返工前的失败记录：P1 相邻推送间隔
+实测 7 µs、P2 读端停读后连接一直不关、P3 无推送计划时撤销 token 后 5 s 仍未关闭）。
+
+1. **P1 重复 `…Start` 绕过最小推送间隔**：`StreamSchedule` 换成 `StreamState`（`plan` + 持久化的
+   `last_attempt`），`start()` 取 `max(now + initial, last_attempt + min_interval)`，`record_attempt()`
+   在每次尝试后按 `now + interval` 重排；`Stop`/`Start` 保留 `last_attempt`。两条流各自独立。测试改成
+   客户端边发边读（否则缓冲帧的“到达时间”被记成读取时间，测量无意义），连发 10 个 `Data="0,1000"` 的
+   `SessionsStart`，断言相邻推送 ≥ 150 ms（下限 200 ms 留抖动余量）、1.2 s 内 ≤ 8 条，并断言
+   `ScheduledTasksInfo` 首次推送不受会话流影响。原先“从 Start 起测量”的上限断言已改为测量两次**连续
+   推送**之间的间隔。
+2. **P2 写阻塞使心跳/空闲超时失效**：`WebSocketUpgrade` 设置 `write_buffer_size` 16 KiB 与
+   `max_write_buffer_size` 64 KiB（选这两个值：一帧 `Sessions` 文档最大约 500 条会话、远小于 64 KiB，
+   而读端停读时 64 KiB 上限把积压压到几十 KB 量级就会失败）；所有发送（`KeepAlive` 应答、心跳、数据帧、
+   关闭帧）改走 `send_bounded`/`bounded`，硬超时 10 s（远小于 120 s 空闲超时）。测试用 10 个播放会话
+   造出约 13 KiB 的 `Sessions` 文档，把写缓冲压到 4 KiB，客户端刻意不读，断言连接在有界时间内被关闭且
+   槽位释放；超时包装本身另有单元测试（挂起的发送在 20 ms 后返回失败）。
+3. **P2 重校验失败一律当作 token 撤销**：`revalidated_principal` 改为透传 `StatusCode`，
+   `revalidation_outcome` 把 401/403 归为关闭（`1008`）、其余归为临时失败（跳过本次推送、保留连接、
+   下次计划再试），并用每条连接 60 s 限频的 warn 记录（不含 token）。单元测试覆盖 401/403/500/503；
+   推送路径与周期重校验共用同一分类，避免两处判断分叉。
+4. **P3 无推送计划的连接永不重校验**：新增与推送无关的 `revalidate_interval`（默认 45 s），复用同一个
+   循环与心跳时钟；失败分类同上。测试在 `SessionsStop` 后撤销 token，断言连接在约 1 s 内以 `1008` 关闭。
+5. **P3 `serve` 返回错误时跳过 WebSocket 排空**：把 `shutdown_emby_websocket_connections()` 移到
+   `serve_result?` **之前**，正常路径的 worker/数据库关闭顺序不变。该顺序属于 `main.rs` 的启动/停机
+   流程，没有直接的单测：验证方式是代码审阅（3 行顺序调整）+ 既有的 `--test shutdown`（SIGTERM 后进程
+   在超时内退出）+ 本模块的关停集成测试（打开连接时服务端 3 s 内停止且槽位排空）。
+
+返工后复跑：`cargo test --locked --test emby emby_websocket::` 18/18、`cargo test --locked --lib
+emby_websocket::` 6/6、`cargo test --locked --test emby` 77/77、
+`LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test shutdown` 2/2、
+`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+`python3 scripts/check-backend-branches.py` 均通过。
+
+返工后仍存在的限制：推送限频约束的是“尝试”，所以临时错误（5xx）下客户端连发 `…Start` 也只能按
+`min_interval` 重试；写超时只有在写缓冲或套接字真正阻塞时才会触发，健康连接不会因此被关闭；空转连接
+（无推送计划）每 45 s 产生一次 token 校验查询，属于有意的成本/安全权衡。
+
+### 第 2 轮返工（独立审查后，2026-11-06）
+
+审查结论 1 个 P1、3 个 P3 全部成立，逐条先写失败测试再修。
+
+1. **P1 写缓冲上限小于合法文档**：`MAX_LISTED_PLAYBACK_SESSIONS = 500`、单条约 1.3–1.5 KiB，最坏
+   `Sessions` 文档约 750 KiB，而上一轮的上限只有 64 KiB。tungstenite 按“整帧长度 + 已缓冲字节 >
+   `max_write_buffer_size`”判定，所以这不是读端背压而是**单条消息过大必然失败**；失败后连 Close 帧都发不
+   出去，Yamby 无退避重连，且任意登录用户都能用不同 `PlaySessionId` 抬高会话数，稳定打断管理员的通道。
+   - (a) 上限提到 4 MiB（约五倍余量），初始容量仍是 16 KiB，并把理由写进常量注释与文档；
+   - (b) 不变量：100 条会话（约 130 KiB，约为最坏情况的 1/5）在生产默认限制下必须完整推送（红测试：
+     把上限改回 64 KiB 时该用例失败 `received 0 sessions`/连接被重置），断言数组长度 100 且连接仍可用；
+   - (c) 序列化后 `payload.len() >= max_write_buffer_bytes` 时跳过本次推送并限频 warn（不含凭据），连接
+     保留；红测试：上限 4 KiB + 10 条会话时旧实现直接 `WriteBufferFull` 断连，修复后连接保持可用且不推
+     送半截文档；
+   - (d) 重写“停读客户端”用例：文档（约 13 KiB）远小于 4 MiB 上限，所以尺寸检查不可能触发；客户端用
+     `TcpSocket::set_recv_buffer_size(1024)` 缩小接收窗口且不读，断言 100 ms 时槽位仍被占用（说明不是首帧
+     就被尺寸检查打断）、随后在 `send_timeout`（300 ms）后释放槽位。该用例在上一轮实现上同样通过（上一轮
+     已有发送超时），它现在证明的是**超时**而不是尺寸；尺寸路径由 (b)(c) 覆盖。
+2. **P3 播放票据用例假阳性**：旧断言用的 `luxPlaybackSignature=deadbeef` 不是播放票据，`is_playback_token`
+   只认前缀 `luxpb_`，那个 401 来自“未知 token”。改为用 `EmbyAuthService::issue_playback_token` **真实
+   签发**的 `luxpb_{item}_{random}`，并先断言该票据在播放白名单路由 `GET /emby/Items/{id}` 上返回 200
+   （证明它是真实且按路由限定的凭据），再断言 `/embywebsocket` 握手 401。`docs/API.md` 与
+   `docs/COMPATIBILITY.md` 里写成 `luxPlayback…` 的描述同步改成 `luxpb_…`。
+3. **P3 `biased` select 让入站帧饿死定时分支**：旧实现在 `select!` 里把 `socket.recv()` 排在
+   `sleep_until` 之前，只要入站帧持续就绪，定时分支就永远不被轮询，推送、心跳和周期重校验全部停摆，
+   被撤销的 token 在该连接上一直有效。现在心跳、空闲检查、周期重校验和两路推送都在**每轮循环顶部**先
+   处理，`select!` 只负责等待事件（`Wake::Timer` 只是回到循环顶部），入站帧不再影响定时工作。
+   测试：客户端每 5 ms 发一个 `KeepAlive` 持续 1 s，同时要求按计划收到 ≥3 条 `Sessions`，并在撤销 token
+   后以 `1008` 关闭。**诚实说明**：该用例在修复前的实现上也能通过——回环上 `recv()` 很难长期保持就绪，
+   无法稳定复现“永远不被选中”，因此它的作用是守住要求的结果（洪水下推送与撤销仍生效），而修复的依据是
+   代码结构（定时工作已完全不依赖 `select!` 的选择顺序）。
+4. **P3 `max_write_buffer_bytes == write_buffer_bytes` 会在升级任务里 panic**：tungstenite 的
+   `WebSocketConfig::assert_valid` 要求严格大于，`false` 时在 `101` 之后的连接任务里 `assert!`。由于
+   `EmbyWebsocketLimits` 与 `with_emby_websocket_limits` 是 `pub`，这属于可达的 panic。现在
+   `normalized()` 把初始容量钳到 `[1 KiB, 1 MiB]`，再令 `max = max(max, write.saturating_add(1))`，
+   所以相等、更小和 `usize::MAX` 三种输入都满足严格不等式（单元测试覆盖三种组合）。端到端用例用相等
+   （1024/1024）的配置完成握手并做一次 `KeepAlive` 往返；修复前该用例在升级任务里 panic（红测试观察到
+   `max_write_buffer_size must be greater than write_buffer_size`）。
+
+第 2 轮返工后复跑：`cargo test --locked --test emby emby_websocket::` 22/22、`cargo test --locked --lib
+emby_websocket::` 9/9、`cargo test --locked --test emby` 81/81、
+`LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test shutdown` 2/2、
+`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+`python3 scripts/check-backend-branches.py`、`cargo build --locked` 全部通过。
+
+### 第 3 轮返工（独立审查后，2026-11-06，最后一轮）
+
+三条 P3 全部成立，逐条先写失败测试再修；另对已知的 `--test emby` 偶发失败做了根因调查（见第 4 条）。
+
+1. **`payload_fits` 未计入帧头**：旧比较只看 `payload.len() < max_write_buffer_bytes`，而 tungstenite 计的是
+   “整帧长度（payload + 帧头）+ 已缓冲字节”，所以 payload 落在 `[max-10, max-1]` 时会通过检查、`start_send`
+   却返回 `WriteBufferFull`，走 `break None` 断连，与“跳过本次推送、连接保留”的承诺不符。新增
+   `EMBY_WEBSOCKET_FRAME_HEADER_BYTES = 16`（服务端到客户端的帧头 2/4/10 字节，16 覆盖最大帧头并留出一个
+   已缓冲控制帧的余量），比较改为 `payload.len() + 16 < max`（饱和加法，避免 `usize::MAX` 覆盖时溢出）。
+   单测覆盖边界：`max-17` 发送、`max-16`/`max-1`/`max` 跳过（红测试：撤掉余量后 `max-16` 断言失败）。
+2. **公开限额覆盖仍可能 panic**：`Semaphore::new(max_connections)` 在超过 `Semaphore::MAX_PERMITS` 时 panic；
+   `Instant::now() + Duration` 在 `Duration::MAX` 这类覆盖下溢出 panic（发生在 `101` 之后的连接任务里）。
+   `normalized()` 现在把 `max_connections` 钳到 `EMBY_WEBSOCKET_MAX_CONNECTIONS_LIMIT = 1024`（默认 32；
+   一千条连接已超出任何现实部署的 fd/缓冲预算，`MAX_PERMITS` 只是硬天花板），`max_connections_per_user`
+   同样钳到 1024，所有时长字段（`min_interval`、`max_interval`、`heartbeat_interval`、`idle_timeout`、
+   `send_timeout`、`revalidate_interval`、`auth_warn_interval`）钳到
+   `EMBY_WEBSOCKET_MAX_DURATION = 24 h`（默认空闲超时 120 s，24 h 已远超本端点会保持的任何状态）。
+   单测用 `usize::MAX`/`Duration::MAX` 覆盖全部字段，并在钳制后构造 `EmbyWebsocketConnections`、计算
+   各截止时间以证明不会 panic；端到端用例用同一组极限覆盖完成握手并做一次 `KeepAlive` 往返
+   （红测试：撤掉钳制后该用例在 `batch_semaphore.rs` 的 `Semaphore::new` 处 panic）。
+3. **洪水用例时间窗余量过窄**：`min_interval = 200 ms`、`max_interval = 400 ms` 时推送约在 0/400/800 ms，
+   而窗口只有 900 ms，第三条稍晚一点就失败。窗口放宽到 1800 ms（约 3 个间隔 + 余量），断言条件不变。
+   顺带复核了本文件其它固定窗口：`expect_no_message` 的 1.3 s/1.6 s/400 ms 都是“应无消息”的负向断言，
+   窗口越长越安全；`closes_a_stalled_reader` 的 100 ms 检查相对 300 ms 超时留有 200 ms 余量；其余用例
+   用逐帧读取或 5–10 s 的读超时，没有第二个“刚好够用”的正向窗口。
+4. **`emby_incremental_refresh::emby_media_updated_queues_incremental_scan_for_absolute_path` 偶发失败
+   （调查，未改生产代码）**：
+   - 证据：写了一个临时探针（未提交）复刻该用例的请求，在 `202` 之后连续采样 `scan_jobs.status` 与
+     `scan_job_paths` 行数：`attempt=0` 为 `PENDING / paths=1`，约 50 ms 后的 `attempt=1` 已是
+     `COMPLETED / paths=0`，且 `total_count` 始终为 1。
+   - 机制：`/Library/Media/Updated` 的 handler 在返回 `202` **之前**就 `spawn_emby_scan_job` 起了后台扫描
+     工作线程；该线程完成作业后走 `postprocessing.rs` 的 `clear_scan_job_paths`（增量扫描的路径表是队列而非
+     历史）。用例在收到 `202` 之后才 `SELECT ... FROM scan_job_paths LIMIT 1`，于是高负载下（整组 16 线程
+     并行）工作线程先完成时该查询得到 `RowNotFound`。
+   - 结论：**测试侧竞态**，与 WebSocket 无关；`scan_jobs` 行在完成后保留（`job_type`/`total_count` 可靠），
+     只有路径行是瞬态的。为此只改测试：持久断言改为 `job_type = INCREMENTAL_SCAN` 且 `total_count = 1`
+     （入队时写入、完成时不清零），相对路径改为“仍在队列中时才断言为 `NewMovie`”，不再与工作线程抢。
+   - 复现情况：48 次并行单测运行与多次整组运行都未能直接抓到失败（窗口只有几十毫秒），因此上面的判定基于
+     探针的确定性证据，而不是一次抓到的 panic 文本。
+
+第 3 轮返工后复跑：`emby_websocket::` 23/23、`--lib emby_websocket::` 10/10、`--test emby` 连续 3 次
+82/82、`LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test shutdown` 2/2、
+`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+`python3 scripts/check-backend-branches.py`、`cargo build --locked` 全部通过。
+
+#### LUX-892：ADR-054 —— Lux Web 实时通道从 SSE 迁移到 WebSocket（只写文档）
+
+背景：`GET /api/v1/events` 与 `GET /api/v1/admin/events` 共用 64 条连接预算（`src/api/legacy.rs:1369`），
+管理页每标签页占 2 条，约 32 个管理标签页即可让所有用户 `429` 并静默回落到 30 秒轮询；管理端从不暴露
+连接状态，兜底轮询从未关闭（`docs/WEB-POLLING-AUDIT.md:27,115`）。盘点与逐条处理见
+`docs/reviews/2026-11-06-sse-to-websocket-review.md`。项目所有者于 2026-11-06 决定全面迁移到 WebSocket、
+单端点 `GET /api/v1/ws`、硬切删除两条 SSE、不新增 `LUX_ALLOWED_ORIGINS`、`/embywebsocket` 保留并与新
+端点共用连接基础设施。
+
+范围：只更新文档。新增 `docs/decisions/054-web-realtime-websocket.md`，冻结端点、信封、Origin 策略、
+握手认证、预算、关停与重连、反代要求、与 `/embywebsocket` 的关系、任务拆分与回退；对 ADR-030、ADR-049、
+ADR-017 中受影响的三处加“已被 ADR-054 部分取代”的状态标注（正文不动）；追加本任务与后续 LUX-893–898
+的条目。不改 `src/`、`web/`、`tests/`、`Cargo.*`，`docs/API.md` 不写成“已实现”（WS 契约由 LUX-894 写入），
+`docs/CHANGELOG.md` 不写条目（本任务不改行为）。
+
+验收：
+
+- [x] 所有者六条决定在 ADR 中原样列出并逐条展开为可实施合同（D1–D15），未被改写或弱化。
+- [x] Origin 策略写死“只比较 `Origin` 的 host[:port] 与 `Host`，不比较 scheme”，并说明
+      `X-Forwarded-Proto` 等转发头不参与该判断；盘点报告里“scheme 取 `X-Forwarded-Proto`”的建议明确作废。
+- [x] ADR 中每个数值（连接预算、每用户上限、帧上限、心跳/空闲/重校验间隔、退避区间）都给出代码或文档
+      来源，派生值标注推导过程，估算值标注“待 LUX-894 实测调整”。
+- [x] 已评估并否决的替代方案覆盖：保留 SSE 仅删除轮询兜底、两端点、同路径按 Upgrade 分流、双轨、
+      `LUX_ALLOWED_ORIGINS` 白名单，另记客户端订阅消息、query 凭据、断线续传、共享 API Key 四条。
+- [x] `docs/LUX-DEVELOPMENT.md` 追加 LUX-893–898（范围、依赖、验收、预计改动文件），LUX-898 标注为
+      独立任务。
+- [x] `git diff` 只含 `docs/` 下的文件；`git diff --check` 通过。
+
+预计文件：`docs/decisions/054-web-realtime-websocket.md`（新）、`docs/decisions/030-domain-module-boundaries.md`、
+`docs/decisions/049-response-revalidation-and-compression.md`、`docs/decisions/017-webhook-notification-delivery.md`、
+`docs/LUX-DEVELOPMENT.md`。
+
+验证：人工核对 ADR 与六条所有者决定的逐条对应、三个标注的指向（ADR-054 D1/D2/D9）、以及所有数字的来源
+（`src/api/legacy.rs:1369`、`src/api/admin/admin_logs_events.rs:426,438,499,521`、`web/src/app/App.tsx:141`、
+`LuxShell.tsx:48`、`AdminLayout.tsx:32`、`useAdminEvents.ts:99-103`、`useUserEvents.ts:96-133`、
+`src/api/routes.rs:26,103-120`、`src/api/users.rs:2813,3096-3114`、`src/api/admin/admin_common.rs:281-296`）；
+`grep -n "X-Forwarded-Proto" docs/decisions/054-*.md` 只有“禁止使用”的表述；`git diff --check` 通过。
+
+实施结果（2026-11-06）：ADR-054 已写入，状态“已采纳（项目所有者 2026-11-06 决定）”，所有者六条决定原样
+保留；`GET /api/v1/ws` 的计划契约、信封示例、Origin 闸门、握手认证、双预算（用户 128 / 管理 64，每用户
+16 / 8）、关停与重连约束、nginx `Upgrade`/`Connection` 要求、与 `/embywebsocket` 的共享边界、任务拆分与
+回退均已记录。ADR-030（英文状态注记）、ADR-049、ADR-017 各加一处最小标注，指向 ADR-054 的具体条款，正文
+未改。本任务只改文档，未运行 Rust 或 Web 测试；`cargo`、`pnpm` 均未执行，提交内容为 `docs/` 五个文件。
+
+#### LUX-893：抽取共享 WebSocket 基础设施（已完成）
+
+状态：已完成（2026-11-06）。依赖：LUX-891 已合并到 `test`（基线 `536986ba`）。
+
+范围：把 LUX-891 在 `src/api/emby_websocket.rs` 中已经打磨过的通用部分抽到
+`src/api/websocket/{mod,budget,shutdown,send}.rs`：全局与每用户连接计数（`EmbyWebsocketConnections` /
+`Permit`）、关停 `watch` 与有界排空（`EmbyWebsocketShutdown` / `wait_until_idle`）、有界写与 close 帧构造
+（`bounded` / `send_bounded` / `payload_fits` / `utf8_close` 与 close code）、周期重校验的节奏常量、
+可注入的 limits 结构（`EmbyWebsocketLimits` 通用化，测试可缩小上限）。
+`emby_websocket.rs` 改为引用共享模块，只保留 Emby 专有的 `StreamState` 唤醒、`revalidated_principal`、
+`handle_client_message` 与消息处理。纯 move，零行为变更：不新增端点、不改协议、不改配置、不改关停顺序。
+
+依赖：LUX-891 已合并。先合并再抽取，可避免在 `src/api/legacy.rs` 的 `CoreState` 字段与 builder、
+`src/api/mod.rs` 的 `pub use`、`src/main.rs` 的两处关停调用、`Cargo.toml` 的同一区域反复冲突；LUX-891 的
+测试同时成为纯 move 的回归网。
+
+验收：
+
+- [x] LUX-891 的集成与单测全部保持通过（合并后按实际计数记录：`--test emby emby_websocket::` 23 例、
+      `--lib` 里 websocket 相关 10 例；其中 6 例随共享代码移到 `api::websocket::*`，断言逐字未改，见实施结果），
+      测试断言不改、未增删任何 WebSocket 测试。
+- [x] `cargo clippy --locked --all-targets --all-features -- -D warnings`、`cargo fmt --all -- --check`
+      通过；`cargo build --locked` 通过。
+- [x] 仓库中不存在第二份计数/关停/写边界实现：`grep -rn "wait_until_idle\|payload_fits\|close_code" src/`
+      只命中 `src/api/websocket/*` 与其调用点（`src/api/emby_websocket.rs`、`src/api/legacy.rs:787`）。
+- [x] 关停顺序、close code 取值、预算计数语义与 LUX-891 逐项相同；`/embywebsocket` 行为无变化，
+      Emby 仍是 32 全局 / 4 每用户，`1000`/`1001`/`1008` 常量随模块移动。
+
+预计改动文件：新增 `src/api/websocket/mod.rs`、`budget.rs`、`shutdown.rs`、`send.rs`；修改
+`src/api/emby_websocket.rs`、`src/api/mod.rs`、`src/api/legacy.rs`、`src/main.rs`、`Cargo.toml`（如需调整
+feature）、`docs/TEST-TARGETS.md`（若测试过滤路径变化）。
+
+实施结果（2026-11-06）：新模块 `src/api/websocket/{mod,budget,shutdown,send}.rs`，`mod.rs` 声明三个子模块
+并在那里集中导出；`src/api/mod.rs` 只加一行 `mod websocket;`（`api` 私有，子模块 `emby_websocket` 直接可见）。
+
+被移动的项（旧位置 → 新位置；均只改名，逻辑/常量值/日志文本不变）：
+
+| 旧（`src/api/emby_websocket.rs`） | 新 |
+|---|---|
+| `EmbyWebsocketConnections` / `EmbyWebsocketConnectionState` / `EmbyWebsocketPermit`（`try_acquire`、`limits`、`wait_until_idle`、`Drop` 释放） | `budget.rs`：`WebsocketConnections` / `WebsocketConnectionState` / `WebsocketPermit` |
+| `EmbyWebsocketShutdown`（`signal` / `subscribe`） | `shutdown.rs`：`WebsocketShutdown` |
+| `bounded` / `send_bounded` / `payload_fits` / `utf8_close`、`EMBY_WEBSOCKET_FRAME_HEADER_BYTES`、`CLOSE_NORMAL`/`CLOSE_GOING_AWAY`/`CLOSE_POLICY_VIOLATION` | `send.rs`：同名函数、`WEBSOCKET_FRAME_HEADER_BYTES`、同名 close code 常量（改为 `pub(crate)`） |
+| `EmbyWebsocketLimits`、`Default`、`normalized()`、12 个默认常量、`_CONNECTIONS_LIMIT`/`_MAX_DURATION`/`_WRITE_BUFFER_BYTES_LIMIT` | `mod.rs`：`WebsocketLimits`、`Default`、`normalized()`、`WEBSOCKET_DEFAULT_*`、`WEBSOCKET_MAX_*` |
+| 6 个单测（`bounded_send_*` 2 例、写缓冲/上限/文档上限/极限覆盖 4 例） | `api::websocket::send::tests`（3 例）、`api::websocket::tests`（3 例） |
+
+留在 `emby_websocket.rs`：`StreamState`/`StreamPlan`/`StreamTiming` 推送计划、`handle_client_message`、
+`revalidated_principal`、`ConnectionContext`、`run_connection`、`next_wake`、`warn_*`、`emby_session_entries`/
+`emby_scheduled_task_entries` 调用与消息格式（`KEEP_ALIVE_REPLY`、`Sessions`/`ScheduledTasksInfo`）、
+`EMBY_WEBSOCKET_SHUTDOWN_DRAIN_TIMEOUT`（Emby 关停的排空上限，`legacy.rs` 直接引用）。
+
+偏离“纯移动”的地方（逐条）：① `EmbyWebsocketLimits` 改为 `pub use crate::api::websocket::WebsocketLimits as
+EmbyWebsocketLimits;`——`Default` 每个类型只能有一个实现，而集成测试用扁平结构体字面量构造该类型，只有类型
+别名能同时满足“API 不变”和“默认值不变”；因此 12 个默认值（含 Emby 协议的 1 s/60 s 间隔钳制、8 KiB 入站、
+16 KiB/4 MiB 写缓冲）随类型移到 `mod.rs`，值一个未改。② `normalized()` 由 `fn` 改为 `pub(crate) fn`（`budget.rs`
+调用）。③ 共享常量的文档注释把“`/embywebsocket` 的连接”改成中性表述（“one budget instance”“these
+endpoints”“by default”），语义与数值不变，因为文档现在服务两个端点。④ `send_bounded`/`payload_fits` 的换行由
+rustfmt 按新标识符长度重排（`payload_fits` 合并为一行），无逻辑变化。
+
+`src/main.rs` 与 `Cargo.*` 未改动；`docs/TEST-TARGETS.md` 的数字未变（集成测试模块名与 23 例不变）。
+
+验证：`cargo test --locked --test emby emby_websocket::` 23/23；`cargo test --locked --lib emby_websocket::` 4/4、
+`cargo test --locked --lib websocket::` 10/10（两者合计即 LUX-891 的 10 例，过滤器 `websocket::` 同时命中
+`api::websocket::*` 与 `api::legacy::emby_websocket::*`）；`cargo test --locked --test emby` 82/82 连续 2 次；
+`LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test shutdown` 2/2；`cargo fmt --all -- --check`、
+`cargo clippy --locked --all-targets --all-features -- -D warnings`、`python3 scripts/check-backend-branches.py`、
+`cargo build --locked` 通过。移动块的逐段核对方式：把基线 `src/api/emby_websocket.rs` 的每个被删块做纯改名后与
+新模块的可执行代码逐字符比对（忽略注释、换行与 `pub(crate)`），14 个块全部命中，缺 0。
+
+#### LUX-894：后端 `GET /api/v1/ws`（已完成）
+
+状态：已完成（2026-11-06）。依赖：LUX-893。必须与 LUX-896 同批合入。真实浏览器的协议级 pong 验证与真实部署
+的并发观测两项未执行，见下方验收。
+
+范围：新增 `src/api/lux_websocket.rs`，注册 `GET /api/v1/ws`：Upgrade 之前的 Origin 闸门（ADR-054 D5：
+只比较 `Origin` 的 host[:port] 与 `Host`、不比较 scheme、`Sec-Fetch-Site: cross-site` 拒绝、缺失 `Origin`
+时 cookie 拒绝而客户端令牌放行）；握手前认证（复用 `require_web_user` / `require_admin(.., false)`，
+禁止 query 凭据，不要求也不接受 CSRF）；按主体给出 `user` 与 `admin` 频道，客户端不发订阅消息；用户 128 /
+管理 64 两个预算实例与每用户 16 / 8 上限，超限在 Upgrade 前 `429` + `Retry-After: 30`；关停 `1001` 与
+5 s 有界排空（`EMBY_WEBSOCKET_SHUTDOWN_DRAIN_TIMEOUT`）；25 s 协议级 ping / 120 s 空闲、4 KiB 上限、
+二进制 `1003`、超限 `1009`、未知 `type` 忽略；45 s 周期重校验，降权只停投 admin 帧、会话撤销 `1008`。同步把 WS 契约写入 `docs/API.md`（含 Origin/CSRF 说明），并按实测
+结果回填 ADR-054 预算段与心跳段。
+
+依赖：LUX-893（共享预算/关停/写边界/重校验）。LUX-895 可并行开发，但发布必须同版本。
+
+验收：
+
+- [x] 新增 `tests/admin/lux_websocket.rs`（并入 `--test admin`，30 例）：未认证 401；无管理权限时只投
+      `user` 帧；跨源 400；`Origin` 缺失 + cookie 401；`Origin` 缺失 + 客户端令牌通过；`Sec-Fetch-Site:
+      cross-site` 拒绝；预算超限 429 + `Retry-After: 30`；关停 1001；会话撤销 1008；>4 KiB 1009；二进制
+      1003；未知 `type` 忽略且不关连接。另覆盖 426、`null`/非法/多值 Origin、host 大小写与默认端口归一化、
+      转发头不参与判断、被设备/客户端规则拒绝 403、令牌认证、`progress` 的 `itemId`、每用户与全局预算
+      各自的 429 与释放、管理/用户预算分离、协议级 ping 保活、空闲 1001、重校验 5xx 不断连。
+      第 2 轮审查返工又补两例：45 s 重校验不写 `user_devices`、`drain_lux_websocket_connections`
+      在连接超出排空时间时返回 `false`。
+- [x] 降权用例：admin 帧停止、user 帧继续、连接不关闭；恢复权限后 admin 帧恢复。
+- [ ] 真实浏览器验证：协议级 pong 会重置 120 s 空闲计时（否则每条连接都会被误杀）；JS 客户端不依赖
+      应用层 ping 判活。**未执行**：本任务用真实 socket 的 `tokio-tungstenite` 客户端覆盖了同一语义
+      （它像浏览器一样在读取时自动回 pong，`protocol_pings_keep_a_silent_connection_alive` 与
+      `an_idle_connection_is_closed_with_1001_and_the_slot_is_released` 两例），但没有驱动真实浏览器，
+      真实浏览器验收留给 LUX-895 前后的联调补做。
+- [ ] 记录一次真实部署的并发观测（峰值连接数、每用户峰值、429 次数），写入 ADR-054「资源与预算」；
+      实测与假设偏差超过 2 倍时按同一推导重算。**未执行**：开发机没有真实部署，也没有可代表部署的并发
+      连接数据；ADR-054 的落地记录已如实标注该项仍待补，数值未因实测调整。
+- [x] `cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets
+      --all-features -- -D warnings`、`cargo test --locked --test admin` 通过。
+
+预计改动文件：新增 `src/api/lux_websocket.rs`、`tests/admin/lux_websocket.rs`；修改 `src/api/legacy.rs`
+（`CoreState` 的预算与关停字段、builder）、`src/api/mod.rs`、`src/api/routes.rs`、`src/main.rs`、
+`tests/admin/main.rs`、`docs/API.md`、`docs/decisions/054-web-realtime-websocket.md`（回填实测值）、
+`docs/TEST-TARGETS.md`、`docs/CHANGELOG.md`、`docs/LUX-DEVELOPMENT.md`。
+
+实施结果（2026-11-06）：新增 `src/api/lux_websocket.rs`（约 1100 行含单测）与 `tests/admin/lux_websocket.rs`
+（30 例）；`src/api/websocket/mod.rs` 增 5 个 Lux 常量（用户 128/16、管理 64/8、4 KiB 契约上限）与 64 KiB
+传输上限；`src/api/websocket/shutdown.rs` 增 `is_signalled()`；`src/api/legacy.rs` 增
+`lux_websocket_connections` 与共享的（改名后）`websocket_shutdown` 字段、`with_lux_websocket_limits`、
+`shutdown_websocket_connections`、`drain_lux_websocket_connections`；`src/api/mod.rs` 导出
+`LuxWebsocketLimits` 与 `WebsocketLimits`；`src/api/routes.rs` 在 ready 树挂载 `GET /api/v1/ws`（不进 Emby
+路由构建器）；`src/main.rs` 的关停链改为 `signal_websocket_shutdown()` 与 `shutdown_websocket_connections()`
+（同一信号、5 s 有界排空）；`tests/admin/main.rs` 追加 `mod lux_websocket;`。
+
+与计划或 ADR 字面表述不同、需要记住的六点：
+
+1. **管理频道由主体的 `can_manage_server` 推导，没有额外调用 `require_admin(.., false)`**。ADR-054 D7 要求
+   频道只从服务端主体推导；cookie 会话下二者完全等价（`require_admin` 的会话分支就是 `can_manage_server`
+   检查且 `require_csrf=false`），而 `require_admin` 的客户端令牌分支会一律拒绝令牌，与 D7 冲突。令牌主体
+   本身能管理服务器时也会收到 `admin` 帧，但这不增加权限：帧内没有数据，而该令牌仍被管理员 JSON API 拒绝。
+2. **缺失 Origin + cookie 返回 401，有效但不匹配的 Origin 与 `Sec-Fetch-Site: cross-site` 返回 400**。401 是
+   本任务验收条目的要求（`Origin` 缺失 + cookie 401），ADR-054 只把 400 绑定到“Origin 不允许”；差别已写入
+   ADR-054 的落地记录，拒绝原因仍按 `origin-missing` / `origin-mismatch` / `sec-fetch-site` 分类记日志且不记
+   头的原值。
+3. **4 KiB 契约上限由 handler 执行**：tungstenite 的 `max_message_size` 被触发时不会写 close 帧，客户端只会
+   看到 `1006`；因此传输层上限设 64 KiB，超 4 KiB 的消息由 handler 自行发 `1009` 关闭。超过 64 KiB 的消息是
+   协议违规，连接直接断开（无 close 帧），已写入 ADR 落地记录。
+4. **重校验只按 45 s 定时器执行，不按帧**（ADR-054 的显式取舍）。每次重校验的失败按 401/403（`1008` 关闭）
+   与 5xx（保留连接、按 `auth_warn_interval` 限频 warn）分流；降权只清空 admin 订阅，恢复后重新订阅、不补发。
+5. **预算超限沿用 Lux 错误信封**（`RATE_LIMITED` + `Retry-After: 30`），与 SSE 的 429 同形状；预算实例与
+   Emby 的 32/4 分开，一条连接只占握手主体所属的那个预算。
+6. **关停**：`CoreState` 的关停字段改名为 `websocket_shutdown` 由两条端点共用（`src/main.rs` 只发一个信号），
+   并行排空 Emby 与 Lux 的三份预算，总上界仍是 5 s；关停信号置位后新握手返回 `503`。Emby 的路由、DTO、
+   协议与限额未改，SSE 的两条路由及其测试一行未动。
+
+验证（第 2 轮审查返工后）：`cargo test --locked --test admin lux_websocket::` 在 10 个 `yes` 烧机进程且机器
+load average 200~290 时连续 3 次 30/30；同一压力下整组 `cargo test --locked --test admin` 为 54 passed / 1 failed；
+停掉烧机进程后整组连续 2 次 54 passed / 1 failed。唯一失败始终是基线已有的环境型用例
+`admin_settings::transcoding_settings_are_admin_only_validated_and_persisted`（本机 VideoToolbox 可用，用例
+断言 `transcodingStatus.available == false`；`docs/TEST-TARGETS.md` §5.3 已记录，单跑同样失败，与本改动无关）。
+`cargo test --locked --test emby` 83/83（其中 `emby_websocket::` 24 例，含新增的「关停后新握手 503」）；
+`LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test shutdown` 2/2；
+`cargo test --locked --lib websocket::` 24/24、`cargo test --locked --lib lux_websocket::` 14/14；
+`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+`python3 scripts/check-backend-branches.py`（28 files / 266 branches）、`cargo build --locked` 全部通过。
+本机为 arm64（`uname -m`），未做 NAS/x86 并发验证，也未在真实反向代理后握手（属 LUX-896）。
+
+返工（2026-11-06，加压稳定性）：两个用例原先依赖固定时间窗——空闲关闭用 `sleep` 后读 close，「保活」在固定
+窗口内断言“没被关闭”——在机器同时跑其它构建/测试时被调度延迟误杀（空闲用例在整组里 27/28、保活用例在整组里
+51/53）。审查复现结果是**测试结构问题**，生产代码没有复现出竞态，因此只改测试：
+
+- **空闲关闭**：不再 `sleep`，改为轮询连接预算空位（`wait_for_capacity`，只有连接任务写完 close 帧、释放槽位后
+  新握手才会成功），随后读 close 帧并断言 `1001` + reason `idle timeout`（同时把“空闲”与关停区分开）。
+- **协议 ping 保活**：改为肯定断言——数到至少 4 个协议 ping 且已观察 1.6 个空闲窗后，再发布一次失效并断言仍能
+  收到帧，而不是“窗口内没被关闭”。
+- **其余等待**：降权/恢复、预算释放、会话撤销、关停、5xx 重校验、事件投递全部改为“轮询到条件成立或
+  `CONDITION_DEADLINE`（20 s）”；只有负向断言（“不应收到 admin 帧”“不应有 pong”）保留短窗口
+  `QUIET_WINDOW`（400 ms），因为窗口越长只越慢、不会更强。
+- **时钟比例**：保活用例心跳 250 ms / 空闲 2.5 s（10 倍），并写注释说明 250 ms ≥ 50 倍典型 5 ms 调度延迟；
+  空闲用例把心跳设为与空闲窗相同（1 s）——服务端先判空闲再发 ping，避免测试客户端在服务端已关闭后才补发 pong
+  被 RST 掩盖 close 帧；比例依据写在用例注释里。
+
+第 2 轮审查返工（2026-11-06）：
+
+1. **文档（P1）**：`docs/API.md` 的 WS 契约曾写 `proxy_set_header Host $http_host;` 并指向
+   `docs/DEPLOYMENT.md`，但该样例属于 LUX-896 且尚未合入（现在仍是 `$host`、没有 `Upgrade`/`Connection`）。
+   现在契约只描述端点要求（反代需转发 `Upgrade`/`Connection`、保留 `Host` 完整 authority），nginx 样例明确
+   以 LUX-896 落地后的 `docs/DEPLOYMENT.md` 为准；本分支没有改任何 nginx 样例。`docs/LUX-DEVELOPMENT.md` 与
+   `docs/CHANGELOG.md` 里没有同类部署指令（LUX-896 任务条目里的描述属于该任务自己的范围）。
+2. **Emby 关停握手（P2）**：`/embywebsocket` 在共享关停信号置位后仍会完成新握手，与 ADR-054 D10 不一致。
+   `emby_websocket` 现在在认证之前检查 `WebsocketShutdown::is_signalled()` 并返回 `503`；新增用例
+   `emby_websocket_refuses_new_handshakes_once_shutdown_started`（先收到已有连接的 `1001`，再断言新握手 `503`）。
+3. **重校验写设备清单（P3）**：45 s 重校验原先走完整的 `require_web_user`，对带 `device_id` 的会话每周期
+   upsert `user_devices`。`src/api/users.rs` 拆出 `require_web_user_observing_device(..., record_device)`，
+   新增只读入口 `require_web_user_read_only`（同样的查询与权限判定，只跳过设备观测写入），WS 重校验改用它；
+   普通 HTTP 请求行为不变。用例 `revalidation_does_not_write_the_device_inventory` 先冻结该行的
+   `last_seen_at`，再用「降权只有重校验能发现」证明重校验确实发生，然后断言该值仍是冻结值。
+4. **死代码（P3）**：`drain_lux_websocket_connections` 没有调用者。现在它是
+   `shutdown_websocket_connections` 里 Lux 一侧的排空实现（`src/main.rs` 走的同一条路径），不再有独立死代码；
+   用例 `a_bounded_drain_reports_a_connection_that_outlives_it` 覆盖「连接未退出 → `false`」「信号后 → `true`」。
+
+#### LUX-895：前端实时客户端（已完成）
+
+状态：已完成（2026-11-06）。依赖：ADR-054 的协议冻结（不等 LUX-894 完成即可开发）；发布需与 LUX-894 同版本。
+
+范围：新增 `web/src/lib/realtime/{socket.ts,types.ts}`（URL 由 `location` 推导、不带凭据、退避、可见性、
+离线、close code 分支），`useUserEvents` / `useAdminEvents` 只换传输层，失效逻辑逐字保留；类型改名
+`SseConnectionState` → `RealtimeConnectionState`、`useSseConnectionState` →
+`useRealtimeConnectionState`（7 个调用点机械替换，`homeRefetchInterval` 签名不变）；按 ADR-054 D14 删除
+`libraryId` 死分支；新增 `web/tests/support/fake-websocket.ts`，一次替掉四份手写 `FakeEventSource`。
+
+依赖：ADR-054（信封与 close code 语义）。后端可并行开发；发布时两个方向必须同版本（硬切）。
+
+验收：
+
+- [x] 退避为 `min(30 s, 500 ms × 2^n)` 加 ±20% 抖动，只有收到首帧 `ready` 才把 `n` 归零（假计时器断言
+      上界与抖动区间）。
+- [x] `1008` 不重连并失效 `queryKeys.me`（回到登录页）；`1001`/`1000` 至少等 5 s；连续 5 次 `1006`
+      触发一次 `api.me()`，401 按会话失效处理。
+- [x] `document.hidden` 与 `offline` 暂停重连，`visibilitychange` 转可见与 `online` 立即重试一次。
+- [x] 三个易碎行为各有断言：用户侧首次 open 不全量失效；管理侧每次 open 做 `all` 失效；管理侧 250 ms
+      合并窗。
+- [x] `pnpm --dir web test`、`pnpm --dir web build` 通过；`grep -rn "EventSource" web/src` 为空。
+
+预计改动文件：新增 `web/src/lib/realtime/socket.ts`、`web/src/lib/realtime/types.ts`、
+`web/tests/support/fake-websocket.ts`；修改 `web/src/features/activity/useUserEvents.ts`、
+`web/src/features/admin/useAdminEvents.ts`、`web/src/features/home/HomePage.tsx`、
+`web/src/features/detail/MediaDetailPage.tsx`、`web/src/features/detail/useMediaEpisodes.ts`、
+`web/src/features/detail/MediaDetailActions.tsx`、`web/src/features/detail/MediaDetailSections.tsx`、
+`web/src/features/detail/MediaDetailHero.tsx`、`web/tests/user-events.test.tsx`、
+`web/tests/admin-events.test.tsx`、`web/tests/lux-shell.test.tsx`、`web/tests/library-page.test.ts`。
+
+实施结果（2026-11-06）：新增 `web/src/lib/realtime/{types,socket,client}.ts` 与
+`web/tests/support/fake-websocket.ts`，`socket.ts`、`types.ts` 按计划，`client.ts` 是计划外拆出的页面级
+单例 hub：ADR-054 决定 1 要求用户频道与管理频道共用一条连接，若两个 hook 各自 `new` 一个客户端，管理页
+仍是 2 条连接，ADR「后果」里"每标签页连接数从 2 降到 1"就落不了地。hub 由第一个订阅者建连、最后一个
+订阅者关断，`useAdminEvents` 因此仍不需要导出连接状态（留给 LUX-898）。
+
+线协议侧（`types.ts`）：URL 固定为 `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/api/v1/ws`，
+不带 query、不放凭据（同源 cookie 由浏览器随握手携带）；只解析 `ready` 与 `invalidate`，`channel` 只接受
+`user`/`admin`，`itemId` 不是非空字符串或超过 256 字符时整帧丢弃，未知字段忽略，未知 `type` 与非法 JSON
+静默丢弃；上行只有每 25 s 一次的 `{"type":"ping"}`。25 s 的依据：服务端 120 s 无任何入站帧（含协议级
+pong）即关闭，4 个 ping 仍在窗口内留满余量，同时与服务端协议级 ping 的 25 s 同节奏。
+
+重连（`socket.ts`）：`min(30 s, 500 ms × 2^n)` 再乘 1±20% 抖动，`n` 只在首帧 `ready` 时归零；首次重试
+等 500 ms，基线到 30 s 封顶，叠加抖动后实际落在 [24 s, 36 s]。握手成功但 10 s 内没有 `ready` 按异常关闭
+处理（`1006` 分支，计入 probe 计数）。`1008` 立即停连并回调会话失效、不再重连；`1000`/`1001` 的等待下限
+固定 5 s（退避仍在下面继续增长）；连续第 5 次 `1006` 触发一次 `api.me()`，只有 401 按会话失效处理，
+其余错误继续退避。隐藏标签页与 `offline` 会取消已排定的重连并挂起重试，`visibilitychange` 转可见、
+`online` 各自立即重试一次；重连、ready 截止、ping 三类定时器每类同时只有一份，`stop()` 全部清理。
+
+与应用层的接缝：`useUserEvents` / `useAdminEvents` 的 scope 校验表、`refreshQueries` 的在途刷新去重、
+管理侧 250 ms 合并窗逐字未改，只把 `EventSource` 的 `open`/`invalidate` 回调换成 `ready`/`invalidate`
+回调；`libraryId` 分支按 D14 删除而不是移植。"已连接"仍然只指收到首帧 `ready` 之后，所以
+`homeRefetchInterval` 签名与语义不变、WebSocket 不可用时保持今天的 30 s 兜底。`SseConnectionContext`
+一并改名 `RealtimeConnectionContext`，否则 `grep "Sse"` 仍会命中实时相关代码。
+
+一处计划外的必要改动：`web/src/app/App.tsx` 的 `SessionRoutes` 把 `/auth/me` 的 401 当作"无会话"。
+`invalidateQueries(queryKeys.me)` 重新请求后若得到 401，React Query 仍保留上一次成功的 `data`，
+`!me.data` 分支不会命中，界面会停在已失效的会话上，D11 要求的"回到登录页"无法只靠失效本身达成。
+
+验证（本机 arm64，2026-11-06）：`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web build`
+通过；`pnpm --dir web test` 166 个测试文件 / 1535 例全绿（`tests/asset-precompression.test.mjs` 需要
+`web/dist`，所以先 build 再 test）；`grep -rn "EventSource" web/src web/tests` 无输出。新增/改写的用例：
+`web/tests/realtime-socket.test.ts` 23 例（URL、信封解析、退避与抖动区间、ready 前不算连接、ping 节奏、
+1008/1001/1000、5×1006 探测、隐藏标签页、离线、定时器不累积、无 WebSocket 时的兜底）、
+`user-events.test.tsx` 14 例、`admin-events.test.tsx` 9 例（含 LuxShell + AdminLayout 只开 1 条连接）、
+`lux-shell.test.tsx` 18 例、`library-page.test.ts` 19 例、`login-page.test.tsx` 15 例（新增 1 例：
+shell 已挂载时 `/auth/me` 返回 401 回到登录页）。
+
+未验证项（当时）：没有对接真实后端，也没有在真实浏览器上验证；结论来自注入假 WebSocket 的单元/组件
+测试。LUX-894 合并后已补做真实 luxd 实跑，见下方返工记录 3/3。
+
+返工记录（2026-11-06，独立审查 1/3）：
+
+- **P1 会话失效只失效 `me`、不清缓存**。`QueryClient` 是 `web/src/main.tsx` 的页级单例、跨登录存活，
+  而 `home/*`、`favorites`、`watch-history`、`playback`、`admin/*` 等键都不带用户维度；在 `staleTime 60 s`
+  + `refetchOnWindowFocus: false` 下，同一标签页换账号会读到上一个账号的数据（显式退出登录走
+  `queryClient.clear()`，这条新路径没有等价处理）。现在会话失效路径与退出登录共用
+  `web/src/lib/api/session.ts` 的 `clearSessionCaches()`：清掉除 `me` 以外的全部查询，再失效 `me`。
+  `me` 必须保留——React Query 不会通知被 remove 的查询的观察者，删掉它 `App` 会继续渲染已缓存的用户；
+  保留后重新请求 `/auth/me` 得到 401，界面才切到登录页，下一次登录再覆盖它。hub 每个失效会话只清一次
+  （不是每个订阅者一次），并照旧 `socket.stop()`。用例：`1008` 与 `1006×5 + 401` 各断言
+  `home/favorites/watch-history/playback/admin` 缓存被清空；`login-page.test.tsx` 端到端跑一遍"1008 →
+  登录页 → 用另一个账号登录"，断言显示的是新账号的继续观看、旧账号标题不再出现（该用例在修复前失败）。
+- **P2 管理端"每次 open 都 `all` 失效"在晚挂载时丢失**。`onReady` 只随连接的 `ready` 帧触发一次，而
+  `/admin` 是在连接已经 ready 之后才挂载的（首页 → 控制台），卸载期间到达的 admin 帧也直接丢弃。现在
+  `useAdminEvents` 在挂载时若连接已 ready 就补一次 `all` 失效。选择"hook 内补"而不是"hub 向新订阅者
+  重放 `ready`"：重放会同时打到用户频道，D15① 的"只有断线过才做全量"就变得难以判定；另有一条用例
+  钉住"用户频道加入已 ready 的连接不做 `home` 全量失效"。管理端用例覆盖"已 ready 后挂载 → 一次 `all`"
+  与"卸载再挂载 → 再失效一次"。
+- **P3 开发代理不转发升级**。`web/vite.config.ts` 的 `/api` 原来是一条裸 target 字符串，`pnpm --dir web
+  dev` 下 `ws://127.0.0.1:5173/api/v1/ws` 永远拿不到 `ready`，静默回落轮询。现在是带 `ws: true` 的对象
+  形式（target 不变），旁边写明**不要开 `changeOrigin`**：浏览器 Origin 是 dev server，上游必须看到同一个
+  `Host`，开了会把 Host 改写成后端地址、被严格同源校验拒绝——与生产反代保留 `Host $http_host` 同一个
+  理由。`web/tests/dev-ws-proxy.test.mjs`（`node --test`）断言 `ws: true` 且没有 `changeOrigin: true`；
+  没有可用的后端，**开发代理的真实握手未验证**。
+
+返工后复验（2026-11-06）：`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web build`、`npx tsc
+--noEmit` 通过；rebase 到本地 `test`（`05abd0f9`，含条目刷新模式那一批 Web 改动）后 `pnpm --dir web test`
+为 167 个 `node --test` 用例 + 167 个 vitest 文件 / 1557 例全绿。
+
+返工记录（2026-11-06，独立审查 2/3）：
+
+- **首次连接失败后重连成功不再补做 `home` 全量失效**。`hadConnectionError` 原来只在
+  `onStateChange("disconnected")` 置位，而 `RealtimeSocket` 的初始状态就是 `disconnected` 且 `setState`
+  对相同状态直接返回——"首次握手失败 → 重试 → `ready`"整条路径没有任何状态变化，`onReady` 看到的
+  `reconnecting` 恒为 `false`。基线 SSE 对每次 `error` 都会置位（D15① 要求保留）。现在
+  `RealtimeSocket` 对**每一次可重试的失败**（握手被拒、连接断开、`ready` 超时）都回调
+  `onConnectionFailure`，hub 转发给订阅者，用户侧 hook 用它置位、`onStateChange` 只负责 React 状态。
+  `1008` 走会话结束分支、不再重试，因此不算"连接失败"、不触发该回调。
+- **会话结束后留下已 stop 的 socket，后续订阅者永远没有连接**。`endSession()` 原来只 `socket.stop()`
+  而不清模块级引用，`subscribeRealtime` 仅在 `socket === null` 时新建，而 `start()` 对已 stop 的实例直接
+  返回——管理端/重新挂载的 shell 会挂在一个再也连不上的实例上。现在 `endSession()` 先置空引用再 stop，
+  并经由唯一的写入口 `setConnectionState()` 向订阅者广播 `disconnected`（不再直接改模块变量）；不变式是
+  "有订阅者就有可用连接，或已明确告知通道不可用"，之后到达的订阅者会拿到一条新连接。
+
+返工后复验（2026-11-06，2/3）：`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web build`、`npx
+tsc --noEmit` 通过；`pnpm --dir web test` 连跑两次均为 167 个 `node --test` 用例 + 168 个 vitest 文件 /
+1562 例全绿。新增用例：socket 级"每次可重试失败都上报（含从未 ready 的首次尝试）、1008 不上报"；hook 级
+"首次尝试失败 → 重连 → `ready` 必须做一次 `home` 全量失效"；hub 级"会话结束后新订阅者拿到新连接"与
+"连接在线时会话结束仍向订阅者广播 `disconnected`"（`web/tests/realtime-client.test.ts`）。
+
+rebase 与实跑（2026-11-06，3/3：LUX-894 与 LUX-896 合并后）：
+
+- **rebase 到 `test`（`dfe40b5a`）**：冲突只有两处追加型文档——`docs/CHANGELOG.md` 的 Unreleased「新增」
+  与 `docs/LUX-DEVELOPMENT.md` 的任务条目，均保留双方：LUX-894 的端点条目在前、本任务的 Web 客户端条目
+  在后；LUX-895/896 的标题以 `test` 侧为准。`web/` 与 `src/` 没有重叠改动。
+- **对照已合并契约逐条核对，未发现前端偏差**：`docs/API.md` 的 `/api/v1/ws` 一节与 ADR-054（含 LUX-894
+  的修订单条）比对——信封（`ready` / `invalidate` + `channel` + 可选 `itemId` ≤256 字符）、服务端从不发送
+  `libraryId`、降级帧 `home`/`all`、只识别 `{"type":"ping"}` 且不回 pong、`1008` 不重连、`1001`/`1000`
+  至少 5 s、`426`/`401`/`400`/`429` 在浏览器侧一律是 `1006` 因而按退避重试、45 s 重校验与"降权只停 admin
+  帧"（客户端无感）——实现与契约一致。
+- **唯一补充**：`1003`/`1009` 原先没有用例，新增 `it.each([1003, 1009])` 断言两者按普通失败退避重试；
+  它们是服务端对客户端二进制/超大文本的反应，而客户端只发 15 字节的 ping，永远触发不了，因此与
+  "只有 `1008` 终止"的单一来源保持一致。
+- **真实 luxd 实跑**（本机 arm64）：`cargo build --locked` 后以
+  `LUX_CONFIG_DIR=.tmp/e2e-ws/config`、`LUX_HTTP_ADDR=127.0.0.1:18097` 启动，用
+  `setup/database/select`（SQLITE）+ `setup/complete` + `auth/login` 建立管理员会话：
+  - 裸 WebSocket 客户端（Node `http` upgrade，带 `Origin` 与 `Cookie`）：`101`、`Sec-WebSocket-Accept`
+    正确、首帧 `{"type":"ready","version":1}`；另一次登录写入审计事件后收到
+    `{"type":"invalidate","channel":"admin","scope":"dashboard"}`；发出 `{"type":"ping"}` 后连接保持。
+    7/7 通过。
+  - 拒绝路径与契约一致：普通 GET `426`（带 `Upgrade: websocket`）、有 cookie 但缺 `Origin` `401`、跨源
+    `400`、无 cookie `401`。
+  - **前端真实客户端代码**（`web/src/lib/realtime/socket.ts`，经 `vite-node` + `ws` 适配器运行，不是测试
+    替身）：连上 → `ready` → 收到上面那条 `dashboard` 失效帧 → 25 s 后发出 `{"type":"ping"}` → `stop()`
+    后不再重连。7/7 通过。
+  - **`1008` 端到端**：连接建立后 `POST /api/v1/auth/logout`（204），45 s 重校验周期到达时服务端以 `1008`
+    关闭；真实客户端 `onSessionEnded` 恰好 1 次、状态转 `disconnected`、随后不再重连。5/5 通过。
+  - **开发代理**：`vite --port 5173`（`LUX_API_ORIGIN=http://127.0.0.1:18097`）下经 `127.0.0.1:5173` 的
+    同源握手同样拿到 `101` + `ready` + 失效帧，7/7 通过——`ws: true` 与"不改写 `Host`"这对配置实测可用。
+- **仍未实跑**：真实浏览器（本机没有 Playwright/浏览器自动化，任务约束不允许安装），所以"登录后页面上的
+  React 组件随失效帧刷新"这一层仍只有 jsdom 组件测试覆盖；真实 nginx/TLS 反代属 LUX-896（其条目已记录
+  未实跑）。上述实跑全部在 `127.0.0.1` 直连与 vite 代理两种明文链路上。
+
+rebase 后复验（2026-11-06，3/3）：`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web build`、`npx
+tsc --noEmit` 通过；`pnpm --dir web test` 连跑两次均为 167 个 `node --test` 用例 + 168 个 vitest 文件 /
+1564 例全绿。
+
+返工记录（2026-11-06，审查后补修：缓存清理范围与联网重建）：
+
+- **P1 `me` 的 401 也要清缓存**。`SessionRoutes` 原来只在 401 时渲染 `LoginPage`，上一个账号的
+  `home/*`、`favorites`、`watch-history`、`admin/*` 原样留在页级单例 `QueryClient` 里；`clearSessionCaches`
+  只在显式退出和实时 `endSession` 中调用，因此 `refetchOnReconnect`（离线期间会话被注销）与
+  `AdminLibrariesPage` / `AccountPage` 对 `me` 的主动失效这两条路径会把旧数据带进下一次登录
+  （`watch-history` 还不在用户频道的失效键里）。现在 `SessionRoutes` 用一个只跑一次的 effect（`me` 进入 401
+  时置位、恢复后复位）调用 `clearUserCaches()`；这里**不** `invalidateQueries(me)`，否则 401 → 重取 → 401
+  自激。
+- **P2 清缓存不再删掉会话之外的服务端状态**。`clearSessionCaches` 的 predicate 原来只保留 `me`，把
+  `["setup"]`（以及 `login-background`）一起删了，回登录页前会先闪"正在启动 Lux"，`setup` 请求再失败就落到
+  错误屏。现在保留名单是 `me` / `setup` / `login-background` 三个根键（仍是短否决名单，新增的用户数据键
+  会自动被清），并拆出 `clearUserCaches()`（只清账号数据、不动 `me`）供 401 分支复用。
+- **P3 联网后重建半开连接**。`offline` 时如果 socket 仍然打开（Wi-Fi 切换、合盖没收到 close），原来的
+  `suspend()` 因为 `socket !== null` 不置 `pendingRetry`，`online` 又直接返回：hub 一直报 `connected`，
+  各页的 30 s 兜底轮询也就一直关着。现在 `online` 发现仍有 socket 就关掉它、广播 `disconnected` 并立即重连
+  （页面隐藏时由 `connect()` 转成 `pendingRetry`），同时上报一次 `onConnectionFailure`，让重连后的首个
+  `ready` 补做用户侧的 `home` 全量失效——断网期间可能漏帧（D15①）。
+
+补修后复验（2026-11-06）：`npx tsc --noEmit`、`pnpm --dir web build` 通过；`pnpm --dir web test` 连跑两次，
+第一次 169 个 vitest 文件 / 1571 例中有 1 例失败（`admin-user-access-rules.test.tsx` 的并行负载 flake，
+单跑 15/15 通过，与本任务无关），第二次全绿；`node --test` 两次均 167/167。新增用例：
+`web/tests/session-caches.test.ts`（保留/清理范围）、`login-page.test.tsx` 的"401 无实时关闭也清缓存并换账号
+不显示旧数据"、`realtime-socket.test.ts` 的"联网后重建已打开的 socket"、`user-events.test.tsx` 的
+"断网期间回到轮询、联网重连后补一次全量失效"。
+
+#### LUX-896：反代配置与部署文档（样例与文档已完成，真实握手未运行）
+
+状态：文档与样例已完成（2026-11-06）；LUX-894 已合并到 `test`，本分支已 rebase 到 `a8c7928a`，并补齐
+894 审查遗留的三个 P3。真实 nginx 的 `101` 握手**仍未实跑**（本机没有 nginx，任务约束禁止 Docker 构建
+与安装软件），因此合并前必须在有 Docker 的机器上补跑 `scripts/proxy-smoke.sh`；它必须与 LUX-894 同批发布
+（同一发布列车），不得单独滞后。
+
+范围：`docs/DEPLOYMENT.md` 的 nginx 样例补 `proxy_set_header Upgrade $http_upgrade;` 与
+`proxy_set_header Connection "upgrade";`，并把 `Host` 明确为 `$http_host`（保留非默认端口，否则
+ADR-054 D5 会拒绝握手）；`scripts/proxy-smoke.nginx.conf` 同步；用 `scripts/proxy-smoke.sh` 跑一次真实
+`101` 握手；`docs/COMPATIBILITY.md` 记录结论（含缺头时 `1006`/`426` 的表现与“与 401 无法区分”的说明，
+Caddy 链路仍标注未实机验证）。
+
+依赖：LUX-894（需要真实端点）。缺头时代理会剥掉 `Upgrade`，请求以普通 GET 到达，handler 显式返回
+`426 Upgrade Required`（不依赖框架提取器默认的 400），浏览器只看到 `close 1006`；前端随后落到 30 秒
+轮询，负载高于断线基线而 UI 显示“正常”。
+
+验收：
+
+- [ ] `scripts/proxy-smoke.sh` 在真实 nginx 容器里完成 `101` 握手并收到 `{"type":"ready","version":1}`。
+- [ ] 故意删掉 `Upgrade`/`Connection` 头时，实测表现与文档描述一致（`1006`），且文档写明前端会落到轮询。
+- [x] 非默认端口部署（`Host` 带端口）的说明与 ADR-054 D5 一致；`$host` 造成端口丢失的后果被写出。
+- [ ] `docs/COMPATIBILITY.md` 记录验证日期、nginx 版本与未验证项（Caddy/Hills 链路）。
+
+预计改动文件：`docs/DEPLOYMENT.md`、`scripts/proxy-smoke.nginx.conf`、`scripts/proxy-smoke.sh`（如需
+增加握手断言）、`docs/COMPATIBILITY.md`、`docs/CHANGELOG.md`、`docs/LUX-DEVELOPMENT.md`。
+
+实施结果（2026-11-06，部分完成：样例与文档完成，真实握手未运行）：
+
+- `docs/DEPLOYMENT.md`：nginx 样例补 `proxy_set_header Upgrade $http_upgrade;` 与
+  `proxy_set_header Connection "upgrade";`，`Host` 由 `$host` 改为 `$http_host`，保留
+  `proxy_http_version 1.1;`、`proxy_buffering off;`、1 小时的读写超时。新增「WebSocket 升级」与
+  「缺头、改写 Host 与排查」两节：`101` 的必要条件、缺头时以普通 GET 到达且浏览器只见 `close 1006`、
+  与 401 不可区分、前端静默落到轮询（用户面 30 s，管理面 2 s/5 s/15 s）、服务端日志的拒绝分类、`502/504`
+  → `400/426` → `401` → `101` 的读法、直连与经反代两条 `curl` 对照命令（`--max-time` 在 `101` 后会超时，
+  属正常）、“改写 `Host` 要在反代侧修正、不放宽校验（没有 `LUX_ALLOWED_ORIGINS`，不读转发头）”、
+  Caddy/Tailscale Serve 链路未实机验证。Tailscale 检查项第 4 条收窄为检查项（不再断言 Serve 一定透传
+  `Upgrade`），第 5 条注明转发头只用于展示与访问诊断；“反代应传 `X-Forwarded-For`/`X-Forwarded-Proto`”
+  一句补上同样的限定。
+- `scripts/proxy-smoke.nginx.conf`：同样的两行升级头与 `Host $http_host`；注释写明端口丢失会导致 `400`。
+- 新增 `scripts/check-proxy-config.sh`：不依赖 nginx/docker 的静态检查，从 `docs/DEPLOYMENT.md` 抽出
+  `nginx` 代码块，与 smoke 样例一起断言 `Upgrade`/`Connection`/`Host $http_host`/HTTP/1.1/关闭缓冲/
+  `proxy_read_timeout`，并禁止 `Host $host;`；临时目录建在 `.tmp/` 下并自清理。已接入
+  `scripts/check-all.sh`，`scripts/proxy-smoke.sh` 在启动容器前先调用它。
+- `scripts/proxy-smoke.sh`：登录后新增 `/api/v1/ws` 冒烟——带 cookie 的同源握手断言 `101`、响应
+  `Upgrade: websocket`、`Sec-WebSocket-Accept` 等于客户端 key 的 SHA-1/base64；用 `openssl s_client`
+  在有界轮询里读首帧并断言 `{"type":"ready","version":1}`；缺 `Origin` 与跨源握手断言 4xx（跨源固定
+  `400`），普通 `GET` 断言 4xx 并把实际码写进结果 JSON。监听端口 `18611` 是非默认端口，所以这条冒烟同时
+  是 `Host $http_host` 的回归测试。
+- `docs/COMPATIBILITY.md` 追加 LUX-896 记录（静态结论、未验证项、探针自测）；`docs/CHANGELOG.md`
+  Unreleased 追加「变更」条目。
+- 本轮（rebase 到 `a8c7928a`，LUX-894 已合并）补齐审查遗留的三个 P3：
+  ① `src/api/lux_websocket.rs` 的 `parse_origin_authority` 原先只丢弃 Origin 自身 scheme 的默认端口，与
+  `request_authority` 丢弃 80/443 不对称；现在两侧都用 `&[80, 443]`，`Host: nas:443` +
+  `Origin: http://nas:443` 这类同源请求不再被误拒。先写失败单测
+  `origin_normalization_drops_both_default_ports_on_either_side`（http:443、https:80 与 `Host` 的四种
+  组合；红态是 `Some("nas:443")` vs `Some("nas")`），再改实现；`--lib lux_websocket::` 由 14 例变 15 例。
+  ② `docs/API.md` 的 `GET /api/v1/ws` 上行段补传输层 64 KiB 上限（超出直接断开、无 close 帧）与“超过
+  4 KiB 的二进制消息先得到 `1003` 而不是 `1009`”；同源校验段改为“80 与 443 一律视为无端口”；“LUX-896
+  落地后的 `docs/DEPLOYMENT.md`”改为直接指向 `docs/DEPLOYMENT.md`。③ `docs/LUX-DEVELOPMENT.md` 的
+  LUX-894 实施结果由 28 例改为 30 例（与验收记录、`docs/TEST-TARGETS.md` 的实测一致）。另按实际行为
+  最小修订 ADR-054：缺失 `Upgrade` 的「反向代理要求」由提取器默认 `400` 改为 handler 显式 `426`，
+  「Origin 校验」规则 2/3 改为两侧都把 80/443 视为默认端口；六条所有者决定未改。
+
+验收状态（与上面的验收清单逐项对应）：
+
+- [x] 两份 nginx 样例都带 `Upgrade`/`Connection` 与 `Host $http_host`，由
+      `scripts/check-proxy-config.sh` 静态断言（`nginx -t` 未运行：本机没有 nginx）。
+- [ ] `scripts/proxy-smoke.sh` 在真实 nginx 容器里完成 `101` 握手并收到
+      `{"type":"ready","version":1}`：**未运行**（需要 Docker 构建，本任务禁止）。断言已写好，探针本身
+      用本机 TLS 桩验证过；服务端的 `101`/`426` 由 LUX-894 的真实 socket 集成测试覆盖，但不经过 nginx。
+- [ ] 故意删掉 `Upgrade`/`Connection` 头时的实测表现：**未运行**。文档写明“普通 GET → `426` → 浏览器
+      `1006` → 前端落到轮询”，`426` 由 `a_plain_get_answers_426_upgrade_required` 覆盖；ADR-054 的
+      `400` 措辞已按实现修订；冒烟对普通 GET 只断言 4xx 并记录实际码。
+- [x] 非默认端口说明与 ADR-054 D5 一致（`$host` 丢端口 → 每次握手 `400`）；冒烟端口 `18611` 让这条成为
+      可执行断言，但该断言尚未实机运行。
+- [x] `docs/COMPATIBILITY.md` 记录日期与未验证项（真实 nginx、缺头实测、Caddy/Tailscale Serve）。
+      未记录 nginx 版本：本机没有 nginx，冒烟未运行（脚本默认镜像 `nginx:1.27-alpine`）。
+
+验证：`cargo test --locked --test admin lux_websocket::` 30/30；`cargo test --locked --lib
+lux_websocket::` 15/15（含新增 P3 单测，先红后绿）；`cargo test --locked --lib websocket::` 25/25；
+`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+`python3 scripts/check-backend-branches.py`（`backend branches ok: 28 files, 266 branches`）、
+`scripts/check-proxy-config.sh`（“nginx samples carry Upgrade/Connection, Host $http_host, HTTP/1.1 and no
+buffering”）、`bash -n scripts/*.sh`、`bash -n scripts/lib/*.sh` 全部通过。冒烟探针用本机自签名证书的
+TLS socket 桩（`.tmp/` 内、已删除）验证过 `101` + `Sec-WebSocket-Accept`、首帧、`400`/`426` 分支——只
+证明探针可用，不证明 nginx。`scripts/proxy-smoke.sh` **未运行**：本机没有 nginx/OpenResty，脚本需要构建
+`lux:arm64-local` 镜像，而任务禁止 Docker 构建（Docker daemon 虽可用，没有镜像就没有可测的
+`/api/v1/ws`）。服务端行为由 LUX-894 的真实 socket 集成测试覆盖，但不等于反向代理验证。本次没有 `web/`
+改动，未跑 Web 测试。
+
+#### LUX-897：删除两条 SSE 路由与旧测试（已完成）
+
+状态：已完成（2026-11-06）。依赖：LUX-894 与 LUX-895 已在基线 `7ac4ab4e` 上；与它们同属一个发布版本（硬切），
+没有并存版本。
+
+范围：删除 `GET /api/v1/events` 与 `GET /api/v1/admin/events` 的路由、handler、`pump_user_events`、
+`event_stream_response`、`sse_capacity_response` 与 `SseConnectionBudget` / `MAX_SSE_CONNECTIONS`（WS
+预算已独立后）；删除只针对 SSE 帧渲染与流预算的测试，保留仍对广播 hub 有效的用例（改为直接订阅 hub 或
+经 WS 验证）；删除 `docs/API.md` 的两段 SSE 契约、更新 `docs/WEB-POLLING-AUDIT.md` 的 SSE 描述与
+`docs/TEST-TARGETS.md` 的用例计数。
+
+依赖：LUX-894（WS 端点可用）与 LUX-895（前端已切走）。同一发布版本内完成，不留双轨。
+
+验收：
+
+- [x] 两条旧端点返回 404：`tests/admin/removed_event_streams.rs` 的两例先红后绿（删除前的实际响应是未登录
+      `401`、登录 `200`），未登录与被登录管理员两种请求都断言 `404`；
+      `grep -rn "api/v1/events\|api/v1/admin/events" src/ web/src docs/API.md` 无输出。
+- [x] `grep -rn "text/event-stream\|EventSource" src/ web/src` 无输出。
+- [x] `cargo test --locked --test admin`：**59 passed / 1 failed（共 60 例）**，唯一失败是既有的环境型用例
+      `admin_settings::transcoding_settings_are_admin_only_validated_and_persisted`（本机 VideoToolbox，
+      基线同样失败，与 SSE 删除无关）；`python3 scripts/check-backend-branches.py` 通过。
+- [x] `pnpm --dir web test`、`pnpm --dir web build` 通过；`docs/API.md` 不再描述 SSE。
+
+实施记录（2026-11-06）：
+
+- **服务端删除**：`src/api/admin/admin_logs_events.rs` 的两条路由、`admin_events`、`user_events`、
+  `event_stream_response`、`pump_user_events`、`user_event_from_receive`、`user_event_frame` 与 4 个
+  SSE 帧单测；`src/api/legacy.rs` 的 `SseConnectionBudget`、`sse_permits` 字段、`with_sse_connection_limit`、
+  `MAX_SSE_CONNECTIONS`、`sse_capacity_response`，以及因此不再使用的 `AsyncWriteExt` 导入。
+- **保留**：`AdminEventHub` / `UserEventHub` 及全部广播/合并语义、`GET /api/v1/ws` 的协议与用户/管理双预算、
+  `WebsocketShutdown`、`/embywebsocket`、媒体流与 Emby 仍在用的其它缓冲/预算设施。删除后 `src/` 不再有
+  `text/event-stream`、`EventSource`、`SseConnectionBudget` 或 `sse_capacity_response` 引用。
+- **集成测试（admin 组 55 → 60）**：删除 `tests/admin/admin_events.rs` 的 4 例 SSE 用例
+  （`admin_event_stream_requires_an_authenticated_admin`、`admin_event_stream_sends_ready_frame_to_an_admin`、
+  `user_event_stream_is_authenticated_and_does_not_expose_admin_events`、`concurrent_event_streams_are_capped`）；
+  该文件与事件流无关的 `admin_scan_job_endpoints_expose_media_progress_without_changing_file_counts`
+  原样移到新模块 `tests/admin/admin_jobs.rs`（1 例，断言未改）；新增
+  `tests/admin/removed_event_streams.rs` 2 例（404，未登录 + 登录），并新增
+  `tests/admin/realtime_contract.rs` 7 例钉住共享客户端的合约。原 SSE 预算的 `429` +
+  `Retry-After: 30` 由 `lux_websocket::the_global_budget_answers_429_and_releases_the_slot` 与
+  `the_admin_and_user_budgets_are_separate_and_classified` 继续覆盖。
+- **保留的行为覆盖改走 WS**：`tests/admin/user_event_scoping.rs` 2 例、`tests/admin/user_query_events.rs`
+  1 例、`tests/playback/playback_webhooks.rs` 的 home 失效断言 1 例，改为通过共享的
+  `tests/common/realtime.rs`（`#[path]` 引入 admin/playback target）连接 `GET /api/v1/ws` 并读 `user`
+  频道；断言范围不变（跨用户隐私、目录级广播、先持久化再通知、非 `progress` 帧不带 `itemId`）。
+  `tests/common/realtime.rs` 对每个观察到的帧校验冻结信封：非 `progress` 的 user 帧只能有
+  `type`/`channel`/`scope`，`progress` 可带 `itemId`（≤256 字符），admin 帧不带 `itemId`/`libraryId`
+  （多键与错位 `itemId` 都有反例测试）。`expect_user_silence` 只在到期无帧时通过，连接关闭/IO 结束返回
+  `Err`，避免隐私断言因“连接已死”而假通过（`realtime_contract` 用真实 socket 关闭验证）。服务端
+  4 个 SSE 帧单测删除后，broadcast `Lagged` 降级仍由 `src/api/lux_websocket.rs` 的 2 个单测覆盖，
+  `src/application/admin_events.rs` 的 12 个 hub 用例未改动。
+- **文档**：`docs/API.md` 删除两段 SSE 契约；`docs/WEB-POLLING-AUDIT.md` 的传输描述与连接状态名改为
+  `GET /api/v1/ws` / `useRealtimeConnectionState`；`docs/TEST-TARGETS.md` 第 2 节模块行与新增的 §9 记录
+  删除/保留用例数；`docs/CHANGELOG.md` 记录**（破坏性）移除 SSE 端点**并修正 LUX-894/895 条目里“两者并存”的
+  表述；`docs/DEPLOYMENT.md` 的 `proxy_buffering off;` 说明改为 WebSocket 帧与媒体流，不再描述成 SSE 要求；
+  ADR-054、`docs/COMPATIBILITY.md` 与历史任务记录中的 SSE 提及按“不改历史”保留。
+
+验证（2026-11-06，本机 arm64）：
+
+- `cargo test --locked --test admin`：59 passed / 1 failed（60 例，失败为上述 VideoToolbox 环境用例）；
+  `cargo test --locked --test emby`：83/83；`LUX_DISCOVERY_BIND_ADDR=127.0.0.1:0 cargo test --locked --test
+  shutdown`：2/2；`cargo test --locked --lib websocket`：25/25。
+- `cargo fmt --all -- --check` 通过；`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过；
+  `python3 scripts/check-backend-branches.py`（`28 files, 266 branches`）、
+  `python3 scripts/check-migration-parity.py`（`179 paired, 50 SQLite-only, 19 PostgreSQL-only`）通过。
+- `pnpm --dir web test`：node `--test` 167/167 + vitest 169 个文件 / 1571 例全绿；`pnpm --dir web build`
+  通过（74 个资源、gzip 后 960260 字节）。Web 端没有依赖被删端点（`web/src` 的 SSE/EventSource 引用为空），
+  因此没有 `web/` 代码改动。
+
+审查返工（2026-11-06）：按独立审查补齐测试与文档——① 恢复旧 SSE 解析器对帧数据“只有 scope”的约束，
+在共享客户端按 WebSocket 信封校验键集合（非 `progress` 只有 `type`/`channel`/`scope`，`progress` 允许
+`itemId`，admin 帧拒绝 `itemId`/`libraryId`），并加反例测试；② `expect_user_silence` 区分“到期无帧”与
+“连接结束/IO 错误”，后者失败，并用真实 socket 关闭验证；③ 修正 `docs/DEPLOYMENT.md`：`proxy_buffering`
+只影响普通 HTTP 响应，WebSocket 在 `101` 之后是隧道，保留它只为媒体流，排查 `101` 后收不到帧时不再检查
+它；④ `docs/COMPATIBILITY.md` 顶部新增 LUX-897 条目（两条 SSE 路由返回 `404`、客户端改连
+`/api/v1/ws`），LUX-555–560 旧条目加指向新条目的历史注记。Test target 计数同步为 admin 60 例。
+
+预计改动文件（实际）：`src/api/admin/admin_logs_events.rs`、`src/api/legacy.rs`、`src/api/emby_resume_visibility.rs`
+（注释）、`src/api/lux_websocket.rs`（注释）、`tests/admin/admin_events.rs`（删除）、
+`tests/admin/admin_jobs.rs`（新增）、`tests/admin/removed_event_streams.rs`（新增）、
+`tests/admin/realtime_contract.rs`（新增）、
+`tests/admin/user_event_scoping.rs`、`tests/admin/user_query_events.rs`、`tests/admin/main.rs`、
+`tests/common/realtime.rs`（新增）、`tests/playback/main.rs`、`tests/playback/playback_webhooks.rs`、
+`docs/API.md`、`docs/WEB-POLLING-AUDIT.md`、`docs/TEST-TARGETS.md`、`docs/CHANGELOG.md`、
+`docs/DEPLOYMENT.md`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-898：管理端实时连接状态与兜底轮询降频（已完成）
+
+状态：已完成（2026-11-07，独立审查后改为保守方案）。依赖：无（不依赖 SSE → WebSocket 迁移，可单独
+发布）；实现复用 LUX-895 的 `RealtimeConnectionState` 与共享连接。
+
+范围：让管理端拿到实时连接状态（`useAdminEvents` 暴露状态，或复用 `useRealtimeConnectionState` 的管理版），
+管理页按“已连接”调整兜底轮询：仪表盘由 15 s 降为 60 s（断线 15 s；运行时长/CPU/内存/存储是逐次请求
+采样），运行记录四类任务列表由 5 s 降为 30 s（断线 5 s；只有扫描与元数据重识别会发布 `jobs` 帧）；
+任务活动弹层保持基线 5 s、不接入连接状态（它挂载在用户壳层，且列表常含不发帧的服务）。不改后端事件
+scope，因此转码会话 2 s、Emby 迁移作业、媒体库删除任务、内容索引状态四类仍无 scope 覆盖的查询保持轮询，
+并在文档中记录“哪些后台服务不发 `jobs` 帧、因此不能关轮询”以及可进一步关闭的前置条件（给这些服务补
+admin 事件）。
+
+依赖：无。若 LUX-895 已落地，直接复用其连接状态类型；否则先导出管理端状态即可，事件语义不变。
+
+验收：
+
+- [x] 已连接时 `adminDashboard` 的 `refetchInterval` 为 60 s（`liveDashboardConnected`）、断线恢复 15 s
+      （两态、重连恢复与 `1008` 各有测试）。
+- [x] 四类 jobs 查询已连接时为 30 s（`adminJobsConnected`）、断线恢复 5 s；任务活动弹层在未连接、已连接、
+      断线三种情形下都保持打开时的 5 s（两态各有测试）。
+- [x] 用户壳层/非管理页面不订阅 admin 频道：`jobs` 帧不会让 `adminTaskActivity` 重取（
+      `admin-realtime-polling.test.tsx` 有测试）；`useAdminRealtimeConnectionState` 只出现在管理路由内的
+      仪表盘与运行记录页，`useAdminEvents` 只在 `AdminLayout`。
+- [x] 页面卸载期间到达的 jobs/dashboard 帧会把匹配的未挂载查询标记为过期（`refetchType: "none"`），
+      页级 `staleTime` 60 s 内重新挂载也会重取，且卸载期间不发请求（`admin-events.test.tsx` 有测试）。
+- [x] 转码 2 s、`admin/emby-migrations*`、`admin/library-deletion-jobs`、
+      `admin/content-restriction-index` 的轮询行为不变；`jobs` 帧只覆盖扫描与元数据重识别，其余服务
+      只写数据库，原因与后续工作写进 `docs/WEB-POLLING-AUDIT.md`。
+- [x] `pnpm --dir web test`、`pnpm --dir web build` 通过；`docs/WEB-POLLING-AUDIT.md` 第 27、115 行附近
+      的描述与表格行号已更新为当前事实。
+
+实际改动文件：`web/src/features/admin/useAdminEvents.ts`、`web/src/features/admin/AdminDashboardPage.tsx`、
+`web/src/features/admin/AdminOperationsPage.tsx`、`web/src/lib/realtime/client.ts`、
+`web/src/lib/api/query-keys.ts`、`web/tests/admin-realtime-polling.test.tsx`（新）、
+`web/tests/admin-events.test.tsx`、`web/tests/realtime-client.test.ts`、`docs/WEB-POLLING-AUDIT.md`、
+`docs/LUX-DEVELOPMENT.md`。`AdminLayout.tsx` 未改（继续调用 `useAdminEvents()`）；
+`ScanActivityPopover.tsx` 与 `test` 分支无差异（接入后被审查撤回，见下）。
+
+实施结果（2026-11-07）：
+
+- **状态来源是 admin 频道，不是用户频道**。`useAdminEvents()` 现在返回 `RealtimeConnectionState`，并新增
+  `useAdminRealtimeConnectionState()`（`web/src/features/admin/useAdminEvents.ts`）：两者都只在控制台挂载，
+  只在共享连接收到首帧 `ready` 时报告 `"connected"`；管理页不读 `RealtimeConnectionContext`，所以用户频道
+  已连接不会让管理页停止轮询，非管理员也不会订阅管理频道。消费方只有管理路由内的仪表盘与运行记录页，
+  `LuxShell` 常驻组件（含任务活动弹层）一条都不使用。
+- **不新开连接**。`web/src/lib/realtime/client.ts` 新增 `observeRealtime()`：与 `subscribeRealtime()` 收到
+  同样的 `ready` / `invalidate` / 状态 / 失败事件，但不启动也不保活 socket。管理频道用它被动观察
+  `LuxShell` 持有的那条 `/api/v1/ws`；只有 `AdminLayout` 的 `useAdminEvents()` 额外用 `subscribeRealtime()`
+  保证“没有用户频道时控制台仍有一条连接”。协议、退避与连接生命周期未改。管理端的失效处理（scope 表、
+  250 ms 合并窗、每次 open 全量失效、挂载时的 D15② 全量失效）收敛为一次注册，多个管理组件同时挂载不会
+  重复失效。
+- **`jobs` 帧的覆盖范围（审查结论）**：只有扫描作业生命周期
+  （`src/application/scanner/jobs/lifecycle.rs` 的 `publish_jobs_progress`）与元数据重识别
+  （`src/application/reidentify.rs` 的 `AdminEventScope::Jobs`）会发布 `jobs`。STRM 探测
+  （`strm_probe.rs`）、片头片尾（`chapter_detector.rs`）、弹幕匹配（`danmaku/`）、媒体库封面
+  （`library_covers.rs`）与计划任务（`scheduled_tasks.rs`、`admin_scheduled_tasks.rs`）都没有
+  `AdminEventHub`，进度只写数据库，运行期间没有帧。因此不能对这些列表关闭轮询。
+- **仪表盘只降频，不关闭**：`adminDashboard` 断线 15 s，已连接 60 s
+  （`queryRefreshIntervals.liveDashboardConnected`）。它的运行时长、CPU、内存与存储占用是服务端每次请求
+  实时采样的值，而 `dashboard` scope 只在审计/活动事件时发布，空闲服务器没有事件可驱动刷新；关掉轮询会
+  让这些数字永久冻结。
+- **四类任务列表降为 30 s**：`adminStrmProbeJobs` / `adminChapterDetectionJobs` /
+  `adminDanmakuMatchJobs` / `adminLibraryCoverJobs` 在已连接时使用 `adminJobsConnected`（30 s），断线恢复
+  `adminJobs`（5 s）；四者共用一个由连接状态派生的间隔，仍同时驱动「运行记录」标签页计数，不按标签页
+  关闭。之所以不设 `false`：上述四个服务不发帧，任务会停在 RUNNING/PENDING。
+- **任务活动弹层撤回**：`ScanActivityPopover` 恢复基线（`refetchInterval: open ? 5_000 : false`，不读取
+  连接状态）。它同时展示扫描/元数据重识别（有帧）与 STRM/片头片尾/弹幕/封面（无帧）的任务，且常驻用户
+  壳层；接入连接状态会让无帧任务冻结，也会让用户壳层常驻订阅 admin 频道。
+- **离开页面期间的帧会让缓存过期**：`invalidateSubscribedQueries` 对匹配的**活动**查询立即重取，对**未
+  挂载**查询改用 `invalidateQueries({ …, refetchType: "none" })` 标记过期。页级 `QueryClient` 的
+  `staleTime` 是 60 s（`web/src/main.tsx`），没有这一步时，卸载期间已结束的任务在 60 s 内重新挂载会继续
+  显示运行中；标记过期优先于 `staleTime`，下次挂载即重取，且卸载期间不发请求。
+- **保持轮询的四类及原因**（写入 `docs/WEB-POLLING-AUDIT.md` 的 LUX-898 小节）：转码会话 2 s、
+  `admin/emby-migrations*` 5 s、媒体库删除任务（`AdminLibraryDeletionPanel`，有任务 5 s / 空闲 15 s）、
+  内容分类索引状态 5 s（仅 `pendingItems`）。它们都没有被任何管理事件 scope 覆盖，`invalidate` 帧不会因
+  这些数据变化而出现；`all` 帧只在连接建立与广播 lag 降级时出现，不能当常态刷新。补齐需要后端新增或
+  扩展事件 scope，超出本任务范围（`src/` 未改）。
+- **测试**：`web/tests/admin-realtime-polling.test.tsx`（11 例）——仪表盘“断线 15 s / 已连接 60 s / 断线
+  恢复 / 重连恢复 / `1008`”，四类任务列表“未连接 5 s / 已连接 30 s / 断线恢复 5 s”，任务活动弹层在已连接
+  与断线时都保持 5 s；用户壳层页面收到 `jobs` 帧不会让 `adminTaskActivity` 重取且只开一条连接；用户频道
+  上下文声称 `connected` 时管理页仍按 15 s 轮询；转码 2 s、媒体库删除任务（有任务 5 s / 空闲 15 s）与内容
+  索引（`pendingItems` 时 5 s）不变。`admin-events.test.tsx` 新增一例：`staleTime` 60 s + 页面卸载期间
+  收到 `jobs` 帧 → 重新挂载必须重取，卸载期间不发请求。`web/tests/realtime-client.test.ts` 新增
+  `observeRealtime` 用例（不建连、收帧与状态、退出不关闭 owner 的 socket）。
+- **文档**：`docs/WEB-POLLING-AUDIT.md` 第 27 行与「需要后续任务处理」第 1 条改为当前事实；表格第 10、
+  15–20 行更新为“弹层不接入 / 仪表盘 60 s / 四类列表 30 s / 删除任务不变”，并按最终代码更正行号
+  （`ScanActivityPopover.tsx:38`、`AdminDashboardPage.tsx:22`、`AdminOperationsPage.tsx:263/269/275/281`、
+  `AdminLibraryDeletionPanel.tsx:23`、`AdminTranscodingPage.tsx:44`）；文末「LUX-898」小节记录 `jobs` 帧
+  覆盖范围、剩余轮询表、所有权与过期标记、降权窗口、后续工作（给缺失的服务补 `AdminEventHub` 后才能
+  进一步关闭）与复核命令。
+- **未做**：不改 `src/` 与后端事件 scope；不删/不改 SSE 以外的实时通道代码（LUX-897 已处理）；不改
+  `web/src/lib/realtime/{socket,types}.ts` 的协议或退避；不改转码 / Emby 迁移 / 媒体库删除 / 内容索引的
+  轮询配置。
+
+验证（2026-11-07，本机 arm64）：`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web build`、
+`pnpm --dir web exec tsc --noEmit` 通过；`pnpm --dir web test` 连跑两次，均为 167 个 `node --test` 用例 +
+170 个 vitest 文件 / 1584 例全绿（`asset-precompression` 需要先构建 `web/dist`，因此构建在两次测试之前
+执行）。先写的失败用例在实现后转绿：首轮 4 红；审查返工 1（仪表盘 60 s/15 s 两态）4 红；审查返工 2
+（30 s/5 s、弹层不接入、壳层不因 `jobs` 帧重取）3 红。`web/tests/realtime-client.test.ts` 的 observer 用例
+同样先红后绿。
+
+#### LUX-899：Lux 原生 `GET /api/v1/items/{item_id}/similar`（Emby Similar 改为兼容适配层）（已完成）
+
+状态：已完成（2026-11-07）。规格修订由项目负责人确认；子会话实现后经 7 轮独立审查返工，最终由本地测试验收（见 `docs/CHANGELOG.md` Unreleased）。依赖：
+LUX-889（已完成，提供 `CatalogService::list_similar_items` 与 `list_similar_catalog_rows`）。
+
+背景：LUX-889 把相似条目只做成 Emby 兼容路由，并约定“不改 `/api/v1` DTO 与 `web/`”。本任务取代该约束中
+关于 `/api/v1` 的部分：Lux 原生接口成为相似条目的权威实现，Emby `/Items/{id}/Similar` 只做协议适配。
+
+范围：
+
+- 新增 `GET /api/v1/items/{item_id}/similar`，鉴权与其他 `/api/v1/items/{item_id}/*` 路由一致（Lux token），
+  执行媒体库 ACL 与内容限制。
+- 请求参数：`limit`（默认 50，上限 1000，非法值 400）；`page`（1 起，默认 1，非法值 400）；`pageSize` 作为 `limit` 的别名（同时提供且不一致返回 400）。项目负责人于 2026-11-07 确认“按规格做分页”，`page` 与 `offset=(page-1)*limit` 属于本任务范围。
+- 响应 DTO 为 Lux 自有类型（不复用 Emby DTO），字段与分页约定沿用现有 `/api/v1` 列表响应，实施前在
+  `docs/API.md` 与 `docs/API-TYPES-SYNC.md` 核对并同步。
+- 相似规则与候选池上限与 LUX-889 完全一致，由同一个 `CatalogService::list_similar_items` 提供，不复制 SQL。
+- Emby `GET /Items/{id}/Similar` 改为调用同一服务，只保留 Emby DTO 映射与 `Fields`/`EnableUserData`/
+  `EnableImageTypes` 等 Emby 参数处理；对外行为（状态码、字段、排序、`TotalRecordCount`）保持不变。
+- 不做：Web 详情页展示（另立任务，需项目负责人单独确认）；新增迁移；改变相似规则；`/Users/{userId}/...` 形态。
+
+验收：
+
+- [x] Lux 路由返回的 `items` 与 Emby 路由在同一库与同一用户下的条目 id 顺序一致（同一服务，回归对照测试）。
+- [x] `limit` 生效；空值按未提供；负数、非整数或超上限 400；不存在或不可见的条目 404；未鉴权 401。
+- [x] 被媒体库 ACL 或内容限制排除的条目不出现在结果或 `totalRecordCount`。
+- [x] Emby `cargo test --locked --test emby emby_similar::` 6/6 保持通过，且不修改其断言。
+- [x] 新增 Lux 路由集成测试（`--test auth_users` 或 `--test library` 中选择与路由所在域一致的分组，实施时在
+      `docs/TEST-TARGETS.md` 登记）。
+- [x] 存储与服务层不新增 SQL 扫描：沿用 LUX-889 的查询计划验收。
+
+预计文件：`src/api/lux_api.rs`（或同域的新模块）、`src/api/emby_similar.rs`、`src/application/catalog.rs`、
+`src/api/dto` 中的 Lux 响应类型、`tests/` 下新增 Lux 路由测试、`docs/API.md`、`docs/API-TYPES-SYNC.md`、
+`docs/COMPATIBILITY.md`、`docs/CHANGELOG.md`、`docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-901：Web 资源详情页“相似推荐”区块
+
+状态：已完成（2026-11-07，提交 `349c4fd9`；“点击卡片进入详情”的专门测试尚未补齐，见下方未勾选项）。承接 LUX-899 中“Web 详情页展示另立任务”的约定。
+依赖：LUX-899（已完成，提供 `GET /api/v1/items/{item_id}/similar`）。
+
+背景：LUX-899 只交付了后端接口，Lux Web 的媒体详情页（`web/src/features/detail/MediaDetailPage.tsx`）目前没有相似推荐区块。
+
+范围：
+
+- API 客户端：`web/src/lib/api/client.ts` 增加 `similarItems(itemId, { limit })`，请求 `/api/v1/items/{id}/similar`，
+  返回 `PageResponse<MediaItem>`；`web/src/lib/api/types.ts` 与 `query-keys.ts` 同步增加类型与查询键。
+- 区块：新增 `web/src/features/detail/MediaSimilarSection.tsx`，在媒体详情页的剧集/主要内容之后、剧照/NFO 之前渲染。
+  - 仅对 `MOVIE` 与 `SERIES` 详情页显示；季度、单集、合集、人物页不显示。
+  - 请求 `limit=12`，只展示第一页，不做翻页控件。
+  - 卡片复用现有 `MediaCard`（`web/src/features/home/media.tsx`），点击进入对应详情页。
+  - 加载中显示与其他区块一致的占位；结果为空或请求失败时整个区块不渲染（相似区不得影响详情页主体）。
+  - 样式写入 `web/src/features/detail/detail.css`，沿用现有详情页区块的间距与标题样式。
+- 不做：后端改动、迁移、新接口、Emby 端改动、翻页/“更多”入口、相似规则调整。
+
+验收：
+
+- [ ] 电影与剧集详情页在有结果时显示区块，卡片数量不超过 12，点击卡片进入对应详情页。
+- [x] 季度、单集、合集、人物页不请求 `similar`、不显示区块。
+- [x] 结果为空或接口返回 404/503/401 时区块不渲染，详情页其余区块正常。
+- [x] 请求参数为 `limit=12`，不发送 `page` 或 `pageSize`（非必须，但不得误用）。
+- [ ] Web 单元测试覆盖：显示、隐藏（空/错误）、类型过滤、链接目标。
+- [x] `pnpm --dir web test`、`pnpm --dir web build`、`pnpm --dir web exec tsc --noEmit` 通过；`docs/CHANGELOG.md` 记录。
+- [x] `docs/API-TYPES-SYNC.md` 标注 Web 已消费 `similar`（路由清点的“无前端消费”改为已接入）。
+
+预计文件：`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/src/lib/api/query-keys.ts`、
+`web/src/features/detail/MediaSimilarSection.tsx`（新）、`web/src/features/detail/MediaDetailPage.tsx`、
+`web/src/features/detail/detail.css`、`web/tests/media-similar-section.test.tsx`（新）、`docs/API-TYPES-SYNC.md`、
+`docs/CHANGELOG.md`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-902：Trakt 评分插件的刮削器排除与协议文档对齐
+
+状态：已完成（2026-11-08，本地合并至 `test`，提交 `6999f50a`…`c08d374d`，未推送）。依赖：无。验证：`plugins::`、`plugin_protocol::tests`、`admin-libraries` vitest 与 `web_static::` 由负责人复跑通过；全量 `--all-targets`、fmt、clippy 由子会话报告通过，负责人未复跑。权威设计见 `docs/decisions/053-scheduled-ratings-sync.md`（ADR-053）；
+评分同步、NFO 旁车写入与 `RATINGS_SYNC` 计划任务已由宿主实现（`src/application/ratings_sync/`），不属于本任务。
+
+背景：`org.lux.trakt-ratings` 是 `type: metadata`、`category: SCRAPER` 的只读查询插件，只实现 `ratings.*`，
+不实现 `metadata.search`。若被选为库刮削器，会在 `metadata.search` 上失败。
+
+范围：
+
+- 刮削器排除：只声明 `ratings.*`、不声明 `metadata.search` 的插件不得被选为库刮削器（后端 `validate_selection` 门禁），
+  Web 选择器不得把它作为可选项提供；已保存但不受支持的值显示为禁用项，不静默隐藏。
+- 清单校验：`ratings.*` 只能由 `metadata` 插件声明，未知 `ratings.*` 能力名拒绝，能力名大小写不敏感。
+- 文档：`docs/PLUGIN-SDK.md` 的评分约定与 ADR-053 及 `ratings_sync` 解析契约一致。
+- 不做：协议类型的第二份定义（已删除，以 `ratings_sync` 为唯一来源）、数据库、迁移、计划任务、NFO 写入、管理 API、新 Web 页面。
+
+验收：
+
+- [ ] 只声明 `ratings.*` 的插件不能被选为库刮削器（API 与单元测试）。
+- [ ] Web：已保存的不受支持刮削器显示为禁用项；只声明 `ratings.*` 的插件不作为新选项出现。
+- [ ] 清单校验大小写不敏感；未知 `ratings.*` 被拒绝。
+- [ ] `docs/PLUGIN-SDK.md` 的评分约定与 `src/application/ratings_sync/output.rs` 一致。
+- [ ] 相关 `cargo test --locked --test plugins <module>::`、`--lib` 过滤、`vitest` 与 `web_static::` 通过。
+
+预计文件：`src/application/plugin_protocol.rs`、`src/application/plugins.rs`、`src/application/scraper.rs`、
+`tests/plugins/`、`web/src/features/admin/AdminLibrariesPage.tsx`、`web/tests/admin-libraries.test.tsx`、
+`docs/PLUGIN-SDK.md`、`docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-903 至 LUX-905：已取消（由 ADR-053 覆盖）
+
+原方案的评分表（`item_external_ratings`、`item_rating_sync_state`）、独立同步服务与 NFO 写回器，与已接受的
+ADR-053 重复，且 ADR-053 不建表、不加迁移。已取消，不实施。若需要每条目的同步状态或“未命中”清单，应另写 ADR 增补。
+
+#### LUX-906：计划任务与管理员触发（已核对，无新增代码）
+
+状态：已完成核对（2026-11-08），未新增代码。结论：
+- 默认关闭：计划任务启用需同时满足插件启用、配置有效、必填项 `clientId` 存在，且媒体库已被显式选中（`src/application/plugins.rs`）；未选中任何库时不登记任务。
+- 未配置 Client ID：手动触发在发起任何上游请求前返回 `PluginNotConfigured`（`src/application/ratings_sync/mod.rs`）。
+- 并发：计划任务与手动触发都经 `RatingsSyncService::start`，共用按媒体库的活跃集合，重复触发返回 `AlreadyActive`。
+- 敏感信息：响应只含 `runId`、`libraryId`；`clientId` 不进入响应。
+- 验证：`cargo test --locked --lib ratings_sync` 17/17 通过（HEAD `c08d374d`）。
+
+#### LUX-907：Web 评分展示（暂缓）
+
+ADR-053 明确 v1 不提供评分界面。若需要，等待 ADR 增补后另立任务。
 
 ## 31. 参考资料
 

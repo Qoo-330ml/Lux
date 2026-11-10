@@ -257,9 +257,8 @@ async fn dashboard_activity_series_metadata(
         return Ok(HashMap::new());
     }
 
-    let principal = crate::application::access::AccessPrincipal::new(UserId::new(), true);
     let items_by_id = catalog
-        .find_items(principal, &item_ids)
+        .find_item_summaries(&item_ids)
         .await
         .map_err(|_| AdminDashboardError::Catalog)?;
     let series_ids = items_by_id
@@ -270,7 +269,7 @@ async fn dashboard_activity_series_metadata(
         .into_iter()
         .collect::<Vec<_>>();
     let series_by_id = catalog
-        .find_items(principal, &series_ids)
+        .find_item_summaries(&series_ids)
         .await
         .map_err(|_| AdminDashboardError::Catalog)?;
 

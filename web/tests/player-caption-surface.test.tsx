@@ -58,7 +58,6 @@ describe("LuxPlayer native caption lifecycle", () => {
           captionTrack={{ id: "caption-1", label: "中文", src: "/caption.vtt" }}
           captionOffset={1}
           captionDuration={10}
-          centerSplash={null}
           fallbackLoading={false}
           fallbackSpeedX={null}
           errorMessage={null}
@@ -82,7 +81,6 @@ describe("LuxPlayer native caption lifecycle", () => {
           captionTrack={{ id: "caption-1", label: "中文", src: "/caption.vtt" }}
           captionOffset={-1}
           captionDuration={5}
-          centerSplash={null}
           fallbackLoading={false}
           fallbackSpeedX={null}
           errorMessage={null}
@@ -134,7 +132,6 @@ describe("LuxPlayer native caption lifecycle", () => {
           onDoubleClick={() => undefined}
           nativeCaptionTrackId="inband-caption-0"
           onNativeCaptionTracksChange={(tracks) => { reported = tracks; }}
-          centerSplash={null}
           fallbackLoading={false}
           fallbackSpeedX={null}
           errorMessage={null}

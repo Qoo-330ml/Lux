@@ -1,0 +1,111 @@
+{
+  "description": "Shared danmaku entry-validity vectors. Both the Rust inspector (src/application/danmaku/xml.rs) and the Web parser (web/src/features/player/danmaku/parse.ts) assert these counts, so the server and the client agree on what a usable entry is. Every vector carries one control entry (<d p=\"1,1,25,16777215,0,0,0,0\">) so the document keeps at least one valid entry; 'valid' and 'dropped' are totals for the whole snippet.",
+  "control": "<d p=\"1,1,25,16777215,0,0,0,0\">control</d>",
+  "vectors": [
+    {
+      "name": "eight_field_p_attribute_is_valid",
+      "note": "Bilibili writes eight p fields; only the first four are meaningful.",
+      "xml": "<i><d p=\"1,1,25,16777215,0,0,0,0\">control</d><d p=\"12.5,1,25,16777215,1700000000,0,deadbeef,65264337\">八字段</d></i>",
+      "valid": 2,
+      "dropped": 0
+    },
+    {
+      "name": "mode_7_is_dropped",
+      "xml": "<i><d p=\"1,1,25,16777215,0,0,0,0\">control</d><d p=\"13,7,25,0,0,0,0,0\">[0,0,\"1-1\",4,\"advanced\",0]</d></i>",
+      "valid": 1,
+      "dropped": 1
+    },
+    {
+      "name": "mode_8_and_unknown_modes_are_dropped",
+      "xml": "<i><d p=\"1,1,25,16777215,0,0,0,0\">control</d><d p=\"14,8,25,0\">code</d><d p=\"15,9,25,0\">unknown</d><d p=\"16,0,25,0\">none</d><d p=\"17,6,25,0\">mode six</d></i>",
+      "valid": 2,
+      "dropped": 3
+    },
+    {
+      "name": "size_below_range_is_valid_and_clamped_by_normalization",
+      "note": "Validity only requires a finite size; the playback parser and the normalization job clamp 12..=64.",
+      "xml": "<i><d p=\"1,1,25,16777215,0,0,0,0\">control</d><d p=\"1,1,11,16777215,0,0,0,0\">too small</d><d p=\"1,1,65,16777215,0,0,0,0\">too large</d></i>",
+      "valid": 3,
+      "dropped": 0
+    },
+    {
+      "name": "size_must_be_finite",
+      "xml": "<i><d p=\"1,1,25,16777215,0,0,0,0\">control</d><d p=\"1,1,NaN,16777215\">nan</d><d p=\"1,1,Infinity,16777215\">inf</d></i>",
+      "valid": 1,
+      "dropped": 2
+    },
+    {
+      "name": "color_must_be_a_24_bit_integer",
+      "xml": "<i><d p=\"1,1,25,16777215,0,0,0,0\">control</d><d p=\"1,1,25,16777216\">overflow</d><d p=\"1,1,25,-1\">negative</d><d p=\"1,1,25,12.5\">fraction</d></i>",
+      "valid": 1,
+      "dropped": 3
+    },
+    {
+      "name": "empty_text_is_dropped",
+      "xml": "<i><d p=\"1,1,25,16777215,0,0,0,0\">control</d><d p=\"1,1,25,16777215,0,0,0,0\"></d><d p=\"1,1,25,16777215,0,0,0,0\">   </d></i>",
+      "valid": 1,
+      "dropped": 2
+    },
+    {
+      "name": "text_over_two_hundred_code_points_is_dropped",
+      "xml": "<i><d p=\"1,1,25,16777215,0,0,0,0\">control</d><d p=\"1,1,25,16777215,0,0,0,0\">AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</d><d p=\"1,1,25,16777215,0,0,0,0\">AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</d></i>",
+      "valid": 2,
+      "dropped": 1
+    },
+    {
+      "name": "text_length_counts_unicode_code_points",
+      "note": "200 astral characters are 400 UTF-16 units but 200 code points.",
+      "xml": "<i><d p=\"1,1,25,16777215,0,0,0,0\">control</d><d p=\"1,1,25,16777215,0,0,0,0\">😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀</d></i>",
+      "valid": 2,
+      "dropped": 0
+    },
+    {
+      "name": "control_character_text_is_dropped",
+      "xml": "<i><d p=\"1,1,25,16777215,0,0,0,0\">control</d><d p=\"1,1,25,16777215,0,0,0,0\">bad&#1;text</d><d p=\"1,1,25,16777215,0,0,0,0\">bad&#x7F;text</d></i>",
+      "valid": 1,
+      "dropped": 2
+    },
+    {
+      "name": "entities_are_decoded_before_the_text_rules",
+      "xml": "<i><d p=\"1,1,25,16777215,0,0,0,0\">control</d><d p=\"1,1,25,16777215,0,0,0,0\">a &amp; b &lt;tag&gt; &#65; &quot;quoted&quot; &apos;single&apos;</d></i>",
+      "valid": 2,
+      "dropped": 0
+    },
+    {
+      "name": "negative_time_is_dropped",
+      "xml": "<i><d p=\"1,1,25,16777215,0,0,0,0\">control</d><d p=\"-1,1,25,16777215\">negative</d></i>",
+      "valid": 1,
+      "dropped": 1
+    },
+    {
+      "name": "time_boundary_is_86400_seconds",
+      "xml": "<i><d p=\"1,1,25,16777215,0,0,0,0\">control</d><d p=\"86400,1,25,16777215\">last second</d><d p=\"86401,1,25,16777215\">past the boundary</d></i>",
+      "valid": 2,
+      "dropped": 1
+    },
+    {
+      "name": "p_attribute_needs_four_fields",
+      "xml": "<i><d p=\"1,1,25,16777215,0,0,0,0\">control</d><d p=\"1,1,25\">too few</d></i>",
+      "valid": 1,
+      "dropped": 1
+    },
+    {
+      "name": "whitespace_around_p_fields_is_tolerated",
+      "xml": "<i><d p=\"1,1,25,16777215,0,0,0,0\">control</d><d p=\" 2 , 5 , 30 , 0 \">padded</d></i>",
+      "valid": 2,
+      "dropped": 0
+    },
+    {
+      "name": "trimmable_text_is_valid",
+      "xml": "<i><d p=\"1,1,25,16777215,0,0,0,0\">control</d><d p=\"1,1,25,16777215,0,0,0,0\">  padded text  </d></i>",
+      "valid": 2,
+      "dropped": 0
+    },
+    {
+      "name": "dirty_entries_do_not_invalidate_the_file",
+      "xml": "<i><d p=\"1,1,25,16777215,0,0,0,0\">control</d><d p=\"2,1,25,16777215\">good</d><d p=\"3,7,25,16777215\">mode 7</d><d p=\"4,1,25,16777216\">color</d><d p=\"5,1,25,16777215\"></d></i>",
+      "valid": 2,
+      "dropped": 3
+    }
+  ]
+}

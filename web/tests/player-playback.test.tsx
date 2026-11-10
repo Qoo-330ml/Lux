@@ -11,6 +11,7 @@ import { api } from "../src/lib/api/client";
 import { chooseLuxOptionByValue, luxCombobox, luxSelectValue } from "./lux-select-helpers";
 import { queryKeys } from "../src/lib/api/query-keys";
 import { mockPlaybackBootstrap } from "./player-test-helpers";
+import { trackMenuButton } from "./player-test-helpers";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -31,6 +32,11 @@ function dispatchPointer(
 
 function CurrentPath() {
   return <output data-testid="current-path">{useLocation().pathname}</output>;
+}
+
+function RouteStateProbe() {
+  const location = useLocation();
+  return <output data-testid="route-state">{location.state ? "present" : "cleared"}</output>;
 }
 
 describe("PlayerPage playback synchronization", () => {
@@ -57,6 +63,7 @@ describe("PlayerPage playback synchronization", () => {
     vi.spyOn(api, "stopWebPlaybackSession").mockResolvedValue(undefined);
     vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => undefined);
     vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -421,73 +428,6 @@ describe("PlayerPage playback synchronization", () => {
     expect(api.createWebPlaybackSession).toHaveBeenCalledTimes(1);
   });
 
-  it("stops the old session before creating a selected replacement source", async () => {
-    const lifecycle: string[] = [];
-    vi.mocked(api.createWebPlaybackSession).mockImplementation(async (_itemId, sourceId) => {
-      lifecycle.push(`create:${sourceId}`);
-      return {
-        sessionId: `web-${sourceId}`,
-        playSessionId: `lux-web:web-${sourceId}`,
-        sourceId,
-        tier: 0,
-        expiresAt: 1_900_000_000,
-        plan: {
-          type: "DIRECT",
-          url: `/api/v1/playback/sessions/web-${sourceId}/direct?expires=1900000000&signature=test`,
-        },
-      };
-    });
-    vi.mocked(api.stopWebPlaybackSession).mockImplementation(async (sessionId) => {
-      lifecycle.push(`stop:${sessionId}`);
-    });
-    vi.spyOn(api, "item").mockResolvedValue({
-      id: "movie-switch",
-      title: "版本切换测试",
-      itemType: "MOVIE",
-      mediaSources: [
-        { id: "source-1", isDefault: true, qualityLabel: "1080P" },
-        { id: "source-2", qualityLabel: "4K" },
-      ],
-    });
-    vi.spyOn(api, "playback").mockResolvedValue({
-      positionTicks: 0,
-      isPlayed: false,
-      state: null,
-      isPaused: false,
-    });
-
-    container = document.createElement("div");
-    document.body.append(container);
-    root = createRoot(container);
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-
-    await act(async () => {
-      root?.render(
-        <QueryClientProvider client={queryClient}>
-          <MemoryRouter initialEntries={["/watch/movie-switch"]}>
-            <Routes>
-              <Route path="watch/:itemId" element={<PlayerPage />} />
-            </Routes>
-          </MemoryRouter>
-        </QueryClientProvider>,
-      );
-    });
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-
-    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
-    if (!settings) throw new Error("settings control was not rendered");
-    await act(async () => settings.click());
-    expect(luxCombobox(container, "选择播放版本")).not.toBeNull();
-    await chooseLuxOptionByValue(container, "选择播放版本", "source-2");
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    });
-
-    expect(lifecycle).toEqual(["create:source-1", "stop:web-source-1", "create:source-2"]);
-  });
-
   it("toggles only the local danmu visibility control without playback requests", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-danmu-toggle",
@@ -536,14 +476,180 @@ describe("PlayerPage playback synchronization", () => {
     expect(container.textContent).not.toContain("热力图");
   });
 
-  it("keeps presentation settings local and reapplies them across source changes", async () => {
+  it("opens the keyboard shortcut help with ? (no control-bar button) and closes it with Escape", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-shortcut-help",
+      title: "快捷键帮助测试",
+      itemType: "MOVIE",
+      mediaSources: [{ id: "source-shortcut-help", isDefault: true, durationTicks: 1_200_000_000 }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({
+      positionTicks: 0,
+      isPlayed: false,
+      state: null,
+      isPaused: false,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-shortcut-help"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector(".lux-player-shortcut-help")).toBeNull();
+    expect(container.querySelector('[aria-label="键盘快捷键"]')).toBeNull();
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "?", bubbles: true }));
+    });
+
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    expect(dialog).not.toBeNull();
+    expect(dialog?.getAttribute("aria-modal")).toBe("true");
+    expect(container.querySelector("#lux-player-shortcut-help-title")?.textContent).toBe("键盘快捷键");
+    expect(dialog?.textContent).toContain("后退 10 秒");
+    expect(dialog?.textContent).toContain("Esc");
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    });
+
+    expect(container.querySelector(".lux-player-shortcut-help")).toBeNull();
+  });
+
+  it("closes the settings panel on a pointer press outside it but not inside it", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-settings-outside",
+      title: "设置外部点击测试",
+      itemType: "MOVIE",
+      mediaSources: [{ id: "source-settings-outside", isDefault: true, durationTicks: 1_200_000_000 }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({
+      positionTicks: 0,
+      isPlayed: false,
+      state: null,
+      isPaused: false,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-settings-outside"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const settings = container.querySelector<HTMLButtonElement>('button[aria-label="播放器设置"]');
+    if (!settings) throw new Error("settings control was not rendered");
+    await act(async () => settings.click());
+    expect(container.querySelector(".lux-player-settings-drawer")).not.toBeNull();
+
+    await act(async () => {
+      container?.querySelector(".lux-player-settings-drawer")?.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
+    });
+    expect(container.querySelector(".lux-player-settings-drawer")).not.toBeNull();
+
+    await act(async () => {
+      document.body.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
+    });
+    expect(container.querySelector(".lux-player-settings-drawer")).toBeNull();
+  });
+
+  async function renderSimplePlayer(id: string) {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id,
+      title: "抽屉测试",
+      itemType: "MOVIE",
+      mediaSources: [{ id: `source-${id}`, isDefault: true, durationTicks: 1_200_000_000 }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({ positionTicks: 0, isPlayed: false, state: null, isPaused: false });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={[`/watch/${id}`]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    return container;
+  }
+
+  it("opens playback information as the settings drawer's info tab with the I key", async () => {
+    const host = await renderSimplePlayer("movie-info-key");
+    expect(host.querySelector(".lux-player-settings-drawer")).toBeNull();
+
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "i", bubbles: true }));
+    });
+    const drawer = host.querySelector(".lux-player-settings-drawer");
+    expect(drawer).not.toBeNull();
+    const selected = host.querySelector('[role="tab"][aria-selected="true"]');
+    expect(selected?.textContent?.trim()).toBe("播放信息");
+    expect(host.querySelector('[aria-label="复制播放信息"]')).not.toBeNull();
+
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "i", bubbles: true }));
+    });
+    expect(host.querySelector(".lux-player-settings-drawer")).toBeNull();
+  });
+
+  it("breathes the centre mark until the media element has data", async () => {
+    const host = await renderSimplePlayer("movie-center-loading");
+    const control = () => host.querySelector<HTMLButtonElement>(".lux-player-center-control");
+    if (!control()) throw new Error("centre control was not rendered");
+    expect(control()?.classList.contains("is-loading")).toBe(true);
+    expect(control()?.getAttribute("aria-label")).toBe("加载中");
+
+    const video = host.querySelector<HTMLVideoElement>("video");
+    await act(async () => video?.dispatchEvent(new Event("loadedmetadata")));
+    expect(control()?.classList.contains("is-loading")).toBe(false);
+    expect(control()?.getAttribute("aria-label")).toBe("播放");
+
+    await act(async () => video?.dispatchEvent(new Event("waiting")));
+    expect(control()?.classList.contains("is-loading")).toBe(true);
+    await act(async () => video?.dispatchEvent(new Event("playing")));
+    expect(control()?.classList.contains("is-loading")).toBe(false);
+  });
+
+  it("keeps presentation settings local without rebuilding the playback session", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-presentation",
       title: "画面设置测试",
       itemType: "MOVIE",
       mediaSources: [
         { id: "source-presentation-1", isDefault: true, qualityLabel: "1080P" },
-        { id: "source-presentation-2", qualityLabel: "4K" },
       ],
     });
     vi.spyOn(api, "playback").mockResolvedValue({
@@ -576,53 +682,45 @@ describe("PlayerPage playback synchronization", () => {
     if (!settings) throw new Error("settings control was not rendered");
     await act(async () => settings.click());
 
+    const tab = (name: string) => Array.from(container?.querySelectorAll<HTMLButtonElement>('[role="tab"]') ?? [])
+      .find((candidate) => candidate.textContent?.trim() === name);
+    const choice = (group: string, value: string) =>
+      container?.querySelector<HTMLButtonElement>(`[role="radiogroup"][aria-label="${group}"] [data-value="${value}"]`);
+
     const loop = container.querySelector<HTMLButtonElement>('[role="switch"][aria-labelledby="lux-player-loop-label"]');
-    const aspect = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
-      .find((button) => button.textContent?.trim() === "4:3");
-    const flip = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
-      .find((button) => button.textContent?.trim() === "水平镜像");
     const video = container.querySelector<HTMLVideoElement>("video");
-    if (!loop || !aspect || !flip || !video) throw new Error("presentation controls were not rendered");
+    if (!loop || !video) throw new Error("presentation controls were not rendered");
     const sessionCallsBeforeSettings = vi.mocked(api.createWebPlaybackSession).mock.calls.length;
     const eventCallsBeforeSettings = vi.mocked(api.webPlaybackEvent).mock.calls.length;
 
     await act(async () => loop.click());
+    expect(loop.getAttribute("aria-checked")).toBe("true");
+    expect(video.loop).toBe(true);
+
+    await act(async () => tab("长宽比")?.click());
+    const aspect = choice("长宽比", "4:3");
+    const flip = choice("画面翻转", "horizontal");
+    if (!aspect || !flip) throw new Error("aspect and flip controls were not rendered");
     await act(async () => aspect.click());
     await act(async () => flip.click());
 
-    expect(loop.getAttribute("aria-checked")).toBe("true");
-    expect(video.loop).toBe(true);
     expect(video.style.aspectRatio).toBe("4 / 3");
     expect(video.style.transform).toBe("translate(-50%, -50%) scaleX(-1)");
     expect(vi.mocked(api.createWebPlaybackSession)).toHaveBeenCalledTimes(sessionCallsBeforeSettings);
     expect(vi.mocked(api.webPlaybackEvent)).toHaveBeenCalledTimes(eventCallsBeforeSettings);
 
-    await chooseLuxOptionByValue(container, "选择播放版本", "source-presentation-2");
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    });
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-
-    const replacementVideo = container.querySelector<HTMLVideoElement>("video");
-    if (!replacementVideo) {
-      throw new Error("replacement video was not rendered after the source change");
-    }
-    expect(replacementVideo?.loop).toBe(true);
-    expect(replacementVideo?.style.aspectRatio).toBe("4 / 3");
-    expect(replacementVideo?.style.transform).toBe("translate(-50%, -50%) scaleX(-1)");
-
-    const defaultAspect = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
-      .find((button) => button.textContent?.trim() === "默认");
-    const normalFlip = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
-      .find((button) => button.textContent?.trim() === "正常");
+    const defaultAspect = choice("长宽比", "default");
+    const normalFlip = choice("画面翻转", "normal");
     if (!defaultAspect || !normalFlip) throw new Error("default presentation controls were not rendered");
     await act(async () => defaultAspect.click());
     await act(async () => normalFlip.click());
 
-    expect(replacementVideo?.style.aspectRatio).toBe("");
-    expect(replacementVideo?.style.transform).toBe("");
+    expect(video.style.aspectRatio).toBe("");
+    expect(video.style.transform).toBe("");
+
+    await act(async () => tab("长宽比")?.click());
+    await act(async () => choice("长宽比", "fill")?.click());
+    expect(video.style.objectFit).toBe("cover");
   });
 
   it("restarts locally at the end only while loop is enabled", async () => {
@@ -740,7 +838,6 @@ describe("PlayerPage playback synchronization", () => {
     const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
     if (!video || !settings) throw new Error("chapter player was not rendered");
     await act(async () => settings.click());
-    expect(luxCombobox(container, "选择播放版本")).not.toBeNull();
     Object.defineProperty(video, "duration", { configurable: true, value: 10 });
     Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 3 });
     await act(async () => video.dispatchEvent(new Event("durationchange")));
@@ -754,21 +851,8 @@ describe("PlayerPage playback synchronization", () => {
     await act(async () => skip.click());
     expect(video.currentTime).toBe(6);
     expect(vi.mocked(api.createWebPlaybackSession)).toHaveBeenCalledTimes(sessionCallsBeforeSeek);
-
-    await chooseLuxOptionByValue(container, "选择播放版本", "source-chapters-2");
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    });
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-    const replacementVideo = container.querySelector<HTMLVideoElement>("video");
-    if (!replacementVideo) throw new Error("replacement chapter video was not rendered");
-    Object.defineProperty(replacementVideo, "duration", { configurable: true, value: 10 });
-    await act(async () => replacementVideo.dispatchEvent(new Event("durationchange")));
-    expect(container.querySelector("[aria-label='章节：片头开始']")).toBeNull();
-    expect(container.querySelector("[aria-label='章节：另一版本']")).not.toBeNull();
-    expect(container.querySelector("[aria-label='跳过片头']")).toBeNull();
+    // Chapters belong to the played source only: the other version's marker never renders here.
+    expect(container.querySelector("[aria-label='章节：另一版本']")).toBeNull();
   });
 
   it("selects and clears a current-source WebVTT track without replacing the playback session", async () => {
@@ -812,7 +896,7 @@ describe("PlayerPage playback synchronization", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="字幕"]');
     if (!settings) throw new Error("settings control was not rendered");
     await act(async () => settings.click());
 
@@ -889,6 +973,7 @@ describe("PlayerPage playback synchronization", () => {
     );
     expect(container.querySelector("script")).toBeNull();
 
+    await act(async () => trackMenuButton(container!, "字幕").click());
     const captionOffset = container.querySelector<HTMLInputElement>("#lux-player-caption-offset");
     const captionOffsetValue = container.querySelector<HTMLOutputElement>(".lux-player-caption-offset-value");
     if (!captionOffset || !captionOffsetValue) throw new Error("caption offset control was not rendered");
@@ -906,76 +991,6 @@ describe("PlayerPage playback synchronization", () => {
     expect(container.querySelector(".lux-player-caption-text")).toBeNull();
     expect(vi.mocked(api.createWebPlaybackSession)).toHaveBeenCalledTimes(sessionCallsBeforeOffset);
     expect(vi.mocked(api.webPlaybackEvent)).toHaveBeenCalledTimes(eventCallsBeforeOffset);
-  });
-
-  it("creates a local PNG from the current video frame without playback requests", async () => {
-    vi.spyOn(api, "item").mockResolvedValue({
-      id: "movie-screenshot",
-      title: "截图: 测试/媒体",
-      itemType: "MOVIE",
-      mediaSources: [{ id: "source-screenshot", isDefault: true, durationTicks: 1_200_000_000 }],
-    });
-    vi.spyOn(api, "playback").mockResolvedValue({
-      positionTicks: 0,
-      isPlayed: false,
-      state: null,
-      isPaused: false,
-    });
-
-    container = document.createElement("div");
-    document.body.append(container);
-    root = createRoot(container);
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    await act(async () => {
-      root?.render(
-        <QueryClientProvider client={queryClient}>
-          <MemoryRouter initialEntries={["/watch/movie-screenshot"]}>
-            <Routes>
-              <Route path="watch/:itemId" element={<PlayerPage />} />
-            </Routes>
-          </MemoryRouter>
-        </QueryClientProvider>,
-      );
-    });
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-
-    const video = container.querySelector<HTMLVideoElement>("video");
-    const screenshot = container.querySelector<HTMLButtonElement>('[aria-label="截图"]');
-    if (!video || !screenshot) throw new Error("screenshot controls were not rendered");
-    Object.defineProperties(video, {
-      videoWidth: { configurable: true, value: 1920 },
-      videoHeight: { configurable: true, value: 1080 },
-    });
-    const drawImage = vi.fn();
-    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
-      drawImage,
-    } as unknown as CanvasRenderingContext2D);
-    vi.spyOn(HTMLCanvasElement.prototype, "toBlob").mockImplementation((callback) => {
-      callback(new Blob(["fixture"], { type: "image/png" }));
-    });
-    const createObjectURL = vi.fn(() => "blob:lux-screenshot");
-    const revokeObjectURL = vi.fn();
-    vi.stubGlobal("URL", { createObjectURL, revokeObjectURL });
-    let downloadedFileName = "";
-    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function click() {
-      downloadedFileName = this.download;
-    });
-    const sessionCallsBeforeScreenshot = vi.mocked(api.createWebPlaybackSession).mock.calls.length;
-    const eventCallsBeforeScreenshot = vi.mocked(api.webPlaybackEvent).mock.calls.length;
-
-    await act(async () => screenshot.click());
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-
-    expect(drawImage).toHaveBeenCalledWith(video, 0, 0, 1920, 1080);
-    expect(createObjectURL).toHaveBeenCalledTimes(1);
-    expect(revokeObjectURL).toHaveBeenCalledWith("blob:lux-screenshot");
-    expect(downloadedFileName).toMatch(/^截图- 测试-媒体-.*\.png$/);
-    expect(vi.mocked(api.createWebPlaybackSession)).toHaveBeenCalledTimes(sessionCallsBeforeScreenshot);
-    expect(vi.mocked(api.webPlaybackEvent)).toHaveBeenCalledTimes(eventCallsBeforeScreenshot);
   });
 
   it("waits for the direct session to stop before creating a server fallback", async () => {
@@ -1240,5 +1255,519 @@ describe("PlayerPage playback synchronization", () => {
     expect(video.currentTime).toBe(60);
     act(() => vi.advanceTimersByTime(3_000));
     expect(player.classList.contains("controls-hidden")).toBe(true);
+  });
+
+  it("offers the next episode after playback ends and can follow it immediately", async () => {
+    const episodes = {
+      "episode-1": { id: "episode-1", title: "第一集", itemType: "EPISODE" as const, seriesId: "series-1", parentId: "season-1", indexNumber: 1, mediaSources: [{ id: "source-1", isDefault: true }] },
+      "episode-2": { id: "episode-2", title: "第二集", itemType: "EPISODE" as const, seriesId: "series-1", parentId: "season-1", indexNumber: 2, mediaSources: [{ id: "source-2", isDefault: true }] },
+    };
+    vi.spyOn(api, "item").mockImplementation(async (itemId) => (
+      episodes[itemId as keyof typeof episodes] ?? {
+        id: itemId,
+        title: "示例电影",
+        itemType: "MOVIE",
+        mediaSources: [{ id: "movie-source", isDefault: true }],
+      }
+    ));
+    vi.spyOn(api, "playback").mockResolvedValue({ positionTicks: 0, isPlayed: false, state: null, isPaused: false });
+    vi.spyOn(api, "children").mockResolvedValue({ items: Object.values(episodes) });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/episode-1"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<><PlayerPage /><CurrentPath /></>} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const video = container.querySelector<HTMLVideoElement>("video");
+    if (!video) throw new Error("video element was not rendered");
+    Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 0 });
+    await act(async () => video.dispatchEvent(new Event("loadedmetadata")));
+    await act(async () => video.dispatchEvent(new Event("play")));
+    await act(async () => video.dispatchEvent(new Event("ended")));
+
+    const card = container.querySelector("[aria-label='自动连播下一集']");
+    expect(card?.textContent).toContain("下一集将在 10 秒后播放");
+    const playNow = container.querySelector<HTMLButtonElement>("[aria-label='立即播放下一集']");
+    if (!playNow) throw new Error("auto play next card was not rendered");
+    await act(async () => playNow.click());
+    expect(container.querySelector('[data-testid="current-path"]')?.textContent).toBe("/watch/episode-2");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    // The countdown jump carries the one-shot marker, so the next episode starts by itself.
+    expect(HTMLMediaElement.prototype.play).toHaveBeenCalled();
+  });
+
+  it("keeps a movie without a next episode free of the countdown card", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-single",
+      title: "单集电影",
+      itemType: "MOVIE",
+      mediaSources: [{ id: "source-single", isDefault: true }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({ positionTicks: 0, isPlayed: false, state: null, isPaused: false });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-single"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const video = container.querySelector<HTMLVideoElement>("video");
+    if (!video) throw new Error("video element was not rendered");
+    Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 0 });
+    await act(async () => video.dispatchEvent(new Event("loadedmetadata")));
+    await act(async () => video.dispatchEvent(new Event("play")));
+    await act(async () => video.dispatchEvent(new Event("ended")));
+
+    expect(container.querySelector("[aria-label='自动连播下一集']")).toBeNull();
+  });
+
+  it("skips credits into the next episode, or to the media end when there is none", async () => {
+    const episodes = {
+      "credits-episode-1": {
+        id: "credits-episode-1",
+        title: "片尾第一集",
+        itemType: "EPISODE" as const,
+        seriesId: "series-credits",
+        parentId: "season-credits",
+        indexNumber: 1,
+        mediaSources: [{
+          id: "credits-source-1",
+          isDefault: true,
+          chapters: [{ startPositionTicks: 900_000_000, name: "片尾", markerType: "CREDITS_START", chapterIndex: 1 }],
+        }],
+      },
+      "credits-episode-2": {
+        id: "credits-episode-2",
+        title: "片尾第二集",
+        itemType: "EPISODE" as const,
+        seriesId: "series-credits",
+        parentId: "season-credits",
+        indexNumber: 2,
+        mediaSources: [{ id: "credits-source-2", isDefault: true }],
+      },
+      "credits-movie": {
+        id: "credits-movie",
+        title: "片尾电影",
+        itemType: "MOVIE" as const,
+        mediaSources: [{
+          id: "credits-movie-source",
+          isDefault: true,
+          chapters: [{ startPositionTicks: 900_000_000, name: "片尾", markerType: "CREDITS_START", chapterIndex: 1 }],
+        }],
+      },
+    };
+    vi.spyOn(api, "item").mockImplementation(async (itemId) => (
+      episodes[itemId as keyof typeof episodes]
+    ));
+    vi.spyOn(api, "playback").mockResolvedValue({ positionTicks: 0, isPlayed: false, state: null, isPaused: false });
+    vi.spyOn(api, "children").mockResolvedValue({
+      items: [episodes["credits-episode-1"], episodes["credits-episode-2"]],
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/credits-episode-1"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<><PlayerPage /><CurrentPath /></>} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const video = container.querySelector<HTMLVideoElement>("video");
+    if (!video) throw new Error("video element was not rendered");
+    Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 95 });
+    await act(async () => video.dispatchEvent(new Event("durationchange")));
+    await act(async () => {
+      video.dispatchEvent(new Event("timeupdate"));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const skipCredits = container.querySelector<HTMLButtonElement>("[aria-label='跳过片尾']");
+    if (!skipCredits) throw new Error("skip credits control was not rendered");
+    await act(async () => skipCredits.click());
+    expect(container.querySelector('[data-testid="current-path"]')?.textContent).toBe("/watch/credits-episode-2");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(HTMLMediaElement.prototype.play).toHaveBeenCalled();
+
+    await act(async () => root?.unmount());
+    root = undefined;
+    container.remove();
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const movieClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={movieClient}>
+          <MemoryRouter initialEntries={["/watch/credits-movie"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const movieVideo = container.querySelector<HTMLVideoElement>("video");
+    if (!movieVideo) throw new Error("movie video element was not rendered");
+    Object.defineProperty(movieVideo, "duration", { configurable: true, value: 120 });
+    Object.defineProperty(movieVideo, "currentTime", { configurable: true, writable: true, value: 95 });
+    await act(async () => movieVideo.dispatchEvent(new Event("durationchange")));
+    await act(async () => {
+      movieVideo.dispatchEvent(new Event("timeupdate"));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const movieSkip = container.querySelector<HTMLButtonElement>("[aria-label='跳过片尾']");
+    if (!movieSkip) throw new Error("movie skip credits control was not rendered");
+    await act(async () => movieSkip.click());
+    expect(movieVideo.currentTime).toBe(119);
+  });
+
+  it("auto starts playback when the route carries the one-shot marker", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "episode-auto-1",
+      title: "自动起播第一集",
+      itemType: "EPISODE",
+      seriesId: "series-auto",
+      parentId: "season-auto",
+      indexNumber: 1,
+      mediaSources: [{ id: "auto-source-1", isDefault: true }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({ positionTicks: 0, isPlayed: false, state: null, isPaused: false });
+    vi.spyOn(api, "children").mockResolvedValue({ items: [] });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter
+            initialEntries={[{
+              pathname: "/watch/episode-auto-1",
+              state: { luxAutoStartPlayback: true },
+            }]}
+          >
+            <Routes>
+              <Route path="watch/:itemId" element={<><PlayerPage /><RouteStateProbe /></>} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(HTMLMediaElement.prototype.play).toHaveBeenCalled();
+    expect(container.querySelector('[data-testid="route-state"]')?.textContent).toBe("cleared");
+  });
+
+  it("does not start playback without the marker", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "episode-manual-1",
+      title: "手动起播第一集",
+      itemType: "EPISODE",
+      seriesId: "series-manual",
+      parentId: "season-manual",
+      indexNumber: 1,
+      mediaSources: [{ id: "manual-source-1", isDefault: true }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({ positionTicks: 0, isPlayed: false, state: null, isPaused: false });
+    vi.spyOn(api, "children").mockResolvedValue({ items: [] });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/episode-manual-1"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(HTMLMediaElement.prototype.play).not.toHaveBeenCalled();
+    expect(container.querySelector('[aria-label="播放"]')).not.toBeNull();
+  });
+
+  it("keeps a paused, manually playable player when the browser blocks auto start", async () => {
+    vi.mocked(HTMLMediaElement.prototype.play).mockRejectedValue(
+      new DOMException("play() failed because the user didn't interact", "NotAllowedError"),
+    );
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "episode-blocked-1",
+      title: "被拦截自动起播",
+      itemType: "EPISODE",
+      seriesId: "series-blocked",
+      parentId: "season-blocked",
+      indexNumber: 1,
+      mediaSources: [{ id: "blocked-source-1", isDefault: true }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({ positionTicks: 0, isPlayed: false, state: null, isPaused: false });
+    vi.spyOn(api, "children").mockResolvedValue({ items: [] });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter
+            initialEntries={[{
+              pathname: "/watch/episode-blocked-1",
+              state: { luxAutoStartPlayback: true },
+            }]}
+          >
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(HTMLMediaElement.prototype.play).toHaveBeenCalled();
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    const manualPlay = container.querySelector<HTMLButtonElement>('[aria-label="播放"]');
+    expect(manualPlay).not.toBeNull();
+    vi.mocked(HTMLMediaElement.prototype.play).mockResolvedValue(undefined);
+    await act(async () => manualPlay?.click());
+    expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(2);
+  });
+
+  it("auto starts once on the server fallback session after a real playback failure", async () => {
+    vi.mocked(HTMLMediaElement.prototype.play)
+      .mockRejectedValueOnce(new DOMException("no supported source", "NotSupportedError"))
+      .mockResolvedValue(undefined);
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "episode-retry-1",
+      title: "回退后自动起播",
+      itemType: "EPISODE",
+      seriesId: "series-retry",
+      parentId: "season-retry",
+      indexNumber: 1,
+      mediaSources: [{ id: "retry-source-1", isDefault: true }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({ positionTicks: 0, isPlayed: false, state: null, isPaused: false });
+    vi.spyOn(api, "children").mockResolvedValue({ items: [] });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter
+            initialEntries={[{
+              pathname: "/watch/episode-retry-1",
+              state: { luxAutoStartPlayback: true },
+            }]}
+          >
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    // 直连会话的起播失败后走服务端回退重载，新会话仍应自动起播一次。
+    expect(vi.mocked(api.createWebPlaybackBootstrap).mock.calls.length).toBeGreaterThanOrEqual(1);
+    expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(2);
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it("drops the auto start request when the fallback session also fails", async () => {
+    const notSupported = () => new DOMException("no supported source", "NotSupportedError");
+    vi.mocked(HTMLMediaElement.prototype.play)
+      .mockRejectedValueOnce(notSupported())
+      .mockRejectedValueOnce(notSupported())
+      .mockResolvedValue(undefined);
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-retry-terminal",
+      title: "回退也失败",
+      itemType: "MOVIE",
+      mediaSources: [{
+        id: "terminal-source",
+        isDefault: true,
+        sourceKind: "LOCAL_FILE",
+        streams: [
+          { index: 0, type: "VIDEO", codec: "hevc" },
+          { index: 1, type: "AUDIO", codec: "aac", isDefault: true },
+          { index: 2, type: "AUDIO", codec: "eac3" },
+        ],
+      }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({ positionTicks: 0, isPlayed: false, state: null, isPaused: false });
+    vi.spyOn(api, "children").mockResolvedValue({ items: [] });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter
+            initialEntries={[{
+              pathname: "/watch/movie-retry-terminal",
+              state: { luxAutoStartPlayback: true },
+            }]}
+          >
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    // 直连起播失败 → 服务端回退重载 → 回退会话起播再失败，回退已用尽，属终态失败。
+    expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(2);
+    expect(container.querySelector('[role="alert"]')).not.toBeNull();
+
+    // 终态失败清掉一次性自动起播标记，之后手动切音轨的新会话不得自动起播。
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="音轨"]');
+    if (!settings) throw new Error("settings control was not rendered");
+    await act(async () => settings.click());
+    await chooseLuxOptionByValue(container, "选择音轨", "2");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancels the countdown when the viewer resumes playback or seeks", async () => {
+    const episodes = {
+      "episode-resume-1": { id: "episode-resume-1", title: "重看第一集", itemType: "EPISODE" as const, seriesId: "series-resume", parentId: "season-resume", indexNumber: 1, mediaSources: [{ id: "resume-source-1", isDefault: true }] },
+      "episode-resume-2": { id: "episode-resume-2", title: "重看第二集", itemType: "EPISODE" as const, seriesId: "series-resume", parentId: "season-resume", indexNumber: 2, mediaSources: [{ id: "resume-source-2", isDefault: true }] },
+    };
+    vi.spyOn(api, "item").mockImplementation(async (itemId) => episodes[itemId as keyof typeof episodes]);
+    vi.spyOn(api, "playback").mockResolvedValue({ positionTicks: 0, isPlayed: false, state: null, isPaused: false });
+    vi.spyOn(api, "children").mockResolvedValue({ items: Object.values(episodes) });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/episode-resume-1"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<><PlayerPage /><CurrentPath /></>} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const video = container.querySelector<HTMLVideoElement>("video");
+    if (!video) throw new Error("video element was not rendered");
+    Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 0 });
+    await act(async () => video.dispatchEvent(new Event("loadedmetadata")));
+    await act(async () => video.dispatchEvent(new Event("play")));
+    await act(async () => video.dispatchEvent(new Event("ended")));
+    expect(container.querySelector("[aria-label='自动连播下一集']")).not.toBeNull();
+
+    // Pressing play on the ended media cancels the countdown instead of switching episodes.
+    await act(async () => video.dispatchEvent(new Event("play")));
+    expect(container.querySelector("[aria-label='自动连播下一集']")).toBeNull();
+    expect(container.querySelector('[data-testid="current-path"]')?.textContent).toBe("/watch/episode-resume-1");
+
+    // A seek inside the same episode also retracts the card.
+    await act(async () => video.dispatchEvent(new Event("ended")));
+    expect(container.querySelector("[aria-label='自动连播下一集']")).not.toBeNull();
+    await act(async () => {
+      video.dispatchEvent(new Event("seeking"));
+      video.dispatchEvent(new Event("seeked"));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(container.querySelector("[aria-label='自动连播下一集']")).toBeNull();
+    expect(container.querySelector('[data-testid="current-path"]')?.textContent).toBe("/watch/episode-resume-1");
   });
 });

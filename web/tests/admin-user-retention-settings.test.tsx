@@ -30,7 +30,7 @@ describe("AdminUserSettingsPage retention settings", () => {
     expect(input.value).toBe("30");
     expect(container.textContent).toContain("只影响之后移入回收站的账号");
     expect(container.querySelector('input[aria-label="活动记录保留天数"]')).toBeTruthy();
-    expect(findActivityInput().value).toBe("90");
+    expect(findActivityInput().value).toBe("7");
 
     await act(async () => {
       changeInput(input, "14");

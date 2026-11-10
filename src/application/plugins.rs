@@ -35,11 +35,14 @@ use crate::{
             CHAPTER_FINGERPRINT_POINT_DURATION_TICKS, CHAPTER_FINGERPRINT_SAMPLE_RATE,
             CHAPTER_LOOKUP_CAPABILITY, CHAPTER_LOOKUP_METHOD,
             CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES, ChapterDetectRpcRequest, ChapterDetectRpcResult,
-            ChapterLookupRpcRequest, ChapterLookupRpcResult, DANMAKU_MATCH_CAPABILITY,
-            DANMAKU_MATCH_METHOD, DanmakuMatchRpcRequest, DanmakuMatchRpcResult,
-            DanmakuMatchStatus, EMBY_MIGRATION_CAPABILITY, IP_LOCATION_CAPABILITY,
-            IpLocationRpcRequest, IpLocationRpcResult, LOGIN_BACKGROUND_GET_CAPABILITY,
-            LOGIN_BACKGROUND_GET_METHOD, LoginBackgroundRpcResult, MEDIA_PROBE_CAPABILITY,
+            ChapterLookupRpcRequest, ChapterLookupRpcResult, DANMAKU_FETCH_CAPABILITY,
+            DANMAKU_FETCH_METHOD, DANMAKU_MATCH_CAPABILITY, DANMAKU_MATCH_METHOD,
+            DANMAKU_SEARCH_CAPABILITY, DANMAKU_SEARCH_METHOD, DanmakuFetchResult,
+            DanmakuFetchRpcRequest, DanmakuMatchRpcRequest, DanmakuMatchRpcResult,
+            DanmakuMatchStatus, DanmakuSearchResult, DanmakuSearchRpcRequest,
+            EMBY_MIGRATION_CAPABILITY, IP_LOCATION_CAPABILITY, IpLocationRpcRequest,
+            IpLocationRpcResult, LOGIN_BACKGROUND_GET_CAPABILITY, LOGIN_BACKGROUND_GET_METHOD,
+            LoginBackgroundRpcResult, MEDIA_PROBE_CAPABILITY, METADATA_SEARCH_CAPABILITY,
             MediaProbeRpcResult, MediaProbeRpcStreamType, NOTIFICATION_SEND_CAPABILITY,
             NOTIFICATION_SEND_METHOD, NotificationSendRpcResult, PLUGIN_CATEGORY_MEDIA,
             PLUGIN_CATEGORY_MIGRATION, PLUGIN_CATEGORY_NETWORK, PLUGIN_CATEGORY_NOTIFICATION,
@@ -47,8 +50,9 @@ use crate::{
             PLUGIN_TYPE_DANMAKU, PLUGIN_TYPE_DATA_MIGRATION, PLUGIN_TYPE_IP_LOCATION,
             PLUGIN_TYPE_LOGIN_BACKGROUND, PLUGIN_TYPE_NOTIFICATION, PLUGIN_TYPE_STRM_RESOLVER,
             PluginConfigField, PluginConfigOption, PluginEmbyRouteRequest, PluginEmbyRouteResponse,
-            STRM_RESOLVE_CAPABILITY, STRM_RESOLVE_METHOD, StrmResolveRpcRequest,
-            StrmResolveRpcResult, StrmResolveStatus, is_valid_login_background_asset_id,
+            SECRET_CONFIG_FIELD_KEY, STRM_RESOLVE_CAPABILITY, STRM_RESOLVE_METHOD,
+            StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
+            declares_danmaku_manual_match, is_valid_login_background_asset_id,
         },
         plugin_runtime::{DiscoveredPlugin, PluginCatalog, PluginRuntimeError, PluginSupervisor},
         plugin_store::{
@@ -59,7 +63,7 @@ use crate::{
         schedule::{
             DEFAULT_CHAPTER_DETECTION_SCHEDULE, DEFAULT_DANMAKU_MATCH_SCHEDULE,
             DEFAULT_ONLINE_CHAPTER_DETECTION_SCHEDULE, DEFAULT_STRM_MEDIA_INFO_SCHEDULE,
-            validate_cron,
+            RATINGS_SYNC_TASK_TYPE, validate_cron,
         },
         strm_target::{StrmTargetKind, classify_strm_target},
     },
@@ -154,8 +158,15 @@ pub struct PluginService {
     provider_cache: ProviderResponseCache,
     login_background_refresh_notify: Arc<Notify>,
     login_background_refresh_worker_started: Arc<AtomicBool>,
+    /// Stop handle of the login-background refresh loop; `None` before it starts (and in tests that
+    /// deliberately build a service without it).
+    login_background_refresh_worker:
+        Arc<std::sync::Mutex<Option<crate::application::background_loop::BackgroundLoop>>>,
     login_background_refresh_failures: Arc<Mutex<HashMap<String, LoginBackgroundRefreshFailure>>>,
     login_background_asset_upload_lock: Arc<Mutex<()>>,
+    /// Deadline for one danmaku plugin RPC. Production keeps the supervisor default; tests lower
+    /// it so the timeout path does not have to wait the full 30 s.
+    danmaku_call_timeout: Duration,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -190,6 +201,15 @@ impl PluginService {
         Self::build_with_proxy(database, config_dir, None)
     }
 
+    /// Overrides the deadline used for danmaku plugin RPCs.
+    ///
+    /// Production keeps the supervisor default (the same deadline `danmaku.match` always used).
+    /// A shorter deadline lets tests cover the timeout path without sleeping for 30 s.
+    pub fn with_danmaku_call_timeout(mut self, timeout: Duration) -> Self {
+        self.danmaku_call_timeout = timeout;
+        self
+    }
+
     fn build_with_proxy(
         database: Database,
         config_dir: PathBuf,
@@ -203,6 +223,7 @@ impl PluginService {
             .with_config_dir(config_dir.clone())
             .with_network_proxy_url(proxy_url.clone())
             .with_proxy_bypass(proxy_bypass);
+        let danmaku_call_timeout = supervisor.call_timeout();
         let store = PluginStore::new(config_dir.clone(), proxy_url).ok();
         Self {
             database,
@@ -218,8 +239,10 @@ impl PluginService {
             )),
             login_background_refresh_notify: Arc::new(Notify::new()),
             login_background_refresh_worker_started: Arc::new(AtomicBool::new(false)),
+            login_background_refresh_worker: Arc::new(std::sync::Mutex::new(None)),
             login_background_refresh_failures: Arc::new(Mutex::new(HashMap::new())),
             login_background_asset_upload_lock: Arc::new(Mutex::new(())),
+            danmaku_call_timeout,
         }
     }
 
@@ -236,9 +259,9 @@ impl PluginService {
     }
 
     fn start_login_background_refresh_worker(&self) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        if tokio::runtime::Handle::try_current().is_err() {
             return;
-        };
+        }
         if self
             .login_background_refresh_worker_started
             .swap(true, Ordering::AcqRel)
@@ -247,17 +270,51 @@ impl PluginService {
         }
 
         let service = self.clone();
-        runtime.spawn(async move {
-            let mut interval = tokio::time::interval(LOGIN_BACKGROUND_REFRESH_INTERVAL);
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => service.refresh_selected_login_background(false).await,
-                    _ = service.login_background_refresh_notify.notified() => {
-                        service.refresh_selected_login_background(true).await;
+        let worker = crate::application::background_loop::BackgroundLoop::spawn(
+            "login_background_refresh",
+            move |mut shutdown| {
+                let service = service.clone();
+                async move {
+                    // The observable interval used to tick immediately, which is what keeps the
+                    // cached artwork of the selected plugin fresh after a restart.
+                    service.refresh_selected_login_background(false).await;
+                    loop {
+                        if *shutdown.borrow() {
+                            return;
+                        }
+                        tokio::select! {
+                            _ = tokio::time::sleep(LOGIN_BACKGROUND_REFRESH_INTERVAL) => {}
+                            _ = service.login_background_refresh_notify.notified() => {
+                                service.refresh_selected_login_background(true).await;
+                                continue;
+                            }
+                            changed = shutdown.changed() => {
+                                if changed.is_err() || *shutdown.borrow() {
+                                    return;
+                                }
+                                continue;
+                            }
+                        }
+                        service.refresh_selected_login_background(false).await;
                     }
                 }
-            }
-        });
+            },
+        );
+        if let Ok(mut slot) = self.login_background_refresh_worker.lock() {
+            *slot = Some(worker);
+        }
+    }
+
+    /// Stops the login-background refresh loop and waits for its current pass.
+    pub(crate) async fn shutdown(&self) {
+        let worker = self
+            .login_background_refresh_worker
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(worker) = worker {
+            worker.shutdown().await;
+        }
     }
 
     pub(crate) fn request_login_background_refresh(&self) {
@@ -666,6 +723,7 @@ impl PluginService {
         }
         self.database.install_plugin(&plugin_id).await?;
         self.invalidate_scraper_client_cache();
+        self.provider_cache.clear_provider(&plugin_id).await;
         let current_catalog = self.catalog_snapshot().await;
         if current_catalog
             .get(&plugin_id)
@@ -704,8 +762,12 @@ impl PluginService {
             .await
             .map_err(PluginServiceError::ConfigIo)?;
         self.invalidate_scraper_client_cache();
+        self.provider_cache.clear_provider(&plugin_id).await;
         let _catalog_refresh_guard = self.catalog_refresh_lock.lock().await;
         self.supervisor.stop(&plugin_id).await;
+        // The process may have answered one last request while it was stopping; drop those
+        // responses too, now that no process can still be running with the removed config.
+        self.provider_cache.clear_provider(&plugin_id).await;
         remove_plugin_files(plugin)
             .await
             .map_err(PluginServiceError::ConfigIo)?;
@@ -830,8 +892,10 @@ impl PluginService {
             .set_plugin_enabled(&plugin_id, enabled)
             .await?;
         self.invalidate_scraper_client_cache();
+        self.provider_cache.clear_provider(&plugin_id).await;
         if !enabled {
             self.supervisor.stop(&plugin_id).await;
+            self.provider_cache.clear_provider(&plugin_id).await;
         } else if catalog
             .get(&plugin_id)
             .is_some_and(is_login_background_plugin)
@@ -867,6 +931,12 @@ impl PluginService {
         let view = self.view_for_id(&scraper_id, true, true).await?;
         if view.category != PLUGIN_CATEGORY_SCRAPER || !view.available {
             return Err(PluginServiceError::Unavailable(scraper_id));
+        }
+        // A `type: metadata` plugin without `metadata.search` cannot answer a single scraper call.
+        // The ratings plugin is exactly that: read-only, in the SCRAPER category, and never a
+        // metadata source for a library.
+        if !crate::application::scraper::declares_metadata_search(&view.capabilities) {
+            return Err(PluginServiceError::Unsupported(METADATA_SEARCH_CAPABILITY));
         }
         Ok(())
     }
@@ -1031,6 +1101,51 @@ impl PluginService {
         Ok(value)
     }
 
+    /// Whether a notification provider declares a per-destination credential.
+    ///
+    /// A provider that declares the `secret` config field receives the target credential from the
+    /// administrator; the host stores it as the destination secret instead of inventing a value.
+    pub async fn notification_provider_declares_secret(
+        &self,
+        plugin_id: &str,
+    ) -> Result<bool, PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
+        let plugin = catalog
+            .get(&plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
+        if !is_notification_plugin(plugin) {
+            return Err(PluginServiceError::Unavailable(plugin_id));
+        }
+        Ok(plugin.manifest.secret_config_field().is_some())
+    }
+
+    /// The per-destination config fields a notification provider declares.
+    ///
+    /// A notification plugin's `configFields` describe one destination instead of the plugin
+    /// installation. The `secret` field is excluded: the host stores that credential as the target
+    /// secret and never forwards it through the non-secret provider config.
+    pub async fn notification_provider_config_fields(
+        &self,
+        plugin_id: &str,
+    ) -> Result<Vec<PluginConfigField>, PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
+        let plugin = catalog
+            .get(&plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
+        if !is_notification_plugin(plugin) {
+            return Err(PluginServiceError::Unavailable(plugin_id));
+        }
+        Ok(plugin
+            .manifest
+            .config_fields
+            .iter()
+            .filter(|field| field.key != SECRET_CONFIG_FIELD_KEY)
+            .cloned()
+            .collect())
+    }
+
     pub async fn validate_notification_provider(
         &self,
         plugin_id: &str,
@@ -1166,9 +1281,7 @@ impl PluginService {
             ));
         }
         let value = self
-            .supervisor
-            .call_isolated(
-                DANMAKU_PLUGIN_ID,
+            .call_danmaku_rpc(
                 DANMAKU_MATCH_METHOD,
                 serde_json::to_value(DanmakuMatchRpcRequest {
                     file_name: file_name.to_owned(),
@@ -1176,14 +1289,7 @@ impl PluginService {
                 })
                 .map_err(|_| PluginServiceError::InvalidResponse)?,
             )
-            .await
-            .map_err(PluginServiceError::Runtime)?;
-        if serde_json::to_vec(&value)
-            .ok()
-            .is_none_or(|bytes| bytes.len() > 4 * 1024 * 1024)
-        {
-            return Err(PluginServiceError::InvalidResponse);
-        }
+            .await?;
         let result: DanmakuMatchRpcResult =
             serde_json::from_value(value).map_err(|_| PluginServiceError::InvalidResponse)?;
         match result.status {
@@ -1221,6 +1327,163 @@ impl PluginService {
 
     pub async fn has_available_strm_resolver(&self) -> Result<bool, PluginServiceError> {
         Ok(!self.available_strm_resolver_ids().await?.is_empty())
+    }
+
+    /// Whether the enabled danmaku plugin can be used for manual matching (ADR-052 P4).
+    ///
+    /// A plugin that only declares `danmaku.match` keeps automatic matching; callers hide manual
+    /// search and episode selection for it. Any probe failure reports `false` instead of an error,
+    /// because the answer only decides whether an optional interface is exposed.
+    pub async fn danmaku_manual_match_supported(&self) -> bool {
+        let catalog = self.catalog_snapshot().await;
+        let Some(plugin) = catalog.get(DANMAKU_PLUGIN_ID) else {
+            return false;
+        };
+        if !declares_danmaku_manual_match(&plugin.manifest) {
+            return false;
+        }
+        let Ok((installed, enabled)) = self.plugin_state(DANMAKU_PLUGIN_ID).await else {
+            return false;
+        };
+        if !installed || !enabled {
+            return false;
+        }
+        matches!(
+            self.dynamic_view(plugin, installed, enabled).await,
+            Ok(view) if view.available
+        )
+    }
+
+    /// Searches danmaku candidates through the enabled plugin (ADR-052 P4).
+    ///
+    /// The host validates the query and page bound before the plugin is called, then validates
+    /// and trims the returned candidates. Only the query text and the bound reach the plugin; no
+    /// path, upstream address or user information is forwarded.
+    pub async fn search_danmaku(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> Result<DanmakuSearchResult, PluginServiceError> {
+        let request = DanmakuSearchRpcRequest {
+            query: query.to_owned(),
+            limit,
+        }
+        .validate()
+        .map_err(|_| {
+            PluginServiceError::InvalidRequest(
+                "danmaku search needs a 1-200 character query and a 1-50 limit",
+            )
+        })?;
+        self.require_danmaku_manual_match_plugin().await?;
+        let params =
+            serde_json::to_value(&request).map_err(|_| PluginServiceError::InvalidResponse)?;
+        let value = self.call_danmaku_rpc(DANMAKU_SEARCH_METHOD, params).await?;
+        DanmakuSearchResult::from_value(value, request.limit)
+            .map_err(|_| PluginServiceError::InvalidResponse)
+    }
+
+    /// Fetches the danmaku XML of one episode through the enabled plugin (ADR-052 P4).
+    ///
+    /// The same byte budget and structural XML rules as `danmaku.match` apply, and nothing is
+    /// written here: the plugin payload is decoded and validated with `validate_danmaku_xml`
+    /// before it is returned, and callers still own persistence.
+    pub async fn fetch_danmaku(
+        &self,
+        provider: Option<&str>,
+        episode_id: &str,
+    ) -> Result<DanmakuFetchResult, PluginServiceError> {
+        let request = DanmakuFetchRpcRequest {
+            provider: provider.map(str::to_owned),
+            episode_id: episode_id.to_owned(),
+        }
+        .validate()
+        .map_err(|_| {
+            PluginServiceError::InvalidRequest(
+                "danmaku fetch needs a 1-64 character provider label and a 1-128 character episode id",
+            )
+        })?;
+        self.require_danmaku_manual_match_plugin().await?;
+        let params =
+            serde_json::to_value(&request).map_err(|_| PluginServiceError::InvalidResponse)?;
+        let value = self.call_danmaku_rpc(DANMAKU_FETCH_METHOD, params).await?;
+        let result = DanmakuFetchResult::from_value(value)
+            .map_err(|_| PluginServiceError::InvalidResponse)?;
+        result
+            .decode_xml()
+            .map_err(|_| PluginServiceError::InvalidResponse)?;
+        Ok(result)
+    }
+
+    /// Resolves the enabled danmaku plugin and proves it may serve a manual-match RPC.
+    ///
+    /// Missing installation, a disabled plugin or an unfinished configuration each keep their own
+    /// error variant so callers do not have to guess from a generic failure. Exposed to the danmaku
+    /// application service, which must not report an unconfigured plugin as "not supported".
+    pub(crate) async fn require_danmaku_manual_match_plugin(
+        &self,
+    ) -> Result<(), PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let plugin = catalog
+            .get(DANMAKU_PLUGIN_ID)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(DANMAKU_PLUGIN_ID.to_owned()))?;
+        if !is_danmaku_plugin(plugin) {
+            return Err(PluginServiceError::Unavailable(
+                DANMAKU_PLUGIN_ID.to_owned(),
+            ));
+        }
+        for capability in [DANMAKU_SEARCH_CAPABILITY, DANMAKU_FETCH_CAPABILITY] {
+            if !plugin
+                .manifest
+                .capabilities
+                .iter()
+                .any(|declared| declared == capability)
+            {
+                return Err(PluginServiceError::Unsupported(capability));
+            }
+        }
+        let (installed, enabled) = self.plugin_state(DANMAKU_PLUGIN_ID).await?;
+        if !installed || !enabled {
+            return Err(PluginServiceError::Unavailable(
+                DANMAKU_PLUGIN_ID.to_owned(),
+            ));
+        }
+        let view = self.dynamic_view(plugin, installed, enabled).await?;
+        if !view.configured {
+            return Err(PluginServiceError::InvalidConfig);
+        }
+        if !view.available {
+            return Err(PluginServiceError::Unavailable(
+                DANMAKU_PLUGIN_ID.to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// One danmaku RPC with the host deadline applied.
+    ///
+    /// A response line above `plugin_runtime::MAX_PLUGIN_RESPONSE_BYTES` means the plugin answered
+    /// with something unusable, not that the process is broken, so it surfaces as
+    /// `InvalidResponse` (`PLUGIN_INVALID_RESPONSE`) instead of the unavailable/runtime bucket.
+    async fn call_danmaku_rpc(
+        &self,
+        method: &'static str,
+        params: Value,
+    ) -> Result<Value, PluginServiceError> {
+        self.supervisor
+            .call_isolated_with_timeout(
+                DANMAKU_PLUGIN_ID,
+                method,
+                params,
+                self.danmaku_call_timeout,
+            )
+            .await
+            .map_err(|error| {
+                if error.is_oversized_response() {
+                    PluginServiceError::InvalidResponse
+                } else {
+                    PluginServiceError::Runtime(error)
+                }
+            })
     }
 
     pub async fn has_available_chapter_detector(
@@ -1532,6 +1795,7 @@ impl PluginService {
             return Err(error);
         }
         self.supervisor.stop(&plugin_id).await;
+        self.provider_cache.clear_provider(&plugin_id).await;
         self.request_login_background_refresh();
         if let Err(error) = assets.prune_except(&uploaded.asset_id).await {
             return Err(PluginServiceError::ImageAsset(error));
@@ -1681,6 +1945,43 @@ impl PluginService {
         chapter_detector_settings_from_values(&plugin_id, &fields, &values)?;
         self.write_plugin_config(&plugin_id, &values).await?;
         self.sync_chapter_detection_scheduled_tasks().await
+    }
+
+    /// Rewrites the schedule of the library-scoped `RATINGS_SYNC` task the plugin declares.
+    ///
+    /// The schedule lives in the plugin configuration (`scheduleConfigKey`) exactly like the other
+    /// manifest tasks, so the task page edits the same value the plugin settings page shows and a
+    /// manifest sync afterwards keeps both in step.
+    pub async fn update_ratings_sync_schedule(
+        &self,
+        plugin_id: &str,
+        schedule: &str,
+    ) -> Result<(), PluginServiceError> {
+        let schedule = schedule.trim();
+        validate_cron(schedule).map_err(|_| PluginServiceError::InvalidConfig)?;
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
+        let plugin = catalog
+            .get(&plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
+        let Some(task) =
+            plugin.manifest.scheduled_tasks.iter().find(|task| {
+                task.task_type == RATINGS_SYNC_TASK_TYPE && task.owner_type == "LIBRARY"
+            })
+        else {
+            return Err(PluginServiceError::InvalidConfig);
+        };
+        let schedule_key = task.schedule_config_key.clone();
+        let fields = self.config_fields_for_plugin(plugin).await?;
+        let mut values = merge_default_config_values(
+            &fields,
+            normalize_plugin_config(&plugin_id, self.read_plugin_config(&plugin_id).await?),
+        );
+        values.insert(schedule_key, Value::String(schedule.to_owned()));
+        let values = validate_config_values(&fields, &values)?;
+        validate_dynamic_plugin_config(&plugin_id, &values)?;
+        self.write_plugin_config(&plugin_id, &values).await?;
+        self.sync_manifest_scheduled_tasks().await
     }
 
     pub async fn media_info_settings(&self) -> Result<MediaInfoSettings, PluginServiceError> {
@@ -2072,6 +2373,12 @@ impl PluginService {
         if is_chapter_detector_plugin(plugin) {
             fields.retain(|field| field.key != "libraryIds");
         }
+        if is_notification_plugin(plugin) {
+            // The notification target credential is not plugin-level configuration: the host keeps
+            // it per destination and hands it to the plugin through the controlled RPC `secret`
+            // field, so it must not appear in the plugin config form or its completion check.
+            fields.retain(|field| field.key != SECRET_CONFIG_FIELD_KEY);
+        }
         if fields.iter().any(|field| {
             field.options_source.as_deref() == Some(CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES)
         }) {
@@ -2180,6 +2487,9 @@ impl PluginService {
             .await
             .map_err(PluginServiceError::ConfigIo)?;
         self.invalidate_scraper_client_cache();
+        // The response cache key carries the plugin id but not its configuration, so a saved
+        // config would otherwise keep serving the previous plugin output until the TTL expires.
+        self.provider_cache.clear_provider(plugin_id).await;
         Ok(())
     }
 
@@ -2356,6 +2666,10 @@ impl PluginService {
         let catalog = self.catalog_snapshot().await;
         let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
         self.supervisor.stop(&plugin_id).await;
+        // A config save clears the cache before the process is replaced. The old process can still
+        // answer during that window, so clear again after it has stopped; otherwise that response
+        // stays cached under the new generation until the TTL expires.
+        self.provider_cache.clear_provider(&plugin_id).await;
     }
 
     pub async fn stop_all(&self) {
@@ -2525,6 +2839,7 @@ impl PluginService {
         let _ = fs::remove_dir_all(&validation_dir).await;
         *self.catalog.write().await = catalog;
         self.invalidate_scraper_client_cache();
+        self.provider_cache.clear_provider(&entry.id).await;
         Ok(())
     }
 
@@ -2544,6 +2859,18 @@ impl PluginService {
     async fn plugin_state(&self, plugin_id: &str) -> Result<(bool, bool), PluginServiceError> {
         let status = self.database.plugin_installation_status(plugin_id).await?;
         Ok((status.is_some(), status == Some(true)))
+    }
+
+    /// Whether a background task may call this plugin right now.
+    ///
+    /// A stopped or disabled plugin is not an error for a scheduler, so callers get `false`
+    /// instead of a service error and can report a precondition failure.
+    pub async fn plugin_installed_and_enabled(
+        &self,
+        plugin_id: &str,
+    ) -> Result<bool, PluginServiceError> {
+        let (installed, enabled) = self.plugin_state(plugin_id).await?;
+        Ok(installed && enabled)
     }
 
     async fn installed_other_ip_location_plugins(&self) -> Result<Vec<String>, PluginServiceError> {
@@ -2641,7 +2968,11 @@ impl PluginService {
             merge_default_config_values(&config_fields, stored_values),
         );
         let public_config_values = public_config_values(&config_fields, &config_values);
-        let configured = config_fields.is_empty()
+        // Notification fields describe one destination, not the installed provider, so their
+        // requiredness is enforced when an administrator creates or updates a notification
+        // destination. A provider without a destination yet is still selectable.
+        let configured = is_notification_plugin(plugin)
+            || config_fields.is_empty()
             || (validate_config_values(&config_fields, &config_values).is_ok()
                 && validate_dynamic_plugin_config(&plugin.manifest.id, &config_values).is_ok());
         let enabled = installed && enabled && !disabled_by_other_ip_provider;
@@ -2687,6 +3018,11 @@ impl PluginService {
             },
             configurable: !config_fields.is_empty(),
             config_fields,
+            secret_field: plugin
+                .manifest
+                .secret_config_field()
+                .filter(|_| is_notification_plugin(plugin))
+                .cloned(),
             config_source,
             config_values: public_config_values,
             latest_version: None,
@@ -3026,6 +3362,7 @@ fn remote_plugin_view(entry: &PluginStoreEntry, installed: bool, enabled: bool) 
         },
         configurable: false,
         config_fields: Vec::new(),
+        secret_field: None,
         config_source: CONFIG_SOURCE_NONE.to_owned(),
         config_values: Map::new(),
         latest_version: Some(entry.version.clone()),
@@ -3267,6 +3604,10 @@ pub struct PluginView {
     pub unavailable_reason: Option<String>,
     pub configurable: bool,
     pub config_fields: Vec<PluginConfigField>,
+    /// Credential metadata for notification plugins: the target secret field declared by the
+    /// manifest. It is deliberately kept out of `config_fields`, because the value belongs to one
+    /// notification destination instead of the plugin's own configuration.
+    pub secret_field: Option<PluginConfigField>,
     pub config_source: String,
     pub config_values: serde_json::Map<String, Value>,
     pub latest_version: Option<String>,
@@ -3277,6 +3618,11 @@ pub struct PluginView {
 pub enum PluginServiceError {
     UnknownPlugin(String),
     Unavailable(String),
+    /// The installed plugin does not declare the capability the host asked for.
+    Unsupported(&'static str),
+    /// The host refused the caller's request before reaching the plugin. The payload is host-owned
+    /// text, so it never carries an upstream address, token or user input.
+    InvalidRequest(&'static str),
     InvalidConfig,
     NoUpdate,
     InvalidResponse,
@@ -3293,6 +3639,15 @@ impl fmt::Display for PluginServiceError {
             Self::UnknownPlugin(plugin_id) => write!(formatter, "unknown plugin: {plugin_id}"),
             Self::Unavailable(plugin_id) => {
                 write!(formatter, "plugin is unavailable: {plugin_id}")
+            }
+            Self::Unsupported(capability) => {
+                write!(
+                    formatter,
+                    "plugin capability is not supported: {capability}"
+                )
+            }
+            Self::InvalidRequest(reason) => {
+                write!(formatter, "invalid plugin request: {reason}")
             }
             Self::InvalidConfig => formatter.write_str("invalid plugin configuration"),
             Self::NoUpdate => formatter.write_str("plugin is already up to date"),
@@ -3316,6 +3671,8 @@ impl std::error::Error for PluginServiceError {
             Self::ImageAsset(error) => Some(error),
             Self::UnknownPlugin(_)
             | Self::Unavailable(_)
+            | Self::Unsupported(_)
+            | Self::InvalidRequest(_)
             | Self::InvalidConfig
             | Self::NoUpdate
             | Self::InvalidResponse => None,
@@ -3841,6 +4198,29 @@ mod plugin_discovery_tests {
         storage::Database,
     };
 
+    /// The login-background refresh loop must be stoppable: its handle used to be dropped.
+    #[tokio::test]
+    async fn the_login_background_worker_stops_on_shutdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: root.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let service = PluginService::new(database, config.config_dir.clone());
+        // The periodic wake is fifteen minutes away, so returning at all proves the stop signal
+        // reaches the loop.
+        assert!(
+            super::LOGIN_BACKGROUND_REFRESH_INTERVAL >= std::time::Duration::from_secs(300),
+            "the login background refresh must stay a slow fallback"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), service.shutdown())
+            .await
+            .expect("shutdown must stop the login background worker");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn discovers_a_catalog_through_the_async_boundary() {
         let root = tempdir().expect("temporary plugin directory should be created");
@@ -3870,6 +4250,219 @@ mod plugin_discovery_tests {
             .await?;
 
         assert_ne!(revision, service.scraper_client_revision());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    const SCRAPER_STUB_PLUGIN_ID: &str = "org.example.scraper";
+
+    /// Installs a scraper stub whose `metadata.images` answer carries the width supplied by the
+    /// script, and returns a service that can call it.
+    #[cfg(unix)]
+    async fn install_scraper_stub(
+        root: &std::path::Path,
+        script: &str,
+    ) -> Result<PluginService, Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let config_dir = root.join("config");
+        let plugin_dir = config_dir.join(format!("plugins/{SCRAPER_STUB_PLUGIN_ID}"));
+        tokio::fs::create_dir_all(plugin_dir.join("binaries")).await?;
+        let entrypoint = plugin_dir.join("binaries/plugin");
+        tokio::fs::write(&entrypoint, script).await?;
+        tokio::fs::set_permissions(&entrypoint, std::fs::Permissions::from_mode(0o700)).await?;
+        tokio::fs::write(
+            plugin_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "formatVersion": 1,
+                "id": SCRAPER_STUB_PLUGIN_ID,
+                "name": "Scraper stub",
+                "version": "1.0.0",
+                "apiVersion": 1,
+                "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+                "type": "metadata",
+                "category": "SCRAPER",
+                "providerKey": "example",
+                "supportedItemTypes": ["Movie"],
+                "capabilities": ["metadata.images"],
+                "configFields": [{
+                    "key": "minWidth",
+                    "label": "Minimum width",
+                    "type": "number",
+                    "required": false,
+                    "defaultValue": 1000,
+                    "minimum": 0,
+                    "maximum": 8192
+                }],
+                "permissions": {"network": [], "filesystem": []},
+                "files": []
+            }))?,
+        )
+        .await?;
+
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.clone(),
+        };
+        let database = Database::connect(&config).await?;
+        let service =
+            PluginService::new_without_login_background_worker_for_test(database, config_dir);
+        service.install(SCRAPER_STUB_PLUGIN_ID).await?;
+        Ok(service)
+    }
+
+    /// Saving a scraper plugin's config must drop that plugin's cached responses.
+    ///
+    /// The stub answers `metadata.images` from the config file it receives through
+    /// `LUX_PLUGIN_CONFIG_PATH` and appends one line per real RPC, so the second call before the
+    /// config change proves the response cache is used and the call after it proves the plugin is
+    /// asked again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn saving_scraper_config_invalidates_the_plugin_response_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::application::scraper::{ScraperImageRequest, ScraperItemType};
+
+        let root = tempdir()?;
+        let call_log = root.path().join("plugin-calls.log");
+        let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"metadata.images"'*)
+      printf 'call\n' >> "__CALL_LOG__"
+      min_width=1000
+      if [ -f "$LUX_PLUGIN_CONFIG_PATH" ]; then
+        saved=$(sed -n 's/.*"minWidth"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$LUX_PLUGIN_CONFIG_PATH")
+        if [ -n "$saved" ]; then min_width="$saved"; fi
+      fi
+      printf '{"id":"%s","result":{"images":[{"Type":"Poster","Url":"https://images.example.test/poster.jpg","Width":%s,"Height":1500}],"originalLanguageMode":false}}\n' "$id" "$min_width"
+      ;;
+    *)
+      printf '{"id":"%s","error":{"code":"PLUGIN_UNSUPPORTED_METHOD","message":"unsupported"}}\n' "$id"
+      ;;
+  esac
+done
+"#
+        .replace(
+            "__CALL_LOG__",
+            call_log.to_str().ok_or("non-utf8 call log path")?,
+        );
+        let service = install_scraper_stub(root.path(), &script).await?;
+        let client = service.scraper_client(SCRAPER_STUB_PLUGIN_ID).await?;
+        let request = || ScraperImageRequest::new(ScraperItemType::Movie, "603", "zh-CN");
+
+        let first = client.images(request()).await?;
+        assert_eq!(first.images[0].width, Some(1000));
+        let cached = client.images(request()).await?;
+        assert_eq!(cached.images[0].width, Some(1000));
+        let calls_before = tokio::fs::read_to_string(&call_log)
+            .await
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(
+            calls_before, 1,
+            "the repeated call should hit the response cache instead of the plugin"
+        );
+
+        service
+            .update_dynamic_config(
+                SCRAPER_STUB_PLUGIN_ID,
+                serde_json::Map::from_iter([("minWidth".to_owned(), json!(1500))]),
+            )
+            .await?;
+
+        let refreshed = client.images(request()).await?;
+        assert_eq!(
+            refreshed.images[0].width,
+            Some(1500),
+            "the next scrape must use the saved plugin configuration"
+        );
+        let calls_after = tokio::fs::read_to_string(&call_log)
+            .await
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(
+            calls_after, 2,
+            "the config change should force another plugin RPC"
+        );
+        Ok(())
+    }
+
+    /// A plugin process keeps the configuration it read when it started, so a scrape that runs
+    /// between the config write (and its first cache clear) and `restart()` can cache a response
+    /// produced under the old config. Restart must clear that response once the process has been
+    /// replaced, otherwise it survives until the 24h TTL.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_clears_responses_produced_between_config_save_and_restart()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::application::scraper::{ScraperImageRequest, ScraperItemType};
+
+        let root = tempdir()?;
+        let call_log = root.path().join("plugin-calls.log");
+        // Snapshot the config at process start, like a real plugin that reads
+        // `LUX_PLUGIN_CONFIG_PATH` once while starting up.
+        let script = r#"#!/bin/sh
+min_width=1000
+if [ -f "$LUX_PLUGIN_CONFIG_PATH" ]; then
+  saved=$(sed -n 's/.*"minWidth"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$LUX_PLUGIN_CONFIG_PATH")
+  if [ -n "$saved" ]; then min_width="$saved"; fi
+fi
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"metadata.images"'*)
+      printf 'call\n' >> "__CALL_LOG__"
+      printf '{"id":"%s","result":{"images":[{"Type":"Poster","Url":"https://images.example.test/poster.jpg","Width":%s,"Height":1500}],"originalLanguageMode":false}}\n' "$id" "$min_width"
+      ;;
+    *)
+      printf '{"id":"%s","error":{"code":"PLUGIN_UNSUPPORTED_METHOD","message":"unsupported"}}\n' "$id"
+      ;;
+  esac
+done
+"#
+        .replace(
+            "__CALL_LOG__",
+            call_log.to_str().ok_or("non-utf8 call log path")?,
+        );
+        let service = install_scraper_stub(root.path(), &script).await?;
+        let client = service.scraper_client(SCRAPER_STUB_PLUGIN_ID).await?;
+        let request = || ScraperImageRequest::new(ScraperItemType::Movie, "603", "zh-CN");
+
+        let first = client.images(request()).await?;
+        assert_eq!(first.images[0].width, Some(1000));
+
+        service
+            .update_dynamic_config(
+                SCRAPER_STUB_PLUGIN_ID,
+                serde_json::Map::from_iter([("minWidth".to_owned(), json!(1500))]),
+            )
+            .await?;
+        // The old process still answers with its startup snapshot after the immediate clear.
+        let stale = client.images(request()).await?;
+        assert_eq!(
+            stale.images[0].width,
+            Some(1000),
+            "the old process should still answer with the pre-change config"
+        );
+
+        service.restart(SCRAPER_STUB_PLUGIN_ID).await;
+
+        let refreshed = client.images(request()).await?;
+        assert_eq!(
+            refreshed.images[0].width,
+            Some(1500),
+            "restart must clear the response cached by the old process after it stops"
+        );
+        let calls = tokio::fs::read_to_string(&call_log)
+            .await
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert_eq!(calls, 3, "the post-restart call should reach a new process");
         Ok(())
     }
 
@@ -4121,6 +4714,82 @@ mod plugin_discovery_tests {
                 .fetch_one(database.pool())
                 .await?;
         assert_eq!(assigned_source.as_deref(), Some("existing-source"));
+        Ok(())
+    }
+
+    /// The notification target credential is per destination, not plugin configuration. A notifier
+    /// that declares `secret` must still count as configured, and the credential field must be
+    /// exposed separately so the admin page can ask for it once per destination.
+    #[tokio::test]
+    async fn notification_providers_report_the_target_credential_separately()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = "org.lux.test-notifier-credential";
+
+        let root = tempdir()?;
+        let config_dir = root.path().join("config");
+        let plugin_dir = config_dir.join(format!("plugins/{PLUGIN_ID}/binaries"));
+        tokio::fs::create_dir_all(&plugin_dir).await?;
+        tokio::fs::write(plugin_dir.join("plugin"), b"placeholder").await?;
+        tokio::fs::write(
+            config_dir.join(format!("plugins/{PLUGIN_ID}/manifest.json")),
+            serde_json::to_vec_pretty(&json!({
+                "formatVersion": 1,
+                "id": PLUGIN_ID,
+                "name": "Test notifier",
+                "version": "1.0.0",
+                "apiVersion": 1,
+                "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+                "type": "notification",
+                "category": "NOTIFICATION",
+                "capabilities": ["notification.send"],
+                "configFields": [{
+                    "key": "serverUrl",
+                    "label": "服务地址",
+                    "type": "text",
+                    "required": true
+                }, {
+                    "key": "secret",
+                    "label": "设备密钥",
+                    "type": "password",
+                    "required": true,
+                    "sensitive": true
+                }],
+                "permissions": {"network": [], "filesystem": []},
+                "files": []
+            }))?,
+        )
+        .await?;
+
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.clone(),
+        };
+        let database = Database::connect(&config).await?;
+        let service = PluginService::new_without_login_background_worker_for_test(
+            database.clone(),
+            config_dir,
+        );
+        service.install(PLUGIN_ID).await?;
+
+        let page = service.list_notification_plugins(0, 20).await?;
+
+        assert_eq!(page.plugins.len(), 1);
+        let view = &page.plugins[0];
+        assert!(
+            view.config_fields.iter().all(|field| field.key != "secret"),
+            "the target credential must not be plugin-level configuration"
+        );
+        let secret_field = view
+            .secret_field
+            .as_ref()
+            .expect("the credential metadata must be exposed");
+        assert_eq!(secret_field.key, "secret");
+        assert_eq!(secret_field.label, "设备密钥");
+        assert!(secret_field.required);
+        assert!(
+            view.configured,
+            "a missing per-destination credential must not mark the notifier unconfigured"
+        );
         Ok(())
     }
 }

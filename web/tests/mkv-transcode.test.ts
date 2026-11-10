@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createFile } from "mp4box";
-import { addHevcTrack, hevcCodecString, makeAacEsdsData, matroskaTimestampTicks, matroskaVideoCodecString, toLengthPrefixed } from "../src/features/player/mkv-remux";
+import { addHevcTrack, av1CodecString, hevcCodecString, makeAacEsdsData, matroskaTimestampTicks, matroskaVideoCodecString, toLengthPrefixed, vp9CodecString } from "../src/features/player/mkv-remux";
 import { encodedVideoDurationTicks, isSupportedMatroskaAudio, isSupportedMatroskaVideo, matroskaAudioConfig, matroskaSampleRoute, toAnnexB } from "../src/features/player/mkv-transcode";
 
 describe("MKV transcode input", () => {
@@ -80,6 +80,24 @@ describe("MKV transcode input", () => {
     expect(hevcCodecString(hvcC)).toBe("hvc1.2.4.L153.B0");
     expect(matroskaVideoCodecString({ codecId: "V_MPEGH/ISO/HEVC", codecPrivate: hvcC })).toBe("hvc1.2.4.L153.B0");
     expect(matroskaTimestampTicks(1_234.5, 90_000)).toBe(111_105);
+  });
+
+  it("describes the real VP9 profile, level and bit depth", () => {
+    const eightBit = new Uint8Array([1, 0, 0, 0, 0, 0x1f, 0x82, 1, 1, 1, 0, 0]);
+    const tenBit = new Uint8Array([1, 0, 0, 0, 2, 0x33, 0xa2, 1, 1, 1, 0, 0]);
+
+    expect(vp9CodecString(eightBit)).toBe("vp09.00.31.08");
+    expect(vp9CodecString(tenBit)).toBe("vp09.02.51.10");
+    expect(matroskaVideoCodecString({ codecId: "V_VP9", codecPrivate: tenBit })).toBe("vp09.02.51.10");
+    // A truncated record keeps the historical assumption instead of throwing.
+    expect(vp9CodecString(new Uint8Array([1, 0]))).toBe("vp09.00.10.08");
+  });
+
+  it("describes the real AV1 profile, level, tier and bit depth", () => {
+    expect(av1CodecString(new Uint8Array([0x81, 0x00, 0x0c, 0x00]))).toBe("av01.0.00M.08");
+    expect(av1CodecString(new Uint8Array([0x81, 0x08, 0x40, 0x00]))).toBe("av01.0.08M.10");
+    expect(av1CodecString(new Uint8Array([0x81, 0x28, 0xa0, 0x00]))).toBe("av01.1.08H.12");
+    expect(av1CodecString(new Uint8Array([0x81]))).toBe("av01.0.04M.08");
   });
 
   it("builds an MPEG-4 AudioSpecificConfig descriptor for AAC fMP4", () => {

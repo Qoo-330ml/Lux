@@ -373,6 +373,12 @@ export type { ItemImagesResponse } from "./generated/ItemImagesResponse";
 
 export type { ItemImageSelectResponse } from "./generated/ItemImageSelectResponse";
 
+// `GET /api/v1/tags` has no Web consumer yet; the bindings are generated from the Rust DTO so a
+// future page cannot drift from the endpoint.
+export type { LuxTag } from "./generated/LuxTag";
+
+export type { LuxTagsResponse } from "./generated/LuxTagsResponse";
+
 export type ImageSearchResult = {
   id: string;
   imageType: string;
@@ -411,6 +417,14 @@ export type PageResponse<T> = {
   total?: number;
   hasNext?: boolean;
 };
+
+/** Query options for `GET /api/v1/items/{item_id}/similar`; the Web section only asks for one page. */
+export type SimilarItemsQuery = {
+  limit?: number;
+};
+
+/** Similar items reuse the standard catalog page envelope (LUX-899). */
+export type SimilarItemsResponse = PageResponse<MediaItem>;
 
 export type AdminMetadataBatchConfirmation = {
   confirmedCount: number;
@@ -479,6 +493,35 @@ export type WebPlaybackPlan =
   | { type: "SERVER_HLS"; manifestUrl: string; tier: number }
   | { type: "UNSUPPORTED"; reason: string };
 
+/**
+ * What the server actually decided about the caller's bitrate ceiling
+ * (`docs/API.md`, Web 播放会话). `sourceBitrate` comes from ffprobe and is `null`
+ * when the source was never probed; `targetBitrate` is the video bitrate the
+ * encoder really uses, so it is `null` on every video-copy path (Direct, Remux,
+ * audio-only transcode) even when a ceiling was requested.
+ */
+export type WebPlaybackBitrate = {
+  sourceBitrate: number | null;
+  maxBitrate: number | null;
+  targetBitrate: number | null;
+  limited: boolean;
+};
+
+/**
+ * What the server actually decided about the caller's resolution ceiling
+ * (`docs/API.md`, Web 播放会话). `sourceHeight` comes from ffprobe and is `null`
+ * when the source was never probed; `targetHeight` is the height the server
+ * really emits, so a video-copy path can report the source height unchanged.
+ * Every field may be `null` when the server cannot prove it.
+ */
+export type WebPlaybackResolution = {
+  sourceHeight: number | null;
+  maxHeight: number | null;
+  targetHeight: number | null;
+  /** `true` only when the server actually transcoded down to `maxHeight`; `null` when unknown. */
+  limited: boolean | null;
+};
+
 export type WebPlaybackSession = {
   sessionId: string | null;
   playSessionId: string | null;
@@ -486,6 +529,10 @@ export type WebPlaybackSession = {
   tier: number;
   expiresAt: number;
   plan: WebPlaybackPlan;
+  /** Absent on responses from servers that do not report the bitrate decision yet. */
+  bitrate?: WebPlaybackBitrate;
+  /** Absent (or `null`) on responses from servers that do not report the resolution decision yet. */
+  resolution?: WebPlaybackResolution | null;
 };
 
 /** Live `ffmpeg -progress` values for a running server-side HLS transcode. */
@@ -531,6 +578,19 @@ export type WebPlaybackTrackSelection = {
   subtitleStreamIndex?: number;
 };
 
+/**
+ * Optional request fields shared by session creation and bootstrap. `maxHeight`
+ * is the manual resolution ceiling in pixels (144–4320); the rest of the
+ * contract lives in `docs/API.md`. `.strm` sources ignore it server-side.
+ *
+ * `maxBitrate` (bps) stays in the API contract for compatibility but the player
+ * UI no longer offers it and never sends it.
+ */
+export type WebPlaybackRequestSelection = WebPlaybackTrackSelection & {
+  maxHeight?: number;
+  maxBitrate?: number;
+};
+
 export type WebPlaybackBootstrap = {
   item: MediaItem;
   playback: PlaybackState;
@@ -539,6 +599,13 @@ export type WebPlaybackBootstrap = {
 
 /** Metadata for a registered, same-origin Lux Web danmaku sidecar. */
 export type { WebDanmakuInfo } from "./generated/WebDanmakuInfo";
+
+/** Candidate of the administrator manual danmaku search (ADR-052 P5). */
+export type { ManualDanmakuCandidate } from "./generated/ManualDanmakuCandidate";
+/** One selectable episode of a manual danmaku search candidate. */
+export type { ManualDanmakuEpisode } from "./generated/ManualDanmakuEpisode";
+/** Body of `GET /api/v1/admin/items/{itemId}/danmaku/search`. */
+export type { ManualDanmakuSearchResponse } from "./generated/ManualDanmakuSearchResponse";
 
 export type AdminRoot = {
   id: string;
@@ -617,6 +684,8 @@ export type AdminPlugin = {
   unavailableReason?: string | null;
   configurable: boolean;
   configFields: AdminPluginConfigField[];
+  /** Present when a notification provider declares a per-destination credential field. */
+  secretField?: AdminPluginConfigField | null;
   configValues?: Record<string, unknown>;
   configSource: "PLUGIN_DEFAULT" | "CUSTOM" | "ENVIRONMENT" | "READ_ACCESS_TOKEN" | "NONE" | string;
   latestVersion?: string | null;
@@ -1112,6 +1181,7 @@ export type AdminHealth = {
       source: string;
       usedBytes: number | null;
       limitBytes: number | null;
+      hostTotalBytes: number | null;
       usagePercent: number | null;
     };
     mediaStorage: {
@@ -1401,7 +1471,8 @@ export type AdminMetadataReidentifyJob = {
   mode: "REIDENTIFY" | "FILL_MISSING" | "FULL_REFRESH" | string;
   processedCount: number;
   totalCount: number;
-  pendingCount?: number;
+  /** `null` unless the list request asked for it with `includePending`; details always fill it. */
+  pendingCount?: number | null;
   error?: string | null;
   createdAt: string | number;
   updatedAt?: string | number;
@@ -1927,7 +1998,6 @@ export type MediaArtworkPolicySettings = {
   scraperRoles?: MediaScraperRole[];
   overwrite?: MediaArtworkOverwrite;
   maxCount?: number;
-  minWidth?: number;
 };
 
 export type MediaImageLevelSettings = {
@@ -1948,7 +2018,6 @@ export type MediaImageStrategySettings = {
   wallpaper: boolean;
   writeToMetadata: boolean;
   maxBackdropCount: number;
-  minDownloadWidth: number;
   variantCache?: MediaImageVariantCacheSettings;
   levels?: Partial<Record<MediaImageLevelKey, MediaImageLevelSettings>>;
 };

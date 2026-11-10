@@ -1,11 +1,13 @@
 # Lux Plugin SDK v1
 
+> 面向第三方开发者的上手指南（示例、打包、协议要点、各类插件接口）见 [PLUGIN-DEVELOPER-GUIDE.md](PLUGIN-DEVELOPER-GUIDE.md)。本文件是字段级合同。
+
 ## 目标
 
 Lux 插件是放在 `/config/plugins` 中、由服务重启后发现的独立插件包。首版使用 `.zip` 包格式和独立进程运行时。插件不直接访问 Lux 数据库、媒体根目录或内部任务对象。除元数据插件外，SDK v1 也支持由 Lux 宿主调度的媒体探测、IP 归属地、通知和弹幕插件；任务、媒体库选择、通知队列、结果持久化和旁车写入仍由宿主负责。
 
-弹幕插件固定使用 `type: "danmaku"`、`category: "MEDIA"` 和 `danmaku.match` 能力。Lux
-只向插件发送不含路径和上游地址的文件名：
+弹幕插件使用 `type: "danmaku"`、`category: "MEDIA"`，并且必须声明 `danmaku.match` 能力。
+Lux 只向插件发送不含路径和上游地址的文件名：
 
 ```json
 {"fileName":"Show.S01E02.1080p.mkv"}
@@ -15,6 +17,68 @@ Lux 插件是放在 `/config/plugins` 中、由服务重启后发现的独立插
 `animeId`/`provider` 和受大小限制的 `xmlBase64`。插件负责上游请求、匹配回退、超时、响应
 限制和 XML 校验，宿主负责最终 XML 校验、原子写入同名 `.xml` 旁车、任务进度和 ACL。弹幕
 插件配置由 manifest 的 `configFields` 声明，不能通过普通服务器设置保存。
+
+### 弹幕手动匹配合同（可选能力，ADR-052 P4）
+
+弹幕插件可以额外声明两个可选能力，用于管理员“先搜索、再按集取弹幕”的手动匹配：
+
+- 能力名与方法名相同：`danmaku.search`、`danmaku.fetch`。
+- 两个能力必须**同时声明或同时不声明**；只声明其中一个的 manifest 无效。声明其他未知
+  `danmaku.*` 能力同样无效。`danmaku.match` 仍然必需，旧插件继续只走自动匹配。
+- 只有两个能力都声明、且插件已安装/启用/配置完成时，宿主才暴露手动匹配入口；否则宿主 API
+  返回明确错误（未安装 → `UnknownPlugin`、未启用/不可用 → `Unavailable`、未声明能力 →
+  `Unsupported`、配置未完成 → `InvalidConfig`），不 panic、不降级为通用内部错误。
+
+`danmaku.search` 请求（宿主已 trim，`deny_unknown_fields`）：
+
+```json
+{"query":"Show","limit":20}
+```
+
+- 宿主在发送前校验：`query` trim 后 1–200 个字符且不含控制字符，`limit` 为 1–50。
+- 结果：
+
+```json
+{"candidates":[{"provider":"dandanplay","animeId":"anime-1","animeTitle":"Show",
+  "episodes":[{"episodeId":"ep-1","title":"第 1 集"}]}]}
+```
+
+- 插件应只返回**不超过请求 `limit`** 的候选，且单条响应必须 ≤ 4 MiB（插件 RPC 的单行上限）。
+  宿主仍会裁剪：候选超过请求的 `limit`（本身上限 50）时按顺序截断，每个候选的 `episodes`
+  超过 180 时截断，因此插件多返回的部分不会让整次搜索失败。
+- 宿主对**保留下来**的候选做严格校验：`animeId`/`episodeId` 超过 128 字符、`provider` 超过
+  64 字符、标题超过 300 字符，或任一字符串 trim 后为空／含控制字符，都视为插件返回无效
+  （`PluginInvalidResponse`）。
+- 这份页内裁剪只覆盖“语义上坏掉的候选”：保留页之外的坏候选（空/超长/控制字符）会被直接丢弃，
+  不会毁掉整次搜索。但**形状**错误不在此列——未知字段、多余字段或类型错误在反序列化阶段就使
+  整个响应无效（`deny_unknown_fields`），裁剪发生在此之前。
+- 响应体超过 4 MiB 时传输层先拒绝，宿主按无效响应处理（`PLUGIN_INVALID_RESPONSE`），不会报成
+  插件不可用（503）。50 个候选 × 180 集 × 各字段取上限的形状仍在 4 MiB 以内，因此文档化的
+  上限是插件可实际交付的。
+
+`danmaku.fetch` 请求：
+
+```json
+{"provider":"dandanplay","episodeId":"ep-1"}
+```
+
+- `provider` 可选：缺省、空串或纯空白都表示“未设置”（不发送该字段），非空时 1–64 字符；
+  `episodeId` 1–128 字符。两者都不得包含控制字符。
+- 结果：
+
+```json
+{"xmlBase64":"PGk+PGQgcD0iMSwxLDI1LDE2Nzc3MjE1LDAsMCwwLDAiPmhlbGxvPC9kPjwvaT4="}
+```
+
+- `xmlBase64` 不得为空，响应体沿用同样的 4 MiB 上限（超限同样是 `PLUGIN_INVALID_RESPONSE`）。
+  宿主在返回结果前解码并按 `danmaku.match`
+  的规则执行 `validate_danmaku_xml`（Bilibili/Dandanplay 结构校验）与 50 MiB XML 上限，因此
+  调用方拿到的一定是结构合法的弹幕文档；该层不写盘，写旁车仍由宿主的调用方负责。
+- 宿主仍不向插件传路径、上游地址或用户信息，插件也不能写文件。
+
+版本兼容：旧宿主不会因为 manifest 多出 `danmaku.search`/`danmaku.fetch` 而拒绝升级后的插件
+（旧版只校验必需能力），只是永远不会调用这两个方法；新宿主对未声明这两个能力的旧插件保持
+完全相同的自动匹配行为，并在 UI 中隐藏手动匹配入口。
 
 ## 包格式
 
@@ -222,6 +286,8 @@ Actions 在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` runner 上分别构建。Relea
 - `metadata.credits`：返回演员/人物的 provider-neutral cast 列表。
 - `metadata.externalIds`：返回 `ProviderIds`。
 - `metadata.trailers`：返回预告片候选。
+- `ratings.lookup` / `ratings.batch` / `ratings.search`：只读评分查询，只由声明 `ratings.*` 的 `metadata`
+  插件提供，见下文“评分查询调用约定”。
 - `media.probe`：接收一个已由 Lux 宿主校验的媒体地址，以及 `includeMediaInfo`、
   `includeThumbnail` 和 `thumbnailPositionPercent`。媒体信息由 `ffprobe` 返回受限的 format/stream 信息；
   缩略图由 `ffmpeg` 在 duration 的 `thumbnailPositionPercent` 百分比位置生成 JPEG（缺省为 30），并通过受限的
@@ -233,6 +299,9 @@ Actions 在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` runner 上分别构建。Relea
   `mediaInfoImport` Bundle，宿主负责校验目标并把媒体流、格式、时长、码率和章节写入已索引的 STRM 媒体源。
   未安装或未启用插件时返回 404；插件或 Bundle 不满足能力和大小边界时拒绝请求。该路由不触发远程媒体读取或
   SHA1 计算，SHA1、FF 缓存和远程缓存仍由 MediaTidy 负责。
+- `danmaku.match`：接收不含路径和上游地址的文件名（可带少量备选文件名），返回 `MATCHED`/`NO_MATCH` 和受大小限制的 `xmlBase64`；仅声明了 `danmaku.search` 与 `danmaku.fetch` 的插件才额外提供下面两个方法。
+- `danmaku.search`：接收 `{ "query": string, "limit": number }`（query 1–200 字符、limit 1–50，均经宿主校验），返回候选动画与分集列表；插件应只返回不超过 `limit` 的候选且整条响应 ≤ 4 MiB，宿主仍按 `limit`/50 与每候选 180 集裁剪，并拒绝空或超长（animeId/episodeId 128、provider 64、标题 300）字段，超限响应按 `PLUGIN_INVALID_RESPONSE` 处理。
+- `danmaku.fetch`：接收 `{ "provider"?: string, "episodeId": string }`，返回 `{ "xmlBase64": string }`；与 `danmaku.match` 使用同一响应上限，XML 结构与大小校验仍由宿主执行。
 - `ip.location`：接收一个已由 Lux 宿主校验的公网 IP，返回统一的归属地字段；第三方供应商协议只存在于插件进程。
 - `chapters.detect`：接收同一季度至少两个分集的有界 Chromaprint 指纹序列。每个分集只包含请求内临时 `key`、固定 `sampleRate: 11025`、`fingerprintPointDurationTicks: 1238095`、指纹 Base64、窗口起点和窗口时长；宿主对每个文件固定取第一个音频流并让 FFmpeg chromaprint muxer 输出 raw `uint32` 点序列，按 little-endian 编码，不能把 Base64 字节索引当作时间。插件不得接收路径、URL、媒体源 ID 或任务对象。结果只能返回 `IntroStart`、`IntroEnd` 和 `CreditsStart`，时间必须落在对应窗口内，置信度为 0-1。
 - `chapters.lookup`：接收请求内临时 `key`、TMDb/TVDb/IMDb ID、季号、集号和可选时长；插件不得接收路径、URL、媒体源 ID、音频指纹或任务对象。插件只能访问 manifest 声明的固定网络主机，返回 `IntroStart`、`IntroEnd` 和 `CreditsStart`；无数据时返回空标记，宿主不会因空响应删除已有标记。
@@ -266,7 +335,7 @@ Actions 在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` runner 上分别构建。Relea
   宿主负责迁移任务、映射、导入、幂等、恢复和历史事件落库；插件不能访问 Lux 数据库、媒体目录或任务对象。
 - `plugin.shutdown`：请求插件优雅退出。
 
-配置字段支持 text、password、select、toggle、number 和 `login_background` 专用的 `image`；select 可通过 multiple: true 声明多选，选项使用
+配置字段支持 text、textarea、password、select、toggle、number 和 `login_background` 专用的 `image`；select 可通过 multiple: true 声明多选，选项使用
 `{ "value": "...", "label": "..." }`。`number` 可以声明 `minimum`、`maximum` 和
 `defaultValue`。select 可以声明 `optionsSource`，当前支持 `media-libraries`，由 Lux 根据当前
 媒体库动态填充选项，不把媒体库 ID 或路径写死在插件包中。管理 API 返回的 `configValues` 只允许包含非敏感当前值。
@@ -403,6 +472,130 @@ zh-SG、zh-HK、zh-TW，开关默认关闭。替代 API 地址开关默认关闭
 `https://api.tmdb.org` 或填写自定义 HTTP(S) 基础地址。地址由宿主校验，不得包含凭据、查询参数
 或片段。
 
+### 评分查询调用约定
+
+评分查询插件（`org.lux.trakt-ratings`）是只读的 `type: "metadata"`、`category: "SCRAPER"` 插件，只实现
+`ratings.lookup`、`ratings.batch` 和 `ratings.search`，**不实现** `metadata.search`。因此它不能充当媒体库
+刮削器：清单校验只允许 `metadata` 类型的插件声明 `ratings.*`，且未知的 `ratings.*` 能力名（例如
+`ratings.foo`）会被拒绝；声明了 `metadata` 类型却没有声明 `metadata.search` 的插件不会被选为
+`metadata.search` 的调用目标。已经声明 `metadata.search` 的刮削器行为不变。
+
+本节的依据是 ADR-053 与 `src/application/ratings_sync/output.rs`，描述的是宿主**实际读取**的结构。宿主只读
+以下字段：`traktId`、`matchedBy`、`lowConfidence`、`writeback.confident`，以及 `writeback.nfo.ratings`
+（其中的 `rating`、`votes`、`criticRating`）。`stats`、`distribution`、`sources`、`minVotes`、`primary` 与
+`nfo.xml` 宿主一律忽略：插件可以返回它们，但宿主不会据此写盘或展示，`nfo.xml` 也不会被读取。
+
+#### 请求
+
+`ratings.lookup` 的请求就是一个查询对象；`ratings.batch` 把同样的对象放进 `items`：
+
+```json
+{"items": [{"kind": "movie", "imdb": "tt0111161"}]}
+```
+
+```json
+{"items": [
+  {"kind": "movie", "title": "片名", "tmdb": "278", "year": 1994},
+  {"kind": "show", "imdb": "tt0903747"},
+  {"kind": "episode", "show": "tt0903747", "season": 5, "episode": 14}
+]}
+```
+
+`kind` 只能是 `movie`、`show` 或 `episode`。宿主只使用可靠标识：IMDb ID，或 TMDb ID 加标题和年份，绝不只靠
+标题；分集复用剧集的 IMDb ID，或先前剧集查询返回的 Trakt ID。宿主每批最多发送 50 个查询，单批超时 120 秒；
+批级失败按 5 秒、30 秒退避重试两次后中止本次运行。`ratings.search` 接收
+`{"query": string, "kind"?: "movie"|"show", "year"?: number, "limit"?: number}` 并返回候选列表，它不参与
+写回。
+
+#### 响应
+
+`ratings.batch` 返回 `results` 数组，每个成员回显它对应的请求元素，并用 `ok` 区分成功与失败。回显数量不得
+超过请求数量，也不得超过 200 个。违反这些信封规则（缺 `input` 或 `ok`、`ok: true` 缺 `result`、`ok: false` 缺字符串
+`code`）时，宿主视为整批响应无效并**中止整次运行**，不会只跳过单个条目。下面是合法示例：
+
+```json
+{"results": [
+  {"input": {"kind": "movie", "imdb": "tt0111161"}, "ok": true, "result": {"traktId": 129}}
+]}
+```
+
+```json
+{"results": [
+  {"input": {"kind": "movie", "imdb": "tt0111161"}, "ok": false,
+   "error": {"code": "TRAKT_NOT_FOUND", "message": "no match"}}
+]}
+```
+
+成功结果的宿主契约（`nfo.xml` 是插件序列化好的旁车片段，宿主不读取）：
+
+```json
+{
+  "traktId": 129,
+  "matchedBy": "imdb",
+  "lowConfidence": false,
+  "writeback": {
+    "confident": true,
+    "source": "trakt",
+    "rating": 6.564,
+    "votes": 280,
+    "criticRating": 7.2,
+    "nfo": {
+      "ratings": [
+        {"name": "tmdb", "value": 7.4, "votes": 1200, "max": 10, "default": false},
+        {"name": "trakt", "value": 6.564, "votes": 280, "max": 10, "default": true}
+      ],
+      "xml": "<nfo/>",
+      "rating": 6.564,
+      "votes": 280,
+      "criticRating": 7.2
+    }
+  }
+}
+```
+
+`traktId` 是数字 Trakt ID，供同一剧集的分集查询复用。
+
+宿主只接受同时满足以下全部条件的结果；任何一项不满足就跳过该条目，不写任何文件：
+
+- `writeback.nfo` 必须是对象，`null` 或缺省表示插件没有可写内容；
+- `writeback.confident` 必须为 `true`；
+- `lowConfidence` 不得为 `true`；
+- `matchedBy` 不得为 `title+year`（比较时忽略大小写和首尾空白）；
+- `nfo.rating` 必填，且是 0–10 的有限数；
+- `nfo.votes` 可选，存在时必须是非负整数；
+- `nfo.criticRating` 可选，`null` 表示没有影评人评分；存在时必须是 0–10 的有限数；
+- `nfo.ratings` 可选，`null` 视为空数组；最多 64 项，每项约束如下。
+
+| `ratings` 项字段 | 约束 |
+|---|---|
+| `name` | 必填；去掉首尾空白后 1–64 个字符，只允许 ASCII 小写字母、数字和下划线 |
+| `value` | 必填；0–10 的有限数 |
+| `votes` | 可选；非负整数 |
+| `max` | 必填；必须等于 `10` |
+| `default` | 可选布尔值，缺省为 `false` |
+
+票数上限为 10^15，更大的值按解析错误处理。分数必须是有限数：`NaN`、`Infinity` 和越界值一律丢弃，宿主不会
+修正或截断后写入。`ratings` 的容器顺序原样保留，因为 Jellyfin 取最后一个非 `tomato` 条目，插件应把主来源
+排在最后。
+
+`writeback` 是唯一的写回入口：**`confident: false` 时宿主不得覆盖用户原有评分**，即使对象里仍带有分数；
+`lowConfidence: true` 或 `matchedBy: "title+year"` 的匹配同样不写盘。写回只替换旁车里的 `<ratings>` 容器和
+扁平的 `<rating>`、`<votes>`、`<criticrating>`；没有旁车的条目直接跳过，宿主不会新建旁车。
+
+错误码只出现在 `error.code`；`message` 仅供人阅读，不得包含凭据、访问令牌或完整上游 URL。
+
+| 错误码 | 宿主处理 |
+|---|---|
+| `TRAKT_NOT_FOUND` | 跳过该条目，不重试 |
+| `TRAKT_RATE_LIMITED` | 本轮分页全部结束后等待 60 秒，统一重试该条目一轮（仅一轮） |
+| `TRAKT_UPSTREAM_ERROR` | 与限流相同：本轮结束后等待 60 秒，统一重试一轮（仅一轮） |
+| `TRAKT_INVALID_REQUEST` | 不重试，计为失败 |
+| `TRAKT_UNAUTHORIZED` | 中止整次运行 |
+| `TRAKT_NOT_CONFIGURED` | 中止整次运行 |
+
+宿主未分类的错误码（包括 `TRAKT_BATCH_TOO_LARGE`）计为失败，不盲目重试。日志只包含运行 id、媒体库 id、
+插件 id、条目 id、计数和耗时，不记录 `clientId`、完整 URL 或查询串。
+
 ### IP 归属地调用约定
 
 IP 归属地插件必须声明 `type: "ip_location"`、`category: "NETWORK"` 和
@@ -510,21 +703,45 @@ Lux 在发送请求前执行协议、主机和地址策略校验，并在收到�
 隐私字段。`target` 是通知器投递所需的目标信息，`url` 为空时由通知器根据自身配置决定目标；
 `allowPrivateNetwork` 是 Lux 已批准的私网策略，通知器必须继续执行危险保留地址检查且不得自行放宽策略。
 `config` 只能保存非秘密目标设置；密码、Token、API Key 等必须放入受控的 `secret` 字段。
-插件必须返回 `DELIVERED`、`RETRYABLE` 或 `FAILED`，可选返回 provider 请求 ID、重试秒数和稳定错误码：
+
+通知器把需要管理员填写的凭据声明为唯一的 `secret` 配置字段：
 
 ```json
-{"status":"DELIVERED","providerRequestId":"message-1"}
+{
+  "key": "secret",
+  "label": "设备密钥",
+  "type": "password",
+  "required": true,
+  "sensitive": true,
+  "description": "在 Bark App 首页查看"
+}
 ```
 
-宿主负责超时、重试、退避、投递记录和失败恢复。通知插件进程不会获得 `LUX_CONFIG_DIR`，不能通过文件系统
-读取其他插件或服务器 Secret。Webhook、Telegram、企业微信等平台的 payload 和认证逻辑属于各自插件，不应
-写入通知核心。
+约束与宿主语义：
 
-Lux 核心在事件进入投递队列前统一生成 `source`、`title`、`content`、`body` 和 ISO `timestamp`，并将它们
-放入 `event.data`。播放事件的进度条、播放方式、设备、大小、码率、远程 IP 和简介等展示文本也由 Lux 核心
-生成；通知插件不得重新生成或覆盖这些字段。`org.lux.webhook` 的 `url` 配置可以引用 `{title}`、`{content}`
-等核心字段并进行 URL 编码，但这只影响目标地址，不改变通知正文。插件可以根据目标平台增加外层字段映射，
-但必须保留 Lux 提供的统一通知内容。
+- 只有 `type: "notification"` 插件可以声明 `secret` 字段，且最多一个；该字段必须是 `sensitive: true` 的
+  `password` 字段，不能声明 `defaultValue`。
+- 声明后，创建通知目标必须由管理员提交 `secret`，更新时留空表示不修改，`rotate-secret` 用请求体里的新值
+  覆盖旧值。宿主不会为第三方渠道生成随机凭据。
+- 该值走通知目标 secret 存储：不进入 `config`/`providerConfig`，不出现在普通列表、事件 payload、投递记录或
+  日志中，只在创建和轮换的响应里返回一次。
+- 凭据属于一个 provider：更换通知器时宿主不会沿用旧凭据。新 provider 声明了 `secret` 字段时必须在同一次更新
+  里重新提交，否则返回校验错误；切换到 `builtin.webhook` 由宿主重新生成 HMAC secret；切换到未声明该字段的
+  provider 时旧值会被清除。
+- 通知器的其它 `configFields` 属于**每条通知目标**，不是插件安装级配置；`required` 由创建/更新目标时校验，
+  未创建任何目标不会让 provider 变成不可用。除 `secret` 外，通知器不得把任何字段声明为 `sensitive: true` 或
+  `type: "password"`：这些字段走非秘密 `providerConfig`，声明成秘密字段会承诺宿主并未提供的保护。
+- 目标 `providerConfig` 由宿主按 manifest 的 `configFields` 校验：未知键、缺少 required 值、类型不匹配、
+  非法选项和超出范围的数值都在创建/更新时返回 400，不会原样转发给插件。
+- 宿主把凭据声明通过 `GET /api/v1/admin/notification-providers` 的 `secretField` 元数据交给 Web 控制台，
+  插件自身不需要读取任何配置文件。
+
+### 通知器 SDK
+
+通知器插件的共享 SDK（stdio 循环、出站客户端、目的地守卫、状态分类）以及 Bark、企业微信应用、飞书/Lark、邮件
+四个通知器插件的源码和说明在插件仓库 [Lux-plugins](https://github.com/Qoo-330ml/Lux-plugins)，见其
+`docs/NOTIFIER-PLUGINS.md`。宿主只负责本节上文的 `secret` 字段契约、`providerConfig` 校验和 `target.allowPrivateNetwork`
+策略下发；插件必须在连接前执行私网/保留地址检查。
 
 ## 错误码
 

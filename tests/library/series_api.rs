@@ -453,7 +453,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     );
     assert_eq!(
         vidhub_episodes_body["Items"][0]["MediaSources"][0]["MediaStreams"][0]["DisplayTitle"],
-        "2160p"
+        "1080p H264"
     );
     assert_eq!(
         vidhub_episodes_body["Items"][0]["MediaSources"][0]["Name"],
@@ -480,7 +480,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         .as_array()
         .expect("Fields=MediaStreams must be projected on list responses");
     assert!(!projected_streams.is_empty());
-    assert_eq!(projected_streams[0]["DisplayTitle"], "2160p");
+    assert_eq!(projected_streams[0]["DisplayTitle"], "1080p H264");
     assert!(
         streams_only_body["Items"][0].get("MediaSources").is_none(),
         "MediaStreams alone must not pull in MediaSources"
@@ -621,7 +621,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     );
     assert_eq!(
         filmly_episode["MediaSources"][0]["MediaStreams"][0]["DisplayTitle"],
-        "2160p"
+        "1080p H264"
     );
     assert_eq!(
         filmly_episode["MediaSources"][0]["Name"],

@@ -1,4 +1,5 @@
 pub mod logs;
+mod redacting_writer;
 pub mod request_metrics;
 pub mod resources;
 
@@ -9,6 +10,8 @@ use std::{
 
 use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+
+use self::redacting_writer::RedactingMakeWriter;
 
 /// 0 = not initialised yet, 1 = file logging available, 2 = stdout only.
 static FILE_LOGGING_STATE: AtomicU8 = AtomicU8::new(0);
@@ -43,8 +46,15 @@ pub async fn init(config_dir: &Path) -> (Option<WorkerGuard>, Option<logs::LogSt
         .thread_name("lux-log-writer")
         .finish(log_store.writer());
     let filter = env_filter();
-    let stdout_layer = fmt::layer().json().with_writer(std::io::stdout);
-    let file_layer = fmt::layer().json().with_writer(file_writer);
+    // `tracing` output never passes through `logs::redact_sensitive_log_values` by itself, so
+    // both sinks are wrapped: an event field carrying a full URL or a credential must not reach
+    // stdout or the daily log file (§18.3).
+    let stdout_layer = fmt::layer()
+        .json()
+        .with_writer(RedactingMakeWriter::new(std::io::stdout));
+    let file_layer = fmt::layer()
+        .json()
+        .with_writer(RedactingMakeWriter::new(file_writer));
     if tracing_subscriber::registry()
         .with(filter)
         .with(stdout_layer)
@@ -58,8 +68,14 @@ pub async fn init(config_dir: &Path) -> (Option<WorkerGuard>, Option<logs::LogSt
     (Some(guard), Some(log_store))
 }
 
+/// Stdout-only fallback: the same redacting writer, so the degraded path is not a hole.
 fn init_stdout() {
-    let _ = fmt().json().with_env_filter(env_filter()).try_init();
+    let writer = RedactingMakeWriter::new(std::io::stdout);
+    let _ = fmt()
+        .json()
+        .with_env_filter(env_filter())
+        .with_writer(writer)
+        .try_init();
 }
 
 fn env_filter() -> EnvFilter {

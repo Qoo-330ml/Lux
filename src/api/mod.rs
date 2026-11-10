@@ -60,5 +60,14 @@ macro_rules! require_ready {
 pub mod lux;
 
 mod legacy;
+mod websocket;
 
-pub use legacy::{AppState, CoreState, ReadyServices, app, app_with_state, setup_app_with_state};
+/// The protocol-neutral resource limits of one realtime endpoint. Public so an endpoint (and its
+/// tests) can inject its own values; the Emby endpoint also re-exports it as
+/// `EmbyWebsocketLimits`.
+pub use websocket::WebsocketLimits;
+
+pub use legacy::{
+    AppState, CoreState, EmbyWebsocketLimits, LuxWebsocketLimits, ReadyServices, app,
+    app_with_state, setup_app_with_state,
+};

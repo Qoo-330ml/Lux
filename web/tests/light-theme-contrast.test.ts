@@ -186,10 +186,10 @@ describe("light theme contrast", () => {
 
     expect(cssRule(".lux-admin-transcoding-state.is-ok")).toContain("color: var(--lux-status-success)");
     expect(cssRule(".lux-admin-transcoding-state.is-error")).toContain("color: var(--lux-status-danger)");
-    expect(cssRule(".lux-transcoding-session-state.is-finished")).toContain("color: var(--lux-status-warning)");
-    expect(cssRule(".lux-transcoding-history-reason")).toContain("color: var(--lux-status-danger)");
-    expect(cssRule(".lux-transcoding-outcome.is-ok")).toContain("color: var(--lux-status-success)");
-    expect(cssRule(".lux-transcoding-outcome.is-error")).toContain("color: var(--lux-status-danger)");
+    expect(cssRule(".lux-tc-session-state.is-finished")).toContain("color: var(--lux-status-warning)");
+    expect(cssRule(".lux-tc-history-main .lux-tc-history-reason")).toContain("color: var(--lux-status-danger)");
+    expect(cssRule(".lux-tc-outcome.is-ok")).toContain("color: var(--lux-status-success)");
+    expect(cssRule(".lux-tc-outcome.is-error")).toContain("color: var(--lux-status-danger)");
     expect(cssRule(".lux-now-playing-kv-value.is-direct")).toContain("color: var(--lux-status-success)");
     expect(cssRule(".lux-now-playing-kv-value.is-transcode")).toContain("color: var(--lux-status-warning)");
     expect(cssRule(".lux-now-playing-kv-value.is-source")).toContain("color: var(--lux-status-info)");
@@ -232,7 +232,7 @@ describe("light theme contrast", () => {
     expect(cssRule(":focus-visible")).toContain("outline: 2px solid var(--lux-focus-ring)");
     expect(lightThemeRule(".lux-library-strategy-toggle input:focus-visible + span + i")).toContain("outline: 2px solid var(--lux-focus-ring)");
     expect(lightThemeRule(".lux-thumbnail-scraping-mode input:focus-visible + span")).toContain("outline: 2px solid var(--lux-focus-ring)");
-    expect(stylesheet).toContain(".lux-player-center-play:focus-visible { outline: 3px solid rgba(255,255,255,.78)");
+    expect(stylesheet).toContain(".lux-player-center-control:focus-visible { outline: 3px solid rgba(255,255,255,.78)");
   });
 
   it("keeps the plugin configuration dialog readable in light mode", () => {

@@ -28,10 +28,13 @@ use uuid::Uuid;
 
 #[path = "access_changes.rs"]
 mod access_changes;
-pub(crate) use access_changes::{AccessChangeEpochs, AccessEpoch};
+pub(crate) use access_changes::{AccessChangeEpochs, AccessEpoch, TrustedProxyCidrCache};
 #[path = "auth_cache.rs"]
 mod auth_cache;
 pub(crate) use auth_cache::{AuthCacheEpochSnapshot, AuthCacheEpochs};
+#[path = "outbox_signals.rs"]
+mod outbox_signals;
+pub(crate) use outbox_signals::OutboxSignals;
 #[path = "catalog.rs"]
 mod catalog;
 #[path = "database_cleanup.rs"]
@@ -110,6 +113,7 @@ mod migration;
 mod notifications;
 #[path = "people.rs"]
 mod people;
+pub(crate) use people::CanonicalPersonBatch;
 #[path = "sessions.rs"]
 mod sessions;
 #[path = "user_mail_flows.rs"]
@@ -126,6 +130,7 @@ pub(crate) use user_series_next::ResumePointerQuery;
 mod users;
 #[path = "watch_state_archive.rs"]
 mod watch_state_archive;
+pub use watch_state_archive::DetachedStateReconcileWorker;
 
 // A media_sources row uses 11 bind values. Keep each backend's positive-index batches
 // below its parameter limit while allowing PostgreSQL fewer round trips per transaction.
@@ -561,10 +566,12 @@ const DATABASE_POOL_MAX_LIFETIME: std::time::Duration = std::time::Duration::fro
 /// The caller location is captured at acquisition so a long hold names the code path without
 /// logging SQL text, identifiers, or user data.
 pub(crate) struct WriteLockGuard {
-    _guard: tokio::sync::OwnedMutexGuard<()>,
+    _guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     operation: &'static str,
     caller: &'static std::panic::Location<'static>,
     acquired_at: Instant,
+    /// Signalled when the guarded write finishes, so the outbox consumers see the committed rows.
+    outbox_signals: Arc<OutboxSignals>,
 }
 
 /// How long one writer may hold a process-wide write lock before the hold is reported.
@@ -572,6 +579,11 @@ const WRITE_LOCK_HOLD_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 
 impl Drop for WriteLockGuard {
     fn drop(&mut self) {
+        // The guard outlives the caller's transaction, so this runs after the commit: every write
+        // that goes through `acquire_metadata_write_lock` wakes the derived-data consumers without
+        // each write site having to remember to. On PostgreSQL there is no shared lock (the guard
+        // carries none) but the drop still signals.
+        self.outbox_signals.notify_writers();
         let held = self.acquired_at.elapsed();
         if held >= WRITE_LOCK_HOLD_LOG_THRESHOLD {
             tracing::warn!(
@@ -589,13 +601,15 @@ async fn acquire_write_lock_after(
     operation: &'static str,
     threshold: Duration,
     caller: &'static std::panic::Location<'static>,
+    outbox_signals: Arc<OutboxSignals>,
 ) -> WriteLockGuard {
     match tokio::time::timeout(threshold, lock.clone().lock_owned()).await {
         Ok(guard) => WriteLockGuard {
-            _guard: guard,
+            _guard: Some(guard),
             operation,
             caller,
             acquired_at: Instant::now(),
+            outbox_signals,
         },
         Err(_) => {
             let started = Instant::now();
@@ -613,10 +627,11 @@ async fn acquire_write_lock_after(
                 "database write lock acquired after waiting"
             );
             WriteLockGuard {
-                _guard: guard,
+                _guard: Some(guard),
                 operation,
                 caller,
                 acquired_at: started,
+                outbox_signals,
             }
         }
     }
@@ -627,11 +642,19 @@ async fn acquire_write_lock_after(
 fn acquire_write_lock(
     lock: &Arc<AsyncMutex<()>>,
     operation: &'static str,
+    outbox_signals: Arc<OutboxSignals>,
 ) -> impl std::future::Future<Output = WriteLockGuard> {
     let caller = std::panic::Location::caller();
     let lock = lock.clone();
     async move {
-        acquire_write_lock_after(&lock, operation, WRITE_LOCK_WAIT_LOG_THRESHOLD, caller).await
+        acquire_write_lock_after(
+            &lock,
+            operation,
+            WRITE_LOCK_WAIT_LOG_THRESHOLD,
+            caller,
+            outbox_signals,
+        )
+        .await
     }
 }
 
@@ -732,6 +755,15 @@ pub struct Database {
     access_changes: Arc<AccessChangeEpochs>,
     /// Invalidation epochs for the cached request principals (credentials, access rules, users).
     auth_cache: Arc<AuthCacheEpochs>,
+    /// Wake-up handles for the background outbox consumers of derived data.
+    outbox_signals: Arc<OutboxSignals>,
+    /// "A mail outbox row was committed" signal, owned by this database instance.
+    ///
+    /// The mail rows are appended inside storage transactions by several user flows, so the queue
+    /// itself publishes this signal once a row is committed; the delivery worker waits on it and
+    /// falls back to a slow poll. Keeping it on the instance (rather than in a process-wide static)
+    /// means two databases - and two workers in parallel tests - never steal each other's wake-ups.
+    mail_outbox_appended: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     query_count: Arc<AtomicUsize>,
 }
@@ -1364,7 +1396,11 @@ impl Database {
                 path: path.clone(),
                 source,
             })?;
-        migration::record_server_state(&config.config_dir, &server_id).await?;
+        // While the wizard still has to pick a database, this one is a placeholder. Recording it
+        // would make the database chosen next look like a lost one at the restart setup requires.
+        if !config.database_selection_pending().await {
+            migration::record_server_state(&config.config_dir, &server_id).await?;
+        }
 
         Ok(Self {
             pool,
@@ -1385,6 +1421,8 @@ impl Database {
             filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
             access_changes: Arc::new(AccessChangeEpochs::default()),
             auth_cache: Arc::new(AuthCacheEpochs::default()),
+            outbox_signals: Arc::new(OutboxSignals::default()),
+            mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             query_count: Arc::new(AtomicUsize::new(0)),
         })
@@ -1409,6 +1447,7 @@ impl Database {
         let caller = std::panic::Location::caller();
         let backend = self.backend;
         let lock = self.metadata_write_lock.clone();
+        let outbox_signals = Arc::clone(&self.outbox_signals);
         async move {
             if backend == DatabaseBackend::Sqlite {
                 Some(
@@ -1417,11 +1456,20 @@ impl Database {
                         "metadata_write",
                         WRITE_LOCK_WAIT_LOG_THRESHOLD,
                         caller,
+                        outbox_signals,
                     )
                     .await,
                 )
             } else {
-                None
+                // PostgreSQL needs no shared lock, but the guard still carries the outbox signal:
+                // dropping it after the commit is what wakes the derived-data consumers.
+                Some(WriteLockGuard {
+                    _guard: None,
+                    operation: "metadata_write",
+                    caller,
+                    acquired_at: Instant::now(),
+                    outbox_signals,
+                })
             }
         }
     }
@@ -1436,6 +1484,8 @@ impl Database {
     async fn begin_metadata_write_transaction(
         &self,
     ) -> Result<sqlx::Transaction<'_, Any>, StorageError> {
+        #[cfg(test)]
+        metadata_write_transaction_counter(&self.path).fetch_add(1, AtomicOrdering::Relaxed);
         let transaction = if self.backend == DatabaseBackend::Sqlite {
             self.pool.begin_with("BEGIN IMMEDIATE").await
         } else {
@@ -1455,6 +1505,19 @@ impl Database {
             self.pool.begin().await
         };
         transaction.map_err(self.sqlx_err())
+    }
+
+    /// Starts the write transaction that records one finished transcode.
+    ///
+    /// The history insert and its retention prune commit together so a stop pays one commit
+    /// instead of two. The transaction opens deferred: its first statement is already a write, so
+    /// there is no read-then-upgrade risk on SQLite.
+    pub(crate) async fn begin_transcoding_history_transaction(
+        &self,
+    ) -> Result<sqlx::Transaction<'_, Any>, StorageError> {
+        #[cfg(test)]
+        transcoding_history_transaction_counter(&self.path).fetch_add(1, AtomicOrdering::Relaxed);
+        self.pool.begin().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn begin_scan_write_transaction(
@@ -1848,9 +1911,51 @@ impl Database {
         &self.auth_cache
     }
 
+    /// The wake-up signal of the mail outbox queue this database owns.
+    ///
+    /// The delivery worker waits on it; every path that appends a mail row signals it through
+    /// [`Self::notify_mail_outbox_appended`].
+    pub(crate) fn mail_outbox_appended(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.mail_outbox_appended)
+    }
+
+    /// Wakes the mail delivery worker after a mail outbox row was committed.
+    ///
+    /// Call this from every path that enqueues mail; without it the row is only picked up by the
+    /// worker's idle fallback.
+    pub(crate) fn notify_mail_outbox_appended(&self) {
+        self.mail_outbox_appended.notify_one();
+    }
+
     #[cfg(test)]
     pub(crate) fn query_count(&self) -> usize {
         self.query_count.load(AtomicOrdering::Relaxed)
+    }
+
+    /// How many metadata write transactions this database started (test-only).
+    ///
+    /// Write-path batches are judged by commit count, not statement count (see
+    /// `docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` §2): a path that keeps a page in one
+    /// transaction leaves this number flat while the number of actors grows.
+    #[cfg(test)]
+    pub(crate) fn metadata_write_transaction_count(&self) -> usize {
+        metadata_write_transaction_counter(&self.path).load(AtomicOrdering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_metadata_write_transaction_count(&self) {
+        metadata_write_transaction_counter(&self.path).store(0, AtomicOrdering::Relaxed);
+    }
+
+    /// How many finished-transcode write transactions this database started (test-only).
+    #[cfg(test)]
+    pub(crate) fn transcoding_history_transaction_count(&self) -> usize {
+        transcoding_history_transaction_counter(&self.path).load(AtomicOrdering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_transcoding_history_transaction_count(&self) {
+        transcoding_history_transaction_counter(&self.path).store(0, AtomicOrdering::Relaxed);
     }
 
     /// The change counters that the playback access cache stamps its entries with.
@@ -1858,6 +1963,33 @@ impl Database {
     /// The permission writes in this module bump these counters; the cache only reads them.
     pub(crate) fn access_changes(&self) -> &AccessChangeEpochs {
         &self.access_changes
+    }
+
+    /// The wake-up handles that the background outbox consumers wait on.
+    ///
+    /// Returned as an owned `Arc` so a consumer task can hold it without borrowing the database.
+    pub(crate) fn outbox_signals(&self) -> Arc<OutboxSignals> {
+        Arc::clone(&self.outbox_signals)
+    }
+
+    /// Tells the derived-data consumers that an authoritative write committed.
+    ///
+    /// The storage write functions outside the metadata write lock call this after their commit;
+    /// writes that hold the lock signal through [`WriteLockGuard`] automatically. Signalling is
+    /// coarse by design (see [`OutboxSignals`]): a consumer that wakes and finds an empty queue
+    /// costs one bounded pass, a missed signal would leave derived data stale until the fallback.
+    pub(crate) fn signal_outbox_consumers(&self) {
+        self.outbox_signals.notify_writers();
+    }
+
+    /// Signals the derived-data consumers only when a write changed at least one row.
+    ///
+    /// Rescans re-derive the same values for most files; those writes change nothing and therefore
+    /// queue no outbox row, so they must not cost the consumers a wake-up.
+    pub(crate) fn signal_outbox_consumers_if_changed(&self, changed: u64) {
+        if changed > 0 {
+            self.signal_outbox_consumers();
+        }
     }
 
     /// Maps an sqlx failure onto a storage error that names the database it came from.
@@ -1912,6 +2044,42 @@ impl Database {
         self.query_count.fetch_add(1, AtomicOrdering::Relaxed);
         sqlx::query_scalar(adapt_sql_for_backend(self.backend, sql))
     }
+}
+
+/// Per-database metadata write transaction counter for the write-path tests.
+///
+/// Commit counts are the metric the write-path performance work records
+/// (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` §2). The counter is keyed by the database
+/// path instead of living on [`Database`]: a test-only field would grow `Database`, and `Database`
+/// is embedded by value in `ReadyAppState`, which in test builds would tip the `AppMode` variant
+/// size lint.
+#[cfg(test)]
+fn metadata_write_transaction_counter(path: &Path) -> Arc<AtomicUsize> {
+    write_transaction_counter(path, "metadata")
+}
+
+#[cfg(test)]
+fn transcoding_history_transaction_counter(path: &Path) -> Arc<AtomicUsize> {
+    write_transaction_counter(path, "transcoding_history")
+}
+
+#[cfg(test)]
+type WriteTransactionCounters =
+    std::sync::Mutex<HashMap<(PathBuf, &'static str), Arc<AtomicUsize>>>;
+
+#[cfg(test)]
+fn write_transaction_counter(path: &Path, kind: &'static str) -> Arc<AtomicUsize> {
+    static COUNTERS: std::sync::OnceLock<WriteTransactionCounters> = std::sync::OnceLock::new();
+    let counters = COUNTERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut counters = match counters.lock() {
+        Ok(counters) => counters,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    Arc::clone(
+        counters
+            .entry((path.to_path_buf(), kind))
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0))),
+    )
 }
 
 fn sqlite_migrator_with_legacy_timestamp_checksum() -> Option<Migrator> {
@@ -2443,7 +2611,7 @@ pub(crate) struct StoredLibraryDeletionJob {
     pub(crate) finished_at: Option<i64>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StoredLibraryScraper {
     pub(crate) scraper_id: String,
     pub(crate) position: i64,
@@ -3971,7 +4139,7 @@ pub(crate) struct StoredMetadataCandidate {
     pub(crate) item_title: String,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StoredMetadataCapabilityAttempt {
     pub(crate) provider: String,
     pub(crate) provider_id: String,
@@ -3999,7 +4167,20 @@ pub(crate) struct MetadataCapabilityResult<'a> {
     pub(crate) has_data: bool,
 }
 
-#[derive(Debug)]
+/// One provider identity's capability writes, collected by the candidate search loop.
+///
+/// The search loop resolves up to 20 candidates; each used to commit its own transaction. The
+/// application layer now collects one entry per candidate and writes them together
+/// (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S1).
+pub(crate) struct MetadataCapabilityWrite<'a> {
+    pub(crate) provider: String,
+    pub(crate) provider_id: String,
+    pub(crate) results: Vec<MetadataCapabilityResult<'a>>,
+    pub(crate) transient_failures: Vec<&'a str>,
+    pub(crate) now: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StoredMetadataImageAttempt {
     pub(crate) image_type: String,
     pub(crate) candidate_key: String,
@@ -4053,7 +4234,8 @@ pub(crate) struct StoredMetadataReidentifyJob {
     pub(crate) cancel_requested: bool,
     pub(crate) library_id: Option<String>,
     pub(crate) job_scope: String,
-    pub(crate) pending_count: i64,
+    /// `None` when the caller did not ask for the pending aggregation.
+    pub(crate) pending_count: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -4094,7 +4276,7 @@ struct StoredMetadataReidentifyJobRow {
     cancel_requested: i64,
     library_id: Option<String>,
     job_scope: String,
-    pending_count: i64,
+    pending_count: Option<i64>,
 }
 
 fn stored_metadata_reidentify_job(
@@ -4667,6 +4849,12 @@ pub(crate) struct ItemImageBatchInsert {
     pub(crate) clear_poster_fallback: bool,
 }
 
+/// The image row and the attempt completion that must commit together.
+pub(crate) struct ItemImageAttemptCommit<'a> {
+    pub(crate) metadata: ItemImageMetadata<'a>,
+    pub(crate) update: MetadataImageAttemptUpdate<'a>,
+}
+
 pub(crate) struct MetadataImageAttemptUpdate<'a> {
     pub(crate) item_id: &'a str,
     pub(crate) image_type: &'a str,
@@ -4753,8 +4941,11 @@ fn catalog_filter_where_clause<'a>(
     let provider_id_equals = filter.provider_id_equals;
     let excluded_item_types = filter.excluded_item_types;
     let years = filter.years;
+    let genre_keys = filter.genre_keys;
+    let studio_keys = filter.studio_keys;
     let is_played = filter.is_played;
     let is_favorite = filter.is_favorite;
+    let is_resumable = filter.is_resumable;
     let min_date_last_saved = filter.min_date_last_saved;
     let metadata_pending = filter.metadata_pending;
     let mut where_clause = format!(
@@ -4952,6 +5143,23 @@ fn catalog_filter_where_clause<'a>(
         ));
         binds.extend(years.iter().copied().map(CatalogBind::Integer));
     }
+    for (kind, keys) in [("GENRE", genre_keys), ("STUDIO", studio_keys)] {
+        if keys.is_empty() {
+            continue;
+        }
+        where_clause.push_str(&format!(
+            " AND EXISTS (
+                SELECT 1 FROM media_item_facets facet_filter
+                WHERE facet_filter.item_id = mi.id
+                  AND facet_filter.kind = '{kind}'
+                  AND facet_filter.name_key IN ({})
+            )",
+            std::iter::repeat_n("?", keys.len())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        binds.extend(keys.iter().map(|key| CatalogBind::Text(key.as_str())));
+    }
     if let Some(is_played) = is_played {
         where_clause.push_str(
             " AND COALESCE(
@@ -4985,6 +5193,28 @@ fn catalog_filter_where_clause<'a>(
         }
         binds.push(CatalogBind::Text(user_id));
         binds.push(CatalogBind::Integer(i64::from(is_favorite)));
+    }
+    if let Some(resume) = is_resumable {
+        // Same decision as `Items/Resume`, expressed as a correlated existence check so the list
+        // keeps its one-row-per-item projection and its filtered `TotalRecordCount`.
+        where_clause.push_str(&format!(
+            " AND EXISTS (
+                SELECT 1
+                FROM user_item_state resumable_state
+                WHERE resumable_state.user_id = ?
+                  AND resumable_state.item_id = mi.id
+                  AND {}
+                  AND {}
+            )",
+            resumable_state_predicate("resumable_state"),
+            resumable_progress_predicate(
+                "resumable_state.position_ticks",
+                resume_runtime_ticks_sql()
+            ),
+        ));
+        binds.push(CatalogBind::Text(user_id));
+        binds.push(CatalogBind::Integer(resume.minimum_ticks));
+        binds.push(CatalogBind::Integer(resume.played_percent));
     }
     if metadata_pending {
         where_clause.push_str(
@@ -5266,6 +5496,23 @@ fn resume_runtime_ticks_sql() -> &'static str {
     )"
 }
 
+/// The user-state half of the continue-watching decision.
+///
+/// Shared by the `Items/Resume` queries and the `Filters=IsResumable` catalog filter so both only
+/// accept rows of the same unpaused, unhidden and started-yet-unfinished state. Binds one value:
+/// the minimum progress ticks.
+fn resumable_state_predicate(state_alias: &str) -> String {
+    format!(
+        "{state_alias}.is_played = 0 AND {state_alias}.hide_from_resume = 0 AND {state_alias}.position_ticks >= ?"
+    )
+}
+
+/// The progress half of the continue-watching decision: the item has a known runtime and has not
+/// reached the configured watched percentage. Binds one value: the played percentage.
+fn resumable_progress_predicate(position_expression: &str, runtime_expression: &str) -> String {
+    format!("{runtime_expression} > 0 AND {position_expression} * 100 < {runtime_expression} * ?")
+}
+
 #[derive(Clone, Copy)]
 enum CatalogBind<'a> {
     Text(&'a str),
@@ -5310,8 +5557,13 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) media_source_ids: Option<&'a [String]>,
     pub(crate) provider_id_equals: Option<&'a [(String, String)]>,
     pub(crate) years: &'a [i64],
+    /// Lower-cased genre keys; an item matches when it has any of them (`Genres=A|B`).
+    pub(crate) genre_keys: &'a [String],
+    pub(crate) studio_keys: &'a [String],
     pub(crate) is_played: Option<bool>,
     pub(crate) is_favorite: Option<bool>,
+    /// `Filters=IsResumable`: keep the items the continue-watching list would offer this user.
+    pub(crate) is_resumable: Option<ResumeThresholds>,
     pub(crate) min_date_last_saved: Option<i64>,
     pub(crate) metadata_pending: bool,
     pub(crate) parent_id_scope: Option<Option<&'a str>>,
@@ -5323,6 +5575,16 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) include_total: bool,
 }
 
+/// The continue-watching thresholds a filter compares against.
+///
+/// The values are the ones `Items/Resume` reads (`home_resume_settings`), so
+/// `Filters=IsResumable` cannot drift into a second set of thresholds.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResumeThresholds {
+    pub(crate) played_percent: i64,
+    pub(crate) minimum_ticks: i64,
+}
+
 pub(crate) struct ResumeItemsQuery<'a> {
     pub(crate) user_id: &'a str,
     pub(crate) library_ids: &'a [String],
@@ -5330,6 +5592,16 @@ pub(crate) struct ResumeItemsQuery<'a> {
     pub(crate) content_restrictions: Option<&'a UserContentRestrictions>,
     pub(crate) played_percent: i64,
     pub(crate) minimum_ticks: i64,
+    pub(crate) offset: i64,
+    pub(crate) limit: i64,
+}
+
+/// One page of the current user's watch history (seen items, newest play first).
+pub(crate) struct WatchHistoryQuery<'a> {
+    pub(crate) user_id: &'a str,
+    pub(crate) library_ids: &'a [String],
+    pub(crate) item_types: &'a [&'a str],
+    pub(crate) content_restrictions: Option<&'a UserContentRestrictions>,
     pub(crate) offset: i64,
     pub(crate) limit: i64,
 }
@@ -5359,6 +5631,22 @@ pub(crate) struct StoredMediaWritebackContext {
     pub(crate) source: Option<StoredMediaSourcePath>,
 }
 
+/// One candidate of a library-wide ratings sync, with the fields that build the upstream lookup.
+///
+/// The row carries no source path: the ratings writer resolves the sidecar target itself, and the
+/// sync only needs the item identity plus the identifiers Trakt understands.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub(crate) struct StoredRatingsSyncItem {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) provider_ids_json: Option<String>,
+    pub(crate) production_year: Option<i64>,
+    pub(crate) season_number: Option<i64>,
+    pub(crate) episode_number: Option<i64>,
+    pub(crate) series_id: Option<String>,
+    pub(crate) parent_id: Option<String>,
+}
+
 #[derive(Debug)]
 pub(crate) struct StoredItemScanPath {
     pub(crate) library_id: String,
@@ -5381,8 +5669,28 @@ pub(crate) struct StoredPlaybackSource {
     pub(crate) source_kind: String,
     pub(crate) container: Option<String>,
     pub(crate) external_url: Option<String>,
+    /// Container bitrate measured by the last probe, in bits per second.
+    ///
+    /// `None` until the source was probed. Playback uses it to decide whether a caller's output
+    /// ceiling can still be met by Direct Play or a copy tier.
+    pub(crate) bitrate: Option<i64>,
+    /// Height of the first video stream in pixels, read from the stored probe details.
+    ///
+    /// `None` until the source was probed (or when the probe recorded no height). Playback uses it
+    /// to decide whether a caller's resolution ceiling forces a re-encode.
+    pub(crate) video_height: Option<i64>,
     pub(crate) root_path: String,
     pub(crate) relative_path: String,
+}
+
+/// Probed pixel dimensions of a media source's first video stream.
+///
+/// Either side can be missing: a probe or NFO sidecar may record only one of them, and an
+/// unprobed source records neither.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct StoredVideoDimensions {
+    pub(crate) width: Option<i64>,
+    pub(crate) height: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -5411,11 +5719,40 @@ pub(crate) struct NewDanmakuTrack<'a> {
     pub(crate) error_code: Option<&'a str>,
 }
 
+/// A tracked sidecar plus the media-root paths a delete needs (ADR-052 P5).
+///
+/// Unlike [`StoredDanmakuSource`] this joins `danmaku_tracks` without requiring a `READY` row, so an
+/// administrator can also remove a registration whose file already disappeared.
+#[derive(Clone, Debug)]
+pub(crate) struct StoredTrackedDanmakuSource {
+    pub(crate) source_id: String,
+    pub(crate) root_path: String,
+    pub(crate) relative_path: String,
+    pub(crate) provider: Option<String>,
+}
+
+/// The single job item of a one-target danmaku job (an administrator's manual match, or the retry
+/// of a one-item library job).
+pub(crate) struct NewDanmakuSingleItemJob<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) media_source_id: &'a str,
+    /// `true` for an administrator's manual match (`kind = 'MANUAL'`), `false` for a sweep retry.
+    pub(crate) manual: bool,
+    pub(crate) provider_anime_id: Option<&'a str>,
+    /// Set only for a manual match, which fetches one exact episode instead of running
+    /// `danmaku.match`.
+    pub(crate) provider_episode_id: Option<&'a str>,
+    /// Provider label the administrator selected; `None` for a sweep retry.
+    pub(crate) provider: Option<&'a str>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct StoredDanmakuMatchJob {
     pub(crate) id: String,
     pub(crate) library_id: String,
     pub(crate) status: String,
+    /// `SWEEP` (library sweep, the default) or `MANUAL` (an administrator's single-episode match).
+    pub(crate) kind: String,
     pub(crate) overwrite: bool,
     pub(crate) concurrency: i64,
     pub(crate) total_count: i64,
@@ -5434,6 +5771,12 @@ pub(crate) struct StoredDanmakuMatchJob {
 pub(crate) struct StoredDanmakuMatchItem {
     pub(crate) id: String,
     pub(crate) media_source_id: String,
+    /// Prefilled by an administrator's manual match; a set episode id means the worker must fetch
+    /// the episode instead of running `danmaku.match` (ADR-052 P5).
+    pub(crate) provider_anime_id: Option<String>,
+    pub(crate) provider_episode_id: Option<String>,
+    /// Provider label the administrator selected for a manual match.
+    pub(crate) provider: Option<String>,
     pub(crate) root_path: Option<String>,
     pub(crate) relative_path: Option<String>,
     pub(crate) item_type: Option<String>,
@@ -5501,6 +5844,7 @@ struct StoredDanmakuMatchJobRow {
     id: String,
     library_id: String,
     status: String,
+    kind: String,
     overwrite: i64,
     concurrency: i64,
     total_count: i64,
@@ -5521,6 +5865,7 @@ fn stored_danmaku_match_job(row: sqlx::any::AnyRow) -> Result<StoredDanmakuMatch
         id: row.id,
         library_id: row.library_id,
         status: row.status,
+        kind: row.kind,
         overwrite: row.overwrite != 0,
         concurrency: row.concurrency,
         total_count: row.total_count,
@@ -7484,7 +7829,7 @@ mod stored_row_decoding_tests {
         assert_eq!(job.library_id.as_deref(), Some("reid-lib"));
         assert_eq!(job.total_count, 1);
         assert_eq!(job.processed_count, 0);
-        assert_eq!(job.pending_count, 0);
+        assert_eq!(job.pending_count, Some(0));
         assert!(!job.cancel_requested);
         assert_eq!(job.error, None);
         assert_eq!(job.started_at, None);

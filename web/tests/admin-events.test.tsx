@@ -1,52 +1,46 @@
 // @vitest-environment jsdom
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { LuxShell } from "../src/components/layout/LuxShell";
 import { AdminLayout } from "../src/features/admin/AdminLayout";
+import { FakeWebSocket, installFakeWebSocket } from "./support/fake-websocket";
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
-type EventListener = (event: Event) => void;
-
-class FakeEventSource {
-  static instances: FakeEventSource[] = [];
-  readonly listeners = new Map<string, Set<EventListener>>();
-  closed = false;
-
-  constructor(readonly url: string) {
-    FakeEventSource.instances.push(this);
-  }
-
-  addEventListener(type: string, listener: EventListener) {
-    const listeners = this.listeners.get(type) ?? new Set<EventListener>();
-    listeners.add(listener);
-    this.listeners.set(type, listeners);
-  }
-
-  removeEventListener(type: string, listener: EventListener) {
-    this.listeners.get(type)?.delete(listener);
-  }
-
-  close() {
-    this.closed = true;
-  }
-
-  emit(type: string, data?: string) {
-    const event = new MessageEvent(type, { data });
-    for (const listener of this.listeners.get(type) ?? []) listener(event);
-  }
+/** One `jobs` query whose page can be unmounted while the console stays mounted. */
+function StrmJobsPage({ queryFn }: { queryFn: () => Promise<unknown> }) {
+  useQuery({ queryKey: ["admin", "strm-probe-jobs", "all"], queryFn });
+  return null;
 }
 
-describe("admin SSE events", () => {
+/** Stands in for an admin page that subscribes to two of the `jobs` scope query keys. */
+function SubscribedAdminQueries() {
+  useQuery({
+    queryKey: ["admin", "metadata-jobs", "all", "base"],
+    queryFn: () => new Promise<never>(() => {}),
+  });
+  useQuery({ queryKey: ["admin", "logs"], queryFn: () => new Promise<never>(() => {}) });
+  return null;
+}
+
+function socket(index = -1): FakeWebSocket {
+  const ws = FakeWebSocket.instances.at(index);
+  if (!ws) throw new Error("no realtime socket was created");
+  return ws;
+}
+
+describe("admin realtime events", () => {
   let container: HTMLDivElement;
   let root: Root;
 
   beforeEach(() => {
-    FakeEventSource.instances = [];
-    vi.stubGlobal("EventSource", FakeEventSource);
+    installFakeWebSocket();
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    vi.useFakeTimers();
     container = document.createElement("div");
     document.body.append(container);
   });
@@ -59,104 +53,287 @@ describe("admin SSE events", () => {
     vi.restoreAllMocks();
   });
 
-  it("opens one authenticated stream and invalidates matching queries", async () => {
-    vi.useFakeTimers();
+  function renderAdminLayout(subscribed: boolean) {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue();
-
     act(() => {
       root = createRoot(container);
       root.render(
         <QueryClientProvider client={queryClient}>
-          <MemoryRouter>
-            <AdminLayout />
+          <MemoryRouter initialEntries={["/admin"]}>
+            <Routes>
+              <Route path="/admin" element={<AdminLayout />}>
+                <Route index element={subscribed ? <SubscribedAdminQueries /> : null} />
+              </Route>
+            </Routes>
           </MemoryRouter>
         </QueryClientProvider>,
       );
     });
+    return queryClient;
+  }
+
+  it("opens one websocket and invalidates the queries the mounted view subscribes to", async () => {
+    const queryClient = renderAdminLayout(true);
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue();
     await act(async () => await Promise.resolve());
 
-    expect(FakeEventSource.instances).toHaveLength(1);
-    const source = FakeEventSource.instances[0];
-    expect(source.url).toBe("/api/v1/admin/events");
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(socket().url).toBe("ws://localhost:3000/api/v1/ws");
 
-    act(() => source.emit("open"));
-    act(() => vi.advanceTimersByTime(250));
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["admin"] });
-
-    invalidate.mockClear();
-    act(() => source.emit("invalidate", JSON.stringify({ scope: "jobs" })));
+    act(() => socket().message({ type: "ready", version: 1 }));
     act(() => vi.advanceTimersByTime(250));
     expect(invalidate.mock.calls.map(([options]) => options)).toEqual([
-      { queryKey: ["admin", "jobs"] },
-      { queryKey: ["admin", "metadata-jobs"] },
-      { queryKey: ["admin", "strm-probe-jobs"] },
-      { queryKey: ["admin", "chapter-detection-jobs"] },
-      { queryKey: ["admin", "danmaku-match-jobs"] },
-      { queryKey: ["admin", "library-cover-jobs"] },
-      { queryKey: ["admin", "task-activity"] },
-      { queryKey: ["admin", "scheduled-tasks"] },
-      { queryKey: ["admin", "dashboard"] },
-      { queryKey: ["admin", "logs"] },
+      { queryKey: ["admin", "metadata-jobs", "all", "base"], exact: true },
+      { queryKey: ["admin", "logs"], exact: true },
+    ]);
+
+    invalidate.mockClear();
+    act(() => socket().message({ type: "invalidate", channel: "admin", scope: "jobs" }));
+    act(() => vi.advanceTimersByTime(250));
+    // The eight other job queries no mounted admin view observes are left alone instead of
+    // being refreshed (and, with the metadata list, aggregated) once per second.
+    expect(invalidate.mock.calls.map(([options]) => options)).toEqual([
+      { queryKey: ["admin", "metadata-jobs", "all", "base"], exact: true },
+      { queryKey: ["admin", "logs"], exact: true },
     ]);
   });
 
-  it("closes the stream when the admin layout unmounts", () => {
-    const queryClient = new QueryClient();
-    act(() => {
-      root = createRoot(container);
-      root.render(
-        <QueryClientProvider client={queryClient}>
-          <MemoryRouter>
-            <AdminLayout />
-          </MemoryRouter>
-        </QueryClientProvider>,
-      );
-    });
+  it("refreshes every subscribed query on each open, not only the first one (D15②)", async () => {
+    const queryClient = renderAdminLayout(true);
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue();
+    await act(async () => await Promise.resolve());
 
-    const source = FakeEventSource.instances[0];
+    act(() => socket().ready());
+    act(() => vi.advanceTimersByTime(250));
+    expect(invalidate).toHaveBeenCalledTimes(2);
+
+    invalidate.mockClear();
+    act(() => socket().serverClose(1006));
+    act(() => vi.advanceTimersByTime(500));
+    expect(FakeWebSocket.instances).toHaveLength(2);
+
+    act(() => socket().ready());
+    act(() => vi.advanceTimersByTime(250));
+    expect(invalidate.mock.calls.map(([options]) => options)).toEqual([
+      { queryKey: ["admin", "metadata-jobs", "all", "base"], exact: true },
+      { queryKey: ["admin", "logs"], exact: true },
+    ]);
+  });
+
+  it("merges invalidations that arrive inside the same 250ms window (D15③)", async () => {
+    const queryClient = renderAdminLayout(true);
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue();
+    await act(async () => await Promise.resolve());
+    act(() => socket().ready());
+    act(() => vi.advanceTimersByTime(250));
+    invalidate.mockClear();
+
+    act(() => socket().message({ type: "invalidate", channel: "admin", scope: "jobs" }));
+    act(() => vi.advanceTimersByTime(100));
+    act(() => socket().message({ type: "invalidate", channel: "admin", scope: "metadata" }));
+    act(() => vi.advanceTimersByTime(100));
+    expect(invalidate).not.toHaveBeenCalled();
+
+    act(() => vi.advanceTimersByTime(50));
+    expect(invalidate.mock.calls.map(([options]) => options)).toEqual([
+      { queryKey: ["admin", "metadata-jobs", "all", "base"], exact: true },
+      { queryKey: ["admin", "logs"], exact: true },
+    ]);
+
+    invalidate.mockClear();
+    act(() => socket().message({ type: "invalidate", channel: "admin", scope: "metadata" }));
+    act(() => vi.advanceTimersByTime(249));
+    expect(invalidate).not.toHaveBeenCalled();
+    act(() => vi.advanceTimersByTime(1));
+    expect(invalidate.mock.calls.map(([options]) => options)).toEqual([
+      { queryKey: ["admin", "logs"], exact: true },
+    ]);
+  });
+
+  it("ignores user-channel frames and malformed scopes", async () => {
+    const queryClient = renderAdminLayout(true);
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue();
+    await act(async () => await Promise.resolve());
+    act(() => socket().ready());
+    act(() => vi.advanceTimersByTime(250));
+    invalidate.mockClear();
+
+    act(() => socket().message({ type: "invalidate", channel: "user", scope: "home" }));
+    act(() => socket().message({ type: "invalidate", channel: "admin", scope: "unknown" }));
+    act(() => socket().message("not-json"));
+    act(() => vi.advanceTimersByTime(250));
+    expect(invalidate).not.toHaveBeenCalled();
+  });
+
+  it("does not refetch job queries no admin view is subscribed to", async () => {
+    const queryClient = renderAdminLayout(false);
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue();
+    await act(async () => await Promise.resolve());
+
+    act(() => socket().message({ type: "invalidate", channel: "admin", scope: "jobs" }));
+    act(() => vi.advanceTimersByTime(250));
+    expect(invalidate).not.toHaveBeenCalled();
+  });
+
+  it("closes the socket when the admin layout unmounts", () => {
+    renderAdminLayout(false);
+
+    const ws = socket();
     act(() => root.unmount());
-    expect(source.closed).toBe(true);
+    expect(ws.closeCalls).toHaveLength(1);
   });
 
   it("does not refresh metadata jobs twice for metadata audit events", async () => {
-    vi.useFakeTimers();
+    const queryClient = renderAdminLayout(true);
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue();
+    await act(async () => await Promise.resolve());
+
+    act(() => socket().message({ type: "invalidate", channel: "admin", scope: "metadata" }));
+    act(() => vi.advanceTimersByTime(250));
+    expect(invalidate.mock.calls.map(([options]) => options)).toEqual([
+      { queryKey: ["admin", "logs"], exact: true },
+    ]);
+  });
+
+  it("shares one socket between the user shell and the admin layout", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue();
-
     act(() => {
       root = createRoot(container);
       root.render(
         <QueryClientProvider client={queryClient}>
-          <MemoryRouter>
-            <AdminLayout />
+          <MemoryRouter initialEntries={["/admin"]}>
+            <Routes>
+              <Route element={<LuxShell user={{ id: "operator", usernameNormalized: "operator" }} />}>
+                <Route path="/admin" element={<AdminLayout />}>
+                  <Route index element={<SubscribedAdminQueries />} />
+                </Route>
+              </Route>
+            </Routes>
           </MemoryRouter>
         </QueryClientProvider>,
       );
     });
     await act(async () => await Promise.resolve());
 
-    act(() => FakeEventSource.instances[0].emit("invalidate", JSON.stringify({ scope: "metadata" })));
+    // ADR-054: user and admin channels ride the same connection, so an admin tab holds one.
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    act(() => socket().ready());
     act(() => vi.advanceTimersByTime(250));
-    expect(invalidate.mock.calls.map(([options]) => options)).toEqual([
-      { queryKey: ["admin", "logs"] },
-    ]);
+    expect(invalidate).toHaveBeenCalled();
+
+    act(() => socket().message({ type: "invalidate", channel: "admin", scope: "jobs" }));
+    act(() => vi.advanceTimersByTime(250));
+    expect(FakeWebSocket.instances).toHaveLength(1);
   });
 
-  it("prefetches a target page when its navigation link is activated", () => {
+  it("sweeps every admin query when the console mounts on an already-ready connection", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const prefetch = vi.spyOn(queryClient, "prefetchQuery").mockResolvedValue(undefined);
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue();
 
-    act(() => {
-      root = createRoot(container);
+    const renderTree = (showAdmin: boolean) => act(() => {
       root.render(
         <QueryClientProvider client={queryClient}>
-          <MemoryRouter>
-            <AdminLayout />
+          <MemoryRouter initialEntries={["/admin"]}>
+            <Routes>
+              <Route element={<LuxShell user={{ id: "operator", usernameNormalized: "operator" }} />}>
+                <Route path="/admin" element={showAdmin ? <AdminLayout /> : null}>
+                  <Route index element={<SubscribedAdminQueries />} />
+                </Route>
+              </Route>
+            </Routes>
           </MemoryRouter>
         </QueryClientProvider>,
       );
     });
+
+    // The shell (user channel) opens the connection first; this is the home -> /admin path.
+    renderTree(false);
+    await act(async () => await Promise.resolve());
+    act(() => socket().ready());
+    await act(async () => await Promise.resolve());
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    invalidate.mockClear();
+
+    // Joining an already-ready connection must still refresh everything the console shows.
+    renderTree(true);
+    await act(async () => await Promise.resolve());
+    act(() => vi.advanceTimersByTime(250));
+    expect(invalidate.mock.calls.map(([options]) => options)).toEqual([
+      { queryKey: ["admin", "metadata-jobs", "all", "base"], exact: true },
+      { queryKey: ["admin", "logs"], exact: true },
+    ]);
+
+    // Leaving the console and coming back sweeps again: frames that arrived while it was
+    // unmounted were dropped.
+    invalidate.mockClear();
+    renderTree(false);
+    await act(async () => await Promise.resolve());
+    renderTree(true);
+    await act(async () => await Promise.resolve());
+    act(() => vi.advanceTimersByTime(250));
+    expect(invalidate).toHaveBeenCalledTimes(2);
+  });
+
+  it("marks an unmounted query stale so the next mount refetches it (LUX-898)", async () => {
+    // `web/src/main.tsx` keeps every query fresh for 60 s. A frame that arrives while its page is
+    // unmounted must still mark the query stale, otherwise a job that finished meanwhile keeps
+    // showing as running until the stale window ends.
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { staleTime: 60_000, retry: false, refetchOnWindowFocus: false },
+      },
+    });
+    const load = vi.fn<() => Promise<unknown>>().mockResolvedValue({ jobs: [] });
+    root = createRoot(container);
+    const renderTree = (showPage: boolean) => act(() => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/admin"]}>
+            <Routes>
+              <Route path="/admin" element={<AdminLayout />}>
+                <Route index element={showPage ? <StrmJobsPage queryFn={load} /> : null} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+
+    renderTree(true);
+    await act(async () => await Promise.resolve());
+    expect(load).toHaveBeenCalledTimes(1);
+
+    // The `ready` sweep (D15②) refreshes the page while it is on screen.
+    act(() => socket().ready());
+    act(() => vi.advanceTimersByTime(250));
+    await act(async () => await Promise.resolve());
+    expect(load).toHaveBeenCalledTimes(2);
+
+    // Leaving the page keeps the console (and its connection) mounted.
+    renderTree(false);
+    await act(async () => await Promise.resolve());
+    expect(load).toHaveBeenCalledTimes(2);
+
+    act(() => socket().message({ type: "invalidate", channel: "admin", scope: "jobs" }));
+    act(() => vi.advanceTimersByTime(250));
+    await act(async () => await Promise.resolve());
+    // No request for a page that is not on screen...
+    expect(load).toHaveBeenCalledTimes(2);
+
+    // ...but the query was marked stale, so mounting it again refetches even inside the 60 s
+    // staleTime window.
+    renderTree(true);
+    await act(async () => await Promise.resolve());
+    expect(load).toHaveBeenCalledTimes(3);
+  });
+
+  it("prefetches a target page when its navigation link is activated", () => {
+    const queryClient = renderAdminLayout(false);
+    const prefetch = vi.spyOn(queryClient, "prefetchQuery").mockResolvedValue(undefined);
 
     const pluginsLink = [...container.querySelectorAll<HTMLAnchorElement>("a")]
       .find((link) => link.getAttribute("href") === "/admin/plugins");

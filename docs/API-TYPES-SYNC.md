@@ -23,7 +23,7 @@
 | (c) | 非 JSON：图片字节流、媒体流、字幕文本、XML |
 | 204 | 成功但无响应体 |
 
-统计口径：`src/api/lux_api.rs` 共 **45 条 route 条目、47 个 handler**（`/items/{item_id}/metadata` 与 `/people/{person_id}` 各有两个方法）。
+统计口径：`src/api/lux_api.rs` 共 **48 条 route 条目、50 个 handler**（`/items/{item_id}/metadata` 与 `/people/{person_id}` 各有两个方法；LUX-899 新增 `/items/{item_id}/similar`，LUX-900 新增 `/api/v1/tags`）。
 
 ## 全量路由清点
 
@@ -60,7 +60,7 @@
 | 29 | `/api/v1/items/{item_id}/stream` | GET, HEAD | `lux_stream` | (c) | 媒体流（含 Range） | — |
 | 30 | `/api/v1/items/{item_id}/playback` | GET | `lux_get_playback` | (b) | 播放状态 `json!` | `PlaybackState` |
 | 31 | `/api/v1/items/{item_id}/progress` | POST | `lux_post_progress` | 204 | — | `void` |
-| 32 | `/api/v1/playback/sessions` | POST | `lux_create_web_playback_session` | (b) | `create_web_playback_session_json`（`playback.rs:3645`）返回 `Value` | `WebPlaybackSession` |
+| 32 | `/api/v1/playback/sessions` | POST | `lux_create_web_playback_session` | (b) | `create_web_playback_session_json`（`playback.rs:3645`）返回 `Value` | `WebPlaybackSession`（含 `bitrate` / `resolution`，见「手工镜像补充」） |
 | 33 | `/api/v1/playback/bootstrap` | POST | `lux_create_web_playback_bootstrap` | (b) | `{playback,session}` 等 `json!` | `WebPlaybackBootstrap` |
 | 34 | `/api/v1/playback/sessions/{session_id}/events` | POST | `lux_web_playback_event` | (b) | `{accepted,duplicate,stale}` | 内联 `{accepted,duplicate,stale}` |
 | 35 | `/api/v1/playback/sessions/{session_id}/heartbeat` | POST | `lux_web_playback_heartbeat` | (b) | `{sessionId,expiresAt}` | 内联 `{sessionId,expiresAt}` |
@@ -74,19 +74,22 @@
 | 43 | `/api/v1/playback-history` | GET | `lux_list_playback_history` | (b) | `{events:Vec<PlaybackHistoryEventView>,page,pageSize}` | **无前端消费** |
 | 44 | `/api/v1/items/{item_id}/metadata` | GET, PATCH | `lux_get_metadata` / `lux_update_metadata` | (b) | `metadata_json`（`media.rs:1274`） | `ItemMetadata` / `MetadataFieldName` |
 | 45 | `/api/v1/items/{item_id}/download` | GET, HEAD | `lux_download` | (c) | 文件下载流 | — |
+| 46 | `/api/v1/watch-history` | GET | `lux_list_watch_history` | (b) | `lux_catalog_page_json_for_user` | `PageResponse<MediaItem>` |
+| 47 | `/api/v1/items/{item_id}/similar` | GET | `lux_get_similar` | (b) | `lux_catalog_page_json_for_user` | `PageResponse<MediaItem>`（已接入 Web 详情页相似推荐，见「LUX-899 原生相似条目接口」） |
+| 48 | `/api/v1/tags` | GET | `lux_list_tags` | (a) | `LuxTagsResponse`（`media.rs`） | `LuxTagsResponse` / `LuxTag`（生成绑定，暂无调用点；见「LUX-900 原生标签列表接口」） |
 
 ### 统计
 
 | 类别 | route 条目 | 占比 |
 | --- | --- | --- |
-| (a) 全新具名结构体 | 1 | 2% |
+| (a) 全新具名结构体 | 2 | 4% |
 | (a)+(b) 混合（元素具名、信封手拼） | 1 | 2% |
-| (b) `json!` 手拼 / `Value` | 25 | 56% |
-| (c) 非 JSON | 12 | 27% |
+| (b) `json!` 手拼 / `Value` | 27 | 56% |
+| (c) 非 JSON | 12 | 25% |
 | 204 无响应体 | 6 | 13% |
-| **合计** | **45** | 100% |
+| **合计** | **48** | 100% |
 
-结论：Lux API 的 JSON 响应里 **只有 1 条路由（`/people/{id}`）已经是纯具名结构体**，(b) 占 56%。
+结论：Lux API 的 JSON 响应里 **只有 2 条路由（`/people/{id}` 与 `/tags`）已经是纯具名结构体**，(b) 占 56%。
 `types.ts` 中 221 个导出类型的绝大部分（含整个 `Admin*` 家族）对应的是 `src/api/admin/**` 与 `src/api/users.rs` 的路由，
 不在本次清点范围内，但同样属于 (b)。
 
@@ -152,7 +155,7 @@
 
 ## 阶段 1 结论
 
-- Lux API 45 条路由中，(b) `json!` 手拼占 56%，(a) 纯具名结构体只有 1 条；这正是 `types.ts` 需要手工镜像的根因。
+- Lux API 47 条路由中，(b) `json!` 手拼占 57%，(a) 纯具名结构体只有 1 条；这正是 `types.ts` 需要手工镜像的根因。
 - 全量改造需要 11~16 人日，必须先做 `MediaItem` / 播放会话两个大件；本次试点取 3 组小形状（约 1.2 人日）先打通「Rust 结构体 → 生成 TS → re-export」和防漂移检查。
 - 清点过程中发现 4 处既有漂移，已记录为后续验收样本。
 
@@ -298,6 +301,42 @@ scripts/check-api-types.sh          # 只跑这一项
 已验证：`TS_RS_IMPORT_EXTENSION=.js TS_RS_LARGE_INT=bigint scripts/generate-api-types.sh` 生成的产物
 与提交内容完全一致。
 
+## 手工镜像补充：手动分辨率上限（`maxHeight`）
+
+手动画质上限没有走 ts-rs 试点（`bitrate` / `resolution` 仍由 `web_playback_session_json` 的 `json!` 拼装），
+前端按本文件约定继续手工镜像。播放页的「画质」已从码率上限改为分辨率上限，对应关系如下。
+
+> **后端实现状态**：下表的 `max_height` 请求字段与 `resolution` 响应字段由并行后端任务
+> `playback-max-height-backend` 提供；该任务合并前，本文档按契约记录字段，Rust 侧尚未落地，
+> 不应把表中“Rust 位置/类型”当成已存在的代码。合并后如字段名或可空性有出入，以后端实际实现为准并同步本表。
+
+| Rust（契约，由 `playback-max-height-backend` 提供） | 位置 | `types.ts` | 说明 |
+| --- | --- | --- | --- |
+| 请求体 `max_height: Option<i64>` | `WebPlaybackSessionRequest` / `WebPlaybackBootstrapRequest` | `WebPlaybackRequestSelection.maxHeight?: number` | 可选，像素，144–4320；`client.ts` 把 `selection` 原样展开进请求体，不做字段重命名 |
+| 响应 `resolution.sourceHeight` | `web_playback_session_json` | `WebPlaybackResolution.sourceHeight: number \| null` | 源视频高度（ffprobe `Height`），未探测为 `null` |
+| 响应 `resolution.maxHeight` | 同上 | `WebPlaybackResolution.maxHeight: number \| null` | 请求里的用户上限回显，未提供为 `null` |
+| 响应 `resolution.targetHeight` | 同上 | `WebPlaybackResolution.targetHeight: number \| null` | 实际输出高度；无法确定时为 `null` |
+| 响应 `resolution.limited` | 同上 | `WebPlaybackResolution.limited: boolean \| null` | 仅当源高度 > `maxHeight`、服务端真的转码缩放时为 `true`；无法确定时为 `null` |
+| 响应 `resolution` 键本身 | 同上 | `WebPlaybackSession.resolution?: WebPlaybackResolution \| null` | **可选**：旧服务端不带该键或显式给 `null`，前端回落到中性文案「原画（自动）」 |
+| 请求体 `max_bitrate: Option<i64>` | 同上 | `WebPlaybackRequestSelection.maxBitrate?: number` | **仅保留在 API 类型中**：UI 不再提供码率档位，播放页不再读取/写入 `maxBitrate` URL 参数 |
+| 响应 `bitrate.*` / `bitrate` 键 | 同上 | `WebPlaybackBitrate` / `WebPlaybackSession.bitrate?` | 继续保留（其它读路径仍可能使用），但播放页的画质文案已改用 `resolution` |
+
+约定：
+
+- **`resolution` 与 `bitrate` 都保持可选**，与 `WebPlaybackPlan.candidates`、`MediaSource.bitrate` 的既有写法一致：
+  这是读路径上的放宽，不会让旧响应的测试夹具全部失效；真正的必填化应等 G-Playback 改造成结构体时一次完成。
+- **语义**：源高度 > `maxHeight` 时服务端转码并缩放到 `maxHeight`；否则不变（`limited: false`）。
+  前端不自行断言服务端没有报告的结论：`resolution`/`limited` 缺失或 `targetHeight/sourceHeight` 均为 `null` 时只显示「原画（自动）」。
+  `limited: false` 的状态文案优先使用 `targetHeight`（服务端真实输出高度），缺失才回落到 `sourceHeight`。
+- **query key 槽位改为 `maxHeight`**（缓存按分辨率变体隔离，切换画质才能触发新会话）：
+  `["playback-bootstrap" | "web-playback-session", itemId, sourceId, audioStreamIndex, subtitleStreamIndex, maxHeight, attempt]`。
+  读取单个槽位的 helper 跟着各自的 feature 走：`audioParamFromQueryKey`（`audio-track-selection.ts`，下标 3）、
+  `maxHeightParamFromQueryKey`（`playback-quality.ts`，下标 5）。后续若要改成具名对象键，两处 helper 与
+  `usePlaybackReporting` 的 `queryKey[0]` 判断需要一起改。
+- **URL 参数**：`maxHeight` 是唯一画质参数；旧的 `maxBitrate` 参数不再读取/写入（手写 URL 会被忽略），
+  切换片源时保留规范化后的 `maxHeight`，音轨/字幕索引则随旧片源一起丢弃。
+- 档位生成、URL 参数、状态文案都在 `web/src/features/player/playback-quality.ts`（纯函数，有单测），不参与类型生成。
+
 ## 如何扩展到更多路由
 
 1. **先定形状，再改代码**：在 `docs/` 或 PR 描述里写出目标 JSON（键顺序无所谓，但 `null` / 缺省 / 数字类型要写清）。
@@ -336,6 +375,76 @@ scripts/check-api-types.sh          # 只跑这一项
 
 `/api/v1/continue-watching`、`/favorites`、`/search`、`/children` 等 8 条路由共用 `G-Page` + `G-MediaItem`，
 所以第 3、4 步完成后一次就能覆盖它们。
+
+## 管理员手动弹幕匹配 DTO（ADR-052 P5）
+
+`GET /api/v1/admin/items/{item_id}/danmaku/search` 的响应在实现时就按具名结构体写，并直接接入
+ts-rs 生成流程（`--features ts-bindings` → `scripts/generate-api-types.sh`），因此不再需要手工镜像：
+
+| 类型 | 定义位置 | 覆盖路由 | 生成文件 |
+| --- | --- | --- | --- |
+| `ManualDanmakuSearchResponse` | `src/api/admin/admin_danmaku.rs` | `GET .../danmaku/search` | `ManualDanmakuSearchResponse.ts` |
+| `ManualDanmakuCandidate` | 同上 | 响应项 | `ManualDanmakuCandidate.ts` |
+| `ManualDanmakuEpisode` | 同上 | 候选内的分集 | `ManualDanmakuEpisode.ts` |
+
+- `web/src/lib/api/types.ts` 用 `export type { ... } from "./generated/..."` 转出这三个类型，导出名与
+  Rust 类型一致；`web/src/lib/api/client.ts` 的 `manualDanmakuSearch` / `startManualDanmakuMatch` /
+  `deleteItemDanmaku` 使用它们（`AdminDanmakuMatchJob` 继续复用现有手写类型）。
+- `provider` 在 Rust 是 `Option<String>`，因此生成 `provider: string | null`；服务端始终输出该键（不跳过
+  `null`），与 `WebDanmakuInfo.sourceId` 的处理一致。
+- **请求体不参与生成**（本文件范围约定）。`POST .../danmaku/match` 的请求形状
+  `{ sourceId?, provider?, animeId?, episodeId, overwrite }` 与 `DELETE .../danmaku` 的
+  `sourceId`/`confirmUserSidecar` 查询参数在 `client.ts` 里手写，字段名与 `docs/API.md` 一致。
+- `DELETE` 成功为 `204`，因此生成类型不适用；`POST` 复用现有 match-jobs 作业 DTO（`{ job }` 信封）。
+- 生成命令与防漂移检查沿用第 3 节：`scripts/generate-api-types.sh`、`scripts/check-api-types.sh`
+  （后者已接入 `scripts/check-all.sh`）。
+
+## LUX-899 原生相似条目接口
+
+`GET /api/v1/items/{item_id}/similar?limit=`（路由在 `src/api/lux_api.rs` 注册，handler `lux_get_similar` 位于 `src/api/media.rs`）是相似条目的
+权威实现；Emby `GET /Items/{id}/Similar` 改为调用同一个 `CatalogService::list_similar_items`，只保留
+Emby DTO/参数适配。
+
+- 响应形状直接复用 `lux_catalog_page_json_for_user`：`{items,page,pageSize,hasNext,total}`。`items` 是
+  `lux_catalog_items_json_for_user` 生成的 Lux 媒体条目（`MediaItem` 家族），**不是** Emby 的
+  `Items`/`TotalRecordCount` DTO。
+- 因此该路由按本文件口径属于 **(b)**：信封与条目都是 `json!` 手拼的 `Value`，没有可派生的具名结构体。
+  `total` 是有界候选池（最多 10 个源 Genre × 每个 200 个候选，即 2000）内的去重总数；`page` 是请求的
+  1 起页码，`pageSize` 是生效的 `limit`，`hasNext = offset + items.len() < total`（`offset =
+  (page - 1) * limit`）。`offset` 超出候选池时返回 200 与空 `items`。
+- 目前 Web 详情页的「相似推荐」区块（LUX-901）已接入该路由：`web/src/lib/api/client.ts` 的
+  `similarItems` 只发送 `limit=12`（不发送 `page`/`pageSize`），复用 `lux_catalog_page_json_for_user` 的
+  `{items,page,pageSize,hasNext,total}` 信封；`types.ts` 只增加 `SimilarItemsQuery` 与
+  `SimilarItemsResponse`（后者的别名是 `PageResponse<MediaItem>`），`generated/` 不新增类型，也不需要重新
+  生成绑定。响应仍是 (b) 手拼 `Value`，尚未按「如何扩展到更多路由」拆成 G-Page/G-MediaItem 具名结构体；
+  后续做该拆分时，Web 侧类型应随之一并迁移。该区块只用于电影与剧集详情，结果为空或请求失败时整体不渲染。
+- 请求参数是 `limit`（默认 50、1-1000，空值按未提供，`0`/负数/非整数/超过 1000 为 400）与 `page`
+  （1 起、默认 1，空值按未提供，`0`/负数/非整数为 400）；`pageSize` 是 `limit` 的别名，使用同一默认值与
+  上限，两者同时提供且数值不一致返回 400。它们属于读路径查询参数，不在本文件的请求体范围内。Lux 与 Emby
+  的默认值/上限分开定义（`LUX_SIMILAR_*` 与 `EMBY_SIMILAR_DEFAULT_LIMIT`/`EMBY_MAX_PAGE_LIMIT`），
+  Emby 不接收 `page`。
+
+## LUX-900 原生标签列表接口
+
+`GET /api/v1/tags`（路由在 `src/api/lux_api.rs` 注册，handler `lux_list_tags` 与 DTO 位于 `src/api/media.rs`）
+是首个在实现时就写成具名结构体并接入 ts-rs 的 Lux 标签响应，按本文件口径属于 **(a)**：
+
+| 类型 | 定义位置 | 覆盖路由 | 生成文件 |
+| --- | --- | --- | --- |
+| `LuxTagsResponse` | `src/api/media.rs` | `GET /api/v1/tags` | `LuxTagsResponse.ts` |
+| `LuxTag` | 同上 | 响应项 | `LuxTag.ts` |
+
+- 响应形状是 `{tags:[{name}],page,pageSize,total}`：分页字段名与其它 `/api/v1` 列表一致，集合名是 `tags`
+  而不是 `items`，因为返回的是标签而不是媒体条目；`total` 是去重后的标签总数。
+- `LuxTag` 只有 `name`；存储投影里的 `name_key` 与 `item_count` 不出现在响应里，因此 DTO 不是
+  `StoredMediaFacet` 的直接序列化。
+- `web/src/lib/api/types.ts` 只用 `export type { LuxTag } from "./generated/LuxTag"` 与
+  `export type { LuxTagsResponse } from "./generated/LuxTagsResponse"` 转出这两个生成类型；没有新增
+  `client.ts` 函数、页面或调用点，生成命令与防漂移检查沿用第 3 节
+  （`scripts/generate-api-types.sh`、`scripts/check-api-types.sh`）。
+- 这是新端点，不存在「响应字节不变」的兼容负担；`page`/`pageSize`/`total` 都是 `i64`
+  （`TS_RS_LARGE_INT=number`）。
+- 查询参数（`libraryId`、`itemType`、`page`、`pageSize`）与状态码不在本文件的请求体范围内，见 `docs/API.md`。
 
 ## 已知限制
 

@@ -74,11 +74,29 @@ export type MatroskaTrack = {
   contentEncodings: MatroskaContentEncoding[];
 };
 
+/**
+ * Copies bytes into a standalone array whose `byteOffset` is 0.
+ *
+ * The `ebml` decoder hands out Node `Buffer`s (the `buffer` polyfill in the browser) and
+ * `Buffer#slice` returns a **view**, not a copy — unlike `Uint8Array#slice`. MP4Box writes
+ * `Uint8Array` payloads with `DataStream.writeUint8Array`, which copies from `array.buffer` offset 0
+ * and ignores `byteOffset`, so a view written into an fMP4 box silently carries the wrong bytes: a
+ * `hvcC`/`avcC`/`vpcC`/`av1C` built from a view ends up holding the start of the read chunk, and the
+ * browser rejects the init segment with “MSE SourceBuffer append failed”. Every byte array that
+ * reaches MP4Box therefore goes through this helper first.
+ */
+export function copyBytes(data: Uint8Array): Uint8Array {
+  const copy = new Uint8Array(data.byteLength);
+  copy.set(data);
+  return copy;
+}
+
 export type MatroskaSample = {
   trackNumber: number;
   timestampMs: number;
   durationMs: number;
   keyframe: boolean;
+  /** Standalone bytes (`byteOffset === 0`); see `copyBytes` for why that matters. */
   data: Uint8Array;
   discardPaddingNs?: number;
   ptsMs: number;
@@ -260,7 +278,7 @@ export class MatroskaStreamDemuxer {
     if (!block) return;
     const track = this.tracks.get(block.trackNumber);
     if (!track) {
-      this.pendingBlocks.push({ data: data.slice(), simple });
+      this.pendingBlocks.push({ data: copyBytes(data), simple });
       return;
     }
     const timestampMs = (this.clusterTimecode + block.timecode) * this.timecodeScale / 1_000_000;
@@ -273,7 +291,7 @@ export class MatroskaStreamDemuxer {
       ptsMs: timestampMs + index * defaultDuration,
       durationMs: defaultDuration,
       keyframe: keyframe && (simple ? Boolean(block.flags & 0x80) : true),
-      data: frame,
+      data: copyBytes(frame),
       decodeOrder: decodeOrder + index,
       clusterOffset,
       ...(discardPaddingNs === undefined ? {} : { discardPaddingNs }),
@@ -431,7 +449,7 @@ function readTrackField(data: Uint8Array, element: Element, track: Partial<Matro
     const value = readUnsigned(data, element.dataStart, element.dataEnd);
     track.type = value === 1 ? "video" : value === 2 ? "audio" : value === 17 ? "subtitle" : "other";
   } else if (element.id === IDS.codecId) track.codecId = new TextDecoder().decode(data.subarray(element.dataStart, element.dataEnd));
-  else if (element.id === IDS.codecPrivate) track.codecPrivate = data.slice(element.dataStart, element.dataEnd);
+  else if (element.id === IDS.codecPrivate) track.codecPrivate = copyBytes(data.subarray(element.dataStart, element.dataEnd));
   else if (element.id === IDS.name) track.name = new TextDecoder().decode(data.subarray(element.dataStart, element.dataEnd));
   else if (element.id === IDS.language) track.language = new TextDecoder().decode(data.subarray(element.dataStart, element.dataEnd));
   else if (element.id === IDS.languageBcp47) track.languageBcp47 = new TextDecoder().decode(data.subarray(element.dataStart, element.dataEnd));
@@ -455,7 +473,7 @@ function readTrackFieldByName(name: string, data: Uint8Array, track: Partial<Mat
     const value = readUnsigned(data, 0, data.byteLength);
     track.type = value === 1 ? "video" : value === 2 ? "audio" : value === 17 ? "subtitle" : "other";
   } else if (name === "CodecID") track.codecId = new TextDecoder().decode(data);
-  else if (name === "CodecPrivate") track.codecPrivate = data.slice();
+  else if (name === "CodecPrivate") track.codecPrivate = copyBytes(data);
   else if (name === "Name") track.name = new TextDecoder().decode(data);
   else if (name === "Language") track.language = new TextDecoder().decode(data);
   else if (name === "LanguageBCP47") track.languageBcp47 = new TextDecoder().decode(data);

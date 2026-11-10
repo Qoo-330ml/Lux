@@ -30,6 +30,48 @@ pub(crate) struct ContentRestrictionIndexWrite {
     pub(crate) expected_nfo_json: Option<String>,
     pub(crate) certification_code: Option<String>,
     pub(crate) tags: Vec<String>,
+    pub(crate) facets: Vec<MediaItemFacetWrite>,
+}
+
+/// One genre or studio value of an item, as stored in `media_item_facets`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MediaItemFacetWrite {
+    pub(crate) kind: MediaFacetKind,
+    pub(crate) name_key: String,
+    pub(crate) name: String,
+}
+
+/// One distinct genre/studio value together with its visible item count.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredMediaFacet {
+    pub(crate) name_key: String,
+    pub(crate) name: String,
+    pub(crate) item_count: i64,
+}
+
+/// One distinct official rating code (the value `media_content_restriction_index` stores for the
+/// Emby `OfficialRating` field) together with its visible item count.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredMediaCertification {
+    pub(crate) certification_code: String,
+    pub(crate) item_count: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MediaFacetKind {
+    Genre,
+    Studio,
+    Tag,
+}
+
+impl MediaFacetKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Genre => "GENRE",
+            Self::Studio => "STUDIO",
+            Self::Tag => "TAG",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -510,11 +552,22 @@ mod tests {
         )
         .execute(database.pool())
         .await?;
+        // The abort is injected on the reference INSERT, so this selection has to derive a
+        // reference that differs from the stored row; re-storing an identical reference performs
+        // no write by design and could not reach the trigger.
+        let changed_reference = GlobalMovieCollectionReference::from_scraper(
+            "tmdb",
+            "movie-599",
+            Some("1281826"),
+            Some("飞驰人生"),
+            Some(2019),
+        )
+        .ok_or("valid confirmed collection identity")?;
         assert!(
             database
                 .select_metadata_candidate_with_collection_reference(
                     selection_update(item_id, second_candidate_id, "Changed", false),
-                    Some(&reference),
+                    Some(&changed_reference),
                 )
                 .await
                 .is_err()
@@ -832,40 +885,42 @@ pub(crate) struct ItemMetadataCompletenessCommit {
 pub(crate) use repository::CatalogRowProjection;
 pub(crate) use repository::GLOBAL_COLLECTION_LIBRARY_ID;
 pub(crate) use repository::MAX_PLAYBACK_SESSION_WINDOW_SECONDS;
-pub(crate) use repository::{AccessChangeEpochs, AccessEpoch};
+pub(crate) use repository::{AccessChangeEpochs, AccessEpoch, TrustedProxyCidrCache};
 pub use repository::{
-    Database, DatabaseDiagnosticsSnapshot, DatabaseLifecycleCleanupReport, PersonListOptions,
-    PersonSort, SqliteStatisticsRefresh, StorageError,
+    Database, DatabaseDiagnosticsSnapshot, DatabaseLifecycleCleanupReport,
+    DetachedStateReconcileWorker, PersonListOptions, PersonSort, SqliteStatisticsRefresh,
+    StorageError,
 };
 
 #[allow(unused_imports)]
 pub(crate) use repository::{
     AdminUserSortField, AdminUserStatusFilter, AuthCacheEpochSnapshot, AuthCacheEpochs,
-    CATALOG_ITEMS_INCREMENTAL_CONSUMER, CATALOG_OUTBOX, CatalogFilterQuery, CatalogSort,
-    ChapterDetectionOutcomeUpdate, ChapterDetectionSourceStateUpdate,
+    CATALOG_ITEMS_INCREMENTAL_CONSUMER, CATALOG_OUTBOX, CanonicalPersonBatch, CatalogFilterQuery,
+    CatalogSort, ChapterDetectionOutcomeUpdate, ChapterDetectionSourceStateUpdate,
     DEFAULT_MAINTENANCE_INITIAL_DELAY_SECONDS, DEFAULT_MAINTENANCE_INTERVAL_SECONDS,
     DEFAULT_PLAYED_PERCENT, DashboardStats, DatabasePoolSnapshot, DevicePairingRedeemResult,
     EmbyMigrationHandledItemBatch, EmbyMigrationImportRecordBatch, EmbyMigrationItemMatchBatch,
     EmbyMigrationItemPageBatch, EmbyMigrationJobProgress, EmbyMigrationPersonFavoriteBatch,
     EmbyMigrationPersonFavoriteStateBatch, EmbyMigrationUserItemStateBatch,
     EmbyMigrationUserItemStateFields, ExternalSubtitleUpdate, FilesystemEntryMove,
-    FilesystemEntryUpdate, ItemImageBatchInsert, ItemImageInsert, ItemImageMetadata,
-    LibraryDeletionBatch, LibrarySettingsUpdate, LocalNfoDefaultsRepair,
+    FilesystemEntryUpdate, ItemImageAttemptCommit, ItemImageBatchInsert, ItemImageInsert,
+    ItemImageMetadata, LibraryDeletionBatch, LibrarySettingsUpdate, LocalNfoDefaultsRepair,
     MANIFEST_POSTPROCESSING_TARGET_PAGE_SIZE, MailChallengeKind, MailDeliveryErrorCode,
     MailOutboxPage, MailOutboxStatus, MailOutboxTemplateKind, MaintenanceCandidate,
     MaintenanceReport, ManifestDeltaBatchCommit, ManifestDeltaBatchCommitResult,
     ManifestDiscoveryCommitResult, ManifestExistingFileUpdate,
     ManifestPostprocessingTargetBatchResult, ManifestPostprocessingTargetPage,
     MediaInfoChapterUpdate, MediaItemNfoMetadataUpdate, MediaMergeOrigin, MediaMetadataUpdate,
-    MediaProbeUpdate, MediaStreamUpdate, MetadataCapabilityResult, MetadataImageAttemptUpdate,
-    MetadataImageUnavailable, MigrationMediaIdentityLookup, MigrationPersonIdentityLookup,
-    NewAccessToken, NewAuditEvent, NewChapterDetectionJob, NewChapterDetectionJobItem,
-    NewCollection, NewDanmakuMatchJob, NewDanmakuTrack, NewDeviceAccessToken, NewDevicePairing,
-    NewEmbyDirectPlaybackTicket, NewEmbyMigrationJob, NewEpisodeFile, NewFilesystemEntry,
-    NewHierarchyItem, NewLibrary, NewLibraryRoot, NewMailChallenge, NewMailOutboxMessage,
-    NewMediaChapterMarker, NewMediaItem, NewMediaSource, NewMetadataCandidate, NewMovieFile,
-    NewNotificationDestination, NewNotificationEvent, NewPersonCredit, NewPlaybackAccessToken,
-    NewPlaybackEvent, NewScanLocalMetadataBatch, NewScanManifest, NewScanManifestDelta,
+    MediaProbeUpdate, MediaStreamUpdate, MetadataCapabilityResult, MetadataCapabilityWrite,
+    MetadataImageAttemptUpdate, MetadataImageUnavailable, MigrationMediaIdentityLookup,
+    MigrationPersonIdentityLookup, NewAccessToken, NewAuditEvent, NewChapterDetectionJob,
+    NewChapterDetectionJobItem, NewCollection, NewDanmakuMatchJob, NewDanmakuSingleItemJob,
+    NewDanmakuTrack, NewDeviceAccessToken, NewDevicePairing, NewEmbyDirectPlaybackTicket,
+    NewEmbyMigrationJob, NewEpisodeFile, NewFilesystemEntry, NewHierarchyItem, NewLibrary,
+    NewLibraryRoot, NewMailChallenge, NewMailOutboxMessage, NewMediaChapterMarker, NewMediaItem,
+    NewMediaSource, NewMetadataCandidate, NewMovieFile, NewNotificationDestination,
+    NewNotificationEvent, NewPersonCredit, NewPlaybackAccessToken, NewPlaybackEvent,
+    NewScanLocalMetadataBatch, NewScanManifest, NewScanManifestDelta,
     NewScanManifestDiscoveryChunk, NewScanManifestEntry, NewScanManifestFilesystemEntry,
     NewScanManifestIndexedFile, NewScanManifestPositiveIndex, NewScanManifestRoot,
     NewScanManifestSeenFilesystemEntry, NewScanManifestSidecarEntry, NewScanManifestUnresolvedFile,
@@ -875,7 +930,7 @@ pub(crate) use repository::{
     OutboxStream, PLAYBACK_SESSION_STALE_AFTER_SECONDS, PersonMatchCandidateRestore,
     PlaybackEventEffects, ReadModelPageQuery, ReadModelSort, RecentByLibraryReadModelQuery,
     RecentReadModelQuery, ReconciliationBatchCommit, ReconciliationBatchCommitResult,
-    ResumeItemsQuery, ResumePointerQuery, SEARCH_OUTBOX, SEARCH_REINDEX_CONSUMER,
+    ResumeItemsQuery, ResumePointerQuery, ResumeThresholds, SEARCH_OUTBOX, SEARCH_REINDEX_CONSUMER,
     ScanFingerprintMigrationCommit, ScanManifestRemovalCandidateQuery, SelectedMetadataUpdate,
     StoredAccessTokenDevice, StoredActivityEvent, StoredAdminUserListItem, StoredCanonicalPerson,
     StoredCanonicalPersonMatch, StoredCatalogDetail, StoredCatalogImageTag,
@@ -903,27 +958,29 @@ pub(crate) use repository::{
     StoredPersonIdentityMove, StoredPersonIndexRebuildJob, StoredPersonMatchCandidate,
     StoredPipelineStageActivity, StoredPipelineStageKind, StoredPipelineStatusCounts,
     StoredPlaybackDurations, StoredPlaybackHistoryEvent, StoredPlaybackSession,
-    StoredPlaybackSource, StoredReconciliationScanEntry, StoredRouteTokenPrincipal,
-    StoredScanFingerprintMigrationCandidate, StoredScanFingerprintMigrationCursor, StoredScanJob,
-    StoredScanJobCounts, StoredScanJobMetadataPage, StoredScanJobMetadataSources,
-    StoredScanJobPath, StoredScanJobRetryState, StoredScanLocalMetadataBackfillPage,
-    StoredScanLocalMetadataBatch, StoredScanLocalMetadataSource, StoredScanManifest,
-    StoredScanManifestDelta, StoredScanManifestDiffCandidate, StoredScanManifestDirectory,
+    StoredPlaybackSource, StoredRatingsSyncItem, StoredReconciliationScanEntry,
+    StoredRouteTokenPrincipal, StoredScanFingerprintMigrationCandidate,
+    StoredScanFingerprintMigrationCursor, StoredScanJob, StoredScanJobCounts,
+    StoredScanJobMetadataPage, StoredScanJobMetadataSources, StoredScanJobPath,
+    StoredScanJobRetryState, StoredScanLocalMetadataBackfillPage, StoredScanLocalMetadataBatch,
+    StoredScanLocalMetadataSource, StoredScanManifest, StoredScanManifestDelta,
+    StoredScanManifestDiffCandidate, StoredScanManifestDirectory,
     StoredScanManifestFilesystemBaseline, StoredScanManifestPostprocessingRoot,
     StoredScanManifestPostprocessingState, StoredScanManifestRemovalCandidate,
     StoredScheduledTaskConfig, StoredScheduledTaskPlan, StoredScheduledTaskPlanLibrary,
     StoredSeriesMetadataSource, StoredStrmMediaSource, StoredStrmProbeJob, StoredSubtitleStream,
-    StoredThumbnailScraperRetry, StoredThumbnailSource, StoredTranscodingHistory,
-    StoredTranscodingSessionRow, StoredUser, StoredUserAccessBlacklistRule,
-    StoredUserActivityEvent, StoredUserDevice, StoredUserInvitation, StoredUserItemState,
-    StoredUserPermissionPresetSource, StoredWebPlaybackAccessContext, StoredWebPlaybackSession,
-    StoredWebSession, StoredWebSessionSummary, UpdateNotificationDestination, UpdateUser,
+    StoredThumbnailScraperRetry, StoredThumbnailSource, StoredTrackedDanmakuSource,
+    StoredTranscodingHistory, StoredTranscodingSessionRow, StoredUser,
+    StoredUserAccessBlacklistRule, StoredUserActivityEvent, StoredUserDevice, StoredUserInvitation,
+    StoredUserItemState, StoredUserPermissionPresetSource, StoredVideoDimensions,
+    StoredWebPlaybackAccessContext, StoredWebPlaybackSession, StoredWebSession,
+    StoredWebSessionSummary, UpdateNotificationDestination, UpdateUser,
     UserAccessBlacklistIpRuleQuery, UserAccessBlacklistRuleMatchQuery,
     UserAccessBlacklistRulePageQuery, UserAccessBlacklistRuleScope, UserAccessSnapshot,
     UserAccountPreferences, UserAccountPreferencesCasResult, UserActivityEventQuery,
     UserContentRestrictions, UserContentRestrictionsCasResult, UserDevicePageQuery,
     UserInvitationCreateResult, UserInvitationPage, UserInvitationResendResult,
-    UserInvitationStatus, WebPlaybackEventClaim, WebPlaybackTranscodingDetails,
+    UserInvitationStatus, WatchHistoryQuery, WebPlaybackEventClaim, WebPlaybackTranscodingDetails,
     is_lite_manifest_discovery, movie_parent_folder_identity, playback_reached_played_threshold,
     recommendation_batch_key_at,
 };

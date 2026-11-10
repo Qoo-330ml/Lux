@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { AdminLibrariesPage } from "../src/features/admin/AdminLibrariesPage";
 import { api } from "../src/lib/api/client";
-import type { AdminLibraryDeletionJob, AdminPlugin } from "../src/lib/api/types";
+import type { AdminLibraryDeletionJob, AdminPlugin, AdminSettings } from "../src/lib/api/types";
 import { stylesheet as allStyles } from "./style-source.mjs";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -53,7 +53,7 @@ const configuredScraper: AdminPlugin = {
   category: "SCRAPER",
   version: "1.0.0",
   runtime: "builtin",
-  capabilities: ["metadata"],
+  capabilities: ["metadata.search", "metadata.get"],
   status: "READY",
   running: true,
   lastError: null,
@@ -94,6 +94,36 @@ const mediaProbePlugin: AdminPlugin = {
   configSource: "NONE",
 };
 
+const adminSettingsFixture: AdminSettings = {
+  resumePlayedPercent: 90,
+  resumeMinTicks: 1_200_000_000,
+  mediaStrategy: {
+    metadataLanguage: "zh-CN",
+    imageLanguage: "zh-CN",
+    region: "CN",
+    scraperId: null,
+    applyScope: "NEW_CONTENT",
+    images: {
+      poster: true,
+      artwork: false,
+      banner: false,
+      logo: true,
+      thumbnail: true,
+      thumbnailScrapingMode: "SCRAPER_FIRST",
+      disc: false,
+      wallpaper: false,
+      writeToMetadata: false,
+      maxBackdropCount: 1,
+    },
+    subtitles: {
+      autoDownload: false,
+      languages: ["zh-CN"],
+      forcedOnly: false,
+      hearingImpaired: false,
+    },
+  },
+};
+
 describe("AdminLibrariesPage library cards", () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -104,36 +134,7 @@ describe("AdminLibrariesPage library cards", () => {
     vi.spyOn(api, "adminPlugins").mockResolvedValue({ plugins: [configuredScraper] });
     vi.spyOn(api, "adminChapterSources").mockResolvedValue({ sources: [] });
     vi.spyOn(api, "adminLibraryDeletionJobs").mockResolvedValue({ jobs: [], page: 1, pageSize: 20, total: 0 });
-    vi.spyOn(api, "adminSettings").mockResolvedValue({
-      resumePlayedPercent: 90,
-      resumeMinTicks: 1_200_000_000,
-      mediaStrategy: {
-        metadataLanguage: "zh-CN",
-        imageLanguage: "zh-CN",
-        region: "CN",
-        scraperId: null,
-        applyScope: "NEW_CONTENT",
-        images: {
-          poster: true,
-          artwork: false,
-          banner: false,
-          logo: true,
-          thumbnail: true,
-          thumbnailScrapingMode: "SCRAPER_FIRST",
-          disc: false,
-          wallpaper: false,
-          writeToMetadata: false,
-          maxBackdropCount: 1,
-          minDownloadWidth: 1280,
-        },
-        subtitles: {
-          autoDownload: false,
-          languages: ["zh-CN"],
-          forcedOnly: false,
-          hearingImpaired: false,
-        },
-      },
-    });
+    vi.spyOn(api, "adminSettings").mockResolvedValue(adminSettingsFixture);
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -603,7 +604,14 @@ describe("AdminLibrariesPage library cards", () => {
     });
   });
 
-  it("starts metadata refresh from the library actions menu", async () => {
+  const refreshActionLabels = ["补全缺失元数据", "全量刷新元数据"];
+
+  function metadataRefreshMenuActions() {
+    return [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
+      .filter((button) => refreshActionLabels.includes(button.textContent?.trim() ?? ""));
+  }
+
+  async function openLibraryMenuAndStartRefresh(expectedLabel: string) {
     const refresh = vi.spyOn(api, "startLibraryMetadataRefresh").mockResolvedValue({
       totalCount: 1,
       mode: "FILL_MISSING",
@@ -614,15 +622,65 @@ describe("AdminLibrariesPage library cards", () => {
     await act(async () => {
       container.querySelector<HTMLButtonElement>("[aria-label='打开 01每日更新 操作菜单']")?.click();
     });
-    const refreshAction = [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
-      .find((button) => button.textContent?.includes("刷新元数据"));
-    expect(refreshAction).toBeTruthy();
-    expect(refreshAction?.disabled).toBe(false);
+    const actions = metadataRefreshMenuActions();
+    expect(actions).toHaveLength(1);
+    const refreshAction = actions[0];
+    expect(refreshAction.textContent?.trim()).toBe(expectedLabel);
+    expect(refreshAction.disabled).toBe(false);
 
     await act(async () => {
-      refreshAction?.click();
+      refreshAction.click();
       await Promise.resolve();
     });
+    return refresh;
+  }
+
+  async function globalMediaStrategy() {
+    return (await api.adminSettings()).mediaStrategy;
+  }
+
+  it("labels the library refresh action 补全缺失元数据 and fills missing by default", async () => {
+    const refresh = await openLibraryMenuAndStartRefresh("补全缺失元数据");
+
+    expect(refresh).toHaveBeenCalledWith("library-1", "FILL_MISSING");
+  });
+
+  it("labels the library refresh action 全量刷新元数据 when the library strategy is a full refresh", async () => {
+    const strategy = await globalMediaStrategy();
+    vi.mocked(api.adminLibraries).mockResolvedValue({
+      libraries: [{ ...library, mediaStrategy: { ...strategy, metadataRefreshMode: "FULL_REFRESH" } }],
+    });
+
+    const refresh = await openLibraryMenuAndStartRefresh("全量刷新元数据");
+
+    expect(refresh).toHaveBeenCalledWith("library-1", "FULL_REFRESH");
+  });
+
+  it("follows the global strategy when the library has no override", async () => {
+    const strategy = await globalMediaStrategy();
+    vi.mocked(api.adminSettings).mockResolvedValue({
+      resumePlayedPercent: 90,
+      resumeMinTicks: 1_200_000_000,
+      mediaStrategy: { ...strategy, metadataRefreshMode: "FULL_REFRESH" },
+    });
+
+    const refresh = await openLibraryMenuAndStartRefresh("全量刷新元数据");
+
+    expect(refresh).toHaveBeenCalledWith("library-1", "FULL_REFRESH");
+  });
+
+  it("lets a fill-missing library override a full-refresh global strategy", async () => {
+    const strategy = await globalMediaStrategy();
+    vi.mocked(api.adminSettings).mockResolvedValue({
+      resumePlayedPercent: 90,
+      resumeMinTicks: 1_200_000_000,
+      mediaStrategy: { ...strategy, metadataRefreshMode: "FULL_REFRESH" },
+    });
+    vi.mocked(api.adminLibraries).mockResolvedValue({
+      libraries: [{ ...library, mediaStrategy: { ...strategy, metadataRefreshMode: "FILL_MISSING" } }],
+    });
+
+    const refresh = await openLibraryMenuAndStartRefresh("补全缺失元数据");
 
     expect(refresh).toHaveBeenCalledWith("library-1", "FILL_MISSING");
   });
@@ -903,6 +961,64 @@ describe("AdminLibrariesPage library cards", () => {
     expect(document.body.textContent).not.toContain("仅使用本地元数据");
   });
 
+  it("does not offer a SCRAPER plugin that declares only ratings.* capabilities", async () => {
+    const ratingsOnly: AdminPlugin = {
+      ...configuredScraper,
+      id: "org.lux.trakt-ratings",
+      name: "Trakt 多源评分",
+      capabilities: ["ratings.lookup", "ratings.batch", "ratings.search"],
+    };
+    vi.mocked(api.adminPlugins).mockResolvedValue({ plugins: [configuredScraper, ratingsOnly] });
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("[aria-label='打开 01每日更新 操作菜单']")?.click();
+    });
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
+        .find((button) => button.textContent?.includes("编辑"))
+        ?.click();
+    });
+    await act(async () => container.querySelector<HTMLButtonElement>("[aria-label='刮削器']")?.click());
+
+    expect(document.body.textContent).toContain("TMDb 元数据插件");
+    expect(document.body.textContent).not.toContain("Trakt 多源评分");
+  });
+
+  it("keeps a saved scraper that cannot answer metadata.search visible but disabled", async () => {
+    const ratingsOnly: AdminPlugin = {
+      ...configuredScraper,
+      id: "org.lux.trakt-ratings",
+      name: "Trakt 多源评分",
+      capabilities: ["ratings.lookup", "ratings.batch", "ratings.search"],
+    };
+    vi.mocked(api.adminPlugins).mockResolvedValue({ plugins: [configuredScraper, ratingsOnly] });
+    vi.mocked(api.adminSettings).mockResolvedValue({
+      ...adminSettingsFixture,
+      mediaStrategy: { ...adminSettingsFixture.mediaStrategy, scraperId: "org.lux.trakt-ratings" },
+    });
+    await renderPage();
+
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("[role='tab']")]
+        .find((button) => button.textContent?.includes("高级"))
+        ?.click();
+    });
+
+    // The stored value stays selected and readable instead of silently falling back to the placeholder.
+    const trigger = container.querySelector<HTMLButtonElement>("#global-strategy-scraper");
+    expect(trigger).toBeTruthy();
+    expect(trigger?.textContent).toContain("已配置（不受支持）");
+
+    await act(async () => trigger?.click());
+
+    const savedOption = document.querySelector<HTMLButtonElement>("[role='option'][data-value='org.lux.trakt-ratings']");
+    expect(savedOption).toBeTruthy();
+    expect(savedOption?.textContent).toContain("已配置（不受支持）");
+    expect(savedOption?.disabled).toBe(true);
+    expect(document.querySelector("[role='option'][data-value='tmdb']")).toBeTruthy();
+  });
+
   it("does not list media probe plugins as library scrapers", async () => {
     vi.mocked(api.adminPlugins).mockResolvedValue({ plugins: [configuredScraper, mediaProbePlugin] });
     await renderPage();
@@ -989,6 +1105,16 @@ describe("AdminLibrariesPage library cards", () => {
     expect(stylesheet).toMatch(/\.lux-admin-scraper-field\s+\.lux-admin-scraper-clear\s*\{[^}]*width:\s*auto;[^}]*min-height:\s*32px;[^}]*white-space:\s*nowrap;/s);
   });
 
+  it("sizes the image strategy grids for the fields that remain", () => {
+    // Both grids lost the minimum-width field; a leftover empty track would show as a gap.
+    expect(allStyles).toMatch(/\.lux-library-strategy-image-limits\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\);/s);
+    expect(allStyles).toMatch(/\.lux-library-override-fields\s*\{[^}]*grid-template-columns:\s*1\.2fr \.8fr;/s);
+    // The removed width column was the only reason to cap two matrix cells; the scraper-role
+    // column must keep its full width.
+    expect(allStyles).not.toMatch(/\.lux-level-policy-table td:nth-child\(6\)/);
+    expect(allStyles).toMatch(/\.lux-level-policy-table td:nth-child\(5\)\s*\{ max-width: 112px; \}/);
+  });
+
   it("shows global image and subtitle defaults in the strategy view", async () => {
     await renderPage();
 
@@ -1003,7 +1129,9 @@ describe("AdminLibrariesPage library cards", () => {
     expect(container.textContent).toContain("图像抓取");
     expect(container.textContent).toContain("光盘封面");
     expect(container.textContent).toContain("壁纸");
-    expect(container.textContent).toContain("最小下载宽度");
+    expect(container.textContent).not.toContain("最小下载宽度");
+    // Only the backdrop count is left in that grid, so it must not occupy a second empty track.
+    expect(container.querySelector(".lux-library-strategy-image-limits")?.children).toHaveLength(1);
     expect(container.textContent).toContain("字幕默认值");
     expect(container.textContent).toContain("存储预估");
   });
@@ -1049,7 +1177,6 @@ describe("AdminLibrariesPage library cards", () => {
           wallpaper: false,
           writeToMetadata: false,
           maxBackdropCount: 1,
-          minDownloadWidth: 1280,
         },
         subtitles: { autoDownload: false, languages: ["zh-CN"], forcedOnly: false, hearingImpaired: false },
       },
@@ -1114,7 +1241,7 @@ describe("AdminLibrariesPage library cards", () => {
         region: "CN",
         scraperId: null,
         applyScope: "NEW_CONTENT",
-        images: { poster: true, artwork: true, banner: false, logo: true, thumbnail: true, thumbnailScrapingMode: "SCRAPER_FIRST", disc: false, wallpaper: false, writeToMetadata: false, maxBackdropCount: 1, minDownloadWidth: 1280 },
+        images: { poster: true, artwork: true, banner: false, logo: true, thumbnail: true, thumbnailScrapingMode: "SCRAPER_FIRST", disc: false, wallpaper: false, writeToMetadata: false, maxBackdropCount: 1 },
         subtitles: { autoDownload: false, languages: ["zh-CN"], forcedOnly: false, hearingImpaired: false },
       },
     });
@@ -1162,6 +1289,8 @@ describe("AdminLibrariesPage library cards", () => {
 
     const customMode = container.querySelectorAll<HTMLInputElement>(".lux-library-override-modes input")[1];
     await act(async () => customMode?.click());
+    // Metadata language and backdrop count remain; the width select no longer leaves a gap.
+    expect(container.querySelectorAll(".lux-library-override-fields > *")).toHaveLength(2);
     const thumbnailMode = container.querySelector<HTMLElement>("[role='radiogroup'][aria-label='缩略图刮削方式']");
     await act(async () => thumbnailMode?.querySelector<HTMLInputElement>("input[value='NONE']")?.click());
     await act(async () => {
@@ -1199,7 +1328,6 @@ describe("AdminLibrariesPage library cards", () => {
           wallpaper: false,
           writeToMetadata: false,
           maxBackdropCount: 1,
-          minDownloadWidth: 1280,
           variantCache: { enabled: true, maxFiles: 20000, maxBytes: 2147483648, concurrency: 2 },
         },
         subtitles: { autoDownload: false, languages: ["zh-CN"], forcedOnly: false, hearingImpaired: false },

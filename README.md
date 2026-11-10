@@ -25,11 +25,11 @@
 
 ![Lux 插件商店](docs/screenshots/lux-plugin-store.png)
 
-Lux 是面向 NAS 的个人媒体服务端：用 Rust 提供高效、可诊断的媒体索引与播放服务，用 React + TypeScript 提供同源 Web 客户端（暂不支持web播放），并通过 Emby 兼容 API 连接 VidHub、SenPlayer、Infuse 等第三方客户端。
+Lux 是面向 NAS 的个人媒体服务端：用 Rust 提供高效、可诊断的媒体索引与播放服务，用 React + TypeScript 提供同源 Web 客户端（含 Web 播放），并通过 Emby 兼容 API 连接 VidHub、SenPlayer、Infuse 等第三方客户端。
 
 Lux的出现是为了解决Emby在面临大库时遇到的内存占用过大、加载慢等痛点。虽然Emby的第三方客户端开发环境很好，大批量的第三方播放器涌现弥补了Emby的一些问题，但指标不治本，作为一个媒体管理者，打开emby网页对于我来说真的变成了一件很痛苦的事情。于是本项目因运而生，Lux兼容了Emby的大部分接口，可以直接使用第三方emby客户端进行连接Lux，获得很好的播放体验，同时媒体库的占用也大大降低，流畅性得到了提高。
 
-当然，还要说在前面的是，Lux现在不支持web播放，本身web播放，浏览器解码能力不行，体验只会差，可以配合比如harbor、vidhub、hills等优秀第三方emby客户端来连接Lux。
+Lux 的 Web 播放优先直放，浏览器无法直接播放时才按需启用服务端 Remux、音频转码或视频转码（受管理员配置的并发与临时目录配额限制）。浏览器的解码能力终究有限，追求最佳体验时，仍推荐配合 VidHub、SenPlayer、Infuse 等第三方 Emby 客户端连接 Lux。
 
 还有，lux不是movieclaw也不是moiepilot，没有那么强的订阅功能，lux就是一个纯粹的本地媒体管理器，用来解决emby痛点的，允许建议但是不要比较。
 
@@ -180,7 +180,7 @@ services:
 5. 启动扫描，等待媒体进入索引。
 6. 按需安装并配置刮削器，然后处理低置信度的待匹配条目。
 
-Lux 首版以直放为主，不提供音视频转码、HLS 转码或字幕格式转换。客户端是否能播放某种编码和渲染某种字幕，取决于客户端本身。
+Lux 以直放为主：本地媒体优先原样传输，浏览器无法直放时，Web 播放按 Remux → 音频转码 → 硬件转码 → 软件转码的顺序逐档升级（见 `docs/decisions/026-web-playback-and-server-hls.md`）。`.strm` 只直连，不转码也不代理。不提供字幕格式转换或烧录；客户端能否渲染某种字幕，取决于客户端本身。
 
 
 ## 当前兼容性
@@ -262,7 +262,7 @@ Lux 首版以直放为主，不提供音视频转码、HLS 转码或字幕格式
 - `GET` / `HEAD /Items/{itemId}/Subtitles/{streamIndex}/Stream`
 - `GET` / `HEAD /Videos/{itemId}/{mediaSourceId}/Subtitles/{streamIndex}/Stream`
 
-同时兼容部分客户端使用的小写 `/videos/...` 路径。当前以直放为主：本地媒体支持鉴权、Range 请求，`.strm` 远程地址返回直连重定向，不提供音视频转码、HLS 转码或字幕格式转换。
+同时兼容部分客户端使用的小写 `/videos/...` 路径。当前以直放为主：本地媒体支持鉴权、Range 请求，`.strm` 远程地址返回直连重定向，不转码也不代理；本地媒体的服务端 HLS 转码由 Web 播放与按会话容器协商的 Emby 客户端使用，不提供字幕格式转换。
 
 ### 播放状态与收藏
 
@@ -282,7 +282,7 @@ Lux 首版以直放为主，不提供音视频转码、HLS 转码或字幕格式
 
 ## 已知限制
 
-- 首版只做直接播放，不做转码、HLS、容器转换或在线字幕下载。
+- 服务端转码是受限的按需能力：`.strm` 永远只直连；不做多码率自适应 HLS、DRM、字幕格式转换或烧录、在线字幕下载；硬件转码取决于宿主机 GPU 与容器设备映射。
 - 不实现完整 Emby API；只持续覆盖目标客户端实际需要的兼容接口。
 - `.strm` 播放地址会交给有权限的客户端；Lux 播放路径不替客户端隐藏其中可能存在的 token。
 - 当前 Docker 镜像和 Compose 以 root 运行 Lux，以兼容不同 NAS bind mount 的 UID/GID；请保护 `/config`，不要把管理入口未经反向代理安全措施直接暴露到公网。

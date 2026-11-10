@@ -6,7 +6,8 @@ use crate::{
     application::nfo::{LocalNfoDetails, local_nfo_details_from_cache_json},
     domain::content_restrictions::project_content_restriction_index,
     storage::{
-        CONTENT_RESTRICTION_INDEX_BATCH_LIMIT, ContentRestrictionIndexWrite, Database, StorageError,
+        CONTENT_RESTRICTION_INDEX_BATCH_LIMIT, ContentRestrictionIndexWrite, Database,
+        MediaFacetKind, MediaItemFacetWrite, StorageError,
     },
 };
 
@@ -77,6 +78,7 @@ impl ContentRestrictionIndexService {
                 expected_nfo_json: candidate.nfo_metadata_json,
                 certification_code: projection.certification_code,
                 tags: projection.tags,
+                facets: facets_from_details(&details.genres, &details.studios, &details.tags),
             });
         }
 
@@ -88,6 +90,44 @@ impl ContentRestrictionIndexService {
         report.stale_snapshots = outcome.stale;
         Ok(report)
     }
+}
+
+const MAX_FACET_NAME_CHARS: usize = 256;
+
+/// Genre, studio and tag values worth indexing: trimmed, bounded, de-duplicated case-insensitively
+/// (the first spelling wins as the display name). Tags are the NFO `<tag>` values and stay a
+/// separate facet kind from genres, which the parental-control projection keeps using.
+fn facets_from_details(
+    genres: &[String],
+    studios: &[String],
+    tags: &[String],
+) -> Vec<MediaItemFacetWrite> {
+    let mut facets: Vec<MediaItemFacetWrite> = Vec::new();
+    for (kind, values) in [
+        (MediaFacetKind::Genre, genres),
+        (MediaFacetKind::Studio, studios),
+        (MediaFacetKind::Tag, tags),
+    ] {
+        for value in values {
+            let name = value.trim();
+            if name.is_empty() || name.chars().count() > MAX_FACET_NAME_CHARS {
+                continue;
+            }
+            let name_key = name.to_lowercase();
+            if facets
+                .iter()
+                .any(|facet| facet.kind == kind && facet.name_key == name_key)
+            {
+                continue;
+            }
+            facets.push(MediaItemFacetWrite {
+                kind,
+                name_key,
+                name: name.to_owned(),
+            });
+        }
+    }
+    facets
 }
 
 const CONTENT_RESTRICTION_INDEX_IDLE_RETRY: Duration = Duration::from_secs(10);
@@ -399,6 +439,278 @@ mod tests {
         .await;
         worker.shutdown().await;
         assert_eq!(result??, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn index_batches_project_genres_and_studios_into_facets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Facet Index", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        let nfo_json = r#"{"genres":[" Sci-Fi ","sci-fi","Drama"],"studios":["A24"]}"#;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('facet-a', ?, 'MOVIE', 'facet-a', 'facet-a', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_item_nfo_cache (item_id, json, bytes)
+             VALUES ('facet-a', ?, length(CAST(? AS BLOB)))",
+        )
+        .bind(nfo_json)
+        .bind(nfo_json)
+        .execute(database.pool())
+        .await?;
+
+        let report = ContentRestrictionIndexService::new(database.clone())
+            .index_batch(None, 10)
+            .await?;
+        assert_eq!(report.indexed, 1);
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT kind, name_key, name FROM media_item_facets
+             WHERE item_id = 'facet-a' ORDER BY kind, name_key",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(
+            rows,
+            [
+                ("GENRE".to_owned(), "drama".to_owned(), "Drama".to_owned()),
+                ("GENRE".to_owned(), "sci-fi".to_owned(), "Sci-Fi".to_owned()),
+                ("STUDIO".to_owned(), "a24".to_owned(), "A24".to_owned()),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn index_batches_project_nfo_tags_into_tag_facets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Tag Facet Index", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        let nfo_json = r#"{"genres":["Drama"],"studios":["A24"],"tags":[" Sci-Fi ","sci-fi","Director's Cut"]}"#;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('facet-tags-a', ?, 'MOVIE', 'facet-tags-a', 'facet-tags-a', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_item_nfo_cache (item_id, json, bytes)
+             VALUES ('facet-tags-a', ?, length(CAST(? AS BLOB)))",
+        )
+        .bind(nfo_json)
+        .bind(nfo_json)
+        .execute(database.pool())
+        .await?;
+
+        let report = ContentRestrictionIndexService::new(database.clone())
+            .index_batch(None, 10)
+            .await?;
+        assert_eq!(report.indexed, 1);
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT kind, name_key, name FROM media_item_facets
+             WHERE item_id = 'facet-tags-a' ORDER BY kind, name_key",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(
+            rows,
+            [
+                ("GENRE".to_owned(), "drama".to_owned(), "Drama".to_owned()),
+                ("STUDIO".to_owned(), "a24".to_owned(), "A24".to_owned()),
+                (
+                    "TAG".to_owned(),
+                    "director's cut".to_owned(),
+                    "Director's Cut".to_owned()
+                ),
+                ("TAG".to_owned(), "sci-fi".to_owned(), "Sci-Fi".to_owned()),
+            ]
+        );
+
+        // The parental-control projection stays on genres; NFO tags must not leak into it.
+        let restriction_tags: Vec<String> = sqlx::query_scalar(
+            "SELECT tag FROM media_content_restriction_tags
+             WHERE item_id = 'facet-tags-a' ORDER BY tag",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(restriction_tags, ["drama"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalidated_old_nfo_snapshot_is_rebuilt_into_tag_facets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::application::{
+            metadata::MetadataEnricher, nfo::LocalNfoMetadataStore, scanner::LibraryScanner,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let root = temp_dir.path().join("Tag Rebuild");
+        let movie_dir = root.join("Tagged Movie (2026)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(movie_dir.join("Tagged.Movie.2026.mkv"), b"movie").await?;
+        tokio::fs::write(
+            movie_dir.join("movie.nfo"),
+            "<movie><title>Tagged Movie</title><genre>Drama</genre>\
+             <tag>Sci-Fi</tag><tag>Director's Cut</tag></movie>",
+        )
+        .await?;
+
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Tag Rebuild", LibraryKind::Movie, false)
+            .await?;
+        LibraryService::new(database.clone())
+            .add_root(library.id, root.to_str().ok_or("non-UTF8 root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let item_id: String =
+            sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+                .fetch_one(database.pool())
+                .await?;
+
+        let enricher = MetadataEnricher::new(database.clone())
+            .with_nfo_store(LocalNfoMetadataStore::new(database.clone()));
+        enricher.enrich_movie_library(library.id).await?;
+        let valid_fingerprint: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT nfo_metadata_fingerprint FROM media_items WHERE id = ?")
+                .bind(&item_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert!(
+            valid_fingerprint.is_some(),
+            "a current snapshot must store the NFO source fingerprint"
+        );
+
+        // Rewrite that snapshot into the pre-upgrade shape: the same envelope, but without the
+        // `tags` key the old parser never wrote. The fingerprint stays valid, so nothing about the
+        // row looks stale yet.
+        let modern_json: String =
+            sqlx::query_scalar("SELECT json FROM media_item_nfo_cache WHERE item_id = ?")
+                .bind(&item_id)
+                .fetch_one(database.pool())
+                .await?;
+        let mut old_value: serde_json::Value = serde_json::from_str(&modern_json)?;
+        old_value
+            .get_mut("details")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or("cached details must be an object")?
+            .remove("tags");
+        let old_json = serde_json::to_string(&old_value)?;
+        assert!(!old_json.contains("tags"));
+        sqlx::query(
+            "UPDATE media_item_nfo_cache SET json = ?, bytes = length(CAST(? AS BLOB))
+             WHERE item_id = ?",
+        )
+        .bind(&old_json)
+        .bind(&old_json)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query("DELETE FROM media_content_restriction_index_queue")
+            .execute(database.pool())
+            .await?;
+
+        // The gap migration 0249 has to close: with a valid fingerprint the pipeline skips the
+        // item, so the snapshot keeps whatever it had and no tag can appear.
+        let skipped = enricher.enrich_movie_library(library.id).await?;
+        assert!(
+            skipped.nfo_skipped >= 1,
+            "a current snapshot is not re-parsed"
+        );
+        let unrebuild_json: String =
+            sqlx::query_scalar("SELECT json FROM media_item_nfo_cache WHERE item_id = ?")
+                .bind(&item_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(unrebuild_json, old_json);
+
+        // 0249 re-queues every visible item for the TAG backfill.
+        sqlx::query(
+            "INSERT INTO media_content_restriction_index_queue (item_id) VALUES (?)
+             ON CONFLICT(item_id) DO UPDATE SET queued_at = unixepoch()",
+        )
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+        // Indexing the stale snapshot first only projects GENRE/STUDIO: it has no tags to write.
+        let indexer = ContentRestrictionIndexService::new(database.clone());
+        let stale = indexer.index_batch(None, 10).await?;
+        assert!(stale.indexed >= 1, "the queued item must be visited");
+        let stale_tags: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_item_facets WHERE item_id = ? AND kind = 'TAG'",
+        )
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(stale_tags, 0, "the old snapshot carries no tags to project");
+
+        // 0249 also clears the fingerprint, which is the `rich_cache_missing` signal that makes the
+        // pipeline re-read the sidecar.
+        sqlx::query("UPDATE media_items SET nfo_metadata_fingerprint = NULL WHERE id = ?")
+            .bind(&item_id)
+            .execute(database.pool())
+            .await?;
+        enricher.enrich_movie_library(library.id).await?;
+        let rebuilt_json: String =
+            sqlx::query_scalar("SELECT json FROM media_item_nfo_cache WHERE item_id = ?")
+                .bind(&item_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert!(
+            rebuilt_json.contains(r#""tags":["Sci-Fi","Director's Cut"]"#),
+            "the rebuilt snapshot must carry the NFO tags: {rebuilt_json}"
+        );
+        let queued: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_content_restriction_index_queue WHERE item_id = ?",
+        )
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(
+            queued, 1,
+            "the rebuilt snapshot re-queues the derived index"
+        );
+
+        let refreshed = indexer.index_batch(None, 10).await?;
+        assert!(refreshed.indexed >= 1, "the re-queued item must be visited");
+        let tag_names: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM media_item_facets
+             WHERE item_id = ? AND kind = 'TAG' ORDER BY name_key",
+        )
+        .bind(&item_id)
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(tag_names, ["Director's Cut", "Sci-Fi"]);
         Ok(())
     }
 }

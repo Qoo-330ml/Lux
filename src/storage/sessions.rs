@@ -141,6 +141,7 @@ impl From<TranscodingHistoryRow> for StoredTranscodingHistory {
 #[derive(Debug, sqlx::FromRow)]
 struct TranscodingSessionRow {
     session_id: String,
+    play_session_id: String,
     user_id: String,
     user_name: Option<String>,
     item_id: String,
@@ -161,6 +162,7 @@ impl From<TranscodingSessionRow> for StoredTranscodingSessionRow {
     fn from(row: TranscodingSessionRow) -> Self {
         Self {
             session_id: row.session_id,
+            play_session_id: row.play_session_id,
             user_id: row.user_id,
             user_name: row.user_name,
             item_id: row.item_id,
@@ -272,11 +274,21 @@ impl Database {
         }))
     }
 
+    /// Reserves one admission slot, reusing a playback policy the caller already read.
+    ///
+    /// `known_policy` comes from the same request (resource authorization reads it to check the
+    /// HLS tier). SQLite opens this transaction with `BEGIN IMMEDIATE`, which already serializes
+    /// every writer, so reusing that snapshot cannot let two reservations pass one limit together
+    /// and the `users` row does not have to be read again. PostgreSQL opens a plain
+    /// `READ COMMITTED` transaction where the `FOR UPDATE` lock on that row is the only thing that
+    /// serializes concurrent reservations for one user, so the row is still read there and the
+    /// values it returns decide the admission.
     pub(crate) async fn reserve_playback_admission(
         &self,
         user_id: &str,
         play_session_id: &str,
         now: i64,
+        known_policy: Option<&crate::storage::UserPlaybackPolicy>,
     ) -> Result<Option<PlaybackAdmissionResult>, StorageError> {
         let mut transaction = self.begin_playback_admission_transaction().await?;
         let row_lock = if self.backend() == crate::config::DatabaseBackend::Postgres {
@@ -284,21 +296,27 @@ impl Database {
         } else {
             ""
         };
-        let policy_query = format!(
-            "SELECT can_play, max_simultaneous_playbacks FROM users WHERE id = ?{row_lock}"
-        );
-        let policy = self
-            .query_as::<PlaybackPolicyRow>(sqlx::AssertSqlSafe(policy_query))
-            .bind(user_id)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(self.sqlx_err())?;
-        let Some(policy) = policy else {
-            transaction.commit().await.map_err(self.sqlx_err())?;
-            return Ok(None);
+        let known_policy = known_policy.copied().filter(|_| row_lock.is_empty());
+        let policy = match known_policy {
+            Some(policy) => (policy.can_play, policy.max_simultaneous_playbacks),
+            None => {
+                let policy_query = format!(
+                    "SELECT can_play, max_simultaneous_playbacks FROM users WHERE id = ?{row_lock}"
+                );
+                let policy = self
+                    .query_as::<PlaybackPolicyRow>(sqlx::AssertSqlSafe(policy_query))
+                    .bind(user_id)
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(self.sqlx_err())?;
+                let Some(policy) = policy else {
+                    transaction.commit().await.map_err(self.sqlx_err())?;
+                    return Ok(None);
+                };
+                (policy.can_play != 0, policy.max_simultaneous_playbacks)
+            }
         };
-        let can_play = policy.can_play != 0;
-        let limit = policy.max_simultaneous_playbacks;
+        let (can_play, limit) = policy;
         let now = now.max(0);
         let stale_before = now.saturating_sub(PLAYBACK_SESSION_STALE_AFTER_SECONDS);
         self.query(
@@ -375,23 +393,14 @@ impl Database {
         .execute(&mut *transaction)
         .await
         .map_err(self.sqlx_err())?;
-        let active_playback_count: i64 = self
-            .query_scalar(
-                "SELECT COUNT(*) FROM (
-                     SELECT play_session_id FROM playback_admissions
-                     WHERE user_id = ? AND state = 'ACTIVE' AND last_seen_at > ?
-                     UNION
-                     SELECT play_session_id FROM playback_sessions
-                     WHERE user_id = ? AND state IN ('PLAYING', 'PAUSED') AND last_event_at > ?
-                 ) active_playbacks",
-            )
-            .bind(user_id)
-            .bind(stale_before)
-            .bind(user_id)
-            .bind(stale_before)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(self.sqlx_err())?;
+        // The count above already reports whether this play session was part of the active set, so
+        // the upsert adds exactly one row when it was not and none when it was. Recounting after the
+        // write would restate the same union and cost another scan inside the write transaction.
+        let active_playback_count = if session_is_active {
+            active_count
+        } else {
+            active_count.saturating_add(1)
+        };
         transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(Some(PlaybackAdmissionResult {
             decision: PlaybackAdmissionDecision::Admitted,
@@ -400,16 +409,77 @@ impl Database {
         }))
     }
 
+    /// How often a streaming session has to re-run the full admission.
+    ///
+    /// HLS segment and manifest GETs only *check* the slot, they do not write it: a request whose
+    /// admission stamp is newer than this interval verifies the row and is served, and only the
+    /// first request after the interval runs [`Self::reserve_playback_admission`], which moves the
+    /// stamp to the request time and opens the next interval. The concurrent playback limit and
+    /// `can_play` are therefore re-evaluated at most this long after a change, instead of never
+    /// while a stream keeps asking for assets.
+    pub(crate) const PLAYBACK_ADMISSION_RECHECK_INTERVAL_SECONDS: i64 = 30;
+
+    /// Renews a live admission so the slot does not fall out of the active set.
+    ///
+    /// Callers that must keep the stamp moving (playback events, the session heartbeat) use this:
+    /// it accepts any admission inside [`PLAYBACK_SESSION_STALE_AFTER_SECONDS`]. The asset path
+    /// deliberately does not renew, so this is what keeps a streaming slot inside the active set
+    /// between its periodic full admissions.
     pub(crate) async fn renew_existing_playback_admission(
         &self,
         user_id: &str,
         play_session_id: &str,
         now: i64,
     ) -> Result<bool, StorageError> {
-        let max_function = self.scalar_max_function();
-        let stale_before = now
+        let renew_after = now
             .max(0)
             .saturating_sub(PLAYBACK_SESSION_STALE_AFTER_SECONDS);
+        self.renew_playback_admission_after(user_id, play_session_id, now, renew_after)
+            .await
+    }
+
+    /// Whether a segment or manifest request may skip the full admission.
+    ///
+    /// One `SELECT`, no write: the slot counts as fresh only while it is active *and* was admitted
+    /// less than [`Self::PLAYBACK_ADMISSION_RECHECK_INTERVAL_SECONDS`] ago. `false` means the
+    /// caller has to run [`Self::reserve_playback_admission`], which also re-opens the interval.
+    pub(crate) async fn has_fresh_playback_admission(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        let not_before = now
+            .max(0)
+            .saturating_sub(Self::PLAYBACK_ADMISSION_RECHECK_INTERVAL_SECONDS);
+        let fresh = self
+            .query_scalar::<i64>(
+                "SELECT 1 FROM playback_admissions
+                 WHERE user_id = ? AND play_session_id = ? AND state = 'ACTIVE'
+                   AND last_seen_at > ?",
+            )
+            .bind(user_id)
+            .bind(play_session_id)
+            .bind(not_before)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        Ok(fresh.is_some())
+    }
+
+    /// Moves an active admission's `last_seen_at` forward when it is newer than `renew_after`.
+    ///
+    /// The window is checked inside the statement so the renewal stays a single write: a row that
+    /// is not newer than `renew_after` (or is not active) is left untouched and reported as not
+    /// renewed.
+    async fn renew_playback_admission_after(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+        now: i64,
+        renew_after: i64,
+    ) -> Result<bool, StorageError> {
+        let max_function = self.scalar_max_function();
         let query = format!(
             "UPDATE playback_admissions
              SET last_seen_at = {max_function}(last_seen_at, ?)
@@ -420,7 +490,7 @@ impl Database {
             .bind(now.max(0))
             .bind(user_id)
             .bind(play_session_id)
-            .bind(stale_before)
+            .bind(renew_after)
             .execute(&self.pool)
             .await
             .map(|result| result.rows_affected() == 1)
@@ -1095,6 +1165,50 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
+    /// Reads one stored playback session together with the authorization device and client the
+    /// resource access-rule check needs.
+    ///
+    /// Both halves come from the same `web_playback_sessions` row, so serving an HLS manifest or
+    /// segment reads that row once instead of once for the session and once for its device/client.
+    pub(crate) async fn find_web_playback_session_with_access_context(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(StoredWebPlaybackSession, StoredWebPlaybackAccessContext)>, StorageError>
+    {
+        let Some(row) = self
+            .query(
+                "SELECT id, user_id, item_id, media_source_id, play_session_id,
+                        tier, plan, state, temp_dir, is_admin, expires_at, last_heartbeat_at,
+                        last_sequence, video_codec, audio_codec, video_bitrate, audio_bitrate,
+                        transcoding_container, created_at, updated_at,
+                        authorization_device_id, authorization_client_name
+                 FROM web_playback_sessions
+                 WHERE id = ?",
+            )
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?
+        else {
+            return Ok(None);
+        };
+        let device_id: Option<String> =
+            sqlx::Row::try_get(&row, "authorization_device_id").map_err(self.sqlx_err())?;
+        let client_name: Option<String> =
+            sqlx::Row::try_get(&row, "authorization_client_name").map_err(self.sqlx_err())?;
+        let session = stored_web_playback_session(row).map_err(self.sqlx_err())?;
+        let access = StoredWebPlaybackAccessContext {
+            user_id: session.user_id.clone(),
+            device_id,
+            client_name,
+        };
+        Ok(Some((session, access)))
+    }
+
+    /// Kept for the storage contract test that pins the `ACTIVE`-only access-context projection;
+    /// resource authorization reads the same columns through
+    /// [`Self::find_web_playback_session_with_access_context`].
+    #[cfg(test)]
     pub(crate) async fn find_web_playback_access_context(
         &self,
         session_id: &str,
@@ -1225,13 +1339,15 @@ impl Database {
 
     /// Inserts one finished-transcode row; a session id is recorded at most once.
     ///
-    /// Rows older than [`TRANSCODING_HISTORY_RETENTION_SECONDS`] are dropped on the same call so
-    /// the table stays bounded without a background worker.
+    /// Rows older than [`TRANSCODING_HISTORY_RETENTION_SECONDS`] are dropped in the same
+    /// transaction so the table stays bounded without a background worker, and a stop pays one
+    /// commit instead of two.
     pub(crate) async fn insert_transcoding_history(
         &self,
         entry: NewTranscodingHistory<'_>,
     ) -> Result<(), StorageError> {
         let now = entry.now;
+        let mut transaction = self.begin_transcoding_history_transaction().await?;
         self.query(
             "INSERT INTO transcoding_history (
                  id, session_id, user_id, item_id, media_source_id, tier, outcome,
@@ -1256,18 +1372,22 @@ impl Database {
         .bind(entry.output_bytes)
         .bind(entry.failure_reason)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(self.sqlx_err())?;
-        let _ = self
+        if let Err(error) = self
             .query(
                 "DELETE FROM transcoding_history
                  WHERE finished_at < ?",
             )
             .bind(now.saturating_sub(TRANSCODING_HISTORY_RETENTION_SECONDS))
-            .execute(&self.pool)
-            .await;
-        Ok(())
+            .execute(&mut *transaction)
+            .await
+        {
+            // The prune is best effort; it must not cost the history row its commit.
+            tracing::warn!(%error, "failed to prune expired transcoding history rows");
+        }
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     /// One page of finished transcodes, newest first, with item title and user name.
@@ -1313,7 +1433,8 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<StoredTranscodingSessionRow>, StorageError> {
         self.query_as::<TranscodingSessionRow>(
-            "SELECT w.id AS session_id, w.user_id, u.display_name AS user_name,
+            "SELECT w.id AS session_id, w.play_session_id, w.user_id,
+                    u.display_name AS user_name,
                     w.item_id, mi.title AS item_title, mi.item_type, w.tier, w.state,
                     w.expires_at, w.created_at, w.updated_at, w.video_codec, w.audio_codec,
                     w.audio_bitrate, w.transcoding_container
@@ -1472,6 +1593,29 @@ impl Database {
         .into_iter()
         .map(stored_web_playback_session)
         .collect::<Result<Vec<_>, _>>()
+        .map_err(self.sqlx_err())
+    }
+
+    /// The earliest moment at which one of the active Web playback sessions becomes reapable.
+    ///
+    /// A session is reapable once it expired (`expires_at`) or once it stopped heartbeating for
+    /// `inactive_after_seconds` (server HLS sessions only). The reaper sleeps until this moment
+    /// instead of polling on a fixed tick, so an idle server with no playback never wakes up for it.
+    pub(crate) async fn next_web_playback_session_deadline(
+        &self,
+        inactive_after_seconds: i64,
+    ) -> Result<Option<i64>, StorageError> {
+        self.query_scalar::<Option<i64>>(
+            "SELECT MIN(deadline) FROM (
+                 SELECT expires_at AS deadline FROM web_playback_sessions WHERE state = 'ACTIVE'
+                 UNION ALL
+                 SELECT last_heartbeat_at + ? AS deadline FROM web_playback_sessions
+                 WHERE state = 'ACTIVE' AND plan = 'SERVER_HLS'
+             ) deadlines",
+        )
+        .bind(inactive_after_seconds.max(0))
+        .fetch_one(&self.pool)
+        .await
         .map_err(self.sqlx_err())
     }
 
@@ -1701,6 +1845,7 @@ impl Database {
 
 pub(crate) struct StoredTranscodingSessionRow {
     pub(crate) session_id: String,
+    pub(crate) play_session_id: String,
     pub(crate) user_id: String,
     pub(crate) user_name: Option<String>,
     pub(crate) item_id: String,
@@ -1769,6 +1914,81 @@ mod tests {
     #[test]
     fn session_listing_bound_is_small_enough_to_stay_cheap() {
         assert!((100..=1000).contains(&MAX_LISTED_PLAYBACK_SESSIONS));
+    }
+
+    /// The reservation already knows whether the play session held an admission, so the total it
+    /// reports after the upsert is that count plus the row it just wrote. A second `UNION` scan
+    /// would only restate it.
+    #[tokio::test]
+    async fn playback_admission_derives_the_new_total_without_a_second_count()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        sqlx::query(
+            "INSERT INTO users (
+                 id, username_normalized, display_name, password_hash,
+                 can_play, max_simultaneous_playbacks
+             ) VALUES ('admission-user', 'admission-user', 'Admission', 'hash', 1, 2)",
+        )
+        .execute(database.pool())
+        .await?;
+
+        database.reset_query_count();
+        let reserved = database
+            .reserve_playback_admission("admission-user", "play-session-a", 1_000, None)
+            .await?
+            .ok_or("the admission user must exist")?;
+        assert_eq!(reserved.decision, PlaybackAdmissionDecision::Admitted);
+        assert_eq!(reserved.active_playback_count, 1);
+        assert_eq!(
+            database.query_count(),
+            4,
+            "one policy read, the stale reclaim, the active count and the upsert"
+        );
+
+        // Reserving the session that already holds an admission must not raise the total.
+        let renewed = database
+            .reserve_playback_admission("admission-user", "play-session-a", 1_001, None)
+            .await?
+            .ok_or("the admission user must exist")?;
+        assert_eq!(renewed.decision, PlaybackAdmissionDecision::Admitted);
+        assert_eq!(renewed.active_playback_count, 1);
+        Ok(())
+    }
+
+    /// The caller that just authorized the request already read this user's playback policy.
+    /// Reusing that snapshot on SQLite (where `BEGIN IMMEDIATE` serializes writers anyway) leaves
+    /// the quota check intact without a second read of the same `users` row.
+    #[tokio::test]
+    async fn playback_admission_reuses_the_policy_the_caller_already_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        sqlx::query(
+            "INSERT INTO users (
+                 id, username_normalized, display_name, password_hash,
+                 can_play, max_simultaneous_playbacks
+             ) VALUES ('policy-user', 'policy-user', 'Policy', 'hash', 1, 2)",
+        )
+        .execute(database.pool())
+        .await?;
+        let policy = database
+            .get_user_playback_policy("policy-user")
+            .await?
+            .ok_or("the policy user must exist")?;
+
+        database.reset_query_count();
+        let reserved = database
+            .reserve_playback_admission("policy-user", "play-session-a", 1_000, Some(&policy))
+            .await?
+            .ok_or("the policy user must exist")?;
+        assert_eq!(reserved.decision, PlaybackAdmissionDecision::Admitted);
+        assert_eq!(reserved.active_playback_count, 1);
+        assert_eq!(reserved.max_simultaneous_playbacks, 2);
+        assert_eq!(
+            database.query_count(),
+            3,
+            "the stale reclaim, the active count and the upsert"
+        );
+        Ok(())
     }
 
     /// Creates the user, library and movie that the transcoding readers join against.
@@ -1848,6 +2068,71 @@ mod tests {
         Ok(())
     }
 
+    /// The finished-transcode write and its retention prune share one commit.
+    ///
+    /// Every stop used to pay two autocommits, i.e. two fsyncs on `synchronous=FULL`; the write
+    /// path is judged by commit count, not by statement count
+    /// (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` §2).
+    #[tokio::test]
+    async fn transcoding_history_write_and_prune_commit_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        insert_transcoding_fixtures(&database).await?;
+        sqlx::query(
+            "INSERT INTO transcoding_history (
+                 id, session_id, user_id, item_id, media_source_id, tier, outcome,
+                 started_at, finished_at, wall_seconds, encoded_seconds, average_speed,
+                 last_fps, output_bytes, failure_reason, created_at
+             ) VALUES ('history-old', 'play-session-old', 'user-a', 'item-a', NULL, 2,
+                       'COMPLETED', 1, 1, 1, NULL, NULL, NULL, NULL, NULL, 1)",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let now = TRANSCODING_HISTORY_RETENTION_SECONDS + 60;
+        database.reset_query_count();
+        database.reset_transcoding_history_transaction_count();
+        database
+            .insert_transcoding_history(NewTranscodingHistory {
+                id: "history-new",
+                session_id: "play-session-new",
+                user_id: "user-a",
+                item_id: "item-a",
+                media_source_id: None,
+                tier: 2,
+                outcome: "COMPLETED",
+                started_at: 1,
+                finished_at: now,
+                wall_seconds: 1,
+                encoded_seconds: None,
+                average_speed: None,
+                last_fps: None,
+                output_bytes: None,
+                failure_reason: None,
+                now,
+            })
+            .await?;
+        assert_eq!(
+            database.query_count(),
+            2,
+            "the history insert and the retention delete"
+        );
+        assert_eq!(
+            database.transcoding_history_transaction_count(),
+            1,
+            "both statements must commit once instead of twice"
+        );
+
+        let (rows, total) = database.transcoding_history_page(10, 0).await?;
+        assert_eq!(total, 1, "the expired row was pruned");
+        assert_eq!(
+            rows.first().map(|row| row.id.as_str()),
+            Some("history-new"),
+            "the new row survives the same commit"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn active_server_transcoding_sessions_decodes_named_row_fields()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1874,6 +2159,7 @@ mod tests {
             .first()
             .ok_or("transcoding session row was not returned")?;
         assert_eq!(row.session_id, "session-a");
+        assert_eq!(row.play_session_id, "play-a");
         assert_eq!(row.user_id, "user-a");
         assert_eq!(row.user_name.as_deref(), Some("User A"));
         assert_eq!(row.item_id, "item-a");

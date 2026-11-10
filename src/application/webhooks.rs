@@ -19,8 +19,9 @@ use url::{Host, Url};
 
 use crate::application::{
     notification_template,
-    plugin_protocol::{NotificationSendRpcRequest, NotificationSendStatus},
+    plugin_protocol::{NotificationSendRpcRequest, NotificationSendStatus, PluginConfigField},
     plugins::PluginService,
+    remote_url_policy::ipv4_compatible_target,
 };
 use crate::storage::{
     Database, NewNotificationDestination, NewNotificationEvent, StorageError,
@@ -33,10 +34,19 @@ pub const WEBHOOK_SECRET_FILE: &str = "lux_webhook_secrets.json";
 const MAX_NAME_LENGTH: usize = 128;
 const MAX_URL_LENGTH: usize = 2048;
 const MAX_EVENT_PAYLOAD_BYTES: usize = 256 * 1024;
+const MAX_PROVIDER_CREDENTIAL_CHARS: usize = 4_096;
 const MAX_DELIVERY_ATTEMPTS: i64 = 8;
 const MAX_RETRY_DELAY_SECONDS: i64 = 7_200;
 const DELIVERY_LEASE_SECONDS: i64 = 60;
-const DELIVERY_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Idle fallback for the delivery worker. Every in-process producer wakes it through
+/// [`WebhookService::delivery_notify`] as soon as a delivery row is committed, so this only covers a
+/// row written by a path that cannot notify (there is none today) and it can be slow.
+const DELIVERY_POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// Retry cadence while a batch is still settling. A failed attempt schedules the next one seconds
+/// later, so the worker keeps the old 5 s cadence for this long after it last attempted a delivery
+/// instead of stretching every retry to the idle fallback.
+const DELIVERY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const DELIVERY_RETRY_WINDOW: Duration = Duration::from_secs(60);
 const HISTORY_RETENTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const HISTORY_RETENTION_SECONDS: i64 = 30 * 86_400;
 const HISTORY_RETENTION_BATCH_SIZE: i64 = 500;
@@ -150,6 +160,8 @@ pub struct WebhookService {
     server_id: String,
     plugins: Option<PluginService>,
     worker: Arc<tokio::sync::Mutex<Option<super::background_loop::BackgroundLoop>>>,
+    /// Wakes the delivery worker as soon as [`Self::publish`] commits a delivery row.
+    delivery_notify: Arc<tokio::sync::Notify>,
 }
 
 async fn run_webhook_delivery_worker(
@@ -157,6 +169,9 @@ async fn run_webhook_delivery_worker(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut last_retention_sweep: Option<Instant> = None;
+    // Set after a pass that attempted deliveries: a requeued delivery is due seconds later, so the
+    // worker keeps the old short cadence for one window instead of sleeping through it.
+    let mut retry_window_until: Option<Instant> = None;
     loop {
         if *shutdown.borrow() {
             return;
@@ -165,23 +180,37 @@ async fn run_webhook_delivery_worker(
             service.prune_history().await;
             last_retention_sweep = Some(Instant::now());
         }
-        match service.process_ready_deliveries().await {
+        let wait = match service.process_ready_deliveries().await {
             Ok(0) => {
-                if super::background_loop::wait_or_shutdown(&mut shutdown, DELIVERY_POLL_INTERVAL)
-                    .await
-                {
-                    return;
+                let waiting_for_retry =
+                    retry_window_until.is_some_and(|until| Instant::now() < until);
+                if !waiting_for_retry {
+                    retry_window_until = None;
+                }
+                if waiting_for_retry {
+                    DELIVERY_RETRY_INTERVAL
+                } else {
+                    DELIVERY_POLL_INTERVAL
                 }
             }
-            Ok(_) => {}
+            // A non-empty ready queue is drained without waiting, exactly like before.
+            Ok(_) => {
+                retry_window_until = Some(Instant::now() + DELIVERY_RETRY_WINDOW);
+                continue;
+            }
             Err(error) => {
                 tracing::error!(%error, "webhook delivery worker iteration failed");
-                if super::background_loop::wait_or_shutdown(&mut shutdown, DELIVERY_POLL_INTERVAL)
-                    .await
-                {
-                    return;
-                }
+                DELIVERY_POLL_INTERVAL
             }
+        };
+        if super::background_loop::wait_for_wake_or_shutdown(
+            &mut shutdown,
+            &service.delivery_notify,
+            wait,
+        )
+        .await
+        {
+            return;
         }
     }
 }
@@ -196,6 +225,7 @@ impl WebhookService {
             server_id,
             plugins: None,
             worker: Arc::new(tokio::sync::Mutex::new(None)),
+            delivery_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -265,7 +295,7 @@ impl WebhookService {
     ) -> Result<(WebhookDestinationView, String), WebhookError> {
         let name = validate_name(name)?;
         let provider_plugin_id = validate_provider_id(provider_plugin_id)?;
-        validate_provider(self, provider_plugin_id, provider_config).await?;
+        validate_provider(self, provider_plugin_id, provider_config, true).await?;
         let url = if provider_plugin_id == BUILTIN_WEBHOOK_PROVIDER_ID {
             validate_destination(url, allow_private_network).map(Some)?
         } else {
@@ -274,7 +304,13 @@ impl WebhookService {
         let event_types = normalize_event_types(event_types)?;
         let payload_format = normalize_payload_format(payload_format)?;
         let provider_config_json = provider_config_json(provider_config)?;
-        let secret = normalize_or_generate_secret(secret)?;
+        let secret = if self.provider_declares_secret(provider_plugin_id).await? {
+            normalize_provider_credential(secret.ok_or_else(|| {
+                WebhookError::Invalid("notification provider credential is required".to_owned())
+            })?)?
+        } else {
+            normalize_or_generate_secret(secret)?
+        };
         let id = uuid::Uuid::now_v7().to_string();
         self.set_secret(&id, Some(&secret)).await?;
         let event_types_json = serde_json::to_string(&event_types)
@@ -333,15 +369,20 @@ impl WebhookService {
         &self,
         offset: i64,
         limit: i64,
-    ) -> Result<Vec<WebhookDeliveryView>, WebhookError> {
-        Ok(self
-            .database
-            .notifications()
-            .list_notification_deliveries(offset, limit)
+        status: Option<&str>,
+        destination_id: Option<&str>,
+    ) -> Result<(Vec<WebhookDeliveryView>, i64), WebhookError> {
+        let notifications = self.database.notifications();
+        let total = notifications
+            .count_notification_deliveries(status, destination_id)
+            .await?;
+        let deliveries = notifications
+            .list_notification_deliveries(offset, limit, status, destination_id)
             .await?
             .into_iter()
             .map(delivery_view)
-            .collect())
+            .collect();
+        Ok((deliveries, total))
     }
 
     pub async fn retry_delivery(&self, id: &str) -> Result<(), WebhookError> {
@@ -398,6 +439,7 @@ impl WebhookService {
             payload_format,
             None,
             None,
+            None,
         )
         .await
     }
@@ -414,6 +456,7 @@ impl WebhookService {
         payload_format: Option<&str>,
         provider_plugin_id: Option<&str>,
         provider_config: Option<&Value>,
+        secret: Option<&str>,
     ) -> Result<WebhookDestinationView, WebhookError> {
         let current = self
             .database
@@ -433,7 +476,14 @@ impl WebhookService {
             Value::Null
         };
         let next_provider_config = provider_config.unwrap_or(&current_provider_config);
-        validate_provider(self, next_provider_id, next_provider_config).await?;
+        let provider_changed = next_provider_id != current.provider_plugin_id;
+        validate_provider(
+            self,
+            next_provider_id,
+            next_provider_config,
+            provider_config.is_some() || provider_changed,
+        )
+        .await?;
         let validated_url = url
             .map(|value| {
                 if next_provider_id == BUILTIN_WEBHOOK_PROVIDER_ID {
@@ -454,25 +504,65 @@ impl WebhookService {
             .map_err(|error| WebhookError::Serialization(error.to_string()))?;
         let normalized_payload_format = payload_format.map(normalize_payload_format).transpose()?;
         let provider_config_json = provider_config.map(provider_config_json).transpose()?;
-        self.database
-            .notifications()
-            .update_notification_destination(
-                id,
-                UpdateNotificationDestination {
-                    name: validated_name,
-                    url: validated_url
-                        .as_ref()
-                        .and_then(Option::as_ref)
-                        .map(Url::as_str),
-                    enabled,
-                    allow_private_network,
-                    event_types_json: event_types_json.as_deref(),
-                    payload_format: normalized_payload_format.map(WebhookPayloadFormat::as_str),
-                    provider_plugin_id,
-                    provider_config_json: provider_config_json.as_deref(),
-                },
-            )
-            .await?;
+        let submitted_secret = secret.map(str::trim).filter(|value| !value.is_empty());
+        let secret_change = if provider_changed {
+            if self.secret_is_generated(next_provider_id) {
+                // The host owns the built-in HMAC secret, so a browser switch can regenerate it.
+                Some(SecretChange::Set(match submitted_secret {
+                    Some(value) => normalize_or_generate_secret(Some(value))?,
+                    None => generate_secret()?,
+                }))
+            } else if self.provider_declares_secret(next_provider_id).await? {
+                let value = submitted_secret.ok_or_else(|| {
+                    WebhookError::Invalid(
+                        "changing the notification provider requires its credential".to_owned(),
+                    )
+                })?;
+                Some(SecretChange::Set(normalize_provider_credential(value)?))
+            } else {
+                // The new provider never declared this credential, so it must not receive it.
+                Some(SecretChange::Clear)
+            }
+        } else {
+            submitted_secret
+                .map(|value| {
+                    if self.secret_is_generated(next_provider_id) {
+                        normalize_or_generate_secret(Some(value))
+                    } else {
+                        normalize_provider_credential(value)
+                    }
+                    .map(SecretChange::Set)
+                })
+                .transpose()?
+        };
+        let previous_secret = self.secret_value(id).await?;
+        self.write_destination_with_secret(id, previous_secret, secret_change, async {
+            let updated = self
+                .database
+                .notifications()
+                .update_notification_destination(
+                    id,
+                    UpdateNotificationDestination {
+                        name: validated_name,
+                        url: validated_url
+                            .as_ref()
+                            .and_then(Option::as_ref)
+                            .map(Url::as_str),
+                        enabled,
+                        allow_private_network,
+                        event_types_json: event_types_json.as_deref(),
+                        payload_format: normalized_payload_format.map(WebhookPayloadFormat::as_str),
+                        provider_plugin_id,
+                        provider_config_json: provider_config_json.as_deref(),
+                    },
+                )
+                .await?;
+            if !updated {
+                return Err(WebhookError::NotFound);
+            }
+            Ok(())
+        })
+        .await?;
         self.view_by_id(id).await?.ok_or(WebhookError::NotFound)
     }
 
@@ -488,17 +578,37 @@ impl WebhookService {
         self.set_secret(id, None).await
     }
 
-    pub async fn rotate_secret(&self, id: &str) -> Result<String, WebhookError> {
-        if self
+    /// Rotates the target secret.
+    ///
+    /// The built-in webhook provider generates a fresh HMAC secret. A provider that declares a
+    /// `secret` config field receives its credential from the administrator, so rotating it means
+    /// overwriting the stored value with the submitted one.
+    pub async fn rotate_secret(
+        &self,
+        id: &str,
+        new_secret: Option<&str>,
+    ) -> Result<String, WebhookError> {
+        let destination = self
             .database
             .notifications()
             .find_notification_destination(id)
             .await?
-            .is_none()
+            .ok_or(WebhookError::NotFound)?;
+        if !self
+            .provider_declares_secret(&destination.provider_plugin_id)
+            .await?
         {
-            return Err(WebhookError::NotFound);
+            let secret = generate_secret()?;
+            self.set_secret(id, Some(&secret)).await?;
+            return Ok(secret);
         }
-        let secret = generate_secret()?;
+        let submitted = new_secret
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                WebhookError::Invalid("notification provider credential is required".to_owned())
+            })?;
+        let secret = normalize_provider_credential(submitted)?;
         self.set_secret(id, Some(&secret)).await?;
         Ok(secret)
     }
@@ -515,7 +625,9 @@ impl WebhookService {
             .notifications()
             .list_enabled_notification_destinations()
             .await?;
-        let mut destination_groups = BTreeMap::<WebhookPayloadFormat, Vec<String>>::new();
+        // Keyed by payload format and whether the target is an external plugin: plugins receive
+        // the Lux envelope with the host-built Emby object, which native targets must not see.
+        let mut destination_groups = BTreeMap::<(WebhookPayloadFormat, bool), Vec<String>>::new();
         for destination in destinations {
             let selected = event_types_from_json(&destination.event_types_json)
                 .ok()
@@ -526,30 +638,41 @@ impl WebhookService {
             if !selected {
                 continue;
             }
-            let payload_format = if destination.provider_plugin_id == BUILTIN_WEBHOOK_PROVIDER_ID {
+            let external = destination.provider_plugin_id != BUILTIN_WEBHOOK_PROVIDER_ID;
+            let payload_format = if external {
+                // External providers receive the provider-neutral Lux event.
+                WebhookPayloadFormat::Lux
+            } else {
                 WebhookPayloadFormat::from_wire_name(&destination.payload_format).ok_or_else(
                     || WebhookError::Invalid("unknown webhook payload format".to_owned()),
                 )?
-            } else {
-                // External providers receive the provider-neutral Lux event.
-                WebhookPayloadFormat::Lux
             };
             destination_groups
-                .entry(payload_format)
+                .entry((payload_format, external))
                 .or_default()
                 .push(destination.id);
         }
         let mut first_event_id = None;
-        for (payload_format, destination_ids) in destination_groups {
+        for ((payload_format, external), destination_ids) in destination_groups {
             let event_id = uuid::Uuid::now_v7().to_string();
-            let payload = build_event_payload_for_format(
-                &self.server_id,
-                &event_id,
-                event_type,
-                occurred_at,
-                payload_format,
-                data.clone(),
-            )?;
+            let payload = if external {
+                external_event_payload(
+                    &self.server_id,
+                    &event_id,
+                    event_type,
+                    occurred_at,
+                    data.clone(),
+                )?
+            } else {
+                build_event_payload_for_format(
+                    &self.server_id,
+                    &event_id,
+                    event_type,
+                    occurred_at,
+                    payload_format,
+                    data.clone(),
+                )?
+            };
             let payload_json = serde_json::to_vec(&payload)
                 .map_err(|error| WebhookError::Serialization(error.to_string()))?;
             if payload_json.len() > MAX_EVENT_PAYLOAD_BYTES {
@@ -559,9 +682,10 @@ impl WebhookService {
             }
             let payload_json = String::from_utf8(payload_json)
                 .map_err(|error| WebhookError::Serialization(error.to_string()))?;
-            let event_dedupe_key = match payload_format {
-                WebhookPayloadFormat::Lux => dedupe_key.to_owned(),
-                WebhookPayloadFormat::Emby => format!("{dedupe_key}:EMBY"),
+            let event_dedupe_key = match (payload_format, external) {
+                (_, true) => format!("{dedupe_key}:PLUGIN"),
+                (WebhookPayloadFormat::Lux, false) => dedupe_key.to_owned(),
+                (WebhookPayloadFormat::Emby, false) => format!("{dedupe_key}:EMBY"),
             };
             let inserted = self
                 .database
@@ -578,8 +702,12 @@ impl WebhookService {
                     &destination_ids,
                 )
                 .await?;
-            if inserted && first_event_id.is_none() {
-                first_event_id = Some(event_id);
+            if inserted {
+                // Wake the delivery worker now instead of waiting for the idle fallback.
+                self.delivery_notify.notify_one();
+                if first_event_id.is_none() {
+                    first_event_id = Some(event_id);
+                }
             }
         }
         Ok(first_event_id)
@@ -956,6 +1084,63 @@ impl WebhookService {
         )?))
     }
 
+    /// Whether the built-in webhook provider owns the generated HMAC secret.
+    fn secret_is_generated(&self, provider_plugin_id: &str) -> bool {
+        provider_plugin_id == BUILTIN_WEBHOOK_PROVIDER_ID
+    }
+
+    /// Whether the provider declared a per-destination credential in its manifest.
+    async fn provider_declares_secret(
+        &self,
+        provider_plugin_id: &str,
+    ) -> Result<bool, WebhookError> {
+        if self.secret_is_generated(provider_plugin_id) {
+            return Ok(false);
+        }
+        let plugins = self.plugins.as_ref().ok_or_else(|| {
+            WebhookError::Plugin("notification plugin service is unavailable".to_owned())
+        })?;
+        plugins
+            .notification_provider_declares_secret(provider_plugin_id)
+            .await
+            .map_err(|error| WebhookError::Plugin(error.to_string()))
+    }
+
+    async fn secret_value(&self, id: &str) -> Result<Option<String>, WebhookError> {
+        Ok(self.read_secrets().await?.get(id).cloned())
+    }
+
+    /// Applies a pending secret change and rolls it back when the database write fails.
+    ///
+    /// A destination is a database row plus a credential in the secret store. Writing the secret
+    /// first and restoring the previous value on failure keeps the two in step: no update can leave
+    /// a destination holding a credential for a provider it no longer points at.
+    async fn write_destination_with_secret<F>(
+        &self,
+        id: &str,
+        previous_secret: Option<String>,
+        change: Option<SecretChange>,
+        write: F,
+    ) -> Result<(), WebhookError>
+    where
+        F: std::future::Future<Output = Result<(), WebhookError>>,
+    {
+        let Some(change) = change else {
+            return write.await;
+        };
+        match &change {
+            SecretChange::Set(secret) => self.set_secret(id, Some(secret)).await?,
+            SecretChange::Clear => self.set_secret(id, None).await?,
+        }
+        match write.await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = self.set_secret(id, previous_secret.as_deref()).await;
+                Err(error)
+            }
+        }
+    }
+
     async fn read_secrets(&self) -> Result<BTreeMap<String, String>, WebhookError> {
         read_secret_map(&self.secret_path()).await
     }
@@ -993,6 +1178,16 @@ pub enum WebhookEventType {
     PlaybackStopped,
 }
 
+/// A pending change of the destination secret.
+///
+/// A credential belongs to exactly one provider, so switching providers either replaces or drops
+/// the stored value instead of reusing it for the new provider.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SecretChange {
+    Set(String),
+    Clear,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum WebhookPayloadFormat {
     Lux,
@@ -1017,6 +1212,16 @@ impl WebhookPayloadFormat {
 }
 
 impl WebhookEventType {
+    const fn is_playback(self) -> bool {
+        matches!(
+            self,
+            Self::PlaybackStarted
+                | Self::PlaybackPaused
+                | Self::PlaybackProgress
+                | Self::PlaybackStopped
+        )
+    }
+
     pub const ALL: [Self; 10] = [
         Self::MediaAdded,
         Self::MediaRemoved,
@@ -1194,7 +1399,11 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     output
 }
 
-fn is_dangerous_address(address: IpAddr) -> bool {
+/// Whether an address must never be a webhook destination, even when the administrator approved the
+/// private network: unspecified, link-local (cloud metadata), multicast and broadcast ranges.
+///
+/// Shared with the notifier plugin SDK destination guard so both keep one classification.
+pub(crate) fn is_dangerous_address(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(value) => {
             value.is_unspecified()
@@ -1203,15 +1412,24 @@ fn is_dangerous_address(address: IpAddr) -> bool {
                 || value.octets()[0] == 0
         }
         IpAddr::V6(value) => {
-            if let Some(mapped) = value.to_ipv4() {
+            if let Some(mapped) = value.to_ipv4_mapped() {
                 return is_dangerous_address(IpAddr::V4(mapped));
+            }
+            // A deprecated IPv4-compatible address (`::/96`) still carries an IPv4 target, so it
+            // must not bypass the IPv4 policy; `::` and `::1` keep their IPv6 meaning.
+            if let Some(compatible) = ipv4_compatible_target(value) {
+                return is_dangerous_address(IpAddr::V4(compatible));
             }
             value.is_unspecified() || value.is_multicast() || value.is_unicast_link_local()
         }
     }
 }
 
-fn is_private_address(address: IpAddr) -> bool {
+/// Whether an address is a loopback, private or link-local destination that the host only permits
+/// after an explicit private-network approval.
+///
+/// Shared with the notifier plugin SDK destination guard so both keep one classification.
+pub(crate) fn is_private_address(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(value) => {
             value.is_private()
@@ -1222,8 +1440,11 @@ fn is_private_address(address: IpAddr) -> bool {
                 || value.octets()[0] == 192 && value.octets()[1] == 0 && value.octets()[2] == 0
         }
         IpAddr::V6(value) => {
-            if let Some(mapped) = value.to_ipv4() {
+            if let Some(mapped) = value.to_ipv4_mapped() {
                 return is_private_address(IpAddr::V4(mapped));
+            }
+            if let Some(compatible) = ipv4_compatible_target(value) {
+                return is_private_address(IpAddr::V4(compatible));
             }
             let octets = value.octets();
             value.is_loopback() || value.is_unicast_link_local() || (octets[0] & 0xfe) == 0xfc
@@ -1289,6 +1510,31 @@ fn normalize_or_generate_secret(value: Option<&str>) -> Result<String, WebhookEr
     generate_secret()
 }
 
+/// Normalizes a third-party credential submitted by an administrator.
+///
+/// Channel credentials (Bark device keys, WeCom corp secrets, bot webhook keys, SMTP passwords) are
+/// issued by the provider, so the host must not impose the webhook HMAC length rule; it only
+/// rejects values that cannot be forwarded safely.
+fn normalize_provider_credential(value: &str) -> Result<String, WebhookError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(WebhookError::Invalid(
+            "notification provider credential is required".to_owned(),
+        ));
+    }
+    if value.chars().count() > MAX_PROVIDER_CREDENTIAL_CHARS {
+        return Err(WebhookError::Invalid(
+            "notification provider credential is too long".to_owned(),
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(WebhookError::Invalid(
+            "notification provider credential must not contain control characters".to_owned(),
+        ));
+    }
+    Ok(value.to_owned())
+}
+
 fn generate_secret() -> Result<String, WebhookError> {
     let mut bytes = [0_u8; 32];
     OsRng
@@ -1323,6 +1569,37 @@ fn build_event_payload(
     Ok(Value::Object(data))
 }
 
+/// External notifier plugins receive the Lux envelope plus the host-built Emby object under `emby`.
+/// Plugins forward `emby` as-is, so the host stays the only place that builds payload text.
+fn external_event_payload(
+    server_id: &str,
+    event_id: &str,
+    event_type: WebhookEventType,
+    occurred_at: i64,
+    data: Value,
+) -> Result<Value, WebhookError> {
+    let mut payload = build_event_payload_for_format(
+        server_id,
+        event_id,
+        event_type,
+        occurred_at,
+        WebhookPayloadFormat::Lux,
+        data.clone(),
+    )?;
+    let emby = build_event_payload_for_format(
+        server_id,
+        event_id,
+        event_type,
+        occurred_at,
+        WebhookPayloadFormat::Emby,
+        data,
+    )?;
+    if let Value::Object(object) = &mut payload {
+        object.insert("emby".to_owned(), emby);
+    }
+    Ok(payload)
+}
+
 fn build_event_payload_for_format(
     server_id: &str,
     event_id: &str,
@@ -1331,28 +1608,70 @@ fn build_event_payload_for_format(
     payload_format: WebhookPayloadFormat,
     data: Value,
 ) -> Result<Value, WebhookError> {
+    // Keep the publisher's raw fields so the Emby adapter can read Emby-only fields. The Lux-native
+    // payload above still applies its allow-list, so native output does not change.
+    let raw = match &data {
+        Value::Object(map) => map.clone(),
+        _ => Map::new(),
+    };
     let lux_payload = build_event_payload(server_id, event_id, event_type, occurred_at, data)?;
     if payload_format == WebhookPayloadFormat::Lux {
         return Ok(lux_payload);
     }
-    let item_id = lux_payload.get("itemId").and_then(Value::as_str);
-    let play_session_id = lux_payload.get("playSessionId").and_then(Value::as_str);
+    let mut source = lux_payload.as_object().cloned().unwrap_or_default();
+    for (key, value) in raw {
+        source.entry(key).or_insert(value);
+    }
+    let lux_payload = Value::Object(source);
+    let text = |key: &str| {
+        lux_payload
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    let item_id = text("itemId");
+    let play_session_id = text("playSessionId");
+    let server_name = text("serverName")
+        .or_else(|| text("libraryName"))
+        .unwrap_or(server_id);
+    let user_name = text("userName");
+    let device_name = text("deviceName");
+    let item_name = text("itemTitle").or_else(|| text("itemName"));
+    let media_source = lux_payload
+        .get("mediaSource")
+        .filter(|value| value.is_object());
     let mut payload = json!({
         "Event": emby_event_name(event_type),
         "EventId": event_id,
         "Timestamp": occurred_at,
-        "Server": { "Id": server_id },
+        "Date": emby_date(occurred_at),
+        "Severity": "Info",
+        "Server": { "Id": server_id, "Name": server_name, "Version": env!("CARGO_PKG_VERSION") },
         "ServerID": server_id,
-        "ServerName": lux_payload
-            .get("serverName")
-            .or_else(|| lux_payload.get("libraryName"))
-            .and_then(Value::as_str)
-            .unwrap_or(server_id),
+        "ServerName": server_name,
         "TimeStamp": OffsetDateTime::from_unix_timestamp(occurred_at)
             .ok()
             .and_then(|value| value.format(&Rfc3339).ok())
             .unwrap_or_else(|| occurred_at.to_string()),
     });
+    payload["Title"] = match (event_type, user_name, device_name, item_name) {
+        (WebhookEventType::PlaybackStarted, Some(user), Some(device), Some(item)) => {
+            json!(format!("{user} 在 {device} 上开始播放 {item}"))
+        }
+        (WebhookEventType::PlaybackPaused, Some(user), Some(device), Some(item)) => {
+            json!(format!("{device} 上 {user} 已暂停播放 {item}"))
+        }
+        (WebhookEventType::PlaybackStopped, Some(user), Some(device), Some(item)) => {
+            json!(format!("{device} 上 {user} 已停止播放 {item}"))
+        }
+        _ => json!(text("title")),
+    };
+    // Emby sends a null description for pause and an empty one for start and stop.
+    payload["Description"] = match event_type {
+        WebhookEventType::PlaybackPaused => Value::Null,
+        event_type if event_type.is_playback() => json!(""),
+        _ => json!(text("content").unwrap_or("")),
+    };
     if let Some(item_id) = item_id {
         payload["Item"] = json!({ "Id": item_id });
         payload["ItemID"] = json!(item_id);
@@ -1380,8 +1699,53 @@ fn build_event_payload_for_format(
             }
         }
     }
+    if let Some(item) = payload.get_mut("Item").and_then(Value::as_object_mut) {
+        item.insert(
+            "Type".to_owned(),
+            json!(text("itemType").map(emby_item_type).unwrap_or_default()),
+        );
+        item.insert("Name".to_owned(), json!(item_name));
+        item.insert("MediaType".to_owned(), json!("Video"));
+        item.insert("Overview".to_owned(), json!(text("overview")));
+        item.insert(
+            "ProductionYear".to_owned(),
+            json!(lux_payload.get("productionYear")),
+        );
+        item.insert(
+            "RunTimeTicks".to_owned(),
+            json!(lux_payload.get("runtimeTicks")),
+        );
+        item.insert(
+            "ProviderIds".to_owned(),
+            json!(lux_payload.get("providerIds")),
+        );
+        item.insert("Path".to_owned(), json!(text("itemPath")));
+        item.insert(
+            "MediaStreams".to_owned(),
+            json!(media_source.and_then(|source| source.get("MediaStreams"))),
+        );
+        item.insert("FileName".to_owned(), json!(text("fileName")));
+    }
     if let Some(play_session_id) = play_session_id {
         payload["PlaySessionId"] = json!(play_session_id);
+    }
+    payload["User"] = json!({ "Name": user_name, "Id": text("userId") });
+    payload["Session"] = json!({
+        "Client": text("client"),
+        "DeviceName": device_name,
+        "ApplicationVersion": text("clientVersion"),
+        "RemoteEndPoint": text("remoteIp"),
+    });
+    payload["PlaybackInfo"] = json!({
+        "PositionTicks": lux_payload.get("positionTicks"),
+        "PlaySessionId": play_session_id,
+    });
+    if let Some(media_source) = media_source {
+        let mut media_source = media_source.clone();
+        if let Some(object) = media_source.as_object_mut() {
+            object.insert("Path".to_owned(), json!(text("itemPath")));
+        }
+        payload["PlaybackInfo"]["MediaSource"] = media_source;
     }
     let mappings = [
         ("mediaSourceId", "MediaSourceId"),
@@ -1404,6 +1768,27 @@ fn build_event_payload_for_format(
         }
     }
     Ok(payload)
+}
+
+fn emby_date(occurred_at: i64) -> String {
+    OffsetDateTime::from_unix_timestamp(occurred_at)
+        .ok()
+        .and_then(|value| value.format(&Rfc3339).ok())
+        .map(|value| value.replace('Z', ".0000000Z"))
+        .unwrap_or_else(|| occurred_at.to_string())
+}
+
+fn emby_item_type(value: &str) -> &str {
+    match value {
+        "MOVIE" => "Movie",
+        "EPISODE" => "Episode",
+        "SERIES" => "Series",
+        "SEASON" => "Season",
+        "AUDIO" => "Audio",
+        "MUSIC_ALBUM" => "MusicAlbum",
+        "PERSON" => "Person",
+        _ => value,
+    }
 }
 
 fn plugin_event_from_payload(payload_json: &str) -> Result<Value, WebhookError> {
@@ -1659,6 +2044,7 @@ async fn validate_provider(
     service: &WebhookService,
     provider_plugin_id: &str,
     config: &Value,
+    validate_values: bool,
 ) -> Result<(), WebhookError> {
     provider_config_json(config)?;
     if provider_plugin_id == BUILTIN_WEBHOOK_PROVIDER_ID {
@@ -1670,7 +2056,121 @@ async fn validate_provider(
     plugins
         .validate_notification_provider(provider_plugin_id)
         .await
-        .map_err(|error| WebhookError::Plugin(error.to_string()))
+        .map_err(|error| WebhookError::Plugin(error.to_string()))?;
+    if !validate_values {
+        return Ok(());
+    }
+    let fields = plugins
+        .notification_provider_config_fields(provider_plugin_id)
+        .await
+        .map_err(|error| WebhookError::Plugin(error.to_string()))?;
+    validate_provider_config_values(&fields, config)
+}
+
+/// Validates a notification target config against the fields the provider declared.
+///
+/// The config reaches the plugin verbatim, so a value the manifest does not describe (an unknown
+/// key, a wrong type, an invalid option, a missing required field) is rejected here instead of
+/// being silently forwarded.
+fn validate_provider_config_values(
+    fields: &[PluginConfigField],
+    config: &Value,
+) -> Result<(), WebhookError> {
+    let Some(object) = config.as_object() else {
+        return Err(WebhookError::Invalid(
+            "notification provider config must be an object".to_owned(),
+        ));
+    };
+    if let Some(unknown) = object
+        .keys()
+        .find(|key| !fields.iter().any(|field| field.key == **key))
+    {
+        return Err(WebhookError::Invalid(format!(
+            "unknown notification provider config field: {unknown}"
+        )));
+    }
+    for field in fields {
+        match object.get(&field.key) {
+            None => {
+                if field.required {
+                    return Err(WebhookError::Invalid(format!(
+                        "notification provider config field is required: {}",
+                        field.key
+                    )));
+                }
+            }
+            Some(value) => validate_provider_config_value(field, value)?,
+        }
+    }
+    Ok(())
+}
+
+fn validate_provider_config_value(
+    field: &PluginConfigField,
+    value: &Value,
+) -> Result<(), WebhookError> {
+    let invalid = || {
+        WebhookError::Invalid(format!(
+            "notification provider config field is invalid: {}",
+            field.key
+        ))
+    };
+    match field.input_type.as_str() {
+        "text" | "textarea" | "password" => {
+            let Some(text) = value.as_str() else {
+                return Err(invalid());
+            };
+            if text.chars().count() > 4096 || (field.required && text.trim().is_empty()) {
+                return Err(invalid());
+            }
+        }
+        "toggle" => {
+            if !value.is_boolean() {
+                return Err(invalid());
+            }
+        }
+        "number" => {
+            let Some(number) = value.as_i64() else {
+                return Err(invalid());
+            };
+            if field.minimum.is_some_and(|minimum| number < minimum)
+                || field.maximum.is_some_and(|maximum| number > maximum)
+            {
+                return Err(invalid());
+            }
+        }
+        "select" => {
+            if field.multiple {
+                let Some(values) = value.as_array() else {
+                    return Err(invalid());
+                };
+                if field.required && values.is_empty() {
+                    return Err(invalid());
+                }
+                if values
+                    .iter()
+                    .any(|value| !provider_config_option_is_valid(field, value))
+                {
+                    return Err(invalid());
+                }
+            } else if !provider_config_option_is_valid(field, value) {
+                return Err(invalid());
+            }
+        }
+        // Notification providers cannot declare image fields, and an unknown type is already
+        // rejected when the manifest is validated.
+        _ => return Err(invalid()),
+    }
+    Ok(())
+}
+
+fn provider_config_option_is_valid(field: &PluginConfigField, value: &Value) -> bool {
+    let Some(candidate) = value.as_str() else {
+        return false;
+    };
+    // Dynamic options (for example media library IDs) cannot be resolved for a notification
+    // target here, so the value is only checked for shape.
+    field.options_source.is_some() || field.options.iter().any(|option| option.value == candidate)
 }
 
 fn delivery_view(delivery: StoredNotificationDelivery) -> WebhookDeliveryView {
@@ -1807,14 +2307,145 @@ fn public_error_message(error: &WebhookError) -> String {
 mod tests {
     use super::{
         WebhookEventType, WebhookPayloadFormat, build_event_payload,
-        build_event_payload_for_format, is_retryable_http_status, parse_retry_after,
-        plugin_event_from_payload, provider_config_json, retry_delay,
+        build_event_payload_for_format, external_event_payload, is_retryable_http_status,
+        parse_retry_after, plugin_event_from_payload, provider_config_json, retry_delay,
         validate_optional_provider_url,
     };
     use reqwest::StatusCode;
     use serde_json::json;
     use std::time::{Duration, SystemTime};
     use url::Url;
+
+    /// The idle fallback must stay well above the old 5 s poll: the worker is woken by `publish`,
+    /// so the periodic wake only exists for a row no in-process publisher announced.
+    #[test]
+    fn the_idle_delivery_fallback_stays_at_least_thirty_seconds() {
+        assert!(
+            super::DELIVERY_POLL_INTERVAL >= Duration::from_secs(30),
+            "the idle delivery fallback must be at least 30 s"
+        );
+        assert!(
+            super::DELIVERY_RETRY_INTERVAL <= Duration::from_secs(5),
+            "a failing endpoint must keep the old retry cadence"
+        );
+    }
+
+    fn test_config_dir(temp_dir: &tempfile::TempDir) -> std::path::PathBuf {
+        temp_dir.path().join("config")
+    }
+
+    async fn test_database(
+        temp_dir: &tempfile::TempDir,
+    ) -> Result<crate::storage::Database, Box<dyn std::error::Error>> {
+        Ok(crate::storage::Database::connect(&crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: test_config_dir(temp_dir),
+        })
+        .await?)
+    }
+
+    /// A published event must reach the worker immediately: waiting for the idle fallback would
+    /// leave a notification unsent for up to 30 s, which is worse than the old 5 s poll.
+    #[tokio::test]
+    async fn publishing_an_event_wakes_the_delivery_worker()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = test_database(&temp_dir).await?;
+        let service = super::WebhookService::new(database, test_config_dir(&temp_dir))?;
+        // A closed local port keeps the delivery attempt short: the worker records the failed
+        // attempt, which is what the test observes.
+        service
+            .create_destination("wake", "http://127.0.0.1:1/webhook", true, true, &[], None)
+            .await?;
+        service.spawn_worker().await;
+        let published = service
+            .publish(
+                WebhookEventType::JobFailed,
+                "wake-test",
+                super::unix_now(),
+                json!({"test": true}),
+            )
+            .await?;
+        assert!(published.is_some(), "the event must be recorded");
+
+        let started = std::time::Instant::now();
+        loop {
+            let attempted = service
+                .list_deliveries(0, 10, None, None)
+                .await?
+                .0
+                .iter()
+                .any(|delivery| delivery.attempt_count >= 1);
+            if attempted {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "the worker must be woken by the enqueue, not by the idle fallback"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        service.shutdown().await;
+        Ok(())
+    }
+
+    /// A delivery that failed is requeued one second later: the worker must keep the old short
+    /// cadence for that window instead of sleeping through it on the idle fallback.
+    #[tokio::test]
+    async fn a_failed_delivery_is_retried_on_the_short_cadence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = test_database(&temp_dir).await?;
+        let service = super::WebhookService::new(database, test_config_dir(&temp_dir))?;
+        service
+            .create_destination("retry", "http://127.0.0.1:1/webhook", true, true, &[], None)
+            .await?;
+        service.spawn_worker().await;
+        service
+            .publish(
+                WebhookEventType::JobFailed,
+                "retry-test",
+                super::unix_now(),
+                json!({"test": true}),
+            )
+            .await?;
+
+        let started = std::time::Instant::now();
+        loop {
+            let attempts = service
+                .list_deliveries(0, 10, None, None)
+                .await?
+                .0
+                .iter()
+                .map(|delivery| delivery.attempt_count)
+                .max()
+                .unwrap_or(0);
+            if attempts >= 2 {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "a requeued delivery must be retried on the short cadence, not the idle fallback"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        service.shutdown().await;
+        Ok(())
+    }
+
+    /// Shutdown must not wait for the idle fallback.
+    #[tokio::test]
+    async fn shutdown_stops_the_delivery_worker_within_the_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = test_database(&temp_dir).await?;
+        let service = super::WebhookService::new(database, test_config_dir(&temp_dir))?;
+        service.spawn_worker().await;
+        tokio::time::timeout(Duration::from_secs(2), service.shutdown())
+            .await
+            .expect("shutdown must stop an idle delivery worker");
+        Ok(())
+    }
 
     #[test]
     fn retry_after_accepts_seconds_and_caps_long_delays() {
@@ -2181,6 +2812,235 @@ mod tests {
     }
 
     #[test]
+    fn emby_playback_payload_matches_emby_envelope_and_text() {
+        let payload = build_event_payload_for_format(
+            "server-1",
+            "event-emby-start",
+            WebhookEventType::PlaybackStarted,
+            1_700_000_000,
+            WebhookPayloadFormat::Emby,
+            json!({
+                "itemId": "item-1",
+                "itemType": "MOVIE",
+                "itemName": "示例电影",
+                "itemTitle": "示例电影",
+                "productionYear": 2024,
+                "runtimeTicks": 72_000_000_000_i64,
+                "providerIds": {"Imdb": "tt1", "Tmdb": "2"},
+                "overview": "简介",
+                "userId": "1234",
+                "userName": "alice",
+                "serverName": "Lux 服务器",
+                "playSessionId": "session-1",
+                "positionTicks": 42,
+                "client": "Lux",
+                "deviceName": "Chrome",
+                "clientVersion": "1.2.3",
+                "remoteIp": "192.0.2.10"
+            }),
+        )
+        .expect("Emby payload should be accepted");
+        assert_eq!(payload["Event"], "playback.start");
+        assert_eq!(payload["Title"], "alice 在 Chrome 上开始播放 示例电影");
+        assert_eq!(payload["Severity"], "Info");
+        assert_eq!(payload["Date"], "2023-11-14T22:13:20.0000000Z");
+        assert_eq!(payload["Server"]["Name"], "Lux 服务器");
+        assert_eq!(payload["User"]["Name"], "alice");
+        assert_eq!(payload["User"]["Id"], "1234");
+        assert_eq!(payload["Session"]["Client"], "Lux");
+        assert_eq!(payload["Session"]["DeviceName"], "Chrome");
+        assert_eq!(payload["Session"]["ApplicationVersion"], "1.2.3");
+        assert_eq!(payload["Session"]["RemoteEndPoint"], "192.0.2.10");
+        assert_eq!(payload["Item"]["Type"], "Movie");
+        assert_eq!(payload["Item"]["MediaType"], "Video");
+        assert_eq!(payload["Item"]["ProductionYear"], 2024);
+        assert_eq!(payload["Item"]["RunTimeTicks"], 72_000_000_000_i64);
+        assert_eq!(payload["Item"]["ProviderIds"]["Imdb"], "tt1");
+        assert_eq!(payload["PlaybackInfo"]["PositionTicks"], 42);
+        assert_eq!(payload["PlaybackInfo"]["PlaySessionId"], "session-1");
+        assert!(payload.get("path").is_none());
+        assert!(payload["Item"]["Path"].is_null());
+    }
+
+    #[test]
+    fn emby_playback_payload_includes_local_path_and_file_name_only_for_emby() {
+        let data = json!({
+            "itemId": "item-1",
+            "itemType": "MOVIE",
+            "itemTitle": "示例电影",
+            "userName": "alice",
+            "deviceName": "Chrome",
+            "playSessionId": "session-1",
+            "itemPath": "/media/movies/示例电影.mkv",
+            "fileName": "示例电影.mkv",
+            "remoteIp": "192.0.2.10"
+        });
+        let emby = build_event_payload_for_format(
+            "server-1",
+            "event-emby-path",
+            WebhookEventType::PlaybackStarted,
+            1_700_000_000,
+            WebhookPayloadFormat::Emby,
+            data.clone(),
+        )
+        .expect("Emby payload should be accepted");
+        assert_eq!(emby["Item"]["Path"], "/media/movies/示例电影.mkv");
+        assert_eq!(emby["Item"]["FileName"], "示例电影.mkv");
+
+        let native = build_event_payload_for_format(
+            "server-1",
+            "event-native-path",
+            WebhookEventType::PlaybackStarted,
+            1_700_000_000,
+            WebhookPayloadFormat::Lux,
+            data,
+        )
+        .expect("native payload should be accepted");
+        assert!(native.get("itemPath").is_none());
+        assert!(native.get("fileName").is_none());
+    }
+
+    #[test]
+    fn emby_playback_payload_carries_media_source_and_streams() {
+        let data = json!({
+            "itemId": "item-1",
+            "itemType": "MOVIE",
+            "itemTitle": "示例电影",
+            "playSessionId": "session-1",
+            "itemPath": "/media/movies/示例电影.mkv",
+            "mediaSource": {
+                "Id": "item-1",
+                "Container": "mkv",
+                "Size": 1234,
+                "MediaStreams": [
+                    {"Type": "Video", "Codec": "hevc", "Index": 0},
+                    {"Type": "Audio", "Codec": "aac", "Index": 1}
+                ]
+            }
+        });
+        let emby = build_event_payload_for_format(
+            "server-1",
+            "event-emby-source",
+            WebhookEventType::PlaybackStarted,
+            1_700_000_000,
+            WebhookPayloadFormat::Emby,
+            data.clone(),
+        )
+        .expect("Emby payload should be accepted");
+        assert_eq!(emby["Item"]["MediaStreams"][0]["Type"], "Video");
+        assert_eq!(emby["Item"]["MediaStreams"][1]["Codec"], "aac");
+        assert_eq!(emby["PlaybackInfo"]["MediaSource"]["Container"], "mkv");
+        assert_eq!(emby["PlaybackInfo"]["MediaSource"]["Size"], 1234);
+        assert_eq!(
+            emby["PlaybackInfo"]["MediaSource"]["Path"],
+            "/media/movies/示例电影.mkv"
+        );
+
+        let native = build_event_payload_for_format(
+            "server-1",
+            "event-native-source",
+            WebhookEventType::PlaybackStarted,
+            1_700_000_000,
+            WebhookPayloadFormat::Lux,
+            data,
+        )
+        .expect("native payload should be accepted");
+        assert!(native.get("mediaSource").is_none());
+    }
+
+    #[test]
+    fn emby_playback_pause_uses_the_server_pause_wording() {
+        let payload = build_event_payload_for_format(
+            "server-1",
+            "event-emby-pause",
+            WebhookEventType::PlaybackPaused,
+            1_700_000_000,
+            WebhookPayloadFormat::Emby,
+            json!({
+                "itemId": "item-1",
+                "itemTitle": "示例电影",
+                "userName": "alice",
+                "deviceName": "Chrome",
+                "playSessionId": "session-1",
+                "positionTicks": 42,
+                "remoteIp": "192.0.2.10"
+            }),
+        )
+        .expect("Emby payload should be accepted");
+        assert_eq!(payload["Event"], "playback.pause");
+        assert_eq!(payload["Title"], "Chrome 上 alice 已暂停播放 示例电影");
+        assert!(payload["Description"].is_null());
+    }
+
+    #[test]
+    fn external_plugin_payload_carries_the_host_built_emby_object_only_for_plugins() {
+        let data = json!({
+            "itemId": "item-1",
+            "itemType": "MOVIE",
+            "itemTitle": "示例电影",
+            "userName": "alice",
+            "deviceName": "Chrome",
+            "playSessionId": "session-1",
+            "itemPath": "/media/movies/示例电影.mkv",
+            "fileName": "示例电影.mkv",
+            "remoteIp": "192.0.2.10"
+        });
+        let plugin = external_event_payload(
+            "server-1",
+            "event-plugin",
+            WebhookEventType::PlaybackStarted,
+            1_700_000_000,
+            data.clone(),
+        )
+        .expect("plugin payload should be accepted");
+        assert_eq!(plugin["emby"]["Event"], "playback.start");
+        assert_eq!(
+            plugin["emby"]["Title"],
+            "alice 在 Chrome 上开始播放 示例电影"
+        );
+        assert_eq!(plugin["emby"]["Item"]["Path"], "/media/movies/示例电影.mkv");
+        assert!(plugin.get("itemPath").is_none());
+
+        let native = build_event_payload_for_format(
+            "server-1",
+            "event-native",
+            WebhookEventType::PlaybackStarted,
+            1_700_000_000,
+            WebhookPayloadFormat::Lux,
+            data,
+        )
+        .expect("native payload should be accepted");
+        assert!(native.get("emby").is_none());
+    }
+
+    #[test]
+    fn emby_playback_stop_title_follows_emby_wording() {
+        let payload = build_event_payload_for_format(
+            "server-1",
+            "event-emby-stop",
+            WebhookEventType::PlaybackStopped,
+            1_700_000_000,
+            WebhookPayloadFormat::Emby,
+            json!({
+                "itemId": "item-1",
+                "itemType": "EPISODE",
+                "itemName": "第一集",
+                "seriesTitle": "示例剧",
+                "userName": "alice",
+                "serverName": "Lux 服务器",
+                "playSessionId": "session-1",
+                "positionTicks": 42,
+                "deviceName": "Chrome",
+                "remoteIp": "192.0.2.10"
+            }),
+        )
+        .expect("Emby payload should be accepted");
+        assert_eq!(payload["Event"], "playback.stop");
+        assert_eq!(payload["Title"], "Chrome 上 alice 已停止播放 第一集");
+        assert_eq!(payload["Item"]["Type"], "Episode");
+    }
+
+    #[test]
     fn external_provider_receives_an_envelope_with_data_separated() {
         let payload = build_event_payload(
             "server-1",
@@ -2237,5 +3097,669 @@ mod tests {
         assert!(
             validate_optional_provider_url("http://192.168.10.50:5401/notify", false,).is_err()
         );
+    }
+
+    /// Seeds notification providers; `true` declares a per-destination credential.
+    async fn notification_provider_service_with(
+        temp_dir: &tempfile::TempDir,
+        providers: &[(&str, bool)],
+    ) -> Result<super::WebhookService, Box<dyn std::error::Error>> {
+        let config_dir = test_config_dir(temp_dir);
+        let database = test_database(temp_dir).await?;
+        for (plugin_id, declares_secret) in providers {
+            seed_notification_provider(&config_dir, plugin_id, *declares_secret).await?;
+            database.install_plugin(plugin_id).await?;
+        }
+        let plugins = crate::application::plugins::PluginService::
+            new_without_login_background_worker_for_test(database.clone(), config_dir.clone());
+        let service = super::WebhookService::new(database, config_dir)?.with_plugins(plugins);
+        Ok(service)
+    }
+
+    /// Seeds one notification provider that may declare a per-destination credential.
+    async fn notification_provider_service(
+        temp_dir: &tempfile::TempDir,
+        declares_secret: bool,
+    ) -> Result<super::WebhookService, Box<dyn std::error::Error>> {
+        notification_provider_service_with(temp_dir, &[("org.lux.test-notifier", declares_secret)])
+            .await
+    }
+
+    async fn seed_notification_provider(
+        config_dir: &std::path::Path,
+        plugin_id: &str,
+        declares_secret: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let plugin_dir = config_dir.join(format!("plugins/{plugin_id}/binaries"));
+        tokio::fs::create_dir_all(&plugin_dir).await?;
+        tokio::fs::write(plugin_dir.join("plugin"), b"placeholder").await?;
+        let mut config_fields = vec![
+            json!({
+                "key": "serverUrl",
+                "label": "服务地址",
+                "type": "text",
+                "required": true
+            }),
+            json!({
+                "key": "sound",
+                "label": "铃声",
+                "type": "select",
+                "required": false,
+                "options": [
+                    {"value": "default", "label": "默认"},
+                    {"value": "alarm", "label": "警报"}
+                ]
+            }),
+            json!({
+                "key": "volume",
+                "label": "音量",
+                "type": "number",
+                "required": false,
+                "minimum": 1,
+                "maximum": 15
+            }),
+        ];
+        if declares_secret {
+            config_fields.push(json!({
+                "key": "secret",
+                "label": "设备密钥",
+                "type": "password",
+                "required": true,
+                "sensitive": true
+            }));
+        }
+        tokio::fs::write(
+            config_dir.join(format!("plugins/{plugin_id}/manifest.json")),
+            serde_json::to_vec_pretty(&json!({
+                "formatVersion": 1,
+                "id": plugin_id,
+                "name": format!("Test notifier {plugin_id}"),
+                "version": "1.0.0",
+                "apiVersion": 1,
+                "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+                "type": "notification",
+                "category": "NOTIFICATION",
+                "capabilities": ["notification.send"],
+                "configFields": config_fields,
+                "permissions": {"network": [], "filesystem": []},
+                "files": []
+            }))?,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn stored_secret(
+        service: &super::WebhookService,
+        destination_id: &str,
+    ) -> Option<String> {
+        super::read_secret_map(&service.secret_path())
+            .await
+            .expect("the secret store must be readable")
+            .get(destination_id)
+            .cloned()
+    }
+
+    /// A notifier that declares `secret` keeps the administrator's credential as the target
+    /// secret: it never reaches `providerConfig`, the destination view or the delivery payload.
+    #[tokio::test]
+    async fn a_declared_secret_field_is_stored_outside_the_provider_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = "org.lux.test-notifier";
+        let temp_dir = tempfile::tempdir()?;
+        let service = notification_provider_service(&temp_dir, true).await?;
+
+        let (destination, secret) = service
+            .create_destination_with_provider(
+                "bark",
+                "",
+                true,
+                false,
+                &[],
+                Some("device-key-1"),
+                "LUX",
+                PLUGIN_ID,
+                &json!({"serverUrl": "https://bark.example.invalid"}),
+            )
+            .await?;
+
+        assert_eq!(secret, "device-key-1");
+        assert_eq!(
+            stored_secret(&service, &destination.id).await.as_deref(),
+            Some("device-key-1")
+        );
+        assert!(
+            destination.provider_config.get("secret").is_none(),
+            "the credential must not enter the provider config"
+        );
+        assert!(destination.secret_configured);
+
+        let listed = service.list_destinations(0, 10).await?;
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].secret_configured);
+        let serialized = serde_json::to_string(&listed)?;
+        assert!(
+            !serialized.contains("device-key-1"),
+            "no destination response may contain the credential"
+        );
+
+        let stored_config = service
+            .database
+            .notifications()
+            .find_notification_destination(&destination.id)
+            .await?
+            .expect("the destination must exist")
+            .provider_config_json;
+        assert!(!stored_config.contains("device-key-1"));
+        Ok(())
+    }
+
+    /// Updating with an empty credential keeps the stored one; a new value replaces it.
+    #[tokio::test]
+    async fn updating_a_declared_secret_only_changes_it_when_a_value_is_submitted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = "org.lux.test-notifier";
+        let temp_dir = tempfile::tempdir()?;
+        let service = notification_provider_service(&temp_dir, true).await?;
+        let (destination, _) = service
+            .create_destination_with_provider(
+                "bark",
+                "",
+                true,
+                false,
+                &[],
+                Some("device-key-1"),
+                "LUX",
+                PLUGIN_ID,
+                &json!({"serverUrl": "https://bark.example.invalid"}),
+            )
+            .await?;
+
+        service
+            .update_destination_with_provider(
+                &destination.id,
+                Some("bark renamed"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&json!({"serverUrl": "https://bark.example.invalid"})),
+                Some(""),
+            )
+            .await?;
+        assert_eq!(
+            stored_secret(&service, &destination.id).await.as_deref(),
+            Some("device-key-1"),
+            "an empty update must keep the stored credential"
+        );
+
+        service
+            .update_destination_with_provider(
+                &destination.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("device-key-2"),
+            )
+            .await?;
+        assert_eq!(
+            stored_secret(&service, &destination.id).await.as_deref(),
+            Some("device-key-2")
+        );
+        Ok(())
+    }
+
+    /// A channel credential must be submitted: the host must not invent one for a third party.
+    #[tokio::test]
+    async fn creating_a_declared_secret_provider_requires_the_credential()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = "org.lux.test-notifier";
+        let temp_dir = tempfile::tempdir()?;
+        let service = notification_provider_service(&temp_dir, true).await?;
+        let config = json!({"serverUrl": "https://bark.example.invalid"});
+
+        for secret in [None, Some(""), Some("   ")] {
+            let result = service
+                .create_destination_with_provider(
+                    "bark",
+                    "",
+                    true,
+                    false,
+                    &[],
+                    secret,
+                    "LUX",
+                    PLUGIN_ID,
+                    &config,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(super::WebhookError::Invalid(_))),
+                "creating a declared-secret provider without a credential must fail"
+            );
+        }
+        assert!(service.list_destinations(0, 10).await?.is_empty());
+        Ok(())
+    }
+
+    /// Rotating a declared-secret provider overwrites it with the submitted value.
+    #[tokio::test]
+    async fn rotating_a_declared_secret_provider_overwrites_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = "org.lux.test-notifier";
+        let temp_dir = tempfile::tempdir()?;
+        let service = notification_provider_service(&temp_dir, true).await?;
+        let (destination, _) = service
+            .create_destination_with_provider(
+                "bark",
+                "",
+                true,
+                false,
+                &[],
+                Some("device-key-1"),
+                "LUX",
+                PLUGIN_ID,
+                &json!({"serverUrl": "https://bark.example.invalid"}),
+            )
+            .await?;
+
+        assert!(
+            matches!(
+                service.rotate_secret(&destination.id, None).await,
+                Err(super::WebhookError::Invalid(_))
+            ),
+            "a declared-secret provider must not rotate to a generated value"
+        );
+        assert_eq!(
+            service
+                .rotate_secret(&destination.id, Some("device-key-3"))
+                .await?,
+            "device-key-3"
+        );
+        assert_eq!(
+            stored_secret(&service, &destination.id).await.as_deref(),
+            Some("device-key-3")
+        );
+        Ok(())
+    }
+
+    /// A provider declares its per-destination settings, so the host rejects a config the plugin
+    /// cannot receive: a missing required value, an unknown key, a wrong type or an invalid option.
+    #[tokio::test]
+    async fn provider_config_is_validated_against_the_provider_manifest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = "org.lux.test-notifier";
+        let temp_dir = tempfile::tempdir()?;
+        let service = notification_provider_service(&temp_dir, true).await?;
+
+        let rejected = [
+            json!({}),
+            json!({"serverUrl": "   "}),
+            json!({"serverUrl": "https://bark.example.invalid", "unknownKey": 1}),
+            json!({"serverUrl": 42}),
+            json!({"serverUrl": "https://bark.example.invalid", "sound": "airhorn"}),
+            json!({"serverUrl": "https://bark.example.invalid", "volume": 99}),
+            json!({"serverUrl": "https://bark.example.invalid", "volume": "loud"}),
+        ];
+        for config in rejected {
+            let result = service
+                .create_destination_with_provider(
+                    "bark",
+                    "",
+                    true,
+                    false,
+                    &[],
+                    Some("device-key-1"),
+                    "LUX",
+                    PLUGIN_ID,
+                    &config,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(super::WebhookError::Invalid(_))),
+                "provider config {config} should be rejected"
+            );
+        }
+        assert!(service.list_destinations(0, 10).await?.is_empty());
+
+        service
+            .create_destination_with_provider(
+                "bark",
+                "",
+                true,
+                false,
+                &[],
+                Some("device-key-1"),
+                "LUX",
+                PLUGIN_ID,
+                &json!({
+                    "serverUrl": "https://bark.example.invalid",
+                    "sound": "alarm",
+                    "volume": 8
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The same field contract applies when an administrator edits a destination.
+    #[tokio::test]
+    async fn updating_a_destination_validates_the_submitted_provider_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = "org.lux.test-notifier";
+        let temp_dir = tempfile::tempdir()?;
+        let service = notification_provider_service(&temp_dir, true).await?;
+        let (destination, _) = service
+            .create_destination_with_provider(
+                "bark",
+                "",
+                true,
+                false,
+                &[],
+                Some("device-key-1"),
+                "LUX",
+                PLUGIN_ID,
+                &json!({"serverUrl": "https://bark.example.invalid"}),
+            )
+            .await?;
+
+        for config in [
+            json!({}),
+            json!({"serverUrl": "https://bark.example.invalid", "volume": 0}),
+        ] {
+            let result = service
+                .update_destination_with_provider(
+                    &destination.id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&config),
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(super::WebhookError::Invalid(_))),
+                "provider config {config} should be rejected on update"
+            );
+        }
+
+        let updated = service
+            .update_destination_with_provider(
+                &destination.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&json!({
+                    "serverUrl": "https://bark.example.invalid",
+                    "volume": 15
+                })),
+                None,
+            )
+            .await?;
+        assert_eq!(updated.provider_config["volume"], 15);
+        assert_eq!(
+            stored_secret(&service, &destination.id).await.as_deref(),
+            Some("device-key-1"),
+            "a config-only update must keep the credential"
+        );
+        Ok(())
+    }
+
+    /// A credential belongs to exactly one provider: switching the provider never reuses the
+    /// stored value, because the new provider would silently receive another service's secret.
+    #[tokio::test]
+    async fn switching_to_a_secret_provider_requires_a_new_credential()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = "org.lux.test-notifier";
+        let temp_dir = tempfile::tempdir()?;
+        let service = notification_provider_service(&temp_dir, true).await?;
+        let (destination, generated) = service
+            .create_destination(
+                "local",
+                "http://127.0.0.1:8787/hooks",
+                true,
+                true,
+                &[],
+                None,
+            )
+            .await?;
+        assert!(generated.starts_with("lux_wh_"));
+        let config = json!({"serverUrl": "https://bark.example.invalid"});
+
+        let rejected = service
+            .update_destination_with_provider(
+                &destination.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(PLUGIN_ID),
+                Some(&config),
+                None,
+            )
+            .await;
+        assert!(
+            matches!(rejected, Err(super::WebhookError::Invalid(_))),
+            "switching providers must not reuse the previous credential"
+        );
+        assert_eq!(
+            stored_secret(&service, &destination.id).await.as_deref(),
+            Some(generated.as_str()),
+            "a rejected provider change must keep the old destination unchanged"
+        );
+
+        let updated = service
+            .update_destination_with_provider(
+                &destination.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(PLUGIN_ID),
+                Some(&config),
+                Some("device-key-9"),
+            )
+            .await?;
+        assert_eq!(updated.provider_plugin_id, PLUGIN_ID);
+        assert_eq!(
+            stored_secret(&service, &destination.id).await.as_deref(),
+            Some("device-key-9")
+        );
+        Ok(())
+    }
+
+    /// Switching back to the built-in webhook host generates a fresh HMAC secret instead of
+    /// keeping the previous provider's credential.
+    #[tokio::test]
+    async fn switching_to_the_builtin_webhook_regenerates_the_secret()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = "org.lux.test-notifier";
+        let temp_dir = tempfile::tempdir()?;
+        let service = notification_provider_service(&temp_dir, true).await?;
+        let (destination, _) = service
+            .create_destination_with_provider(
+                "bark",
+                "",
+                true,
+                false,
+                &[],
+                Some("device-key-1"),
+                "LUX",
+                PLUGIN_ID,
+                &json!({"serverUrl": "https://bark.example.invalid"}),
+            )
+            .await?;
+
+        let updated = service
+            .update_destination_with_provider(
+                &destination.id,
+                None,
+                Some("http://127.0.0.1:8787/hooks"),
+                None,
+                Some(true),
+                None,
+                None,
+                Some(super::BUILTIN_WEBHOOK_PROVIDER_ID),
+                Some(&json!({})),
+                None,
+            )
+            .await?;
+        assert_eq!(
+            updated.provider_plugin_id,
+            super::BUILTIN_WEBHOOK_PROVIDER_ID
+        );
+        let secret = stored_secret(&service, &destination.id)
+            .await
+            .expect("the built-in provider must always own a secret");
+        assert!(secret.starts_with("lux_wh_"), "unexpected secret {secret}");
+        assert_ne!(secret, "device-key-1");
+        Ok(())
+    }
+
+    /// A provider without a declared credential cannot use the previous provider's secret, so the
+    /// stored value is dropped instead of being forwarded to it.
+    #[tokio::test]
+    async fn switching_to_a_provider_without_a_credential_clears_the_old_secret()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const SECRET_PLUGIN_ID: &str = "org.lux.test-notifier";
+        const PLAIN_PLUGIN_ID: &str = "org.lux.test-plain-notifier";
+        let temp_dir = tempfile::tempdir()?;
+        let service = notification_provider_service_with(
+            &temp_dir,
+            &[(SECRET_PLUGIN_ID, true), (PLAIN_PLUGIN_ID, false)],
+        )
+        .await?;
+        let (destination, _) = service
+            .create_destination_with_provider(
+                "bark",
+                "",
+                true,
+                false,
+                &[],
+                Some("device-key-1"),
+                "LUX",
+                SECRET_PLUGIN_ID,
+                &json!({"serverUrl": "https://bark.example.invalid"}),
+            )
+            .await?;
+
+        let updated = service
+            .update_destination_with_provider(
+                &destination.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(PLAIN_PLUGIN_ID),
+                Some(&json!({"serverUrl": "https://plain.example.invalid"})),
+                None,
+            )
+            .await?;
+        assert_eq!(updated.provider_plugin_id, PLAIN_PLUGIN_ID);
+        assert!(!updated.secret_configured);
+        assert!(
+            stored_secret(&service, &destination.id).await.is_none(),
+            "the previous provider's credential must not survive the switch"
+        );
+        Ok(())
+    }
+
+    /// The destination row and its credential live in two stores: when the row write fails, the
+    /// credential change is rolled back so the destination stays consistent with its provider.
+    #[tokio::test]
+    async fn a_failed_destination_write_restores_the_previous_credential()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = "org.lux.test-notifier";
+        let temp_dir = tempfile::tempdir()?;
+        let service = notification_provider_service(&temp_dir, true).await?;
+        let (destination, _) = service
+            .create_destination_with_provider(
+                "bark",
+                "",
+                true,
+                false,
+                &[],
+                Some("device-key-1"),
+                "LUX",
+                PLUGIN_ID,
+                &json!({"serverUrl": "https://bark.example.invalid"}),
+            )
+            .await?;
+
+        for change in [
+            super::SecretChange::Set("device-key-2".to_owned()),
+            super::SecretChange::Clear,
+        ] {
+            let result = service
+                .write_destination_with_secret(
+                    &destination.id,
+                    Some("device-key-1".to_owned()),
+                    Some(change.clone()),
+                    async {
+                        Err(super::WebhookError::Storage(
+                            crate::storage::StorageError::Conflict(
+                                "forced destination write failure".to_owned(),
+                            ),
+                        ))
+                    },
+                )
+                .await;
+            assert!(result.is_err(), "the helper must surface the write failure");
+            assert_eq!(
+                stored_secret(&service, &destination.id).await.as_deref(),
+                Some("device-key-1"),
+                "{change:?} must be rolled back after a failed write"
+            );
+        }
+        Ok(())
+    }
+
+    /// The built-in webhook provider keeps generating its own HMAC secret.
+    #[tokio::test]
+    async fn the_builtin_webhook_provider_still_generates_and_rotates_its_secret()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = test_database(&temp_dir).await?;
+        let service = super::WebhookService::new(database, test_config_dir(&temp_dir))?;
+        let (destination, secret) = service
+            .create_destination(
+                "local",
+                "http://127.0.0.1:8787/hooks",
+                true,
+                true,
+                &[],
+                None,
+            )
+            .await?;
+        assert!(secret.starts_with("lux_wh_"), "unexpected secret {secret}");
+
+        let rotated = service.rotate_secret(&destination.id, None).await?;
+        assert!(rotated.starts_with("lux_wh_"));
+        assert_ne!(rotated, secret);
+        assert_eq!(
+            stored_secret(&service, &destination.id).await.as_deref(),
+            Some(rotated.as_str())
+        );
+        Ok(())
     }
 }

@@ -1,12 +1,18 @@
 // @vitest-environment jsdom
 
-import { act } from "react";
+import { act, useState, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it } from "vitest";
 import { ContinueWatchingRail, MediaCard, MediaRail, posterUrlWithFallback, recentPlaybackLabel } from "../src/features/home/media";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+function TestQueryProvider({ children }: { children: ReactNode }) {
+  const [client] = useState(() => new QueryClient({ defaultOptions: { queries: { retry: false } } }));
+  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+}
 
 describe("posterUrlWithFallback", () => {
   it("uses the series poster when a season has no poster", () => {
@@ -216,12 +222,14 @@ describe("ContinueWatchingRail", () => {
 
     act(() => {
       root.render(
-        <MemoryRouter>
-          <MediaRail
-            title="最新电影"
-            items={[{ id: "movie-1", title: "示例电影", itemType: "MOVIE", rating: 7.6, ratingSource: "TMDb" }]}
-          />
-        </MemoryRouter>,
+        <TestQueryProvider>
+          <MemoryRouter>
+            <MediaRail
+              title="最新电影"
+              items={[{ id: "movie-1", title: "示例电影", itemType: "MOVIE", rating: 7.6, ratingSource: "TMDb" }]}
+            />
+          </MemoryRouter>
+        </TestQueryProvider>,
       );
     });
 
@@ -239,11 +247,13 @@ describe("ContinueWatchingRail", () => {
 
     act(() => {
       root.render(
-        <MemoryRouter>
-          <MediaCard
-            item={{ id: "series-1", title: "示例剧集", itemType: "SERIES", rating: 8.1, episodeCount: 12 }}
-          />
-        </MemoryRouter>,
+        <TestQueryProvider>
+          <MemoryRouter>
+            <MediaCard
+              item={{ id: "series-1", title: "示例剧集", itemType: "SERIES", rating: 8.1, episodeCount: 12 }}
+            />
+          </MemoryRouter>
+        </TestQueryProvider>,
       );
     });
 
@@ -259,11 +269,13 @@ describe("ContinueWatchingRail", () => {
 
     act(() => {
       root.render(
-        <MemoryRouter>
-          <MediaCard
-            item={{ id: "season-1", title: "第一季", itemType: "SEASON", episodeCount: 8 }}
-          />
-        </MemoryRouter>,
+        <TestQueryProvider>
+          <MemoryRouter>
+            <MediaCard
+              item={{ id: "season-1", title: "第一季", itemType: "SEASON", episodeCount: 8 }}
+            />
+          </MemoryRouter>
+        </TestQueryProvider>,
       );
     });
 
@@ -277,16 +289,18 @@ describe("ContinueWatchingRail", () => {
 
     act(() => {
       root.render(
-        <MemoryRouter>
-          <MediaCard
-            item={{
-              id: "pending-local-metadata",
-              title: "正在读取本地资源",
-              itemType: "MOVIE",
-              localMetadataPending: true,
-            }}
-          />
-        </MemoryRouter>,
+        <TestQueryProvider>
+          <MemoryRouter>
+            <MediaCard
+              item={{
+                id: "pending-local-metadata",
+                title: "正在读取本地资源",
+                itemType: "MOVIE",
+                localMetadataPending: true,
+              }}
+            />
+          </MemoryRouter>
+        </TestQueryProvider>,
       );
     });
 

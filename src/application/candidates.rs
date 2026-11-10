@@ -30,9 +30,9 @@ use crate::{
     },
     observability::resources::ResourceMetrics,
     storage::{
-        Database, MetadataCapabilityResult, MetadataImageUnavailable, NewMetadataCandidate,
-        SelectedMetadataUpdate, StorageError, StoredMediaMetadata, StoredMetadataCandidate,
-        StoredMetadataCapabilityAttempt,
+        Database, MetadataCapabilityResult, MetadataCapabilityWrite, MetadataImageUnavailable,
+        NewMetadataCandidate, SelectedMetadataUpdate, StorageError, StoredMediaMetadata,
+        StoredMetadataCandidate, StoredMetadataCapabilityAttempt,
     },
 };
 
@@ -57,6 +57,17 @@ const CAPABILITY_EXTERNAL_IDS: &str = "EXTERNAL_IDS";
 const CAPABILITY_TRAILERS: &str = "TRAILERS";
 const CANDIDATE_METADATA_DETAILS_VERSION: u64 = 2;
 const COMPLETENESS_INPUT_VERSION: u64 = 1;
+
+/// Capability and image attempt history for one item.
+///
+/// Same shape as `Database::list_metadata_attempts` and the per-item entries of
+/// `list_metadata_attempts_by_item_ids`, so a plan computed from a prefetched batch entry and one
+/// computed from the single-item read are interchangeable
+/// (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S4).
+pub(crate) type MetadataAttemptHistory = (
+    Vec<StoredMetadataCapabilityAttempt>,
+    Vec<crate::storage::StoredMetadataImageAttempt>,
+);
 
 #[derive(Clone)]
 struct LocalCompletenessPlanningCaches {
@@ -293,10 +304,7 @@ fn requestable_metadata_plan(
     actual_plan: MetadataRequestPlan,
     image_types: &[&str],
     capability_identity: Option<&(String, String)>,
-    attempts: Option<&(
-        Vec<StoredMetadataCapabilityAttempt>,
-        Vec<crate::storage::StoredMetadataImageAttempt>,
-    )>,
+    attempts: Option<&MetadataAttemptHistory>,
 ) -> MetadataRequestPlan {
     let (capability_states, image_attempts) =
         attempts.map_or((&[][..], &[][..]), |(capability_states, image_attempts)| {
@@ -395,25 +403,6 @@ pub struct MetadataCandidateService {
 impl MetadataCandidateService {
     pub fn new(database: Database) -> Self {
         Self { database }
-    }
-
-    async fn candidate_image_policy_for(
-        &self,
-        item_id: &str,
-        plan: MetadataRequestPlan,
-    ) -> Result<ImageSelectionPolicy, MetadataCandidateError> {
-        if let Some(policy) = plan.image_policy {
-            return Ok(policy);
-        }
-        let (library, global) = self
-            .database
-            .find_item_media_strategy_settings(item_id)
-            .await?
-            .ok_or(MetadataCandidateError::ItemNotFound)?;
-        Ok(ImageSelectionPolicy::from_json(
-            library.as_deref(),
-            global.as_deref(),
-        ))
     }
 
     pub async fn list_pending(
@@ -545,6 +534,25 @@ impl MetadataCandidateService {
         self.list_pending_for_current(item_id, current).await
     }
 
+    /// Manual candidate searches reject items that are soft-deleted or whose library is
+    /// disabled. This used to fall out of the media-strategy lookup that also supplied the
+    /// (now removed) image-width policy; only its availability result remains. Automatic
+    /// plans already carry a resolved policy and deliberately skip this read.
+    async fn ensure_candidate_item_available(
+        &self,
+        item_id: &str,
+        plan: MetadataRequestPlan,
+    ) -> Result<(), MetadataCandidateError> {
+        if plan.image_policy.is_some() {
+            return Ok(());
+        }
+        self.database
+            .find_item_media_strategy_settings(item_id)
+            .await?
+            .ok_or(MetadataCandidateError::ItemNotFound)?;
+        Ok(())
+    }
+
     pub async fn search_and_store(
         &self,
         item_id: &str,
@@ -579,6 +587,32 @@ impl MetadataCandidateService {
             year,
             scraper,
             MetadataRequestPlan::full(),
+        )
+        .await
+    }
+
+    /// Manual candidate search on the caller's snapshot of the item.
+    ///
+    /// `docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S3: the manual entry point already read
+    /// the item (to reject `VIDEO` items), so the search must not read it a second time.
+    pub(crate) async fn search_and_store_for_current(
+        &self,
+        item_id: &str,
+        query: &str,
+        year: Option<i32>,
+        scraper: &ScraperProvider,
+        current: &StoredMediaMetadata,
+    ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
+        self.search_and_store_with_mode(
+            item_id,
+            query,
+            year,
+            scraper,
+            CandidateSearchOptions {
+                mode: CandidateSearchMode::Manual,
+                plan: MetadataRequestPlan::full(),
+                current: Some(current),
+            },
         )
         .await
     }
@@ -727,7 +761,7 @@ impl MetadataCandidateService {
             MediaKind::Series => crate::application::scraper::ScraperItemType::Series,
             MediaKind::Episode => return Err(MetadataCandidateError::InvalidSearch),
         };
-        let candidate_image_policy = self.candidate_image_policy_for(item_id, plan).await?;
+        self.ensure_candidate_item_available(item_id, plan).await?;
         let direct_provider_id = selected_scraper_provider_id(current, scraper).filter(|_| {
             if plan != MetadataRequestPlan::full() {
                 return true;
@@ -828,6 +862,11 @@ impl MetadataCandidateService {
             results.truncate(2);
         }
         let mut pending_candidates = Vec::with_capacity(results.len());
+        // One transaction for the whole loop (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md`
+        // S1): each candidate used to commit its own capability rows. A failure while resolving a
+        // later candidate still commits what the earlier ones produced, so the flush runs before
+        // the error leaves this function.
+        let mut capability_writes = Vec::with_capacity(results.len());
         for (result_index, (result, precomputed_score)) in results.into_iter().enumerate() {
             let Some((provider, provider_id)) = scraper.selected_provider_entry(&result) else {
                 continue;
@@ -914,16 +953,21 @@ impl MetadataCandidateService {
             } else if let Some(bundle) = bundle.as_ref() {
                 Some(bundle.metadata.clone())
             } else if plan.needs_metadata {
-                Some(
-                    scraper
-                        .get_generic(crate::application::scraper::ScraperGetRequest::new(
-                            item_type,
-                            provider_id.clone(),
-                            "zh-CN",
-                        ))
-                        .await
-                        .map_err(MetadataCandidateError::Scraper)?,
-                )
+                match scraper
+                    .get_generic(crate::application::scraper::ScraperGetRequest::new(
+                        item_type,
+                        provider_id.clone(),
+                        "zh-CN",
+                    ))
+                    .await
+                {
+                    Ok(details) => Some(details),
+                    Err(error) => {
+                        self.record_capability_writes(item_id, &capability_writes)
+                            .await?;
+                        return Err(MetadataCandidateError::Scraper(error));
+                    }
+                }
             } else {
                 None
             };
@@ -1102,35 +1146,36 @@ impl MetadataCandidateService {
                     transient_capability_failures.push(capability);
                 }
             }
-            self.database
-                .record_metadata_capability_results(
-                    item_id,
-                    scraper.provider_key(),
-                    &provider_id,
-                    &capability_results,
+            if !capability_results.is_empty() || !transient_capability_failures.is_empty() {
+                capability_writes.push(MetadataCapabilityWrite {
+                    provider: scraper.provider_key().to_owned(),
+                    provider_id: provider_id.clone(),
+                    results: capability_results,
+                    transient_failures: transient_capability_failures,
                     now,
-                )
-                .await
-                .map_err(MetadataCandidateError::Storage)?;
-            if !transient_capability_failures.is_empty() {
-                self.database
-                    .record_metadata_capability_failures(
-                        item_id,
-                        scraper.provider_key(),
-                        &provider_id,
-                        &transient_capability_failures,
-                        now,
-                    )
-                    .await
-                    .map_err(MetadataCandidateError::Storage)?;
+                });
             }
             if plan.needs_images
                 && images_response
                     .as_ref()
                     .is_some_and(|response| response.images.is_empty())
+                && let Err(error) = self
+                    .record_explicitly_unavailable_images(
+                        item_id,
+                        scraper,
+                        &provider_id,
+                        details
+                            .as_ref()
+                            .and_then(|value| value.poster_url.as_deref()),
+                        details
+                            .as_ref()
+                            .and_then(|value| value.backdrop_url.as_deref()),
+                    )
+                    .await
             {
-                self.record_explicitly_unavailable_images(item_id, scraper, &provider_id)
+                self.record_capability_writes(item_id, &capability_writes)
                     .await?;
+                return Err(error);
             }
             let actors = generic_candidate_actors(&credits.cast);
             let mut provider_ids = details
@@ -1211,14 +1256,7 @@ impl MetadataCandidateService {
                     provider_id,
                     images: images_response
                         .as_ref()
-                        .map(|response| {
-                            filtered_candidate_images(
-                                &response.images,
-                                item_type,
-                                &current.item_type,
-                                candidate_image_policy,
-                            )
-                        })
+                        .map(|response| candidate_images_by_type(&response.images, item_type))
                         .unwrap_or_default(),
                     actors,
                     metadata_fetched: details.is_some(),
@@ -1227,10 +1265,28 @@ impl MetadataCandidateService {
                 expires_at,
             ));
         }
+        self.record_capability_writes(item_id, &capability_writes)
+            .await?;
         self.store_candidates(item_id, current, pending_candidates)
             .await?;
         self.list_pending_after_search(item_id, current, reuse_current_snapshot, automatic_match)
             .await
+    }
+
+    /// Commits every candidate's capability rows in one transaction.
+    ///
+    /// The candidate loop collects `(provider, provider_id)` writes and calls this once, so a
+    /// manual search of 20 results costs one metadata write transaction instead of one per
+    /// result (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S1).
+    async fn record_capability_writes(
+        &self,
+        item_id: &str,
+        writes: &[MetadataCapabilityWrite<'_>],
+    ) -> Result<(), MetadataCandidateError> {
+        self.database
+            .record_metadata_capability_writes(item_id, writes)
+            .await
+            .map_err(MetadataCandidateError::Storage)
     }
 
     async fn reuse_unexpired_automatic_candidates(
@@ -1391,7 +1447,7 @@ impl MetadataCandidateService {
             "EPISODE" => ScraperItemType::Episode,
             _ => return Err(MetadataCandidateError::InvalidSearch),
         };
-        let candidate_image_policy = self.candidate_image_policy_for(item_id, plan).await?;
+        self.ensure_candidate_item_available(item_id, plan).await?;
         let season_number = current
             .season_number
             .and_then(|value| i32::try_from(value).ok())
@@ -1505,8 +1561,14 @@ impl MetadataCandidateService {
                 .as_ref()
                 .is_some_and(|response| response.images.is_empty())
             {
-                self.record_explicitly_unavailable_images(item_id, scraper, &parent.provider_id)
-                    .await?;
+                self.record_explicitly_unavailable_images(
+                    item_id,
+                    scraper,
+                    &parent.provider_id,
+                    metadata.poster_url.as_deref(),
+                    metadata.backdrop_url.as_deref(),
+                )
+                .await?;
             }
             let images = images_response.unwrap_or_default();
             let title = metadata
@@ -1555,12 +1617,7 @@ impl MetadataCandidateService {
                     trailers: Vec::new(),
                     provider: parent.provider,
                     provider_id,
-                    images: filtered_candidate_images(
-                        &images.images,
-                        item_type,
-                        &current.item_type,
-                        candidate_image_policy,
-                    ),
+                    images: candidate_images_by_type(&images.images, item_type),
                     actors: Vec::new(),
                     metadata_fetched,
                     score: Some(parent.score),
@@ -1734,7 +1791,13 @@ impl MetadataCandidateService {
         item_id: &str,
         scraper: &ScraperProvider,
         provider_id: &str,
+        poster_url: Option<&str>,
+        backdrop_url: Option<&str>,
     ) -> Result<(), MetadataCandidateError> {
+        let image_types = explicitly_unavailable_image_types(poster_url, backdrop_url);
+        if image_types.is_empty() {
+            return Ok(());
+        }
         let sources = [
             scraper.plugin_id().unwrap_or(scraper.provider_key()),
             scraper.provider_key(),
@@ -1747,11 +1810,11 @@ impl MetadataCandidateService {
             .ok()
             .and_then(|duration| i64::try_from(duration.as_secs()).ok())
             .unwrap_or_default();
-        let mut candidate_keys = Vec::with_capacity(sources.len() * SCRAPER_IMAGE_TYPES.len());
+        let mut candidate_keys = Vec::with_capacity(sources.len() * image_types.len());
         for source in &sources {
-            for image_type in SCRAPER_IMAGE_TYPES {
+            for image_type in &image_types {
                 candidate_keys.push((
-                    image_type,
+                    *image_type,
                     image_no_candidate_key(source, image_type, provider_id),
                 ));
             }
@@ -1768,6 +1831,32 @@ impl MetadataCandidateService {
             .await
             .map_err(MetadataCandidateError::Storage)
     }
+}
+
+/// Image types an empty typed-image response may mark as unavailable for good.
+///
+/// An empty `metadata.images` result only means the provider has no *typed* image entries. When
+/// the same response's metadata payload still carries a poster or backdrop URL, that artwork is
+/// not missing: the candidate keeps the URL and Lux downloads it as a fallback. Recording
+/// `NO_IMAGE` for those types would drop the artwork and make every later fill-missing run skip
+/// the item, because the missing image is treated as settled.
+fn explicitly_unavailable_image_types(
+    poster_url: Option<&str>,
+    backdrop_url: Option<&str>,
+) -> Vec<&'static str> {
+    let has_poster = poster_url.is_some_and(|url| !url.trim().is_empty());
+    let has_backdrop = backdrop_url.is_some_and(|url| !url.trim().is_empty());
+    SCRAPER_IMAGE_TYPES
+        .into_iter()
+        .filter(|image_type| match *image_type {
+            // `Primary` typed images feed both POSTER and DISC (DISC only as a fallback for an
+            // item that has no disc artwork), so a poster URL covers both.
+            "POSTER" | "DISC" => !has_poster,
+            // `Backdrop` typed images feed FANART/THUMB/BANNER/ART/WALLPAPER.
+            "FANART" | "THUMB" | "BANNER" | "ART" | "WALLPAPER" => !has_backdrop,
+            _ => true,
+        })
+        .collect()
 }
 
 struct CandidateMetadata {
@@ -2213,23 +2302,25 @@ fn candidate_image_targets(
 fn candidate_image_entries(
     images: &[crate::application::scraper::ScraperImage],
     item_type: ScraperItemType,
-) -> Vec<(&'static str, &str, Option<i32>)> {
+) -> Vec<(&'static str, &str)> {
     let mut entries = Vec::new();
     for image in images {
         for image_type in candidate_image_targets(&image.image_type, item_type) {
-            entries.push((*image_type, image.url.as_str(), image.width));
+            entries.push((*image_type, image.url.as_str()));
         }
     }
     entries
 }
 
-#[cfg(test)]
-fn generic_candidate_images(
+/// Candidate images grouped by the local image type they can fill. Every URL the
+/// scraper returned is kept: the minimum width moved to the scraper plugin, so the width
+/// the upstream reports no longer affects what is stored.
+fn candidate_images_by_type(
     images: &[crate::application::scraper::ScraperImage],
-    item_type: ScraperItemType,
+    scraper_item_type: ScraperItemType,
 ) -> BTreeMap<String, Vec<String>> {
     let mut result = BTreeMap::<String, Vec<String>>::new();
-    for (image_type, url, _) in candidate_image_entries(images, item_type) {
+    for (image_type, url) in candidate_image_entries(images, scraper_item_type) {
         result
             .entry(image_type.to_owned())
             .or_default()
@@ -2238,28 +2329,35 @@ fn generic_candidate_images(
     result
 }
 
-/// Candidate images that already dropped entries below the configured minimum
-/// width for the owning item type. Unknown upstream widths are kept.
-fn filtered_candidate_images(
-    images: &[crate::application::scraper::ScraperImage],
-    scraper_item_type: ScraperItemType,
-    host_item_type: &str,
-    policy: ImageSelectionPolicy,
-) -> BTreeMap<String, Vec<String>> {
-    let mut result = BTreeMap::<String, Vec<String>>::new();
-    for (image_type, url, width) in candidate_image_entries(images, scraper_item_type) {
-        let cell = policy.type_policy_for_item_type(host_item_type, image_type);
-        let below_minimum =
-            cell.min_width > 0 && width.is_some_and(|width| i64::from(width) < cell.min_width);
-        if below_minimum {
-            continue;
+/// `DISC` candidate URLs separated by where the candidate got them from.
+#[derive(Default)]
+struct CandidateDiscUrls {
+    /// URLs an upstream `Disc` typed image supplied; they are tried first and keep the normal
+    /// overwrite rules.
+    explicit: Vec<String>,
+    /// URLs that only reached `DISC` because a `Primary`/`Poster` typed image fills both types.
+    /// They are the fallback for an item without disc artwork, used only when no explicit disc
+    /// candidate produced an image.
+    poster_fallback: Vec<String>,
+}
+
+/// Splits the stored `DISC` bucket into explicit disc artwork and poster-derived fallbacks.
+///
+/// `Primary`/`Poster` typed images are stored under both `POSTER` and `DISC`, so the candidate
+/// map cannot tell the two apart by key alone: a poster URL appears in both buckets. The poster
+/// bucket is the marker. Both lists are kept because the fallback is still needed when every
+/// explicit disc URL fails.
+fn candidate_disc_urls(images: &BTreeMap<String, Vec<String>>) -> CandidateDiscUrls {
+    let poster_urls = images.get("POSTER").map(Vec::as_slice).unwrap_or_default();
+    let mut urls = CandidateDiscUrls::default();
+    for url in images.get("DISC").into_iter().flatten() {
+        if poster_urls.iter().any(|poster| poster == url) {
+            urls.poster_fallback.push(url.clone());
+        } else {
+            urls.explicit.push(url.clone());
         }
-        result
-            .entry(image_type.to_owned())
-            .or_default()
-            .push(url.to_owned());
     }
-    result
+    urls
 }
 
 fn generic_candidate_actors(
@@ -2420,12 +2518,29 @@ pub struct MetadataSelectionReport {
     pub actor_count: usize,
 }
 
+/// Optional selection inputs a caller may already hold.
+///
+/// Bundles the two optional arguments of the `select_*` entry points so they stay within the
+/// argument-count budget.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SelectionInputs<'a> {
+    pub(crate) image_policy: Option<ImageSelectionPolicy>,
+    /// The caller's item snapshot, when nothing has rewritten the row since it was read
+    /// (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` M8).
+    pub(crate) current: Option<&'a StoredMediaMetadata>,
+}
+
 struct MetadataSelectionOptions<'a> {
     keep_pending: bool,
     scraper_id: Option<&'a str>,
     supplemental: bool,
     preserve_identity: bool,
     image_policy: Option<ImageSelectionPolicy>,
+    /// The caller's snapshot of the item, when it can prove nothing rewrote the row since.
+    ///
+    /// `docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` M8: selection re-read the same
+    /// `media_items` row (wide projection, NFO cache columns) the caller already held.
+    current: Option<&'a StoredMediaMetadata>,
 }
 
 #[derive(Clone)]
@@ -2474,12 +2589,14 @@ impl MetadataSelectionService {
         &self,
         item_id: &str,
         current: &StoredMediaMetadata,
+        prefetched_attempts: Option<&MetadataAttemptHistory>,
     ) -> Result<FillMissingRequestPlan, MetadataSelectionError> {
         let (_, requestable, actual_missing_image_mask) = self
             .fill_missing_request_plans_for_current(
                 item_id,
                 current,
                 MetadataAttemptMode::RespectRetryState,
+                prefetched_attempts,
             )
             .await?;
         Ok(FillMissingRequestPlan {
@@ -2498,6 +2615,7 @@ impl MetadataSelectionService {
                 item_id,
                 current,
                 MetadataAttemptMode::IgnoreRetryState,
+                None,
             )
             .await?;
         Ok(actual_plan)
@@ -2767,6 +2885,7 @@ impl MetadataSelectionService {
         item_id: &str,
         current: &StoredMediaMetadata,
         attempt_mode: MetadataAttemptMode,
+        prefetched_attempts: Option<&MetadataAttemptHistory>,
     ) -> Result<(MetadataRequestPlan, MetadataRequestPlan, u16), MetadataSelectionError> {
         if fill_missing_fields(&current.item_type).is_none() {
             return Ok((MetadataRequestPlan::full(), MetadataRequestPlan::full(), 0));
@@ -2801,16 +2920,23 @@ impl MetadataSelectionService {
         // confirmed provider identity. Backups use actual missing data only.
         let should_read_attempt_state =
             capability_identity.is_some() && metadata_request_plan_has_work(actual_plan);
-        let attempts = if should_read_attempt_state {
-            Some(self.database.list_metadata_attempts(item_id).await?)
-        } else {
+        // A claim batch already read this item's history (audit S4); that snapshot is taken before
+        // the item's first search, so it is the state the single-item read would have returned here.
+        // Later reads must not reuse it -- the item's own attempts changed by then.
+        let read_attempts;
+        let attempts: Option<&MetadataAttemptHistory> = if !should_read_attempt_state {
             None
+        } else if let Some(prefetched_attempts) = prefetched_attempts {
+            Some(prefetched_attempts)
+        } else {
+            read_attempts = self.database.list_metadata_attempts(item_id).await?;
+            Some(&read_attempts)
         };
         let requestable_plan = requestable_metadata_plan(
             actual_plan,
             &image_types,
             capability_identity.as_ref(),
-            attempts.as_ref(),
+            attempts,
         );
         Ok((actual_plan, requestable_plan, actual_missing_image_mask))
     }
@@ -2831,6 +2957,7 @@ impl MetadataSelectionService {
                 supplemental: false,
                 preserve_identity: false,
                 image_policy: None,
+                current: None,
             },
         )
         .await
@@ -2850,7 +2977,7 @@ impl MetadataSelectionService {
             mode,
             scraper_id,
             supplemental,
-            None,
+            SelectionInputs::default(),
         )
         .await
     }
@@ -2862,7 +2989,7 @@ impl MetadataSelectionService {
         mode: MetadataSelectionMode,
         scraper_id: Option<&str>,
         supplemental: bool,
-        image_policy: Option<ImageSelectionPolicy>,
+        inputs: SelectionInputs<'_>,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
         self.select_internal(
             item_id,
@@ -2873,7 +3000,8 @@ impl MetadataSelectionService {
                 scraper_id,
                 supplemental,
                 preserve_identity: false,
-                image_policy,
+                image_policy: inputs.image_policy,
+                current: inputs.current,
             },
         )
         .await
@@ -2886,7 +3014,7 @@ impl MetadataSelectionService {
         mode: MetadataSelectionMode,
         scraper_id: Option<&str>,
         supplemental: bool,
-        image_policy: Option<ImageSelectionPolicy>,
+        inputs: SelectionInputs<'_>,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
         self.select_internal(
             item_id,
@@ -2897,7 +3025,8 @@ impl MetadataSelectionService {
                 scraper_id,
                 supplemental,
                 preserve_identity: false,
-                image_policy,
+                image_policy: inputs.image_policy,
+                current: inputs.current,
             },
         )
         .await
@@ -2919,6 +3048,7 @@ impl MetadataSelectionService {
                 supplemental: false,
                 preserve_identity: false,
                 image_policy: None,
+                current: None,
             },
         )
         .await
@@ -2969,7 +3099,7 @@ impl MetadataSelectionService {
         item_id: &str,
         candidate_id: &str,
         scraper_id: &str,
-        image_policy: Option<ImageSelectionPolicy>,
+        inputs: SelectionInputs<'_>,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
         self.select_internal(
             item_id,
@@ -2980,7 +3110,8 @@ impl MetadataSelectionService {
                 scraper_id: Some(scraper_id),
                 supplemental: false,
                 preserve_identity: true,
-                image_policy,
+                image_policy: inputs.image_policy,
+                current: inputs.current,
             },
         )
         .await
@@ -2993,11 +3124,18 @@ impl MetadataSelectionService {
         mode: MetadataSelectionMode,
         options: MetadataSelectionOptions<'_>,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
-        let current = self
-            .database
-            .find_media_item_metadata(item_id)
-            .await?
-            .ok_or(MetadataSelectionError::ItemNotFound)?;
+        let fetched_current;
+        let current = match options.current {
+            Some(current) => current,
+            None => {
+                fetched_current = self
+                    .database
+                    .find_media_item_metadata(item_id)
+                    .await?
+                    .ok_or(MetadataSelectionError::ItemNotFound)?;
+                &fetched_current
+            }
+        };
         let candidate = self
             .database
             .find_metadata_candidate(item_id, candidate_id)
@@ -3011,7 +3149,7 @@ impl MetadataSelectionService {
         let mut payload = candidate_payload(&candidate)?;
         let collection_reference = (current.item_type == "MOVIE")
             .then(|| {
-                let current_provider_ids = current_provider_ids(&current);
+                let current_provider_ids = current_provider_ids(current);
                 let (movie_provider, movie_provider_id) = if options.preserve_identity {
                     Some((
                         candidate.provider.as_str(),
@@ -3064,7 +3202,7 @@ impl MetadataSelectionService {
             payload.actors = payload.movie_nfo.actors.clone();
             payload.end_date = payload.movie_nfo.last_air_date.clone();
             if options.supplemental {
-                preserve_supplemental_scalar_values(&mut payload, &current);
+                preserve_supplemental_scalar_values(&mut payload, current);
             }
         }
         let image_source = options.scraper_id.unwrap_or(candidate.provider.as_str());
@@ -3072,7 +3210,7 @@ impl MetadataSelectionService {
             Some(image_policy) => image_policy,
             None => self.image_selection_policy(item_id).await?,
         };
-        let mut state = metadata_state(&current);
+        let mut state = metadata_state(current);
         let metadata_candidate = MetadataCandidate {
             source: MetadataSource::ScraperLocalized,
             metadata: payload.metadata.clone(),
@@ -3141,7 +3279,7 @@ impl MetadataSelectionService {
         };
         self.resources
             .record_metadata_stage("nfo_write", nfo_started.elapsed());
-        let mut provider_ids = current_provider_ids(&current);
+        let mut provider_ids = current_provider_ids(current);
         if options.supplemental || options.preserve_identity {
             for (provider, provider_id) in &movie_nfo.provider_ids {
                 insert_provider_id_if_missing(&mut provider_ids, provider, provider_id);
@@ -3193,7 +3331,7 @@ impl MetadataSelectionService {
             keep_pending: options.keep_pending,
         };
         let nfo_details_json = matches!(current.item_type.as_str(), "MOVIE" | "SERIES")
-            .then(|| selected_nfo_details(&current, &movie_nfo))
+            .then(|| selected_nfo_details(current, &movie_nfo))
             .map(|details| {
                 serde_json::to_string(&details)
                     .map_err(|error| MetadataSelectionError::InvalidCandidate(error.to_string()))
@@ -3306,6 +3444,10 @@ impl MetadataSelectionService {
                 image_policy.episode_image_policy(),
                 EpisodeImagePolicy::ScraperStill
             );
+        // A `Primary`/`Poster` typed image also fills `DISC`, but only as a fallback: it may fill
+        // an item that has no disc artwork and must never replace one that exists. Explicit
+        // `Disc` candidates keep the normal overwrite rules.
+        let disc_urls = candidate_disc_urls(&payload.images);
         if payload.typed_images_present {
             for image_type in image_policy.enabled_types_for_item_type(item_type) {
                 if screenshot_fallback_types.contains(image_type) || !scraper_allowed(image_type) {
@@ -3318,7 +3460,12 @@ impl MetadataSelectionService {
                 if max_count == 0 {
                     continue;
                 }
-                if let Some(urls) = payload.images.get(image_type).cloned() {
+                let candidate_urls = if image_type == "DISC" {
+                    (!disc_urls.explicit.is_empty()).then(|| disc_urls.explicit.clone())
+                } else {
+                    payload.images.get(image_type).cloned()
+                };
+                if let Some(urls) = candidate_urls {
                     if image_type == "FANART" && supplemental {
                         let urls = self
                             .filter_new_supplemental_image_urls(item_id, image_type, urls)
@@ -3342,31 +3489,53 @@ impl MetadataSelectionService {
                     }
                 }
             }
-        } else {
-            if let Some(url) = payload.poster_url.clone() {
-                add_spec!("POSTER", vec![url]);
-            }
-            if let Some(url) = payload.fanart_url.clone()
-                && scraper_allowed("FANART")
-                && episode_still_allowed
-                && !screenshot_fallback_types.contains("FANART")
-            {
-                let max_count = max_count_for("FANART");
-                if supplemental {
-                    let mut urls = self
-                        .filter_new_supplemental_image_urls(item_id, "FANART", vec![url])
-                        .await?;
-                    if let Some(url) = urls.pop() {
-                        let start = self.images.next_image_index(item_id, "FANART").await?;
-                        if usize::try_from(start).unwrap_or(usize::MAX) < max_count {
-                            specs.push(("FANART", vec![url], start));
-                        }
+        }
+        // Typed images are authoritative only for the types they actually carry. A provider can
+        // return an empty or partial image map (no image in the requested language, a failed
+        // images call, or a scraper that only fills the legacy poster/backdrop fields) while the
+        // metadata payload still carries a poster or backdrop URL, so fall back per missing type
+        // instead of dropping artwork the provider already supplied.
+        let poster_is_typed = specs.iter().any(|(kind, _, _)| *kind == "POSTER");
+        if !poster_is_typed
+            && max_count_for("POSTER") > 0
+            && let Some(url) = payload.poster_url.clone()
+        {
+            add_spec!("POSTER", vec![url]);
+        }
+        let fanart_is_typed = specs.iter().any(|(kind, _, _)| *kind == "FANART");
+        if !fanart_is_typed
+            && let Some(url) = payload.fanart_url.clone()
+            && scraper_allowed("FANART")
+            && episode_still_allowed
+            && !screenshot_fallback_types.contains("FANART")
+        {
+            let max_count = max_count_for("FANART");
+            if supplemental {
+                let mut urls = self
+                    .filter_new_supplemental_image_urls(item_id, "FANART", vec![url])
+                    .await?;
+                if let Some(url) = urls.pop() {
+                    let start = self.images.next_image_index(item_id, "FANART").await?;
+                    if usize::try_from(start).unwrap_or(usize::MAX) < max_count {
+                        specs.push(("FANART", vec![url], start));
                     }
-                } else if max_count > 0 {
-                    specs.push(("FANART", vec![url], 0));
                 }
+            } else if max_count > 0 {
+                specs.push(("FANART", vec![url], 0));
             }
         }
+        // A poster stands in for disc artwork only as the last attempt: the explicit `Disc`
+        // candidates are written first, and the poster URLs are used only when none of them
+        // produced an image and the item still has no disc artwork. Whether the item already has
+        // disc artwork is checked right before that attempt, where a failed probe can be handled
+        // without failing the selection.
+        let disc_policy = image_policy.type_policy_for_item_type(item_type, "DISC");
+        let poster_disc_fallback = (!disc_urls.poster_fallback.is_empty()
+            && disc_policy.enabled
+            && max_count_for("DISC") > 0
+            && scraper_allowed("DISC")
+            && !screenshot_fallback_types.contains("DISC"))
+        .then(|| disc_urls.poster_fallback.clone());
         let item_permits = Arc::new(Semaphore::new(IMAGE_ITEM_CONCURRENCY));
         let mut tasks = JoinSet::new();
         for (index, (image_type, urls, image_index)) in specs.into_iter().enumerate() {
@@ -3464,7 +3633,63 @@ impl MetadataSelectionService {
                 result.push(image_type);
             }
         }
+        // Last attempt for disc artwork: every explicit `Disc` candidate failed (or the candidate
+        // only had poster-derived URLs), so use the poster when the item still has no disc. A
+        // failed probe must not fail the whole selection, so `disc_artwork_present` reports
+        // "present" on errors and only logs a desensitized warning.
+        if let Some(poster_urls) = poster_disc_fallback
+            && !result.contains(&"DISC")
+            && !self.disc_artwork_present(item_id).await
+        {
+            let mut written = false;
+            let mut failed = false;
+            for url in poster_urls.into_iter().take(4) {
+                match self
+                    .images
+                    .try_download_item_image_if_missing_from_scraper_at_index(
+                        item_id, "DISC", &url, source, 0,
+                    )
+                    .await
+                {
+                    Ok(Some(_)) => {
+                        written = true;
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(_) => failed = true,
+                }
+            }
+            if written {
+                result.push("DISC");
+            } else if failed {
+                tracing::warn!(
+                    item_id,
+                    image_type = "DISC",
+                    "metadata image candidates were unavailable"
+                );
+            }
+        }
         Ok(result)
+    }
+
+    /// Whether the item already has disc artwork.
+    ///
+    /// The probe is optional groundwork for the poster fallback, and it can fail on paths the
+    /// writer deliberately refuses to follow (for example a symlinked `disc.jpg`). Such a failure
+    /// counts as "present" so the fallback is skipped and the selection keeps going; the warning
+    /// carries no path or URL.
+    async fn disc_artwork_present(&self, item_id: &str) -> bool {
+        match self.images.has_local_image(item_id, "DISC").await {
+            Ok(present) => present,
+            Err(_) => {
+                tracing::warn!(
+                    item_id,
+                    image_type = "DISC",
+                    "could not check existing disc artwork; skipping the poster fallback"
+                );
+                true
+            }
+        }
     }
 
     async fn filter_new_supplemental_image_urls(
@@ -4284,10 +4509,9 @@ struct ArtworkPolicyOverride {
     sources: Option<ArtworkSources>,
     scraper_roles: Option<ScraperRoles>,
     overwrite: Option<ArtworkOverwrite>,
-    // Small numeric types keep the copyable policy compact; validated ranges
-    // are 0..=20 for counts and 0..=8192 for widths.
+    // A small numeric type keeps the copyable policy compact; the validated range is
+    // 0..=20 for counts.
     max_count: Option<u8>,
-    min_width: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -4305,7 +4529,6 @@ pub(crate) struct ImageTypePolicy {
     pub(crate) scraper_roles: ScraperRoles,
     pub(crate) overwrite: ArtworkOverwrite,
     pub(crate) max_count: usize,
-    pub(crate) min_width: i64,
 }
 
 fn is_multi_image_type(image_type: &str) -> bool {
@@ -4333,7 +4556,6 @@ pub(crate) struct ImageSelectionPolicy {
     wallpaper: bool,
     thumbnail_scraping_mode: ThumbnailScrapingMode,
     max_backdrop_count: i64,
-    min_download_width: i64,
     levels: [LevelOverrides; ImageLevel::ALL.len()],
 }
 
@@ -4408,7 +4630,6 @@ impl ImageSelectionPolicy {
             scraper_roles: ScraperRoles::default(),
             overwrite: ArtworkOverwrite::default(),
             max_count,
-            min_width: self.min_download_width,
         }
     }
 
@@ -4431,7 +4652,6 @@ impl ImageSelectionPolicy {
                 .max_count
                 .map(usize::from)
                 .unwrap_or(flat.max_count),
-            min_width: overrides.min_width.map(i64::from).unwrap_or(flat.min_width),
         })
     }
 
@@ -4525,8 +4745,6 @@ struct StoredImageStrategy {
     #[serde(default)]
     max_backdrop_count: Option<i64>,
     #[serde(default)]
-    min_download_width: Option<i64>,
-    #[serde(default)]
     levels: BTreeMap<String, StoredImageLevel>,
 }
 
@@ -4554,8 +4772,6 @@ struct StoredArtworkPolicy {
     overwrite: Option<String>,
     #[serde(default)]
     max_count: Option<i64>,
-    #[serde(default)]
-    min_width: Option<i64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -4572,7 +4788,6 @@ fn default_true() -> bool {
 /// Built-in cap for multi-image artwork; matches `MAX_IMAGE_VARIANTS` so the
 /// legacy "append several backdrops" behaviour stays the default.
 const DEFAULT_BACKDROP_MAX_COUNT: i64 = MAX_IMAGE_VARIANTS as i64;
-const DEFAULT_MIN_DOWNLOAD_WIDTH: i64 = 1280;
 
 fn default_image_selection_policy() -> ImageSelectionPolicy {
     ImageSelectionPolicy {
@@ -4582,7 +4797,6 @@ fn default_image_selection_policy() -> ImageSelectionPolicy {
         thumbnail: true,
         thumbnail_scraping_mode: ThumbnailScrapingMode::ScraperFirst,
         max_backdrop_count: DEFAULT_BACKDROP_MAX_COUNT,
-        min_download_width: DEFAULT_MIN_DOWNLOAD_WIDTH,
         ..ImageSelectionPolicy::default()
     }
 }
@@ -4639,9 +4853,6 @@ fn policy_from_stored_strategy(strategy: StoredImageStrategy) -> ImageSelectionP
                 max_count: policy
                     .max_count
                     .and_then(|count| u8::try_from(count.clamp(0, MAX_IMAGE_VARIANTS as i64)).ok()),
-                min_width: policy
-                    .min_width
-                    .and_then(|width| u16::try_from(width.clamp(0, 8192)).ok()),
             };
         }
         levels[level.index()] = overrides;
@@ -4659,9 +4870,6 @@ fn policy_from_stored_strategy(strategy: StoredImageStrategy) -> ImageSelectionP
         max_backdrop_count: strategy
             .max_backdrop_count
             .unwrap_or(DEFAULT_BACKDROP_MAX_COUNT),
-        min_download_width: strategy
-            .min_download_width
-            .unwrap_or(DEFAULT_MIN_DOWNLOAD_WIDTH),
         levels,
     }
 }
@@ -5178,16 +5386,17 @@ mod tests {
     use super::{
         ACTOR_METADATA_FETCH_CONCURRENCY, ArtworkOverwrite, COMPLETENESS_PLAN_ITEM_CONCURRENCY,
         EpisodeImagePolicy, FillMissingRequestPlan, ImageLevel, ImageSelectionPolicy,
-        MAX_ACTOR_DETAIL_FETCHES, MetadataCandidateService, MetadataRequestPlan,
-        MetadataSelectionService, SCRAPER_IMAGE_TYPES, ScraperRoles, candidate_actor_credits,
-        candidate_actors, candidate_payload, capability_needs_request, completeness_capabilities,
-        credits_need_actor_relation_check, default_image_selection_policy, enrich_actor_metadata,
-        filtered_candidate_images, generic_candidate_actors, generic_candidate_images,
-        image_attempt_identities, local_metadata_completeness_plan, merge_actor_values,
-        merge_supplemental_movie_nfo, metadata_completeness_fingerprint, metadata_match_score,
-        metadata_request_plan, metadata_request_plan_has_work, parse_image_selection_policy,
-        replace_provider_id_with_candidate, run_bounded_completeness_plan_tasks,
-        selected_scraper_provider_id,
+        MAX_ACTOR_DETAIL_FETCHES, MetadataCandidateError, MetadataCandidateService,
+        MetadataRequestPlan, MetadataSelectionMode, MetadataSelectionService, SCRAPER_IMAGE_TYPES,
+        ScraperRoles, SelectionInputs, candidate_actor_credits, candidate_actors,
+        candidate_disc_urls, candidate_images_by_type, candidate_payload, capability_needs_request,
+        completeness_capabilities, credits_need_actor_relation_check,
+        default_image_selection_policy, enrich_actor_metadata, explicitly_unavailable_image_types,
+        generic_candidate_actors, image_attempt_identities, local_metadata_completeness_plan,
+        merge_actor_values, merge_supplemental_movie_nfo, metadata_completeness_fingerprint,
+        metadata_match_score, metadata_request_plan, metadata_request_plan_has_work,
+        parse_image_selection_policy, replace_provider_id_with_candidate,
+        run_bounded_completeness_plan_tasks, selected_scraper_provider_id,
     };
     use crate::application::images::ImageWriteService;
     use crate::application::scraper::{
@@ -5195,7 +5404,7 @@ mod tests {
         ScraperExternalIdsResponse, ScraperFuture, ScraperGetRequest, ScraperImage,
         ScraperImageRequest, ScraperImagesResponse, ScraperItemType, ScraperMetadata,
         ScraperMetadataBundle, ScraperProvider, ScraperSearchRequest, ScraperSearchResponse,
-        ScraperTrailersResponse,
+        ScraperSearchResult, ScraperTrailersResponse,
     };
     use crate::application::thumbnail_policy::ThumbnailScrapingMode;
     use crate::storage::{Database, StoredMediaMetadata, StoredMetadataCapabilityAttempt};
@@ -5474,6 +5683,470 @@ mod tests {
         }
     }
 
+    /// Search results for every resolution step, so the candidate loop runs to completion.
+    struct ManyCandidateAdapter {
+        candidates: usize,
+    }
+
+    impl ScraperAdapter for ManyCandidateAdapter {
+        fn provider_key(&self) -> &str {
+            "tmdb"
+        }
+
+        fn search(
+            &self,
+            _request: ScraperSearchRequest,
+        ) -> ScraperFuture<'_, Result<ScraperSearchResponse, ScraperError>> {
+            let items = (0..self.candidates)
+                .map(|index| ScraperSearchResult {
+                    item_type: Some("Movie".to_owned()),
+                    title: Some(format!("Example {index}")),
+                    original_title: Some(format!("Example {index}")),
+                    provider_ids: BTreeMap::from([("tmdb".to_owned(), format!("movie-{index}"))]),
+                    ..ScraperSearchResult::default()
+                })
+                .collect();
+            Box::pin(std::future::ready(Ok(ScraperSearchResponse { items })))
+        }
+
+        fn get(
+            &self,
+            request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperMetadata, ScraperError>> {
+            Box::pin(std::future::ready(Ok(ScraperMetadata {
+                title: Some(request.provider_id),
+                ..ScraperMetadata::default()
+            })))
+        }
+
+        fn bundle(
+            &self,
+            request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperMetadataBundle, ScraperError>> {
+            Box::pin(std::future::ready(Ok(ScraperMetadataBundle {
+                metadata: ScraperMetadata {
+                    title: Some(format!("Bundle {}", request.provider_id)),
+                    ..ScraperMetadata::default()
+                },
+                // A non-empty image list keeps the search on the normal path; the empty-list
+                // `NO_IMAGE` fallback still commits per candidate (out of S1's scope).
+                images: ScraperImagesResponse {
+                    images: vec![ScraperImage {
+                        image_type: "POSTER".to_owned(),
+                        url: "https://images.example.test/poster.jpg".to_owned(),
+                        ..ScraperImage::default()
+                    }],
+                    original_language_mode: false,
+                },
+                ..ScraperMetadataBundle::default()
+            })))
+        }
+
+        fn images(
+            &self,
+            _request: ScraperImageRequest,
+        ) -> ScraperFuture<'_, Result<ScraperImagesResponse, ScraperError>> {
+            Box::pin(std::future::ready(Ok(ScraperImagesResponse::default())))
+        }
+
+        fn credits(
+            &self,
+            _request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperCreditsResponse, ScraperError>> {
+            Box::pin(std::future::ready(Ok(ScraperCreditsResponse::default())))
+        }
+
+        fn external_ids(
+            &self,
+            _request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperExternalIdsResponse, ScraperError>> {
+            Box::pin(std::future::ready(
+                Ok(ScraperExternalIdsResponse::default()),
+            ))
+        }
+
+        fn trailers(
+            &self,
+            _request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperTrailersResponse, ScraperError>> {
+            Box::pin(std::future::ready(Ok(ScraperTrailersResponse::default())))
+        }
+    }
+
+    /// Runs one fill-missing selection on a fresh library and reports its statement count and the
+    /// title stored afterwards.
+    ///
+    /// A fresh fixture per run keeps the comparison honest: the first selection writes the NFO
+    /// projection, which would change the second selection's statement shape.
+    async fn selection_statement_count(
+        use_snapshot: bool,
+    ) -> Result<(usize, String), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{libraries::LibraryService, scanner::LibraryScanner},
+            config::Config,
+            library::LibraryKind,
+            storage::NewMetadataCandidate,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("Movies");
+        let movie_dir = root.join("Example Movie (2020)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(movie_dir.join("Example.Movie.2020.mkv"), b"movie").await?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        LibraryService::new(database.clone())
+            .add_root(library.id, root.to_str().ok_or("non-UTF8 media root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let item_id: String =
+            sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+                .fetch_one(database.pool())
+                .await?;
+        sqlx::query("UPDATE media_items SET title = 'Database Title' WHERE id = ?")
+            .bind(&item_id)
+            .execute(database.pool())
+            .await?;
+        let candidate_json =
+            json!({"providerIds": {"tmdb": "movie-9"}, "metadataFetched": true, "images": {}})
+                .to_string();
+        database
+            .insert_metadata_candidates(&[NewMetadataCandidate {
+                id: "snapshot-candidate",
+                item_id: &item_id,
+                provider: "tmdb",
+                provider_id: "movie-9",
+                candidate_json: &candidate_json,
+                score: 90.0,
+                expires_at: None,
+            }])
+            .await?;
+        let service = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new_with_config_dir(database.clone(), config.config_dir.clone())?,
+            config.config_dir.clone(),
+        );
+        let snapshot = if use_snapshot {
+            let mut snapshot = database
+                .find_media_item_metadata(&item_id)
+                .await?
+                .ok_or("item metadata missing")?;
+            snapshot.title = "Snapshot Title".to_owned();
+            Some(snapshot)
+        } else {
+            None
+        };
+
+        database.reset_query_count();
+        service
+            .select_with_scraper_and_policy(
+                &item_id,
+                "snapshot-candidate",
+                MetadataSelectionMode::FillMissing,
+                None,
+                false,
+                SelectionInputs {
+                    image_policy: None,
+                    current: snapshot.as_ref(),
+                },
+            )
+            .await?;
+        let statements = database.query_count();
+        let title: String = sqlx::query_scalar("SELECT title FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+        database.close().await;
+        Ok((statements, title))
+    }
+
+    #[tokio::test]
+    async fn selection_reuses_the_callers_item_snapshot() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (with_snapshot, snapshot_title) = selection_statement_count(true).await?;
+        let (without_snapshot, database_title) = selection_statement_count(false).await?;
+
+        assert_eq!(
+            snapshot_title, "Snapshot Title",
+            "the selection must use the caller's snapshot instead of re-reading the row"
+        );
+        assert_eq!(database_title, "Database Title");
+        assert_eq!(
+            with_snapshot + 1,
+            without_snapshot,
+            "a snapshot selection must save exactly the media_items re-read"
+        );
+        Ok(())
+    }
+
+    /// A scanned movie library with one unconfirmed item, plus the config directory.
+    async fn candidate_search_fixture()
+    -> Result<(Database, String, tempfile::TempDir), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{libraries::LibraryService, scanner::LibraryScanner},
+            config::Config,
+            library::LibraryKind,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("Movies");
+        let movie_dir = root.join("Example Movie (2020)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(movie_dir.join("Example.Movie.2020.mkv"), b"movie").await?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        LibraryService::new(database.clone())
+            .add_root(library.id, root.to_str().ok_or("non-UTF8 media root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let item_id: String =
+            sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+                .fetch_one(database.pool())
+                .await?;
+        Ok((database, item_id, directory))
+    }
+
+    /// Runs one manual 20-candidate search and reports its statement count and stored scores.
+    async fn manual_search_statements(
+        use_snapshot: bool,
+    ) -> Result<(usize, Vec<(String, f64)>), Box<dyn std::error::Error>> {
+        let (database, item_id, _directory) = candidate_search_fixture().await?;
+        let service = MetadataCandidateService::new(database.clone());
+        let adapter = ManyCandidateAdapter { candidates: 20 };
+        let scraper = ScraperProvider::from_adapter(adapter);
+
+        database.reset_metadata_write_transaction_count();
+        database.reset_query_count();
+        let page = if use_snapshot {
+            let current = database
+                .find_media_item_metadata(&item_id)
+                .await?
+                .ok_or("item metadata missing")?;
+            database.reset_query_count();
+            service
+                .search_and_store_for_current(&item_id, "Example", None, &scraper, &current)
+                .await?
+        } else {
+            service
+                .search_and_store(&item_id, "Example", None, &scraper)
+                .await?
+        };
+        let statements = database.query_count();
+        assert_eq!(page.items.len(), 20);
+        let scores: Vec<(String, f64)> = sqlx::query_as(
+            "SELECT provider_id, score FROM metadata_candidates
+             WHERE item_id = ? ORDER BY provider_id",
+        )
+        .bind(&item_id)
+        .fetch_all(database.pool())
+        .await?;
+        database.close().await;
+        Ok((statements, scores))
+    }
+
+    #[tokio::test]
+    async fn manual_candidate_search_commits_capability_rows_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, item_id, _directory) = candidate_search_fixture().await?;
+        let service = MetadataCandidateService::new(database.clone());
+
+        database.reset_metadata_write_transaction_count();
+        let page = service
+            .search_and_store(
+                &item_id,
+                "Example",
+                None,
+                &ScraperProvider::from_adapter(ManyCandidateAdapter { candidates: 20 }),
+            )
+            .await?;
+
+        assert_eq!(page.items.len(), 20);
+        // One transaction for the capability rows of all 20 candidates, one for the candidates
+        // themselves (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S1).
+        assert_eq!(
+            database.metadata_write_transaction_count(),
+            2,
+            "a 20-candidate manual search must not commit once per candidate"
+        );
+        let capability_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM metadata_capability_attempts
+             WHERE item_id = ?",
+        )
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(capability_rows, 60);
+        database.close().await;
+        Ok(())
+    }
+
+    /// Soft-deletes every catalog item in the fixture's database.
+    async fn soft_delete_fixture_items(
+        database: &Database,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        sqlx::query("UPDATE media_items SET removed_at = unixepoch()")
+            .execute(database.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// Disables the fixture's library without touching its items.
+    async fn disable_fixture_library(
+        database: &Database,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        sqlx::query("UPDATE libraries SET is_enabled = 0")
+            .execute(database.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// Inserts a plain season row in the fixture's library, enough to reach the child branch.
+    async fn insert_season_item(database: &Database) -> Result<String, Box<dyn std::error::Error>> {
+        let library_id: String = sqlx::query_scalar("SELECT library_id FROM media_items LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+        let item_id = "season-for-availability".to_owned();
+        sqlx::query(
+            "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, season_number,
+                    identification_status, has_available_source
+                 ) VALUES (?, ?, 'SEASON', 'Season 1', 'season 1', 1, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&item_id)
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        Ok(item_id)
+    }
+
+    async fn stored_candidate_count(
+        database: &Database,
+        item_id: &str,
+    ) -> Result<i64, Box<dyn std::error::Error>> {
+        Ok(
+            sqlx::query_scalar("SELECT COUNT(*) FROM metadata_candidates WHERE item_id = ?")
+                .bind(item_id)
+                .fetch_one(database.pool())
+                .await?,
+        )
+    }
+
+    // Manual searches used to reject soft-deleted items and items in disabled libraries through
+    // the media-strategy lookup that also supplied the (now removed) width policy. Only the
+    // availability result of that lookup must survive.
+
+    #[tokio::test]
+    async fn manual_movie_search_rejects_a_soft_deleted_item()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, item_id, _directory) = candidate_search_fixture().await?;
+        let service = MetadataCandidateService::new(database.clone());
+        let scraper = ScraperProvider::from_adapter(ManyCandidateAdapter { candidates: 1 });
+
+        soft_delete_fixture_items(&database).await?;
+        assert!(matches!(
+            service
+                .search_and_store(&item_id, "Example", None, &scraper)
+                .await,
+            Err(MetadataCandidateError::ItemNotFound)
+        ));
+        assert_eq!(stored_candidate_count(&database, &item_id).await?, 0);
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_movie_search_rejects_an_item_in_a_disabled_library()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, item_id, _directory) = candidate_search_fixture().await?;
+        let service = MetadataCandidateService::new(database.clone());
+        let scraper = ScraperProvider::from_adapter(ManyCandidateAdapter { candidates: 1 });
+
+        disable_fixture_library(&database).await?;
+        assert!(matches!(
+            service
+                .search_and_store(&item_id, "Example", None, &scraper)
+                .await,
+            Err(MetadataCandidateError::ItemNotFound)
+        ));
+        assert_eq!(stored_candidate_count(&database, &item_id).await?, 0);
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_child_search_rejects_a_soft_deleted_item()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, _movie_id, _directory) = candidate_search_fixture().await?;
+        let season_id = insert_season_item(&database).await?;
+        let service = MetadataCandidateService::new(database.clone());
+        let scraper = ScraperProvider::from_adapter(ManyCandidateAdapter { candidates: 1 });
+
+        soft_delete_fixture_items(&database).await?;
+        assert!(matches!(
+            service
+                .search_and_store(&season_id, "Example", None, &scraper)
+                .await,
+            Err(MetadataCandidateError::ItemNotFound)
+        ));
+        assert_eq!(stored_candidate_count(&database, &season_id).await?, 0);
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_child_search_rejects_an_item_in_a_disabled_library()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, _movie_id, _directory) = candidate_search_fixture().await?;
+        let season_id = insert_season_item(&database).await?;
+        let service = MetadataCandidateService::new(database.clone());
+        let scraper = ScraperProvider::from_adapter(ManyCandidateAdapter { candidates: 1 });
+
+        disable_fixture_library(&database).await?;
+        assert!(matches!(
+            service
+                .search_and_store(&season_id, "Example", None, &scraper)
+                .await,
+            Err(MetadataCandidateError::ItemNotFound)
+        ));
+        assert_eq!(stored_candidate_count(&database, &season_id).await?, 0);
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_search_with_the_callers_snapshot_skips_item_reads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (with_snapshot, snapshot_scores) = manual_search_statements(true).await?;
+        let (without_snapshot, database_scores) = manual_search_statements(false).await?;
+
+        // The same rows, so the caller's snapshot changed nothing observable.
+        assert_eq!(snapshot_scores, database_scores);
+        // S3: the public entry point reads the item and then re-reads it for the returned page;
+        // the snapshot entry point does neither.
+        assert_eq!(
+            with_snapshot + 2,
+            without_snapshot,
+            "passing the caller's snapshot must save the item read and the page re-read"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn actor_metadata_fetches_are_bounded_and_parallel() {
         let active = Arc::new(AtomicUsize::new(0));
@@ -5708,7 +6381,7 @@ mod tests {
 
     #[test]
     fn episode_stills_are_not_duplicated_into_other_backdrop_types() {
-        let images = generic_candidate_images(
+        let images = candidate_images_by_type(
             &[ScraperImage {
                 image_type: "Backdrop".to_owned(),
                 url: "https://images.example/episode.jpg".to_owned(),
@@ -5723,6 +6396,45 @@ mod tests {
         );
         assert!(!images.contains_key("THUMB"));
         assert!(!images.contains_key("BANNER"));
+    }
+
+    #[test]
+    fn empty_typed_images_only_settle_types_without_a_fallback_url() {
+        // The provider returned nothing at all: every scraper image type stays settled.
+        assert_eq!(
+            explicitly_unavailable_image_types(None, None),
+            SCRAPER_IMAGE_TYPES.to_vec()
+        );
+        // A poster URL keeps the poster-derived types requestable.
+        let with_poster =
+            explicitly_unavailable_image_types(Some("https://example.invalid/poster.jpg"), None);
+        assert!(!with_poster.contains(&"POSTER"));
+        assert!(!with_poster.contains(&"DISC"));
+        assert!(with_poster.contains(&"FANART"));
+        assert!(with_poster.contains(&"LOGO"));
+        // A backdrop URL keeps every backdrop-derived type requestable.
+        let with_backdrop =
+            explicitly_unavailable_image_types(None, Some("https://example.invalid/backdrop.jpg"));
+        for image_type in ["FANART", "THUMB", "BANNER", "ART", "WALLPAPER"] {
+            assert!(
+                !with_backdrop.contains(&image_type),
+                "{image_type} should stay requestable"
+            );
+        }
+        assert!(with_backdrop.contains(&"POSTER"));
+        // Blank URLs are not artwork.
+        assert_eq!(
+            explicitly_unavailable_image_types(Some("  "), Some("")),
+            SCRAPER_IMAGE_TYPES.to_vec()
+        );
+        // Both URLs present: only LOGO has no metadata fallback.
+        assert_eq!(
+            explicitly_unavailable_image_types(
+                Some("https://example.invalid/poster.jpg"),
+                Some("https://example.invalid/backdrop.jpg")
+            ),
+            vec!["LOGO"]
+        );
     }
 
     #[test]
@@ -6462,6 +7174,8 @@ mod tests {
 
     #[test]
     fn type_policy_defaults_come_from_the_flat_limits_and_level_values_win() {
+        // Strategies saved by older versions still carry `minDownloadWidth` / `minWidth`;
+        // they are accepted and ignored, so only the remaining flat and cell limits apply.
         let policy = parse_image_selection_policy(
             r#"{"images":{"poster":true,"artwork":true,"maxBackdropCount":3,"minDownloadWidth":1920,
                  "levels":{"series":{"artworks":{"artwork":{"maxCount":1,"minWidth":720,"overwrite":"KEEP","sources":["SCRAPER"],"scraperRoles":["PRIMARY"]}}}}}}"#,
@@ -6472,7 +7186,6 @@ mod tests {
             .type_policy(ImageLevel::Movie, "ART")
             .expect("art cell");
         assert_eq!(movie_art.max_count, 3);
-        assert_eq!(movie_art.min_width, 1920);
         assert_eq!(movie_art.overwrite, ArtworkOverwrite::Inherit);
         assert!(movie_art.sources.scraper && movie_art.sources.screenshot);
 
@@ -6480,7 +7193,6 @@ mod tests {
             .type_policy(ImageLevel::Series, "ART")
             .expect("art cell");
         assert_eq!(series_art.max_count, 1);
-        assert_eq!(series_art.min_width, 720);
         assert_eq!(series_art.overwrite, ArtworkOverwrite::Keep);
         assert!(series_art.sources.scraper);
         assert!(!series_art.sources.screenshot);
@@ -6548,12 +7260,12 @@ mod tests {
     }
 
     #[test]
-    fn minimum_width_filters_candidate_images_per_level() {
+    fn candidate_images_keep_low_width_urls_for_every_level() {
         let images = vec![
             ScraperImage {
                 image_type: "Poster".to_owned(),
                 url: "https://images.example/poster-small".to_owned(),
-                width: Some(1000),
+                width: Some(640),
                 ..ScraperImage::default()
             },
             ScraperImage {
@@ -6575,29 +7287,74 @@ mod tests {
                 ..ScraperImage::default()
             },
         ];
-        let policy = parse_image_selection_policy(
-            r#"{"images":{"minDownloadWidth":1920,"levels":{"season":{"artworks":{"backdrop":{"minWidth":1000}}}}}}"#,
-        )
-        .expect("strategy JSON is valid");
 
-        let movie = filtered_candidate_images(&images, ScraperItemType::Movie, "MOVIE", policy);
+        let movie = candidate_images_by_type(&images, ScraperItemType::Movie);
         assert_eq!(
             movie.get("POSTER"),
             Some(&vec![
+                "https://images.example/poster-small".to_owned(),
                 "https://images.example/poster-large".to_owned(),
                 "https://images.example/poster-unknown".to_owned()
-            ])
+            ]),
+            "a 640px poster must no longer be dropped before it is stored"
         );
-        assert!(
-            !movie.contains_key("FANART"),
-            "a 1280px backdrop is below the 1920px movie minimum"
-        );
-
-        let season = filtered_candidate_images(&images, ScraperItemType::Season, "SEASON", policy);
         assert_eq!(
-            season.get("FANART"),
+            movie.get("FANART"),
             Some(&vec!["https://images.example/backdrop".to_owned()])
         );
+        let movie_disc = candidate_disc_urls(&movie);
+        assert!(
+            movie_disc.explicit.is_empty(),
+            "a poster typed image must not become explicit disc artwork"
+        );
+        assert_eq!(
+            movie_disc.poster_fallback,
+            movie.get("POSTER").cloned().unwrap_or_default(),
+            "poster typed images only reach DISC as a fallback"
+        );
+
+        let episode = candidate_images_by_type(&images, ScraperItemType::Episode);
+        assert_eq!(
+            episode.get("FANART"),
+            Some(&vec!["https://images.example/backdrop".to_owned()])
+        );
+        assert!(
+            !episode.contains_key("THUMB"),
+            "episode stills are not duplicated into other backdrop types"
+        );
+    }
+
+    #[test]
+    fn explicit_disc_candidates_keep_the_poster_fallback_for_a_later_attempt() {
+        let poster = "https://images.example/poster".to_owned();
+        let disc = "https://images.example/disc".to_owned();
+        let mut combined = BTreeMap::new();
+        combined.insert("POSTER".to_owned(), vec![poster.clone()]);
+        combined.insert("DISC".to_owned(), vec![poster.clone(), disc.clone()]);
+        let urls = candidate_disc_urls(&combined);
+        assert_eq!(urls.explicit, vec![disc.clone()]);
+        assert_eq!(
+            urls.poster_fallback,
+            vec![poster.clone()],
+            "the poster URLs must stay available when every explicit Disc URL fails"
+        );
+
+        let mut explicit_only = BTreeMap::new();
+        explicit_only.insert("DISC".to_owned(), vec![disc.clone()]);
+        let urls = candidate_disc_urls(&explicit_only);
+        assert_eq!(urls.explicit, vec![disc]);
+        assert!(urls.poster_fallback.is_empty());
+
+        let mut poster_only = BTreeMap::new();
+        poster_only.insert("POSTER".to_owned(), vec![poster.clone()]);
+        poster_only.insert("DISC".to_owned(), vec![poster.clone()]);
+        let urls = candidate_disc_urls(&poster_only);
+        assert!(urls.explicit.is_empty());
+        assert_eq!(urls.poster_fallback, vec![poster]);
+
+        let urls = candidate_disc_urls(&BTreeMap::new());
+        assert!(urls.explicit.is_empty());
+        assert!(urls.poster_fallback.is_empty());
     }
 
     #[test]

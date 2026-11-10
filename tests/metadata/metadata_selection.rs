@@ -10,6 +10,7 @@ use crate::common::{TestScraper, TestScraperConfig};
 use axum::{
     Json, Router,
     body::Body,
+    extract::Path as AxumPath,
     extract::State as AxumState,
     http::{Request, StatusCode},
     response::{IntoResponse, Response},
@@ -286,6 +287,50 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
 }
 
 #[tokio::test]
+async fn empty_typed_image_map_falls_back_to_candidate_poster_url()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Online Title",
+            "productionYear": 2020,
+            "posterUrl": format!("{image_url}/poster"),
+            "backdropUrl": format!("{image_url}/fanart"),
+            "images": {}
+        }),
+    )
+    .await?;
+
+    let selection = MetadataSelectionService::with_config_dir(
+        fixture.database.clone(),
+        ImageWriteService::with_config_and_config_dir(
+            fixture.database.clone(),
+            local_image_config(),
+            fixture.config.config_dir.clone(),
+        )?,
+        fixture.config.config_dir.clone(),
+    );
+    let report = selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::FillMissing,
+        )
+        .await?;
+
+    assert!(report.image_types.contains(&"POSTER"));
+    assert_eq!(
+        tokio::fs::read(fixture.movie_dir.join("poster.png")).await?,
+        PNG_1X1
+    );
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn metadata_selection_refreshes_cached_catalog_and_home_images()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(false).await?;
@@ -451,6 +496,348 @@ async fn full_refresh_preserves_locked_nfo_fields_and_replaces_existing_images()
             .fetch_one(fixture.database.pool())
             .await?;
     assert_eq!(fallback_required, 0);
+
+    image_server.abort();
+    Ok(())
+}
+
+/// A `Primary`/`Poster` typed image feeds both `POSTER` and `DISC`, so the stored candidate JSON
+/// carries the same URL under both keys. That disc entry is only a fallback: refreshing an item
+/// that already has a disc must not replace `disc.jpg` with the poster bytes.
+#[tokio::test]
+async fn full_refresh_keeps_existing_disc_artwork_when_the_candidate_only_has_a_poster()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    configure_image_strategy(&fixture.database, &fixture.item_id).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let disc_path = fixture.movie_dir.join("disc.jpg");
+    tokio::fs::write(&disc_path, b"existing-disc").await?;
+    let poster_url = format!("{image_url}/poster");
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Online Title",
+            "images": {
+                "POSTER": [poster_url.clone()],
+                "DISC": [poster_url.clone()]
+            }
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+    );
+
+    let report = selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::RefreshUnlocked,
+        )
+        .await?;
+
+    assert_eq!(
+        report.image_types,
+        vec!["POSTER"],
+        "a poster-derived DISC must not be written when the item already has disc artwork"
+    );
+    assert_eq!(
+        tokio::fs::read(&disc_path).await?,
+        b"existing-disc",
+        "a full refresh must not overwrite the existing disc artwork with the poster"
+    );
+    assert_eq!(
+        tokio::fs::read(fixture.movie_dir.join("poster.png")).await?,
+        PNG_1X1,
+        "the poster itself must still be refreshed"
+    );
+
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn full_refresh_still_fills_a_missing_disc_with_the_poster_fallback()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    configure_image_strategy(&fixture.database, &fixture.item_id).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let poster_url = format!("{image_url}/poster");
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Online Title",
+            "images": {
+                "POSTER": [poster_url.clone()],
+                "DISC": [poster_url.clone()]
+            }
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+    );
+
+    let report = selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::RefreshUnlocked,
+        )
+        .await?;
+
+    assert!(
+        report.image_types.contains(&"DISC"),
+        "an item without disc artwork must still get the poster fallback"
+    );
+    assert_eq!(
+        tokio::fs::read(fixture.movie_dir.join("disc.png")).await?,
+        PNG_1X1
+    );
+    let source_url: Option<String> = sqlx::query_scalar(
+        "SELECT source_url FROM item_images WHERE item_id = ? AND image_type = 'DISC'",
+    )
+    .bind(&fixture.item_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(source_url.as_deref(), Some(poster_url.as_str()));
+
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn full_refresh_uses_an_explicit_disc_candidate_over_existing_disc_artwork()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    configure_image_strategy(&fixture.database, &fixture.item_id).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let disc_path = fixture.movie_dir.join("disc.jpg");
+    tokio::fs::write(&disc_path, b"existing-disc").await?;
+    let disc_url = format!("{image_url}/disc");
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Online Title",
+            "images": {
+                "POSTER": [format!("{image_url}/poster")],
+                "DISC": [disc_url.clone()]
+            }
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+    );
+
+    let report = selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::RefreshUnlocked,
+        )
+        .await?;
+
+    assert!(report.image_types.contains(&"DISC"));
+    assert_eq!(
+        tokio::fs::read(&disc_path).await?,
+        PNG_1X1,
+        "an explicit Disc candidate keeps the overwrite semantics of a full refresh"
+    );
+    let source_url: Option<String> = sqlx::query_scalar(
+        "SELECT source_url FROM item_images WHERE item_id = ? AND image_type = 'DISC'",
+    )
+    .bind(&fixture.item_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(source_url.as_deref(), Some(disc_url.as_str()));
+
+    image_server.abort();
+    Ok(())
+}
+
+/// The explicit `Disc` candidate is tried first, but when every explicit URL fails the poster
+/// URLs are still available as the last attempt for an item that has no disc artwork.
+#[tokio::test]
+async fn full_refresh_falls_back_to_the_poster_when_the_explicit_disc_candidate_fails()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    configure_image_strategy(&fixture.database, &fixture.item_id).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let poster_url = format!("{image_url}/poster");
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Online Title",
+            "images": {
+                "POSTER": [poster_url.clone()],
+                "DISC": [format!("{image_url}/missing-disc"), poster_url.clone()]
+            }
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+    );
+
+    let report = selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::RefreshUnlocked,
+        )
+        .await?;
+
+    assert!(
+        report.image_types.contains(&"DISC"),
+        "a failing explicit Disc candidate must fall back to the poster"
+    );
+    assert_eq!(
+        tokio::fs::read(fixture.movie_dir.join("disc.png")).await?,
+        PNG_1X1,
+        "the fallback writes the poster bytes as the disc artwork"
+    );
+    let source_url: Option<String> = sqlx::query_scalar(
+        "SELECT source_url FROM item_images WHERE item_id = ? AND image_type = 'DISC'",
+    )
+    .bind(&fixture.item_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(source_url.as_deref(), Some(poster_url.as_str()));
+
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn full_refresh_does_not_add_a_poster_disc_when_the_explicit_disc_succeeds()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    configure_image_strategy(&fixture.database, &fixture.item_id).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let disc_url = format!("{image_url}/disc-webp");
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Online Title",
+            "images": {
+                "POSTER": [format!("{image_url}/poster")],
+                "DISC": [disc_url.clone()]
+            }
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+    );
+
+    let report = selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::RefreshUnlocked,
+        )
+        .await?;
+
+    assert!(report.image_types.contains(&"DISC"));
+    assert_eq!(
+        tokio::fs::read(fixture.movie_dir.join("disc.webp")).await?,
+        b"RIFF\x04\x00\x00\x00WEBP",
+        "the disc must keep the explicit candidate bytes"
+    );
+    assert!(
+        !fixture.movie_dir.join("disc.png").exists(),
+        "a successful explicit Disc candidate must not add the poster fallback"
+    );
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'DISC'",
+    )
+    .bind(&fixture.item_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(rows, 1);
+    let source_url: Option<String> = sqlx::query_scalar(
+        "SELECT source_url FROM item_images WHERE item_id = ? AND image_type = 'DISC'",
+    )
+    .bind(&fixture.item_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(source_url.as_deref(), Some(disc_url.as_str()));
+
+    image_server.abort();
+    Ok(())
+}
+
+/// A `disc.jpg` symlink makes the existing-artwork probe fail. That optional check must not fail
+/// the whole selection: NFO writeback and the poster continue, and the fallback is simply skipped.
+#[cfg(unix)]
+#[tokio::test]
+async fn full_refresh_survives_a_symlinked_disc_artwork_probe()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(true).await?;
+    configure_image_strategy(&fixture.database, &fixture.item_id).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let target = fixture.movie_dir.join("external-disc.jpg");
+    tokio::fs::write(&target, b"existing-disc").await?;
+    let disc_path = fixture.movie_dir.join("disc.jpg");
+    std::os::unix::fs::symlink(&target, &disc_path)?;
+    let poster_url = format!("{image_url}/poster");
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Online Title",
+            "overview": "Online Overview",
+            "images": {
+                "POSTER": [poster_url.clone()],
+                "DISC": [poster_url.clone()]
+            }
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+    );
+
+    let report = selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::RefreshUnlocked,
+        )
+        .await?;
+
+    assert_eq!(
+        report.image_types,
+        vec!["POSTER"],
+        "a failed disc probe skips the fallback instead of failing the selection"
+    );
+    assert!(
+        tokio::fs::symlink_metadata(&disc_path)
+            .await?
+            .file_type()
+            .is_symlink(),
+        "the symlinked disc artwork must stay untouched"
+    );
+    assert_eq!(tokio::fs::read(&target).await?, b"existing-disc");
+    assert_eq!(
+        tokio::fs::read(fixture.movie_dir.join("poster.png")).await?,
+        PNG_1X1
+    );
+    let nfo = tokio::fs::read_to_string(fixture.movie_dir.join("movie.nfo")).await?;
+    assert!(nfo.contains("<title>Online Title</title>"));
+    assert!(nfo.contains("<plot>Online Overview</plot>"));
 
     image_server.abort();
     Ok(())
@@ -843,6 +1230,176 @@ async fn supplemental_selection_appends_multiple_backdrops_after_main_image()
 
     let nfo = tokio::fs::read_to_string(fixture.movie_dir.join("movie.nfo")).await?;
     assert!(nfo.contains("<title>主来源标题</title>"));
+    image_server.abort();
+    Ok(())
+}
+
+/// LUX-887: two refreshes with a rescan in between must never make two image rows of one item
+/// share a file. Regression: the rescan moved a downloaded `-backdrop` file to another index and
+/// the next refresh reused it under a second index, leaving the first row's content tag stale.
+#[tokio::test]
+async fn rescan_between_image_refreshes_keeps_indexes_on_their_own_files()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Example Movie (2020)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    // Two media files force the media-prefixed image names the bug report describes.
+    tokio::fs::write(movie_dir.join("Example.Movie.2020.mkv"), b"fixture").await?;
+    tokio::fs::write(movie_dir.join("Companion.Movie.2021.mkv"), b"fixture").await?;
+    for sidecar in [
+        "poster.jpg",
+        "disc.jpg",
+        "logo.jpg",
+        "fanart.jpg",
+        "fanart1.jpg",
+        "fanart2.jpg",
+        "fanart3.jpg",
+        "thumb.jpg",
+        "banner.jpg",
+        "art.jpg",
+        "wallpaper.jpg",
+    ] {
+        tokio::fs::write(
+            movie_dir.join(sidecar),
+            format!("local-{sidecar}").as_bytes(),
+        )
+        .await?;
+    }
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let enricher = MetadataEnricher::new(database.clone());
+    enricher.enrich_movie_library(library.id).await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT ms.item_id
+         FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path LIKE '%Example.Movie.2020.mkv'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+
+    let (image_url, image_server) = start_varied_image_stub().await?;
+    let selection = MetadataSelectionService::new(
+        database.clone(),
+        ImageWriteService::with_config(database.clone(), local_image_config())?,
+    );
+    let refresh = |round: &'static str| {
+        let image_url = image_url.clone();
+        json!({
+            "title": format!("Refresh {round}"),
+            "images": {
+                "POSTER": [
+                    format!("{image_url}/{round}-poster-a"),
+                    format!("{image_url}/{round}-poster-b")
+                ],
+                "FANART": [
+                    format!("{image_url}/{round}-fanart-0"),
+                    format!("{image_url}/{round}-fanart-1"),
+                    format!("{image_url}/{round}-fanart-2"),
+                    format!("{image_url}/{round}-fanart-3")
+                ],
+                "LOGO": [format!("{image_url}/{round}-logo")]
+            }
+        })
+    };
+
+    let first_candidate = insert_candidate(&database, &item_id, refresh("first")).await?;
+    let first_report = selection
+        .select(
+            &item_id,
+            &first_candidate,
+            MetadataSelectionMode::RefreshUnlocked,
+        )
+        .await?;
+    assert!(first_report.image_types.contains(&"FANART"));
+    // The scanning-approved `fanart{k}` sidecars must be reused instead of a fresh `-backdrop{k}`.
+    for image_index in 1..=3 {
+        for extension in ["jpg", "png", "webp"] {
+            assert!(
+                !movie_dir
+                    .join(format!(
+                        "Example.Movie.2020-backdrop{image_index}.{extension}"
+                    ))
+                    .exists(),
+                "FANART/{image_index} must reuse fanart{image_index}.jpg instead of a new file"
+            );
+        }
+        let path: String = sqlx::query_scalar(
+            "SELECT local_path FROM item_images
+             WHERE item_id = ? AND image_type = 'FANART' AND image_index = ?",
+        )
+        .bind(&item_id)
+        .bind(image_index)
+        .fetch_one(database.pool())
+        .await?;
+        assert!(
+            path.ends_with(&format!("fanart{image_index}.jpg")),
+            "FANART/{image_index} should stay on fanart{image_index}.jpg, got {path}"
+        );
+    }
+
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    enricher.enrich_movie_library(library.id).await?;
+
+    let second_candidate = insert_candidate(&database, &item_id, refresh("second")).await?;
+    selection
+        .select(
+            &item_id,
+            &second_candidate,
+            MetadataSelectionMode::RefreshUnlocked,
+        )
+        .await?;
+
+    let rows: Vec<(String, i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT image_type, image_index, local_path, content_tag
+         FROM item_images
+         WHERE item_id = ?
+         ORDER BY local_path, image_type, image_index",
+    )
+    .bind(&item_id)
+    .fetch_all(database.pool())
+    .await?;
+    for pair in rows.windows(2) {
+        assert_ne!(
+            pair[0].2, pair[1].2,
+            "{}:{} and {}:{} share the registered path {}",
+            pair[0].0, pair[0].1, pair[1].0, pair[1].1, pair[0].2
+        );
+    }
+    let fanart_count = rows
+        .iter()
+        .filter(|(image_type, ..)| image_type == "FANART")
+        .count();
+    assert_eq!(
+        fanart_count, 4,
+        "the local fanart sidecars must stay registered at indexes 0..3"
+    );
+    for (image_type, image_index, path, content_tag) in &rows {
+        let bytes = tokio::fs::read(path).await?;
+        let expected = format!("{:x}", Sha256::digest(&bytes));
+        assert_eq!(
+            content_tag.as_deref(),
+            Some(expected.as_str()),
+            "{image_type}/{image_index} at {path} keeps a stale content tag"
+        );
+    }
+
     image_server.abort();
     Ok(())
 }
@@ -3441,15 +3998,17 @@ async fn start_image_stub()
                     .header(CONTENT_TYPE, "image/png")
                     .body(Body::from(PNG_1X1.to_vec()))
                     .unwrap(),
-                "fanart" | "fanart-supplement-1" | "fanart-supplement-2" => Response::builder()
-                    .header(CONTENT_TYPE, "image/webp")
-                    .body(Body::from(b"RIFF\x04\x00\x00\x00WEBP".to_vec()))
-                    .unwrap(),
+                "fanart" | "fanart-supplement-1" | "fanart-supplement-2" | "disc-webp" => {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "image/webp")
+                        .body(Body::from(b"RIFF\x04\x00\x00\x00WEBP".to_vec()))
+                        .unwrap()
+                }
                 "poster-second" => Response::builder()
                     .header(CONTENT_TYPE, "image/png")
                     .body(Body::from(b"broken".to_vec()))
                     .unwrap(),
-                "poster-first" | "logo" | "thumb" | "banner" | "art" | "wallpaper" => {
+                "poster-first" | "logo" | "thumb" | "banner" | "art" | "wallpaper" | "disc" => {
                     Response::builder()
                         .header(CONTENT_TYPE, "image/png")
                         .body(Body::from(PNG_1X1.to_vec()))
@@ -3464,6 +4023,30 @@ async fn start_image_stub()
                     .body(Body::empty())
                     .unwrap(),
             }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    Ok((
+        format!("http://{address}"),
+        tokio::spawn(async move { axum::serve(listener, app).await }),
+    ))
+}
+
+/// Serves a different (still valid) PNG payload per request path so a refresh always changes the
+/// file content and therefore its content tag.
+async fn start_varied_image_stub()
+-> Result<(String, tokio::task::JoinHandle<Result<(), std::io::Error>>), Box<dyn std::error::Error>>
+{
+    let app = Router::new().route(
+        "/{name}",
+        get(|AxumPath(name): AxumPath<String>| async move {
+            let mut body = PNG_1X1.to_vec();
+            body.extend_from_slice(name.as_bytes());
+            Response::builder()
+                .header(CONTENT_TYPE, "image/png")
+                .body(Body::from(body))
+                .unwrap()
         }),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await?;

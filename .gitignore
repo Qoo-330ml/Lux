@@ -26,8 +26,11 @@
 
 # Local tool caches and build artifacts (never part of a commit)
 /.pnpm-store/
+/.pnpm/
 /.vite/
 /.tscli/
+/.cache/
+/.playwright-browsers/
 /.rustc_info.json
 /debug/
 
@@ -42,3 +45,7 @@
 /docs/*-PROPOSAL.md
 /docs/LUX-DATA-PATH-*.md
 /docs/STAGE-*-GATE-REVIEW-*.md
+
+# Web 播放兼容性矩阵本地产物（样本与报告从不提交）
+/scripts/playback-matrix/samples/
+/scripts/playback-matrix/reports/

@@ -9,6 +9,7 @@ import { App } from "../src/app/App";
 import { LoginPage } from "../src/features/auth/LoginPage";
 import { ApiError, api } from "../src/lib/api/client";
 import { queryKeys } from "../src/lib/api/query-keys";
+import { FakeWebSocket, installFakeWebSocket } from "./support/fake-websocket";
 
 const libraryRouteChunk = vi.hoisted(() => {
   let resolve!: () => void;
@@ -31,6 +32,8 @@ describe("LoginPage session state", () => {
 
   beforeEach(() => {
     vi.spyOn(api, "loginBackground").mockResolvedValue({ source: "STATIC", images: [] });
+    // Mounting the shell opens the realtime channel; keep it in-process and deterministic.
+    installFakeWebSocket();
   });
 
   afterEach(() => {
@@ -565,5 +568,253 @@ describe("LoginPage session state", () => {
       await vi.waitFor(() => expect(libraryRouteChunk.complete).toBe(true));
       await vi.waitFor(() => expect(container.querySelector("[data-testid=loaded-library-route]")).not.toBeNull());
     });
+  });
+
+  it("returns to the login page when a 401 arrives while the shell is already mounted", async () => {
+    const user = { id: "user-1", usernameNormalized: "admin", canManageServer: false };
+    vi.spyOn(api, "setupStatus").mockResolvedValue({ initialized: true });
+    let meCalls = 0;
+    vi.spyOn(api, "me").mockImplementation(async () => {
+      meCalls += 1;
+      if (meCalls === 1) return { user, serverName: "客厅 Lux" };
+      throw new ApiError("需要登录", { status: 401 });
+    });
+    vi.spyOn(api, "homeCarousel").mockResolvedValue({ recommended: [] });
+    vi.spyOn(api, "homeLibraries").mockResolvedValue({ libraries: [] });
+    vi.spyOn(api, "homeContinueWatching").mockResolvedValue({ items: [], total: 0 });
+    vi.spyOn(api, "homeLibrariesLatest").mockResolvedValue({ libraries: [] });
+    // The realtime channel is not what this test exercises; keep it on the polling fallback.
+    vi.stubGlobal("WebSocket", undefined);
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/"]}>
+            <App />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await vi.waitFor(() => expect(container.querySelector(".lux-home"), container.innerHTML).not.toBeNull());
+
+    // This is exactly what the realtime client does on a 1008 close (ADR-054 D11).
+    await act(async () => { await queryClient.invalidateQueries({ queryKey: queryKeys.me }); });
+
+    await act(async () => {
+      await vi.waitFor(() => {
+        expect(container.querySelector("input[autocomplete='username']"), container.innerHTML).not.toBeNull();
+      });
+    });
+    expect(container.querySelector(".lux-home")).toBeNull();
+  });
+
+  it("drops the previous account's pages when /auth/me answers 401 without a realtime close", async () => {
+    const userA = { id: "user-a", usernameNormalized: "a", canManageServer: false };
+    const userB = { id: "user-b", usernameNormalized: "b", canManageServer: false };
+    let signedInAs: "a" | "b" = "a";
+    let revoked = false;
+    const unauthorized = () => new ApiError("需要登录", { status: 401 });
+
+    vi.spyOn(api, "setupStatus").mockResolvedValue({ initialized: true });
+    vi.spyOn(api, "me").mockImplementation(async () => {
+      if (revoked) throw unauthorized();
+      return { user: signedInAs === "a" ? userA : userB, serverName: "客厅 Lux" };
+    });
+    vi.spyOn(api, "login").mockImplementation(async () => {
+      revoked = false;
+      signedInAs = "b";
+      return userB;
+    });
+    vi.spyOn(api, "homeCarousel").mockImplementation(async () => {
+      if (revoked) throw unauthorized();
+      return { recommended: [] };
+    });
+    vi.spyOn(api, "homeLibraries").mockImplementation(async () => {
+      if (revoked) throw unauthorized();
+      return { libraries: [] };
+    });
+    vi.spyOn(api, "homeLibrariesLatest").mockImplementation(async () => {
+      if (revoked) throw unauthorized();
+      return { libraries: [] };
+    });
+    vi.spyOn(api, "homeContinueWatching").mockImplementation(async () => {
+      if (revoked) throw unauthorized();
+      return {
+        items: [{
+          id: signedInAs === "a" ? "resume-a" : "resume-b",
+          title: signedInAs === "a" ? "A 的继续观看" : "B 的继续观看",
+          itemType: "MOVIE",
+          runtimeTicks: 3_600_000_000,
+          userData: { positionTicks: 1_800_000_000 },
+        }],
+        total: 1,
+      };
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 60_000, refetchOnWindowFocus: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/"]}>
+            <App />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent, container.innerHTML).toContain("A 的继续观看"));
+    });
+
+    // Pages the previous account visited, cached under keys without a user dimension.
+    queryClient.setQueryData(queryKeys.favorites, { items: ["A 的收藏"] });
+    queryClient.setQueryData(queryKeys.watchHistory, { items: ["A 的历史"] });
+
+    // No realtime close: this is refetchOnReconnect, or the explicit `me` invalidation the admin
+    // pages perform, finding out that the session was revoked while the tab was away.
+    revoked = true;
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.me });
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => {
+        expect(container.querySelector("input[autocomplete='username']"), container.innerHTML).not.toBeNull();
+      });
+    });
+    expect(queryClient.getQueryData(queryKeys.favorites)).toBeUndefined();
+    expect(queryClient.getQueryData(queryKeys.watchHistory)).toBeUndefined();
+    // Server state that predates the session must survive, or the app would flash "正在启动 Lux".
+    expect(queryClient.getQueryData(queryKeys.setup)).toBeDefined();
+
+    const setInputValue = (input: HTMLInputElement, value: string) => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(input, value);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    };
+    act(() => {
+      setInputValue(container.querySelector<HTMLInputElement>("input[autocomplete='username']")!, "b");
+      setInputValue(container.querySelector<HTMLInputElement>("input[autocomplete='current-password']")!, "password");
+    });
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("button[type='submit']")?.click();
+      await vi.waitFor(() => expect(api.login).toHaveBeenCalledWith("b", "password"));
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent, container.innerHTML).toContain("B 的继续观看"));
+    });
+    expect(container.textContent).not.toContain("A 的继续观看");
+  });
+
+  it("drops the previous account's data when the realtime session is revoked", async () => {
+    const userA = { id: "user-a", usernameNormalized: "a", canManageServer: false };
+    const userB = { id: "user-b", usernameNormalized: "b", canManageServer: false };
+    let signedInAs: "a" | "b" = "a";
+    // Mirrors the server: after the 1008 close every request fails until a new login.
+    let revoked = false;
+    const unauthorized = () => new ApiError("需要登录", { status: 401 });
+
+    vi.spyOn(api, "setupStatus").mockResolvedValue({ initialized: true });
+    vi.spyOn(api, "me").mockImplementation(async () => {
+      if (revoked) throw unauthorized();
+      return { user: signedInAs === "a" ? userA : userB, serverName: "客厅 Lux" };
+    });
+    vi.spyOn(api, "login").mockImplementation(async () => {
+      revoked = false;
+      signedInAs = "b";
+      return userB;
+    });
+    vi.spyOn(api, "homeCarousel").mockImplementation(async () => {
+      if (revoked) throw unauthorized();
+      return { recommended: [] };
+    });
+    vi.spyOn(api, "homeLibraries").mockImplementation(async () => {
+      if (revoked) throw unauthorized();
+      return { libraries: [] };
+    });
+    vi.spyOn(api, "homeLibrariesLatest").mockImplementation(async () => {
+      if (revoked) throw unauthorized();
+      return { libraries: [] };
+    });
+    vi.spyOn(api, "homeContinueWatching").mockImplementation(async () => {
+      if (revoked) throw unauthorized();
+      return {
+        items: [{
+          id: signedInAs === "a" ? "resume-a" : "resume-b",
+          title: signedInAs === "a" ? "A 的继续观看" : "B 的继续观看",
+          itemType: "MOVIE",
+          runtimeTicks: 3_600_000_000,
+          userData: { positionTicks: 1_800_000_000 },
+        }],
+        total: 1,
+      };
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    // Same cache policy as main.tsx: entries stay fresh for 60s and a focus does not refetch,
+    // so nothing below can rely on staleness to hide the previous account's data.
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 60_000, refetchOnWindowFocus: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/"]}>
+            <App />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent, container.innerHTML).toContain("A 的继续观看"));
+    });
+    act(() => FakeWebSocket.last()?.ready());
+
+    // The server revokes the session and closes the realtime connection with 1008.
+    revoked = true;
+    act(() => FakeWebSocket.last()?.serverClose(1008));
+
+    await act(async () => {
+      await vi.waitFor(() => {
+        expect(container.querySelector("input[autocomplete='username']"), container.innerHTML).not.toBeNull();
+      });
+    });
+    expect(queryClient.getQueryData(queryKeys.homeContinueWatching)).toBeUndefined();
+    expect(queryClient.getQueryData(queryKeys.favorites)).toBeUndefined();
+    // The session query survives on purpose so its observer can report the 401.
+    expect(queryClient.getQueryState(queryKeys.me)?.error).toBeInstanceOf(ApiError);
+
+    const setInputValue = (input: HTMLInputElement, value: string) => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setter?.call(input, value);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    };
+    act(() => {
+      setInputValue(container.querySelector<HTMLInputElement>("input[autocomplete='username']")!, "b");
+      setInputValue(container.querySelector<HTMLInputElement>("input[autocomplete='current-password']")!, "password");
+    });
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("button[type='submit']")?.click();
+      await vi.waitFor(() => expect(api.login).toHaveBeenCalledWith("b", "password"));
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent, container.innerHTML).toContain("B 的继续观看"));
+    });
+    expect(container.textContent).not.toContain("A 的继续观看");
   });
 });

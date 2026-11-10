@@ -1,9 +1,11 @@
 use std::{collections::BTreeMap, fmt, path::Path};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::{Host, Url};
 
+use super::danmaku::validate_danmaku_xml;
 use super::schedule::validate_cron;
 
 pub const PLUGIN_FORMAT_VERSION: u32 = 1;
@@ -31,6 +33,10 @@ pub const MEDIA_SOURCE_KIND_LOCAL_FILE: &str = "LOCAL_FILE";
 pub const MEDIA_SOURCE_KIND_STRM_URL: &str = "STRM_URL";
 pub const NOTIFICATION_SEND_CAPABILITY: &str = "notification.send";
 pub const DANMAKU_MATCH_CAPABILITY: &str = "danmaku.match";
+/// Optional manual-match capabilities (ADR-052 P4). A danmaku plugin either declares both or
+/// neither; a plugin that only declares `danmaku.match` keeps the automatic matching contract.
+pub const DANMAKU_SEARCH_CAPABILITY: &str = "danmaku.search";
+pub const DANMAKU_FETCH_CAPABILITY: &str = "danmaku.fetch";
 pub const LOGIN_BACKGROUND_GET_CAPABILITY: &str = "login_background.get";
 pub const EMBY_MIGRATION_CAPABILITY: &str = "migration.emby";
 pub const EMBY_ROUTE_CAPABILITY: &str = "emby.route";
@@ -41,11 +47,22 @@ pub const METADATA_IMAGES_CAPABILITY: &str = "metadata.images";
 pub const METADATA_CREDITS_CAPABILITY: &str = "metadata.credits";
 pub const METADATA_EXTERNAL_IDS_CAPABILITY: &str = "metadata.externalIds";
 pub const METADATA_TRAILERS_CAPABILITY: &str = "metadata.trailers";
+/// The only plugin type allowed to declare a `ratings.*` capability.
+pub const PLUGIN_TYPE_METADATA: &str = "metadata";
+/// Rating lookup capabilities of a read-only ratings plugin.
+///
+/// The plugin that declares them (`org.lux.trakt-ratings`) is a `type: metadata` plugin, but it
+/// deliberately does not implement `metadata.search`, so it is not a scraper.
+pub const RATINGS_LOOKUP_CAPABILITY: &str = "ratings.lookup";
+pub const RATINGS_BATCH_CAPABILITY: &str = "ratings.batch";
+pub const RATINGS_SEARCH_CAPABILITY: &str = "ratings.search";
 pub const STRM_RESOLVE_METHOD: &str = "strm.resolve";
 pub const CHAPTER_DETECT_METHOD: &str = "chapters.detect";
 pub const CHAPTER_LOOKUP_METHOD: &str = "chapters.lookup";
 pub const NOTIFICATION_SEND_METHOD: &str = "notification.send";
 pub const DANMAKU_MATCH_METHOD: &str = "danmaku.match";
+pub const DANMAKU_SEARCH_METHOD: &str = "danmaku.search";
+pub const DANMAKU_FETCH_METHOD: &str = "danmaku.fetch";
 pub const LOGIN_BACKGROUND_GET_METHOD: &str = "login_background.get";
 pub const UNIFIED_LOGIN_BACKGROUND_PLUGIN_ID: &str = "org.lux.login-background";
 pub const LOGIN_BACKGROUND_CUSTOM_IMAGE_PATH: &str = "/api/v1/auth/login-background/custom-image";
@@ -61,6 +78,12 @@ pub const MIGRATION_AUTHENTICATE_USER_METHOD: &str = "migration.authenticate_use
 pub const CHAPTER_FINGERPRINT_SAMPLE_RATE: u32 = 11_025;
 pub const CHAPTER_FINGERPRINT_POINT_DURATION_TICKS: i64 = 1_238_095;
 pub const CONFIG_OPTIONS_SOURCE_MEDIA_LIBRARIES: &str = "media-libraries";
+/// Manifest key of the notification target credential.
+///
+/// A notification plugin may declare exactly one `sensitive` password field with this key. The host
+/// never forwards the value in `config` or stores it in the non-secret provider configuration: it
+/// keeps the value as the target secret and passes it through the controlled RPC `secret` field.
+pub const SECRET_CONFIG_FIELD_KEY: &str = "secret";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -113,6 +136,13 @@ impl PluginManifest {
         Ok(manifest)
     }
 
+    /// The manifest field that declares the notification target credential.
+    pub fn secret_config_field(&self) -> Option<&PluginConfigField> {
+        self.config_fields
+            .iter()
+            .find(|field| field.key == SECRET_CONFIG_FIELD_KEY)
+    }
+
     pub fn validate(&self) -> Result<(), PluginManifestError> {
         if self.format_version != PLUGIN_FORMAT_VERSION {
             return Err(PluginManifestError::Invalid(format!(
@@ -150,7 +180,7 @@ impl PluginManifest {
             }
         }
         match self.plugin_type.as_str() {
-            "metadata" => {}
+            PLUGIN_TYPE_METADATA => {}
             PLUGIN_TYPE_LOGIN_BACKGROUND => {
                 if self.category != PLUGIN_CATEGORY_UTILITY {
                     return Err(PluginManifestError::Invalid(
@@ -294,6 +324,34 @@ impl PluginManifest {
                         "danmaku plugins must declare danmaku.match".to_owned(),
                     ));
                 }
+                for capability in &self.capabilities {
+                    if capability.starts_with("danmaku.")
+                        && !matches!(
+                            capability.as_str(),
+                            DANMAKU_MATCH_CAPABILITY
+                                | DANMAKU_SEARCH_CAPABILITY
+                                | DANMAKU_FETCH_CAPABILITY
+                        )
+                    {
+                        return Err(PluginManifestError::Invalid(format!(
+                            "unsupported danmaku capability: {capability}"
+                        )));
+                    }
+                }
+                let declares_search = self
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == DANMAKU_SEARCH_CAPABILITY);
+                let declares_fetch = self
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == DANMAKU_FETCH_CAPABILITY);
+                if declares_search != declares_fetch {
+                    return Err(PluginManifestError::Invalid(
+                        "danmaku plugins must declare danmaku.search and danmaku.fetch together"
+                            .to_owned(),
+                    ));
+                }
             }
             PLUGIN_TYPE_DATA_MIGRATION => {
                 if self.category != PLUGIN_CATEGORY_MIGRATION {
@@ -318,6 +376,7 @@ impl PluginManifest {
                 )));
             }
         }
+        validate_ratings_capabilities(&self.capabilities, &self.plugin_type)?;
         self.runtime.validate()?;
         if self.emby_routes.len() > 32 {
             return Err(PluginManifestError::Invalid(
@@ -391,6 +450,40 @@ impl PluginManifest {
                         .to_owned(),
                 ));
             }
+            if field.key == SECRET_CONFIG_FIELD_KEY {
+                if self.plugin_type != PLUGIN_TYPE_NOTIFICATION {
+                    return Err(PluginManifestError::Invalid(
+                        "only notification plugins may declare a secret config field".to_owned(),
+                    ));
+                }
+                if !field.sensitive || field.input_type != "password" {
+                    return Err(PluginManifestError::Invalid(
+                        "a secret config field must be a sensitive password field".to_owned(),
+                    ));
+                }
+                if field.default_value.is_some() {
+                    return Err(PluginManifestError::Invalid(
+                        "a secret config field must not declare a defaultValue".to_owned(),
+                    ));
+                }
+            }
+            if self.plugin_type == PLUGIN_TYPE_NOTIFICATION && field.key != SECRET_CONFIG_FIELD_KEY
+            {
+                // A notification provider's config fields are per destination and travel in the
+                // non-secret provider config, so the only credential channel is `secret`.
+                if field.sensitive {
+                    return Err(PluginManifestError::Invalid(
+                        "notification plugins may only mark the secret config field as sensitive"
+                            .to_owned(),
+                    ));
+                }
+                if field.input_type == "password" {
+                    return Err(PluginManifestError::Invalid(
+                        "notification plugins may only declare the secret config field as a password field"
+                            .to_owned(),
+                    ));
+                }
+            }
             if field.input_type == "select" {
                 if field.options.is_empty() == field.options_source.is_none()
                     || field.options.len() > 256
@@ -451,6 +544,17 @@ impl PluginManifest {
         {
             return Err(PluginManifestError::Invalid(
                 "login background plugins may declare only one image config field".to_owned(),
+            ));
+        }
+        if self
+            .config_fields
+            .iter()
+            .filter(|field| field.key == SECRET_CONFIG_FIELD_KEY)
+            .count()
+            > 1
+        {
+            return Err(PluginManifestError::Invalid(
+                "notification plugins may declare only one secret config field".to_owned(),
             ));
         }
         if self.scheduled_tasks.len() > 32 {
@@ -1366,6 +1470,257 @@ pub struct DanmakuMatchRpcResult {
     pub xml_base64: Option<String>,
 }
 
+/// True when a danmaku plugin declares `danmaku.match` plus both optional manual-match
+/// capabilities. Only such a plugin may be asked to search or fetch by episode.
+pub fn declares_danmaku_manual_match(manifest: &PluginManifest) -> bool {
+    manifest.plugin_type == PLUGIN_TYPE_DANMAKU
+        && manifest.category == PLUGIN_CATEGORY_MEDIA
+        && [
+            DANMAKU_MATCH_CAPABILITY,
+            DANMAKU_SEARCH_CAPABILITY,
+            DANMAKU_FETCH_CAPABILITY,
+        ]
+        .iter()
+        .all(|required| {
+            manifest
+                .capabilities
+                .iter()
+                .any(|capability| capability == required)
+        })
+}
+
+/// Longest manual search query the host forwards to a plugin, after trimming.
+pub const MAX_DANMAKU_SEARCH_QUERY_CHARS: usize = 200;
+/// Largest candidate count one manual search may request or return.
+pub const MAX_DANMAKU_SEARCH_LIMIT: u32 = 50;
+/// Largest candidate list the host keeps from one plugin response.
+pub const MAX_DANMAKU_SEARCH_CANDIDATES: usize = 50;
+/// Largest episode list the host keeps from one search candidate.
+///
+/// 50 candidates times 180 episodes with 128-character ids and 300-character titles stays inside
+/// the plugin RPC line budget, so the documented "largest allowed search" is a shape a plugin can
+/// actually deliver instead of a shape the transport rejects first.
+pub const MAX_DANMAKU_SEARCH_EPISODES: usize = 180;
+/// Largest provider anime/episode identifier the host accepts.
+pub const MAX_DANMAKU_IDENTIFIER_CHARS: usize = 128;
+/// Largest provider label the host accepts.
+pub const MAX_DANMAKU_PROVIDER_CHARS: usize = 64;
+/// Largest anime or episode title the host accepts.
+pub const MAX_DANMAKU_TITLE_CHARS: usize = 300;
+
+/// `danmaku.search` request. The host sends only the query text and the page bound; never a path,
+/// an upstream address or user information.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DanmakuSearchRpcRequest {
+    pub query: String,
+    pub limit: u32,
+}
+
+/// `danmaku.search` result. Also the host-facing return type of
+/// [`PluginService::search_danmaku`](crate::application::plugins::PluginService::search_danmaku),
+/// so every value a caller sees already passed the host bounds checks.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DanmakuSearchResult {
+    pub candidates: Vec<DanmakuSearchCandidate>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DanmakuSearchCandidate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    pub anime_id: String,
+    pub anime_title: String,
+    pub episodes: Vec<DanmakuSearchEpisode>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DanmakuSearchEpisode {
+    pub episode_id: String,
+    pub title: String,
+}
+
+/// `danmaku.fetch` request. `provider` is the opaque label a search result carried.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DanmakuFetchRpcRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    pub episode_id: String,
+}
+
+/// `danmaku.fetch` result. Decoding and XML validation stay with the caller so this layer never
+/// touches the filesystem.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DanmakuFetchResult {
+    pub xml_base64: String,
+}
+
+/// Why a host-side danmaku request or a plugin payload was refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DanmakuRpcValidationError {
+    /// The payload is not the documented JSON shape or an identifier is missing.
+    InvalidPayload,
+    /// A provider/anime/episode identifier is empty, too long or contains control characters.
+    InvalidIdentifier,
+    /// A title is empty, too long or contains control characters.
+    InvalidText,
+    /// The decoded payload is not a valid Bilibili/Dandanplay danmaku document.
+    InvalidXml,
+}
+
+impl fmt::Display for DanmakuRpcValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPayload => formatter.write_str("danmaku RPC payload is invalid"),
+            Self::InvalidIdentifier => formatter.write_str("danmaku RPC identifier is invalid"),
+            Self::InvalidText => formatter.write_str("danmaku RPC text is invalid"),
+            Self::InvalidXml => formatter.write_str("danmaku XML payload is invalid"),
+        }
+    }
+}
+
+impl std::error::Error for DanmakuRpcValidationError {}
+
+impl DanmakuSearchRpcRequest {
+    /// Host-side request validation. The query is trimmed; both bounds are inclusive.
+    pub fn validate(self) -> Result<Self, DanmakuRpcValidationError> {
+        let query = self.query.trim();
+        if query.is_empty()
+            || query.chars().count() > MAX_DANMAKU_SEARCH_QUERY_CHARS
+            || query.chars().any(char::is_control)
+        {
+            return Err(DanmakuRpcValidationError::InvalidPayload);
+        }
+        if !(1..=MAX_DANMAKU_SEARCH_LIMIT).contains(&self.limit) {
+            return Err(DanmakuRpcValidationError::InvalidPayload);
+        }
+        Ok(Self {
+            query: query.to_owned(),
+            limit: self.limit,
+        })
+    }
+}
+
+impl DanmakuFetchRpcRequest {
+    /// Host-side request validation. An empty `provider` is treated as "not set".
+    pub fn validate(self) -> Result<Self, DanmakuRpcValidationError> {
+        let provider = match self.provider.as_deref() {
+            // An empty or blank label carries no provider information: treat it as "not set"
+            // instead of failing a fetch the caller could already serve.
+            Some(provider) if !provider.trim().is_empty() => Some(
+                normalized_danmaku_identifier(provider, MAX_DANMAKU_PROVIDER_CHARS)
+                    .ok_or(DanmakuRpcValidationError::InvalidIdentifier)?,
+            ),
+            Some(_) | None => None,
+        };
+        let episode_id =
+            normalized_danmaku_identifier(&self.episode_id, MAX_DANMAKU_IDENTIFIER_CHARS)
+                .ok_or(DanmakuRpcValidationError::InvalidPayload)?;
+        Ok(Self {
+            provider,
+            episode_id,
+        })
+    }
+}
+
+impl DanmakuSearchResult {
+    /// Deserializes one `danmaku.search` result and applies the host contract.
+    ///
+    /// Candidate and episode lists above [`MAX_DANMAKU_SEARCH_CANDIDATES`],
+    /// [`MAX_DANMAKU_SEARCH_EPISODES`] or the requested `limit` are trimmed, because a plugin may
+    /// legitimately ignore the page bound. Identifiers and titles are validated instead of
+    /// trimmed: an empty or oversized value is a broken plugin response, not extra data.
+    pub fn from_value(value: Value, limit: u32) -> Result<Self, DanmakuRpcValidationError> {
+        let result: Self =
+            serde_json::from_value(value).map_err(|_| DanmakuRpcValidationError::InvalidPayload)?;
+        let limit = limit.clamp(1, MAX_DANMAKU_SEARCH_LIMIT) as usize;
+        let mut candidates = Vec::with_capacity(result.candidates.len().min(limit));
+        for candidate in result.candidates.into_iter().take(limit) {
+            let anime_id =
+                normalized_danmaku_identifier(&candidate.anime_id, MAX_DANMAKU_IDENTIFIER_CHARS)
+                    .ok_or(DanmakuRpcValidationError::InvalidIdentifier)?;
+            let anime_title =
+                normalized_danmaku_text(&candidate.anime_title, MAX_DANMAKU_TITLE_CHARS)
+                    .ok_or(DanmakuRpcValidationError::InvalidText)?;
+            let provider = match candidate.provider.as_deref() {
+                Some(provider) => Some(
+                    normalized_danmaku_identifier(provider, MAX_DANMAKU_PROVIDER_CHARS)
+                        .ok_or(DanmakuRpcValidationError::InvalidIdentifier)?,
+                ),
+                None => None,
+            };
+            let mut episodes =
+                Vec::with_capacity(candidate.episodes.len().min(MAX_DANMAKU_SEARCH_EPISODES));
+            for episode in candidate
+                .episodes
+                .into_iter()
+                .take(MAX_DANMAKU_SEARCH_EPISODES)
+            {
+                episodes.push(DanmakuSearchEpisode {
+                    episode_id: normalized_danmaku_identifier(
+                        &episode.episode_id,
+                        MAX_DANMAKU_IDENTIFIER_CHARS,
+                    )
+                    .ok_or(DanmakuRpcValidationError::InvalidIdentifier)?,
+                    title: normalized_danmaku_text(&episode.title, MAX_DANMAKU_TITLE_CHARS)
+                        .ok_or(DanmakuRpcValidationError::InvalidText)?,
+                });
+            }
+            candidates.push(DanmakuSearchCandidate {
+                provider,
+                anime_id,
+                anime_title,
+                episodes,
+            });
+        }
+        Ok(Self { candidates })
+    }
+}
+
+impl DanmakuFetchResult {
+    /// Deserializes one `danmaku.fetch` result; the transport already bounded its size.
+    pub fn from_value(value: Value) -> Result<Self, DanmakuRpcValidationError> {
+        let result: Self =
+            serde_json::from_value(value).map_err(|_| DanmakuRpcValidationError::InvalidPayload)?;
+        if result.xml_base64.trim().is_empty() {
+            return Err(DanmakuRpcValidationError::InvalidPayload);
+        }
+        Ok(result)
+    }
+
+    /// Decodes the payload and applies the host XML validation the automatic match path uses.
+    ///
+    /// The caller owns persistence: this helper never writes a sidecar, and callers must run it
+    /// before registering a track or exposing the XML.
+    pub fn decode_xml(&self) -> Result<Vec<u8>, DanmakuRpcValidationError> {
+        let bytes = BASE64
+            .decode(&self.xml_base64)
+            .map_err(|_| DanmakuRpcValidationError::InvalidPayload)?;
+        // `validate_danmaku_xml` owns the structural rules and the 50 MiB XML ceiling.
+        validate_danmaku_xml(&bytes).map_err(|_| DanmakuRpcValidationError::InvalidXml)?;
+        Ok(bytes)
+    }
+}
+
+/// Trims an opaque provider identifier and enforces the host length and character rules.
+fn normalized_danmaku_identifier(value: &str, max_chars: usize) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()
+        && trimmed.chars().count() <= max_chars
+        && !trimmed.chars().any(char::is_control))
+    .then(|| trimmed.to_owned())
+}
+
+/// Trims human text and enforces the host length and character rules.
+fn normalized_danmaku_text(value: &str, max_chars: usize) -> Option<String> {
+    normalized_danmaku_identifier(value, max_chars)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IpLocationRpcRequest {
@@ -1561,7 +1916,6 @@ pub enum MediaProbeRpcStreamType {
     Audio,
     Subtitle,
 }
-
 #[derive(Debug)]
 pub enum PluginManifestError {
     Invalid(String),
@@ -1576,6 +1930,42 @@ impl fmt::Display for PluginManifestError {
 }
 
 impl std::error::Error for PluginManifestError {}
+
+/// Rejects a `ratings.*` capability the protocol does not define, and any `ratings.*` capability on
+/// a plugin type other than `metadata`.
+///
+/// A ratings plugin is a `type: metadata` plugin by contract, but it is read-only and out of the
+/// scraper path: that is why the capability prefix, not the plugin type alone, decides where it may
+/// appear. Capability names are compared after ASCII lowercasing so `Ratings.Batch` is recognised as
+/// a ratings capability (and therefore rejected outside a metadata plugin) and `RATINGS.FOO` is
+/// rejected as unknown instead of slipping through as some other prefix.
+fn validate_ratings_capabilities(
+    capabilities: &[String],
+    plugin_type: &str,
+) -> Result<(), PluginManifestError> {
+    let mut declares_ratings = false;
+    for capability in capabilities {
+        let normalized = capability.to_ascii_lowercase();
+        if !normalized.starts_with("ratings.") {
+            continue;
+        }
+        if !matches!(
+            normalized.as_str(),
+            RATINGS_LOOKUP_CAPABILITY | RATINGS_BATCH_CAPABILITY | RATINGS_SEARCH_CAPABILITY
+        ) {
+            return Err(PluginManifestError::Invalid(format!(
+                "unsupported ratings capability: {capability}"
+            )));
+        }
+        declares_ratings = true;
+    }
+    if declares_ratings && plugin_type != PLUGIN_TYPE_METADATA {
+        return Err(PluginManifestError::Invalid(
+            "only metadata plugins may declare ratings capabilities".to_owned(),
+        ));
+    }
+    Ok(())
+}
 
 fn validate_identifier(
     field: &str,
@@ -1663,6 +2053,28 @@ mod tests {
         .expect("notification manifest should deserialize")
     }
 
+    /// A manifest shaped like `org.lux.trakt-ratings`: a `metadata` plugin in the scraper category
+    /// that answers ratings lookups. The type and capabilities are overridable so the rejection
+    /// cases stay readable.
+    fn ratings_manifest(
+        plugin_type: &str,
+        category: &str,
+        capabilities: &[&str],
+    ) -> PluginManifest {
+        serde_json::from_value(json!({
+            "formatVersion": 1,
+            "id": "org.lux.trakt-ratings",
+            "name": "Trakt ratings",
+            "version": "1.0.0",
+            "apiVersion": 1,
+            "runtime": {"kind": "process", "entrypoint": "bin/ratings"},
+            "type": plugin_type,
+            "category": category,
+            "capabilities": capabilities,
+        }))
+        .expect("ratings manifest should deserialize")
+    }
+
     #[test]
     fn data_migration_manifest_requires_migration_category_and_capability() {
         let manifest: PluginManifest = serde_json::from_value(json!({
@@ -1694,6 +2106,127 @@ mod tests {
         );
         assert!(
             notification_manifest("NOTIFICATION", &[])
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ratings_capabilities_are_accepted_on_metadata_plugins() {
+        for capabilities in [
+            vec!["ratings.lookup", "ratings.batch", "ratings.search"],
+            vec!["ratings.lookup"],
+            vec!["ratings.batch"],
+            vec!["ratings.search"],
+            vec!["metadata.search", "ratings.batch"],
+            vec!["Ratings.Batch"],
+            vec!["RATINGS.SEARCH", "ratings.lookup"],
+            Vec::new(),
+        ] {
+            assert!(
+                ratings_manifest("metadata", "SCRAPER", &capabilities)
+                    .validate()
+                    .is_ok(),
+                "metadata plugin should accept {capabilities:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_ratings_capabilities_are_rejected() {
+        for capability in [
+            "ratings.foo",
+            "ratings.",
+            "ratings.lookup.extra",
+            "RATINGS.FOO",
+            "Ratings.Unknown",
+        ] {
+            let error = ratings_manifest("metadata", "SCRAPER", &["ratings.lookup", capability])
+                .validate()
+                .expect_err("an unknown ratings capability must be rejected");
+            assert!(
+                error.to_string().contains(capability),
+                "error should name {capability}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn ratings_capability_names_are_matched_case_insensitively() {
+        // The prefix decides whether the capability is a ratings capability at all, so a mixed-case
+        // name may not slip past the metadata-only rule.
+        let error = ratings_manifest("media_probe", "MEDIA", &["media.probe", "Ratings.Batch"])
+            .validate()
+            .expect_err("a non-metadata plugin must not declare Ratings.Batch");
+        assert!(
+            error
+                .to_string()
+                .contains("only metadata plugins may declare ratings capabilities"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            ratings_manifest("media_probe", "MEDIA", &["media.probe", "RATINGS.FOO"])
+                .validate()
+                .is_err(),
+            "an unknown mixed-case capability must be rejected"
+        );
+    }
+
+    #[test]
+    fn ratings_capabilities_are_rejected_outside_metadata_plugins() {
+        for (plugin_type, category, capabilities) in [
+            (
+                "media_probe",
+                "MEDIA",
+                vec!["media.probe", "ratings.lookup"],
+            ),
+            (
+                "ip_location",
+                "NETWORK",
+                vec!["ip.location", "ratings.batch"],
+            ),
+            (
+                "strm_resolver",
+                "MEDIA",
+                vec!["strm.resolve", "ratings.search"],
+            ),
+            ("danmaku", "MEDIA", vec!["danmaku.match", "ratings.batch"]),
+            (
+                "notification",
+                "NOTIFICATION",
+                vec!["notification.send", "ratings.lookup"],
+            ),
+            (
+                "data_migration",
+                "MIGRATION",
+                vec!["migration.emby", "ratings.search"],
+            ),
+        ] {
+            assert!(
+                ratings_manifest(plugin_type, category, &capabilities)
+                    .validate()
+                    .is_err(),
+                "{plugin_type} plugin must not declare ratings capabilities"
+            );
+        }
+    }
+
+    #[test]
+    fn ratings_capabilities_do_not_change_the_existing_danmaku_rules() {
+        assert!(
+            ratings_manifest("danmaku", "MEDIA", &["danmaku.match", "danmaku.search"])
+                .validate()
+                .is_err(),
+            "danmaku.search still requires danmaku.fetch"
+        );
+        assert!(
+            ratings_manifest("danmaku", "MEDIA", &["danmaku.match"])
+                .validate()
+                .is_ok(),
+            "a match-only danmaku plugin is still valid"
+        );
+        assert!(
+            ratings_manifest("danmaku", "MEDIA", &["danmaku.match", "danmaku.foo"])
                 .validate()
                 .is_err()
         );

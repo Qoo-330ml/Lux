@@ -2,14 +2,14 @@ import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { MediaItem } from "../../lib/api/types";
-import { useSseConnectionState } from "../activity/useUserEvents";
+import { useRealtimeConnectionState } from "../activity/useUserEvents";
 
 export function useMediaEpisodes(item: MediaItem) {
   const isSeries = item.itemType === "SERIES";
   const isSeason = item.itemType === "SEASON";
   const isEpisode = item.itemType === "EPISODE";
-  const sseState = useSseConnectionState();
-  const refetchInterval = sseState === "connected" ? false : queryRefreshIntervals.mediaSurface;
+  const realtimeState = useRealtimeConnectionState();
+  const refetchInterval = realtimeState === "connected" ? false : queryRefreshIntervals.mediaSurface;
   const seasons = useQuery({
     queryKey: queryKeys.children(item.id, "SEASON"),
     queryFn: () => api.children(item.id, { itemType: "SEASON" }),

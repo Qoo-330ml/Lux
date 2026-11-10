@@ -32,8 +32,13 @@ use crate::application::metadata_writeback::item_metadata_writeback_enabled;
 use crate::application::people::ActorCredit;
 use crate::application::probe::{MediaProbeResult, MediaStreamResult, StreamType};
 use crate::storage::{
-    Database, MediaMetadataUpdate, StorageError, StoredMediaSourcePath, StoredMediaWritebackContext,
+    Database, MediaMetadataUpdate, StorageError, StoredMediaItemKind, StoredMediaSourcePath,
+    StoredMediaWritebackContext,
 };
+
+mod ratings;
+
+pub use ratings::{NfoRatingEntry, RatingsNfoPatch, RatingsWriteOutcome};
 
 #[derive(Clone, Default)]
 pub(crate) struct LocalNfoProjectionCache {
@@ -145,6 +150,9 @@ pub struct LocalNfoDetails {
     pub countries: Vec<String>,
     pub genres: Vec<String>,
     pub studios: Vec<String>,
+    /// Item-level `<tag>` values, kept separate from `genres` so the parental-control projection
+    /// (`media_content_restriction_tags`) keeps matching on genres only.
+    pub tags: Vec<String>,
     pub provider_ids: BTreeMap<String, String>,
     pub directors: Vec<LocalNfoCredit>,
     pub writers: Vec<LocalNfoCredit>,
@@ -203,6 +211,7 @@ const MAX_MOVIE_NFO_DETAILS_ITEMS: usize = 64;
 const MAX_MOVIE_NFO_DETAILS_TEXT_BYTES: usize = 256 * 1024;
 const MAX_MOVIE_NFO_DETAILS_URL_BYTES: usize = 2048;
 const MAX_MOVIE_NFO_DETAILS_ID_BYTES: usize = 256;
+const MAX_NFO_RATING_ENTRIES: usize = 64;
 
 /// Parses all local NFO projections in one bounded XML pass.
 ///
@@ -240,6 +249,10 @@ fn parse_local_nfo_projection_inner(
     let mut depth = 0_usize;
     let mut event_count = 0_usize;
     let mut semantic_tokens = include_semantic_fingerprint.then(Vec::new);
+    let mut ratings_depth = None;
+    let mut rating_entries: Vec<ParsedRatingEntry> = Vec::new();
+    let mut active_rating_entry = None;
+    let mut active_rating_field: Option<ActiveRatingField> = None;
 
     loop {
         event_count = event_count.saturating_add(1);
@@ -270,6 +283,33 @@ fn parse_local_nfo_projection_inner(
                         });
                 } else if depth == 2 {
                     active_direct = direct_value_kind(&event)?;
+                    if event.name().as_ref() == b"ratings" {
+                        ratings_depth = Some(depth);
+                        rating_entries.clear();
+                        active_rating_entry = None;
+                        active_rating_field = None;
+                    }
+                } else if let Some(rating_depth) = ratings_depth {
+                    if depth == rating_depth.saturating_add(1) && event.name().as_ref() == b"rating"
+                    {
+                        active_rating_entry = if rating_entries.len() < MAX_NFO_RATING_ENTRIES {
+                            Some(rating_entry(&event)?)
+                        } else {
+                            None
+                        };
+                    } else if depth == rating_depth.saturating_add(2) {
+                        active_rating_field = match event.name().as_ref() {
+                            b"value" => Some(ActiveRatingField {
+                                field: RatingFieldKind::Value,
+                                text: String::new(),
+                            }),
+                            b"votes" => Some(ActiveRatingField {
+                                field: RatingFieldKind::Votes,
+                                text: String::new(),
+                            }),
+                            _ => None,
+                        };
+                    }
                 }
             }
             Ok(Event::Text(event)) => {
@@ -291,8 +331,10 @@ fn parse_local_nfo_projection_inner(
                 append_projection_text(
                     depth,
                     actor_depth,
+                    ratings_depth,
                     active_direct.as_mut(),
                     active_actor.as_mut(),
+                    active_rating_field.as_mut(),
                     value.as_ref(),
                 )?;
             }
@@ -309,8 +351,10 @@ fn parse_local_nfo_projection_inner(
                 append_projection_text(
                     depth,
                     actor_depth,
+                    ratings_depth,
                     active_direct.as_mut(),
                     active_actor.as_mut(),
+                    active_rating_field.as_mut(),
                     value.as_ref(),
                 )?;
             }
@@ -345,6 +389,29 @@ fn parse_local_nfo_projection_inner(
                 {
                     let raw_value = active.text.trim().to_owned();
                     assign_direct_value(&mut projection, active, &raw_value)?;
+                } else if let Some(rating_depth) = ratings_depth {
+                    if depth == rating_depth.saturating_add(2) {
+                        if let (Some(entry), Some(field)) =
+                            (active_rating_entry.as_mut(), active_rating_field.take())
+                        {
+                            let text = field.text.trim().to_owned();
+                            if !text.is_empty() {
+                                match field.field {
+                                    RatingFieldKind::Value => entry.value = Some(text),
+                                    RatingFieldKind::Votes => entry.votes = Some(text),
+                                }
+                            }
+                        }
+                    } else if depth == rating_depth.saturating_add(1) {
+                        if let Some(entry) = active_rating_entry.take() {
+                            rating_entries.push(entry);
+                        }
+                        active_rating_field = None;
+                    } else if depth == rating_depth {
+                        ratings_depth = None;
+                        active_rating_entry = None;
+                        active_rating_field = None;
+                    }
                 }
                 if depth == 0 {
                     return Err(NfoError::Unbalanced);
@@ -352,6 +419,11 @@ fn parse_local_nfo_projection_inner(
                 depth -= 1;
             }
             Ok(Event::Empty(event)) => {
+                if event.name().as_ref() == b"ratings" && ratings_depth == Some(2) {
+                    ratings_depth = None;
+                    active_rating_entry = None;
+                    active_rating_field = None;
+                }
                 if let Some(tokens) = semantic_tokens.as_mut() {
                     let decoder = reader.decoder();
                     tokens.push(NfoSemanticToken::start(&event, decoder)?);
@@ -411,8 +483,10 @@ fn parse_local_nfo_projection_inner(
                     append_projection_text(
                         depth,
                         actor_depth,
+                        ratings_depth,
                         active_direct.as_mut(),
                         active_actor.as_mut(),
+                        active_rating_field.as_mut(),
                         &value,
                     )?;
                 }
@@ -421,6 +495,18 @@ fn parse_local_nfo_projection_inner(
             Err(error) => return Err(NfoError::Xml(error.to_string())),
         }
         buffer.clear();
+    }
+
+    // A flat `<rating>`/`<votes>` pair remains the primary source; the Emby/Kodi
+    // `<ratings>` container only fills in when the flat form is absent, so the two
+    // shapes never mix a rating from one provider with votes from another.
+    if projection.details.rating.is_none()
+        && let Some((rating, votes)) = select_container_rating(&rating_entries)
+    {
+        projection.details.rating = Some(rating);
+        if projection.details.votes.is_none() {
+            projection.details.votes = votes;
+        }
     }
 
     let semantic_fingerprint = semantic_tokens
@@ -741,6 +827,28 @@ struct ActiveActorValue {
     text: String,
 }
 
+/// One `<rating>` entry inside an Emby/Jellyfin/Kodi `<ratings>` container.
+#[derive(Default)]
+struct ParsedRatingEntry {
+    provider: Option<String>,
+    is_default: bool,
+    max: Option<f64>,
+    value: Option<String>,
+    votes: Option<String>,
+}
+
+/// The nested `<value>` or `<votes>` element of the rating entry being read.
+struct ActiveRatingField {
+    field: RatingFieldKind,
+    text: String,
+}
+
+#[derive(Clone, Copy)]
+enum RatingFieldKind {
+    Value,
+    Votes,
+}
+
 #[derive(Clone, Copy)]
 enum BaseNfoField {
     Title,
@@ -775,14 +883,20 @@ fn base_nfo_field(name: &[u8]) -> Option<BaseNfoField> {
 fn append_projection_text(
     depth: usize,
     actor_depth: Option<usize>,
+    ratings_depth: Option<usize>,
     direct: Option<&mut ActiveDirectValue>,
     actor: Option<&mut ActiveActorValue>,
+    rating_field: Option<&mut ActiveRatingField>,
     value: &str,
 ) -> Result<(), NfoError> {
     if depth == 2 {
         if let Some(direct) = direct {
             append_rich_text(&mut direct.text, value)?;
         }
+    } else if let (Some(ratings_depth), Some(field)) = (ratings_depth, rating_field)
+        && depth == ratings_depth.saturating_add(2)
+    {
+        append_rich_text(&mut field.text, value)?;
     } else if actor_depth.is_some_and(|actor_depth| depth == actor_depth.saturating_add(1))
         && let Some(actor) = actor
     {
@@ -872,6 +986,7 @@ enum RichValueKind {
     Country,
     Genre,
     Studio,
+    Tag,
     Provider(String),
     Director(String),
     Writer(String),
@@ -901,6 +1016,7 @@ fn rich_value_kind(event: &BytesStart<'_>) -> Result<Option<RichValueKind>, NfoE
         b"country" => RichValueKind::Country,
         b"genre" => RichValueKind::Genre,
         b"studio" => RichValueKind::Studio,
+        b"tag" => RichValueKind::Tag,
         b"trailer" => RichValueKind::Trailer,
         b"director" => {
             RichValueKind::Director(attribute_value(event, b"tmdbid")?.unwrap_or_default())
@@ -940,6 +1056,82 @@ fn attribute_value(event: &BytesStart<'_>, name: &[u8]) -> Result<Option<String>
         }
     }
     Ok(None)
+}
+
+/// Reads one `<rating>` entry of an Emby/Jellyfin/Kodi `<ratings>` container.
+///
+/// The container form nests the score and vote count
+/// (`<rating name="tmdb" max="10"><value>7.6</value><votes>204</votes></rating>`),
+/// so the flat `<rating>`/`<votes>` handling above does not reach them.
+/// `default="true"` marks the entry the writer considers authoritative.
+fn rating_entry(event: &BytesStart<'_>) -> Result<ParsedRatingEntry, NfoError> {
+    let provider = attribute_value(event, b"name")?
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty() && value.len() <= MAX_MOVIE_NFO_DETAILS_ID_BYTES);
+    let is_default = attribute_value(event, b"default")?.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes"
+        )
+    });
+    let max = attribute_value(event, b"max")?
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0);
+    Ok(ParsedRatingEntry {
+        provider,
+        is_default,
+        max,
+        value: None,
+        votes: None,
+    })
+}
+
+/// Picks the entry the ratings container should contribute and normalizes it to 0-10.
+///
+/// Entries that cannot produce a score are skipped instead of shadowing a usable
+/// sibling: an explicit default wins, then the movie database entry, then the first
+/// readable score.
+fn select_container_rating(entries: &[ParsedRatingEntry]) -> Option<(f64, Option<i64>)> {
+    let mut best: Option<(&ParsedRatingEntry, f64, u8)> = None;
+    for entry in entries {
+        let Some(rating) = container_rating_value(entry) else {
+            continue;
+        };
+        let priority = if entry.is_default {
+            0
+        } else if entry.provider.as_deref().is_some_and(is_tmdb_provider_name) {
+            1
+        } else {
+            2
+        };
+        if best.is_none_or(|(_, _, current)| priority < current) {
+            best = Some((entry, rating, priority));
+        }
+    }
+    let (entry, rating, _) = best?;
+    let votes = entry
+        .votes
+        .as_deref()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value >= 0);
+    Some((rating, votes))
+}
+
+fn container_rating_value(entry: &ParsedRatingEntry) -> Option<f64> {
+    let value = entry.value.as_deref()?.trim().parse::<f64>().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    // Containers may declare a different scale (for example `max="100"`); Lux stores 0-10.
+    let scaled = match entry.max {
+        Some(max) => (value * 10.0 / max * 100.0).round() / 100.0,
+        None => value,
+    };
+    (scaled.is_finite() && (0.0..=10.0).contains(&scaled)).then_some(scaled)
+}
+
+fn is_tmdb_provider_name(name: &str) -> bool {
+    matches!(name, "tmdb" | "themoviedb")
 }
 
 fn append_rich_text(target: &mut String, value: &str) -> Result<(), NfoError> {
@@ -993,6 +1185,7 @@ fn assign_rich_value(
         RichValueKind::Country => push_bounded(&mut details.countries, raw_value),
         RichValueKind::Genre => push_bounded(&mut details.genres, raw_value),
         RichValueKind::Studio => push_bounded(&mut details.studios, raw_value),
+        RichValueKind::Tag => push_bounded(&mut details.tags, raw_value),
         RichValueKind::Provider(provider) => {
             if let Some(value) = bounded_id(raw_value) {
                 details.provider_ids.insert(provider, value);
@@ -3030,6 +3223,31 @@ impl NfoWriteService {
         self.read_item_projection_at_target(&target).await
     }
 
+    /// Whether `item_id` already has a sidecar NFO a rating write could rewrite.
+    ///
+    /// This is the read-only twin of [`Self::write_item_ratings`]: the same target resolution,
+    /// but nothing is created, parsed or written, so a caller can skip upstream work for items
+    /// whose ratings could never be stored. Items that are not a movie, series or episode report
+    /// `false` because those are exactly the kinds the rating writer skips.
+    pub async fn item_has_nfo(&self, item_id: &str) -> Result<bool, NfoWriteError> {
+        let Some(kind) = self.database.find_media_item_kind(item_id).await? else {
+            return Ok(false);
+        };
+        if !matches!(kind.item_type.as_str(), "MOVIE" | "SERIES" | "EPISODE") {
+            return Ok(false);
+        }
+        let target = match self.item_nfo_target_for_kind(item_id, &kind).await {
+            Ok(target) => target,
+            // A source that vanished (or was never indexed) is "no NFO", not a sync failure.
+            Err(NfoWriteError::ItemNotFound) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        Ok(tokio::fs::metadata(&target)
+            .await
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false))
+    }
+
     pub(crate) async fn read_item_projection_with_writeback_context_cached(
         &self,
         season_number: Option<i64>,
@@ -3280,6 +3498,14 @@ impl NfoWriteService {
             .find_media_item_kind(item_id)
             .await?
             .ok_or(NfoWriteError::ItemNotFound)?;
+        self.item_nfo_target_for_kind(item_id, &kind).await
+    }
+
+    async fn item_nfo_target_for_kind(
+        &self,
+        item_id: &str,
+        kind: &StoredMediaItemKind,
+    ) -> Result<PathBuf, NfoWriteError> {
         let source = match kind.item_type.as_str() {
             "MOVIE" | "EPISODE" | "VIDEO" => {
                 self.database
@@ -4812,6 +5038,44 @@ mod tests {
             !crate::application::images::should_suppress_internal_image_write(&target).await,
             "an external edit should invalidate the internal-write marker"
         );
+    }
+
+    #[test]
+    fn nfo_tag_elements_feed_the_item_tag_list() {
+        let details = parse_local_nfo_details(
+            br#"<movie><title>Tags</title><tag>  Sci-Fi  </tag>
+                <tag>Sci-Fi</tag><tag>Director's Cut</tag>
+                <tag>   </tag><tag></tag><genre>Drama</genre></movie>"#,
+        )
+        .expect("parse tag elements");
+
+        assert_eq!(details.tags, ["Sci-Fi", "Director's Cut"]);
+        assert_eq!(details.genres, ["Drama"]);
+    }
+
+    #[test]
+    fn nfo_tag_elements_follow_the_bounded_detail_rules() {
+        let mut xml = String::from("<movie>");
+        for index in 0..(MAX_MOVIE_NFO_DETAILS_ITEMS + 8) {
+            xml.push_str(&format!("<tag>tag-{index}</tag>"));
+        }
+        xml.push_str("</movie>");
+        let details = parse_local_nfo_details(xml.as_bytes()).expect("bounded tag parse");
+        assert_eq!(details.tags.len(), MAX_MOVIE_NFO_DETAILS_ITEMS);
+        assert_eq!(details.tags.first().map(String::as_str), Some("tag-0"));
+        assert_eq!(details.tags.last().map(String::as_str), Some("tag-63"));
+        assert!(
+            !details.tags.iter().any(|tag| tag == "tag-64"),
+            "tag values stop at the shared detail item bound"
+        );
+
+        let oversized = format!(
+            "<movie><tag>{}</tag></movie>",
+            "x".repeat(MAX_MOVIE_NFO_DETAILS_TEXT_BYTES + 1)
+        );
+        let error = parse_local_nfo_details(oversized.as_bytes())
+            .expect_err("an oversized tag is rejected like the other detail fields");
+        assert!(matches!(error, NfoError::FieldTooLarge));
     }
 
     #[test]

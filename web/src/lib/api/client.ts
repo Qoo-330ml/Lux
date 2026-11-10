@@ -28,6 +28,7 @@ import type {
   AdminStrmProbeJob,
   AdminChapterDetectionJob,
   AdminDanmakuMatchJob,
+  ManualDanmakuSearchResponse,
   AdminLibraryCoverJob,
   AdminLibraryDeletionJob,
   AdminLibraryDeletionJobsPage,
@@ -126,6 +127,8 @@ import type {
   LoginBackgroundResponse,
   MetadataFieldName,
   PageResponse,
+  SimilarItemsQuery,
+  SimilarItemsResponse,
   PersonDetail,
   PlaybackState,
   PlaybackEventState,
@@ -136,7 +139,7 @@ import type {
   AdminTranscodingStatus,
   AdminTranscodingSessions,
   AdminTranscodingHistoryPage,
-  WebPlaybackTrackSelection,
+  WebPlaybackRequestSelection,
   WebDanmakuInfo,
   SetupStatus,
   SetupDatabaseBackend,
@@ -208,6 +211,12 @@ export type LibraryItemsOptions = {
   sortBy?: LibrarySortBy;
   sortOrder?: LibrarySortOrder;
   metadataStatus?: "PENDING";
+  /** 按发行年份筛选；参数名与 `LuxPageQuery::year` 一致。 */
+  year?: number;
+  /** 按已看/未看筛选；以 `is_played` 下发。 */
+  isPlayed?: boolean;
+  /** 只看收藏；以 `is_favorite` 下发。 */
+  isFavorite?: boolean;
   pageSize?: number;
   parentId?: string;
   fields?: "card";
@@ -675,6 +684,11 @@ export class LuxApiClient {
     return this.request<PageResponse<MediaItem>>(`/api/v1/favorites?${params}`);
   }
 
+  watchHistory(page = 1) {
+    const params = new URLSearchParams({ page: String(page), pageSize: "24" });
+    return this.request<PageResponse<MediaItem>>(`/api/v1/watch-history?${params}`);
+  }
+
   libraries() {
     return this.request<LibrariesResponse>("/api/v1/libraries");
   }
@@ -690,6 +704,9 @@ export class LuxApiClient {
     if (options.sortBy) params.set("sortBy", options.sortBy);
     if (options.sortOrder) params.set("sortOrder", options.sortOrder);
     if (options.metadataStatus) params.set("metadataStatus", options.metadataStatus);
+    if (options.year != null) params.set("year", String(options.year));
+    if (options.isPlayed != null) params.set("is_played", String(options.isPlayed));
+    if (options.isFavorite != null) params.set("is_favorite", String(options.isFavorite));
     if (options.parentId) params.set("parentId", options.parentId);
     if (options.fields) params.set("fields", options.fields);
     if (options.count === false) params.set("count", "false");
@@ -728,6 +745,13 @@ export class LuxApiClient {
 
   item(itemId: string) {
     return this.request<MediaItem>(`/api/v1/items/${encodeURIComponent(itemId)}`);
+  }
+
+  similarItems(itemId: string, options: SimilarItemsQuery = {}) {
+    const params = new URLSearchParams({ limit: String(options.limit ?? 12) });
+    return this.request<SimilarItemsResponse>(
+      `/api/v1/items/${encodeURIComponent(itemId)}/similar?${params}`,
+    );
   }
 
   person(personId: string) {
@@ -803,12 +827,12 @@ export class LuxApiClient {
     });
   }
 
-  startItemMetadataRefresh(itemId: string) {
+  startItemMetadataRefresh(itemId: string, mode: MetadataRefreshMode) {
     return this.request<AdminMetadataReidentifyStart>(
       `/api/v1/admin/items/${encodeURIComponent(itemId)}/metadata/refresh`,
       {
-      method: "POST",
-        body: JSON.stringify({ mode: "FILL_MISSING" }),
+        method: "POST",
+        body: JSON.stringify({ mode }),
       },
     );
   }
@@ -891,12 +915,20 @@ export class LuxApiClient {
     );
   }
 
+  /**
+   * `selection` carries the optional request fields the player controls:
+   * `audioStreamIndex`, `subtitleStreamIndex` and the manual quality ceiling
+   * `maxHeight` (pixels, 144–4320). It is spread into the body as-is, so the
+   * field names mirror `docs/API.md` rather than being remapped here. The legacy
+   * `maxBitrate` field is still part of the API contract but the player no longer
+   * sends it.
+   */
   createWebPlaybackSession(
     itemId: string,
     sourceId: string,
     capabilities: WebPlaybackCapabilities,
     signal?: AbortSignal,
-    selection?: WebPlaybackTrackSelection,
+    selection?: WebPlaybackRequestSelection,
   ) {
     return this.request<WebPlaybackSession>("/api/v1/playback/sessions", {
       method: "POST",
@@ -905,12 +937,13 @@ export class LuxApiClient {
     });
   }
 
+  /** Same optional `selection` fields as `createWebPlaybackSession`, including `maxHeight`. */
   createWebPlaybackBootstrap(
     itemId: string,
     sourceId: string | undefined,
     capabilities: WebPlaybackCapabilities,
     signal?: AbortSignal,
-    selection?: WebPlaybackTrackSelection,
+    selection?: WebPlaybackRequestSelection,
   ) {
     return this.request<WebPlaybackBootstrap>("/api/v1/playback/bootstrap", {
       method: "POST",
@@ -1174,6 +1207,8 @@ export class LuxApiClient {
     payloadFormat?: "LUX" | "EMBY";
     providerPluginId?: string;
     providerConfig?: Record<string, unknown>;
+    /** A new credential for a provider that declares a secret field; empty leaves it unchanged. */
+    secret?: string;
   }) {
     return this.request<{ destination: AdminWebhookDestination }>(
       `/api/v1/admin/notification-destinations/${encodeURIComponent(destinationId)}`,
@@ -1195,16 +1230,19 @@ export class LuxApiClient {
     );
   }
 
-  rotateAdminWebhookSecret(destinationId: string) {
+  rotateAdminWebhookSecret(destinationId: string, secret?: string) {
     return this.request<{ secret: string }>(
       `/api/v1/admin/notification-destinations/${encodeURIComponent(destinationId)}/rotate-secret`,
-      { method: "POST" },
+      secret ? { method: "POST", body: JSON.stringify({ secret }) } : { method: "POST" },
     );
   }
 
-  adminWebhookDeliveries() {
-    return this.request<{ deliveries?: AdminWebhookDelivery[]; page?: number; pageSize?: number }>(
-      "/api/v1/admin/notification-deliveries?page=1&pageSize=50",
+  adminWebhookDeliveries(params: { page: number; pageSize: number; status?: string; destinationId?: string }) {
+    const query = new URLSearchParams({ page: String(params.page), pageSize: String(params.pageSize) });
+    if (params.status) query.set("status", params.status);
+    if (params.destinationId) query.set("destinationId", params.destinationId);
+    return this.request<{ deliveries?: AdminWebhookDelivery[]; page?: number; pageSize?: number; total?: number }>(
+      `/api/v1/admin/notification-deliveries?${query.toString()}`,
     );
   }
 
@@ -1361,6 +1399,22 @@ export class LuxApiClient {
     return this.request<AdminMetadataReidentifyStart>(
       `/api/v1/admin/libraries/${encodeURIComponent(libraryId)}/metadata/refresh`,
       { method: "POST", body: JSON.stringify({ mode }) },
+    );
+  }
+
+  startLibraryDanmakuMatch(
+    libraryId: string,
+    options?: { concurrency?: number; overwrite?: boolean },
+  ) {
+    return this.request<{ job: AdminDanmakuMatchJob }>(
+      `/api/v1/admin/libraries/${encodeURIComponent(libraryId)}/danmaku/match`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          concurrency: options?.concurrency ?? 2,
+          overwrite: options?.overwrite ?? false,
+        }),
+      },
     );
   }
 
@@ -1898,9 +1952,17 @@ export class LuxApiClient {
     );
   }
 
-  adminMetadataReidentifyJobs(status?: string) {
+  /**
+   * Lists metadata jobs.
+   *
+   * `includePending` opts into the server-side pending candidate aggregation: the default page
+   * leaves `pendingCount` null instead of joining job items with candidates (S6 of
+   * `docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md`).
+   */
+  adminMetadataReidentifyJobs(status?: string, options?: { includePending?: boolean }) {
     const params = new URLSearchParams({ page: "1", pageSize: "50" });
     if (status) params.set("status", status);
+    if (options?.includePending) params.set("includePending", "1");
     return this.request<{ jobs?: AdminMetadataReidentifyJob[] }>(
       `/api/v1/admin/metadata/reidentify?${params}`,
     );
@@ -1956,6 +2018,64 @@ export class LuxApiClient {
     if (status) params.set("status", status);
     return this.request<{ jobs?: AdminLibraryCoverJob[] }>(
       `/api/v1/admin/library-cover-jobs?${params}`,
+    );
+  }
+
+  /**
+   * Administrator manual danmaku candidates for one item (ADR-052 P5).
+   *
+   * `query` defaults to the item's own title on the server; `limit` defaults to 20 and is capped at
+   * 50. Every search reaches the upstream provider, so the endpoint is rate limited per session and
+   * answers `429 RATE_LIMITED` when the budget is exhausted.
+   */
+  manualDanmakuSearch(
+    itemId: string,
+    options?: { query?: string; sourceId?: string; limit?: number },
+  ) {
+    const params = new URLSearchParams();
+    if (options?.query) params.set("query", options.query);
+    if (options?.sourceId) params.set("sourceId", options.sourceId);
+    if (options?.limit !== undefined) params.set("limit", String(options.limit));
+    const search = params.toString();
+    return this.request<ManualDanmakuSearchResponse>(
+      `/api/v1/admin/items/${encodeURIComponent(itemId)}/danmaku/search${search ? `?${search}` : ""}`,
+    );
+  }
+
+  /** Queues the single-item manual danmaku match job; answers `202` with the match job. */
+  startManualDanmakuMatch(
+    itemId: string,
+    selection: {
+      sourceId?: string;
+      provider?: string;
+      animeId?: string;
+      episodeId: string;
+      overwrite: boolean;
+    },
+  ) {
+    return this.request<{ job: AdminDanmakuMatchJob }>(
+      `/api/v1/admin/items/${encodeURIComponent(itemId)}/danmaku/match`,
+      { method: "POST", body: JSON.stringify(selection) },
+    );
+  }
+
+  /**
+   * Deletes the registered sidecar file and its danmaku track of one media source.
+   *
+   * A sidecar the user wrote next to the media file (no provider) is only removed with
+   * `confirmUserSidecar: true`; the server answers `409` otherwise.
+   */
+  deleteItemDanmaku(
+    itemId: string,
+    options?: { sourceId?: string; confirmUserSidecar?: boolean },
+  ) {
+    const params = new URLSearchParams();
+    if (options?.sourceId) params.set("sourceId", options.sourceId);
+    if (options?.confirmUserSidecar) params.set("confirmUserSidecar", "true");
+    const query = params.toString();
+    return this.request<void>(
+      `/api/v1/admin/items/${encodeURIComponent(itemId)}/danmaku${query ? `?${query}` : ""}`,
+      { method: "DELETE" },
     );
   }
 

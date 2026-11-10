@@ -4,6 +4,13 @@ import { readFileSync } from "node:fs";
 import { stylesheet as allStyles } from "./style-source.mjs";
 
 const stylesheet = allStyles;
+const homePageSource = readFileSync(new URL("../src/features/home/HomePage.tsx", import.meta.url), "utf8");
+
+test("hero carousel derives its slide index from the list instead of remounting", () => {
+  assert.doesNotMatch(homePageSource, /<HeroCarousel key=/);
+  assert.match(homePageSource, /const \[slideKeyState, setSlideKeyState\] = useState\(slideKey\)/);
+  assert.match(homePageSource, /if \(slideKeyState !== slideKey\) \{[\s\S]*?setActiveIndex\(0\);/);
+});
 
 test("hero carousel controls share a flexible row and stay at its right edge", () => {
   const actionRowRule = stylesheet.match(/\.lux-hero-action-row\s*\{([^}]*)\}/)?.[1] ?? "";
@@ -22,6 +29,10 @@ test("hero carousel uses a bordered progress dot instead of arrow controls", () 
   assert.match(stylesheet, /\.lux-hero-dot\.is-active\s*\{[^}]*border:\s*1px\s+solid/);
   assert.match(stylesheet, /\.lux-hero-dot-progress\s*\{[^}]*animation:\s*lux-hero-dot-progress/);
   assert.match(stylesheet, /@keyframes lux-hero-dot-progress\s*\{[\s\S]*?100%\s*\{[^}]*transform:\s*scaleX\(1\)/);
+});
+
+test("hero progress dot freezes whenever autoplay is paused", () => {
+  assert.match(stylesheet, /\.lux-hero-dot-progress\.is-paused\s*\{[^}]*animation-play-state:\s*paused/);
 });
 
 test("hero keeps a shorter vertical footprint across responsive breakpoints", () => {

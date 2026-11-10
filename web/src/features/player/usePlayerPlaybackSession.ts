@@ -6,9 +6,10 @@ import type {
   MediaItem,
   MediaSource,
   PlaybackState,
+  WebPlaybackRequestSelection,
   WebPlaybackSession,
-  WebPlaybackTrackSelection,
 } from "../../lib/api/types";
+import { parseMaxHeightParam } from "./playback-quality";
 import { webPlaybackCapabilities } from "./playback-capabilities";
 import { episodeNavigationFor } from "./player-page-helpers";
 import type { PlayerEpisodeNavigation } from "./components/player-controls";
@@ -18,7 +19,13 @@ type PlayerPlaybackSessionOptions = {
   requestedSourceId: string | null;
   requestedAudioStreamIndex: string | null;
   requestedSubtitleStreamIndex: string | null;
+  requestedMaxHeight: string | null;
   playbackAttempt: number;
+  /**
+   * The previous native Direct Play attempt decoded no audio at all, so the fallback request must
+   * not offer the audio track as a copy again.
+   */
+  forceAudioTranscode?: boolean;
 };
 
 export type PlayerPlaybackSession = {
@@ -53,19 +60,25 @@ export function usePlayerPlaybackSession({
   requestedSourceId,
   requestedAudioStreamIndex,
   requestedSubtitleStreamIndex,
+  requestedMaxHeight,
   playbackAttempt,
+  forceAudioTranscode = false,
 }: PlayerPlaybackSessionOptions): PlayerPlaybackSession {
-  const trackSelection = useMemo<WebPlaybackTrackSelection | undefined>(() => {
+  // Out-of-contract URL values are dropped instead of being sent: the API
+  // rejects them with 400 and the player would have no recoverable UI state.
+  const maxHeight = parseMaxHeightParam(requestedMaxHeight);
+  const requestSelection = useMemo<WebPlaybackRequestSelection | undefined>(() => {
     const audioStreamIndex = requestedAudioStreamIndex?.trim() ? Number(requestedAudioStreamIndex) : undefined;
     const subtitleStreamIndex = requestedSubtitleStreamIndex?.trim() ? Number(requestedSubtitleStreamIndex) : undefined;
-    return Number.isInteger(audioStreamIndex) || Number.isInteger(subtitleStreamIndex)
+    return Number.isInteger(audioStreamIndex) || Number.isInteger(subtitleStreamIndex) || maxHeight !== null
       ? {
         ...(Number.isInteger(audioStreamIndex) ? { audioStreamIndex } : {}),
         ...(Number.isInteger(subtitleStreamIndex) ? { subtitleStreamIndex } : {}),
+        ...(maxHeight !== null ? { maxHeight } : {}),
       }
       : undefined;
-  }, [requestedAudioStreamIndex, requestedSubtitleStreamIndex]);
-  const bootstrapKey = `${itemId}:${requestedSourceId ?? ""}:${requestedAudioStreamIndex ?? ""}:${playbackAttempt}`;
+  }, [maxHeight, requestedAudioStreamIndex, requestedSubtitleStreamIndex]);
+  const bootstrapKey = `${itemId}:${requestedSourceId ?? ""}:${requestedAudioStreamIndex ?? ""}:${maxHeight ?? ""}:${playbackAttempt}`;
   const [sessionGateKey, setSessionGateKey] = useState(bootstrapKey);
 
   const playbackBootstrap = usePlaybackBootstrapQuery({
@@ -73,8 +86,9 @@ export function usePlayerPlaybackSession({
     requestedSourceId,
     requestedAudioStreamIndex,
     requestedSubtitleStreamIndex,
+    maxHeight,
     playbackAttempt,
-    trackSelection,
+    requestSelection,
     bootstrapKey,
     sessionGateKey,
   });
@@ -112,7 +126,7 @@ export function usePlayerPlaybackSession({
   const playbackKeySourceId = playbackAttempt === 0 && !requestedSourceId
     ? ""
     : source?.id ?? requestedSourceId ?? "";
-  const playbackKey = `${itemId}:${playbackKeySourceId}:${requestedAudioStreamIndex ?? ""}:${playbackAttempt}`;
+  const playbackKey = `${itemId}:${playbackKeySourceId}:${requestedAudioStreamIndex ?? ""}:${maxHeight ?? ""}:${playbackAttempt}`;
   const sessionStartedRef = useRef(false);
   const playbackSessionIdRef = useRef<string | null>(null);
   const webPlaybackSession = useWebPlaybackSessionQuery({
@@ -121,12 +135,14 @@ export function usePlayerPlaybackSession({
     playbackAttempt,
     requestedAudioStreamIndex,
     requestedSubtitleStreamIndex,
-    trackSelection,
+    maxHeight,
+    requestSelection,
     useLegacyPlaybackQueries,
     playbackKey,
     sessionGateKey,
     sessionStartedRef,
     playbackSessionIdRef,
+    forceAudioTranscode,
   });
   const playbackSession = playbackBootstrap.isPlaceholderData
     ? webPlaybackSession.data
@@ -156,8 +172,9 @@ export function usePlayerPlaybackSession({
   };
 }
 
-type BootstrapQueryOptions = PlayerPlaybackSessionOptions & {
-  trackSelection: WebPlaybackTrackSelection | undefined;
+type BootstrapQueryOptions = Omit<PlayerPlaybackSessionOptions, "requestedMaxHeight"> & {
+  maxHeight: number | null;
+  requestSelection: WebPlaybackRequestSelection | undefined;
   bootstrapKey: string;
   sessionGateKey: string;
 };
@@ -167,20 +184,28 @@ function usePlaybackBootstrapQuery({
   requestedSourceId,
   requestedAudioStreamIndex,
   requestedSubtitleStreamIndex,
+  maxHeight,
   playbackAttempt,
-  trackSelection,
+  requestSelection,
   bootstrapKey,
   sessionGateKey,
 }: BootstrapQueryOptions) {
   const bootstrapCapabilities = webPlaybackCapabilities(undefined, playbackAttempt);
   return useQuery({
-    queryKey: queryKeys.playbackBootstrap(itemId, requestedSourceId, playbackAttempt, requestedAudioStreamIndex, requestedSubtitleStreamIndex),
+    queryKey: queryKeys.playbackBootstrap(
+      itemId,
+      requestedSourceId,
+      playbackAttempt,
+      requestedAudioStreamIndex,
+      requestedSubtitleStreamIndex,
+      maxHeight,
+    ),
     queryFn: ({ signal }) => api.createWebPlaybackBootstrap(
       itemId,
       requestedSourceId ?? undefined,
       bootstrapCapabilities,
       signal,
-      trackSelection,
+      requestSelection,
     ),
     enabled: Boolean(itemId) && playbackAttempt === 0 && sessionGateKey === bootstrapKey,
     retry: false,
@@ -211,12 +236,14 @@ type WebPlaybackSessionQueryOptions = {
   playbackAttempt: number;
   requestedAudioStreamIndex: string | null;
   requestedSubtitleStreamIndex: string | null;
-  trackSelection: WebPlaybackTrackSelection | undefined;
+  maxHeight: number | null;
+  requestSelection: WebPlaybackRequestSelection | undefined;
   useLegacyPlaybackQueries: boolean;
   playbackKey: string;
   sessionGateKey: string;
   sessionStartedRef: { current: boolean };
   playbackSessionIdRef: { current: string | null };
+  forceAudioTranscode: boolean;
 };
 
 function useWebPlaybackSessionQuery({
@@ -225,22 +252,33 @@ function useWebPlaybackSessionQuery({
   playbackAttempt,
   requestedAudioStreamIndex,
   requestedSubtitleStreamIndex,
-  trackSelection,
+  maxHeight,
+  requestSelection,
   useLegacyPlaybackQueries,
   playbackKey,
   sessionGateKey,
   sessionStartedRef,
   playbackSessionIdRef,
+  forceAudioTranscode,
 }: WebPlaybackSessionQueryOptions) {
-  const capabilities = webPlaybackCapabilities(source, playbackAttempt);
+  // A retry that follows a silent native track declares the audio track non-copyable, so the
+  // server's existing capabilities decision picks the audio-transcode tier.
+  const capabilities = webPlaybackCapabilities(source, playbackAttempt, undefined, { forceAudioTranscode });
   return useQuery({
-    queryKey: queryKeys.webPlaybackSession(itemId, source?.id ?? "", playbackAttempt, requestedAudioStreamIndex, requestedSubtitleStreamIndex),
+    queryKey: queryKeys.webPlaybackSession(
+      itemId,
+      source?.id ?? "",
+      playbackAttempt,
+      requestedAudioStreamIndex,
+      requestedSubtitleStreamIndex,
+      maxHeight,
+    ),
     queryFn: ({ signal }) => api.createWebPlaybackSession(
       itemId,
       source?.id ?? "",
       capabilities,
       signal,
-      trackSelection,
+      requestSelection,
     ),
     enabled: Boolean(itemId && source?.id) && useLegacyPlaybackQueries
       && (sessionGateKey === playbackKey

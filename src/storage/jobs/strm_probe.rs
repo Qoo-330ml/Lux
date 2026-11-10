@@ -212,7 +212,12 @@ impl Database {
         status: &str,
         error: Option<&str>,
     ) -> Result<(), StorageError> {
-        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
+        // This transaction reads the job row it updates. A deferred `BEGIN` upgrades to the write
+        // lock on the first UPDATE and fails with SQLITE_BUSY_SNAPSHOT when another connection
+        // committed after this snapshot; `busy_timeout` does not retry that. A failed finish would
+        // leave the job RUNNING forever, so start with the write lock (see
+        // `Database::begin_metadata_write_transaction`).
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         let cancelled_scope: Option<(String, Option<String>)> = self
             .query_as(
                 "SELECT library_id, target_source_id FROM strm_probe_jobs
@@ -267,7 +272,10 @@ impl Database {
         .execute(&mut *transaction)
         .await
         .map_err(self.sqlx_err())?;
-        transaction.commit().await.map_err(self.sqlx_err())
+        transaction.commit().await.map_err(self.sqlx_err())?;
+        // Finishing a job can reset a source's probe status, which the read model derives.
+        self.signal_outbox_consumers();
+        Ok(())
     }
 }
 

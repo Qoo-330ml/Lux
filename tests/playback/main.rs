@@ -1,3 +1,6 @@
+#[path = "../common/realtime.rs"]
+mod realtime;
+
 mod chapter_detection;
 mod chapter_detection_api;
 mod chapters;

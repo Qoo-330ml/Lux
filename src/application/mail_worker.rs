@@ -2,6 +2,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -10,10 +11,14 @@ use lettre::{
     message::{Mailbox, header::ContentType},
 };
 use subtle::ConstantTimeEq;
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::{
+    sync::{Notify, watch},
+    task::JoinHandle,
+};
 use url::Url;
 
 use crate::{
+    application::background_loop::wait_for_wake_or_shutdown,
     application::mail::{
         MailChallengeSigner, MailError, MailSettings, SmtpCredentials, build_smtp_transport,
         hash_mail_challenge_token, read_mail_settings, read_smtp_credentials,
@@ -23,7 +28,13 @@ use crate::{
     },
 };
 
-const MAIL_QUEUE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Idle fallback for the delivery worker. Every in-process enqueue wakes it through
+/// [`Database::notify_mail_outbox_appended`], so this only covers a row another process (or a future
+/// enqueue path that forgets to notify) wrote, and it can be slow.
+const MAIL_QUEUE_POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// Retry cadence after an attempt that did not send: a deferred row is due in seconds, so the
+/// worker keeps the old cadence while the queue is actually moving.
+const MAIL_QUEUE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const MAIL_QUEUE_LEASE_SECONDS: i64 = 30;
 const MAIL_RETRY_BASE_SECONDS: i64 = 30;
 const MAX_MAIL_ATTEMPTS: i64 = 5;
@@ -36,10 +47,14 @@ pub struct MailDeliveryWorker {
 impl MailDeliveryWorker {
     pub fn start(database: Database, config_dir: PathBuf) -> Self {
         let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+        // The wake-up belongs to this database instance, so a second worker (another database, or a
+        // parallel test) never consumes it.
+        let wake = database.mail_outbox_appended();
         let task = tokio::spawn(run_mail_delivery_worker(
             database,
             config_dir,
             shutdown_receiver,
+            wake,
         ));
         Self {
             shutdown_sender,
@@ -102,13 +117,14 @@ async fn run_mail_delivery_worker(
     database: Database,
     config_dir: PathBuf,
     mut shutdown: watch::Receiver<bool>,
+    wake: Arc<Notify>,
 ) {
     loop {
         if *shutdown.borrow() {
             return;
         }
 
-        match process_next_mail(
+        let wait = match process_next_mail(
             &database,
             &config_dir,
             current_timestamp(),
@@ -117,22 +133,21 @@ async fn run_mail_delivery_worker(
         .await
         {
             Ok(MailWorkerStep::Sent | MailWorkerStep::Failed) => continue,
-            Ok(MailWorkerStep::Empty | MailWorkerStep::Deferred) => {}
+            // Nothing claimable: park until an enqueue wakes us.
+            Ok(MailWorkerStep::Empty) => MAIL_QUEUE_POLL_INTERVAL,
+            // A row is requeued for a retry seconds from now.
+            Ok(MailWorkerStep::Deferred) => MAIL_QUEUE_RETRY_INTERVAL,
             Err(_) => {
                 tracing::warn!(
                     event_code = "MAIL_QUEUE_PROCESSING_FAILED",
                     "mail queue processing failed"
                 );
+                MAIL_QUEUE_RETRY_INTERVAL
             }
-        }
+        };
 
-        tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    return;
-                }
-            }
-            _ = tokio::time::sleep(MAIL_QUEUE_POLL_INTERVAL) => {}
+        if wait_for_wake_or_shutdown(&mut shutdown, &wake, wait).await {
+            return;
         }
     }
 }
@@ -773,6 +788,132 @@ mod tests {
         let (_directory, database, config_dir) = test_context().await?;
         let worker = MailDeliveryWorker::start(database, config_dir);
         tokio::time::timeout(Duration::from_secs(1), worker.shutdown()).await?;
+        Ok(())
+    }
+
+    /// The idle fallback must stay well above the old 5 s poll, because an enqueue now wakes the
+    /// worker directly.
+    #[test]
+    fn the_idle_queue_fallback_stays_at_least_thirty_seconds() {
+        assert!(
+            super::MAIL_QUEUE_POLL_INTERVAL >= Duration::from_secs(30),
+            "the idle queue fallback must be at least 30 s"
+        );
+        assert!(
+            super::MAIL_QUEUE_RETRY_INTERVAL <= Duration::from_secs(5),
+            "a deferred message must keep the old retry cadence"
+        );
+    }
+
+    /// Context without SMTP settings: the worker records a "settings missing" attempt instead of
+    /// opening a network connection, which keeps these timing tests deterministic.
+    async fn wake_test_context() -> Result<(TempDir, Database, std::path::PathBuf), Box<dyn Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let config_dir = directory.path().join("config");
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8100".parse()?,
+            config_dir: config_dir.clone(),
+        })
+        .await?;
+        Ok((directory, database, config_dir))
+    }
+
+    async fn wait_for_attempt(
+        database: &Database,
+        outbox_id: &str,
+        seconds: u64,
+        reason: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        let started = std::time::Instant::now();
+        loop {
+            if read_outbox(database, outbox_id).await?.attempt_count >= 1 {
+                return Ok(());
+            }
+            assert!(started.elapsed() < Duration::from_secs(seconds), "{reason}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Enqueuing a message must wake the worker: waiting for the idle fallback would leave an
+    /// invitation or verification mail unsent for up to 30 s, worse than the old 5 s poll.
+    #[tokio::test]
+    async fn enqueueing_a_message_wakes_the_worker() -> Result<(), Box<dyn Error>> {
+        let (_directory, database, config_dir) = wake_test_context().await?;
+        let worker = MailDeliveryWorker::start(database.clone(), config_dir.clone());
+        // Let the first pass find an empty queue and park on the idle fallback.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let now = super::current_timestamp();
+        let (outbox_id, _token) = enqueue_challenge(
+            &database,
+            &config_dir,
+            MailChallengeKind::Invitation,
+            now,
+            now + 900,
+        )
+        .await?;
+        database.notify_mail_outbox_appended();
+
+        wait_for_attempt(
+            &database,
+            &outbox_id,
+            2,
+            "the worker must be woken by the enqueue, not by the idle fallback",
+        )
+        .await?;
+        tokio::time::timeout(Duration::from_secs(1), worker.shutdown()).await?;
+        Ok(())
+    }
+
+    /// The wake-up belongs to one database, so a second worker (another database, or a test running
+    /// in parallel) cannot consume it.
+    #[tokio::test]
+    async fn two_workers_do_not_steal_each_others_wake_ups() -> Result<(), Box<dyn Error>> {
+        let (_directory_a, database_a, config_dir_a) = wake_test_context().await?;
+        let (_directory_b, database_b, config_dir_b) = wake_test_context().await?;
+        let worker_a = MailDeliveryWorker::start(database_a.clone(), config_dir_a.clone());
+        let worker_b = MailDeliveryWorker::start(database_b.clone(), config_dir_b.clone());
+        // Let both loops find an empty queue and park on the idle fallback.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let now = super::current_timestamp();
+        let (outbox_a, _) = enqueue_challenge(
+            &database_a,
+            &config_dir_a,
+            MailChallengeKind::Invitation,
+            now,
+            now + 900,
+        )
+        .await?;
+        database_a.notify_mail_outbox_appended();
+        wait_for_attempt(
+            &database_a,
+            &outbox_a,
+            2,
+            "database A's worker must be woken by database A's signal",
+        )
+        .await?;
+
+        let (outbox_b, _) = enqueue_challenge(
+            &database_b,
+            &config_dir_b,
+            MailChallengeKind::Invitation,
+            now,
+            now + 900,
+        )
+        .await?;
+        database_b.notify_mail_outbox_appended();
+        wait_for_attempt(
+            &database_b,
+            &outbox_b,
+            2,
+            "database B's worker must be woken by database B's signal",
+        )
+        .await?;
+
+        tokio::time::timeout(Duration::from_secs(1), worker_a.shutdown()).await?;
+        tokio::time::timeout(Duration::from_secs(1), worker_b.shutdown()).await?;
         Ok(())
     }
 }

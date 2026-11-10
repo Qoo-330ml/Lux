@@ -495,7 +495,10 @@ async fn local_metadata_backfill_retries_nfo_failure_without_advancing_its_curso
     .bind(root.id.to_string())
     .execute(database.pool())
     .await?;
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    // The raw UPDATE bypasses the service write that signals the outbox worker, and the worker
+    // re-reads the queue on its own only after its 10 s idle fallback. A 10 s wait therefore
+    // raced that timer; leave several fallback periods so the retry path is what gets tested.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             let (status, title, attempts): (String, String, i64) = sqlx::query_as(
                 "SELECT backfill.status, item.title, backfill.attempts
@@ -707,8 +710,9 @@ async fn local_metadata_backfill_retry_keeps_conflicted_item_excluded()
     .bind(root.id.to_string())
     .execute(database.pool())
     .await?;
+    // Same idle-fallback race as the sibling retry test; the worker only re-reads after 10 s.
     let completed_page: (String, i64, Option<String>) =
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
                 let page: (String, i64, Option<String>) = sqlx::query_as(
                     "SELECT status, attempts, error FROM scan_local_metadata_backfills
@@ -819,7 +823,9 @@ async fn manifest_scan_indexes_poster_while_local_nfo_is_blocked()
     let mut scan = tokio::spawn(async move { scan_jobs.run_to_completion(&job_id, 1, None).await });
 
     let observations = async {
-        let poster_visible_before_nfo = tokio::time::timeout(Duration::from_secs(10), async {
+        // The whole target runs in parallel; a scan that has to reach the poster/local-batch
+        // overlap can take far longer than ten seconds when the drive is saturated.
+        let poster_visible_before_nfo = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let poster_count: i64 = sqlx::query_scalar(
                     "SELECT COUNT(*) FROM item_images

@@ -1,4 +1,4 @@
-import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { LuxSelect } from "../../components/LuxSelect";
@@ -8,7 +8,20 @@ import { GLOBAL_COLLECTION_LIBRARY_ID } from "../../lib/api/types";
 import type { Library } from "../../lib/api/types";
 import { MediaCard, mediaTitle } from "../home/media";
 import { LibraryGrid } from "./LibraryGrid";
-import { LuxButton } from "../../components/ui";
+import { LuxButton, LuxTextField } from "../../components/ui";
+import {
+  EMPTY_LIBRARY_FILTERS,
+  LIBRARY_FILTER_YEAR_MAX,
+  LIBRARY_FILTER_YEAR_MIN,
+  clearLibraryFilterParams,
+  isLibraryFilterYear,
+  libraryFilterQueryKey,
+  libraryFilterQueryOptions,
+  libraryFiltersActive,
+  libraryTypeFilterValues,
+  readLibraryFilters,
+  setLibraryFilterParam,
+} from "./libraryFilters";
 
 const LIBRARY_SORT_STORAGE_KEY = "lux.library.sort";
 const DEFAULT_BROWSER_TITLE = "Lux Server - Lux";
@@ -148,17 +161,27 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
   const libraries = useQuery({ queryKey: queryKeys.libraries, queryFn: () => api.libraries() });
   const library = libraries.data?.libraries?.find((entry) => entry.id === libraryId);
   const isHomeVideos = library?.kind === "HOMEVIDEOS";
+  // 有意决定：文件夹浏览（其他视频）不是电影/剧集目录，筛选 UNSET 的 FOLDER
+  // 与「已看/未看」语义也不明确，因此这里始终不显示筛选行，仅保留排序/元数据；
+  // 全局合集库（虚拟媒体库）同样不提供筛选。改动前请先确认产品口径。
+  const showFilters = !isGlobalCollectionLibrary && library?.kind !== "HOMEVIDEOS";
+  const filterTypes = libraryTypeFilterValues(library?.kind);
+  const filters = showFilters ? readLibraryFilters(searchParams, library?.kind) : EMPTY_LIBRARY_FILTERS;
+  const filtersActive = libraryFiltersActive(filters);
+  const filterQueryKey = libraryFilterQueryKey(filters);
+  const [yearDraft, setYearDraft] = useState<string>("");
   const folderPath = isHomeVideos ? homeVideoFolderPath(searchParams.get("folderPath")) : [];
   const parentId = isHomeVideos ? folderPath.at(-1)?.id ?? "root" : undefined;
   const showMetadataPending = libraries.data?.showMetadataPending ?? true;
-  // Until the library record arrives, fetch the top-level movie/series set. The
-  // same filter is safe for MOVIE/SERIES/MIXED libraries, so the key does not
-  // change again once the record loads; HOMEVIDEOS switches after the record.
+  // 库记录就绪后才决定 itemType：未校验的 `type` 不能用来发出首个请求，否则会
+  // 先发一次错误请求、再因为 kind 校验换键重发。库记录到来前保持默认集合。
   const itemTypes = isGlobalCollectionLibrary
     ? "BOX_SET"
     : library?.kind === "HOMEVIDEOS"
       ? undefined
       : "MOVIE,SERIES";
+  // 类型筛选直接在请求的 itemType 上收窄，不再叠加第二层类型参数。
+  const requestItemTypes = filters.itemType ?? itemTypes;
   const confirmMetadata = useMutation({
     mutationFn: () => api.confirmAdminMetadata([...selectedIds]),
     onSuccess: (result) => {
@@ -194,7 +217,11 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     setSelectionMode(false);
     setMergeOpen(false);
     setMergePrimaryId(undefined);
-  }, [libraryId, metadataStatus, parentId, sortBy, sortOrder]);
+  }, [libraryId, metadataStatus, parentId, sortBy, sortOrder, filterQueryKey]);
+
+  useEffect(() => {
+    setYearDraft(filters.year != null ? String(filters.year) : "");
+  }, [filters.year]);
 
   useEffect(() => {
     if (mergeOpen) mergeCloseButtonRef.current?.focus();
@@ -212,20 +239,24 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     };
   }, [library?.name, serverName]);
 
-  const libraryQueryKey = queryKeys.library(libraryId, 1, itemTypes, sortBy, sortOrder, metadataStatus ?? "all");
+  const libraryQueryKey = queryKeys.library(libraryId, 1, requestItemTypes, sortBy, sortOrder, metadataStatus ?? "all", 24, filterQueryKey);
   const pages = useInfiniteQuery({
     queryKey: parentId ? [...libraryQueryKey, parentId] : libraryQueryKey,
-    queryFn: ({ pageParam }) => api.libraryItems(libraryId, pageParam, itemTypes, {
+    queryFn: ({ pageParam }) => api.libraryItems(libraryId, pageParam, requestItemTypes, {
       sortBy,
       sortOrder,
       fields: "card",
       count: false,
+      ...libraryFilterQueryOptions(filters),
       ...(metadataStatus ? { metadataStatus } : {}),
       ...(parentId ? { parentId } : {}),
     }),
     initialPageParam: 1,
     maxPages: 5,
-    enabled: Boolean(libraryId),
+    // 库记录就绪后再请求，避免用未校验的 type 发出一次错误请求。
+    enabled: Boolean(libraryId) && Boolean(library),
+    // 切换筛选/排序时保留上一份结果，工具条和年份草稿不会被骨架屏卸载。
+    placeholderData: keepPreviousData,
     getNextPageParam: (lastPage) => {
       const page = lastPage.page ?? 1;
       if (typeof lastPage.hasNext === "boolean") return lastPage.hasNext ? page + 1 : undefined;
@@ -238,13 +269,14 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
 
   useEffect(() => {
     const sentinel = loadMoreRef.current;
-    if (!sentinel || !pages.hasNextPage || pages.isFetchingNextPage || typeof IntersectionObserver === "undefined") return;
+    // 占位数据属于上一组筛选，不能在它之上继续翻页。
+    if (!sentinel || !pages.hasNextPage || pages.isFetchingNextPage || pages.isPlaceholderData || typeof IntersectionObserver === "undefined") return;
     const observer = new IntersectionObserver((entries) => {
       if (entries.some((entry) => entry.isIntersecting)) void pages.fetchNextPage();
     }, { rootMargin: "600px 0px" });
     observer.observe(sentinel);
     return () => observer.disconnect();
-  }, [pages.fetchNextPage, pages.hasNextPage, pages.isFetchingNextPage]);
+  }, [pages.fetchNextPage, pages.hasNextPage, pages.isFetchingNextPage, pages.isPlaceholderData]);
 
   if (pages.error && !pages.data) return <section className="lux-page-state"><h1>媒体库加载失败</h1><p>{pages.error.message}</p></section>;
   if (!library && !libraries.isPending) return <section className="lux-page-state"><h1>媒体库不存在</h1><p>这个媒体库可能已被删除或你没有访问权限。</p></section>;
@@ -270,6 +302,22 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     { value: "ALL", label: "全部内容" },
     { value: "PENDING", label: "待确认" },
   ] as const;
+  const typeOptions = [
+    { value: "ALL", label: "全部类型" },
+    { value: "MOVIE", label: "电影" },
+    { value: "SERIES", label: "剧集" },
+  ] as const;
+  const playedOptions = [
+    { value: "ALL", label: "全部" },
+    { value: "UNPLAYED", label: "未看" },
+    { value: "PLAYED", label: "已看" },
+  ] as const;
+  const playedValue = filters.played === true ? "PLAYED" : filters.played === false ? "UNPLAYED" : "ALL";
+  const favoriteOptions = [
+    { value: "ALL", label: "全部" },
+    { value: "ONLY", label: "仅收藏" },
+  ] as const;
+  const favoriteValue = filters.favoriteOnly ? "ONLY" : "ALL";
   const selectedItems = loadedItems.filter((item) => selectedIds.has(item.id));
   const canMergeSelectedItems = selectedItems.length >= 2 && selectedItems.length === selectedIds.size;
   const allSelectedPending = selectedIds.size > 0
@@ -296,6 +344,38 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     if (value === "PENDING") next.set("metadataStatus", "pending");
     else next.delete("metadataStatus");
     setSearchParams(next);
+  }
+
+  function changeTypeFilter(value: string) {
+    setSearchParams(setLibraryFilterParam(searchParams, "type", value === "ALL" ? undefined : value));
+  }
+
+  function changePlayedFilter(value: string) {
+    setSearchParams(setLibraryFilterParam(searchParams, "status", value === "ALL" ? undefined : value.toLowerCase()));
+  }
+
+  function changeFavoriteFilter(value: string) {
+    setSearchParams(setLibraryFilterParam(searchParams, "favorite", value === "ALL" ? undefined : "1"));
+  }
+
+  function commitYearFilter() {
+    const trimmed = yearDraft.trim();
+    if (!trimmed) {
+      if (searchParams.has("year")) setSearchParams(setLibraryFilterParam(searchParams, "year", undefined));
+      return;
+    }
+    if (!isLibraryFilterYear(trimmed)) {
+      setYearDraft(filters.year != null ? String(filters.year) : "");
+      return;
+    }
+    const nextYear = String(Number(trimmed));
+    if (searchParams.get("year") === nextYear) return;
+    setSearchParams(setLibraryFilterParam(searchParams, "year", nextYear));
+  }
+
+  function clearLibraryFilters() {
+    setYearDraft("");
+    setSearchParams(clearLibraryFilterParams(searchParams));
   }
 
   function folderHref(item: { id: string; title?: string | null; name?: string | null }) {
@@ -346,6 +426,34 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
         <div className="lux-library-sort-control"><span>排序</span><LuxSelect value={sortBy} options={sortOptions} onChange={changeSortBy} aria-label="排序方式" /></div>
         <div className="lux-library-sort-control"><span>顺序</span><LuxSelect value={sortOrder} options={orderOptions} onChange={changeSortOrder} aria-label="排序顺序" /></div>
       </div> : null}
+      {showFilters ? <div className="lux-library-filter-toolbar" aria-label="媒体库筛选">
+        {filterTypes.length > 1 ? <div className="lux-library-sort-control"><span>类型</span><LuxSelect value={filters.itemType ?? "ALL"} options={typeOptions} onChange={changeTypeFilter} aria-label="媒体类型" /></div> : null}
+        <div className="lux-library-sort-control">
+          <span>年份</span>
+          <LuxTextField
+            className="lux-library-filter-year"
+            type="number"
+            inputMode="numeric"
+            min={LIBRARY_FILTER_YEAR_MIN}
+            max={LIBRARY_FILTER_YEAR_MAX}
+            step={1}
+            placeholder="全部"
+            aria-label="年份"
+            value={yearDraft}
+            onChange={(event) => setYearDraft(event.target.value)}
+            onBlur={commitYearFilter}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter") return;
+              event.preventDefault();
+              commitYearFilter();
+            }}
+          />
+        </div>
+        <div className="lux-library-sort-control"><span>观看</span><LuxSelect value={playedValue} options={playedOptions} onChange={changePlayedFilter} aria-label="观看状态" /></div>
+        <div className="lux-library-sort-control"><span>收藏</span><LuxSelect value={favoriteValue} options={favoriteOptions} onChange={changeFavoriteFilter} aria-label="收藏筛选" /></div>
+        {filtersActive ? <LuxButton tone="secondary" type="button" data-action="clear-library-filters" onClick={clearLibraryFilters}>清除筛选</LuxButton> : null}
+      </div> : null}
+      {pages.isPlaceholderData && pages.isFetching ? <p className="lux-muted-copy" role="status">正在更新列表…</p> : null}
       <LibraryGrid
         key={JSON.stringify([libraryQueryKey, parentId])}
         items={loadedItems}
@@ -410,7 +518,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
           </section>
         </div>
       ) : null}
-      {!loadedItems.length ? <div className="lux-empty-card"><span>{isGlobalCollectionLibrary ? "当前没有可见的合集。" : isHomeVideos && folderPath.length ? "此文件夹没有可浏览内容。" : "这个媒体库还没有内容。"}</span>{!(isHomeVideos && folderPath.length) ? <Link to="/libraries">返回媒体库</Link> : null}</div> : null}
+      {!loadedItems.length ? <div className="lux-empty-card"><span>{isGlobalCollectionLibrary ? "当前没有可见的合集。" : isHomeVideos && folderPath.length ? "此文件夹没有可浏览内容。" : filtersActive ? "没有符合筛选条件的内容。" : "这个媒体库还没有内容。"}</span>{!(isHomeVideos && folderPath.length) ? <Link to="/libraries">返回媒体库</Link> : null}</div> : null}
       <div ref={loadMoreRef} aria-hidden="true" />
       {pages.isFetchingNextPage ? <p className="lux-muted-copy" role="status">正在加载更多…</p> : null}
       {pages.isFetchNextPageError ? (

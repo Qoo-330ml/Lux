@@ -4303,7 +4303,7 @@ async fn lux_531_metadata_concurrency_benchmark() -> Result<(), Box<dyn std::err
             METADATA_CONCURRENCY_BENCHMARK_ITEMS as i64
         );
         assert_eq!(completed.items.len(), METADATA_CONCURRENCY_BENCHMARK_ITEMS);
-        assert_eq!(completed.pending_count, 0);
+        assert_eq!(completed.pending_count, Some(0));
         assert!(observed_peak > 0 && observed_peak <= concurrency);
         assert_eq!(active_after_job, 0);
         assert_eq!(successful_item_elapsed_ns.len(), successful_item_count);

@@ -1,11 +1,7 @@
 use super::*;
 
-use crate::application::admin_events::{UserEvent, UserEventScope, UserEventSubscriber};
-
 pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new()
-        .route("/api/v1/admin/events", get(admin_events))
-        .route("/api/v1/events", get(user_events))
         .route("/api/v1/admin/audit", get(admin_list_audit))
         .route("/api/v1/admin/logs/export", get(admin_export_logs))
         .route("/api/v1/admin/logs", get(admin_list_logs))
@@ -109,17 +105,50 @@ pub(crate) fn admin_event_scope_for_audit(event_type: &str) -> AdminEventScope {
     AdminEventScope::All
 }
 
+/// Human-readable item name for activity logs. Episodes read as
+/// "Series S01E03 Title" so the log says which episode was played.
+fn playback_item_display_title(
+    item_type: &str,
+    title: &str,
+    series_title: Option<&str>,
+    season_number: Option<i64>,
+    episode_number: Option<i64>,
+) -> String {
+    let Some(series_title) = series_title.filter(|_| item_type == "EPISODE") else {
+        return title.to_owned();
+    };
+    match (season_number, episode_number) {
+        (Some(season), Some(episode)) => {
+            format!("{series_title} S{season:02}E{episode:02} {title}")
+        }
+        _ => format!("{series_title} · {title}"),
+    }
+}
+
 pub(crate) async fn record_activity_event(
     database: Option<&Database>,
     admin_events: &AdminEventHub,
     user_id: &str,
     event_type: &str,
     target_id: Option<&str>,
-    metadata: Value,
+    mut metadata: Value,
 ) {
     let Some(database) = database else {
         return;
     };
+    if let Some(item_id) = target_id
+        && let Some(object) = metadata.as_object_mut()
+        && let Ok(Some(item)) = database.find_media_item_metadata(item_id).await
+    {
+        let title = playback_item_display_title(
+            &item.item_type,
+            &item.title,
+            item.series_title.as_deref(),
+            item.season_number,
+            item.episode_number,
+        );
+        object.insert("itemTitle".to_owned(), json!(title));
+    }
     let metadata_json = match serde_json::to_string(&metadata) {
         Ok(metadata_json) => metadata_json,
         Err(_) => return,
@@ -153,6 +182,33 @@ pub(crate) async fn record_activity_event(
     }
 }
 
+/// Emits the §18.3 failed-login event that Fail2Ban-style log tools parse.
+///
+/// The message and the field set are deliberately fixed: no username, credential, cookie,
+/// client-supplied device label, complete URL or query string may reach the log. The address is
+/// whatever the access-IP resolver produced at the call site; an unresolved address leaves the
+/// `remoteIp` field out entirely instead of logging a placeholder.
+///
+/// This touches no storage, so callers emit it for every failed attempt - including an unknown
+/// username or user id, which is exactly the credential-guessing case the ban list exists for -
+/// before they decide whether an account exists. It is separate from
+/// [`record_failed_authentication_event`] so one failure never produces two log lines.
+pub(crate) fn log_authentication_failure(remote_ip: Option<&str>) {
+    match remote_ip {
+        Some(remote_ip) => tracing::warn!(
+            "errorCode" = "AUTH_LOGIN_FAILED",
+            "remoteIp" = remote_ip,
+            "authentication failed"
+        ),
+        None => tracing::warn!("errorCode" = "AUTH_LOGIN_FAILED", "authentication failed"),
+    }
+}
+
+/// Records the storage side of a failed login for an account that actually exists.
+///
+/// The parseable log event is emitted by the call sites through [`log_authentication_failure`];
+/// this function owns only the activity index row, the audit record and the dashboard
+/// notification, so an unavailable database cannot silence the log event.
 pub(crate) async fn record_failed_authentication_event(
     database: Option<&Database>,
     admin_events: &AdminEventHub,
@@ -351,240 +407,6 @@ pub(crate) fn log_export_error_response(headers: &HeaderMap, error: LogExportErr
     }
 }
 
-pub(crate) async fn admin_events(
-    headers: HeaderMap,
-    State(state): State<ReadyAppState>,
-) -> Response {
-    if let Err(response) = require_admin(&headers, &state, false).await {
-        return response;
-    }
-    let Some(connections) = state.sse_permits.try_acquire() else {
-        return super::sse_capacity_response(&headers);
-    };
-
-    let mut receiver = state.admin_events.subscribe();
-    let (mut writer, reader) = tokio::io::duplex(16 * 1024);
-    tokio::spawn(async move {
-        // Held until the stream ends so the budget reflects live connections.
-        let _connections = connections;
-        if writer
-            .write_all(b"event: ready\ndata: {\"version\":1}\n\n")
-            .await
-            .is_err()
-        {
-            return;
-        }
-
-        let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
-        heartbeat.tick().await;
-        loop {
-            tokio::select! {
-                event = receiver.recv() => {
-                    let scope = match event {
-                        Ok(scope) => scope,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => AdminEventScope::All,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    };
-                    let frame = format!(
-                        "event: invalidate\ndata: {{\"scope\":\"{}\"}}\n\n",
-                        scope.as_str(),
-                    );
-                    if writer.write_all(frame.as_bytes()).await.is_err() {
-                        break;
-                    }
-                }
-                _ = heartbeat.tick() => {
-                    if writer.write_all(b": keep-alive\n\n").await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    event_stream_response(reader)
-}
-
-pub(crate) fn event_stream_response(reader: tokio::io::DuplexStream) -> Response {
-    let mut response = Response::new(Body::from_stream(tokio_util::io::ReaderStream::new(reader)));
-    response.headers_mut().insert(
-        "Content-Type",
-        HeaderValue::from_static("text/event-stream; charset=utf-8"),
-    );
-    response.headers_mut().insert(
-        "Cache-Control",
-        HeaderValue::from_static("no-cache, no-store, must-revalidate"),
-    );
-    response
-        .headers_mut()
-        .insert("X-Accel-Buffering", HeaderValue::from_static("no"));
-    response
-}
-
-pub(crate) async fn user_events(
-    headers: HeaderMap,
-    State(state): State<ReadyAppState>,
-) -> Response {
-    let user = match require_web_user(&headers, &state).await {
-        Ok(user) => user,
-        Err(response) => return response,
-    };
-    let Some(connections) = state.sse_permits.try_acquire() else {
-        return super::sse_capacity_response(&headers);
-    };
-
-    // The subscription only yields directory-level events and events about this
-    // user, so another user's playback ticks never reach this stream.
-    let receiver = state.user_events.subscribe_for(&user.id.to_string());
-    let (mut writer, reader) = tokio::io::duplex(16 * 1024);
-    tokio::spawn(async move {
-        // Held until the stream ends so the budget reflects live connections.
-        let _connections = connections;
-        if writer
-            .write_all(b"event: ready\ndata: {\"version\":1}\n\n")
-            .await
-            .is_err()
-        {
-            return;
-        }
-        pump_user_events(receiver, writer).await;
-    });
-
-    event_stream_response(reader)
-}
-
-/// Writes invalidations for one subscription until the client goes away.
-async fn pump_user_events<W>(mut receiver: UserEventSubscriber, mut writer: W)
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
-    heartbeat.tick().await;
-    loop {
-        tokio::select! {
-            event = receiver.recv() => {
-                let Some(event) = user_event_from_receive(event) else {
-                    break;
-                };
-                if writer.write_all(user_event_frame(&event).as_bytes()).await.is_err() {
-                    break;
-                }
-            }
-            _ = heartbeat.tick() => {
-                if writer.write_all(b": keep-alive\n\n").await.is_err() {
-                    break;
-                }
-            }
-        }
-    }
-}
-
-/// Decides what a broadcast receive outcome becomes on the stream.
-///
-/// A lagged subscriber may have missed invalidations of any scope, so it gets
-/// the full home refresh instead of an empty stream; a closed channel ends it.
-fn user_event_from_receive(
-    result: Result<UserEvent, tokio::sync::broadcast::error::RecvError>,
-) -> Option<UserEvent> {
-    match result {
-        Ok(event) => Some(event),
-        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-            Some(UserEvent::broadcast(UserEventScope::Home))
-        }
-        Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
-    }
-}
-
-/// Renders one invalidation frame.
-///
-/// Scope-only payloads keep the legacy `{"scope":"..."}` shape. `progress`
-/// events additionally carry the item the user is playing so the client can
-/// refresh that item's playback state instead of every media query.
-fn user_event_frame(event: &UserEvent) -> String {
-    #[derive(serde::Serialize)]
-    struct Frame<'a> {
-        scope: &'a str,
-        #[serde(rename = "itemId", skip_serializing_if = "Option::is_none")]
-        item_id: Option<&'a str>,
-    }
-
-    let frame = Frame {
-        scope: event.scope().as_str(),
-        item_id: event.item_id(),
-    };
-    let data = serde_json::to_string(&frame).unwrap_or_else(|_| "{\"scope\":\"home\"}".to_owned());
-    format!("event: invalidate\ndata: {data}\n\n")
-}
-
-#[cfg(test)]
-mod user_event_frame_tests {
-    use super::*;
-
-    #[test]
-    fn keeps_the_legacy_scope_only_frame_for_directory_events() {
-        assert_eq!(
-            user_event_frame(&UserEvent::broadcast(UserEventScope::Home)),
-            "event: invalidate\ndata: {\"scope\":\"home\"}\n\n"
-        );
-        assert_eq!(
-            user_event_frame(&UserEvent::for_user(UserEventScope::Item, "user-a")),
-            "event: invalidate\ndata: {\"scope\":\"item\"}\n\n"
-        );
-    }
-
-    #[test]
-    fn narrows_progress_frames_to_the_playing_item() {
-        assert_eq!(
-            user_event_frame(
-                &UserEvent::for_user(UserEventScope::Progress, "user-a").with_item_id("item-1")
-            ),
-            "event: invalidate\ndata: {\"scope\":\"progress\",\"itemId\":\"item-1\"}\n\n"
-        );
-    }
-
-    #[test]
-    fn lagged_subscribers_fall_back_to_the_full_home_refresh() {
-        let fallback =
-            user_event_from_receive(Err(tokio::sync::broadcast::error::RecvError::Lagged(3)))
-                .expect("a lagged subscriber still receives an invalidation");
-        assert_eq!(
-            user_event_frame(&fallback),
-            "event: invalidate\ndata: {\"scope\":\"home\"}\n\n"
-        );
-        assert!(
-            user_event_from_receive(Err(tokio::sync::broadcast::error::RecvError::Closed))
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn a_lagged_stream_writes_the_home_fallback_frame() {
-        use tokio::io::AsyncReadExt;
-
-        let hub = crate::application::admin_events::UserEventHub::new();
-        let subscriber = hub.subscribe_for("viewer");
-        // Overflow the broadcast buffer while the subscriber is not draining it,
-        // which is what a slow client looks like to the pump.
-        for _ in 0..(crate::application::admin_events::EVENT_CHANNEL_CAPACITY + 8) {
-            hub.publish(UserEventScope::Item);
-        }
-
-        let (mut client, server) = tokio::io::duplex(1024);
-        let pump = tokio::spawn(pump_user_events(subscriber, server));
-        let mut buffer = [0_u8; 1024];
-        let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buffer))
-            .await
-            .expect("the pump should write the fallback frame")
-            .expect("stream should be readable");
-        let frame = String::from_utf8_lossy(&buffer[..read]).to_string();
-        assert!(
-            frame.starts_with("event: invalidate\ndata: {\"scope\":\"home\"}\n\n"),
-            "a lagged stream must recover with a full home refresh: {frame}"
-        );
-        pump.abort();
-    }
-}
-
 #[cfg(test)]
 mod failed_authentication_activity_tests {
     use super::*;
@@ -647,5 +469,205 @@ mod failed_authentication_activity_tests {
             Ok(AdminEventScope::Dashboard)
         ));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod failed_authentication_log_event_tests {
+    use std::{
+        error::Error,
+        io::{self, Write},
+        sync::{Arc, Mutex},
+    };
+
+    use serde_json::Value;
+
+    use super::*;
+
+    use crate::{
+        application::{admin_events::AdminEventHub, setup::SetupService},
+        config::Config,
+        storage::Database,
+    };
+
+    /// The smallest in-memory sink that lets a test read what `tracing` actually emitted.
+    #[derive(Clone)]
+    struct CapturedTraceWriterFactory(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedTraceWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedTraceWriterFactory {
+        type Writer = CapturedTraceWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedTraceWriter(Arc::clone(&self.0))
+        }
+    }
+
+    impl Write for CapturedTraceWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut output = self
+                .0
+                .lock()
+                .map_err(|_| io::Error::other("captured trace buffer is unavailable"))?;
+            output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Captures `WARN`-level JSON events for the current thread into `buffer`.
+    ///
+    /// The returned guard must stay alive until the code under test ran; dropping it restores the
+    /// thread's previous dispatcher.
+    fn capture_warn_json(buffer: &Arc<Mutex<Vec<u8>>>) -> tracing::dispatcher::DefaultGuard {
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(CapturedTraceWriterFactory(Arc::clone(buffer)))
+            .finish();
+        tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber))
+    }
+
+    fn captured_json_events(buffer: &Arc<Mutex<Vec<u8>>>) -> Result<Vec<Value>, Box<dyn Error>> {
+        let logs = buffer
+            .lock()
+            .map_err(|_| "captured trace buffer is unavailable")?
+            .clone();
+        Ok(String::from_utf8(logs)?
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .collect())
+    }
+
+    fn login_failure_event(events: &[Value]) -> Result<Value, Box<dyn Error>> {
+        events
+            .iter()
+            .find(|event| event["fields"]["errorCode"] == "AUTH_LOGIN_FAILED")
+            .cloned()
+            .ok_or_else(|| "a failed login must emit an AUTH_LOGIN_FAILED log event".into())
+    }
+
+    #[test]
+    fn authentication_failure_event_carries_the_stable_code_and_remote_ip()
+    -> Result<(), Box<dyn Error>> {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let _capture = capture_warn_json(&buffer);
+
+        log_authentication_failure(Some("203.0.113.9"));
+
+        let event = login_failure_event(&captured_json_events(&buffer)?)?;
+        assert_eq!(event["level"], "WARN");
+        let fields = &event["fields"];
+        assert_eq!(fields["errorCode"], "AUTH_LOGIN_FAILED");
+        assert_eq!(fields["remoteIp"], "203.0.113.9");
+        assert_eq!(fields["message"], "authentication failed");
+        Ok(())
+    }
+
+    #[test]
+    fn authentication_failure_event_omits_an_unknown_remote_ip() -> Result<(), Box<dyn Error>> {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let _capture = capture_warn_json(&buffer);
+
+        log_authentication_failure(None);
+
+        let event = login_failure_event(&captured_json_events(&buffer)?)?;
+        assert_eq!(event["level"], "WARN");
+        assert_eq!(event["fields"]["errorCode"], "AUTH_LOGIN_FAILED");
+        assert_eq!(event["fields"]["message"], "authentication failed");
+        // Documented choice: an unresolved address drops the field entirely instead of logging
+        // `remoteIp: null`, so downstream parsers never see a non-address value.
+        assert!(
+            event["fields"].get("remoteIp").is_none(),
+            "an unknown address must not produce a remoteIp field: {event}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recording_the_storage_side_emits_no_log_event() -> Result<(), Box<dyn Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let user = setup
+            .complete("log-failure", "Failure", "private password")
+            .await?;
+        let user_id = user.id.to_string();
+        let hub = AdminEventHub::new();
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let _capture = capture_warn_json(&buffer);
+
+        record_failed_authentication_event(
+            Some(&database),
+            &hub,
+            &user_id,
+            "LUX_WEB_CLIENT_MARKER",
+            Some("203.0.113.9".to_owned()),
+        )
+        .await;
+
+        // The caller already emits the one §18.3 event through
+        // `log_authentication_failure`; recording the row must not repeat it, and must not leak
+        // the client label or the internal user id either.
+        let captured = String::from_utf8(
+            buffer
+                .lock()
+                .map_err(|_| "captured trace buffer is unavailable")?
+                .clone(),
+        )?;
+        assert!(
+            captured.is_empty(),
+            "the storage side must not log the login failure again: {captured}"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod playback_item_title_tests {
+    use super::*;
+
+    #[test]
+    fn episodes_show_series_season_episode_and_title() {
+        assert_eq!(
+            playback_item_display_title("EPISODE", "开端", Some("Show"), Some(1), Some(3)),
+            "Show S01E03 开端"
+        );
+        assert_eq!(
+            playback_item_display_title("EPISODE", "Long", Some("Show"), Some(12), Some(120)),
+            "Show S12E120 Long"
+        );
+    }
+
+    #[test]
+    fn episodes_without_numbers_fall_back_to_series_and_title() {
+        assert_eq!(
+            playback_item_display_title("EPISODE", "Pilot", Some("Show"), None, Some(1)),
+            "Show · Pilot"
+        );
+        assert_eq!(
+            playback_item_display_title("EPISODE", "Pilot", None, Some(1), Some(1)),
+            "Pilot"
+        );
+    }
+
+    #[test]
+    fn other_items_keep_their_own_title() {
+        assert_eq!(
+            playback_item_display_title("MOVIE", "Film", None, None, None),
+            "Film"
+        );
+        assert_eq!(
+            playback_item_display_title("SERIES", "Show", None, None, None),
+            "Show"
+        );
     }
 }

@@ -1,4 +1,4 @@
-import { AlertCircle, ArrowLeft, Pause, Play } from "lucide-react";
+import { AlertCircle, ArrowLeft } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   MouseEvent as ReactMouseEvent,
@@ -7,7 +7,13 @@ import type {
   SyntheticEvent,
 } from "react";
 import type { PlayerFailure } from "./player-diagnostics";
+import {
+  PlayerPlaybackNoticeBanner,
+  PlayerPlaybackNoticeLayer,
+} from "./player-playback-notice";
+import type { PlaybackNotice } from "../playback-notices";
 import { usePlayerSurfaceGestures } from "./player-gestures";
+import { PlayerCenterControl } from "./player-center-control";
 import {
   readPlayerRuntimeCaptionTracks,
   type PlayerNativeCaptionTrack,
@@ -23,6 +29,8 @@ import {
 
 type PlayerVideoSurfaceProps = {
   streamUrl: string;
+  /** Keep the existing video element mounted while a replacement session loads. */
+  keepVideoMounted?: boolean;
   deferNativeSource?: boolean;
   corsEnabled?: boolean;
   poster?: string | null;
@@ -48,12 +56,15 @@ type PlayerVideoSurfaceProps = {
   presentation?: PlayerVideoPresentation;
   playing?: boolean;
   onTogglePlayback?: () => void;
-  centerSplash: "play" | "pause" | null;
   fallbackLoading: boolean;
   fallbackSpeedX: number | null;
   errorMessage: string | null;
   failure?: PlayerFailure | null;
   showError: boolean;
+  /** Plan/reason/transcode state mapped by `playbackNoticeFor`; replaces the generic error layer. */
+  notice?: PlaybackNotice | null;
+  /** Changes per playback session so a dismissed banner does not leak into the next one. */
+  noticeLifecycleKey?: string;
   onRetry: () => void;
   onBack: () => void;
   gestureOptions?: {
@@ -71,6 +82,7 @@ type PlayerVideoSurfaceProps = {
 
 export function PlayerVideoSurface({
   streamUrl,
+  keepVideoMounted = false,
   deferNativeSource = false,
   corsEnabled = true,
   poster,
@@ -96,22 +108,30 @@ export function PlayerVideoSurface({
   presentation = DEFAULT_VIDEO_PRESENTATION,
   playing = false,
   onTogglePlayback = () => undefined,
-  centerSplash,
   fallbackLoading,
   fallbackSpeedX,
   errorMessage,
   failure,
   showError,
+  notice = null,
+  noticeLifecycleKey = "",
   onRetry,
   onBack,
   gestureOptions,
 }: PlayerVideoSurfaceProps) {
+  const blockingNotice = notice?.blocking ? notice : null;
   const frameRef = useRef<HTMLDivElement>(null);
   const videoElementRef = useRef<HTMLVideoElement | null>(null);
   const captionTrackRef = useRef<HTMLTrackElement>(null);
   const captionOffsetControllerRef = useRef<ReturnType<typeof createNativeCaptionOffsetController> | null>(null);
   const runtimeCaptionIdsRef = useRef(new Map<number, string>());
   const [presentationSize, setPresentationSize] = useState<ReturnType<typeof playerVideoPresentationSize>>(null);
+  // True from the moment a stream is set until the media element has data, and again whenever it
+  // stalls; the centre control breathes while this holds.
+  const [mediaBuffering, setMediaBuffering] = useState(true);
+  useEffect(() => {
+    setMediaBuffering(true);
+  }, [streamUrl]);
   const gestures = usePlayerSurfaceGestures({
     enabled: Boolean(gestureOptions),
     currentTime: gestureOptions?.currentTime ?? 0,
@@ -276,12 +296,12 @@ export function PlayerVideoSurface({
 
   return (
     <div ref={frameRef} className="lux-player-frame">
-      {streamUrl ? (
+      {streamUrl || keepVideoMounted ? (
         <video
           ref={setVideoElementRef}
           className="lux-video"
           crossOrigin={corsEnabled ? "anonymous" : undefined}
-          src={deferNativeSource ? undefined : streamUrl}
+          src={deferNativeSource ? undefined : streamUrl || undefined}
           poster={poster ?? undefined}
           preload="metadata"
           loop={presentation.loop}
@@ -293,7 +313,15 @@ export function PlayerVideoSurface({
           onPointerUp={gestures.onPointerUp}
           onPointerCancel={gestures.onPointerCancel}
           onError={onError}
-          onLoadedMetadata={onLoadedMetadata}
+          onLoadStart={() => setMediaBuffering(true)}
+          onWaiting={() => setMediaBuffering(true)}
+          onLoadedMetadata={() => {
+            setMediaBuffering(false);
+            onLoadedMetadata?.();
+          }}
+          onLoadedData={() => setMediaBuffering(false)}
+          onCanPlay={() => setMediaBuffering(false)}
+          onPlaying={() => setMediaBuffering(false)}
           onPlay={onPlay}
           onPause={onPause}
           onTimeUpdate={onTimeUpdate}
@@ -316,26 +344,12 @@ export function PlayerVideoSurface({
         </video>
       ) : null}
 
-      {!playing && streamUrl && !fallbackLoading && !showError ? (
-        <button
-          type="button"
-          className="lux-player-center-play"
-          aria-label="播放"
-          title="播放 (空格)"
-          onClick={onTogglePlayback}
-        >
-          <Play size={34} fill="currentColor" aria-hidden="true" />
-        </button>
-      ) : null}
-
-      {centerSplash ? (
-        <div className="lux-player-center-splash" aria-hidden="true">
-          {centerSplash === "play" ? (
-            <Play size={38} fill="currentColor" />
-          ) : (
-            <Pause size={38} fill="currentColor" />
-          )}
-        </div>
+      {streamUrl && !showError && !blockingNotice ? (
+        <PlayerCenterControl
+          playing={Boolean(playing)}
+          loading={fallbackLoading || mediaBuffering}
+          onClick={() => onTogglePlayback?.()}
+        />
       ) : null}
 
       {fallbackLoading ? (
@@ -352,13 +366,19 @@ export function PlayerVideoSurface({
         </div>
       ) : null}
 
-      {showError ? (
+      {!showError && notice && !notice.blocking ? (
+        <PlayerPlaybackNoticeBanner notice={notice} lifecycleKey={noticeLifecycleKey} />
+      ) : null}
+
+      {blockingNotice ? (
+        <PlayerPlaybackNoticeLayer notice={blockingNotice} onRetry={onRetry} onBack={onBack} />
+      ) : showError ? (
         <div className="lux-player-error-modal" role="alert">
           <div className="lux-player-error-card">
             <AlertCircle size={36} className="lux-player-error-icon" aria-hidden="true" />
             {failure ? <h2>{failure.title}</h2> : null}
             <p className="lux-player-error">
-              {failure?.message ?? errorMessage ?? "浏览器无法播放这个媒体源。请尝试其他版本或使用支持该格式的客户端。"}
+              {failure?.message ?? errorMessage ?? "浏览器无法播放这个媒体源。请返回详情页选择其他版本或使用支持该格式的客户端。"}
             </p>
             <div className="lux-player-error-actions">
               <button

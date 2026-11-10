@@ -4,23 +4,25 @@ import { ArrowLeft, Check, Heart, Play, Radio } from "lucide-react";
 import { Link, useNavigate } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
-import type { MediaItem } from "../../lib/api/types";
+import type { MediaItem, MetadataRefreshMode } from "../../lib/api/types";
 import { MediaActionMenu } from "../media/MediaActionMenu";
+import { useItemMetadataRefreshMode } from "../media/useItemMetadataRefreshMode";
 import { MediaEditorBoundary } from "../media/MediaEditorBoundary";
 import { useMediaSource } from "./MediaSourcePanel";
 import { MediaEpisodePlayButton } from "./MediaEpisodesSection";
 import { streamsOfType } from "./media-source";
 import { LuxLogo } from "../../components/LuxLogo";
-import { useSseConnectionState } from "../activity/useUserEvents";
+import { useRealtimeConnectionState } from "../activity/useUserEvents";
 import { LuxButton , luxButtonClass } from "../../components/ui";
 
 const LazyMetadataEditor = lazy(() => import("../media/MediaMetadataEditor").then((module) => ({ default: module.MediaMetadataEditor })));
 const LazyImageEditor = lazy(() => import("../media/MediaImageEditor").then((module) => ({ default: module.MediaImageEditor })));
 const LazySubtitleEditor = lazy(() => import("../media/MediaSubtitleEditor").then((module) => ({ default: module.MediaSubtitleEditor })));
+const LazyDanmakuDialog = lazy(() => import("../media/MediaDanmakuDialog").then((module) => ({ default: module.MediaDanmakuDialog })));
 const LazyIdentifier = lazy(() => import("../media/MediaIdentifier").then((module) => ({ default: module.MediaIdentifier })));
 const LazyDeleteDialog = lazy(() => import("../media/MediaDeleteDialog").then((module) => ({ default: module.MediaDeleteDialog })));
 
-type EditorKind = "metadata" | "images" | "subtitles" | "identify";
+type EditorKind = "metadata" | "images" | "subtitles" | "danmaku" | "identify";
 type ActionContextValue = {
   item: MediaItem;
   sourceId?: string;
@@ -37,6 +39,7 @@ type ActionContextValue = {
   setEditor: (editor: EditorKind) => void;
   openDelete: () => void;
   refreshMetadata: () => void;
+  metadataRefreshMode?: MetadataRefreshMode;
   scanLibrary: () => void;
   setMetadataLock: (locked: boolean) => void;
   confirmMetadata: () => void;
@@ -52,8 +55,8 @@ export function MediaDetailActions({ item, pendingReview, children }: {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { source, selectedAudioStreamIndex, selectedSubtitleStreamIndex } = useMediaSource();
-  const sseState = useSseConnectionState();
-  const refetchInterval = sseState === "connected" ? false : queryRefreshIntervals.mediaSurface;
+  const realtimeState = useRealtimeConnectionState();
+  const refetchInterval = realtimeState === "connected" ? false : queryRefreshIntervals.mediaSurface;
   const playback = useQuery({
     queryKey: queryKeys.playback(item.id),
     queryFn: () => api.playback(item.id),
@@ -66,6 +69,7 @@ export function MediaDetailActions({ item, pendingReview, children }: {
     queryFn: () => api.libraryItems(item.libraryId ?? "", 1, undefined, { metadataStatus: "PENDING", pageSize: 100 }),
     enabled: pendingReview && Boolean(item.libraryId),
   });
+  const metadataRefreshMode = useItemMetadataRefreshMode(item);
   const [editor, setEditor] = useState<EditorKind>();
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [error, setError] = useState<string>();
@@ -98,7 +102,7 @@ export function MediaDetailActions({ item, pendingReview, children }: {
     setError(undefined);
     setNotice(undefined);
     try {
-      await api.startItemMetadataRefresh(item.id);
+      await api.startItemMetadataRefresh(item.id, metadataRefreshMode ?? "FILL_MISSING");
       setNotice("元数据刷新任务已提交，可在管理任务中查看进度。");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "元数据刷新任务提交失败，请重试。");
@@ -178,6 +182,7 @@ export function MediaDetailActions({ item, pendingReview, children }: {
     setEditor,
     openDelete: () => setDeleteOpen(true),
     refreshMetadata: () => void refreshMetadata(),
+    metadataRefreshMode,
     scanLibrary: () => void scanLibrary(),
     setMetadataLock: (locked) => void setMetadataLock(locked),
     confirmMetadata: () => void confirmMetadata(),
@@ -197,6 +202,7 @@ export function MediaDetailActions({ item, pendingReview, children }: {
         void queryClient.invalidateQueries({ queryKey: queryKeys.itemImages(item.id) });
       }} /> : null}
       {editor === "subtitles" ? <LazySubtitleEditor item={item} sourceId={source?.id} onClose={closeEditor} onSaved={() => void queryClient.invalidateQueries({ queryKey: queryKeys.item(item.id) })} /> : null}
+      {editor === "danmaku" ? <LazyDanmakuDialog item={item} sourceId={source?.id} onClose={closeEditor} onSubmitted={(job) => setNotice(`弹幕匹配任务已提交 · ${job.totalCount} 项`)} /> : null}
       {deleteOpen ? <LazyDeleteDialog item={item} onClose={() => setDeleteOpen(false)} onConfirm={() => api.deleteItem(item.id, source?.id)} onDeleted={() => navigate("/libraries")} /> : null}
       {editor === "identify" ? <LazyIdentifier item={item} onClose={closeEditor} onSaved={() => {
         void queryClient.invalidateQueries({ queryKey: queryKeys.item(item.id) });
@@ -240,9 +246,11 @@ export const MediaDetailActionMenu = memo(function MediaDetailActionMenu({ class
     onEditMetadata={() => actions.setEditor("metadata")}
     onEditImages={() => actions.setEditor("images")}
     onEditSubtitles={() => actions.setEditor("subtitles")}
+    onScrapeDanmaku={() => actions.setEditor("danmaku")}
     onDelete={actions.openDelete}
     onIdentify={() => actions.setEditor("identify")}
     onRefreshMetadata={actions.refreshMetadata}
+    refreshMode={actions.metadataRefreshMode}
     onScanFolder={actions.scanLibrary}
     onLockMetadata={() => actions.setMetadataLock(true)}
     onUnlockMetadata={() => actions.setMetadataLock(false)}

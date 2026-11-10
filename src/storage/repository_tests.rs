@@ -6637,6 +6637,141 @@ async fn local_item_image_batch_is_bounded_idempotent_and_atomic() {
             .expect("read updated poster path"),
         "/media/first/poster-updated.jpg"
     );
+    // A path another index of the *same* type owns is skipped instead of being written a second
+    // time; the same path under a different type is still a legal registration.
+    let owned_path_batch = [ItemImageBatchInsert {
+        item_id: item_ids[0].clone(),
+        images: vec![
+            make_image("FANART", 2, "/media/first/fanart-2.jpg", "first-fanart-v3"),
+            make_image("LOGO", 0, "/media/first/fanart-2.jpg", "first-fanart-v4"),
+        ],
+        clear_poster_fallback: true,
+    }];
+    assert_eq!(
+        database
+            .insert_item_images_batch_at_indices(&owned_path_batch)
+            .await
+            .expect("skip only the same-type path conflict"),
+        1,
+        "the same-type index conflict is skipped and the cross-type row stays"
+    );
+    let logo_path: String = database
+        .query_scalar(
+            "SELECT local_path FROM item_images
+             WHERE item_id = ? AND image_type = 'LOGO' AND image_index = 0",
+        )
+        .bind(&item_ids[0])
+        .fetch_one(database.pool())
+        .await
+        .expect("read the cross-type registration");
+    assert_eq!(logo_path, "/media/first/fanart-2.jpg");
+    // Two rows of one page that repeat a new path keep the first registration only.
+    let repeated_path_batch = [ItemImageBatchInsert {
+        item_id: item_ids[0].clone(),
+        images: vec![
+            make_image("FANART", 4, "/media/first/fanart-new.jpg", "duplicate-a"),
+            make_image("FANART", 5, "/media/first/fanart-new.jpg", "duplicate-b"),
+        ],
+        clear_poster_fallback: true,
+    }];
+    assert_eq!(
+        database
+            .insert_item_images_batch_at_indices(&repeated_path_batch)
+            .await
+            .expect("keep one registration per path"),
+        1,
+        "one path is registered once per page"
+    );
+    let fanart_rows: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT image_index, local_path, content_tag FROM item_images
+         WHERE item_id = ? AND image_type = 'FANART' ORDER BY image_index",
+    )
+    .bind(&item_ids[0])
+    .fetch_all(database.pool())
+    .await
+    .expect("read fanart registrations");
+    assert_eq!(
+        fanart_rows,
+        vec![
+            (
+                0,
+                "/media/first/fanart.jpg".to_owned(),
+                "first-fanart-v1".to_owned()
+            ),
+            (
+                1,
+                "/media/first/fanart-2.jpg".to_owned(),
+                "first-fanart-v2".to_owned()
+            ),
+            (
+                4,
+                "/media/first/fanart-new.jpg".to_owned(),
+                "duplicate-a".to_owned()
+            ),
+        ]
+    );
+
+    // Cross-type shared paths stay legal: the STRM thumbnail registers POSTER and THUMB on one
+    // file, and a repeated probe must refresh that row instead of dropping it.
+    let strm_thumbnail_path = "/media/second/Image.Movie.2020-thumbnail.jpg";
+    let strm_batch = [ItemImageBatchInsert {
+        item_id: item_ids[1].clone(),
+        images: vec![
+            make_image("POSTER", 0, strm_thumbnail_path, "strm-thumb-letterbox"),
+            make_image("THUMB", 0, strm_thumbnail_path, "strm-thumb-letterbox"),
+        ],
+        clear_poster_fallback: true,
+    }];
+    assert_eq!(
+        database
+            .insert_item_images_batch_at_indices(&strm_batch)
+            .await
+            .expect("register the STRM thumbnail for both types"),
+        2,
+        "POSTER and THUMB may share the STRM thumbnail path"
+    );
+    let refreshed_thumbnail_batch = [ItemImageBatchInsert {
+        item_id: item_ids[1].clone(),
+        images: vec![make_image(
+            "THUMB",
+            0,
+            strm_thumbnail_path,
+            "strm-thumb-reprobed",
+        )],
+        clear_poster_fallback: false,
+    }];
+    assert_eq!(
+        database
+            .insert_item_images_batch_at_indices(&refreshed_thumbnail_batch)
+            .await
+            .expect("refresh the STRM thumbnail row"),
+        1,
+        "a repeated registration updates the shared-path row instead of skipping it"
+    );
+    let strm_rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT image_type, local_path, content_tag FROM item_images
+         WHERE item_id = ? AND local_path = ? ORDER BY image_type",
+    )
+    .bind(&item_ids[1])
+    .bind(strm_thumbnail_path)
+    .fetch_all(database.pool())
+    .await
+    .expect("read the STRM thumbnail rows");
+    assert_eq!(
+        strm_rows,
+        vec![
+            (
+                "POSTER".to_owned(),
+                strm_thumbnail_path.to_owned(),
+                "strm-thumb-letterbox".to_owned()
+            ),
+            (
+                "THUMB".to_owned(),
+                strm_thumbnail_path.to_owned(),
+                "strm-thumb-reprobed".to_owned()
+            ),
+        ]
+    );
     assert_eq!(
         database
             .insert_item_images_batch_at_indices(&[])
@@ -6754,6 +6889,118 @@ async fn local_item_image_batch_is_bounded_idempotent_and_atomic() {
         .await
         .expect("read rolled-back fallback flags");
     assert_eq!(fallback, vec![1, 1]);
+    database.close().await;
+}
+
+/// LUX-887: the image writer picks its target from a snapshot taken before its upsert, while a
+/// scan can register the same file for another index of the same type in between (the two paths
+/// take different locks). The upsert must refuse the second row instead of leaving two indexes
+/// on one file.
+#[tokio::test]
+async fn item_image_upsert_rejects_a_path_registered_between_snapshot_and_write() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Race Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir)
+        .await
+        .expect("movie directory");
+    tokio::fs::write(movie_dir.join("Race.Movie.2024.mkv"), b"video")
+        .await
+        .expect("movie file");
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Local image race", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    libraries
+        .add_root(library.id, media_root.to_str().expect("media root"))
+        .await
+        .expect("library root");
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await
+        .expect("index movies");
+    let item_id: String = database
+        .query_scalar("SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE'")
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await
+        .expect("movie id");
+    let shared_path = movie_dir.join("backdrop1.png");
+    tokio::fs::write(&shared_path, b"registered first")
+        .await
+        .expect("shared file");
+
+    // The scan registration that raced the writer's snapshot.
+    database
+        .upsert_item_image_at_index(
+            &item_id,
+            "FANART",
+            4,
+            &shared_path,
+            ItemImageMetadata {
+                file_size: 15,
+                width: None,
+                height: None,
+                content_tag: "fanart-four",
+                source: "LOCAL",
+                source_url: None,
+            },
+        )
+        .await
+        .expect("register the placeholder fanart index");
+
+    let error = database
+        .upsert_item_image_at_index(
+            &item_id,
+            "FANART",
+            1,
+            &shared_path,
+            ItemImageMetadata {
+                file_size: 15,
+                width: None,
+                height: None,
+                content_tag: "fanart-one",
+                source: "SCRAPER",
+                source_url: None,
+            },
+        )
+        .await
+        .expect_err("a second index must not register the same path");
+    assert!(matches!(error, StorageError::Conflict(_)));
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT image_index, local_path FROM item_images
+         WHERE item_id = ? AND image_type = 'FANART' ORDER BY image_index",
+    )
+    .bind(&item_id)
+    .fetch_all(database.pool())
+    .await
+    .expect("fanart rows");
+    assert_eq!(rows, vec![(4, shared_path.to_string_lossy().into_owned())]);
+
+    // The owning row still refreshes its own path.
+    database
+        .upsert_item_image_at_index(
+            &item_id,
+            "FANART",
+            4,
+            &shared_path,
+            ItemImageMetadata {
+                file_size: 15,
+                width: None,
+                height: None,
+                content_tag: "fanart-four-updated",
+                source: "LOCAL",
+                source_url: None,
+            },
+        )
+        .await
+        .expect("refresh the owning index");
     database.close().await;
 }
 
@@ -11440,6 +11687,50 @@ async fn emby_collection_member_mutations_use_bounded_batches() {
     database.close().await;
 }
 
+#[test]
+fn catalog_filter_where_clause_matches_genres_and_studios_through_facets() {
+    let library_ids = vec!["library".to_owned()];
+    let none: Vec<String> = Vec::new();
+    let years: Vec<i64> = Vec::new();
+    let genre_keys = vec!["drama".to_owned(), "sci-fi".to_owned()];
+    let studio_keys = vec!["a24".to_owned()];
+    let filter = CatalogFilterQuery {
+        library_ids: &library_ids,
+        user_id: "user",
+        item_types: &none,
+        excluded_item_types: &none,
+        item_ids: None,
+        person_id: None,
+        media_source_ids: None,
+        provider_id_equals: None,
+        years: &years,
+        genre_keys: &genre_keys,
+        studio_keys: &studio_keys,
+        is_played: None,
+        is_favorite: None,
+        is_resumable: None,
+        min_date_last_saved: None,
+        metadata_pending: false,
+        parent_id_scope: None,
+        content_restrictions: None,
+        sort_by: CatalogSort::DateCreated,
+        descending: true,
+        offset: 0,
+        limit: 24,
+        include_total: true,
+    };
+    let (where_clause, binds) = catalog_filter_where_clause(&filter);
+    assert_eq!(where_clause.matches("media_item_facets").count(), 2);
+    let texts = binds
+        .iter()
+        .filter_map(|bind| match bind {
+            CatalogBind::Text(value) => Some(*value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(texts, ["library", "drama", "sci-fi", "a24"]);
+}
+
 #[tokio::test]
 async fn favorite_catalog_filter_uses_favorite_state_index() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
@@ -11462,8 +11753,11 @@ async fn favorite_catalog_filter_uses_favorite_state_index() {
         media_source_ids: None,
         provider_id_equals: None,
         years: &empty_years,
+        genre_keys: &[],
+        studio_keys: &[],
         is_played: None,
         is_favorite: Some(true),
+        is_resumable: None,
         min_date_last_saved: None,
         metadata_pending: false,
         parent_id_scope: None,
@@ -11633,8 +11927,11 @@ async fn content_restrictions_filter_catalog_rows_before_pagination()
         media_source_ids: None,
         provider_id_equals: None,
         years: &empty_years,
+        genre_keys: &[],
+        studio_keys: &[],
         is_played: None,
         is_favorite: None,
+        is_resumable: None,
         min_date_last_saved: None,
         metadata_pending: false,
         parent_id_scope: None,
@@ -11789,8 +12086,11 @@ async fn catalog_sort_expression_indexes_cover_default_sorting()
             media_source_ids: None,
             provider_id_equals: None,
             years: &empty_years,
+            genre_keys: &[],
+            studio_keys: &[],
             is_played: None,
             is_favorite: None,
+            is_resumable: None,
             min_date_last_saved: None,
             metadata_pending: false,
             parent_id_scope: None,
@@ -12204,6 +12504,101 @@ async fn metadata_capability_batches_preserve_status_and_retry_backoff() {
 }
 
 #[tokio::test]
+async fn capability_writes_for_a_whole_search_commit_once() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('capability-search-item', ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("media item");
+
+    // A manual candidate search resolves up to 20 results; each used to commit its own
+    // transaction (20 candidates + up to 20 retry writes).
+    let writes = (0..20)
+        .map(|index| MetadataCapabilityWrite {
+            provider: "tmdb".to_owned(),
+            provider_id: format!("movie-{index}"),
+            results: vec![
+                MetadataCapabilityResult {
+                    capability: "CREDITS",
+                    has_data: true,
+                },
+                MetadataCapabilityResult {
+                    capability: "EXTERNAL_IDS",
+                    has_data: false,
+                },
+            ],
+            transient_failures: if index == 0 {
+                vec!["TRAILERS"]
+            } else {
+                Vec::new()
+            },
+            now: 1_000,
+        })
+        .collect::<Vec<_>>();
+
+    database.reset_query_count();
+    database.reset_metadata_write_transaction_count();
+    database
+        .record_metadata_capability_writes("capability-search-item", &writes)
+        .await
+        .expect("batched capability writes");
+    assert_eq!(
+        database.metadata_write_transaction_count(),
+        1,
+        "the whole candidate search must commit its capability rows once"
+    );
+    // 20 multi-row upserts, plus the retry read and retry upsert of the one transient failure.
+    assert_eq!(database.query_count(), 22);
+
+    let available: Vec<(String, String)> = sqlx::query_as(
+        "SELECT provider_id, status FROM metadata_capability_attempts
+         WHERE item_id = 'capability-search-item' AND capability = 'CREDITS'
+         ORDER BY provider_id",
+    )
+    .fetch_all(database.pool())
+    .await
+    .expect("capability rows");
+    assert_eq!(available.len(), 20);
+    assert!(available.iter().all(|(_, status)| status == "AVAILABLE"));
+
+    let failed: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT provider_id, attempt_count, next_retry_at FROM metadata_capability_attempts
+         WHERE item_id = 'capability-search-item' AND status = 'FAILED'",
+    )
+    .fetch_all(database.pool())
+    .await
+    .expect("failed capability rows");
+    assert_eq!(failed, vec![("movie-0".to_owned(), 1, Some(1_300))]);
+
+    database.reset_metadata_write_transaction_count();
+    database
+        .record_metadata_capability_writes("capability-search-item", &[])
+        .await
+        .expect("empty capability batch");
+    assert_eq!(
+        database.metadata_write_transaction_count(),
+        0,
+        "a search without capability work must not open a transaction"
+    );
+
+    database.close().await;
+}
+
+#[tokio::test]
 async fn unavailable_metadata_image_batch_uses_one_statement_and_preserves_attempt_count() {
     type MetadataImageAttemptRow = (String, String, i64, i64, Option<i64>, Option<String>, i64);
 
@@ -12300,8 +12695,10 @@ async fn unavailable_metadata_image_batch_uses_one_statement_and_preserves_attem
     database.close().await;
 }
 
-#[tokio::test]
-async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
+/// Job page fixture: two jobs with one item each, plus the indexes the page query and the pending
+/// aggregation seek. `metadata_candidates` is created only by the tests that need it, so the
+/// default page query cannot depend on it.
+async fn metadata_job_page_pool() -> AnyPool {
     sqlx::any::install_default_drivers();
     let pool = AnyPoolOptions::new()
         .max_connections(1)
@@ -12341,28 +12738,12 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
     .await
     .expect("create metadata job items table");
     sqlx::query(
-        "CREATE TABLE metadata_candidates (
-                item_id TEXT NOT NULL,
-                status TEXT NOT NULL
-            )",
-    )
-    .execute(&pool)
-    .await
-    .expect("create metadata candidates table");
-    sqlx::query(
         "CREATE INDEX idx_metadata_reidentify_items_status
              ON metadata_reidentify_job_items(job_id, status, item_id)",
     )
     .execute(&pool)
     .await
     .expect("create metadata job item index");
-    sqlx::query(
-        "CREATE INDEX idx_metadata_candidates_item
-             ON metadata_candidates(item_id, status)",
-    )
-    .execute(&pool)
-    .await
-    .expect("create metadata candidate index");
     for (id, created_at) in [("older", 1_i64), ("newer", 2_i64)] {
         sqlx::query(
             "INSERT INTO metadata_reidentify_jobs (
@@ -12390,16 +12771,39 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
         .await
         .expect("insert metadata job item");
     }
+    pool
+}
+
+/// Adds the candidate table plus two PENDING candidates for `new-item` (distinct count 1).
+async fn metadata_job_page_candidates(pool: &AnyPool) {
+    sqlx::query(
+        "CREATE TABLE metadata_candidates (
+                item_id TEXT NOT NULL,
+                status TEXT NOT NULL
+            )",
+    )
+    .execute(pool)
+    .await
+    .expect("create metadata candidates table");
+    sqlx::query(
+        "CREATE INDEX idx_metadata_candidates_item
+             ON metadata_candidates(item_id, status)",
+    )
+    .execute(pool)
+    .await
+    .expect("create metadata candidate index");
     sqlx::query(
         "INSERT INTO metadata_candidates (item_id, status)
              VALUES ('old-item', 'PENDING'), ('new-item', 'PENDING'),
                     ('new-item', 'PENDING')",
     )
-    .execute(&pool)
+    .execute(pool)
     .await
     .expect("insert metadata candidates");
+}
 
-    let database = Database {
+fn metadata_job_page_database(pool: AnyPool) -> Database {
+    Database {
         pool,
         log_store: LogStore::new(Path::new("unused-metadata-summary-test")),
         pool_max_connections: 1,
@@ -12418,16 +12822,69 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         access_changes: Arc::new(AccessChangeEpochs::default()),
         auth_cache: Arc::new(AuthCacheEpochs::default()),
+        outbox_signals: Arc::new(OutboxSignals::default()),
+        mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
         query_count: Arc::new(AtomicUsize::new(0)),
-    };
+    }
+}
+
+#[tokio::test]
+async fn metadata_job_list_skips_the_pending_aggregation_unless_requested() {
+    let pool = metadata_job_page_pool().await;
+    let database = metadata_job_page_database(pool);
+    database.reset_query_count();
+    // The candidate table does not exist yet: a default page that joined it would fail here.
     let jobs = database
-        .list_metadata_reidentify_jobs(None, 0, 1)
+        .list_metadata_reidentify_jobs(None, 0, 1, false)
+        .await
+        .expect("the default page must not read metadata_candidates");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].id, "newer");
+    assert_eq!(jobs[0].pending_count, None);
+
+    let filtered = database
+        .list_metadata_reidentify_jobs(Some("QUEUED"), 0, 10, false)
+        .await
+        .expect("the filtered page must not read metadata_candidates");
+    assert_eq!(filtered.len(), 2);
+    assert!(filtered.iter().all(|job| job.pending_count.is_none()));
+
+    // The explicit request still aggregates, so it needs the candidate table.
+    assert!(
+        database
+            .list_metadata_reidentify_jobs(None, 0, 1, true)
+            .await
+            .is_err(),
+        "explicit pending requests must aggregate metadata_candidates"
+    );
+
+    metadata_job_page_candidates(database.pool()).await;
+    let jobs = database
+        .list_metadata_reidentify_jobs(None, 0, 1, true)
+        .await
+        .expect("explicit pending request");
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].id, "newer");
+    assert_eq!(jobs[0].pending_count, Some(1));
+    database.close().await;
+}
+
+#[tokio::test]
+async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
+    let pool = metadata_job_page_pool().await;
+    metadata_job_page_candidates(&pool).await;
+    let database = metadata_job_page_database(pool);
+    database.reset_query_count();
+    let jobs = database
+        .list_metadata_reidentify_jobs(None, 0, 1, true)
         .await
         .expect("list metadata jobs");
+    assert_eq!(database.query_count(), 1);
 
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].id, "newer");
-    assert_eq!(jobs[0].pending_count, 1);
+    assert_eq!(jobs[0].pending_count, Some(1));
 
     let plan = sqlx::query(
         "EXPLAIN QUERY PLAN
@@ -13510,8 +13967,11 @@ async fn catalog_tie_breakers_use_displayed_title_when_sort_key_is_stale() {
             media_source_ids: None,
             provider_id_equals: None,
             years: &empty_years,
+            genre_keys: &[],
+            studio_keys: &[],
             is_played: None,
             is_favorite: None,
+            is_resumable: None,
             min_date_last_saved: None,
             metadata_pending: false,
             parent_id_scope: None,
@@ -13581,8 +14041,11 @@ async fn catalog_filter_parent_scope_applies_before_pagination() {
         media_source_ids: None,
         provider_id_equals: None,
         years: &empty_years,
+        genre_keys: &[],
+        studio_keys: &[],
         is_played: None,
         is_favorite: None,
+        is_resumable: None,
         min_date_last_saved: None,
         metadata_pending: false,
         sort_by: CatalogSort::Name,
@@ -13748,8 +14211,11 @@ async fn catalog_premiere_date_sort_falls_back_to_production_year() {
             media_source_ids: None,
             provider_id_equals: None,
             years: &empty_years,
+            genre_keys: &[],
+            studio_keys: &[],
             is_played: None,
             is_favorite: None,
+            is_resumable: None,
             min_date_last_saved: None,
             metadata_pending: false,
             parent_id_scope: None,
@@ -15020,6 +15486,8 @@ async fn write_probe_reports_a_query_only_sqlite_connection() {
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         access_changes: Arc::new(AccessChangeEpochs::default()),
         auth_cache: Arc::new(AuthCacheEpochs::default()),
+        outbox_signals: Arc::new(OutboxSignals::default()),
+        mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     assert!(database.probe_write().await.is_err());
@@ -15092,6 +15560,8 @@ async fn metadata_jobs_process_series_before_seasons_and_episodes() {
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         access_changes: Arc::new(AccessChangeEpochs::default()),
         auth_cache: Arc::new(AuthCacheEpochs::default()),
+        outbox_signals: Arc::new(OutboxSignals::default()),
+        mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -15226,6 +15696,8 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         access_changes: Arc::new(AccessChangeEpochs::default()),
         auth_cache: Arc::new(AuthCacheEpochs::default()),
+        outbox_signals: Arc::new(OutboxSignals::default()),
+        mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -18299,8 +18771,8 @@ async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
 
     let now = 1_000_i64;
     let (first, second) = tokio::join!(
-        database.reserve_playback_admission(user_id, "admission-session-a", now),
-        database.reserve_playback_admission(user_id, "admission-session-b", now),
+        database.reserve_playback_admission(user_id, "admission-session-a", now, None),
+        database.reserve_playback_admission(user_id, "admission-session-b", now, None),
     );
     let first = first?.expect("user exists");
     let second = second?.expect("user exists");
@@ -18317,7 +18789,7 @@ async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
     assert_eq!(denied.active_playback_count, 1);
 
     let renewal = database
-        .reserve_playback_admission(user_id, accepted_session, now + 1)
+        .reserve_playback_admission(user_id, accepted_session, now + 1, None)
         .await?
         .expect("user exists");
     assert_eq!(renewal.decision, PlaybackAdmissionDecision::Admitted);
@@ -18334,7 +18806,7 @@ async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
     );
 
     let retry = database
-        .reserve_playback_admission(user_id, "admission-session-c", now + 3)
+        .reserve_playback_admission(user_id, "admission-session-c", now + 3, None)
         .await?
         .expect("user exists");
     assert_eq!(retry.decision, PlaybackAdmissionDecision::Admitted);
@@ -18354,7 +18826,7 @@ async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
         .await?;
     for session_id in ["admission-session-d", "admission-session-e"] {
         let unlimited = database
-            .reserve_playback_admission(user_id, session_id, now + 4)
+            .reserve_playback_admission(user_id, session_id, now + 4, None)
             .await?
             .expect("user exists");
         assert_eq!(unlimited.decision, PlaybackAdmissionDecision::Admitted);
@@ -18377,14 +18849,14 @@ async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
         "admission-session-e",
     ] {
         let existing = database
-            .reserve_playback_admission(user_id, session_id, now + 5)
+            .reserve_playback_admission(user_id, session_id, now + 5, None)
             .await?
             .expect("user exists");
         assert_eq!(existing.decision, PlaybackAdmissionDecision::Admitted);
         assert_eq!(existing.active_playback_count, 3);
     }
     let new_session = database
-        .reserve_playback_admission(user_id, "admission-session-f", now + 6)
+        .reserve_playback_admission(user_id, "admission-session-f", now + 6, None)
         .await?
         .expect("user exists");
     assert_eq!(
@@ -18406,7 +18878,7 @@ async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
         )
         .await?;
     let disabled = database
-        .reserve_playback_admission(user_id, "admission-session-g", now + 7)
+        .reserve_playback_admission(user_id, "admission-session-g", now + 7, None)
         .await?
         .expect("user exists");
     assert_eq!(
@@ -18583,8 +19055,8 @@ async fn exercise_user_management_concurrency_storage_contract(
         )
         .await?;
     let (admission_a, admission_b) = tokio::join!(
-        database.reserve_playback_admission(user_id, "concurrency-playback-a", 10_000),
-        database.reserve_playback_admission(user_id, "concurrency-playback-b", 10_000),
+        database.reserve_playback_admission(user_id, "concurrency-playback-a", 10_000, None),
+        database.reserve_playback_admission(user_id, "concurrency-playback-b", 10_000, None),
     );
     let admission_a = admission_a?.ok_or("playback user disappeared")?;
     let admission_b = admission_b?.ok_or("playback user disappeared")?;
@@ -18752,13 +19224,13 @@ async fn playback_admission_counts_legacy_sessions_and_reclaims_stale_reservatio
         .fetch_one(database.pool())
         .await?;
     let existing = database
-        .reserve_playback_admission(user_id, "legacy-play-session", now)
+        .reserve_playback_admission(user_id, "legacy-play-session", now, None)
         .await?
         .expect("user exists");
     assert_eq!(existing.decision, PlaybackAdmissionDecision::Admitted);
     assert_eq!(existing.active_playback_count, 1);
     let denied = database
-        .reserve_playback_admission(user_id, "new-play-session", now)
+        .reserve_playback_admission(user_id, "new-play-session", now, None)
         .await?
         .expect("user exists");
     assert_eq!(
@@ -18794,12 +19266,12 @@ async fn playback_admission_counts_legacy_sessions_and_reclaims_stale_reservatio
             .await?
     );
     let stale_admission = database
-        .reserve_playback_admission(user_id, "stale-play-session", now + 2)
+        .reserve_playback_admission(user_id, "stale-play-session", now + 2, None)
         .await?
         .expect("user exists");
     assert_eq!(stale_admission.active_playback_count, 1);
     let after_stale = database
-        .reserve_playback_admission(user_id, "after-stale-play-session", now + 92)
+        .reserve_playback_admission(user_id, "after-stale-play-session", now + 92, None)
         .await?
         .expect("user exists");
     assert_eq!(after_stale.decision, PlaybackAdmissionDecision::Admitted);
@@ -18813,6 +19285,229 @@ async fn playback_admission_counts_legacy_sessions_and_reclaims_stale_reservatio
     .await?;
     assert_eq!(stale_state, "RELEASED");
     Ok(())
+}
+
+#[tokio::test]
+async fn playback_admission_freshness_check_reads_and_never_writes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let user_id = "asset-freshness-user";
+    database
+        .insert_user(user_id, user_id, "Asset Freshness", "test", false, true)
+        .await?;
+    database
+        .update_user_playback_policy(
+            user_id,
+            UserPlaybackPolicy {
+                can_play: true,
+                max_simultaneous_playbacks: 1,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: true,
+            },
+        )
+        .await?;
+
+    let now = 1_000_000_i64;
+    let play_session_id = "asset-freshness-session";
+    let admitted = database
+        .reserve_playback_admission(user_id, play_session_id, now, None)
+        .await?
+        .expect("user exists");
+    assert_eq!(admitted.decision, PlaybackAdmissionDecision::Admitted);
+    let opening_stamp = asset_admission_stamp(&database, user_id, play_session_id).await?;
+    assert_eq!(opening_stamp, now, "the full admission opens the interval");
+
+    // Inside the interval the check is one read: the stamp must not move, otherwise the interval
+    // would never expire and the limits would freeze for the whole playback.
+    for elapsed in [1, 10, 29] {
+        database.reset_query_count();
+        assert!(
+            database
+                .has_fresh_playback_admission(user_id, play_session_id, now + elapsed)
+                .await?,
+            "an admission {elapsed} seconds old is fresh"
+        );
+        assert_eq!(
+            database.query_count(),
+            1,
+            "the freshness check is a single statement"
+        );
+        assert_eq!(
+            asset_admission_stamp(&database, user_id, play_session_id).await?,
+            now,
+            "the freshness check must not write the stamp"
+        );
+    }
+
+    for elapsed in [30, 31, 90] {
+        assert!(
+            !database
+                .has_fresh_playback_admission(user_id, play_session_id, now + elapsed)
+                .await?,
+            "an admission {elapsed} seconds old has to run the full admission again"
+        );
+        assert_eq!(
+            asset_admission_stamp(&database, user_id, play_session_id).await?,
+            now,
+            "a refused freshness check writes nothing either"
+        );
+    }
+
+    // The full admission re-opens the interval from its own request time.
+    let re_admitted = database
+        .reserve_playback_admission(user_id, play_session_id, now + 32, None)
+        .await?
+        .expect("user exists");
+    assert_eq!(re_admitted.decision, PlaybackAdmissionDecision::Admitted);
+    assert_eq!(
+        asset_admission_stamp(&database, user_id, play_session_id).await?,
+        now + 32
+    );
+    assert!(
+        database
+            .has_fresh_playback_admission(user_id, play_session_id, now + 61)
+            .await?,
+        "one second inside the re-opened interval is fresh"
+    );
+    assert!(
+        !database
+            .has_fresh_playback_admission(user_id, play_session_id, now + 62)
+            .await?,
+        "the re-opened interval lasts exactly thirty seconds"
+    );
+
+    // The heartbeat and playback-event renewals keep moving the stamp inside the wider stale
+    // window, which is what keeps a slot in the active set between two full admissions.
+    assert!(
+        database
+            .renew_existing_playback_admission(user_id, play_session_id, now + 75)
+            .await?
+    );
+    assert_eq!(
+        asset_admission_stamp(&database, user_id, play_session_id).await?,
+        now + 75
+    );
+    assert!(
+        database
+            .has_fresh_playback_admission(user_id, play_session_id, now + 80)
+            .await?,
+        "a heartbeat renewal also refreshes the interval"
+    );
+    assert!(
+        !database
+            .renew_existing_playback_admission(user_id, play_session_id, now + 166)
+            .await?,
+        "a stale admission is not renewed by any path"
+    );
+
+    database
+        .release_playback_admission(user_id, play_session_id, now + 167)
+        .await?;
+    assert!(
+        !database
+            .has_fresh_playback_admission(user_id, play_session_id, now + 168)
+            .await?,
+        "a released slot is never fresh"
+    );
+    assert!(
+        !database
+            .has_fresh_playback_admission(user_id, "unknown-session", now + 168)
+            .await?,
+        "a request without an admission row falls back to the full admission"
+    );
+    Ok(())
+}
+
+async fn asset_admission_stamp(
+    database: &Database,
+    user_id: &str,
+    play_session_id: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    // Goes through `Database::query_scalar` so the placeholder is adapted for both backends.
+    Ok(database
+        .query_scalar(
+            "SELECT last_seen_at FROM playback_admissions
+             WHERE user_id = ? AND play_session_id = ?",
+        )
+        .bind(user_id)
+        .bind(play_session_id)
+        .fetch_one(database.pool())
+        .await?)
+}
+
+/// Same freshness contract as the SQLite test above, on the backend that spells the heartbeat
+/// stamp update with `GREATEST` instead of `MAX`.
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_playback_admission_freshness_never_writes()
+-> Result<(), Box<dyn std::error::Error>> {
+    with_isolated_postgres_database(|database| async move {
+        let user_id = "postgres-asset-freshness-user";
+        database
+            .insert_user(
+                user_id,
+                user_id,
+                "Postgres Asset Freshness",
+                "test",
+                false,
+                true,
+            )
+            .await?;
+        database
+            .update_user_playback_policy(
+                user_id,
+                UserPlaybackPolicy {
+                    can_play: true,
+                    max_simultaneous_playbacks: 1,
+                    allow_remux: true,
+                    allow_audio_transcode: true,
+                    allow_video_transcode: true,
+                },
+            )
+            .await?;
+        let now = 1_000_000_i64;
+        let play_session_id = "postgres-asset-freshness-session";
+        let admitted = database
+            .reserve_playback_admission(user_id, play_session_id, now, None)
+            .await?
+            .expect("user exists");
+        assert_eq!(admitted.decision, PlaybackAdmissionDecision::Admitted);
+
+        assert!(
+            database
+                .has_fresh_playback_admission(user_id, play_session_id, now + 29)
+                .await?
+        );
+        assert_eq!(
+            asset_admission_stamp(&database, user_id, play_session_id).await?,
+            now,
+            "the freshness check must not write the stamp"
+        );
+        assert!(
+            !database
+                .has_fresh_playback_admission(user_id, play_session_id, now + 30)
+                .await?,
+            "the re-check interval applies to both backends"
+        );
+        assert!(
+            database
+                .renew_existing_playback_admission(user_id, play_session_id, now + 40)
+                .await?,
+            "GREATEST keeps the heartbeat renewal working"
+        );
+        assert_eq!(
+            asset_admission_stamp(&database, user_id, play_session_id).await?,
+            now + 40
+        );
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })
+    .await
 }
 
 #[tokio::test]
@@ -19103,6 +19798,8 @@ async fn metadata_attempt_state_loads_both_attempt_tables_with_one_query() {
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         access_changes: Arc::new(AccessChangeEpochs::default()),
         auth_cache: Arc::new(AuthCacheEpochs::default()),
+        outbox_signals: Arc::new(OutboxSignals::default()),
+        mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     database.reset_query_count();
@@ -19197,6 +19894,8 @@ async fn item_media_strategy_settings_use_one_query_and_require_an_active_item()
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         access_changes: Arc::new(AccessChangeEpochs::default()),
         auth_cache: Arc::new(AuthCacheEpochs::default()),
+        outbox_signals: Arc::new(OutboxSignals::default()),
+        mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     database.reset_query_count();
@@ -19703,6 +20402,8 @@ async fn metadata_jobs_reconcile_items_left_running_by_workers() {
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         access_changes: Arc::new(AccessChangeEpochs::default()),
         auth_cache: Arc::new(AuthCacheEpochs::default()),
+        outbox_signals: Arc::new(OutboxSignals::default()),
+        mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -23074,8 +23775,11 @@ async fn catalog_read_model_shadow_matches_the_legacy_default_list()
         media_source_ids: None,
         provider_id_equals: None,
         years: &empty_years,
+        genre_keys: &[],
+        studio_keys: &[],
         is_played: None,
         is_favorite: None,
+        is_resumable: None,
         min_date_last_saved: None,
         metadata_pending: false,
         parent_id_scope: None,
@@ -23138,6 +23842,73 @@ async fn catalog_read_model_shadow_matches_the_legacy_default_list()
         recent_ids,
         vec!["shadow-c".to_owned(), "shadow-a".to_owned()]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_read_model_library_page_keeps_series_without_their_own_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('tv-lib', 'TV', 'SERIES')")
+        .execute(database.pool())
+        .await?;
+    // A series and a season never own a media source; they are visible because a child does.
+    for (id, item_type, parent_id, series_id, has_source) in [
+        ("tv-series", "SERIES", None, None, 0_i64),
+        (
+            "tv-season",
+            "SEASON",
+            Some("tv-series"),
+            Some("tv-series"),
+            0,
+        ),
+        (
+            "tv-episode",
+            "EPISODE",
+            Some("tv-season"),
+            Some("tv-series"),
+            1,
+        ),
+        ("tv-empty-series", "SERIES", None, None, 0),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, parent_id, series_id, title, sort_title,
+                 identification_status, has_available_source, added_at
+             ) VALUES (?, 'tv-lib', ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?, 5)",
+        )
+        .bind(id)
+        .bind(item_type)
+        .bind(parent_id)
+        .bind(series_id)
+        .bind(id)
+        .bind(id)
+        .bind(has_source)
+        .execute(database.pool())
+        .await?;
+    }
+    database.rebuild_catalog_items_batch(None, 100).await?;
+
+    let series_types = vec!["SERIES".to_owned()];
+    let none: Vec<String> = Vec::new();
+    for sort in [ReadModelSort::SortTitle, ReadModelSort::EffectiveAddedAt] {
+        let (ids, total) = database
+            .shadow_catalog_library_page(&ReadModelPageQuery {
+                library_id: "tv-lib",
+                item_types: &series_types,
+                excluded_item_types: &none,
+                sort,
+                descending: false,
+                offset: 0,
+                limit: 10,
+                include_total: true,
+            })
+            .await?;
+        assert_eq!(ids, vec!["tv-series".to_owned()]);
+        assert_eq!(total, 1);
+    }
     Ok(())
 }
 
@@ -30058,6 +30829,350 @@ async fn user_activity_index_retention_deletes_old_events_in_bounded_batches()
 }
 
 #[tokio::test]
+async fn list_activity_events_uses_the_activity_index_quota_and_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::users::{
+        ACTIVITY_FEED_LOGIN_SQL, ACTIVITY_FEED_PLAYBACK_SQL, DASHBOARD_ACTIVITY_WINDOW_SECONDS,
+    };
+
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let now = crate::clock::unix_timestamp();
+    for (id, event_type, occurred_at) in [
+        ("login-old", "AUTH_LOGIN", now - 70),
+        ("login-tie-a", "AUTH_LOGIN", now - 60),
+        ("login-tie-b", "AUTH_LOGIN", now - 60),
+        ("playback-started", "PLAYBACK_STARTED", now - 65),
+        ("playback-paused", "PLAYBACK_PAUSED", now - 55),
+        ("playback-stopped", "PLAYBACK_STOPPED", now - 45),
+        ("login-failed", "AUTH_LOGIN_FAILED", now - 40),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_activity_events (id, user_id, actor_user_id, event_type, occurred_at)
+             VALUES (?, 'feed-user', 'feed-user', ?, ?)",
+        )
+        .bind(id)
+        .bind(event_type)
+        .bind(occurred_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let events = database.list_activity_events(6).await?;
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "playback-stopped",
+            "playback-paused",
+            "login-tie-b",
+            "login-tie-a",
+            "playback-started",
+            "login-old",
+        ]
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event_type != "AUTH_LOGIN_FAILED")
+    );
+    assert_eq!(events[0].created_at, now - 45);
+    assert_eq!(events[0].event_type, "PLAYBACK_STOPPED");
+
+    // `limit / 2` per category with a floor of one, then the overall truncation.
+    let bounded = database.list_activity_events(2).await?;
+    assert_eq!(
+        bounded
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["playback-stopped", "login-tie-b"]
+    );
+    let single = database.list_activity_events(1).await?;
+    assert_eq!(
+        single
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["playback-stopped"]
+    );
+    assert!(database.list_activity_events(0).await?.is_empty());
+
+    // Both category queries are range searches on the retention index: the window lower bound bounds
+    // the scanned rows, and the index order avoids a whole-table sort.
+    let window_start =
+        crate::clock::unix_timestamp().saturating_sub(DASHBOARD_ACTIVITY_WINDOW_SECONDS);
+    for sql in [ACTIVITY_FEED_LOGIN_SQL, ACTIVITY_FEED_PLAYBACK_SQL] {
+        let plan_rows = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+            .bind(window_start)
+            .bind(5_i64)
+            .fetch_all(database.pool())
+            .await?;
+        let plan = plan_rows
+            .iter()
+            .filter_map(|row| sqlx::Row::try_get::<String, _>(row, 3).ok())
+            .collect::<Vec<_>>();
+        assert!(
+            plan.iter().any(|line| {
+                line.starts_with("SEARCH")
+                    && line.contains("idx_user_activity_events_retention")
+                    && line.contains("occurred_at>?")
+            }),
+            "activity feed query should range-search the retention index: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|line| line.starts_with("SCAN ")),
+            "activity feed query should not scan the whole table: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|line| line.to_ascii_uppercase().contains("TEMP B-TREE")),
+            "activity feed query should not sort the whole table: {plan:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_activity_events_only_reads_events_inside_the_dashboard_window()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::users::DASHBOARD_ACTIVITY_WINDOW_SECONDS;
+
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let now = crate::clock::unix_timestamp();
+    let inside = now - 60;
+    // The feed reads the clock again when it queries, so keep every row a minute away from the
+    // exact window edge: a one-second clock step between the two reads must not flip the result.
+    let window_edge = now - DASHBOARD_ACTIVITY_WINDOW_SECONDS;
+    let boundary = window_edge + 60;
+    let outside = window_edge - 60;
+    for (id, event_type, occurred_at) in [
+        ("inside-login", "AUTH_LOGIN", inside),
+        ("inside-playback", "PLAYBACK_STARTED", inside),
+        ("boundary-playback", "PLAYBACK_PAUSED", boundary),
+        ("outside-login", "AUTH_LOGIN", outside),
+        ("outside-playback", "PLAYBACK_STOPPED", outside),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_activity_events (id, user_id, actor_user_id, event_type, occurred_at)
+             VALUES (?, 'window-user', 'window-user', ?, ?)",
+        )
+        .bind(id)
+        .bind(event_type)
+        .bind(occurred_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let events = database.list_activity_events(10).await?;
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["inside-playback", "inside-login", "boundary-playback"]
+    );
+    // Rows older than the window stay in the index but never reach the dashboard feed.
+    let stored_outside: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_activity_events WHERE id LIKE 'outside-%'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(stored_outside, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_activity_events_joins_names_and_ignores_log_only_events()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('feed-library', 'Feed', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title,
+             identification_status, has_available_source
+         ) VALUES ('feed-item', 'feed-library', 'MOVIE', 'Feed Title', 'feed title',
+                   'LOCAL_CONFIRMED', 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    for (id, username) in [
+        ("feed-owner", "feed-owner-name"),
+        ("feed-actor", "feed-actor-name"),
+    ] {
+        sqlx::query(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash)
+             VALUES (?, ?, ?, 'test')",
+        )
+        .bind(id)
+        .bind(username)
+        .bind(username)
+        .execute(database.pool())
+        .await?;
+    }
+    let now = crate::clock::unix_timestamp();
+    type FeedEventRow<'a> = (
+        &'a str,
+        &'a str,
+        Option<&'a str>,
+        &'a str,
+        Option<&'a str>,
+        &'a str,
+        i64,
+    );
+    let rows: [FeedEventRow<'_>; 4] = [
+        (
+            "join-login",
+            "feed-owner",
+            Some("feed-owner"),
+            "AUTH_LOGIN",
+            None,
+            r#"{"remoteIp":"127.0.0.1"}"#,
+            now - 300,
+        ),
+        (
+            "join-play",
+            "feed-owner",
+            Some("feed-actor"),
+            "PLAYBACK_STARTED",
+            Some("feed-item"),
+            "{}",
+            now - 200,
+        ),
+        (
+            "owner-fallback-login",
+            "feed-owner",
+            None,
+            "AUTH_LOGIN",
+            None,
+            "{}",
+            now - 400,
+        ),
+        (
+            "orphan-play",
+            "deleted-user",
+            None,
+            "PLAYBACK_PAUSED",
+            Some("deleted-item"),
+            "{}",
+            now - 100,
+        ),
+    ];
+    for (id, user_id, actor_user_id, event_type, target_id, metadata_json, occurred_at) in rows {
+        sqlx::query(
+            "INSERT INTO user_activity_events (
+                 id, user_id, actor_user_id, event_type, target_type, target_id,
+                 metadata_json, occurred_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(actor_user_id)
+        .bind(event_type)
+        .bind(target_id.map(|_| "media_item"))
+        .bind(target_id)
+        .bind(metadata_json)
+        .bind(occurred_at)
+        .execute(database.pool())
+        .await?;
+    }
+    // A same-shaped activity record that only exists in the JSONL audit log must not be read.
+    crate::observability::logs::LogStore::new(&config.config_dir)
+        .append_json(serde_json::json!({
+            "recordType": "admin_audit_event",
+            "id": "log-only-activity",
+            "actorUserId": "feed-owner",
+            "actorUsername": "feed-owner-name",
+            "eventType": "AUTH_LOGIN",
+            "targetType": null,
+            "targetId": null,
+            "metadata": {},
+            "createdAt": 9_999,
+        }))
+        .await?;
+
+    let events = database.list_activity_events(10).await?;
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "orphan-play",
+            "join-play",
+            "join-login",
+            "owner-fallback-login",
+        ]
+    );
+    let join_play = &events[1];
+    assert_eq!(join_play.actor_user_id.as_deref(), Some("feed-actor"));
+    assert_eq!(join_play.actor_username.as_deref(), Some("feed-actor-name"));
+    assert_eq!(join_play.target_type.as_deref(), Some("media_item"));
+    assert_eq!(join_play.target_id.as_deref(), Some("feed-item"));
+    assert_eq!(join_play.target_title.as_deref(), Some("Feed Title"));
+    assert_eq!(join_play.created_at, now - 200);
+    let join_login = events
+        .iter()
+        .find(|event| event.id == "join-login")
+        .ok_or("missing joined login event")?;
+    assert_eq!(
+        join_login.actor_username.as_deref(),
+        Some("feed-owner-name")
+    );
+    assert_eq!(join_login.metadata_json, r#"{"remoteIp":"127.0.0.1"}"#);
+    assert_eq!(join_login.created_at, now - 300);
+    let fallback_login = events
+        .iter()
+        .find(|event| event.id == "owner-fallback-login")
+        .ok_or("missing fallback login event")?;
+    assert_eq!(fallback_login.actor_user_id, None);
+    assert_eq!(
+        fallback_login.actor_username.as_deref(),
+        Some("feed-owner-name")
+    );
+    let orphan_play = &events[0];
+    assert_eq!(orphan_play.actor_user_id, None);
+    assert!(orphan_play.actor_username.is_none());
+    assert_eq!(orphan_play.target_id.as_deref(), Some("deleted-item"));
+    assert!(orphan_play.target_title.is_none());
+
+    // Deleting the referenced rows keeps the feed readable with nullable names and titles.
+    sqlx::query("DELETE FROM users WHERE id = 'feed-actor'")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DELETE FROM media_items WHERE id = 'feed-item'")
+        .execute(database.pool())
+        .await?;
+    let after_delete = database.list_activity_events(10).await?;
+    let deleted_play = after_delete
+        .iter()
+        .find(|event| event.id == "join-play")
+        .ok_or("missing playback event after deletion")?;
+    assert_eq!(deleted_play.actor_user_id.as_deref(), Some("feed-actor"));
+    assert!(deleted_play.actor_username.is_none());
+    assert!(deleted_play.target_title.is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn user_activity_retention_setting_defaults_validates_and_recovers_invalid_values()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -30067,9 +31182,9 @@ async fn user_activity_retention_setting_defaults_validates_and_recovers_invalid
     })
     .await?;
 
-    assert_eq!(database.user_activity_retention_days().await?, 90);
-    database.set_user_activity_retention_days(180).await?;
-    assert_eq!(database.user_activity_retention_days().await?, 180);
+    assert_eq!(database.user_activity_retention_days().await?, 7);
+    database.set_user_activity_retention_days(60).await?;
+    assert_eq!(database.user_activity_retention_days().await?, 60);
     assert!(database.set_user_activity_retention_days(0).await.is_err());
     assert!(database.set_user_activity_retention_days(-1).await.is_err());
     assert!(
@@ -30078,7 +31193,7 @@ async fn user_activity_retention_setting_defaults_validates_and_recovers_invalid
             .await
             .is_err()
     );
-    assert_eq!(database.user_activity_retention_days().await?, 180);
+    assert_eq!(database.user_activity_retention_days().await?, 60);
 
     sqlx::query(
         "UPDATE server_settings SET value = 'not-a-number'
@@ -30086,14 +31201,14 @@ async fn user_activity_retention_setting_defaults_validates_and_recovers_invalid
     )
     .execute(database.pool())
     .await?;
-    assert_eq!(database.user_activity_retention_days().await?, 90);
+    assert_eq!(database.user_activity_retention_days().await?, 7);
     sqlx::query(
         "UPDATE server_settings SET value = '0'
          WHERE key = 'user_activity_retention_days'",
     )
     .execute(database.pool())
     .await?;
-    assert_eq!(database.user_activity_retention_days().await?, 90);
+    assert_eq!(database.user_activity_retention_days().await?, 7);
     Ok(())
 }
 
@@ -34018,6 +35133,190 @@ async fn search_pages_past_the_end_still_report_the_real_total()
     Ok(())
 }
 
+/// Inserts a searchable movie and lets the FTS consumer pick it up.
+async fn insert_searchable_movie(
+    database: &Database,
+    library_id: &str,
+    id: &'static str,
+    title: &'static str,
+    sort_title: &'static str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source
+         ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(id)
+    .bind(library_id)
+    .bind(title)
+    .bind(sort_title)
+    .execute(database.pool())
+    .await?;
+    Ok(())
+}
+
+async fn search_movie_page(
+    database: &Database,
+    query: &str,
+    like_query: &str,
+    offset: i64,
+    limit: i64,
+    include_total: bool,
+) -> Result<(Vec<String>, i64), Box<dyn std::error::Error>> {
+    let page = database
+        .search_catalog_item_ids(&crate::storage::CatalogSearchQuery {
+            query,
+            like_query,
+            item_types: &["MOVIE".to_owned()],
+            library_ids: None,
+            offset,
+            limit,
+            content_restrictions: None,
+            include_total,
+        })
+        .await?;
+    Ok(page)
+}
+
+/// Locks the observable contract of the search page query (result order, total, and the
+/// `include_total = false` shortcut) so a query rewrite cannot silently change it.
+#[tokio::test]
+async fn search_page_keeps_sort_title_order_and_total_across_pages()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::application::libraries::LibraryService;
+    use crate::library::LibraryKind;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    for (id, title, sort_title) in [
+        ("zebra-foxtrot", "Zebra Foxtrot", "zebra foxtrot"),
+        ("zebra-bravo-b", "Zebra Bravo B", "zebra bravo"),
+        ("zebra-alpha", "Zebra Alpha", "zebra alpha"),
+        ("zebra-bravo-a", "Zebra Bravo A", "zebra bravo"),
+        ("zebra-delta", "Zebra Delta", "zebra delta"),
+        ("zebra-charlie", "Zebra Charlie", "zebra charlie"),
+        ("zebra-echo", "Zebra Echo", "zebra echo"),
+    ] {
+        insert_searchable_movie(&database, &library_id, id, title, sort_title).await?;
+    }
+    drain_search_index(&database).await;
+
+    let expected = [
+        "zebra-alpha",
+        "zebra-bravo-a",
+        "zebra-bravo-b",
+        "zebra-charlie",
+        "zebra-delta",
+        "zebra-echo",
+        "zebra-foxtrot",
+    ];
+    let (ids, total) = search_movie_page(&database, "Zebra", "%Zebra%", 0, 10, true).await?;
+    assert_eq!(ids, expected, "sort title, then id, across the whole page");
+    assert_eq!(total, 7);
+
+    let (ids, total) = search_movie_page(&database, "Zebra", "%Zebra%", 0, 3, true).await?;
+    assert_eq!(ids, expected[..3]);
+    assert_eq!(total, 7, "every page reports the same total");
+
+    let (ids, total) = search_movie_page(&database, "Zebra", "%Zebra%", 3, 3, true).await?;
+    assert_eq!(ids, expected[3..6]);
+    assert_eq!(total, 7);
+
+    let (ids, total) = search_movie_page(&database, "Zebra", "%Zebra%", 6, 3, true).await?;
+    assert_eq!(ids, expected[6..]);
+    assert_eq!(total, 7);
+
+    let (ids, total) = search_movie_page(&database, "Zebra", "%Zebra%", 20, 3, true).await?;
+    assert!(ids.is_empty());
+    assert_eq!(total, 7, "a page past the end still reports the real total");
+
+    let (ids, total) = search_movie_page(&database, "Zebra", "%Zebra%", 0, 7, false).await?;
+    assert_eq!(ids, expected, "skipping the count must not change the page");
+    assert_eq!(total, 0, "count=false reports no total");
+    Ok(())
+}
+
+/// Locks the partial-match path: `Zebra` matches one FTS token and four LIKE rows, so the
+/// `UNION` branch that runs for a page past the FTS matches must deduplicate the overlap and keep
+/// the `sort_title, id` order.
+#[tokio::test]
+async fn search_page_union_keeps_like_only_matches_sorted_and_counted_once()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::application::libraries::LibraryService;
+    use crate::library::LibraryKind;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    for (id, title, sort_title) in [
+        ("solaris-alias", "Solaris", "solaris"),
+        ("zebra-one", "Zebra One", "zebra one"),
+        ("zebrax-three", "Zebrax Three", "zebrax three"),
+        ("zebrax-two", "Zebrax Two", "zebrax two"),
+    ] {
+        insert_searchable_movie(&database, &library_id, id, title, sort_title).await?;
+    }
+    // Matches the LIKE alias branch only: "Zebrax" is not the FTS token "Zebra".
+    sqlx::query(
+        "INSERT INTO item_aliases (id, item_id, alias, alias_normalized)
+         VALUES ('alias-solaris', 'solaris-alias', 'Zebrax Alias', 'zebrax alias')",
+    )
+    .execute(database.pool())
+    .await?;
+    drain_search_index(&database).await;
+
+    let ordered = ["solaris-alias", "zebra-one", "zebrax-three", "zebrax-two"];
+    // A complete token is served by FTS alone, so the partial matches stay out of the page.
+    let (ids, total) = search_movie_page(&database, "Zebra", "%Zebra%", 0, 10, true).await?;
+    assert_eq!(ids, ["zebra-one"]);
+    assert_eq!(total, 1);
+
+    // No FTS token matches, so the LIKE branch serves the page: ordered by sort title, then id.
+    let (ids, total) = search_movie_page(&database, "Zebr", "%Zebr%", 0, 10, true).await?;
+    assert_eq!(
+        ids, ordered,
+        "LIKE pages are ordered by sort title, then id"
+    );
+    assert_eq!(total, 4);
+
+    let (ids, total) = search_movie_page(&database, "Zebr", "%Zebr%", 0, 2, true).await?;
+    assert_eq!(ids, ordered[..2]);
+    assert_eq!(total, 4);
+
+    // Only `zebra-one` is an FTS match, so this page is served by the FTS/LIKE union.
+    let (ids, total) = search_movie_page(&database, "Zebra", "%Zebra%", 1, 2, true).await?;
+    assert_eq!(
+        ids,
+        ordered[1..3],
+        "the overlap is deduplicated, not doubled"
+    );
+    assert_eq!(total, 4, "the union counts each match once");
+    Ok(())
+}
+
+#[test]
+fn search_page_limit_is_clamped_to_the_server_upper_bound() {
+    use super::catalog::{SEARCH_MAX_PAGE_LIMIT, clamped_search_page_limit};
+
+    assert_eq!(clamped_search_page_limit(0), 0, "count-only stays 0");
+    assert_eq!(clamped_search_page_limit(-5), 0);
+    assert_eq!(clamped_search_page_limit(24), 24);
+    assert_eq!(clamped_search_page_limit(SEARCH_MAX_PAGE_LIMIT), 1_000);
+    assert_eq!(
+        clamped_search_page_limit(SEARCH_MAX_PAGE_LIMIT + 1),
+        SEARCH_MAX_PAGE_LIMIT
+    );
+    assert_eq!(clamped_search_page_limit(i64::MAX), SEARCH_MAX_PAGE_LIMIT);
+}
+
 #[tokio::test]
 async fn catalog_children_page_over_items_not_joined_source_rows()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -35078,6 +36377,7 @@ async fn write_lock_waits_for_the_current_writer_instead_of_failing() {
         "test",
         Duration::from_millis(1),
         std::panic::Location::caller(),
+        Arc::new(OutboxSignals::default()),
     )
     .await;
     let waited = started.elapsed();
@@ -36155,7 +37455,7 @@ async fn playback_event_renews_the_admission_in_its_own_transaction()
         .fetch_one(database.pool())
         .await?;
     database
-        .reserve_playback_admission(&user_id, "progress-admission-session", now)
+        .reserve_playback_admission(&user_id, "progress-admission-session", now, None)
         .await?
         .expect("user exists");
     let stale_stamp = now.saturating_sub(40);
@@ -36514,5 +37814,233 @@ async fn sqlite_synchronous_level_reaches_the_connection_pragma()
             "the busy timeout survives the new pragma"
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn media_source_local_location_resolves_nested_files_and_strm_files() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(root_path.join("Nested"))
+        .await
+        .expect("nested media root");
+    tokio::fs::write(
+        root_path.join("Nested").join("Local.Movie.2024.mkv"),
+        b"local",
+    )
+    .await
+    .expect("local movie");
+    tokio::fs::write(
+        root_path.join("Nested").join("Remote.Movie.2024.strm"),
+        b"https://media.example.invalid/remote.mkv",
+    )
+    .await
+    .expect("STRM file");
+    libraries
+        .add_root(library.id, root_path.to_str().expect("utf-8 media root"))
+        .await
+        .expect("library root");
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await
+        .expect("scan");
+
+    let sources = database
+        .list_media_sources_for_library_page(&library.id.to_string(), 10, 0)
+        .await
+        .expect("sources");
+    assert_eq!(sources.len(), 2);
+    let mut resolved = Vec::new();
+    for source in &sources {
+        let location = database
+            .media_source_local_location(&source.source_id)
+            .await
+            .expect("location query")
+            .expect("local location for a scanned source");
+        resolved.push(std::path::Path::new(&location.0).join(&location.1));
+    }
+    let mut names = resolved
+        .iter()
+        .map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["Local.Movie.2024.mkv", "Remote.Movie.2024.strm"]
+    );
+    assert!(
+        resolved
+            .iter()
+            .all(|path| path.parent().and_then(|parent| parent.file_name())
+                == Some(std::ffi::OsStr::new("Nested")))
+    );
+    assert!(
+        database
+            .media_source_local_location("missing-source")
+            .await
+            .expect("missing lookup")
+            .is_none()
+    );
+}
+
+/// The tag list has to answer the same display spelling on PostgreSQL, where the database
+/// collation is locale aware by default: only the explicit `COLLATE "C"` in the query keeps the
+/// byte-order rule that SQLite gets from `COLLATE BINARY`.
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_tag_facet_list_keeps_the_byte_order_smallest_spelling()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_url = DatabaseConfiguration::Postgres(admin_connection.clone())
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect_with_configuration(
+        &Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp.path().join("config"),
+        },
+        &DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+    let outcome = assert_tag_facet_spelling_contract(&database).await;
+    database.close().await;
+    let cleanup = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    cleanup?;
+    outcome
+}
+
+/// Shared by the PostgreSQL test: two spellings per case-insensitive name, written in the order
+/// that a "first row wins" or locale-aware rule would answer differently.
+async fn assert_tag_facet_spelling_contract(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    database
+        .query("INSERT INTO libraries (id, name, kind) VALUES ('pg-tag-lib', 'Tags', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    for (item_id, tag) in [
+        ("pg-tag-first", "sci-fi"),
+        ("pg-tag-second", "Sci-Fi"),
+        ("pg-tag-third", "Noir"),
+        ("pg-tag-fourth", "noir"),
+        ("pg-tag-fifth", "été"),
+        ("pg-tag-sixth", "Été"),
+    ] {
+        database
+            .query(
+                "INSERT INTO media_items
+                 (id, library_id, item_type, title, sort_title, identification_status,
+                  has_available_source)
+                 VALUES (?, 'pg-tag-lib', 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(item_id)
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_item_facets (item_id, kind, name_key, name)
+                 VALUES (?, 'TAG', ?, ?)",
+            )
+            .bind(item_id)
+            .bind(tag.to_lowercase())
+            .bind(tag)
+            .execute(database.pool())
+            .await?;
+    }
+    // A GENRE row with the same spelling must not leak into the tag list.
+    database
+        .query(
+            "INSERT INTO media_item_facets (item_id, kind, name_key, name)
+             VALUES ('pg-tag-first', 'GENRE', 'sci-fi', 'Sci-Fi')",
+        )
+        .execute(database.pool())
+        .await?;
+
+    let library_ids = vec!["pg-tag-lib".to_owned()];
+    let filter = CatalogFilterQuery {
+        library_ids: &library_ids,
+        user_id: "pg-tag-user",
+        item_types: &[],
+        excluded_item_types: &[],
+        item_ids: None,
+        person_id: None,
+        media_source_ids: None,
+        provider_id_equals: None,
+        years: &[],
+        genre_keys: &[],
+        studio_keys: &[],
+        is_played: None,
+        is_favorite: None,
+        is_resumable: None,
+        min_date_last_saved: None,
+        metadata_pending: false,
+        parent_id_scope: None,
+        content_restrictions: None,
+        sort_by: CatalogSort::Name,
+        descending: false,
+        offset: 0,
+        limit: 50,
+        include_total: true,
+    };
+    let (tags, total) = database.list_catalog_tags(&filter, 0, 50).await?;
+    assert_eq!(total, 3);
+    assert_eq!(
+        tags.iter()
+            .map(|tag| (tag.name_key.as_str(), tag.name.as_str(), tag.item_count))
+            .collect::<Vec<_>>(),
+        vec![
+            ("noir", "Noir", 2),
+            ("sci-fi", "Sci-Fi", 2),
+            ("été", "Été", 2)
+        ],
+        "PostgreSQL must answer the byte-order smallest spelling of each name key"
+    );
     Ok(())
 }

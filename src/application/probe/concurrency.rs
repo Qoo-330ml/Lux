@@ -94,7 +94,27 @@ impl ProbeRuntimeRegistry {
         Ok(runtime)
     }
 
+    /// Closes admission for good and waits for in-flight attempts. Production calls this once,
+    /// during process shutdown.
+    #[cfg(not(test))]
     async fn shutdown(&self) -> Result<(), AdmissionError> {
+        self.shutdown_and_drain().await
+    }
+
+    /// Unit tests share one process-wide registry across every test in the binary, and each test
+    /// may build and shut down a full `AppState`. Closing admission here would make every probe
+    /// test that runs afterwards fail with "probe admission is closed", which is test order
+    /// dependence, not product behaviour. The real drain is still exercised by
+    /// `registry_shutdown_prevents_late_runtime_initialization` and by the
+    /// `probe_runtime_shutdown_reaps_active_ffprobe_before_return` integration test, which links
+    /// this library without `cfg(test)`.
+    #[cfg(test)]
+    async fn shutdown(&self) -> Result<(), AdmissionError> {
+        Ok(())
+    }
+
+    /// Closes admission, waits for in-flight attempts, and leaves the registry terminal.
+    async fn shutdown_and_drain(&self) -> Result<(), AdmissionError> {
         let runtime = {
             let _lifecycle = self
                 .lifecycle
@@ -1010,7 +1030,7 @@ mod tests {
     async fn registry_shutdown_prevents_late_runtime_initialization() {
         let registry = ProbeRuntimeRegistry::new();
         registry
-            .shutdown()
+            .shutdown_and_drain()
             .await
             .expect("shutdown before initialization");
 
@@ -1018,6 +1038,30 @@ mod tests {
         assert_eq!(
             registry.get_or_init(8, 4, Instant::now()).err(),
             Some(AdmissionError::Closed)
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_shutdown_keeps_admission_usable_for_the_next_test() {
+        let registry = ProbeRuntimeRegistry::new();
+        let runtime = registry
+            .get_or_init(8, 4, Instant::now())
+            .expect("initial runtime");
+        let session = runtime
+            .register(LibraryId::new(), 1, 1, Instant::now())
+            .expect("session");
+        drop(session);
+
+        registry.shutdown().await.expect("test shutdown");
+
+        // One test shuts a state down; every later test in the same binary must still probe.
+        let usable = registry
+            .get_or_init(8, 4, Instant::now())
+            .expect("usable runtime");
+        assert!(
+            usable
+                .register(LibraryId::new(), 1, 1, Instant::now())
+                .is_ok()
         );
     }
 

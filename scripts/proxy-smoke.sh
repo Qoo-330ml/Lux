@@ -7,6 +7,11 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT_DIR/scripts/lib/wait-for-restart.sh"
 cd "$ROOT_DIR"
 
+# Static half of the WebSocket check (ADR-054 D12): both nginx samples must carry `Upgrade`/
+# `Connection` and send `$http_host`. It needs neither docker nor nginx, so it runs first and fails
+# fast on a sample that would make every handshake reach Lux as a plain GET.
+"$ROOT_DIR/scripts/check-proxy-config.sh"
+
 IMAGE="${LUX_IMAGE:-lux:arm64-local}"
 PROXY_IMAGE="${LUX_PROXY_IMAGE:-nginx:1.27-alpine}"
 PORT="${LUX_PROXY_SMOKE_PORT:-18611}"
@@ -118,6 +123,125 @@ fi
 csrf_value="${csrf_cookie#lux_csrf=}"
 cookies="$session_cookie; $csrf_cookie"
 
+# --- WebSocket upgrade through nginx (ADR-054 D12, LUX-896) ---------------------------------------
+#
+# A browser talks to nginx over TLS and nginx forwards a classic HTTP/1.1 upgrade to luxd, so the
+# handshake below is exactly what the browser does after `new WebSocket(...)`. This listener uses a
+# non-default port, so the `Host: $http_host` sample doubles as a regression test for the port drop
+# that `$host` causes: Origin `https://127.0.0.1:$PORT` would stop matching `Host 127.0.0.1`.
+ws_origin="https://127.0.0.1:$PORT"
+ws_key="$(openssl rand -base64 16)"
+ws_accept_expected="$(printf '%s' "${ws_key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11" \
+    | openssl dgst -sha1 -binary | openssl base64)"
+
+# `curl` reports the status line of a 101 and then discards the upgraded bytes, so the status and
+# handshake headers are read from `-D`. The command always ends with its own timeout because nginx
+# keeps the tunnel open; only the captured status matters.
+ws_handshake() {
+    local name="$1"
+    shift
+    curl -ksS --http1.1 --max-time 4 \
+        -o "$WORK_DIR/ws-$name.body" \
+        -D "$WORK_DIR/ws-$name.headers" \
+        -w '%{http_code}' \
+        "$@" \
+        "https://127.0.0.1:$PORT/api/v1/ws" 2>/dev/null || true
+}
+
+http_header_value() {
+    local file="$1" name="$2"
+    grep -i "^${name}:" "$file" | head -n 1 | sed -E 's/^[^:]+:[[:space:]]*//' | tr -d '\r'
+}
+
+ws_upgrade_status="$(ws_handshake upgrade \
+    -H "Origin: $ws_origin" \
+    -H 'Upgrade: websocket' \
+    -H 'Connection: Upgrade' \
+    -H 'Sec-WebSocket-Version: 13' \
+    -H "Sec-WebSocket-Key: $ws_key" \
+    -H "Cookie: $cookies")"
+if [[ "$ws_upgrade_status" != "101" ]]; then
+    echo "WebSocket upgrade through nginx did not return 101: got '$ws_upgrade_status'" >&2
+    cat "$WORK_DIR/ws-upgrade.headers" >&2 || true
+    exit 1
+fi
+[[ "$(http_header_value "$WORK_DIR/ws-upgrade.headers" 'upgrade')" == "websocket" ]]
+ws_accept_actual="$(http_header_value "$WORK_DIR/ws-upgrade.headers" 'sec-websocket-accept')"
+if [[ "$ws_accept_actual" != "$ws_accept_expected" ]]; then
+    echo "WebSocket handshake returned an unexpected Sec-WebSocket-Accept: '$ws_accept_actual'" >&2
+    exit 1
+fi
+
+# The first frame proves the tunnel carries data and not only the status line. `curl` drops
+# post-101 bytes, so the frame is read with a short-lived `openssl s_client`; the wait is bounded by
+# the polling loop, not by the server's 25 s heartbeat or by the connection staying open.
+#
+# The frame starts with the binary header (0x81 + length), and an invalid UTF-8 lead byte makes BSD
+# grep skip the line even with `-a`, so the payload is matched in the C locale.
+ws_frame_contains() {
+    local file="$1" pattern="$2"
+    LC_ALL=C grep -aq -- "$pattern" "$file"
+}
+ws_first_frame="$WORK_DIR/ws-first-frame.bin"
+(
+    printf 'GET /api/v1/ws HTTP/1.1\r\n'
+    printf 'Host: 127.0.0.1:%s\r\n' "$PORT"
+    printf 'Origin: %s\r\n' "$ws_origin"
+    printf 'Upgrade: websocket\r\n'
+    printf 'Connection: Upgrade\r\n'
+    printf 'Sec-WebSocket-Version: 13\r\n'
+    printf 'Sec-WebSocket-Key: %s\r\n' "$ws_key"
+    printf 'Cookie: %s\r\n' "$cookies"
+    printf '\r\n'
+    sleep 2
+) | openssl s_client -quiet -connect "127.0.0.1:$PORT" -servername localhost 2>/dev/null \
+    >"$ws_first_frame" &
+ws_reader_pid=$!
+for _ in $(seq 1 20); do
+    if ws_frame_contains "$ws_first_frame" '"type":"ready"'; then
+        break
+    fi
+    sleep 0.25
+done
+kill "$ws_reader_pid" 2>/dev/null || true
+wait "$ws_reader_pid" 2>/dev/null || true
+if ! ws_frame_contains "$ws_first_frame" '"type":"ready"' \
+    || ! ws_frame_contains "$ws_first_frame" '"version":1'; then
+    echo "WebSocket upgrade returned 101 but no ready frame" >&2
+    exit 1
+fi
+
+# Negative cases: a cookie-authenticated handshake without `Origin` must be rejected (ADR-054 D5),
+# a mismatched `Origin` must answer 400, and a plain GET — what a proxy that strips `Upgrade` sends
+# upstream — must not be upgraded. The plain GET status is recorded instead of asserted: ADR-054's
+# endpoint contract says 426 while its reverse-proxy section still mentions the extractor's default
+# 400, and the browser turns both into `close 1006`.
+ws_missing_origin_status="$(ws_handshake missing-origin \
+    -H 'Upgrade: websocket' \
+    -H 'Connection: Upgrade' \
+    -H 'Sec-WebSocket-Version: 13' \
+    -H "Sec-WebSocket-Key: $ws_key" \
+    -H "Cookie: $cookies")"
+if [[ ! "$ws_missing_origin_status" =~ ^4[0-9][0-9]$ ]]; then
+    echo "handshake without Origin was not rejected: got '$ws_missing_origin_status'" >&2
+    exit 1
+fi
+ws_cross_origin_status="$(ws_handshake cross-origin \
+    -H 'Origin: https://evil.example' \
+    -H 'Upgrade: websocket' \
+    -H 'Connection: Upgrade' \
+    -H 'Sec-WebSocket-Version: 13' \
+    -H "Sec-WebSocket-Key: $ws_key" \
+    -H "Cookie: $cookies")"
+[[ "$ws_cross_origin_status" == "400" ]]
+ws_plain_get_status="$(ws_handshake plain-get \
+    -H "Origin: $ws_origin" \
+    -H "Cookie: $cookies")"
+if [[ ! "$ws_plain_get_status" =~ ^4[0-9][0-9]$ ]]; then
+    echo "plain GET on the WebSocket path was not rejected: got '$ws_plain_get_status'" >&2
+    exit 1
+fi
+
 create_viewer_status="$(curl -ksS -o "$WORK_DIR/viewer.json" -w '%{http_code}' \
     -X POST "https://127.0.0.1:$PORT/api/v1/admin/users" \
     -H "Cookie: $cookies" \
@@ -209,9 +333,18 @@ jq -n \
     --arg remoteLoginStatus "$remote_login_status" \
     --arg localLoginStatus "$local_login_status" \
     --arg rangeStatus "$range_status" \
+    --arg wsUpgradeStatus "$ws_upgrade_status" \
+    --arg wsMissingOriginStatus "$ws_missing_origin_status" \
+    --arg wsCrossOriginStatus "$ws_cross_origin_status" \
+    --arg wsPlainGetStatus "$ws_plain_get_status" \
     '{architecture: $architecture, image: $image, proxyImage: $proxyImage,
       trustedProxySubnet: $subnet, tlsCertificateSubject: $certificateSubject,
       libraryId: $libraryId, jobId: $jobId, itemId: $itemId, sourceId: $sourceId,
       trustedForwardedPublicLoginStatus: $remoteLoginStatus,
       localLoginStatus: $localLoginStatus, rangeStatus: $rangeStatus,
-      contentRange: "bytes 2-5/10", responseBody: "2345"}'
+      contentRange: "bytes 2-5/10", responseBody: "2345",
+      websocketUpgradeStatus: $wsUpgradeStatus,
+      websocketUpgradeFirstFrame: "{\"type\":\"ready\",\"version\":1}",
+      websocketMissingOriginStatus: $wsMissingOriginStatus,
+      websocketCrossOriginStatus: $wsCrossOriginStatus,
+      websocketPlainGetStatus: $wsPlainGetStatus}'

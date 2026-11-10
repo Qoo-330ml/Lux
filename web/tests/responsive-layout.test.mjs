@@ -37,15 +37,15 @@ test("player overlays use viewport-relative safe-area insets", () => {
   assert.match(rule(".lux-player-frame"), /right:\s*env\(safe-area-inset-right\)/);
 });
 
-test("portrait phone players move AirPlay and picture-in-picture to the top bar", () => {
-  assert.match(stylesheet, /\.lux-player-topbar-actions\s*\{[^}]*display:\s*none/);
-  assert.match(stylesheet, /@media\s*\(max-width:\s*720px\)\s+and\s+\(orientation:\s*portrait\)[\s\S]*?\.lux-player-topbar-actions\s*\{[^}]*display:\s*flex/);
+test("the top bar shows picture-in-picture on every viewport; portrait phones hide the duplicate AirPlay in the control bar", () => {
+  // Picture-in-picture sits top-right on desktop too, so the top-bar actions are always shown.
+  assert.match(stylesheet, /\.lux-player-topbar-actions\s*\{[^}]*display:\s*flex/);
   assert.match(stylesheet, /@media\s*\(max-width:\s*720px\)\s+and\s+\(orientation:\s*portrait\)[\s\S]*?\.lux-player-controls \.lux-player-mobile-top-control\s*\{[^}]*display:\s*none/);
 });
 
 test("center playback action uses a smaller visual footprint", () => {
-  assert.match(stylesheet, /\.lux-player-center-play, \.lux-player-center-splash\s*\{[^}]*width:\s*88px;[^}]*height:\s*88px/);
-  assert.match(stylesheet, /@media\s*\(max-width:\s*560px\)[\s\S]*?\.lux-player-center-play, \.lux-player-center-splash\s*\{[^}]*width:\s*68px;[^}]*height:\s*68px/);
+  assert.match(stylesheet, /\.lux-player-center-control\s*\{[^}]*width:\s*104px;[^}]*height:\s*104px/);
+  assert.match(stylesheet, /@media\s*\(max-width:\s*560px\)[\s\S]*?\.lux-player-center-control\s*\{[^}]*width:\s*76px;[^}]*height:\s*76px/);
 });
 
 test("volume slider keeps its full track available for both endpoints", () => {
@@ -168,6 +168,19 @@ test("mobile library batch actions wrap instead of overflowing", () => {
   assert.match(selectionRule, /flex-wrap:\s*wrap/);
 });
 
+test("library filter controls wrap on desktop and stack on narrow phones", () => {
+  const mobileStyles = mediaStyles("@media (max-width: 560px)");
+  const filterRule = mobileStyles.match(/\.lux-library-filter-toolbar\s*\{([^}]*)\}/)?.[1] ?? "";
+  const yearRule = mobileStyles.match(/\.lux-library-sort-control \.lux-library-filter-year\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(rule(".lux-library-filter-toolbar"), /flex-wrap:\s*wrap/);
+  assert.match(filterRule, /flex-direction:\s*column/);
+  assert.match(filterRule, /align-items:\s*stretch/);
+  assert.match(mobileStyles, /\.lux-library-filter-toolbar\s*>\s*\.lux-button\s*\{[^}]*min-height:\s*var\(--lux-button-height-touch\)/);
+  assert.match(yearRule, /width:\s*min\(220px,\s*62vw\)/);
+  assert.match(yearRule, /min-height:\s*var\(--lux-button-height-touch\)/);
+});
+
 test("mobile image editing controls stay usable in a narrow dialog", () => {
   const mobileStyles = mediaStyles("@media (max-width: 560px)");
   const tabsRule = mobileStyles.match(/\.lux-image-type-tabs\s*\{([^}]*)\}/)?.[1] ?? "";
@@ -191,12 +204,16 @@ test("mobile player controls use the remaining width", () => {
 
 test("mobile action surfaces scroll within the dynamic viewport", () => {
   const actionMenuRule = rule(".lux-media-action-menu");
-  const settingsRule = rule(".lux-player-settings-popover");
+  const drawerRule = rule(".lux-player-settings-drawer");
+  const drawerBodyRule = rule(".lux-player-settings-body");
 
   assert.match(actionMenuRule, /max-height:\s*[^;]*dvh/);
   assert.match(actionMenuRule, /overflow-y:\s*auto/);
-  assert.match(settingsRule, /max-height:\s*[^;]*dvh/);
-  assert.match(settingsRule, /overflow-y:\s*auto/);
+  // The settings drawer spans the full viewport height and scrolls its body inside it.
+  assert.match(drawerRule, /top:\s*0/);
+  assert.match(drawerRule, /bottom:\s*0/);
+  assert.match(drawerRule, /width:\s*min\(340px,\s*100vw\)/);
+  assert.match(drawerBodyRule, /overflow-y:\s*auto/);
 });
 
 test("mobile metadata identifier results keep a usable landscape height", () => {

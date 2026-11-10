@@ -1212,3 +1212,100 @@ async fn read_only_directory_rejects_nfo_write() -> Result<(), Box<dyn std::erro
     ));
     Ok(())
 }
+
+#[test]
+fn local_nfo_parser_reads_emby_ratings_container() -> Result<(), Box<dyn std::error::Error>> {
+    let nfo = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<movie>
+  <title>寒战</title>
+  <ratings>
+    <rating name="tmdb" max="10">
+      <value>7.6</value>
+      <votes>204</votes>
+    </rating>
+  </ratings>
+  <userrating>7.6</userrating>
+</movie>"#;
+
+    let details = parse_local_nfo_details(nfo.as_bytes())?;
+    assert_eq!(details.rating, Some(7.6));
+    assert_eq!(details.votes, Some(204));
+
+    // The background enrichment path must see the same value as the detail projection.
+    let projection = parse_local_nfo_projection(nfo.as_bytes())?;
+    assert_eq!(projection.details.rating, Some(7.6));
+    assert_eq!(projection.details.votes, Some(204));
+    Ok(())
+}
+
+#[test]
+fn local_nfo_parser_prefers_the_default_rating_entry() -> Result<(), Box<dyn std::error::Error>> {
+    let details = parse_local_nfo_details(
+        r#"<movie><ratings>
+            <rating name="imdb" max="10"><value>7.0</value><votes>1200</votes></rating>
+            <rating name="tmdb" max="10" default="true"><value>7.6</value><votes>204</votes></rating>
+        </ratings></movie>"#
+            .as_bytes(),
+    )?;
+    assert_eq!(details.rating, Some(7.6));
+    assert_eq!(details.votes, Some(204));
+    Ok(())
+}
+
+#[test]
+fn local_nfo_parser_prefers_the_movie_database_entry_without_a_default()
+-> Result<(), Box<dyn std::error::Error>> {
+    let details = parse_local_nfo_details(
+        r#"<movie><ratings>
+            <rating name="imdb" max="10"><value>7.0</value><votes>1200</votes></rating>
+            <rating name="themoviedb" max="10"><value>7.4</value><votes>310</votes></rating>
+        </ratings></movie>"#
+            .as_bytes(),
+    )?;
+    assert_eq!(details.rating, Some(7.4));
+    assert_eq!(details.votes, Some(310));
+    Ok(())
+}
+
+#[test]
+fn local_nfo_parser_scales_ratings_container_by_its_max_attribute()
+-> Result<(), Box<dyn std::error::Error>> {
+    let details = parse_local_nfo_details(
+        b"<movie><ratings><rating name=\"imdb\" max=\"100\"><value>76</value></rating></ratings></movie>",
+    )?;
+    assert_eq!(details.rating, Some(7.6));
+    Ok(())
+}
+
+#[test]
+fn local_nfo_parser_keeps_a_flat_rating_ahead_of_the_ratings_container()
+-> Result<(), Box<dyn std::error::Error>> {
+    let details = parse_local_nfo_details(
+        r#"<movie>
+            <ratings><rating name="tmdb"><value>7.6</value><votes>204</votes></rating></ratings>
+            <rating>8.5</rating><votes>900</votes>
+        </movie>"#
+            .as_bytes(),
+    )?;
+    assert_eq!(details.rating, Some(8.5));
+    assert_eq!(details.votes, Some(900));
+    Ok(())
+}
+
+#[test]
+fn local_nfo_parser_ignores_user_ratings_and_incomplete_containers()
+-> Result<(), Box<dyn std::error::Error>> {
+    let user_only =
+        parse_local_nfo_details(b"<movie><title>t</title><userrating>9.0</userrating></movie>")?;
+    assert_eq!(user_only.rating, None);
+
+    let empty_container =
+        parse_local_nfo_details(b"<movie><ratings></ratings><title>t</title></movie>")?;
+    assert_eq!(empty_container.rating, None);
+
+    let value_only = parse_local_nfo_details(
+        b"<movie><ratings><rating name=\"tmdb\"><votes>12</votes></rating></ratings></movie>",
+    )?;
+    assert_eq!(value_only.rating, None);
+    Ok(())
+}

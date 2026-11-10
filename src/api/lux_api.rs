@@ -3,11 +3,13 @@ use super::*;
 pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new()
         .route("/api/v1/libraries", get(lux_list_libraries))
+        .route("/api/v1/tags", get(lux_list_tags))
         .route(
             "/api/v1/libraries/{library_id}/cover",
             get(lux_library_cover).head(lux_library_cover),
         )
         .route("/api/v1/favorites", get(lux_list_favorites))
+        .route("/api/v1/watch-history", get(lux_list_watch_history))
         .route("/api/v1/search", get(lux_search))
         .route("/api/v1/home", get(lux_home))
         .route("/api/v1/home/carousel", get(lux_home_carousel))
@@ -25,6 +27,7 @@ pub(super) fn api_routes() -> Router<ReadyAppState> {
             get(lux_list_library_latest),
         )
         .route("/api/v1/items/{item_id}", get(lux_get_item))
+        .route("/api/v1/items/{item_id}/similar", get(lux_get_similar))
         .route("/api/v1/people", get(lux_search_people))
         .route(
             "/api/v1/people/{person_id}/items",

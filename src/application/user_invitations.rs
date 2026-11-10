@@ -285,7 +285,9 @@ pub(crate) async fn create_user_invitation(
         .await
         .map_err(UserInvitationError::Storage)?;
     match result {
-        UserInvitationCreateResult::Created => {}
+        UserInvitationCreateResult::Created => {
+            database.notify_mail_outbox_appended();
+        }
         UserInvitationCreateResult::AlreadyPending => {
             return Err(UserInvitationError::AlreadyPending);
         }
@@ -379,7 +381,10 @@ pub(crate) async fn queue_user_invitation_resend(
         .queue_user_invitation_resend(invitation_id, idempotency_key, now)
         .await
     {
-        Ok(UserInvitationResendResult::Queued) => Ok(()),
+        Ok(UserInvitationResendResult::Queued) => {
+            database.notify_mail_outbox_appended();
+            Ok(())
+        }
         Ok(UserInvitationResendResult::NotResendable) => Err(UserInvitationError::NotRevocable),
         Ok(UserInvitationResendResult::RateLimited) => Err(UserInvitationError::RateLimited),
         Err(StorageError::Conflict(_)) => Err(UserInvitationError::IdempotencyConflict),

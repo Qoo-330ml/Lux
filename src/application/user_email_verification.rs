@@ -200,11 +200,14 @@ async fn request_user_email_change_with_expected_pending(
         .await
         .map_err(|_| UserEmailVerificationError::StorageUnavailable)?
     {
-        UserEmailChangeCreateResult::Created => Ok(Some(PendingUserEmailChange {
-            challenge_id,
-            pending_email,
-            expires_at,
-        })),
+        UserEmailChangeCreateResult::Created => {
+            database.notify_mail_outbox_appended();
+            Ok(Some(PendingUserEmailChange {
+                challenge_id,
+                pending_email,
+                expires_at,
+            }))
+        }
         UserEmailChangeCreateResult::NotAcceptable if expected_pending_challenge_id.is_some() => {
             Ok(None)
         }

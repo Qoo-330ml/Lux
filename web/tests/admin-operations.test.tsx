@@ -415,6 +415,27 @@ describe("AdminOperationsPage", () => {
     expect(container.textContent).not.toContain("METADATA_REIDENTIFY_STARTED");
   });
 
+  it("requests pending metadata counts only while the runtime records tab is open", async () => {
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    const metadataJobs = vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(metadataJobs).toHaveBeenCalled());
+      await vi.waitFor(() => expect(container.textContent).toContain("运行记录"));
+    });
+    expect(metadataJobs.mock.calls.map(([, options]) => options?.includePending ?? false)).toEqual([false]);
+
+    act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(2)')?.click());
+    await act(async () => {
+      await vi.waitFor(() =>
+        expect(metadataJobs.mock.calls.map(([, options]) => options?.includePending ?? false)).toContain(true),
+      );
+    });
+  });
+
   it("shows per-item metadata failure details on demand", async () => {
     vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
     vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({
@@ -1014,6 +1035,50 @@ describe("AdminOperationsPage", () => {
       "转码已启用是",
       "范围movies、shows",
     ]);
+  });
+
+  it("reads playback activity events as plain language with device details", async () => {
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [
+      {
+        id: "event-start",
+        actorUsername: "nanzi",
+        eventType: "PLAYBACK_STARTED",
+        targetType: "media_item",
+        targetId: "01a0ef34-1572-7130-93b2-aaa0ebbf6098",
+        metadata: { client: "Lux", deviceName: "Web", deviceType: "Web", state: "PLAYING", remoteIp: "10.0.0.2", itemTitle: "流浪地球" },
+        createdAt: "2026-10-31T05:13:00.000Z",
+      },
+      {
+        id: "event-stop",
+        actorUsername: "nanzi",
+        eventType: "PLAYBACK_STOPPED",
+        targetType: "media_item",
+        targetId: "01a0ef34-14dc-7352-90ad-d74dd4a71e40",
+        metadata: { state: "STOPPED" },
+        createdAt: "2026-10-31T05:13:00.000Z",
+      },
+    ] });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("已注册任务"));
+    });
+    act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(3)')?.click());
+    const rows = [...container.querySelectorAll<HTMLElement>(".lux-operations-log-row")];
+    expect(rows[0].querySelector("strong")?.textContent).toBe("开始播放");
+    expect(rows[0].querySelector(".lux-operations-log-copy p")?.textContent).toContain("媒体条目");
+    expect(rows[0].querySelector(".lux-operations-log-copy p")?.textContent).toContain("流浪地球");
+    expect(rows[0].querySelector(".lux-operations-log-copy p")?.textContent).toContain("设备 Web");
+    expect(rows[0].querySelector(".lux-operations-log-copy p")?.textContent).not.toContain("01a0ef34-1572-7130-93b2-aaa0ebbf6098");
+    expect(rows[1].querySelector("strong")?.textContent).toBe("停止播放");
+    expect(rows[1].querySelector(".lux-operations-log-level")?.textContent).toBe("INFO");
+
+    act(() => rows[0].querySelector<HTMLButtonElement>('button[aria-label="展开日志详情"]')?.click());
+    const details = [...rows[0].querySelectorAll("li")].map((item) => item.textContent);
+    expect(details).toEqual(["客户端Lux", "设备名Web", "设备类型Web", "状态播放中", "IP地址10.0.0.2", "条目名称流浪地球"]);
   });
 
   it("exports a selected UTC log date range from the system log tab", async () => {

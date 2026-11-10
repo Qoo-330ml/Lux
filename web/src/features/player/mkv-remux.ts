@@ -1,5 +1,5 @@
 import { Box, createFile } from "mp4box";
-import type { MatroskaTrack } from "./matroska-demuxer";
+import { copyBytes, type MatroskaTrack } from "./matroska-demuxer";
 
 type RemuxFile = ReturnType<typeof createFile>;
 
@@ -17,7 +17,7 @@ export function addHevcTrack(file: RemuxFile, codecPrivate: Uint8Array, width: n
   if (!sampleEntry) throw new Error("MKV fMP4 remux 缺少视频样本描述");
   const hvcC = new Box();
   hvcC.type = "hvcC";
-  hvcC.data = codecPrivate.slice();
+  hvcC.data = copyBytes(codecPrivate);
   sampleEntry.addBox(hvcC);
   return trackId;
 }
@@ -31,11 +31,17 @@ export function addMatroskaVideoTrack(file: RemuxFile, track: Pick<MatroskaTrack
   if (!entry) throw new Error("MKV fMP4 缺少视频样本描述");
   const description = new Box();
   description.type = type === "avc1" ? "avcC" : type === "hvc1" ? "hvcC" : type === "vp09" ? "vpcC" : "av1C";
-  description.data = track.codecPrivate.slice();
+  description.data = copyBytes(track.codecPrivate);
   entry.addBox(description);
   return trackId;
 }
 
+/**
+ * The MSE codec string for a Matroska video track, derived from the track's own configuration
+ * record. The remux worker passes this exact string to `addSourceBuffer`, so an 8-bit fallback for a
+ * 10-bit stream would create a SourceBuffer the browser cannot decode: the picture stays black while
+ * the (separately appended) audio keeps playing.
+ */
 export function matroskaVideoCodecString(track: Pick<MatroskaTrack, "codecId" | "codecPrivate">) {
   const codec = track.codecId.toUpperCase();
   if (codec === "V_MPEG4/ISO/AVC") {
@@ -45,9 +51,35 @@ export function matroskaVideoCodecString(track: Pick<MatroskaTrack, "codecId" | 
     }
     return "avc1.640028";
   }
-  if (codec === "V_VP9") return "vp09.00.10.08";
-  if (codec === "V_AV1") return "av01.0.04M.08";
+  if (codec === "V_VP9") return vp9CodecString(track.codecPrivate);
+  if (codec === "V_AV1") return av1CodecString(track.codecPrivate);
   return hevcCodecString(track.codecPrivate);
+}
+
+/** `vp09.<profile>.<level>.<bitDepth>` from the Matroska VP9 configuration record. */
+export function vp9CodecString(codecPrivate: Uint8Array) {
+  // version (1) + flags (3) + profile (1) + level (1) + depth/chroma byte (1)
+  if (codecPrivate.byteLength < 7) return "vp09.00.10.08";
+  const profile = codecPrivate[4];
+  const level = codecPrivate[5];
+  const bitDepth = (codecPrivate[6] >> 4) & 0x0f;
+  return `vp09.${pad2(profile)}.${pad2(level)}.${pad2(bitDepth || 8)}`;
+}
+
+/** `av01.<profile>.<level><tier>.<bitDepth>` from the AV1 codec configuration record. */
+export function av1CodecString(codecPrivate: Uint8Array) {
+  if (codecPrivate.byteLength < 3) return "av01.0.04M.08";
+  const profile = (codecPrivate[1] >> 5) & 0x07;
+  const level = codecPrivate[1] & 0x1f;
+  const tier = (codecPrivate[2] & 0x80) ? "H" : "M";
+  const highBitDepth = (codecPrivate[2] & 0x40) !== 0;
+  const twelveBit = (codecPrivate[2] & 0x20) !== 0;
+  const bitDepth = twelveBit ? 12 : highBitDepth ? 10 : 8;
+  return `av01.${profile}.${pad2(level)}${tier}.${pad2(bitDepth)}`;
+}
+
+function pad2(value: number) {
+  return String(Math.max(0, Math.round(value))).padStart(2, "0");
 }
 
 export function hevcCodecString(codecPrivate: Uint8Array) {

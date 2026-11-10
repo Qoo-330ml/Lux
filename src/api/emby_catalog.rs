@@ -4,10 +4,10 @@ use tokio::{sync::Semaphore, task::JoinSet};
 
 const EMBY_ITEM_EXTRA_CONCURRENCY: usize = 8;
 const EMBY_SHOW_EPISODE_DEFAULT_LIMIT: i64 = EMBY_MAX_PAGE_LIMIT;
-const EMBY_MAX_PAGE_LIMIT: i64 = 1_000;
+pub(super) const EMBY_MAX_PAGE_LIMIT: i64 = 1_000;
 
 use crate::application::catalog::CatalogItemCounts;
-use crate::storage::GLOBAL_COLLECTION_LIBRARY_ID;
+use crate::storage::{GLOBAL_COLLECTION_LIBRARY_ID, MediaFacetKind};
 
 #[derive(Deserialize, Default)]
 pub(super) struct EmbyItemsQuery {
@@ -40,9 +40,17 @@ pub(super) struct EmbyItemsQuery {
     pub(super) season_id: Option<String>,
     #[serde(rename = "SearchTerm", alias = "searchTerm", default)]
     pub(super) search_term: Option<String>,
-    #[serde(rename = "StartIndex", default)]
+    #[serde(
+        rename = "StartIndex",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) start_index: Option<i64>,
-    #[serde(rename = "Limit", default)]
+    #[serde(
+        rename = "Limit",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) limit: Option<i64>,
     #[serde(
         rename = "IsPlayed",
@@ -67,6 +75,11 @@ pub(super) struct EmbyItemsQuery {
     pub(super) min_date_last_saved: Option<i64>,
     #[serde(rename = "Years", default)]
     pub(super) years: Option<String>,
+    /// Emby separates several values with `|`; an item matches when it has any of them.
+    #[serde(rename = "Genres", default)]
+    pub(super) genres: Option<String>,
+    #[serde(rename = "Studios", default)]
+    pub(super) studios: Option<String>,
     #[serde(rename = "SortBy", alias = "sortBy", default)]
     pub(super) sort_by: Option<String>,
     #[serde(rename = "SortOrder", alias = "sortOrder", default)]
@@ -117,15 +130,50 @@ pub(super) struct EmbyItemCountsQuery {
     pub(super) is_favorite: Option<bool>,
 }
 
-pub(super) fn deserialize_optional_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+/// Shared body of the blank-tolerant query helpers: an empty or whitespace-only value means the
+/// client sent no value at all, so it deserializes to `None`. Any other value must parse, and a
+/// parse failure stays a deserialization error (which the `Query` extractor answers with `400`).
+fn blank_optional_value<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
 {
     let value = Option::<String>::deserialize(deserializer)?;
     match value.as_deref().map(str::trim) {
         None | Some("") => Ok(None),
         Some(value) => value.parse().map(Some).map_err(serde::de::Error::custom),
     }
+}
+
+/// Reads an optional boolean query value, treating an empty or whitespace-only value as absent.
+pub(super) fn deserialize_optional_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    blank_optional_value(deserializer)
+}
+
+/// Reads an optional `i64` query value, treating an empty or whitespace-only value as absent.
+///
+/// Emby clients spell "no explicit value" as `Limit=`/`StartIndex=` when a filter panel is opened
+/// without a paging choice; rejecting that with `400` emptied the Hills media library filter panel
+/// (see `docs/reviews/2026-11-06-hills-yamby-capture.md`). A non-empty value must still parse, so
+/// `Limit=abc`, `Limit=1.5` and negative offsets keep answering `400` exactly as before. This is
+/// the numeric counterpart of [`deserialize_optional_bool`] and shares its rule.
+pub(super) fn deserialize_optional_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    blank_optional_value(deserializer)
+}
+
+/// `i32` variant of [`deserialize_optional_i64`], for `Index`-style query values.
+pub(super) fn deserialize_optional_i32<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    blank_optional_value(deserializer)
 }
 
 fn deserialize_optional_emby_timestamp<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
@@ -165,6 +213,36 @@ pub(super) fn emby_internal_id(id: &str) -> String {
         && let Ok(value) = id.parse::<u128>()
     {
         return Uuid::from_u128(value).to_string();
+    }
+    id.to_owned()
+}
+
+/// Emby media source ids are 32 lowercase hex characters. External playback proxies
+/// (QMediaSync's Emby302, NextEmby, Qmby, emby2Alist) validate that shape and reject longer ids, so
+/// STRM sources expose the internal UUID without hyphens. The mapping is a reversible bijection, so
+/// no lookup table is needed and a UUID keeps resolving after the switch. Local files keep the
+/// internal UUID: their identifiers only ever reach Lux's own HLS/transcoding code, and leaving
+/// them untouched keeps that surface stable.
+pub(super) fn emby_public_source_id(id: &str, source_kind: &str) -> String {
+    let id = id.trim();
+    if !source_kind.eq_ignore_ascii_case("STRM_URL") {
+        return id.to_owned();
+    }
+    id.parse::<Uuid>()
+        .map(|uuid| uuid.simple().to_string())
+        .unwrap_or_else(|_| id.to_owned())
+}
+
+/// Resolves an Emby media source id back to the stored identifier. The 32 hex public form and the
+/// historical UUID both resolve, so signed URLs issued before an upgrade, cached PlaybackInfo
+/// payloads and clients that got a UUID from `/Sessions` stay valid.
+pub(super) fn emby_internal_source_id(id: &str) -> String {
+    let id = id.trim();
+    if id.len() == 32
+        && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && let Ok(uuid) = Uuid::parse_str(id)
+    {
+        return uuid.to_string();
     }
     id.to_owned()
 }
@@ -231,6 +309,32 @@ pub(super) fn normalize_emby_item_type(value: &str) -> Option<String> {
     }
 }
 
+/// Parses an Emby `IncludeItemTypes` value into normalized item types.
+///
+/// An absent or empty value means "every type". A non-empty value where nothing is recognized
+/// becomes `__NO_MATCH__`, so the filter matches no rows instead of silently dropping the
+/// restriction; a mixed value keeps only the recognized types. `/Items` and the filter-metadata
+/// endpoints share this rule so they cannot disagree.
+pub(super) fn emby_item_types_from_value(value: Option<&str>) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let raw_values = value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let normalized = raw_values
+        .iter()
+        .filter_map(|value| normalize_emby_item_type(value))
+        .collect::<Vec<_>>();
+    if raw_values.is_empty() || !normalized.is_empty() {
+        normalized
+    } else {
+        vec!["__NO_MATCH__".to_owned()]
+    }
+}
+
 pub(super) fn catalog_filter_from_values(
     item_types: Option<&str>,
     years: Option<&str>,
@@ -240,24 +344,7 @@ pub(super) fn catalog_filter_from_values(
     sort_order: Option<&str>,
     metadata_pending: bool,
 ) -> CatalogFilter {
-    let item_types = item_types
-        .map(|values| {
-            let raw_values = values
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .collect::<Vec<_>>();
-            let normalized = raw_values
-                .iter()
-                .filter_map(|value| normalize_emby_item_type(value))
-                .collect::<Vec<_>>();
-            if raw_values.is_empty() || !normalized.is_empty() {
-                normalized
-            } else {
-                vec!["__NO_MATCH__".to_owned()]
-            }
-        })
-        .unwrap_or_default();
+    let item_types = emby_item_types_from_value(item_types);
     let years = years
         .map(|values| {
             values
@@ -274,8 +361,11 @@ pub(super) fn catalog_filter_from_values(
         media_source_ids: None,
         provider_id_equals: None,
         years,
+        genre_keys: Vec::new(),
+        studio_keys: Vec::new(),
         is_played,
         is_favorite,
+        is_resumable: false,
         min_date_last_saved: None,
         metadata_pending,
         sort_by: catalog_sort_from_value(sort_by),
@@ -301,6 +391,58 @@ fn catalog_sort_from_value(value: Option<&str>) -> CatalogSort {
     }
 }
 
+/// Splits a `|`-separated Emby facet filter into lower-cased lookup keys (bounded, no blanks).
+fn emby_facet_keys(value: Option<&str>) -> Vec<String> {
+    let mut keys = Vec::new();
+    for key in value
+        .unwrap_or_default()
+        .split('|')
+        .map(|part| part.trim().to_lowercase())
+        .filter(|part| !part.is_empty())
+        .take(32)
+    {
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+/// The Emby `Filters` values Lux understands.
+#[derive(Default)]
+struct EmbyItemFilters {
+    is_played: Option<bool>,
+    is_resumable: bool,
+    is_favorite: bool,
+}
+
+/// Parses the comma-separated Emby `Filters` value case-insensitively.
+///
+/// Unknown values stay ignored. `IsUnplayed` keeps precedence over `IsPlayed`, as it did before
+/// `IsResumable`/`IsFavorite` were understood.
+fn emby_item_filters(value: Option<&str>) -> EmbyItemFilters {
+    let mut parsed = EmbyItemFilters::default();
+    let mut is_unplayed = false;
+    let mut is_played = false;
+    for value in value.unwrap_or_default().split(',').map(str::trim) {
+        if value.eq_ignore_ascii_case("IsUnplayed") {
+            is_unplayed = true;
+        } else if value.eq_ignore_ascii_case("IsPlayed") {
+            is_played = true;
+        } else if value.eq_ignore_ascii_case("IsResumable") {
+            parsed.is_resumable = true;
+        } else if value.eq_ignore_ascii_case("IsFavorite") {
+            parsed.is_favorite = true;
+        }
+    }
+    if is_unplayed {
+        parsed.is_played = Some(false);
+    } else if is_played {
+        parsed.is_played = Some(true);
+    }
+    parsed
+}
+
 pub(super) fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter {
     let mut filter = catalog_filter_from_values(
         query.include_item_types.as_deref(),
@@ -312,17 +454,20 @@ pub(super) fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter 
         false,
     );
     filter.min_date_last_saved = query.min_date_last_saved;
-    let requested_filters = query.filters.as_deref().unwrap_or_default();
-    if requested_filters
-        .split(',')
-        .any(|value| value.trim().eq_ignore_ascii_case("IsUnplayed"))
-    {
-        filter.is_played = Some(false);
-    } else if requested_filters
-        .split(',')
-        .any(|value| value.trim().eq_ignore_ascii_case("IsPlayed"))
-    {
-        filter.is_played = Some(true);
+    filter.genre_keys = emby_facet_keys(query.genres.as_deref());
+    filter.studio_keys = emby_facet_keys(query.studios.as_deref());
+    let requested_filters = emby_item_filters(query.filters.as_deref());
+    if requested_filters.is_played.is_some() {
+        filter.is_played = requested_filters.is_played;
+    }
+    // `IsResumable` implies an unfinished item, and the storage predicate enforces
+    // `is_played = 0` on its own. Combining it with `IsPlayed` is therefore a contradiction that
+    // returns an empty page instead of letting one value silently win.
+    filter.is_resumable = requested_filters.is_resumable;
+    // The dedicated `IsFavorite` parameter stays authoritative; `Filters=IsFavorite` is the
+    // standard-Emby spelling of `IsFavorite=true`.
+    if filter.is_favorite.is_none() && requested_filters.is_favorite {
+        filter.is_favorite = Some(true);
     }
     let ids = query.ids.as_deref().map(|values| {
         values
@@ -336,9 +481,11 @@ pub(super) fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter 
         .as_ref()
         .map(|ids| ids.iter().map(|id| emby_internal_id(id)).collect());
     // MediaSourceId is a separate Emby identifier and is intentionally not
-    // encoded as a numeric item id. Keeping the raw candidates here preserves
-    // the existing `GET /Items?Ids=<MediaSourceId>` compatibility lookup.
-    filter.media_source_ids = ids;
+    // encoded as a numeric item id, so the candidates are resolved back to the
+    // stored identifier before the `GET /Items?Ids=<MediaSourceId>` lookup.
+    filter.media_source_ids = ids
+        .as_ref()
+        .map(|ids| ids.iter().map(|id| emby_internal_source_id(id)).collect());
     filter.provider_id_equals = query
         .any_provider_id_equals
         .as_deref()
@@ -379,8 +526,13 @@ pub(super) fn emby_compat_media_source_id<'a>(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .find(|id| {
+            let requested = emby_internal_source_id(id);
             page.items.iter().any(|item| {
-                item.id != *id && item.media_sources.iter().any(|source| source.id == *id)
+                item.id != requested
+                    && item
+                        .media_sources
+                        .iter()
+                        .any(|source| source.id == requested)
             })
         })
 }
@@ -635,9 +787,19 @@ pub(super) struct EmbyMediaFoldersQuery {
     pub(super) library_id: Option<String>,
     #[serde(rename = "ParentId", alias = "parentId", default)]
     pub(super) parent_id: Option<String>,
-    #[serde(rename = "StartIndex", alias = "startIndex", default)]
+    #[serde(
+        rename = "StartIndex",
+        alias = "startIndex",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) start_index: Option<i64>,
-    #[serde(rename = "Limit", alias = "limit", default)]
+    #[serde(
+        rename = "Limit",
+        alias = "limit",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) limit: Option<i64>,
 }
 
@@ -740,6 +902,157 @@ pub(super) async fn emby_persons(
         "TotalRecordCount": total,
     }))
     .into_response()
+}
+
+#[derive(Deserialize, Default)]
+pub(super) struct EmbyFacetsQuery {
+    #[serde(flatten)]
+    pub(super) auth: EmbyTokenQuery,
+    #[serde(rename = "UserId", alias = "userId", alias = "userid", default)]
+    pub(super) user_id: Option<String>,
+    #[serde(rename = "ParentId", alias = "parentId", default)]
+    pub(super) parent_id: Option<String>,
+    #[serde(rename = "IncludeItemTypes", alias = "includeItemTypes", default)]
+    pub(super) include_item_types: Option<String>,
+    #[serde(
+        rename = "StartIndex",
+        alias = "startIndex",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
+    pub(super) start_index: Option<i64>,
+    #[serde(
+        rename = "Limit",
+        alias = "limit",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
+    pub(super) limit: Option<i64>,
+}
+
+fn emby_facet_id(kind: Option<MediaFacetKind>, name_key: &str) -> String {
+    let prefix = match kind {
+        Some(MediaFacetKind::Genre) => "genre",
+        Some(MediaFacetKind::Studio) => "studio",
+        // Emby `/Tags` reads the `TAG` projection directly, so no facet route is registered with
+        // this kind; the arm keeps the match exhaustive.
+        Some(MediaFacetKind::Tag) => "tag",
+        None => "year",
+    };
+    let hex = name_key
+        .bytes()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{prefix}-{hex}")
+}
+
+async fn emby_facets(
+    headers: HeaderMap,
+    query: EmbyFacetsQuery,
+    state: ReadyAppState,
+    kind: Option<MediaFacetKind>,
+) -> Response {
+    let auth_principal =
+        match require_emby_principal_with_query(&headers, &state, &query.auth).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, query.user_id.as_deref())
+            .await
+        {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    let offset = query.start_index.unwrap_or(0);
+    let limit = match query.limit {
+        Some(value) if value > 0 => value,
+        _ => 50,
+    };
+    if offset < 0 || !(1..=EMBY_MAX_PAGE_LIMIT).contains(&limit) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let item_types = query
+        .include_item_types
+        .as_deref()
+        .map(|values| {
+            values
+                .split(',')
+                .filter_map(|value| normalize_emby_item_type(value.trim()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let parent_id = query.parent_id.as_deref().map(emby_internal_id);
+    let result = state
+        .catalog()
+        .list_facets(
+            principal,
+            parent_id.as_deref(),
+            kind,
+            &item_types,
+            offset,
+            limit,
+        )
+        .await;
+    let (facets, total) = match result {
+        Ok(result) => result,
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(CatalogError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let type_name = match kind {
+        Some(MediaFacetKind::Genre) => "Genre",
+        Some(MediaFacetKind::Studio) => "Studio",
+        // Emby `/Tags` reads the `TAG` projection directly, so no facet route passes this kind;
+        // the arm keeps the match exhaustive.
+        Some(MediaFacetKind::Tag) => "Tag",
+        None => "Year",
+    };
+    Json(json!({
+        "Items": facets
+            .into_iter()
+            .map(|facet| {
+                json!({
+                    "Name": facet.name,
+                    "Id": emby_facet_id(kind, &facet.name_key),
+                    "ServerId": state.server_id,
+                    "Type": type_name,
+                    "IsFolder": true,
+                    "ChildCount": facet.item_count,
+                    "ImageTags": {},
+                    "BackdropImageTags": [],
+                })
+            })
+            .collect::<Vec<_>>(),
+        "TotalRecordCount": total,
+        "StartIndex": offset,
+    }))
+    .into_response()
+}
+
+pub(super) async fn emby_genres(
+    headers: HeaderMap,
+    Query(query): Query<EmbyFacetsQuery>,
+    State(state): State<ReadyAppState>,
+) -> Response {
+    emby_facets(headers, query, state, Some(MediaFacetKind::Genre)).await
+}
+
+pub(super) async fn emby_studios(
+    headers: HeaderMap,
+    Query(query): Query<EmbyFacetsQuery>,
+    State(state): State<ReadyAppState>,
+) -> Response {
+    emby_facets(headers, query, state, Some(MediaFacetKind::Studio)).await
+}
+
+pub(super) async fn emby_years(
+    headers: HeaderMap,
+    Query(query): Query<EmbyFacetsQuery>,
+    State(state): State<ReadyAppState>,
+) -> Response {
+    emby_facets(headers, query, state, None).await
 }
 
 pub(super) async fn emby_person(
@@ -1267,8 +1580,11 @@ pub(super) async fn emby_group_latest_page(
             media_source_ids: None,
             provider_id_equals: None,
             years: Vec::new(),
+            genre_keys: Vec::new(),
+            studio_keys: Vec::new(),
             is_played: None,
             is_favorite: None,
+            is_resumable: false,
             min_date_last_saved: None,
             metadata_pending: false,
             sort_by: CatalogSort::Name,
@@ -2127,6 +2443,8 @@ pub(super) fn emby_single_id_lookup(query: &EmbyItemsQuery) -> Option<&str> {
         || query.is_played.is_some()
         || query.is_favorite.is_some()
         || query.years.is_some()
+        || query.genres.is_some()
+        || query.studios.is_some()
         || query.sort_by.is_some()
         || query.sort_order.is_some()
         || query.group_items.is_some()
@@ -2153,14 +2471,17 @@ pub(super) async fn emby_single_id_lookup_response(
 ) -> Option<Response> {
     let requested_id = emby_single_id_lookup(query)?;
     let internal_item_id = emby_internal_id(requested_id);
+    // `Ids` may name the media source instead of the item; the stored identifier is what the
+    // catalog and the preferred-source ordering compare against.
+    let requested_source_id = emby_internal_source_id(requested_id);
     let catalog = state.catalog();
     let (item, preferred_source_id) = match catalog.find_item(principal, &internal_item_id).await {
         Ok(Some(item)) => (Some(item), None),
         Ok(None) => match catalog
-            .find_item_by_media_source_id(principal, requested_id)
+            .find_item_by_media_source_id(principal, &requested_source_id)
             .await
         {
-            Ok(item) => (item, Some(requested_id)),
+            Ok(item) => (item, Some(requested_source_id.clone())),
             Err(CatalogError::Storage(_)) => {
                 return Some(StatusCode::SERVICE_UNAVAILABLE.into_response());
             }
@@ -2227,9 +2548,14 @@ pub(super) async fn emby_single_id_lookup_response(
     );
     if let Some(source_id) = preferred_source_id
         && let Some(Value::Array(sources)) = item_json.get_mut("MediaSources")
-        && let Some(index) = sources
-            .iter()
-            .position(|source| source.get("Id").and_then(Value::as_str) == Some(source_id))
+        && let Some(index) = sources.iter().position(|source| {
+            // The DTO may carry the 32 hex public id for STRM sources while the request named the
+            // stored UUID (or the other way around), so compare on the stored identifier.
+            source
+                .get("Id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id == source_id || emby_internal_source_id(id) == source_id)
+        })
     {
         let source = sources.remove(index);
         sources.insert(0, source);
@@ -2757,7 +3083,7 @@ pub(super) async fn emby_item_response(
         match catalog.find_item(principal, &internal_item_id).await {
             Ok(Some(item)) => (Some(item), false),
             Ok(None) => match catalog
-                .find_item_by_media_source_id(principal, item_id)
+                .find_item_by_media_source_id(principal, &emby_internal_source_id(item_id))
                 .await
             {
                 Ok(item) => (item, true),
@@ -4046,7 +4372,7 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
                         source
                             .streams
                             .iter()
-                            .map(|stream| emby_media_source_stream_json(source, stream))
+                            .map(|stream| emby_media_source_stream_json(&item.id, source, stream))
                             .collect()
                     })
                     .unwrap_or_default(),
@@ -4499,7 +4825,7 @@ pub(super) fn emby_media_source_json_with_resolver_and_chapters(
         })
         .unwrap_or("Default");
     let mut value = json!({
-        "Id": source.id,
+        "Id": emby_public_source_id(&source.id, &source.source_kind),
         "ItemId": public_item_id,
         "Name": media_source_name,
         "Edition": source.edition_name,
@@ -4559,7 +4885,7 @@ pub(super) fn emby_media_source_json_with_resolver_and_chapters(
                 source
                     .streams
                     .iter()
-                    .map(|stream| emby_media_source_stream_json(source, stream))
+                    .map(|stream| emby_media_source_stream_json(item_id, source, stream))
                     .collect(),
             ),
         );
@@ -4606,6 +4932,7 @@ pub(super) fn emby_media_source_stream_url_parts(
         })
         .map(|container| format!(".{container}"))
         .unwrap_or_default();
+    let source_id = emby_public_source_id(source_id, source_kind);
     format!("/Videos/{item_id}/stream{stream_suffix}?MediaSourceId={source_id}")
 }
 
@@ -4746,10 +5073,12 @@ fn emby_media_type(item_type: &str) -> Option<&'static str> {
 
 pub(super) fn emby_media_stream_json(stream: &crate::application::catalog::CatalogStream) -> Value {
     let language = emby_language_code(stream.language.as_deref());
-    let display_title = emby_media_stream_display_title(stream);
+    let stream_type = emby_stream_type(&stream.stream_type);
+    let base_title = emby_media_stream_base_title(stream);
+    let display_title = base_title.clone().unwrap_or_else(|| stream_type.to_owned());
     let mut value = json!({
         "Index": stream.index,
-        "Type": emby_stream_type(&stream.stream_type),
+        "Type": stream_type,
         "Codec": stream.codec,
         "Language": language,
         "DisplayTitle": display_title,
@@ -4761,6 +5090,12 @@ pub(super) fn emby_media_stream_json(stream: &crate::application::catalog::Catal
         "IsDefault": stream.is_default,
         "IsForced": stream.is_forced,
     });
+    if let Some(display_language) = emby_stream_display_language(stream) {
+        value["DisplayLanguage"] = Value::String(display_language);
+    }
+    if let Some(title) = emby_media_stream_title(stream, base_title.as_deref()) {
+        value["Title"] = Value::String(title);
+    }
     if let Value::Object(object) = &mut value {
         for (key, detail) in &stream.details {
             let Some(detail) = normalize_emby_media_stream_detail(key, detail) else {
@@ -4772,11 +5107,54 @@ pub(super) fn emby_media_stream_json(stream: &crate::application::catalog::Catal
     value
 }
 
+/// Subtitle file extension for the `Stream.<ext>` delivery route. Unknown codecs get no extension
+/// so the URL keeps pointing at the extensionless route instead of promising a format.
+fn emby_subtitle_delivery_extension(codec: Option<&str>) -> Option<&'static str> {
+    match codec?.trim().to_ascii_lowercase().as_str() {
+        "srt" | "subrip" => Some("srt"),
+        "ass" | "ssa" => Some("ass"),
+        "vtt" | "webvtt" => Some("vtt"),
+        _ => None,
+    }
+}
+
+/// Emby delivery metadata for subtitle tracks. External files are fetched through the subtitle
+/// route (a relative URL without credentials; clients append their own token); embedded tracks
+/// stay inside the container.
+fn emby_insert_subtitle_delivery(
+    value: &mut Value,
+    item_id: &str,
+    source: &crate::application::catalog::CatalogSource,
+    stream: &crate::application::catalog::CatalogStream,
+) {
+    value["IsExternalUrl"] = Value::Bool(false);
+    if !stream.is_external {
+        value["DeliveryMethod"] = Value::String("Embed".to_owned());
+        value["SubtitleLocationType"] = Value::String("InternalStream".to_owned());
+        return;
+    }
+    value["DeliveryMethod"] = Value::String("External".to_owned());
+    value["SubtitleLocationType"] = Value::String("ExternalFile".to_owned());
+    let suffix = emby_subtitle_delivery_extension(stream.codec.as_deref())
+        .map(|extension| format!(".{extension}"))
+        .unwrap_or_default();
+    value["DeliveryUrl"] = Value::String(format!(
+        "/Videos/{}/{}/Subtitles/{}/Stream{suffix}",
+        percent_encode_filename(&emby_public_id(item_id)),
+        percent_encode_filename(&emby_public_source_id(&source.id, &source.source_kind)),
+        stream.index,
+    ));
+}
+
 fn emby_media_source_stream_json(
+    item_id: &str,
     source: &crate::application::catalog::CatalogSource,
     stream: &crate::application::catalog::CatalogStream,
 ) -> Value {
     let mut value = emby_media_stream_json(stream);
+    if emby_stream_type(&stream.stream_type) == "Subtitle" {
+        emby_insert_subtitle_delivery(&mut value, item_id, source, stream);
+    }
     let quality_label = source
         .quality_label
         .as_deref()
@@ -4795,6 +5173,9 @@ fn emby_media_source_stream_json(
         .unwrap_or("Video");
     if current_title.eq_ignore_ascii_case("Video") {
         value["DisplayTitle"] = Value::String(quality_label.to_owned());
+    } else if emby_title_has_resolution(current_title) {
+        // The probed frame size already produced a resolution; the filename label can disagree
+        // with the real file, so do not stack a second one.
     } else if !current_title
         .to_ascii_lowercase()
         .contains(&quality_label.to_ascii_lowercase())
@@ -4804,94 +5185,379 @@ fn emby_media_source_stream_json(
     value
 }
 
-fn emby_media_stream_display_title(stream: &crate::application::catalog::CatalogStream) -> String {
-    let stream_type = emby_stream_type(&stream.stream_type);
-    let title = stream
+/// True when a display title already starts with a resolution token such as `1080p`.
+fn emby_title_has_resolution(title: &str) -> bool {
+    title
+        .split_whitespace()
+        .next()
+        .and_then(|word| word.strip_suffix('p'))
+        .is_some_and(|digits| digits.len() >= 3 && digits.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Human readable track descriptor without the source level quality label.
+///
+/// Emby clients render the stream `DisplayTitle` as-is (Hills: `DisplayTitle -> Title ->
+/// DisplayLanguage -> Language -> "und"`), so the descriptor has to carry the codec, the dynamic
+/// range and the bit depth instead of a bare stream type. `None` means the stored row has no
+/// inspectable detail at all and the caller falls back to the stream type.
+fn emby_media_stream_base_title(
+    stream: &crate::application::catalog::CatalogStream,
+) -> Option<String> {
+    match emby_stream_type(&stream.stream_type) {
+        "Video" => emby_video_stream_title(stream),
+        "Audio" => emby_audio_stream_title(stream),
+        "Subtitle" => emby_subtitle_stream_title(stream),
+        _ => emby_stored_stream_title(stream, ""),
+    }
+}
+
+/// `Title` is the human readable track name. Probe metadata already stores the plugin's `Title`
+/// for new rows; older rows only have the legacy probe `DisplayTitle`, which is exactly the base
+/// descriptor and therefore still worth exposing.
+fn emby_media_stream_title(
+    stream: &crate::application::catalog::CatalogStream,
+    base_title: Option<&str>,
+) -> Option<String> {
+    let probed = stream
+        .details
+        .get("Title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    probed
+        .map(str::to_owned)
+        .or_else(|| base_title.map(str::to_owned))
+}
+
+/// Legacy probe rows stored the plugin's `DisplayTitle` (for example `4K HDR 10 HEVC`) in both
+/// `media_streams.title` and the stream details; it is the only descriptor such rows have.
+fn emby_stored_stream_title(
+    stream: &crate::application::catalog::CatalogStream,
+    placeholder: &str,
+) -> Option<String> {
+    let stored = stream
         .title
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if !matches!(stream_type, "Audio" | "Subtitle") {
-        return title.unwrap_or(stream_type).to_owned();
-    }
-
-    let language = stream
-        .details
-        .get("DisplayLanguage")
-        .and_then(Value::as_str)
-        .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .or_else(|| stream.language.as_deref().and_then(emby_language_name));
-    let codec = stream
+        .or_else(|| {
+            stream
+                .details
+                .get("DisplayTitle")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })?;
+    (!stored.eq_ignore_ascii_case(placeholder)).then(|| stored.to_owned())
+}
+
+fn emby_stream_codec(stream: &crate::application::catalog::CatalogStream) -> Option<String> {
+    stream
         .codec
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| value.to_ascii_uppercase());
+        .map(str::to_ascii_uppercase)
+}
 
+/// Standard resolution bucket for a probed frame size. Widescreen crops (1920x800, 3840x1636)
+/// keep the label of the container they were mastered for, so either dimension can promote it.
+pub(super) fn emby_video_resolution_label(width: i64, height: i64) -> Option<String> {
+    let (width, height) = (width.max(0), height.max(0));
+    if width == 0 && height == 0 {
+        return None;
+    }
+    let bucket = |min_width: i64, min_height: i64| width >= min_width || height >= min_height;
+    let label = if bucket(7600, 4300) {
+        "4320p".to_owned()
+    } else if bucket(3700, 2100) {
+        "2160p".to_owned()
+    } else if bucket(2500, 1400) {
+        "1440p".to_owned()
+    } else if bucket(1880, 1040) {
+        "1080p".to_owned()
+    } else if bucket(1240, 700) {
+        "720p".to_owned()
+    } else if height >= 560 {
+        "576p".to_owned()
+    } else if height >= 460 {
+        "480p".to_owned()
+    } else if height > 0 {
+        format!("{height}p")
+    } else {
+        return None;
+    };
+    Some(label)
+}
+
+fn emby_stream_dimension(stream: &crate::application::catalog::CatalogStream, key: &str) -> i64 {
+    stream
+        .details
+        .get(key)
+        .and_then(emby_integer_value)
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0)
+}
+
+fn emby_video_stream_title(stream: &crate::application::catalog::CatalogStream) -> Option<String> {
     let mut parts = Vec::new();
-    if let Some(language) = language {
+    if let Some(resolution) = emby_video_resolution_label(
+        emby_stream_dimension(stream, "Width"),
+        emby_stream_dimension(stream, "Height"),
+    ) {
+        parts.push(resolution);
+    }
+    if let Some(codec) = emby_stream_codec(stream) {
+        parts.push(codec);
+    }
+    if let Some(range) = stream.details.get("VideoRange").and_then(Value::as_str) {
+        let range = emby_video_range(range);
+        // Emby's own display titles leave the SDR default out; only flag real dynamic ranges.
+        if !range.is_empty() && !range.eq_ignore_ascii_case("SDR") {
+            parts.push(range);
+        }
+    }
+    if let Some(depth) = stream
+        .details
+        .get("BitDepth")
+        .and_then(emby_integer_value)
+        .and_then(|value| value.as_i64())
+        .filter(|value| *value > 0)
+    {
+        parts.push(format!("{depth}bit"));
+    }
+    if parts.is_empty() {
+        return emby_stored_stream_title(stream, "Video");
+    }
+    Some(parts.join(" "))
+}
+
+fn emby_audio_stream_title(stream: &crate::application::catalog::CatalogStream) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(language) = emby_stream_display_language(stream) {
         parts.push(language);
     }
-    if stream_type == "Audio" {
-        if let Some(codec) = codec {
-            parts.push(codec);
+    if let Some(codec) = emby_stream_codec(stream) {
+        parts.push(codec);
+    }
+    let mut channels = stream
+        .details
+        .get("Channels")
+        .and_then(emby_integer_value)
+        .and_then(|value| value.as_i64());
+    if let Some(layout) = stream
+        .details
+        .get("ChannelLayout")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let layout = layout.split('(').next().unwrap_or(layout).trim();
+        if !layout.is_empty() {
+            channels = channels.or_else(|| emby_layout_channels(layout));
+            parts.push(layout.to_owned());
         }
-        if let Some(layout) = stream
-            .details
-            .get("ChannelLayout")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            let layout = layout.split('(').next().unwrap_or(layout).trim();
-            if !layout.is_empty() {
-                parts.push(layout.to_owned());
+    } else if let Some(value) = channels {
+        parts.push(format!("{value} channels"));
+    }
+    let legacy = emby_stored_stream_title(stream, "Audio");
+    emby_join_legacy_title(&parts, legacy.as_deref(), channels)
+}
+
+fn emby_subtitle_stream_title(
+    stream: &crate::application::catalog::CatalogStream,
+) -> Option<String> {
+    let language = emby_stream_display_language(stream);
+    let codec = emby_stream_codec(stream);
+    let markers = emby_subtitle_markers(stream);
+    let legacy = emby_stored_stream_title(stream, "Subtitle");
+
+    let mut parts = Vec::new();
+    let mut legacy_merged = false;
+    match language {
+        Some(language) => parts.push(language),
+        // A legacy row only carries the probe `DisplayTitle`; it is the only language hint, so
+        // keep it as the label instead of stacking `Unknown` in front of it.
+        None => match legacy.as_deref() {
+            Some(legacy) => {
+                parts.push(legacy.to_owned());
+                legacy_merged = true;
             }
-        } else if let Some(channels) = stream
-            .details
-            .get("Channels")
-            .and_then(emby_integer_value)
-            .and_then(|value| value.as_i64())
-        {
-            parts.push(format!("{channels} channels"));
-        }
-    } else if let Some(codec) = codec {
+            None => parts.push("Unknown".to_owned()),
+        },
+    }
+    if let Some(codec) = codec.as_deref()
+        && !parts
+            .iter()
+            .any(|part| emby_codec_is_mentioned(&part.to_lowercase(), codec))
+    {
         parts.push(format!("({codec})"));
     }
-
-    let mut display_title = parts.join(" ");
-    if let Some(title) = title.filter(|value| !value.eq_ignore_ascii_case(stream_type)) {
-        if display_title.is_empty() {
-            display_title.push_str(title);
-        } else if !display_title
-            .to_ascii_lowercase()
-            .contains(&title.to_ascii_lowercase())
+    for marker in markers {
+        if !parts
+            .iter()
+            .any(|part| part.to_lowercase().contains(&marker.to_lowercase()))
         {
-            if title
-                .to_ascii_lowercase()
-                .contains(&display_title.to_ascii_lowercase())
-            {
-                display_title = title.to_owned();
-            } else {
-                display_title.push(' ');
-                display_title.push_str(title);
-            }
+            parts.push(marker);
         }
     }
+    if legacy_merged {
+        return Some(parts.join(" "));
+    }
+    emby_join_legacy_title(&parts, legacy.as_deref(), None)
+}
 
-    if display_title.is_empty() {
-        title.unwrap_or(stream_type).to_owned()
-    } else {
-        display_title
+/// Track flags Hills and other clients expect to see spelled out in a subtitle label.
+fn emby_subtitle_markers(stream: &crate::application::catalog::CatalogStream) -> Vec<String> {
+    let mut markers = Vec::new();
+    if stream.is_forced {
+        markers.push("Forced".to_owned());
+    }
+    if stream
+        .details
+        .get("IsHearingImpaired")
+        .and_then(emby_boolean_value)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        markers.push("SDH".to_owned());
+    }
+    markers
+}
+
+/// Probe display titles often use the short codec spelling (`SRT` for `subrip`); treat those as
+/// already mentioned so a legacy label does not grow a second codec suffix.
+fn emby_codec_is_mentioned(title_lower: &str, codec: &str) -> bool {
+    let codec = codec.trim().to_lowercase();
+    if codec.is_empty() {
+        return false;
+    }
+    if title_lower.contains(&codec) {
+        return true;
+    }
+    let alias = match codec.as_str() {
+        "subrip" => "srt",
+        "ass" | "ssa" => "ass",
+        "webvtt" => "vtt",
+        "hdmv_pgs_subtitle" => "pgs",
+        "dvd_subtitle" => "dvdsub",
+        "mov_text" => "tx3g",
+        _ => return false,
+    };
+    title_lower.contains(alias)
+}
+
+/// Joins a composed descriptor with the legacy probe title, which used to be a full
+/// `DisplayTitle` (`FLAC stereo (默认)`). When the legacy value already names every composed part
+/// it is the richer label (`Chinese Simplified DTS-HD MA 7.1 (默认)` beats `Chinese Simplified DTS
+/// 7.1`); otherwise only the legacy words that add information are appended, so markers such as
+/// `(默认)` appear once instead of being stacked.
+fn emby_join_legacy_title(
+    parts: &[String],
+    legacy: Option<&str>,
+    channels: Option<i64>,
+) -> Option<String> {
+    let composed = parts.join(" ");
+    let Some(legacy) = legacy.map(str::trim).filter(|value| !value.is_empty()) else {
+        return (!composed.is_empty()).then_some(composed);
+    };
+    if composed.is_empty() {
+        return Some(legacy.to_owned());
+    }
+    if emby_title_covers_every_part(legacy, parts, channels) {
+        return Some(legacy.to_owned());
+    }
+    let composed_lower = composed.to_lowercase();
+    let mut kept = Vec::new();
+    let mut kept_lower: Vec<String> = Vec::new();
+    for token in legacy.split_whitespace() {
+        let normalized = emby_normalize_title_token(token);
+        if normalized.is_empty() || kept_lower.contains(&normalized) {
+            continue;
+        }
+        if composed_lower.contains(&normalized) {
+            continue;
+        }
+        if let (Some(channels), Some(count)) = (channels, emby_layout_channels(&normalized))
+            && count == channels
+        {
+            continue;
+        }
+        kept.push(token.to_owned());
+        kept_lower.push(normalized);
+    }
+    if kept.is_empty() {
+        return Some(composed);
+    }
+    Some(format!("{composed} {}", kept.join(" ")))
+}
+
+fn emby_title_covers_every_part(legacy: &str, parts: &[String], channels: Option<i64>) -> bool {
+    if parts.is_empty() {
+        return false;
+    }
+    let legacy_lower = legacy.to_lowercase();
+    let legacy_tokens = legacy
+        .split_whitespace()
+        .map(emby_normalize_title_token)
+        .collect::<Vec<_>>();
+    parts.iter().all(|part| {
+        let part = emby_normalize_title_token(part);
+        if part.is_empty() || legacy_lower.contains(&part) {
+            return true;
+        }
+        // `6 channels` is also covered by a layout word that implies six channels (`5.1`).
+        let Some(count) = part
+            .strip_suffix(" channels")
+            .and_then(|count| count.trim().parse::<i64>().ok())
+        else {
+            return false;
+        };
+        channels == Some(count)
+            && legacy_tokens
+                .iter()
+                .any(|token| emby_layout_channels(token) == Some(count))
+    })
+}
+
+fn emby_normalize_title_token(token: &str) -> String {
+    token
+        .trim_matches(|character: char| {
+            matches!(
+                character,
+                '(' | ')' | '（' | '）' | '[' | ']' | ',' | ';' | ':'
+            )
+        })
+        .to_lowercase()
+}
+
+/// Channel count implied by a channel layout word, used to recognise that a legacy title already
+/// carries the channel information the composed descriptor derived from `Channels`.
+fn emby_layout_channels(value: &str) -> Option<i64> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "mono" | "1.0" => Some(1),
+        "stereo" | "2.0" => Some(2),
+        "2.1" | "3.0" => Some(3),
+        "4.0" | "quad" => Some(4),
+        "5.0" => Some(5),
+        "5.1" => Some(6),
+        "6.1" => Some(7),
+        "7.1" => Some(8),
+        _ => None,
     }
 }
 
-/// ISO 639-2/B code, ISO 639-1 alias and English name for the languages Lux maps explicitly.
+/// ISO 639-2 code, ISO 639-1/CJK aliases and English name for the languages Lux maps explicitly.
 const EMBY_LANGUAGE_TABLE: &[(&str, &[&str], &str)] = &[
     ("eng", &["en"], "English"),
-    ("chi", &["zh", "zho"], "Chinese"),
+    (
+        "chi",
+        &[
+            "zh", "zho", "chs", "cht", "zh-cn", "zh-tw", "zh-hk", "zh-hans", "zh-hant", "cmn",
+            "yue",
+        ],
+        "Chinese",
+    ),
     ("jpn", &["ja"], "Japanese"),
     ("kor", &["ko"], "Korean"),
     ("ara", &["ar"], "Arabic"),
@@ -4908,6 +5574,29 @@ const EMBY_LANGUAGE_TABLE: &[(&str, &[&str], &str)] = &[
     ("tha", &["th"], "Thai"),
     ("tur", &["tr"], "Turkish"),
     ("vie", &["vi"], "Vietnamese"),
+    ("fin", &["fi"], "Finnish"),
+    ("swe", &["sv"], "Swedish"),
+    ("dan", &["da"], "Danish"),
+    ("ell", &["el", "gre"], "Greek"),
+    ("heb", &["he"], "Hebrew"),
+    ("hun", &["hu"], "Hungarian"),
+    ("ces", &["cs", "cze"], "Czech"),
+    ("ron", &["ro", "rum"], "Romanian"),
+    ("ukr", &["uk"], "Ukrainian"),
+    ("nor", &["no", "nob", "nb"], "Norwegian"),
+    ("hrv", &["hr"], "Croatian"),
+    ("msa", &["ms", "may"], "Malay"),
+    ("fil", &["tl"], "Filipino"),
+    ("slk", &["sk", "slo"], "Slovak"),
+];
+
+/// Chinese variants keep the shared `chi` code in `Language` but need a script/region specific
+/// name in `DisplayLanguage`, otherwise every Chinese track reads the same in Emby clients.
+const EMBY_LANGUAGE_VARIANT_NAMES: &[(&[&str], &str)] = &[
+    (&["zh-cn", "zh-sg", "zh-hans", "chs"], "中文（简体）"),
+    (&["zh-tw", "zh-mo", "zh-hant", "cht"], "中文（繁体）"),
+    (&["zh-hk", "yue"], "粤语"),
+    (&["cmn"], "中文（普通话）"),
 ];
 
 fn emby_language_entry(value: &str) -> Option<(&'static str, &'static str)> {
@@ -4923,16 +5612,38 @@ fn emby_language_entry(value: &str) -> Option<(&'static str, &'static str)> {
         })
 }
 
-fn emby_language_name(language: &str) -> Option<String> {
-    let language = language.trim();
+/// Human readable language label for `DisplayLanguage` and stream `DisplayTitle`.
+///
+/// Probe metadata wins because it already carries the variant a plugin recognised; a language
+/// code outside the table is kept verbatim instead of being guessed.
+fn emby_language_display(language: Option<&str>) -> Option<String> {
+    let language = language?.trim();
     if language.is_empty() || language.eq_ignore_ascii_case("und") {
         return None;
+    }
+    let normalized = language.to_ascii_lowercase();
+    if let Some((_, name)) = EMBY_LANGUAGE_VARIANT_NAMES
+        .iter()
+        .find(|(aliases, _)| aliases.contains(&normalized.as_str()))
+    {
+        return Some((*name).to_owned());
     }
     Some(
         emby_language_entry(language)
             .map(|(_, name)| name.to_owned())
             .unwrap_or_else(|| language.to_owned()),
     )
+}
+
+fn emby_stream_display_language(
+    stream: &crate::application::catalog::CatalogStream,
+) -> Option<String> {
+    stream
+        .details
+        .get("DisplayLanguage")
+        .and_then(Value::as_str)
+        .and_then(|value| emby_language_display(Some(value)))
+        .or_else(|| emby_language_display(stream.language.as_deref()))
 }
 
 /// Emby clients expect an ISO 639-2/B code in `Language`; values outside the table are kept
@@ -4947,6 +5658,28 @@ fn emby_language_code(language: Option<&str>) -> String {
     emby_language_entry(language)
         .map(|(code, _)| code.to_owned())
         .unwrap_or_else(|| language.to_owned())
+}
+
+/// Emby clients compare `VideoRange` against a fixed vocabulary (`SDR`, `HDR10`, `HDR10+`,
+/// `HLG`, `Dolby Vision`); probe plugins report spellings such as `HDR 10`, so normalize the
+/// known values and keep everything else verbatim instead of guessing.
+pub(super) fn emby_video_range(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return String::new();
+    }
+    let compact: String = value
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    match compact.to_ascii_lowercase().as_str() {
+        "sdr" => "SDR".to_owned(),
+        "hdr10" => "HDR10".to_owned(),
+        "hdr10+" | "hdr10plus" => "HDR10+".to_owned(),
+        "hlg" => "HLG".to_owned(),
+        "dolbyvision" | "dovi" => "Dolby Vision".to_owned(),
+        _ => value.to_owned(),
+    }
 }
 
 pub(super) fn normalize_emby_media_stream_detail(key: &str, value: &Value) -> Option<Value> {
@@ -4981,6 +5714,20 @@ pub(super) fn normalize_emby_media_stream_detail(key: &str, value: &Value) -> Op
         .any(|field| key.eq_ignore_ascii_case(field))
     {
         return emby_boolean_value(value);
+    }
+    if key.eq_ignore_ascii_case("VideoRange") {
+        let Value::String(raw) = value else {
+            return (!value.is_null()).then(|| value.clone());
+        };
+        let normalized = emby_video_range(raw);
+        return (!normalized.is_empty()).then_some(Value::String(normalized));
+    }
+    // Emby clients render blank text as an empty line; probe plugins can store whitespace-only
+    // values, so drop them instead of emitting `""`.
+    if let Value::String(text) = value
+        && text.trim().is_empty()
+    {
+        return None;
     }
     (!value.is_null()).then(|| value.clone())
 }
@@ -5207,6 +5954,11 @@ pub(super) fn emby_virtual_folder_options_json(
     })
 }
 
+/// Emby clients expect a `MinWidth` on every image option. Lux no longer has a global
+/// minimum download width (width filtering moved to the scrapers), so the key is kept
+/// for wire compatibility with the fixed value `0` ("no minimum").
+const EMBY_IMAGE_OPTION_MIN_WIDTH: i64 = 0;
+
 pub(super) fn emby_library_type_options_json(
     item_type: &str,
     media_strategy: &MediaStrategySettings,
@@ -5216,49 +5968,49 @@ pub(super) fn emby_library_type_options_json(
         image_options.push(json!({
             "Type": "Primary",
             "Limit": 1,
-            "MinWidth": media_strategy.images.min_download_width,
+            "MinWidth": EMBY_IMAGE_OPTION_MIN_WIDTH,
         }));
     }
     if media_strategy.images.artwork {
         image_options.push(json!({
             "Type": "Art",
             "Limit": 1,
-            "MinWidth": media_strategy.images.min_download_width,
+            "MinWidth": EMBY_IMAGE_OPTION_MIN_WIDTH,
         }));
     }
     if media_strategy.images.banner {
         image_options.push(json!({
             "Type": "Banner",
             "Limit": 1,
-            "MinWidth": media_strategy.images.min_download_width,
+            "MinWidth": EMBY_IMAGE_OPTION_MIN_WIDTH,
         }));
     }
     if media_strategy.images.logo {
         image_options.push(json!({
             "Type": "Logo",
             "Limit": 1,
-            "MinWidth": media_strategy.images.min_download_width,
+            "MinWidth": EMBY_IMAGE_OPTION_MIN_WIDTH,
         }));
     }
     if media_strategy.images.thumbnail {
         image_options.push(json!({
             "Type": "Thumb",
             "Limit": 1,
-            "MinWidth": media_strategy.images.min_download_width,
+            "MinWidth": EMBY_IMAGE_OPTION_MIN_WIDTH,
         }));
     }
     if media_strategy.images.disc {
         image_options.push(json!({
             "Type": "Disc",
             "Limit": 1,
-            "MinWidth": media_strategy.images.min_download_width,
+            "MinWidth": EMBY_IMAGE_OPTION_MIN_WIDTH,
         }));
     }
     if media_strategy.images.backdrop && media_strategy.images.max_backdrop_count > 0 {
         image_options.push(json!({
             "Type": "Backdrop",
             "Limit": media_strategy.images.max_backdrop_count,
-            "MinWidth": media_strategy.images.min_download_width,
+            "MinWidth": EMBY_IMAGE_OPTION_MIN_WIDTH,
         }));
     }
 
@@ -5402,11 +6154,88 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        EmbyItemsQuery, catalog_filter_from_emby, emby_media_source_json_with_resolver,
-        emby_media_stream_json, emby_media_type, emby_page_params, emby_playback_container_name,
+        EmbyItemsQuery, catalog_filter_from_emby, catalog_filter_from_values,
+        emby_media_source_json_with_resolver, emby_media_stream_json, emby_media_type,
+        emby_page_params, emby_playback_container_name,
     };
 
-    use crate::application::catalog::{CatalogSource, CatalogStream};
+    use crate::application::catalog::{CatalogSort, CatalogSource, CatalogStream};
+
+    /// Yamby's home screen asks for a library's newest items as
+    /// `Items/Latest?EnableImageTypes=…&Fields=…&GroupItems=true&MediaTypes=Video&Limit=16&ParentId=…`
+    /// (Reqable capture, Yamby 2.0.5.5). `emby_user_latest` fills in `Movie,Series` for a library
+    /// scope and forces the `DateCreated` descending order, so this mapping is the whole request as
+    /// far as the catalog query is concerned.
+    #[test]
+    fn latest_request_maps_to_movies_and_series_sorted_by_date_created() {
+        let filter = catalog_filter_from_values(
+            Some("Movie,Series"),
+            None,
+            None,
+            None,
+            Some("DateCreated"),
+            Some("Descending"),
+            false,
+        );
+
+        assert_eq!(filter.item_types, ["MOVIE", "SERIES"]);
+        assert_eq!(filter.sort_by, CatalogSort::DateCreated);
+        assert!(filter.descending);
+        assert!(
+            filter.excluded_item_types.is_empty()
+                && filter.item_ids.is_none()
+                && filter.years.is_empty()
+                && filter.genre_keys.is_empty()
+                && filter.studio_keys.is_empty()
+                && filter.is_played.is_none()
+                && filter.is_favorite.is_none(),
+            "the Latest request carries no further restriction the read-model sort has to reject"
+        );
+    }
+
+    fn catalog_source(quality_label: Option<&str>, streams: Vec<CatalogStream>) -> CatalogSource {
+        CatalogSource {
+            id: "source-1".to_owned(),
+            source_kind: "LOCAL_FILE".to_owned(),
+            file_name: Some("Show.S01E02.mkv".to_owned()),
+            container: Some("mkv".to_owned()),
+            size: Some(1),
+            external_url: None,
+            edition_name: None,
+            quality_label: quality_label.map(str::to_owned),
+            bitrate: Some(1),
+            duration_ticks: Some(1),
+            is_default: true,
+            probe_status: "READY".to_owned(),
+            streams,
+            chapters: Vec::new(),
+        }
+    }
+
+    fn stream(
+        stream_type: &str,
+        codec: Option<&str>,
+        language: Option<&str>,
+        title: Option<&str>,
+        details: BTreeMap<String, serde_json::Value>,
+    ) -> CatalogStream {
+        CatalogStream {
+            index: 0,
+            stream_type: stream_type.to_owned(),
+            codec: codec.map(str::to_owned),
+            language: language.map(str::to_owned),
+            title: title.map(str::to_owned),
+            is_external: false,
+            is_default: true,
+            is_forced: false,
+            details,
+        }
+    }
+
+    fn source_stream_json(source: &CatalogSource) -> serde_json::Value {
+        let json = emby_media_source_json_with_resolver("item-1", source, true, false);
+        json["MediaStreams"][0].clone()
+    }
 
     #[test]
     fn languages_are_reported_with_iso639_2_codes() {
@@ -5418,6 +6247,667 @@ mod tests {
         assert_eq!(super::emby_language_code(None), "und");
         assert_eq!(super::emby_language_code(Some("  ")), "und");
         assert_eq!(super::emby_language_code(Some("tlh")), "tlh");
+    }
+
+    #[test]
+    fn chinese_variant_languages_share_the_chi_code_with_distinct_display_names() {
+        for alias in [
+            "chi", "zh", "zho", "chs", "cht", "zh-CN", "zh-TW", "zh-HK", "zh-Hans", "zh-Hant",
+            "cmn", "yue",
+        ] {
+            assert_eq!(
+                super::emby_language_code(Some(alias)),
+                "chi",
+                "language code for {alias}"
+            );
+        }
+        assert_eq!(
+            super::emby_language_display(Some("zh-CN")),
+            Some("中文（简体）".to_owned())
+        );
+        assert_eq!(
+            super::emby_language_display(Some("chs")),
+            Some("中文（简体）".to_owned())
+        );
+        assert_eq!(
+            super::emby_language_display(Some("zh-Hant")),
+            Some("中文（繁体）".to_owned())
+        );
+        assert_eq!(
+            super::emby_language_display(Some("yue")),
+            Some("粤语".to_owned())
+        );
+        assert_eq!(
+            super::emby_language_display(Some("chi")),
+            Some("Chinese".to_owned())
+        );
+    }
+
+    #[test]
+    fn additional_european_language_codes_are_normalized() {
+        for (alias, code, name) in [
+            ("fi", "fin", "Finnish"),
+            ("swe", "swe", "Swedish"),
+            ("dan", "dan", "Danish"),
+            ("ell", "ell", "Greek"),
+            ("gre", "ell", "Greek"),
+            ("heb", "heb", "Hebrew"),
+            ("hu", "hun", "Hungarian"),
+            ("cze", "ces", "Czech"),
+            ("rum", "ron", "Romanian"),
+            ("ukr", "ukr", "Ukrainian"),
+            ("nob", "nor", "Norwegian"),
+            ("hrv", "hrv", "Croatian"),
+            ("may", "msa", "Malay"),
+            ("fil", "fil", "Filipino"),
+            ("slo", "slk", "Slovak"),
+        ] {
+            assert_eq!(
+                super::emby_language_code(Some(alias)),
+                code,
+                "language code for {alias}"
+            );
+            assert_eq!(
+                super::emby_language_display(Some(alias)),
+                Some(name.to_owned()),
+                "display name for {alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn media_streams_report_a_display_language() {
+        let stream = CatalogStream {
+            index: 1,
+            stream_type: "AUDIO".to_owned(),
+            codec: Some("aac".to_owned()),
+            language: Some("zh-cn".to_owned()),
+            title: None,
+            is_external: false,
+            is_default: true,
+            is_forced: false,
+            details: BTreeMap::new(),
+        };
+        assert_eq!(
+            emby_media_stream_json(&stream)["DisplayLanguage"],
+            "中文（简体）"
+        );
+
+        let probed = CatalogStream {
+            details: BTreeMap::from([("DisplayLanguage".to_owned(), json!("Chinese Simplified"))]),
+            ..stream.clone()
+        };
+        assert_eq!(
+            emby_media_stream_json(&probed)["DisplayLanguage"],
+            "Chinese Simplified"
+        );
+
+        let undetermined = CatalogStream {
+            language: Some("und".to_owned()),
+            details: BTreeMap::new(),
+            ..stream.clone()
+        };
+        assert!(
+            emby_media_stream_json(&undetermined)
+                .get("DisplayLanguage")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn video_range_values_are_normalized_to_the_emby_vocabulary() {
+        assert_eq!(super::emby_video_range("HDR 10"), "HDR10");
+        assert_eq!(super::emby_video_range("hdr10"), "HDR10");
+        assert_eq!(super::emby_video_range("HDR10+"), "HDR10+");
+        assert_eq!(super::emby_video_range("HDR 10+"), "HDR10+");
+        assert_eq!(super::emby_video_range("Dolby Vision"), "Dolby Vision");
+        assert_eq!(super::emby_video_range("dolbyvision"), "Dolby Vision");
+        assert_eq!(super::emby_video_range("hlg"), "HLG");
+        assert_eq!(super::emby_video_range("SDR"), "SDR");
+        // Unrecognised values stay verbatim instead of being guessed.
+        assert_eq!(super::emby_video_range("HDR"), "HDR");
+        assert_eq!(super::emby_video_range("HDR12"), "HDR12");
+    }
+
+    #[test]
+    fn media_streams_report_the_normalized_video_range() {
+        let stream = CatalogStream {
+            index: 0,
+            stream_type: "VIDEO".to_owned(),
+            codec: Some("hevc".to_owned()),
+            language: None,
+            title: None,
+            is_external: false,
+            is_default: true,
+            is_forced: false,
+            details: BTreeMap::from([("VideoRange".to_owned(), json!("HDR 10"))]),
+        };
+
+        assert_eq!(emby_media_stream_json(&stream)["VideoRange"], "HDR10");
+    }
+
+    #[test]
+    fn video_display_title_describes_quality_codec_range_and_bit_depth() {
+        let source = catalog_source(
+            Some("2160p"),
+            vec![stream(
+                "VIDEO",
+                Some("hevc"),
+                None,
+                None,
+                BTreeMap::from([
+                    ("VideoRange".to_owned(), json!("HDR 10")),
+                    ("BitDepth".to_owned(), json!(10)),
+                ]),
+            )],
+        );
+
+        let json = source_stream_json(&source);
+
+        assert_eq!(json["DisplayTitle"], "2160p HEVC HDR10 10bit");
+        assert_eq!(json["Title"], "HEVC HDR10 10bit");
+        assert_eq!(json["VideoRange"], "HDR10");
+    }
+
+    #[test]
+    fn video_display_title_omits_missing_parts_without_extra_spaces() {
+        let source = catalog_source(
+            Some("1080p"),
+            vec![stream("VIDEO", Some("h264"), None, None, BTreeMap::new())],
+        );
+
+        assert_eq!(source_stream_json(&source)["DisplayTitle"], "1080p H264");
+    }
+
+    #[test]
+    fn video_display_title_falls_back_to_the_probed_title_for_old_rows() {
+        let json = emby_media_stream_json(&stream(
+            "VIDEO",
+            None,
+            None,
+            Some("4K HDR 10 HEVC"),
+            BTreeMap::new(),
+        ));
+
+        assert_eq!(json["DisplayTitle"], "4K HDR 10 HEVC");
+        assert_eq!(json["Title"], "4K HDR 10 HEVC");
+    }
+
+    #[test]
+    fn video_display_title_does_not_repeat_the_quality_label() {
+        let source = catalog_source(
+            Some("1080p"),
+            vec![stream(
+                "VIDEO",
+                None,
+                None,
+                Some("1080p H264"),
+                BTreeMap::new(),
+            )],
+        );
+
+        assert_eq!(source_stream_json(&source)["DisplayTitle"], "1080p H264");
+    }
+
+    fn subtitle_stream(index: i64, codec: Option<&str>, is_external: bool) -> CatalogStream {
+        CatalogStream {
+            index,
+            stream_type: "SUBTITLE".to_owned(),
+            codec: codec.map(str::to_owned),
+            language: Some("chi".to_owned()),
+            title: None,
+            is_external,
+            is_default: false,
+            is_forced: false,
+            details: BTreeMap::new(),
+        }
+    }
+
+    fn subtitle_json(stream: CatalogStream) -> serde_json::Value {
+        let source = catalog_source(None, vec![stream]);
+        emby_media_source_json_with_resolver("item-1", &source, true, false)["MediaStreams"][0]
+            .clone()
+    }
+
+    #[test]
+    fn external_subtitles_advertise_an_external_delivery_url() {
+        for (codec, extension) in [
+            ("srt", "srt"),
+            ("subrip", "srt"),
+            ("ass", "ass"),
+            ("ssa", "ass"),
+            ("webvtt", "vtt"),
+            ("vtt", "vtt"),
+        ] {
+            let json = subtitle_json(subtitle_stream(3, Some(codec), true));
+            assert_eq!(json["DeliveryMethod"], "External", "{codec}");
+            assert_eq!(json["SubtitleLocationType"], "ExternalFile", "{codec}");
+            assert_eq!(json["IsExternalUrl"], false, "{codec}");
+            assert_eq!(
+                json["DeliveryUrl"],
+                format!("/Videos/item-1/source-1/Subtitles/3/Stream.{extension}"),
+                "{codec}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_subtitle_with_an_unknown_codec_uses_the_extensionless_route() {
+        let json = subtitle_json(subtitle_stream(2, Some("weird/codec"), true));
+        assert_eq!(
+            json["DeliveryUrl"],
+            "/Videos/item-1/source-1/Subtitles/2/Stream"
+        );
+        let json = subtitle_json(subtitle_stream(2, None, true));
+        assert_eq!(
+            json["DeliveryUrl"],
+            "/Videos/item-1/source-1/Subtitles/2/Stream"
+        );
+    }
+
+    #[test]
+    fn embedded_subtitles_stay_inside_the_container_without_a_delivery_url() {
+        let json = subtitle_json(subtitle_stream(4, Some("subrip"), false));
+        assert_eq!(json["DeliveryMethod"], "Embed");
+        assert_eq!(json["SubtitleLocationType"], "InternalStream");
+        assert_eq!(json["IsExternalUrl"], false);
+        assert!(json.get("DeliveryUrl").is_none());
+    }
+
+    #[test]
+    fn non_subtitle_streams_carry_no_delivery_fields() {
+        let source = catalog_source(
+            Some("1080p"),
+            vec![
+                stream("VIDEO", Some("h264"), None, None, BTreeMap::new()),
+                stream("AUDIO", Some("aac"), Some("eng"), None, BTreeMap::new()),
+            ],
+        );
+        let json = emby_media_source_json_with_resolver("item-1", &source, true, false);
+        for index in 0..2 {
+            let stream = &json["MediaStreams"][index];
+            for key in [
+                "DeliveryMethod",
+                "DeliveryUrl",
+                "IsExternalUrl",
+                "SubtitleLocationType",
+            ] {
+                assert!(stream.get(key).is_none(), "{index} {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn strm_media_source_ids_are_32_hex_so_external_proxies_can_parse_them() {
+        let mut source = catalog_source(None, Vec::new());
+        source.id = "0195f0a2-7c3b-7d21-9e44-0a1b2c3d4e5f".to_owned();
+        source.source_kind = "STRM_URL".to_owned();
+        source.external_url = Some("http://example.invalid/115/url/movie.mkv".to_owned());
+        let json = emby_media_source_json_with_resolver("item-1", &source, false, false);
+        let public_id = json["Id"].as_str().unwrap_or("");
+        assert_eq!(public_id.len(), 32, "{public_id}");
+        assert!(
+            public_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "{public_id}"
+        );
+        assert_eq!(super::emby_internal_source_id(public_id), source.id);
+    }
+
+    #[test]
+    fn local_media_source_ids_stay_internal_uuids() {
+        let mut source = catalog_source(None, Vec::new());
+        source.id = "0195f0a2-7c3b-7d21-9e44-0a1b2c3d4e5f".to_owned();
+        let json = emby_media_source_json_with_resolver("item-1", &source, false, false);
+        assert_eq!(json["Id"], source.id);
+    }
+
+    #[test]
+    fn internal_source_id_accepts_public_hex_uuid_and_foreign_identifiers() {
+        let uuid = "0195f0a2-7c3b-7d21-9e44-0a1b2c3d4e5f";
+        let public = super::emby_public_source_id(uuid, "STRM_URL");
+        assert_eq!(public.len(), 32);
+        assert_eq!(super::emby_internal_source_id(&public), uuid);
+        // Historical UUID ids and synthetic test ids must keep resolving unchanged.
+        assert_eq!(super::emby_internal_source_id(uuid), uuid);
+        assert_eq!(super::emby_internal_source_id("source-1"), "source-1");
+        assert_eq!(
+            super::emby_internal_source_id("src id/with?odd"),
+            "src id/with?odd"
+        );
+        // A decimal item id is not a media source id and must survive untouched.
+        assert_eq!(
+            super::emby_internal_source_id("123456789012345678901234567890123456"),
+            "123456789012345678901234567890123456"
+        );
+    }
+
+    #[test]
+    fn strm_direct_stream_and_subtitle_urls_use_the_32_hex_source_id() {
+        let mut source = catalog_source(None, vec![subtitle_stream(1, Some("srt"), true)]);
+        source.id = "0195f0a2-7c3b-7d21-9e44-0a1b2c3d4e5f".to_owned();
+        source.source_kind = "STRM_URL".to_owned();
+        source.external_url = Some("http://example.invalid/movie.mkv".to_owned());
+        let json = emby_media_source_json_with_resolver("item-1", &source, true, false);
+        let direct_url = json["DirectStreamUrl"].as_str().unwrap_or("");
+        let public_id = json["Id"].as_str().unwrap_or("");
+        assert!(
+            direct_url.contains(&format!("MediaSourceId={public_id}")),
+            "{direct_url}"
+        );
+        assert!(!direct_url.contains("0195f0a2-7c3b"), "{direct_url}");
+        let delivery_url = json["MediaStreams"][0]["DeliveryUrl"]
+            .as_str()
+            .unwrap_or("");
+        assert!(delivery_url.contains(public_id), "{delivery_url}");
+        assert!(!delivery_url.contains("0195f0a2-7c3b"), "{delivery_url}");
+    }
+
+    #[test]
+    fn delivery_urls_use_the_public_ids_and_carry_no_credentials() {
+        let mut source = catalog_source(None, vec![subtitle_stream(1, Some("srt"), true)]);
+        source.id = "src id/with?odd".to_owned();
+        let json = emby_media_source_json_with_resolver("item-1", &source, true, false);
+        let url = json["MediaStreams"][0]["DeliveryUrl"]
+            .as_str()
+            .unwrap_or("");
+        assert!(url.starts_with("/Videos/"), "{url}");
+        assert!(
+            !url.contains('?') && !url.contains("api_key") && !url.contains(' '),
+            "{url}"
+        );
+    }
+
+    #[test]
+    fn video_resolution_label_follows_the_larger_of_width_and_height_buckets() {
+        for (width, height, label) in [
+            (7680, 4320, Some("4320p")),
+            (3840, 1636, Some("2160p")),
+            (3840, 2160, Some("2160p")),
+            (2560, 1440, Some("1440p")),
+            (1920, 800, Some("1080p")),
+            (1920, 1080, Some("1080p")),
+            (1440, 1080, Some("1080p")),
+            (1280, 544, Some("720p")),
+            (720, 576, Some("576p")),
+            (720, 480, Some("480p")),
+            (640, 360, Some("360p")),
+            (1920, 0, Some("1080p")),
+            (0, 1080, Some("1080p")),
+            (0, 0, None),
+        ] {
+            assert_eq!(
+                super::emby_video_resolution_label(width, height).as_deref(),
+                label,
+                "{width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn video_display_title_includes_the_probed_resolution_without_a_quality_label() {
+        let json = emby_media_stream_json(&stream(
+            "VIDEO",
+            Some("hevc"),
+            None,
+            None,
+            BTreeMap::from([
+                ("Width".to_owned(), json!(1920)),
+                ("Height".to_owned(), json!(800)),
+            ]),
+        ));
+        assert_eq!(json["DisplayTitle"], "1080p HEVC");
+        assert_eq!(json["Title"], "1080p HEVC");
+
+        let hdr = emby_media_stream_json(&stream(
+            "VIDEO",
+            Some("hevc"),
+            None,
+            None,
+            BTreeMap::from([
+                ("Width".to_owned(), json!("3840")),
+                ("Height".to_owned(), json!(1636)),
+                ("VideoRange".to_owned(), json!("HDR 10")),
+                ("BitDepth".to_owned(), json!(10)),
+            ]),
+        ));
+        assert_eq!(hdr["DisplayTitle"], "2160p HEVC HDR10 10bit");
+    }
+
+    #[test]
+    fn video_display_title_uses_only_the_dimensions_when_nothing_else_is_known() {
+        let json = emby_media_stream_json(&stream(
+            "VIDEO",
+            None,
+            None,
+            None,
+            BTreeMap::from([("Height".to_owned(), json!(720))]),
+        ));
+        assert_eq!(json["DisplayTitle"], "720p");
+    }
+
+    #[test]
+    fn probed_resolution_wins_over_a_filename_quality_label() {
+        let dims = BTreeMap::from([
+            ("Width".to_owned(), json!(3840)),
+            ("Height".to_owned(), json!(1636)),
+        ]);
+        // The filename claims 1080p but the file is really 2160p: show the probed value once.
+        let source = catalog_source(
+            Some("1080p"),
+            vec![stream("VIDEO", Some("hevc"), None, None, dims.clone())],
+        );
+        assert_eq!(source_stream_json(&source)["DisplayTitle"], "2160p HEVC");
+
+        let matching = catalog_source(
+            Some("2160p"),
+            vec![stream("VIDEO", Some("hevc"), None, None, dims)],
+        );
+        assert_eq!(source_stream_json(&matching)["DisplayTitle"], "2160p HEVC");
+    }
+
+    #[test]
+    fn stream_title_prefers_the_probed_track_name_and_is_omitted_when_unknown() {
+        let probed = emby_media_stream_json(&stream(
+            "VIDEO",
+            Some("hevc"),
+            None,
+            Some("HEVC"),
+            BTreeMap::from([("Title".to_owned(), json!("Main feature"))]),
+        ));
+        assert_eq!(probed["DisplayTitle"], "HEVC");
+        assert_eq!(probed["Title"], "Main feature");
+
+        let empty = emby_media_stream_json(&stream("VIDEO", None, None, None, BTreeMap::new()));
+        assert_eq!(empty["DisplayTitle"], "Video");
+        assert!(empty.get("Title").is_none());
+    }
+
+    #[test]
+    fn audio_display_title_keeps_the_default_marker_without_restacking_the_track_name() {
+        let json = emby_media_stream_json(&stream(
+            "AUDIO",
+            Some("flac"),
+            Some("chi"),
+            Some("FLAC stereo (默认)"),
+            BTreeMap::from([
+                ("ChannelLayout".to_owned(), json!("stereo")),
+                ("Channels".to_owned(), json!(2)),
+            ]),
+        ));
+
+        assert_eq!(json["DisplayTitle"], "Chinese FLAC stereo (默认)");
+        assert_eq!(json["Title"], "Chinese FLAC stereo (默认)");
+    }
+
+    #[test]
+    fn audio_display_title_prefers_a_legacy_title_that_already_names_every_detail() {
+        let json = emby_media_stream_json(&stream(
+            "AUDIO",
+            Some("dts"),
+            Some("chi"),
+            Some("Chinese Simplified DTS-HD MA 7.1 (默认)"),
+            BTreeMap::from([
+                ("DisplayLanguage".to_owned(), json!("Chinese Simplified")),
+                ("ChannelLayout".to_owned(), json!("7.1")),
+                ("Channels".to_owned(), json!(8)),
+            ]),
+        ));
+
+        assert_eq!(
+            json["DisplayTitle"],
+            "Chinese Simplified DTS-HD MA 7.1 (默认)"
+        );
+    }
+
+    #[test]
+    fn audio_display_title_uses_channels_when_the_layout_is_missing() {
+        let json = emby_media_stream_json(&stream(
+            "AUDIO",
+            Some("aac"),
+            None,
+            Some("10 ch"),
+            BTreeMap::from([("Channels".to_owned(), json!(10))]),
+        ));
+
+        assert_eq!(json["DisplayTitle"], "AAC 10 channels");
+    }
+
+    #[test]
+    fn audio_display_title_keeps_a_legacy_layout_that_matches_the_channel_count() {
+        let json = emby_media_stream_json(&stream(
+            "AUDIO",
+            Some("aac"),
+            None,
+            Some("AAC 5.1"),
+            BTreeMap::from([("Channels".to_owned(), json!(6))]),
+        ));
+
+        assert_eq!(json["DisplayTitle"], "AAC 5.1");
+    }
+
+    #[test]
+    fn audio_display_title_adds_missing_parts_once() {
+        let json = emby_media_stream_json(&stream(
+            "AUDIO",
+            Some("aac"),
+            Some("eng"),
+            Some("AAC stereo (默认)"),
+            BTreeMap::from([
+                ("ChannelLayout".to_owned(), json!("stereo")),
+                ("Channels".to_owned(), json!(2)),
+            ]),
+        ));
+
+        assert_eq!(json["DisplayTitle"], "English AAC stereo (默认)");
+    }
+
+    #[test]
+    fn subtitle_display_title_marks_forced_and_sdh_tracks() {
+        let sdh = emby_media_stream_json(&stream(
+            "SUBTITLE",
+            Some("subrip"),
+            Some("eng"),
+            None,
+            BTreeMap::from([("IsHearingImpaired".to_owned(), json!(true))]),
+        ));
+        assert_eq!(sdh["DisplayTitle"], "English (SUBRIP) SDH");
+
+        let forced = CatalogStream {
+            is_forced: true,
+            ..stream("SUBTITLE", Some("ass"), Some("eng"), None, BTreeMap::new())
+        };
+        assert_eq!(
+            emby_media_stream_json(&forced)["DisplayTitle"],
+            "English (ASS) Forced"
+        );
+    }
+
+    #[test]
+    fn subtitle_display_title_does_not_degrade_to_und() {
+        let json = emby_media_stream_json(&stream(
+            "SUBTITLE",
+            Some("ass"),
+            Some("und"),
+            None,
+            BTreeMap::new(),
+        ));
+
+        assert_eq!(json["Language"], "und");
+        assert_eq!(json["DisplayTitle"], "Unknown (ASS)");
+        assert_eq!(json["Title"], "Unknown (ASS)");
+    }
+
+    #[test]
+    fn subtitle_display_title_keeps_a_single_forced_marker() {
+        let json = emby_media_stream_json(&CatalogStream {
+            is_forced: true,
+            ..stream(
+                "SUBTITLE",
+                Some("ass"),
+                Some("eng"),
+                Some("English (ASS) Forced"),
+                BTreeMap::new(),
+            )
+        });
+
+        assert_eq!(json["DisplayTitle"], "English (ASS) Forced");
+    }
+
+    #[test]
+    fn subtitle_display_title_keeps_a_legacy_label_as_the_language_hint() {
+        let named = emby_media_stream_json(&stream(
+            "SUBTITLE",
+            Some("subrip"),
+            Some("und"),
+            Some("Chinese (SRT)"),
+            BTreeMap::new(),
+        ));
+        assert_eq!(named["DisplayTitle"], "Chinese (SRT)");
+
+        let sdh = emby_media_stream_json(&stream(
+            "SUBTITLE",
+            Some("subrip"),
+            Some("und"),
+            Some("SDH"),
+            BTreeMap::from([("IsHearingImpaired".to_owned(), json!(true))]),
+        ));
+        assert_eq!(sdh["DisplayTitle"], "SDH (SUBRIP)");
+    }
+
+    #[test]
+    fn legacy_rows_without_details_still_render_useful_titles() {
+        for (stream_type, legacy) in [("VIDEO", "4K HDR 10 HEVC"), ("AUDIO", "FLAC stereo (默认)")]
+        {
+            let json = emby_media_stream_json(&stream(
+                stream_type,
+                None,
+                Some("und"),
+                Some(legacy),
+                BTreeMap::new(),
+            ));
+
+            assert_eq!(json["DisplayTitle"], legacy, "{stream_type}");
+            assert_eq!(json["Title"], legacy, "{stream_type}");
+            assert_eq!(json["Language"], "und", "{stream_type}");
+        }
+    }
+
+    #[test]
+    fn blank_detail_strings_are_omitted_from_stream_json() {
+        let json = emby_media_stream_json(&stream(
+            "AUDIO",
+            Some("aac"),
+            Some("eng"),
+            None,
+            BTreeMap::from([
+                ("Title".to_owned(), json!("   ")),
+                ("AspectRatio".to_owned(), json!("")),
+            ]),
+        ));
+
+        assert_eq!(json["DisplayTitle"], "English AAC");
+        assert_eq!(json["Title"], "English AAC");
+        assert!(json.get("AspectRatio").is_none());
     }
 
     #[test]
@@ -5464,7 +6954,9 @@ mod tests {
 
         assert_eq!(json["Name"], "Show.S01E02.2160p.WEB-DL.mkv");
         assert_eq!(json["VideoType"], "2160p");
-        assert_eq!(json["MediaStreams"][0]["DisplayTitle"], "2160p");
+        // LUX-878: Emby display titles describe the stream, not just the quality label; Hills
+        // renders this string verbatim in its version row.
+        assert_eq!(json["MediaStreams"][0]["DisplayTitle"], "2160p HEVC");
     }
 
     #[test]
@@ -5552,6 +7044,40 @@ mod tests {
         let filter = catalog_filter_from_emby(&query);
         assert_eq!(filter.is_played, Some(false));
         assert_eq!(filter.min_date_last_saved, Some(1_700_000_000));
+    }
+
+    /// Emby clients read `MinWidth` from the image options. Lux no longer has a minimum
+    /// download width, so the key stays for wire compatibility with the fixed value 0.
+    #[test]
+    fn image_options_keep_min_width_at_zero_for_emby_clients() {
+        let mut strategy = crate::application::settings::MediaStrategySettings::default();
+        strategy.images.artwork = true;
+        strategy.images.banner = true;
+        strategy.images.disc = true;
+        strategy.images.max_backdrop_count = 4;
+
+        let options = super::emby_library_type_options_json("Movie", &strategy);
+        let image_options = options["ImageOptions"]
+            .as_array()
+            .expect("ImageOptions is an array");
+        let types = image_options
+            .iter()
+            .map(|option| option["Type"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            [
+                "Primary", "Art", "Banner", "Logo", "Thumb", "Disc", "Backdrop"
+            ]
+        );
+        for option in image_options {
+            assert_eq!(
+                option["MinWidth"],
+                json!(0),
+                "every image option keeps the compatibility key: {option}"
+            );
+        }
+        assert_eq!(image_options[6]["Limit"], json!(4));
     }
 }
 

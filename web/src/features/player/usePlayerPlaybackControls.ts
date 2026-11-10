@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { LuxPlayerRuntime } from "./core/player-runtime";
 
 type VideoRef = { current: HTMLVideoElement | null };
@@ -8,7 +8,6 @@ export type PlayerPlaybackControls = {
   isMuted: boolean;
   playbackRate: number;
   isFullscreen: boolean;
-  centerSplash: "play" | "pause" | null;
   togglePlayPause: () => void;
   seekTo: (seconds: number) => void;
   seekRelative: (seconds: number) => void;
@@ -43,8 +42,6 @@ export function usePlayerPlaybackControls({
   const [isMuted, setIsMuted] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1.0);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const [centerSplash, setCenterSplash] = useState<"play" | "pause" | null>(null);
-  const splashTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     const handleFullscreenChange = () => {
@@ -56,28 +53,13 @@ export function usePlayerPlaybackControls({
     };
   }, []);
 
-  useEffect(() => () => {
-    if (splashTimeoutRef.current) clearTimeout(splashTimeoutRef.current);
-  }, []);
-
-  const showCenterSplash = (type: "play" | "pause") => {
-    setCenterSplash(type);
-    if (splashTimeoutRef.current) clearTimeout(splashTimeoutRef.current);
-    splashTimeoutRef.current = setTimeout(() => {
-      setCenterSplash(null);
-    }, 600);
-  };
-
   const togglePlayPause = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
     if (video.paused) {
-      void video.play().then(() => {
-        showCenterSplash("play");
-      });
+      void video.play();
     } else {
       video.pause();
-      showCenterSplash("pause");
     }
   }, [videoRef]);
 
@@ -149,7 +131,6 @@ export function usePlayerPlaybackControls({
     isMuted,
     playbackRate,
     isFullscreen,
-    centerSplash,
     togglePlayPause,
     seekTo,
     seekRelative,

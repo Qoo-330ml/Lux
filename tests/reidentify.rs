@@ -186,7 +186,7 @@ fn fill_missing_dispatch_job(id: &str, library_id: &str) -> MetadataReidentifyJo
         cancel_requested: false,
         library_id: Some(library_id.to_owned()),
         job_scope: "ITEMS".to_owned(),
-        pending_count: 0,
+        pending_count: Some(0),
     }
 }
 
@@ -775,6 +775,30 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
                 && job["libraryId"] == library.id.to_string()
         })
     }));
+    // The default page must not aggregate pending candidates: the field is null (or absent)
+    // until the caller opts in.
+    assert!(
+        listed_body["jobs"]
+            .as_array()
+            .is_some_and(|jobs| { jobs.iter().all(|job| job["pendingCount"].is_null()) })
+    );
+
+    let listed_with_pending = client
+        .get(format!(
+            "{base_url}/api/v1/admin/metadata/reidentify?page=1&pageSize=50&includePending=1"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(listed_with_pending.status(), reqwest::StatusCode::OK);
+    let listed_with_pending_body: Value = listed_with_pending.json().await?;
+    assert!(
+        listed_with_pending_body["jobs"]
+            .as_array()
+            .is_some_and(|jobs| {
+                !jobs.is_empty() && jobs.iter().all(|job| job["pendingCount"].is_number())
+            })
+    );
 
     let refresh_started = client
         .post(format!(
@@ -1680,7 +1704,9 @@ async fn fill_missing_dispatcher_serializes_jobs_for_one_library()
         .create_fill_missing_job(vec![item_ids[0].clone()])
         .await?;
     metadata.enqueue_fill_missing_job(&first_job).await?;
-    if tokio::time::timeout(Duration::from_secs(2), async {
+    // Dispatch is asynchronous; under the full parallel target run two seconds was not enough
+    // for the dispatcher task to get scheduled on a saturated drive.
+    if tokio::time::timeout(Duration::from_secs(30), async {
         while gate.started.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -1744,12 +1770,13 @@ async fn fill_missing_dispatcher_serializes_jobs_for_one_library()
         metadata.enqueue_fill_missing_job(&misrouted_job).await,
         Err(luxd::application::reidentify::MetadataDispatchError::InvalidJob)
     ));
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         while gate.started.load(Ordering::SeqCst) < 2 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
-    .await?;
+    .await
+    .map_err(|_| "the independent library's gated request did not start")?;
 
     let queued_jobs = (0..30)
         .map(|index| {
@@ -1809,7 +1836,7 @@ async fn fill_missing_dispatcher_serializes_jobs_for_one_library()
     assert_eq!(other_status, "RUNNING");
 
     gate.release.add_permits(2);
-    if tokio::time::timeout(Duration::from_secs(2), async {
+    if tokio::time::timeout(Duration::from_secs(30), async {
         while gate.started.load(Ordering::SeqCst) < 3 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -1828,7 +1855,7 @@ async fn fill_missing_dispatcher_serializes_jobs_for_one_library()
     let overflow_completion = duplicate_overflow_submission
         .await?
         .ok_or("cancelled backpressured submission should be retryable")?;
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let second_status: String =
                 sqlx::query_scalar("SELECT status FROM metadata_reidentify_jobs WHERE id = ?")
@@ -1848,7 +1875,8 @@ async fn fill_missing_dispatcher_serializes_jobs_for_one_library()
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
-    .await?;
+    .await
+    .map_err(|_| "the cancelled job did not give way to the next same-library job")?;
     tokio::time::timeout(Duration::from_millis(150), metadata.shutdown())
         .await
         .expect("dispatcher shutdown must not wait for a job blocked in the scraper");
@@ -1862,7 +1890,7 @@ async fn fill_missing_dispatcher_serializes_jobs_for_one_library()
         Err(luxd::application::reidentify::MetadataDispatchError::ShuttingDown)
     ));
     gate.release.add_permits(16);
-    if tokio::time::timeout(Duration::from_secs(2), async {
+    if tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let statuses: Vec<String> = sqlx::query_scalar(
                 "SELECT status FROM metadata_reidentify_jobs
@@ -1898,7 +1926,11 @@ async fn fill_missing_dispatcher_serializes_jobs_for_one_library()
         )
         .into());
     }
-    tokio::time::timeout(Duration::from_secs(5), overflow_completion).await??;
+    tokio::time::timeout(Duration::from_secs(30), overflow_completion)
+        .await
+        .map_err(
+            |_| "the backpressured submission did not resolve after permits were released",
+        )??;
     tmdb_server.abort();
     Ok(())
 }

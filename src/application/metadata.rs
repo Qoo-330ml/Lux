@@ -1946,6 +1946,7 @@ impl MetadataEnricher {
         }
 
         let mut inserts_by_item = BTreeMap::<String, ItemImageBatchInsert>::new();
+        let mut assigned_indexes = BTreeMap::<String, BTreeMap<&'static str, BTreeSet<i64>>>::new();
         for (item_id, image) in candidates {
             let indexed = indexed_images
                 .get(&item_id)
@@ -1966,29 +1967,12 @@ impl MetadataEnricher {
                     source: error.error,
                 })?;
             let local_path = prepared.image.path.to_string_lossy().into_owned();
-            let existing = indexed.iter().find(|existing| {
-                existing.source == "LOCAL"
-                    && existing.image_type == image.image_type.as_str()
-                    && existing.local_path == local_path
-            });
-            let image_index = existing.map_or_else(
-                || {
-                    if image.image_type == ImageType::Fanart {
-                        indexed
-                            .iter()
-                            .filter(|existing| {
-                                existing.source == "LOCAL"
-                                    && existing.image_type == image.image_type.as_str()
-                            })
-                            .map(|existing| existing.image_index)
-                            .max()
-                            .unwrap_or(-1)
-                            .saturating_add(1)
-                    } else {
-                        0
-                    }
-                },
-                |existing| existing.image_index,
+            let item_assigned = assigned_indexes.entry(item_id.clone()).or_default();
+            let image_index = next_local_image_index(
+                image.image_type,
+                &prepared.image.path,
+                indexed,
+                item_assigned,
             );
             let insert =
                 inserts_by_item
@@ -2024,12 +2008,26 @@ impl MetadataEnricher {
         directory_cache: &mut DirectoryPathCache,
         report: &mut MetadataReport,
     ) -> Result<(), MetadataError> {
+        let item_ids = sources
+            .iter()
+            .map(|source| source.item_id.clone())
+            .collect::<Vec<_>>();
+        let indexed_images = self.database.list_item_images_by_ids(&item_ids).await?;
         let mut items = Vec::with_capacity(sources.len());
         for source in sources {
             report.items_processed += 1;
-            if let Some((item, skipped_image_count)) =
-                prepare_scan_local_movie_image_batch_item(source, directory_cache, report, true)
-                    .await
+            let indexed = indexed_images
+                .get(&source.item_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if let Some((item, skipped_image_count)) = prepare_scan_local_movie_image_batch_item(
+                source,
+                indexed,
+                directory_cache,
+                report,
+                true,
+            )
+            .await
             {
                 if skipped_image_count > 0 {
                     report.mark_item_image_skipped(&source.item_id);
@@ -2750,11 +2748,34 @@ impl MetadataEnricher {
                 }
             }
 
+            let page_item_ids = source_page
+                .iter()
+                .map(|source| source.item_id.clone())
+                .collect::<Vec<_>>();
+            let page_indexed_images =
+                match self.database.list_item_images_by_ids(&page_item_ids).await {
+                    Ok(images) => images,
+                    Err(error) => {
+                        // Registration still avoids duplicate paths in storage; the allocator just
+                        // cannot keep an already registered index for a recognisable file.
+                        tracing::warn!(
+                            item_count = source_page.len(),
+                            %error,
+                            "local movie image page could not read existing images"
+                        );
+                        HashMap::new()
+                    }
+                };
             let mut image_items = Vec::with_capacity(source_page.len());
             for source in source_page {
+                let indexed = page_indexed_images
+                    .get(&source.item_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
                 if let Some((item, skipped_image_count)) =
                     prepare_scan_local_movie_image_batch_item(
                         source,
+                        indexed,
                         &mut directory_cache,
                         report,
                         background_cpu_budgeted,
@@ -4061,7 +4082,7 @@ async fn prepare_local_image_batch_item(
         })
         .collect::<Vec<_>>();
     let prepared = prepare_local_images(images, background_cpu_budgeted).await;
-    let mut image_indexes = BTreeMap::<&'static str, i64>::new();
+    let mut assigned_indexes = BTreeMap::<&'static str, BTreeSet<i64>>::new();
     let mut records = Vec::new();
     let mut skipped_image_count = 0;
     for result in prepared {
@@ -4078,7 +4099,12 @@ async fn prepare_local_image_batch_item(
                 continue;
             }
         };
-        let image_index = next_local_image_index(&mut image_indexes, prepared.image.image_type);
+        let image_index = next_local_image_index(
+            prepared.image.image_type,
+            &prepared.image.path,
+            indexed_images,
+            &mut assigned_indexes,
+        );
         records.push(ItemImageInsert {
             image_type: prepared.image.image_type.as_str().to_owned(),
             image_index,
@@ -4106,6 +4132,7 @@ async fn prepare_local_image_batch_item(
 
 async fn prepare_scan_local_movie_image_batch_item(
     source: &StoredMediaSourcePath,
+    indexed_images: &[StoredItemImage],
     directory_cache: &mut DirectoryPathCache,
     report: &mut MetadataReport,
     background_cpu_budgeted: bool,
@@ -4148,7 +4175,7 @@ async fn prepare_scan_local_movie_image_batch_item(
     images.extend(extrafanart_local_images(&image_paths, resource_directory));
     images.sort_by(|left, right| left.path.cmp(&right.path));
     let prepared = prepare_local_images(images, background_cpu_budgeted).await;
-    let mut image_indexes = BTreeMap::<&'static str, i64>::new();
+    let mut assigned_indexes = BTreeMap::<&'static str, BTreeSet<i64>>::new();
     let mut records = Vec::new();
     let mut skipped_image_count = 0;
     for result in prepared {
@@ -4165,7 +4192,12 @@ async fn prepare_scan_local_movie_image_batch_item(
                 continue;
             }
         };
-        let image_index = next_local_image_index(&mut image_indexes, prepared.image.image_type);
+        let image_index = next_local_image_index(
+            prepared.image.image_type,
+            &prepared.image.path,
+            indexed_images,
+            &mut assigned_indexes,
+        );
         records.push(ItemImageInsert {
             image_type: prepared.image.image_type.as_str().to_owned(),
             image_index,
@@ -4191,15 +4223,52 @@ async fn prepare_scan_local_movie_image_batch_item(
     ))
 }
 
-fn next_local_image_index(indexes: &mut BTreeMap<&'static str, i64>, image_type: ImageType) -> i64 {
+/// Picks the image index one local image registers under.
+///
+/// Fanart is the only type with several indexes. An index the item already registers for this
+/// exact path is kept, so a rescan never renumbers a file that is already indexed. Any other
+/// registered index of the same type, and every index an earlier image of this pass took, is
+/// avoided: `next_local_image_index` must not hand a new file an index that points at a different
+/// file. Other types keep the single canonical index the scanner assigns.
+fn next_local_image_index(
+    image_type: ImageType,
+    path: &Path,
+    indexed_images: &[StoredItemImage],
+    assigned: &mut BTreeMap<&'static str, BTreeSet<i64>>,
+) -> i64 {
     let key = image_type.as_str();
     if image_type != ImageType::Fanart {
         return 0;
     }
-    let index = indexes.entry(key).or_default();
-    let current = *index;
-    *index = index.saturating_add(1);
-    current
+    let assigned = assigned.entry(key).or_default();
+    let registered_index = indexed_images
+        .iter()
+        .find(|image| {
+            image.image_type.eq_ignore_ascii_case(key) && Path::new(&image.local_path) == path
+        })
+        .map(|image| image.image_index)
+        .filter(|index| *index >= 0 && !assigned.contains(index));
+    if let Some(index) = registered_index {
+        assigned.insert(index);
+        return index;
+    }
+    let mut index = 0_i64;
+    loop {
+        let taken = assigned.contains(&index)
+            || indexed_images.iter().any(|image| {
+                image.image_type.eq_ignore_ascii_case(key)
+                    && image.image_index == index
+                    && Path::new(&image.local_path) != path
+            });
+        if !taken {
+            assigned.insert(index);
+            return index;
+        }
+        match index.checked_add(1) {
+            Some(next) => index = next,
+            None => return 0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -4622,6 +4691,160 @@ mod tests {
         Ok(())
     }
 
+    /// M4: rescanning an unchanged NFO must not rewrite the derived collection reference.
+    ///
+    /// The reference row and the `collection_sync_outbox` generation are the observable side
+    /// effects; the old path always ran `DELETE` + `INSERT`, which reset the row's `updated_at`
+    /// and bumped the generation (one global collection re-derivation) per scanned movie.
+    #[tokio::test]
+    async fn rescanning_an_unchanged_nfo_does_not_rewrite_the_collection_reference()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{libraries::LibraryService, scanner::LibraryScanner},
+            config::Config,
+            library::LibraryKind,
+        };
+
+        /// A `DELETE` + `INSERT` re-creates the row with `unixepoch()`, never with this stamp.
+        const WRITE_STAMP: i64 = 4_242_424;
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let movie_dir = directory.path().join("Movies").join("Fly With You (2019)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(movie_dir.join("Fly.With.You.2019.mkv"), b"media").await?;
+        let nfo_path = movie_dir.join("movie.nfo");
+        tokio::fs::write(
+            &nfo_path,
+            "<movie><title>飞驰人生</title><year>2019</year><tmdbid>movie-599</tmdbid><set>飞驰人生</set><setid>tmdb:1281825</setid></movie>",
+        )
+        .await?;
+
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        LibraryService::new(database.clone())
+            .add_root(
+                library.id,
+                directory
+                    .path()
+                    .join("Movies")
+                    .to_str()
+                    .ok_or("non-UTF8 root")?,
+            )
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let item_id: String =
+            sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+                .fetch_one(database.pool())
+                .await?;
+        let enricher = MetadataEnricher::new(database.clone())
+            .with_nfo_store(LocalNfoMetadataStore::new(database.clone()));
+        enricher.enrich_movie_library(library.id).await?;
+
+        // Pin every derived write target so a rewrite cannot hide behind equal values.
+        sqlx::query("UPDATE collection_item_references SET updated_at = ? WHERE item_id = ?")
+            .bind(WRITE_STAMP)
+            .bind(&item_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("UPDATE media_items SET updated_at = ? WHERE id = ?")
+            .bind(WRITE_STAMP)
+            .bind(&item_id)
+            .execute(database.pool())
+            .await?;
+        let catalog_outbox_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM catalog_outbox WHERE item_id = ?")
+                .bind(&item_id)
+                .fetch_one(database.pool())
+                .await?;
+        let generation_before: i64 = sqlx::query_scalar(
+            "SELECT generation FROM collection_sync_outbox
+             WHERE collection_provider = 'tmdb' AND collection_provider_id = '1281825'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+
+        let report = enricher.enrich_movie_library(library.id).await?;
+        assert_eq!(report.nfo_skipped, 1, "the unchanged NFO must be skipped");
+        let reference: (String, i64) = sqlx::query_as(
+            "SELECT collection_provider_id, updated_at
+             FROM collection_item_references WHERE item_id = ?",
+        )
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(reference.0, "1281825");
+        assert_eq!(
+            reference.1, WRITE_STAMP,
+            "an unchanged NFO must not delete and re-insert the collection reference"
+        );
+        let item_stamp: i64 = sqlx::query_scalar("SELECT updated_at FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(
+            item_stamp, WRITE_STAMP,
+            "an unchanged NFO must not rewrite the media item"
+        );
+        let catalog_outbox_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM catalog_outbox WHERE item_id = ?")
+                .bind(&item_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(
+            catalog_outbox_after, catalog_outbox_before,
+            "an unchanged NFO must not queue catalog work"
+        );
+        let generation_after: i64 = sqlx::query_scalar(
+            "SELECT generation FROM collection_sync_outbox
+             WHERE collection_provider = 'tmdb' AND collection_provider_id = '1281825'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(
+            generation_after, generation_before,
+            "an unchanged NFO must not queue another collection sync"
+        );
+
+        // A real NFO change must still replace the reference and queue the new collection.
+        tokio::fs::write(
+            &nfo_path,
+            "<movie><title>飞驰人生</title><year>2019</year><tmdbid>movie-599</tmdbid><set>飞驰人生</set><setid>tmdb:1281826</setid></movie>",
+        )
+        .await?;
+        enricher.enrich_movie_library(library.id).await?;
+        let changed: (String, i64) = sqlx::query_as(
+            "SELECT collection_provider_id, updated_at
+             FROM collection_item_references WHERE item_id = ?",
+        )
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(changed.0, "1281826");
+        assert_ne!(
+            changed.1, WRITE_STAMP,
+            "a changed NFO must still rewrite the collection reference"
+        );
+        let new_generation: Option<i64> = sqlx::query_scalar(
+            "SELECT generation FROM collection_sync_outbox
+             WHERE collection_provider = 'tmdb' AND collection_provider_id = '1281826'",
+        )
+        .fetch_optional(database.pool())
+        .await?;
+        assert!(
+            new_generation.is_some_and(|generation| generation >= 1),
+            "a changed NFO must still queue the new collection"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn bounded_task_helper_caps_concurrency_and_preserves_input_order() {
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4649,6 +4872,69 @@ mod tests {
             .map(|result| result.expect("bounded task should finish"))
             .collect::<Vec<_>>();
         assert_eq!(results, (0..12).map(|value| value * 2).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn local_image_indexes_avoid_registered_and_assigned_indexes() {
+        let indexed_image =
+            |image_type: &str, image_index: i64, local_path: &str| StoredItemImage {
+                id: format!("{image_type}-{image_index}"),
+                item_id: "item".to_owned(),
+                image_type: image_type.to_owned(),
+                image_index,
+                local_path: local_path.to_owned(),
+                file_size: None,
+                content_tag: None,
+                source: "LOCAL".to_owned(),
+                root_path: None,
+            };
+        let indexed = vec![
+            indexed_image("FANART", 0, "/media/fanart.jpg"),
+            indexed_image("FANART", 1, "/media/fanart1.jpg"),
+            indexed_image("FANART", 2, "/media/fanart2.jpg"),
+            indexed_image("FANART", 3, "/media/fanart3.jpg"),
+        ];
+        let mut assigned = BTreeMap::<&'static str, BTreeSet<i64>>::new();
+
+        // A file that is already registered keeps its index across a rescan.
+        assert_eq!(
+            next_local_image_index(
+                ImageType::Fanart,
+                Path::new("/media/fanart2.jpg"),
+                &indexed,
+                &mut assigned,
+            ),
+            2
+        );
+        // A new file never takes an index that points at another file.
+        assert_eq!(
+            next_local_image_index(
+                ImageType::Fanart,
+                Path::new("/media/new.jpg"),
+                &indexed,
+                &mut assigned,
+            ),
+            4
+        );
+        assert_eq!(
+            next_local_image_index(
+                ImageType::Fanart,
+                Path::new("/media/another.jpg"),
+                &indexed,
+                &mut assigned,
+            ),
+            5
+        );
+        // Other types keep the single canonical index the scanner assigns.
+        assert_eq!(
+            next_local_image_index(
+                ImageType::Poster,
+                Path::new("/media/poster.jpg"),
+                &indexed,
+                &mut assigned,
+            ),
+            0
+        );
     }
 
     #[tokio::test]
@@ -4700,8 +4986,9 @@ mod tests {
         assert_eq!(report.images_found, 2);
         assert_eq!(
             database.query_count(),
-            2,
-            "one source page query and one shared image insert should cover both movies"
+            3,
+            "one source page query, one registered-image read for stable indexes, and one shared \
+             image insert should cover both movies"
         );
         let images: Vec<(String, String)> = sqlx::query_as(
             "SELECT media_items.title, item_images.image_type

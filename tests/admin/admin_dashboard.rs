@@ -194,7 +194,7 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
         .json()
         .await?;
     assert_eq!(initial_settings["userDeletionGraceDays"], 7);
-    assert_eq!(initial_settings["userActivityRetentionDays"], 90);
+    assert_eq!(initial_settings["userActivityRetentionDays"], 7);
     assert_eq!(
         initial_settings["newUserPermissions"]["libraryAccessMode"],
         "NONE"
@@ -493,10 +493,12 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
             .await?;
         assert_eq!(repeated_login.status(), reqwest::StatusCode::OK);
     }
+    // Log-only activity: the migrated legacy row and this record exist in the JSONL audit log but
+    // not in `user_activity_events`, so the index-backed feed must not return them.
     log_store
         .append_json(json!({
             "recordType": "admin_audit_event",
-            "id": "activity-with-deleted-user-and-media",
+            "id": "log-only-activity",
             "actorUserId": "deleted-user",
             "actorUsername": null,
             "eventType": "PLAYBACK_PAUSED",
@@ -506,6 +508,16 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
             "createdAt": 1,
         }))
         .await?;
+    // The same shape as an index event, with a user and item that no longer exist.
+    sqlx::query(
+        "INSERT INTO user_activity_events (
+            id, user_id, actor_user_id, event_type, target_type, target_id, metadata_json, occurred_at
+         ) VALUES ('activity-with-deleted-user-and-media', 'deleted-user', NULL,
+                   'PLAYBACK_PAUSED', 'media_item', 'deleted-media', '{\"state\":\"PAUSED\"}',
+                   unixepoch() - 60)",
+    )
+    .execute(database.pool())
+    .await?;
 
     let dashboard = client
         .get(format!("{base_url}/api/v1/admin/dashboard"))
@@ -573,10 +585,17 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
             .iter()
             .any(|event| event["eventType"] == "PLAYBACK_STARTED")
     );
+    // LUX-313 read the JSONL audit log; this feed now reads the activity index, so records that
+    // only exist in the log (here: the migrated legacy row and a hand-appended log record) stay out.
     assert!(
         events
             .iter()
-            .any(|event| event["id"] == "legacy-playback-activity")
+            .all(|event| event["id"] != "legacy-playback-activity")
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event["id"] != "log-only-activity")
     );
     let playback_activity = events
         .iter()

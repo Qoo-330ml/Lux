@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::application::{
+    image_variants::{ImageVariantIntent, ImageVariantRequest},
     plugin_protocol::{PluginEmbyRouteRequest, PluginEmbyRouteResponse, PluginMediaInfoTarget},
     probe::{media_probe_result_from_rpc, parse_media_info_json},
 };
@@ -176,8 +177,10 @@ async fn resolve_media_info_target(
         .as_deref()
         .or(target.item_id.as_deref())
     {
+        // The id may be a 32 hex public media source id, a decimal Emby item id or a UUID.
+        let id = emby_internal_id(&emby_internal_source_id(id));
         database
-            .find_strm_source_by_emby_id(&emby_internal_id(id))
+            .find_strm_source_by_emby_id(&id)
             .await
             .map_err(|_| ())?
     } else {
@@ -331,7 +334,10 @@ pub(super) async fn emby_danmaku_info(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
     let service = state.danmaku();
-    match service.read_sidecar(&item_id).await {
+    match service
+        .read_for_playback(&item_id, None, DanmakuSidecarScope::AnySource)
+        .await
+    {
         Ok(Some(_)) => Json(json!({
             "hasDanmaku": true,
             "format": "xml",
@@ -368,7 +374,10 @@ pub(super) async fn emby_danmaku_raw(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
     let service = state.danmaku();
-    match service.read_sidecar(&item_id).await {
+    match service
+        .read_for_playback(&item_id, None, DanmakuSidecarScope::AnySource)
+        .await
+    {
         Ok(Some(bytes)) => Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "application/xml; charset=utf-8")
@@ -692,13 +701,28 @@ pub(super) async fn emby_scheduled_tasks(
     if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
+    match emby_scheduled_task_entries(&state).await {
+        Ok(entries) => Json(entries).into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+
+/// Builds the `Data` array of `GET /ScheduledTasks`, shared with the `/embywebsocket`
+/// `ScheduledTasksInfo` message.
+///
+/// The caller keeps the authorization decision (`can_manage_server`): the WebSocket only answers
+/// `ScheduledTasksInfoStart` for an administrator, so a non-administrator can never observe the
+/// scan state through the push channel either.
+pub(super) async fn emby_scheduled_task_entries(
+    state: &ReadyAppState,
+) -> Result<Vec<Value>, StatusCode> {
     let database = state.database();
     let mut active_full_scan = None;
     for status in ["PENDING", "RUNNING"] {
-        let jobs = match database.list_scan_jobs(Some(status), 0, 10_000).await {
-            Ok(jobs) => jobs,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
+        let jobs = database
+            .list_scan_jobs(Some(status), 0, 10_000)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         if let Some(job) = jobs
             .into_iter()
             .find(|job| job.job_type != "INCREMENTAL_SCAN")
@@ -707,7 +731,7 @@ pub(super) async fn emby_scheduled_tasks(
             break;
         }
     }
-    let state = active_full_scan.as_ref().map_or("Idle", |_| "Running");
+    let scan_state = active_full_scan.as_ref().map_or("Idle", |_| "Running");
     let progress = active_full_scan
         .as_ref()
         .filter(|job| job.total_count > 0)
@@ -715,7 +739,7 @@ pub(super) async fn emby_scheduled_tasks(
             ((job.processed_count.max(0) as f64 / job.total_count as f64) * 100.0).clamp(0.0, 100.0)
         })
         .unwrap_or(0.0);
-    Json(json!([{
+    Ok(vec![json!({
         "Id": "lux-refresh-media-library",
         "Name": "Scan media library",
         "Key": "RefreshMediaLibrary",
@@ -723,12 +747,11 @@ pub(super) async fn emby_scheduled_tasks(
         "Category": "Library",
         "IsHidden": false,
         "IsEnabled": true,
-        "State": state,
+        "State": scan_state,
         "CurrentProgressPercentage": progress,
         "LastExecutionResult": Value::Null,
         "Triggers": [],
-    }]))
-    .into_response()
+    })])
 }
 
 fn emby_update_change_kind(update_type: &str) -> crate::application::watch::ChangeKind {
@@ -920,9 +943,19 @@ pub(super) struct EmbyUsersQuery {
         deserialize_with = "deserialize_optional_bool"
     )]
     is_disabled: Option<bool>,
-    #[serde(rename = "StartIndex", alias = "startIndex", default)]
+    #[serde(
+        rename = "StartIndex",
+        alias = "startIndex",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     start_index: Option<i64>,
-    #[serde(rename = "Limit", alias = "limit", default)]
+    #[serde(
+        rename = "Limit",
+        alias = "limit",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     limit: Option<i64>,
     #[serde(
         rename = "NameStartsWithOrGreater",
@@ -1472,7 +1505,12 @@ pub(super) struct EmbyUpdateUserPasswordRequest {
 pub(super) struct EmbyUserImageQuery {
     #[serde(flatten)]
     auth: EmbyTokenQuery,
-    #[serde(rename = "Index", alias = "index")]
+    #[serde(
+        rename = "Index",
+        alias = "index",
+        default,
+        deserialize_with = "deserialize_optional_i32"
+    )]
     index: Option<i32>,
 }
 
@@ -2190,6 +2228,11 @@ pub(super) async fn emby_authenticate(
         }
         Ok(None) => {
             state.login_rate_limiter.record_failure(&login_key).await;
+            // §18.3: every failed credential check emits the parseable event, including an
+            // unknown username - guessing usernames is exactly what the ban list is for. Reuse
+            // the resolver result this handler already holds instead of resolving it again.
+            let failed_login_remote_ip = client_ip.map(|ip| ip.to_string());
+            log_authentication_failure(failed_login_remote_ip.as_deref());
             if let Ok(Some(user_id)) = auth
                 .find_failed_authentication_user_id(&request.username)
                 .await
@@ -2199,7 +2242,7 @@ pub(super) async fn emby_authenticate(
                     &state.admin_events,
                     &user_id,
                     "LUX_EMBY",
-                    request_client_ip(&headers, &state).await,
+                    failed_login_remote_ip,
                 )
                 .await;
             }
@@ -2241,13 +2284,16 @@ pub(super) async fn emby_authenticate_user_id(
         }
         Ok(None) => {
             state.login_rate_limiter.record_failure(&login_key).await;
+            // Same as above: log the attempt even when the id matches no account, once.
+            let failed_login_remote_ip = client_ip.map(|ip| ip.to_string());
+            log_authentication_failure(failed_login_remote_ip.as_deref());
             if let Ok(Some(user)) = auth.user_by_id(&user_id).await {
                 record_failed_authentication_event(
                     Some(state.database()),
                     &state.admin_events,
                     &user.id.to_string(),
                     "LUX_EMBY",
-                    request_client_ip(&headers, &state).await,
+                    failed_login_remote_ip,
                 )
                 .await;
             }
@@ -2406,8 +2452,132 @@ pub(super) struct EmbyTokenQuery {
     pub(super) tag: Option<String>,
     #[serde(rename = "Fields", default)]
     pub(super) fields: Option<String>,
-    #[serde(rename = "ActiveWithinSeconds", alias = "activeWithinSeconds", default)]
+    #[serde(
+        rename = "ActiveWithinSeconds",
+        alias = "activeWithinSeconds",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) active_within_seconds: Option<i64>,
+}
+
+/// Display-size hints, quality and overlay switches Emby clients append to image URLs.
+///
+/// The keys are matched case-insensitively from the raw query string because third-party
+/// clients disagree on the casing of `maxWidth` / `MaxWidth` and serde aliases cannot cover
+/// every spelling. Unparsable and zero hints count as absent. The cached variants are always
+/// opaque JPEG without overlays, so a non-JPEG `format` or any overlay parameter keeps the
+/// original image. `quality` is parsed for the diagnostic log only and never picks a tier.
+#[derive(Debug, Default)]
+pub(super) struct EmbyImageDisplayQuery {
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+    width: Option<u32>,
+    height: Option<u32>,
+    quality: Option<u32>,
+    format: Option<String>,
+    overlay: bool,
+}
+
+/// Overlay parameters that make the answer a composited image the variant cache cannot hold.
+const EMBY_IMAGE_OVERLAY_PARAMETERS: [&str; 4] = [
+    "blur",
+    "percentPlayed",
+    "unplayedCount",
+    "addPlayedIndicator",
+];
+
+impl EmbyImageDisplayQuery {
+    pub(super) fn parse(raw_query: Option<&str>) -> Self {
+        let mut query = Self::default();
+        let Some(raw_query) = raw_query else {
+            return query;
+        };
+        for (key, value) in url::form_urlencoded::parse(raw_query.as_bytes()) {
+            if key.eq_ignore_ascii_case("maxWidth") {
+                query.max_width = query.max_width.or(parse_emby_pixel_hint(&value));
+            } else if key.eq_ignore_ascii_case("maxHeight") {
+                query.max_height = query.max_height.or(parse_emby_pixel_hint(&value));
+            } else if key.eq_ignore_ascii_case("width") {
+                query.width = query.width.or(parse_emby_pixel_hint(&value));
+            } else if key.eq_ignore_ascii_case("height") {
+                query.height = query.height.or(parse_emby_pixel_hint(&value));
+            } else if key.eq_ignore_ascii_case("quality") {
+                query.quality = query.quality.or_else(|| value.trim().parse::<u32>().ok());
+            } else if key.eq_ignore_ascii_case("format") {
+                if query.format.is_none() {
+                    query.format =
+                        Some(value.trim().to_owned()).filter(|format| !format.is_empty());
+                }
+            } else if EMBY_IMAGE_OVERLAY_PARAMETERS
+                .iter()
+                .any(|parameter| key.eq_ignore_ascii_case(parameter))
+            {
+                query.overlay = true;
+            }
+        }
+        query
+    }
+
+    /// Variant this image request may be served from, or [`ImageVariantRequest::Original`] when
+    /// the response has to keep the stored bytes.
+    pub(super) fn variant_request(&self) -> ImageVariantRequest {
+        if self.overlay || !self.is_jpeg_format() {
+            return ImageVariantRequest::Original;
+        }
+        let width = self.max_width.or(self.width);
+        let height = self.max_height.or(self.height);
+        if width.is_none() && height.is_none() {
+            return ImageVariantRequest::Original;
+        }
+        ImageVariantRequest::DisplaySize { width, height }
+    }
+
+    /// Serving intent for this request: the display box plus the format and overlay objections, so
+    /// the server and the diagnostic log agree on why a variant was or was not used.
+    pub(super) fn variant_intent(&self) -> ImageVariantIntent {
+        ImageVariantIntent::display(self.variant_request(), self.overlay, !self.is_jpeg_format())
+    }
+
+    pub(super) fn max_width(&self) -> Option<u32> {
+        self.max_width
+    }
+
+    pub(super) fn max_height(&self) -> Option<u32> {
+        self.max_height
+    }
+
+    pub(super) fn width(&self) -> Option<u32> {
+        self.width
+    }
+
+    pub(super) fn height(&self) -> Option<u32> {
+        self.height
+    }
+
+    /// Parsed `quality` hint. Emby clients send it as an encoder hint; Lux never picks a tier from
+    /// it, and a non-numeric value is ignored.
+    pub(super) fn quality(&self) -> Option<u32> {
+        self.quality
+    }
+
+    pub(super) fn format(&self) -> Option<&str> {
+        self.format.as_deref()
+    }
+
+    pub(super) fn has_overlay(&self) -> bool {
+        self.overlay
+    }
+
+    fn is_jpeg_format(&self) -> bool {
+        self.format.as_deref().is_none_or(|format| {
+            format.eq_ignore_ascii_case("jpg") || format.eq_ignore_ascii_case("jpeg")
+        })
+    }
+}
+
+fn parse_emby_pixel_hint(value: &str) -> Option<u32> {
+    value.trim().parse::<u32>().ok().filter(|hint| *hint > 0)
 }
 
 #[derive(Deserialize, Default)]
@@ -2450,9 +2620,19 @@ pub(super) struct EmbyPersonsQuery {
     pub(super) parent_id: Option<String>,
     #[serde(rename = "PersonTypes", alias = "personTypes", default)]
     pub(super) person_types: Option<String>,
-    #[serde(rename = "StartIndex", alias = "startIndex", default)]
+    #[serde(
+        rename = "StartIndex",
+        alias = "startIndex",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) start_index: Option<i64>,
-    #[serde(rename = "Limit", alias = "limit", default)]
+    #[serde(
+        rename = "Limit",
+        alias = "limit",
+        default,
+        deserialize_with = "deserialize_optional_i64"
+    )]
     pub(super) limit: Option<i64>,
     #[serde(
         rename = "Recursive",
@@ -3165,5 +3345,173 @@ mod parental_rating_tests {
         assert_eq!(emby_parental_rating(Some("TV-MA")), Some(5));
         assert_eq!(emby_parental_rating(Some("unrated")), None);
         assert_eq!(emby_parental_rating(None), None);
+    }
+}
+
+#[cfg(test)]
+mod emby_image_display_query_tests {
+    use super::EmbyImageDisplayQuery;
+    use crate::application::image_variants::{
+        ImageVariantRequest, ImageVariantSelection, OriginalImageReason,
+    };
+
+    #[test]
+    fn size_hints_are_matched_case_insensitively() {
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("maxWidth=300&maxHeight=400")).variant_request(),
+            ImageVariantRequest::DisplaySize {
+                width: Some(300),
+                height: Some(400)
+            }
+        );
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("MaxWidth=300&MAXHEIGHT=400")).variant_request(),
+            ImageVariantRequest::DisplaySize {
+                width: Some(300),
+                height: Some(400)
+            }
+        );
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("width=300&Height=450")).variant_request(),
+            ImageVariantRequest::DisplaySize {
+                width: Some(300),
+                height: Some(450)
+            }
+        );
+        // `maxWidth` / `maxHeight` win over the plain pair when a client sends both.
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("width=100&maxWidth=300")).variant_request(),
+            ImageVariantRequest::DisplaySize {
+                width: Some(300),
+                height: None
+            }
+        );
+    }
+
+    #[test]
+    fn missing_or_unusable_size_hints_keep_the_original() {
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(None).variant_request(),
+            ImageVariantRequest::Original
+        );
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("api_key=secret&tag=abc")).variant_request(),
+            ImageVariantRequest::Original
+        );
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("maxWidth=abc&maxHeight=-1")).variant_request(),
+            ImageVariantRequest::Original
+        );
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("maxWidth=0")).variant_request(),
+            ImageVariantRequest::Original
+        );
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("maxHeight=4294967296")).variant_request(),
+            ImageVariantRequest::Original
+        );
+    }
+
+    #[test]
+    fn non_jpeg_formats_keep_the_original() {
+        for format in ["png", "webp", "gif", "bmp"] {
+            assert_eq!(
+                EmbyImageDisplayQuery::parse(Some(
+                    format!("format={format}&maxWidth=300").as_str()
+                ))
+                .variant_request(),
+                ImageVariantRequest::Original,
+                "format {format} must keep the original"
+            );
+        }
+        for format in ["jpg", "jpeg", "JPG", "Jpeg"] {
+            assert_eq!(
+                EmbyImageDisplayQuery::parse(Some(
+                    format!("format={format}&maxWidth=300").as_str()
+                ))
+                .variant_request(),
+                ImageVariantRequest::DisplaySize {
+                    width: Some(300),
+                    height: None
+                },
+                "format {format} is satisfied by the JPEG cache"
+            );
+        }
+    }
+
+    #[test]
+    fn quality_is_parsed_but_never_changes_the_tier() {
+        let query = EmbyImageDisplayQuery::parse(Some("quality=90&maxWidth=300"));
+        assert_eq!(query.quality(), Some(90));
+        assert_eq!(
+            query.variant_intent().selection(Some((1600, 2400))),
+            ImageVariantSelection::Variant(720)
+        );
+        // A non-numeric or empty quality is ignored, not an error.
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("quality=high")).quality(),
+            None
+        );
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("Quality=")).quality(),
+            None
+        );
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("quality=-5")).quality(),
+            None
+        );
+        // Case-insensitive like the size hints.
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("QUALITY=70")).quality(),
+            Some(70)
+        );
+    }
+
+    #[test]
+    fn variant_intent_carries_the_format_and_overlay_objections() {
+        let original = |reason| ImageVariantSelection::Original(reason);
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("format=png&maxWidth=300"))
+                .variant_intent()
+                .selection(Some((1600, 2400))),
+            original(OriginalImageReason::NonJpegFormat)
+        );
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(Some("blur=true&maxWidth=300"))
+                .variant_intent()
+                .selection(Some((1600, 2400))),
+            original(OriginalImageReason::Overlay)
+        );
+        assert_eq!(
+            EmbyImageDisplayQuery::parse(None)
+                .variant_intent()
+                .selection(Some((1600, 2400))),
+            original(OriginalImageReason::NoSizeHint)
+        );
+        // The parsed hints reach the intent unchanged.
+        let query = EmbyImageDisplayQuery::parse(Some("maxWidth=300&maxHeight=400"));
+        assert_eq!(query.max_width(), Some(300));
+        assert_eq!(query.max_height(), Some(400));
+        assert_eq!(query.width(), None);
+        assert_eq!(query.height(), None);
+    }
+
+    #[test]
+    fn overlay_parameters_keep_the_original() {
+        for overlay in [
+            "blur=true",
+            "BLUR=1",
+            "percentPlayed=40",
+            "PercentPlayed=40",
+            "unplayedCount=3",
+            "addPlayedIndicator=true",
+        ] {
+            assert_eq!(
+                EmbyImageDisplayQuery::parse(Some(format!("{overlay}&maxWidth=300").as_str()))
+                    .variant_request(),
+                ImageVariantRequest::Original,
+                "overlay {overlay} must keep the original"
+            );
+        }
     }
 }

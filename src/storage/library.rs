@@ -2407,7 +2407,10 @@ impl Database {
         schedule: &str,
         is_enabled: bool,
     ) -> Result<(), StorageError> {
-        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
+        // `ensure_global_task_plan` reads the plan before this transaction updates it, so the
+        // transaction must take the write lock up front; a deferred upgrade fails with
+        // SQLITE_BUSY_SNAPSHOT when the running probe job commits in between.
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         let plan_id = self
             .ensure_global_task_plan(
                 &mut transaction,

@@ -1,3 +1,4 @@
+import "./scan-activity.css";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, FileClock, StopCircle } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";

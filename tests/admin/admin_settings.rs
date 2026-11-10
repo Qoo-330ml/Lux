@@ -239,6 +239,8 @@ async fn registration_settings_require_admin_csrf_and_version_without_changing_m
 #[tokio::test]
 async fn transcoding_settings_are_admin_only_validated_and_persisted()
 -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
     let temp = tempfile::tempdir()?;
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
@@ -252,13 +254,23 @@ async fn transcoding_settings_are_admin_only_validated_and_persisted()
     users
         .create_user("viewer", "Viewer", "settings-test-password", false)
         .await?;
-    let app = app_with_state(AppState::ready(
-        config,
-        database.clone(),
-        SetupService::new(database.clone())?,
-        WebAuthService::new(database.clone())?,
-        EmbyAuthService::new(database)?,
-    ));
+    // The self-test result must not depend on whether this host has a working hardware encoder.
+    // This executable always fails, so "configured but unusable" is deterministic everywhere.
+    let fake_ffmpeg = temp.path().join("fake-ffmpeg");
+    tokio::fs::write(&fake_ffmpeg, "#!/bin/sh\nexit 1\n").await?;
+    let mut permissions = std::fs::metadata(&fake_ffmpeg)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_ffmpeg, permissions)?;
+    let app = app_with_state(
+        AppState::ready(
+            config,
+            database.clone(),
+            SetupService::new(database.clone())?,
+            WebAuthService::new(database.clone())?,
+            EmbyAuthService::new(database)?,
+        )
+        .with_hls_executable(fake_ffmpeg),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let base = format!("http://{}", listener.local_addr()?);
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -370,7 +382,8 @@ async fn transcoding_settings_are_admin_only_validated_and_persisted()
         json!("/dev/dri/renderD128")
     );
     assert_eq!(saved["transcoding"]["hardwareDecode"], json!(false));
-    // Saving re-runs the self-test: this test host has no usable VideoToolbox/libva encoder.
+    // Saving re-runs the self-test: the injected FFmpeg always fails, so the configured encoder
+    // stays reported but unavailable regardless of the host.
     assert_eq!(
         saved["transcodingStatus"]["encoder"],
         json!("h264_videotoolbox")

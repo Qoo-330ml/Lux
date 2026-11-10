@@ -1,0 +1,787 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>插件开发 — Lux</title>
+  <meta name="description" content="从零编写一个可安装的 Lux 插件：manifest、进程入口、ZIP 打包、stdin/stdout RPC、配置、错误码、发布与检查清单。">
+  <meta name="theme-color" content="#0a0a0b">
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="nav">
+    <a class="brand" href="./"><img src="assets/logo-white.svg" alt="" width="26" height="26"><span>Lux</span></a>
+    <nav>
+      <a href="./">首页</a>
+      <a href="docs.html">配置教程</a>
+      <a href="plugin-dev.html">插件开发</a>
+      <a class="gh" href="https://github.com/Qoo-330ml/Lux" rel="noopener">GitHub</a>
+    </nav>
+  </header>
+
+  <div class="docs">
+    <aside class="toc">
+      <a href="#quickstart">1. 快速开始</a>
+      <a href="#package">2. 包结构与入口</a>
+      <a href="#manifest">3. Manifest 参考</a>
+      <a href="#protocol">4. 通信协议</a>
+      <a href="#methods">5. 各类型方法与示例</a>
+      <a href="#environment">6. 环境变量与配置</a>
+      <a href="#errors">7. 错误码</a>
+      <a href="#differences">8. 已知差异</a>
+      <a href="#publish">9. 发布到插件商店</a>
+      <a href="#checklist">10. 发布前检查清单</a>
+      <a href="#links">11. 相关文档</a>
+    </aside>
+
+    <article class="article">
+      <h1>插件开发</h1>
+      <p>这一页面向第三方开发者，目标是让你只读这一页（以及它链接的 SDK 合同）就能做出一个可安装、可启动、可被 Lux 调用的插件。Lux 插件是<strong>独立进程</strong>，不是动态库：宿主通过 stdin 写入一行 JSON 请求，插件通过 stdout 写回一行 JSON 响应。语言不限，任何能读写标准输入输出并解析 JSON 的程序都可以。</p>
+      <p>本页按 <code>src/application/plugin_protocol.rs</code>、<code>src/application/plugin_runtime.rs</code> 和 <code>src/application/plugins.rs</code> 的当前行为校对。字段级合同以 <a href="https://github.com/Qoo-330ml/Lux/blob/main/docs/PLUGIN-SDK.md" rel="noopener">PLUGIN-SDK.md</a> 为准；文档与代码冲突时以代码为准，集中列在第 8 节。</p>
+      <div class="callout">先记住两件事：<strong>stdout 只能出现协议响应</strong>，调试日志写 stderr；<strong>宿主停止插件时直接终止进程</strong>，不会发送 <code>plugin.shutdown</code>。示例中的服务/媒体域名只使用 example.com 或 .invalid；GitHub 地址只用于仓库和 Release 示例，不包含任何真实凭据。</div>
+
+      <h2 id="quickstart">1. 快速开始：一个能跑的最小插件</h2>
+      <p>下面是一个完整的 <code>ip_location</code> 插件，只用 Python 3 标准库。它实现一个方法 <code>ip.location</code>，返回固定结果，方便先验证进程、帧格式和安装包。真实插件应把固定结果替换为上游查询，并继续遵守同样的输入输出约束。</p>
+
+      <h3>1.1 目录与 manifest.json</h3>
+      <p>开发目录长这样。两个架构目录可以先放同一份脚本；正式发布时分别放对应架构的入口。</p>
+      <div class="code"><pre><code>org.example.ip-demo/
+├── manifest.json
+└── binaries/
+    ├── linux-x86_64/
+    │   └── plugin.py
+    └── linux-aarch64/
+        └── plugin.py</code></pre></div>
+
+      <p><code>manifest.json</code> 放在包根目录，声明类型、分类、能力和入口模板：</p>
+      <div class="code"><button class="copy" type="button" data-copy="quickstart-manifest">复制</button>
+<pre id="quickstart-manifest"><code>{
+  "formatVersion": 1,
+  "id": "org.example.ip-demo",
+  "name": "示例 IP 归属地",
+  "description": "Lux 插件开发教程的最小示例，只返回固定结果",
+  "version": "0.1.0",
+  "apiVersion": 1,
+  "runtime": {
+    "kind": "process",
+    "entrypoint": "binaries/${platform}-${arch}/plugin.py"
+  },
+  "type": "ip_location",
+  "category": "NETWORK",
+  "capabilities": ["ip.location"],
+  "permissions": {
+    "network": [],
+    "filesystem": []
+  },
+  "files": []
+}</code></pre></div>
+
+      <h3>1.2 入口代码</h3>
+      <p>入口直接由宿主执行，所以需要 shebang 和执行权限。脚本逐行读取 stdin，逐行写 stdout；异常路径也必须返回一行 JSON，不能让进程崩溃。</p>
+      <div class="code"><button class="copy" type="button" data-copy="quickstart-code">复制</button>
+<pre id="quickstart-code"><code>#!/usr/bin/env python3
+"""Lux ip_location 插件：stdin 每行一个请求，stdout 每行一个响应。"""
+import json
+import sys
+
+
+class PluginError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def handle(method, params):
+    if method != "ip.location":
+        raise PluginError("PLUGIN_INVALID_REQUEST", "unsupported method")
+    ip = params.get("ip")
+    if not isinstance(ip, str) or not ip.strip():
+        raise PluginError("PLUGIN_INVALID_REQUEST", "ip is required")
+    # 演示用固定结果；真实插件应在这里查询上游服务，并只返回需要的字段。
+    return {
+        "ip": ip.strip(),
+        "country": "示例",
+        "province": None,
+        "city": None,
+        "district": None,
+        "street": None,
+        "isp": "示例运营商",
+        "latitude": None,
+        "longitude": None,
+    }
+
+
+def main():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        request_id = None
+        try:
+            request = json.loads(line)
+            if not isinstance(request, dict):
+                raise PluginError("PLUGIN_INVALID_REQUEST", "request must be an object")
+            request_id = request.get("id")
+            params = request.get("params") or {}
+            if not isinstance(params, dict):
+                raise PluginError("PLUGIN_INVALID_REQUEST", "params must be an object")
+            result = handle(request.get("method"), params)
+            response = {"id": request_id, "result": result}
+        except json.JSONDecodeError:
+            response = {
+                "id": None,
+                "error": {"code": "PLUGIN_INVALID_REQUEST", "message": "invalid JSON"},
+            }
+        except PluginError as error:
+            response = {
+                "id": request_id,
+                "error": {"code": error.code, "message": str(error)},
+            }
+        except Exception:
+            # 诊断信息只能写 stderr；stdout 只能出现协议响应。
+            print("internal plugin error", file=sys.stderr)
+            response = {
+                "id": request_id,
+                "error": {
+                    "code": "PLUGIN_INTERNAL_ERROR",
+                    "message": "internal error",
+                },
+            }
+        sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()</code></pre></div>
+      <p>给入口加执行权限。通过 ZIP 安装时，宿主只会给 <code>binaries/</code> 下的文件补执行位（0700）；把入口放在其他目录会在解压后丢失执行权限，这是第 8 节列出的一个实际差异。</p>
+      <div class="code"><pre><code>chmod +x binaries/linux-x86_64/plugin.py binaries/linux-aarch64/plugin.py</code></pre></div>
+
+      <h3>1.3 本地 stdin 测试</h3>
+      <p>不经过 Lux，直接对入口发送一条 <code>ip.location</code> 请求。下面命令在插件根目录执行，并要求目标机器有 <code>python3</code>：</p>
+      <div class="code"><button class="copy" type="button" data-copy="quickstart-test">复制</button>
+<pre id="quickstart-test"><code>cd org.example.ip-demo
+printf '%s\n' '{"id":"1","method":"ip.location","params":{"ip":"8.8.8.8"}}' \
+  | python3 binaries/linux-x86_64/plugin.py</code></pre></div>
+      <p>预期输出<strong>恰好一行</strong>（字段顺序可能因实现不同而变化，但必须是合法 JSON，且 <code>id</code> 原样回显）：</p>
+      <div class="code"><button class="copy" type="button" data-copy="quickstart-output">复制</button>
+<pre id="quickstart-output"><code>{"id": "1", "result": {"ip": "8.8.8.8", "country": "示例", "province": null, "city": null, "district": null, "street": null, "isp": "示例运营商", "latitude": null, "longitude": null}}</code></pre></div>
+      <p>再测一条错误输入，确认进程不崩溃、stdout 仍然只有 JSON：</p>
+      <div class="code"><pre><code>printf '%s\n' 'not json' \
+  | python3 binaries/linux-x86_64/plugin.py
+# {"id": null, "error": {"code": "PLUGIN_INVALID_REQUEST", "message": "invalid JSON"}}</code></pre></div>
+      <div class="callout">示例只返回固定结果，不能当成真实归属地数据。真实插件要自己处理上游超时、限流、鉴权和响应解析，并把失败映射到第 7 节的稳定错误码。</div>
+
+      <h2 id="package">2. 包结构与 entrypoint</h2>
+      <p>安装包是一个 ZIP。ZIP 的<strong>根目录</strong>必须直接包含 <code>manifest.json</code>，不能再套一层目录：</p>
+      <div class="code"><pre><code>org.example.ip-demo-0.1.0-linux-x86_64.zip
+├── manifest.json
+└── binaries/
+    └── linux-x86_64/
+        └── plugin.py</code></pre></div>
+      <p>aarch64 包同理，把 <code>linux-x86_64</code> 换成 <code>linux-aarch64</code>。两个包可以有相同的 manifest，入口模板会按宿主当前平台解析到对应文件。</p>
+
+      <h3>2.1 entrypoint 规则</h3>
+      <ul>
+        <li><code>runtime.kind</code> 目前只能是 <code>process</code>。</li>
+        <li><code>runtime.entrypoint</code> 必须是包内<strong>相对路径</strong>，不能是绝对路径，不能含 <code>..</code>。</li>
+        <li>可以使用 <code>${platform}</code> 和 <code>${arch}</code> 两个占位符。Lux 运行在 Linux 时，平台值为 <code>linux</code>；架构值为 <code>x86_64</code> 或 <code>aarch64</code>。例如 <code>binaries/${platform}-${arch}/plugin.py</code> 会解析成 <code>binaries/linux-x86_64/plugin.py</code> 或 <code>binaries/linux-aarch64/plugin.py</code>。</li>
+        <li>解析后的入口文件必须真实存在。入口由宿主直接执行，不经过 shell，也不会自动拼上 <code>python3</code> 或 <code>sh</code>，所以脚本要有 shebang，二进制要能直接运行。</li>
+        <li>ZIP 安装时只有 <code>binaries/</code> 目录下的文件会被补成 0700。入口放在 <code>bin/</code> 等其它目录时，解压后可能没有执行权限；目录调试时请手动 <code>chmod +x</code>。</li>
+        <li><code>files</code> 可选。声明后，宿主会逐个检查文件存在且 SHA-256 匹配；不声明不会跳过入口存在性检查。</li>
+      </ul>
+
+      <h3>2.2 硬性打包上限</h3>
+      <p>以下上限来自 <code>plugin_runtime.rs</code>，超出即拒绝安装或发现：</p>
+      <div class="table-wrap">
+      <table>
+        <tr><th>项目</th><th>上限</th><th>说明</th></tr>
+        <tr><td>ZIP 文件大小</td><td>128 MiB</td><td>插件商店下载也按同一上限限制</td></tr>
+        <tr><td>解压后总大小</td><td>256 MiB</td><td>按实际写出的字节计数，篡改声明的压缩包也会被拒绝</td></tr>
+        <tr><td>ZIP 内文件数</td><td>512</td><td>包含目录项；不要把缓存、测试数据或 <code>__pycache__</code> 打进去</td></tr>
+        <tr><td><code>manifest.json</code></td><td>1 MiB</td><td>必须是根目录下的普通文件</td></tr>
+      </table>
+      </div>
+
+      <h3>2.3 打包命令</h3>
+      <div class="code"><button class="copy" type="button" data-copy="zip-command">复制</button>
+<pre id="zip-command"><code>mkdir -p dist
+cd org.example.ip-demo
+zip -r ../dist/org.example.ip-demo-0.1.0-linux-x86_64.zip \
+  manifest.json binaries/linux-x86_64
+zip -r ../dist/org.example.ip-demo-0.1.0-linux-aarch64.zip \
+  manifest.json binaries/linux-aarch64
+unzip -l ../dist/org.example.ip-demo-0.1.0-linux-x86_64.zip</code></pre></div>
+      <p>检查 <code>unzip -l</code> 的第一层是不是 <code>manifest.json</code>；如果看到 <code>org.example.ip-demo/manifest.json</code>，说明多套了一层目录，安装会失败。Python 入口还要求目标机器安装 Python 3；如果要面向没有 Python 的 NAS，把入口编译成对应架构的原生二进制。</p>
+
+      <h2 id="manifest">3. Manifest 参考</h2>
+      <p>Manifest 是宿主判断“能不能装、能不能调用、怎么渲染配置界面”的唯一依据。下面先列全部顶层字段，再列类型约束、配置字段和权限。</p>
+
+      <h3>3.1 顶层字段</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>字段</th><th>必填</th><th>约束</th><th>说明</th></tr>
+        <tr><td><code>formatVersion</code></td><td>是</td><td>固定为数字 <code>1</code></td><td>包格式版本，不是插件版本</td></tr>
+        <tr><td><code>id</code></td><td>是</td><td>ASCII 字母、数字、<code>.</code>、<code>-</code>、<code>_</code>，最长 128</td><td>安装和运行时身份；推荐 <code>org.&lt;组织&gt;.&lt;名称&gt;</code>，不要使用保留的 <code>org.lux.*</code></td></tr>
+        <tr><td><code>name</code></td><td>是</td><td>非空，最多 256 个字符</td><td>管理界面显示名称</td></tr>
+        <tr><td><code>description</code></td><td>否</td><td>字符串</td><td>简短描述，建议一两句话</td></tr>
+        <tr><td><code>version</code></td><td>是</td><td>恰好三段纯数字，如 <code>1.2.3</code></td><td>插件自身版本；<code>1.0</code>、<code>1.0.0-beta</code> 会被拒绝</td></tr>
+        <tr><td><code>apiVersion</code></td><td>是</td><td>固定为数字 <code>1</code></td><td>RPC 合同版本；必须是数字，不能写成字符串 <code>"1"</code></td></tr>
+        <tr><td><code>runtime</code></td><td>是</td><td><code>{"kind":"process","entrypoint":"..."}</code></td><td>目前只支持独立进程运行时</td></tr>
+        <tr><td><code>type</code></td><td>是</td><td>见 3.2</td><td>插件类型，决定宿主调用哪些方法</td></tr>
+        <tr><td><code>category</code></td><td>是</td><td>见 3.2；省略时代码默认 <code>SCRAPER</code></td><td>必须与类型匹配；不要依赖默认值</td></tr>
+        <tr><td><code>providerKey</code></td><td>否</td><td>标识符，最长 64</td><td>metadata 插件用于稳定引用 provider 的不透明键，不是插件 ID</td></tr>
+        <tr><td><code>aliases</code></td><td>否</td><td>最多 16 个，每个最长 64</td><td>metadata 插件的旧配置兼容别名</td></tr>
+        <tr><td><code>supportedItemTypes</code></td><td>否</td><td>最多 32 个</td><td>metadata 插件支持的条目类型，如 <code>Movie</code>、<code>Series</code></td></tr>
+        <tr><td><code>supportedMediaSourceKinds</code></td><td>否</td><td>最多 8 个；只能是 <code>LOCAL_FILE</code> 或 <code>STRM_URL</code></td><td>chapter_detector 必须非空；<code>chapters.detect</code> 只能声明 <code>LOCAL_FILE</code></td></tr>
+        <tr><td><code>capabilities</code></td><td>是</td><td>最多 64 个字符串</td><td>按类型声明；代码允许省略（默认空数组），但类型校验通常要求对应能力，请始终显式声明</td></tr>
+        <tr><td><code>embyRoutes</code></td><td>否</td><td>最多 32 条；每条 <code>{method,path,rpcMethod}</code></td><td>声明精确的 Emby 路由；同时必须声明 <code>emby.route</code> 能力</td></tr>
+        <tr><td><code>configFields</code></td><td>否</td><td>字段见 3.3</td><td>管理页面据此通用渲染配置表单</td></tr>
+        <tr><td><code>scheduledTasks</code></td><td>否</td><td>最多 32 个</td><td>高级能力，普通第三方插件通常不需要；字段含 <code>taskType</code>、<code>ownerType</code>（<code>GLOBAL</code>/<code>LIBRARY</code>）、<code>name</code>、<code>description</code>、<code>scheduleConfigKey</code>、<code>defaultSchedule</code>、<code>requiredConfigKeys</code>、<code>ownerConfigKey</code>、<code>resourceLimit</code></td></tr>
+        <tr><td><code>permissions</code></td><td>否</td><td>见 3.4</td><td>网络、文件系统和登录背景图片主机声明</td></tr>
+        <tr><td><code>files</code></td><td>否</td><td>数组，元素 <code>{path,sha256}</code></td><td>包内文件及 SHA-256；声明后逐个校验</td></tr>
+        <tr><td><code>signature</code></td><td>否</td><td><code>{algorithm,keyId,value}</code></td><td>历史兼容字段；当前安装流程不把签名作为安全保证，不要依赖</td></tr>
+      </table>
+      </div>
+      <div class="callout warn">Manifest 必须是合法 JSON，字段名区分大小写；未知顶层字段当前会被忽略，拼写错误不一定会报错。SDK 文档里的 <code>apiVersion: "1"</code> 是字符串，按当前代码会被拒绝；请写数字 <code>1</code>。</div>
+
+      <h3>3.2 类型 → 分类 → 必需能力</h3>
+      <p>下表逐条对应 <code>plugin_protocol.rs</code> 的校验分支。分类写错会直接拒绝清单；能力名建议全部小写。</p>
+      <div class="table-wrap">
+      <table>
+        <tr><th><code>type</code></th><th><code>category</code></th><th>必需能力</th><th>用途与备注</th></tr>
+        <tr><td><code>metadata</code></td><td><code>SCRAPER</code></td><td>代码不强制任何能力；要作为媒体库刮削器，必须声明 <code>metadata.search</code>，其它 <code>metadata.*</code> 按方法声明</td><td>电影、剧集、季、集的元数据与图片；只有 metadata 类型可以声明 <code>ratings.*</code></td></tr>
+        <tr><td><code>media_probe</code></td><td><code>MEDIA</code></td><td><code>media.probe</code></td><td>对单个媒体地址做 ffprobe 类探测；宿主每次调用使用独立进程</td></tr>
+        <tr><td><code>ip_location</code></td><td><code>NETWORK</code></td><td><code>ip.location</code></td><td>公网 IP 归属地查询</td></tr>
+        <tr><td><code>strm_resolver</code></td><td><code>MEDIA</code></td><td><code>strm.resolve</code></td><td>把 SMB/FTP 等原始目标解析成可播放的 HTTP(S) 地址</td></tr>
+        <tr><td><code>chapter_detector</code></td><td><code>MEDIA</code></td><td><code>chapters.detect</code> 或 <code>chapters.lookup</code>，二者<strong>恰好一个</strong></td><td>还必须声明非空的 <code>supportedMediaSourceKinds</code>；<code>chapters.detect</code> 只能声明 <code>LOCAL_FILE</code>，<code>chapters.lookup</code> 可声明 <code>LOCAL_FILE</code> 和/或 <code>STRM_URL</code></td></tr>
+        <tr><td><code>danmaku</code></td><td><code>MEDIA</code></td><td><code>danmaku.match</code>；可选 <code>danmaku.search</code> 与 <code>danmaku.fetch</code></td><td>两个可选能力必须同时声明或同时不声明；其它未知 <code>danmaku.*</code> 会被拒绝</td></tr>
+        <tr><td><code>notification</code></td><td><code>NOTIFICATION</code></td><td><code>notification.send</code></td><td>通知推送；凭据只能放在唯一的 <code>secret</code> 配置字段</td></tr>
+        <tr><td><code>data_migration</code></td><td><code>MIGRATION</code></td><td><code>migration.emby</code></td><td>从 Emby 迁移用户、条目和用户状态；任务、映射、幂等和落库都由宿主负责</td></tr>
+        <tr><td><code>login_background</code></td><td><code>UTILITY</code></td><td>只能是 <code>login_background.get</code>，不能附加其它能力</td><td>还必须声明非空的 <code>permissions.imageHosts</code>；<code>image</code> 配置字段只允许统一登录背景插件 <code>org.lux.login-background</code> 使用</td></tr>
+      </table>
+      </div>
+      <p>另外，<code>emby.route</code> 是<strong>附加能力</strong>，可以和其他类型组合（<code>login_background</code> 因能力必须恰好只有 <code>login_background.get</code>，不能再附加）；声明了 <code>embyRoutes</code> 就必须同时声明该能力，路由的 <code>method</code> 必须是 <code>GET</code>/<code>POST</code>/<code>PUT</code>/<code>PATCH</code>/<code>DELETE</code>/<code>HEAD</code> 之一，<code>path</code> 必须以 <code>/</code> 开头、最长 256 字符且不能含 <code>?</code>、<code>#</code>、<code>*</code>、<code>..</code>。未知的 <code>type</code> 会被拒绝。</p>
+
+      <h3>3.3 configFields：管理页面通用配置</h3>
+      <p>宿主根据声明渲染表单，插件不需要自己做界面。字段对象支持 <code>key</code>、<code>label</code>、<code>type</code>、<code>required</code>、<code>sensitive</code>、<code>description</code>、<code>multiple</code>、<code>options</code>、<code>optionsSource</code>、<code>defaultValue</code>、<code>minimum</code>、<code>maximum</code>。</p>
+      <div class="table-wrap">
+      <table>
+        <tr><th><code>type</code></th><th>控件</th><th>规则</th></tr>
+        <tr><td><code>text</code></td><td>单行文本</td><td>最常用；不能声明 <code>options</code>、<code>multiple</code> 或 <code>optionsSource</code></td></tr>
+        <tr><td><code>textarea</code></td><td>多行文本</td><td>适合列表、模板或多行说明</td></tr>
+        <tr><td><code>password</code></td><td>密码输入</td><td>建议同时声明 <code>sensitive: true</code>；只有 <code>sensitive</code> 字段会从管理 API 的 <code>configValues</code> 中排除。通知插件的 <code>secret</code> 必须是 <code>password</code> + <code>sensitive: true</code></td></tr>
+        <tr><td><code>select</code></td><td>下拉选择</td><td>必须且只能声明 <code>options</code> 或 <code>optionsSource</code> 之一；<code>options</code> 最多 256 项，值/标签各最长 128；<code>multiple: true</code> 可多选</td></tr>
+        <tr><td><code>toggle</code></td><td>开关</td><td>布尔值</td></tr>
+        <tr><td><code>number</code></td><td>数字</td><td>可声明整数 <code>minimum</code>、<code>maximum</code> 和 <code>defaultValue</code>；<code>defaultValue</code> 必须是整数且落在范围内</td></tr>
+        <tr><td><code>image</code></td><td>宿主托管的图片资产</td><td>只允许 <code>org.lux.login-background</code> 在 <code>login_background</code> 清单中声明一个；必须可选、非敏感、无 <code>defaultValue</code>；值是 <code>sha256:&lt;64 位小写十六进制&gt;</code>，由管理员图片上传 API 创建，插件拿不到本地路径或图片字节</td></tr>
+      </table>
+      </div>
+      <p><code>select</code> 的 <code>optionsSource</code> 当前只支持 <code>media-libraries</code>：宿主按当前媒体库动态填充 <code>value</code>/<code>label</code>，插件不要把媒体库 ID 或路径写死在包里。其它 <code>optionsSource</code> 会让清单被拒绝。</p>
+      <div class="code"><pre><code>"configFields": [
+  {"key": "apiBaseUrl", "label": "API 地址", "type": "text",
+   "required": true, "defaultValue": "https://api.example.com"},
+  {"key": "apiKey", "label": "API Key", "type": "password",
+   "required": true, "sensitive": true},
+  {"key": "libraryIds", "label": "媒体库", "type": "select", "multiple": true,
+   "required": true, "optionsSource": "media-libraries"},
+  {"key": "concurrency", "label": "并发数", "type": "number",
+   "defaultValue": 2, "minimum": 1, "maximum": 64},
+  {"key": "mode", "label": "模式", "type": "select", "defaultValue": "fast",
+   "options": [{"value": "fast", "label": "快速"}, {"value": "accurate", "label": "精确"}]}
+]</code></pre></div>
+      <p><code>key</code> 必须是标识符（最长 64），<code>label</code> 非空且最多 128 个字符；同一清单里的 key 应保持唯一。除 <code>select</code> 外，其它类型不能声明 <code>options</code>、<code>multiple</code> 或 <code>optionsSource</code>。</p>
+
+      <h3>3.4 permissions：网络、文件系统、图片主机</h3>
+      <div class="code"><pre><code>"permissions": {
+  "network": ["api.example.com"],
+  "filesystem": [],
+  "imageHosts": []
+}</code></pre></div>
+      <div class="table-wrap">
+      <table>
+        <tr><th>字段</th><th>上限</th><th>规则</th></tr>
+        <tr><td><code>network</code></td><td>32 个</td><td>只写主机名（如 <code>api.example.com</code>），不要带协议、路径、端口或 <code>@</code>；代码会拒绝包含 <code>/</code>、空格、<code>@</code> 的值，每项最长 255。它是能力声明，<strong>不替代</strong>插件自己的 SSRF 防护：仍要拒绝 localhost、私网、保留地址和 IP 字面量（协议明确允许时除外）</td></tr>
+        <tr><td><code>filesystem</code></td><td>16 个</td><td>目前用于声明插件需要的本地缓存名；插件不能访问 Lux 的媒体目录</td></tr>
+        <tr><td><code>imageHosts</code></td><td>32 个</td><td>只有 <code>login_background</code> 插件可以声明且必须非空。必须是精确 DNS 域名，不能是通配符、带端口或带路径；应只声明公网域名，不要声明 localhost、私网或 IP 字面量（当前代码对 manifest 只做格式检查，见第 8 节）；浏览器会直接请求这些 HTTPS 图片域名</td></tr>
+      </table>
+      </div>
+
+      <h3>3.5 providerKey、aliases 与 ratings.*</h3>
+      <ul>
+        <li>metadata 插件应声明稳定的 <code>providerKey</code>（最长 64），用于媒体库配置稳定引用 provider；<code>aliases</code> 用于兼容旧配置，最多 16 个、每个最长 64。</li>
+        <li><code>id</code> 只表示安装/运行时身份，不能代替 provider 命名空间。Provider ID 是不透明字符串，插件不要假设它一定是数字。</li>
+        <li><code>ratings.lookup</code>、<code>ratings.batch</code>、<code>ratings.search</code> 只能由 <code>metadata</code> 类型声明；未知的 <code>ratings.*</code> 会被拒绝。只声明 <code>ratings.*</code> 而不声明 <code>metadata.search</code> 的插件不能充当媒体库刮削器，宿主只会按评分合同调用它。</li>
+        <li>不准备做评分插件就不要声明 <code>ratings.*</code>；完整写回规则见 SDK 的“评分查询调用约定”。</li>
+      </ul>
+      <div class="callout">清单校验失败会让插件被发现/安装失败，不会进入 RPC 调用；修正 manifest 后重新安装（直接放目录的包则重启 Lux）。</div>
+
+      <h2 id="protocol">4. 通信协议</h2>
+      <p>协议是换行分隔的 JSON（JSON Lines），UTF-8 编码。每个请求是 stdin 上的一行，每个响应是 stdout 上的一行并以 <code>\n</code> 结尾；行内不能有未转义的换行。插件应逐条处理并及时 <code>flush</code>。</p>
+      <h3>4.1 请求与响应信封</h3>
+      <div class="code"><pre><code>{"id":"0196b2c4-7a1e-7c3b-9f2a-2f6f7c9a1b2c","method":"ip.location","params":{"ip":"8.8.8.8"}}</code></pre></div>
+      <p>成功响应必须原样回显 <code>id</code>，并且只带 <code>result</code>：</p>
+      <div class="code"><pre><code>{"id":"0196b2c4-7a1e-7c3b-9f2a-2f6f7c9a1b2c","result":{"ip":"8.8.8.8","country":"美国"}}</code></pre></div>
+      <p>失败响应只带 <code>error</code>，<code>code</code> 和 <code>message</code> 都是字符串：</p>
+      <div class="code"><pre><code>{"id":"0196b2c4-7a1e-7c3b-9f2a-2f6f7c9a1b2c","error":{"code":"PLUGIN_TIMEOUT","message":"上游超时"}}</code></pre></div>
+      <ul>
+        <li><code>id</code> 由宿主生成，插件必须原样回显；响应可以乱序返回，宿主按 <code>id</code> 分发。顺序处理是最简单可靠的做法。</li>
+        <li><code>result</code> 与 <code>error</code> 二选一。不要同时返回，也不要在错误响应里放业务数据。</li>
+        <li>stdout <strong>只能</strong>输出协议行。任何调试输出、启动横幅、第三方库日志都必须写 stderr；一行非 JSON 会让宿主把整条响应判为无效。</li>
+        <li>宿主同时最多有 16 个未完成请求（<code>MAX_PLUGIN_INFLIGHT</code>）；如果插件严格串行处理，第 17 个请求会等前面的响应完成，属于正常背压。</li>
+        <li>单个响应行上限为 4 MiB（<code>MAX_PLUGIN_RESPONSE_BYTES</code>），含换行前的全部字节。超过会被宿主拒绝。</li>
+        <li>宿主当前会把 stderr 读走并丢弃，不写入 Lux 日志；仍建议把诊断写到 stderr，但不要依赖它被持久化。</li>
+      </ul>
+
+      <h3>4.2 超时与进程生命周期</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>场景</th><th>超时</th><th>说明</th></tr>
+        <tr><td>默认 RPC</td><td>30 秒</td><td><code>DEFAULT_PLUGIN_CALL_TIMEOUT</code>；大多数方法使用该值</td></tr>
+        <tr><td><code>media.probe</code></td><td>130 秒</td><td>给 ffprobe/ffmpeg 留出时间；宿主使用独立进程调用</td></tr>
+        <tr><td><code>emby.route</code></td><td>3 秒</td><td>请求路径上的短超时；不要在这里做长时间上游调用</td></tr>
+        <tr><td><code>ratings.batch</code></td><td>单批 120 秒</td><td>评分批量合同的宿主超时</td></tr>
+      </table>
+      </div>
+      <p>超时后宿主会终止插件进程，并在下一次调用时按需重启。插件不需要常驻；要能被安全地直接杀死，不能依赖退出前的清理动作保证数据一致。宿主不会发送 <code>plugin.hello</code>、<code>plugin.health</code> 或 <code>plugin.shutdown</code>，详见第 8 节。</p>
+
+      <h2 id="methods">5. 各类型的方法与示例</h2>
+      <p>下面每个类型至少给一个请求/响应示例。字段级定义、枚举和全部可选字段以 <a href="https://github.com/Qoo-330ml/Lux/blob/main/docs/PLUGIN-SDK.md" rel="noopener">SDK 合同</a>为准；示例只保留理解调用所需的部分。</p>
+
+      <h3>5.1 metadata：元数据刮削</h3>
+      <p>metadata 插件按能力提供下列方法。宿主按媒体库配置选择插件，并按方法检查对应能力：</p>
+      <div class="table-wrap">
+      <table>
+        <tr><th>方法</th><th>能力</th><th>用途</th></tr>
+        <tr><td><code>metadata.search</code></td><td><code>metadata.search</code></td><td>搜索候选条目，返回 <code>items</code></td></tr>
+        <tr><td><code>metadata.get</code></td><td><code>metadata.get</code></td><td>按 <code>providerId</code> 取详情，返回 <code>metadata</code></td></tr>
+        <tr><td><code>metadata.bundle</code></td><td><code>metadata.bundle</code></td><td>一次返回详情、图片、演员、外部 ID 和预告片</td></tr>
+        <tr><td><code>metadata.images</code></td><td><code>metadata.images</code></td><td>返回 <code>images</code> 候选</td></tr>
+        <tr><td><code>metadata.credits</code></td><td><code>metadata.credits</code></td><td>返回 <code>cast</code>/<code>crew</code></td></tr>
+        <tr><td><code>metadata.externalIds</code></td><td><code>metadata.externalIds</code></td><td>返回 <code>ProviderIds</code></td></tr>
+        <tr><td><code>metadata.trailers</code></td><td><code>metadata.trailers</code></td><td>返回预告片候选</td></tr>
+      </table>
+      </div>
+      <p><code>metadata.search</code> 的请求字段是 <code>itemType</code>、<code>name</code>、<code>year</code>（可选）、<code>language</code>。注意：当前代码<strong>不会</strong>在搜索请求里发送 <code>providerId</code>，它只出现在 get/images/credits/externalIds 等详情请求中。</p>
+      <div class="code"><pre><code>{"id":"m1","method":"metadata.search",
+ "params":{"itemType":"Movie","name":"示例电影","year":2024,"language":"zh-CN"}}</code></pre></div>
+      <div class="code"><pre><code>{"id":"m1","result":{"items":[{
+  "Type":"Movie","Name":"示例电影","OriginalTitle":"Example Movie",
+  "ProductionYear":2024,"ProviderIds":{"Example":"movie-1"},
+  "ImageUrl":"https://images.example.com/poster.jpg"
+}]}}</code></pre></div>
+      <div class="code"><pre><code>{"id":"m2","method":"metadata.get",
+ "params":{"itemType":"Movie","providerId":"movie-1","language":"zh-CN"}}</code></pre></div>
+      <div class="code"><pre><code>{"id":"m2","result":{"metadata":{
+  "Type":"Movie","Name":"示例电影","ProductionYear":2024,
+  "ProviderIds":{"Example":"movie-1"}
+}}}</code></pre></div>
+      <div class="code"><pre><code>{"id":"m3","method":"metadata.images",
+ "params":{"itemType":"Movie","providerId":"movie-1","language":""}}</code></pre></div>
+      <div class="code"><pre><code>{"id":"m3","result":{"images":[{
+  "Type":"Poster","Url":"https://images.example.com/poster.jpg",
+  "Language":"zh","Width":1000,"Height":1500
+}]}}</code></pre></div>
+      <ul>
+        <li><code>itemType</code> 可用值：<code>Movie</code>、<code>Series</code>、<code>Season</code>、<code>Episode</code>、<code>Person</code>、<code>BoxSet</code>。</li>
+        <li><code>ProviderIds</code> 的值必须是字符串；键由插件定义（如 <code>Example</code>、<code>Tmdb</code>），Lux 只当作不透明 ID 保存。</li>
+        <li>图片必须返回完整 HTTPS <code>Url</code>，并声明 <code>Type</code>、语言和可选尺寸。缺少某类媒体/能力时返回 <code>PLUGIN_PROVIDER_NOT_FOUND</code>，不要伪造空数据。</li>
+        <li><code>language</code> 为空字符串表示“不限语言”，插件不得套用管理员的首选语言过滤。</li>
+      </ul>
+
+      <h3>5.2 media_probe：媒体探测</h3>
+      <p>方法 <code>media.probe</code>，请求包含一个已由宿主校验的 <code>url</code>，以及 <code>includeMediaInfo</code>、<code>includeThumbnail</code>、<code>thumbnailPositionPercent</code>。插件不解析 <code>.strm</code> 内容，也不会收到路径或媒体库信息。</p>
+      <div class="code"><pre><code>{"id":"p1","method":"media.probe","params":{
+  "url":"https://media.example.invalid/video.mkv",
+  "includeMediaInfo":true,
+  "includeThumbnail":false,
+  "thumbnailPositionPercent":30
+}}</code></pre></div>
+      <div class="code"><pre><code>{"id":"p1","result":{
+  "container":"matroska","sourceSize":123456789,
+  "durationTicks":125000000,"bitrate":5000000,
+  "streams":[{
+    "streamIndex":0,"streamType":"VIDEO","codec":"h264",
+    "language":null,"title":null,"isDefault":true,"isForced":false,
+    "details":{"Width":1920,"Height":1080}
+  }]
+}}</code></pre></div>
+      <ul>
+        <li><code>streamType</code> 只能是 <code>VIDEO</code>、<code>AUDIO</code>、<code>SUBTITLE</code>；<code>streamIndex</code> 非负且不能重复。</li>
+        <li>结果只应包含 Lux 允许写入 <code>media_sources</code>/<code>media_streams</code> 的字段；不要返回完整 URL、认证信息或原始 ffprobe JSON。</li>
+        <li><code>includeThumbnail</code> 为真时可返回受大小限制的 <code>thumbnailJpegBase64</code>；仍然受单行 4 MiB 上限约束。</li>
+        <li>媒体探测专用错误码：<code>MEDIA_PROBE_INVALID_URL</code>、<code>MEDIA_PROBE_TIMEOUT</code>、<code>MEDIA_PROBE_PROCESS_FAILED</code>、<code>MEDIA_PROBE_INVALID_OUTPUT</code>。错误消息不得包含完整 URL 或 stderr。</li>
+      </ul>
+
+      <h3>5.3 ip_location：IP 归属地</h3>
+      <p>方法 <code>ip.location</code>。宿主只发送已校验的公网 IP；响应中的 <code>ip</code> 必须与请求相同，缺失字段填 <code>null</code>。</p>
+      <div class="code"><pre><code>{"id":"i1","method":"ip.location","params":{"ip":"8.8.8.8"}}</code></pre></div>
+      <div class="code"><pre><code>{"id":"i1","result":{
+  "ip":"8.8.8.8","country":"美国","province":null,"city":null,
+  "district":null,"street":null,"isp":"示例运营商",
+  "latitude":null,"longitude":null
+}}</code></pre></div>
+      <ul>
+        <li>字段：<code>country</code>、<code>province</code>、<code>city</code>、<code>district</code>、<code>street</code>、<code>isp</code>、<code>latitude</code>、<code>longitude</code>。每个字段 trim 后不能为空，最多 256 个字符，不能含控制字符。</li>
+        <li>整个结果超过 64 KiB 会被宿主丢弃。Lux 对成功结果缓存 24 小时、失败结果缓存 5 分钟，插件不需要自己缓存。</li>
+      </ul>
+
+      <h3>5.4 strm_resolver：.strm 目标解析</h3>
+      <p>方法 <code>strm.resolve</code>。宿主把 SMB/FTP 等原始目标交给插件，插件返回可播放的 HTTP(S) 地址；不适用时返回 <code>UNSUPPORTED</code>。</p>
+      <div class="code"><pre><code>{"id":"s1","method":"strm.resolve",
+ "params":{"target":"smb://nas.example.invalid/media/movie.mkv"}}</code></pre></div>
+      <div class="code"><pre><code>{"id":"s1","result":{"status":"RESOLVED",
+ "url":"https://media.example.invalid/movie.mkv"}}</code></pre></div>
+      <div class="code"><pre><code>{"id":"s1","result":{"status":"UNSUPPORTED"}}</code></pre></div>
+      <ul>
+        <li>成功返回的 <code>url</code> 必须是无凭据、无 fragment、无控制字符的 HTTP(S) 地址，长度受限；宿主会再次校验。</li>
+        <li>Lux 按插件 ID 稳定顺序尝试已安装、启用且配置有效的解析器；插件可以自行判断目标是否适用。</li>
+        <li>播放请求只在解析成功后临时重定向到结果地址，Lux 不代理媒体字节。</li>
+      </ul>
+
+      <h3>5.5 chapter_detector：片头片尾章节</h3>
+      <p>只能声明 <code>chapters.detect</code> 或 <code>chapters.lookup</code> 其中一个；清单还必须声明 <code>supportedMediaSourceKinds</code>。检测基于音频指纹，查询基于外部 ID；插件都不能接收文件路径、URL、媒体源 ID 或任务对象。</p>
+      <p><code>chapters.detect</code> 请求示例（指纹用短占位 Base64，实际是同季至少两集的 Chromaprint 点序列）：</p>
+      <div class="code"><pre><code>{"id":"c1","method":"chapters.detect","params":{
+  "episodes":[{
+    "key":"ep-1","sampleRate":11025,"fingerprintPointDurationTicks":1238095,
+    "introFingerprintBase64":"AAAAAAAAAAA=",
+    "creditsFingerprintBase64":"AAAAAAAAAAA=",
+    "introWindowStartTicks":0,"creditsWindowStartTicks":0,
+    "introWindowDurationTicks":900000000,
+    "creditsWindowDurationTicks":900000000
+  },{
+    "key":"ep-2","sampleRate":11025,"fingerprintPointDurationTicks":1238095,
+    "introFingerprintBase64":"AAAAAAAAAAA=",
+    "creditsFingerprintBase64":"AAAAAAAAAAA=",
+    "introWindowStartTicks":0,"creditsWindowStartTicks":0,
+    "introWindowDurationTicks":900000000,
+    "creditsWindowDurationTicks":900000000
+  }],
+  "introWindowTicks":900000000,"creditsWindowTicks":900000000,
+  "minimumMatchDurationTicks":300000000,"matchThreshold":0.8
+}}</code></pre></div>
+      <div class="code"><pre><code>{"id":"c1","result":{"markers":[
+  {"key":"ep-1","markerType":"INTRO_START","startPositionTicks":90000000,
+   "name":"片头","confidence":0.92}
+]}}</code></pre></div>
+      <p><code>chapters.lookup</code> 请求示例：</p>
+      <div class="code"><pre><code>{"id":"c2","method":"chapters.lookup","params":{
+  "episodes":[{
+    "key":"ep-1","tmdbId":12345,"seasonNumber":1,"episodeNumber":1,
+    "durationTicks":2700000000
+  }]
+}}</code></pre></div>
+      <div class="code"><pre><code>{"id":"c2","result":{"markers":[
+  {"key":"ep-1","markerType":"CREDITS_START","startPositionTicks":2400000000,
+   "confidence":0.8}
+]}}</code></pre></div>
+      <ul>
+        <li>线上枚举值是 <code>INTRO_START</code>、<code>INTRO_END</code>、<code>CREDITS_START</code>（大写下划线），不是 SDK 散文里的 <code>IntroStart</code> 写法。</li>
+        <li>时间必须落在对应窗口内，<code>confidence</code> 在 0–1；无数据时返回空 <code>markers</code> 数组。</li>
+        <li><code>chapters.detect</code> 只能声明 <code>supportedMediaSourceKinds: ["LOCAL_FILE"]</code>；<code>chapters.lookup</code> 可以声明 <code>LOCAL_FILE</code> 和/或 <code>STRM_URL</code>。</li>
+      </ul>
+
+      <h3>5.6 danmaku：弹幕匹配</h3>
+      <p>必需方法 <code>danmaku.match</code>。宿主只发送不含路径和上游地址的文件名；匹配成功时返回受大小限制的 <code>xmlBase64</code>，失败返回 <code>NO_MATCH</code>。</p>
+      <div class="code"><pre><code>{"id":"d1","method":"danmaku.match","params":{
+  "fileName":"Show.S01E02.1080p.mkv",
+  "alternateFileNames":["Show.S01E02.mkv"]
+}}</code></pre></div>
+      <div class="code"><pre><code>{"id":"d1","result":{
+  "status":"MATCHED","provider":"dandanplay",
+  "animeId":"anime-1","episodeId":"ep-1",
+  "xmlBase64":"PGk+PGQgcD0iMSwxLDI1LDE2Nzc3MjE1LDAsMCwwLDAiPmhlbGxvPC9kPjwvaT4="
+}}</code></pre></div>
+      <div class="code"><pre><code>{"id":"d1","result":{"status":"NO_MATCH"}}</code></pre></div>
+      <p>可选的手动匹配能力必须<strong>同时</strong>声明 <code>danmaku.search</code> 和 <code>danmaku.fetch</code>；只声明一个的清单无效。两个方法示例：</p>
+      <div class="code"><pre><code>{"id":"d2","method":"danmaku.search","params":{"query":"示例动画","limit":20}}</code></pre></div>
+      <div class="code"><pre><code>{"id":"d2","result":{"candidates":[{
+  "provider":"dandanplay","animeId":"anime-1","animeTitle":"示例动画",
+  "episodes":[{"episodeId":"ep-1","title":"第 1 集"}]
+}]}}</code></pre></div>
+      <div class="code"><pre><code>{"id":"d3","method":"danmaku.fetch",
+ "params":{"provider":"dandanplay","episodeId":"ep-1"}}</code></pre></div>
+      <div class="code"><pre><code>{"id":"d3","result":{"xmlBase64":"PGk+PGQgcD0iMSwxLDI1LDE2Nzc3MjE1LDAsMCwwLDAiPmhlbGxvPC9kPjwvaT4="}}</code></pre></div>
+      <ul>
+        <li>搜索的 <code>query</code> 为 1–200 字符，<code>limit</code> 为 1–50；插件应只返回不超过 <code>limit</code> 的候选，整条响应 ≤ 4 MiB。宿主仍会按 50 个候选、每候选 180 集裁剪。</li>
+        <li><code>animeId</code>/<code>episodeId</code> 最长 128，<code>provider</code> 最长 64，标题最长 300；空值或控制字符会被判为无效响应。</li>
+        <li>XML 解码后按 Bilibili/Dandanplay 结构校验，宿主负责原子写入同名 <code>.xml</code> 旁车；插件不能写文件。</li>
+      </ul>
+
+      <h3>5.7 notification：通知推送</h3>
+      <p>方法 <code>notification.send</code>。宿主传入已按白名单过滤的 <code>event</code>、目标信息 <code>target</code>（含 <code>allowPrivateNetwork</code>）、非秘密配置 <code>config</code>，以及可选的 <code>secret</code>。</p>
+      <div class="code"><pre><code>{"id":"n1","method":"notification.send","params":{
+  "event":{
+    "schemaVersion":1,"eventId":"event-1","eventType":"MEDIA_ADDED",
+    "occurredAt":1700000000,"serverId":"server-1",
+    "data":{"libraryId":"library-1","addedCount":1,"source":"lux",
+      "title":"媒体新增","content":"新增媒体：1 个","body":"新增媒体：1 个"}
+  },
+  "target":{"url":"https://example.com/lux-hook","allowPrivateNetwork":false},
+  "config":{"payloadFormat":"LUX"},
+  "secret":"REPLACE_WITH_DEVICE_KEY"
+}}</code></pre></div>
+      <div class="code"><pre><code>{"id":"n1","result":{"status":"DELIVERED","providerRequestId":"msg-1"}}</code></pre></div>
+      <ul>
+        <li><code>status</code> 只能是 <code>DELIVERED</code>、<code>RETRYABLE</code>、<code>FAILED</code>；可选 <code>providerRequestId</code>、<code>retryAfterSeconds</code>、<code>errorCode</code>。</li>
+        <li>插件必须自己执行私网和保留地址检查，不得放宽 <code>allowPrivateNetwork</code> 策略；<code>event.data</code> 不包含本地绝对路径、原始 <code>.strm</code> 目标或令牌。</li>
+        <li>凭据只能来自 <code>secret</code>，不能进入 <code>config</code>、事件、日志或数据库。</li>
+      </ul>
+      <p>通知插件的 <code>secret</code> 是唯一的凭据字段，必须满足：<code>key</code> 为 <code>secret</code>、<code>type</code> 为 <code>password</code>、<code>sensitive: true</code>、不能有 <code>defaultValue</code>，且最多一个。其它字段不能声明为 <code>sensitive</code> 或 <code>password</code>。通知插件的其它 <code>configFields</code> 属于<strong>每条通知目标</strong>，不是插件安装级配置。</p>
+      <div class="code"><pre><code>{"key":"secret","label":"设备密钥","type":"password",
+ "required":true,"sensitive":true,"description":"在服务商控制台查看"}</code></pre></div>
+
+      <h3>5.8 login_background：登录页背景</h3>
+      <p>方法 <code>login_background.get</code>，参数固定为空对象 <code>{}</code>。插件只提供数据，不提供图片字节，也不负责布局。</p>
+      <div class="code"><pre><code>{"id":"b1","method":"login_background.get","params":{}}</code></pre></div>
+      <div class="code"><pre><code>{"id":"b1","result":{
+  "contentKind":"POSTER_FEED",
+  "sourceName":"示例图库",
+  "copyrightNotice":"示例图片署名",
+  "items":[{
+    "imageUrl":"https://images.example.com/poster.jpg",
+    "title":"示例影片",
+    "copyrightNotice":"© Example rights holder"
+  }]
+}}</code></pre></div>
+      <div class="table-wrap">
+      <table>
+        <tr><th><code>contentKind</code></th><th>条目数</th><th>用途</th></tr>
+        <tr><td><code>POSTER_FEED</code></td><td>0–40</td><td>海报瀑布流</td></tr>
+        <tr><td><code>HERO_IMAGE</code></td><td>恰好 1</td><td>单张主视觉</td></tr>
+        <tr><td><code>SINGLE_POSTER</code></td><td>恰好 1</td><td>原比例完整呈现一张海报</td></tr>
+        <tr><td><code>SINGLE_IMAGE</code></td><td>恰好 1</td><td>原比例完整呈现带署名的单张图片</td></tr>
+      </table>
+      </div>
+      <ul>
+        <li>响应 JSON 最大 256 KiB；最多 40 项；每个图片 URL 最长 2048 字节；<code>sourceName</code> 必填且 1–128 字符，<code>title</code> 最长 256，<code>copyrightNotice</code> 最长 512，文本不能为空或含控制字符。</li>
+        <li>图片 URL 必须是 HTTPS、无凭据、无 fragment、无端口，主机与 <code>permissions.imageHosts</code> 中某一域名<strong>精确匹配</strong>。不要返回 localhost、本地域名或 IP 字面量；当前代码没有额外的本地/私网黑名单（见第 8 节），必须由插件自己保证。</li>
+        <li><code>attributionUrl</code>/<code>licenseUrl</code> 可选，必须是 HTTPS、无凭据/片段/端口，主机与 <code>permissions.network</code> 中某一域名精确匹配；宿主只按文本链接展示，不会把它们当作服务端请求目标。</li>
+        <li>例外：只有 <code>org.lux.login-background</code> 声明了 <code>image</code> 配置字段时，才可返回固定路径 <code>/api/v1/auth/login-background/custom-image</code>；其它相对路径、查询参数或前缀匹配都不接受。</li>
+      </ul>
+
+      <h3>5.9 data_migration：Emby 迁移</h3>
+      <p>必须声明 <code>type: "data_migration"</code>、<code>category: "MIGRATION"</code>、<code>capabilities: ["migration.emby"]</code>。宿主负责任务、映射、导入、幂等、恢复和历史事件；插件只负责与 Emby 通信并返回有界数据。</p>
+      <div class="table-wrap">
+      <table>
+        <tr><th>方法</th><th>概要</th></tr>
+        <tr><td><code>migration.test</code></td><td>验证 Emby 地址与 API key，返回脱敏服务器信息和 <code>historyCapability</code>；可返回 <code>supportsFilteredReads</code></td></tr>
+        <tr><td><code>migration.list_users</code></td><td>分页列出用户、库权限和头像标签；支持可选的用户/字段投影</td></tr>
+        <tr><td><code>migration.list_items</code></td><td>按用户返回 Movie/Series/Season/Episode 的稳定 ID、ProviderIds、层级和可选用户状态</td></tr>
+        <tr><td><code>migration.user_state</code></td><td>按 <code>PLAYED</code>、<code>FAVORITE</code> 或 <code>RESUMABLE</code> 筛选用户状态</td></tr>
+        <tr><td><code>migration.authenticate_user</code></td><td>首次登录迁移账户时验证用户名/密码，只返回成功和脱敏身份</td></tr>
+        <tr><td><code>migration.person_favorites</code></td><td>可选的演职人员收藏迁移；按 SDK 的分页/过滤规则实现</td></tr>
+      </table>
+      </div>
+      <div class="code"><pre><code>{"id":"g1","method":"migration.test","params":{
+  "baseUrl":"https://emby.example.com",
+  "apiKey":"REPLACE_WITH_EMBY_API_KEY",
+  "allowPrivateNetwork":false
+}}</code></pre></div>
+      <div class="code"><pre><code>{"id":"g1","result":{
+  "serverName":"Example Emby",
+  "historyCapability":"ITEM_STATE",
+  "supportsFilteredReads":true
+}}</code></pre></div>
+      <p>插件不得返回或持久化 Emby access token、密码或完整认证响应；字段、分页、字段投影和错误处理细节见 <a href="https://github.com/Qoo-330ml/Lux/blob/main/docs/PLUGIN-SDK.md" rel="noopener">SDK 的迁移章节</a>。这里只给出方法族概要。</p>
+
+      <h3>5.10 emby.route：Emby 兼容路由</h3>
+      <p><code>emby.route</code> 是附加能力。清单用 <code>embyRoutes</code> 声明精确方法和路径，宿主只把匹配的请求转发给已安装、启用且声明了该路由的插件。</p>
+      <div class="code"><pre><code>{
+  "type":"media_probe",
+  "category":"MEDIA",
+  "capabilities":["media.probe","emby.route"],
+  "embyRoutes":[{
+    "method":"POST",
+    "path":"/Items/SyncMediaInfo",
+    "rpcMethod":"emby.syncMediaInfo"
+  }]
+}</code></pre></div>
+      <p>宿主调用的是 <code>rpcMethod</code> 指定的方法，请求参数形如：</p>
+      <div class="code"><pre><code>{"id":"e1","method":"emby.syncMediaInfo","params":{
+  "method":"POST",
+  "path":"/Items/SyncMediaInfo",
+  "query":"path=%2Fmedia%2Fmovie.strm",
+  "headers":{"content-type":"application/json"},
+  "bodyBase64":"e30=",
+  "hostCapabilities":["media.info.import"]
+}}</code></pre></div>
+      <div class="code"><pre><code>{"id":"e1","result":{
+  "statusCode":200,
+  "headers":{"content-type":"application/json"},
+  "bodyBase64":"e30="
+}}</code></pre></div>
+      <ul>
+        <li>认证头、Cookie、完整 URL 和 Lux 内部身份不会传给插件；请求只含方法、路径、已脱敏的 query、已脱敏的非认证头和有界 Base64 body。</li>
+        <li>同一清单最多 32 条路由，不能出现重复的 <code>method</code> + <code>path</code>；<code>rpcMethod</code> 是宿主实际调用的方法名。</li>
+        <li>响应 <code>statusCode</code> 必须在 100–599；<code>headers</code> 最多 16 个，键/值长度受限；<code>bodyBase64</code> 解码后最大 256 KiB。</li>
+        <li><code>emby.route</code> 的 RPC 超时只有 3 秒。可选的 <code>mediaInfoImport</code> Bundle（首个兼容路由 <code>POST /Items/SyncMediaInfo</code>）有额外的字段和大小校验，详见 SDK。</li>
+      </ul>
+
+      <h2 id="environment">6. 环境变量与配置文件</h2>
+      <p>宿主启动插件时设置以下环境变量（来源：<code>plugin_runtime.rs</code>）。插件的工作目录是插件包根目录。</p>
+      <div class="table-wrap">
+      <table>
+        <tr><th>变量</th><th>何时提供</th><th>说明</th></tr>
+        <tr><td><code>LUX_PLUGIN_ID</code></td><td>总是</td><td>插件 ID，与 manifest 的 <code>id</code> 相同</td></tr>
+        <tr><td><code>LUX_PLUGIN_PROTOCOL_VERSION</code></td><td>总是</td><td>manifest 的 <code>apiVersion</code>，当前为 <code>1</code></td></tr>
+        <tr><td><code>LUX_PLUGIN_CONFIG_PATH</code></td><td>仅 <code>metadata</code> 与 <code>login_background</code></td><td>本插件专属配置文件的绝对路径；这类插件不会收到 <code>LUX_CONFIG_DIR</code></td></tr>
+        <tr><td><code>LUX_CONFIG_DIR</code></td><td>其它类型（通知除外）</td><td>旧兼容的共享配置目录；新插件不要依赖它。通知调用不暴露配置目录，凭据通过 RPC 的 <code>secret</code> 传入</td></tr>
+        <tr><td><code>LUX_PROXY_URL</code></td><td>管理员配置网络代理时</td><td>出站代理地址；被标记为绕过代理的插件不会收到，并且会把继承的代理变量移除</td></tr>
+        <tr><td><code>HTTP_PROXY</code>、<code>HTTPS_PROXY</code>、<code>ALL_PROXY</code></td><td>可能从宿主环境继承</td><td>插件不应假定一定存在；需要代理时优先读取 <code>LUX_PROXY_URL</code>。绕过代理的插件会同时移除这些变量及小写形式</td></tr>
+      </table>
+      </div>
+
+      <h3>6.1 配置文件格式</h3>
+      <p><code>LUX_PLUGIN_CONFIG_PATH</code> 指向一个 JSON 对象，键是 manifest 中 <code>configFields</code> 的 <code>key</code>。文件可能不存在（管理员尚未保存配置），插件必须使用自己的默认值，不能因此崩溃。</p>
+      <div class="code"><pre><code>{
+  "apiBaseUrl": "https://api.example.com",
+  "apiKey": "saved-by-admin",
+  "libraryIds": ["library-1"],
+  "concurrency": 2,
+  "mode": "fast"
+}</code></pre></div>
+      <ul>
+        <li>配置由管理员通过 Lux 管理页面修改，插件<strong>不应自行修改</strong>该文件。</li>
+        <li>敏感字段也会写入这个文件。插件不能把内容打印到 stderr、写进错误消息或复制到其它位置。</li>
+        <li>文件不存在、字段缺失或值类型不符合预期时，使用安全默认值；不要把“配置缺失”变成进程崩溃。</li>
+        <li>Lux 不会向插件提供数据库、媒体库路径、媒体文件列表、用户会话或内部 HTTP API 的地址/令牌。</li>
+      </ul>
+
+      <h2 id="errors">7. 稳定错误码与使用规则</h2>
+      <p><code>error.code</code> 使用下列稳定值之一；类型合同另有专用错误码时（如媒体探测、评分查询），按对应合同使用。未知错误码可能被宿主当成失败处理，不要发明随意的字符串。</p>
+      <div class="table-wrap">
+      <table>
+        <tr><th>错误码</th><th>使用场景</th></tr>
+        <tr><td><code>PLUGIN_INVALID_REQUEST</code></td><td>请求参数缺失、类型不对、枚举越界或无法解析</td></tr>
+        <tr><td><code>PLUGIN_TIMEOUT</code></td><td>上游请求超时；不要等宿主超时</td></tr>
+        <tr><td><code>PLUGIN_UNAVAILABLE</code></td><td>上游不可用，或插件暂时无法服务</td></tr>
+        <tr><td><code>PLUGIN_RATE_LIMITED</code></td><td>上游限流；如合同支持，可同时返回重试提示</td></tr>
+        <tr><td><code>PLUGIN_AUTH_FAILED</code></td><td>上游鉴权失败；<strong>不得</strong>回显凭据、令牌或完整响应</td></tr>
+        <tr><td><code>PLUGIN_PROVIDER_NOT_FOUND</code></td><td>未找到条目，或不支持该媒体类型/能力</td></tr>
+        <tr><td><code>PLUGIN_INVALID_RESPONSE</code></td><td>宿主侧使用：插件输出无法解析、字段不合法或超限；插件通常不主动返回</td></tr>
+        <tr><td><code>PLUGIN_INTERNAL_ERROR</code></td><td>插件内部错误，且没有更具体的分类</td></tr>
+      </table>
+      </div>
+      <h3>7.1 错误消息规则</h3>
+      <ul>
+        <li><code>message</code> 只写简短、可诊断的说明，例如“上游超时”“缺少 apiKey”。不要拼接上游完整响应。</li>
+        <li><strong>不得包含</strong>凭据、API Key、访问令牌、Cookie、密码、完整 URL、完整查询串、用户数据或 stderr 内容。需要排查时只写主机名或错误类别，不写完整地址。</li>
+        <li>不要把异常对象的原始字符串直接塞进 <code>message</code>；第三方库的异常经常带 URL 和请求头。</li>
+        <li><code>result</code> 与 <code>error</code> 二选一；一个响应里不要同时出现。</li>
+        <li>媒体探测使用 <code>MEDIA_PROBE_INVALID_URL</code>、<code>MEDIA_PROBE_TIMEOUT</code>、<code>MEDIA_PROBE_PROCESS_FAILED</code>、<code>MEDIA_PROBE_INVALID_OUTPUT</code>；评分查询使用 <code>TRAKT_*</code> 系列，详见 SDK。</li>
+      </ul>
+
+      <h2 id="differences">8. 已知差异与容易踩坑的地方</h2>
+      <div class="callout warn">以下是当前代码与 SDK 文档/开发指南文字不一致，或文档没有强调、但会直接影响安装和运行的地方。发生冲突时以代码为准；如果你在其它版本看到不同行为，以对应版本的源码为准。</div>
+      <div class="table-wrap">
+      <table>
+        <tr><th>项目</th><th>文档说法</th><th>当前代码实际行为</th></tr>
+        <tr><td>生命周期方法</td><td>SDK 列出 <code>plugin.hello</code>、<code>plugin.health</code>、<code>plugin.shutdown</code></td><td>宿主不会发送这三个方法。插件按需启动；停止时直接终止进程，<strong>不会</strong>发送 <code>plugin.shutdown</code>。不要依赖它们做初始化或优雅退出。</td></tr>
+        <tr><td><code>apiVersion</code> 类型</td><td>SDK 的 manifest 示例写成字符串 <code>"1"</code></td><td>代码按无符号整数解析，必须写数字 <code>1</code>；字符串会让清单解析失败。</td></tr>
+        <tr><td>入口执行权限</td><td>指南示例把入口放在 <code>bin/plugin.py</code>，并提示 <code>chmod +x</code></td><td>ZIP 安装时只有 <code>binaries/</code> 下的文件会被补成 0700。放在 <code>bin/</code> 的脚本解压后通常没有执行权限，宿主直接执行会失败。请把入口放在 <code>binaries/&lt;platform&gt;-&lt;arch&gt;/</code>。</td></tr>
+        <tr><td>未知能力名</td><td>指南称未知能力名会被拒绝</td><td>代码只对未知的 <code>danmaku.*</code> 和 <code>ratings.*</code> 做拒绝；其它任意字符串可以通过清单校验，但宿主永远不会调用它。不要依赖这个宽松行为。</td></tr>
+        <tr><td><code>metadata.search</code> 请求</td><td>SDK/指南示例包含 <code>providerId</code></td><td>当前搜索请求只发送 <code>itemType</code>、<code>name</code>、<code>year</code>、<code>language</code>；<code>providerId</code> 出现在 <code>metadata.get</code>/<code>images</code>/<code>credits</code>/<code>externalIds</code>/<code>trailers</code> 等详情请求里。</td></tr>
+        <tr><td>章节标记枚举</td><td>SDK 散文写作 <code>IntroStart</code>/<code>IntroEnd</code>/<code>CreditsStart</code></td><td>线上 JSON 使用 <code>INTRO_START</code>/<code>INTRO_END</code>/<code>CREDITS_START</code>（<code>SCREAMING_SNAKE_CASE</code>）。</td></tr>
+        <tr><td>stderr 日志</td><td>指南说日志写 stderr</td><td>运行时确实把 stderr 接走，但当前实现读到后直接丢弃，不写入 Lux 日志。stdout 仍然只能有协议响应；不要把 stderr 当作可查询的诊断通道。</td></tr>
+        <tr><td><code>metadata</code> 分类</td><td>指南称 <code>category</code> 必填且必须与类型匹配</td><td>代码对 <code>metadata</code> 类型不校验 <code>category</code>，且省略时默认 <code>SCRAPER</code>。仍应显式写 <code>SCRAPER</code>，不要依赖默认值。</td></tr>
+        <tr><td>登录背景图片主机</td><td>SDK 要求拒绝 localhost、本地域名和 IP 字面量</td><td><code>validate_login_background_image_url</code> 只检查 HTTPS、无凭据/端口/fragment，并要求主机与 <code>imageHosts</code> 精确匹配；没有独立的本地/私网黑名单。插件必须自己拒绝这些主机。</td></tr>
+        <tr><td>插件目录扫描时机</td><td>商店安装与目录安装的说明不完全一致</td><td>直接放进插件目录的包在启动时扫描；商店安装路径会重建目录并立即更新。手动替换/升级目录包后重启 Lux 最稳妥。</td></tr>
+      </table>
+      </div>
+      <p>另外两点不属于“文档冲突”，但容易被误解：<code>permissions.network</code> 只是能力声明，不是宿主替你执行的出站白名单；<code>password</code> 字段也不会自动等于 <code>sensitive</code>，要隐藏配置值必须显式写 <code>sensitive: true</code>。</p>
+
+      <h2 id="publish">9. 发布到插件商店</h2>
+      <p>Lux 不要求插件包使用 Lux 签名。发布流程是：构建每个架构的 ZIP → 计算 SHA-256 → 上传到你自己的 GitHub Release → 维护一个 HTTPS 可访问的 <code>index.json</code> → 管理员在 Lux 插件商店里添加该地址。Lux 只会下载目录中声明的 ZIP，并在安装前校验 SHA-256。</p>
+
+      <h3>9.1 构建、打包、计算哈希</h3>
+      <div class="code"><button class="copy" type="button" data-copy="publish-build">复制</button>
+<pre id="publish-build"><code>mkdir -p dist
+cd org.example.ip-demo
+zip -r ../dist/org.example.ip-demo-0.1.0-linux-x86_64.zip \
+  manifest.json binaries/linux-x86_64
+zip -r ../dist/org.example.ip-demo-0.1.0-linux-aarch64.zip \
+  manifest.json binaries/linux-aarch64
+cd ..
+sha256sum dist/org.example.ip-demo-0.1.0-linux-x86_64.zip
+sha256sum dist/org.example.ip-demo-0.1.0-linux-aarch64.zip</code></pre></div>
+      <p><code>sha256sum</code> 会输出“64 位十六进制哈希 + 两个空格 + 文件名”。把哈希原样填进 <code>index.json</code> 的 <code>sha256</code> 字段，不要填文件名或带 <code>0x</code> 前缀。示例输出形状：</p>
+      <div class="code"><pre><code>&lt;64 位小写十六进制&gt;  dist/org.example.ip-demo-0.1.0-linux-x86_64.zip</code></pre></div>
+      <p>在 GitHub 仓库创建 Release（例如标签 <code>v0.1.0</code>），把两个 ZIP 作为 Release 资产上传。资源 URL 应直接指向 ZIP 文件，使用 HTTPS，不要带凭据、查询参数或 fragment。</p>
+
+      <h3>9.2 index.json 格式</h3>
+      <p>目录格式版本为 <code>1</code>。每个插件声明 <code>id</code>、<code>name</code>、<code>description</code>、<code>category</code>、<code>version</code>、<code>runtime</code>、<code>capabilities</code> 和 <code>packages</code>；每个包声明 <code>platform</code>、<code>arch</code>、<code>url</code>、<code>sha256</code>。下面的哈希是占位值，不是真实构建产物：</p>
+      <div class="code"><button class="copy" type="button" data-copy="index-json">复制</button>
+<pre id="index-json"><code>{
+  "formatVersion": 1,
+  "plugins": [
+    {
+      "id": "org.example.ip-demo",
+      "name": "示例 IP 归属地",
+      "description": "演示用的最小 IP 归属地插件",
+      "category": "NETWORK",
+      "version": "0.1.0",
+      "runtime": "process",
+      "capabilities": ["ip.location"],
+      "packages": [
+        {
+          "platform": "linux",
+          "arch": "x86_64",
+          "url": "https://github.com/example/lux-plugins/releases/download/v0.1.0/org.example.ip-demo-0.1.0-linux-x86_64.zip",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "platform": "linux",
+          "arch": "aarch64",
+          "url": "https://github.com/example/lux-plugins/releases/download/v0.1.0/org.example.ip-demo-0.1.0-linux-aarch64.zip",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      ]
+    }
+  ]
+}</code></pre></div>
+      <ul>
+        <li><code>formatVersion</code> 必须是 <code>1</code>；目录最多 100 个插件，索引文件最大 2 MiB。插件 ID 在同一个目录中必须唯一，<code>version</code> 非空且不能含 <code>/</code>。</li>
+        <li><code>runtime</code> 是字符串 <code>"process"</code>，不是 manifest 里的对象。可选的 <code>providerKey</code>/<code>aliases</code> 仅 metadata 插件需要。</li>
+        <li>每个 <code>packages</code> 项的 <code>platform</code>/<code>arch</code> 组合必须唯一；<code>sha256</code> 必须是 64 位十六进制，下载后会与实际文件比对。<code>platform: "*"</code>、<code>arch: "*"</code> 可作为兼容回退。</li>
+        <li>包 URL 可以是绝对 HTTPS URL，也可以相对 <code>index.json</code> 的地址解析；解析结果仍必须是 HTTPS、无凭据、无 fragment。</li>
+      </ul>
+
+      <h3>9.3 让管理员添加目录</h3>
+      <ol class="steps">
+        <li><strong>托管 index.json</strong>把文件放到 HTTPS 可访问的位置，或提交到你自己的 GitHub 仓库（GitHub 仓库地址可解析为 <code>main/index.json</code>）。</li>
+        <li><strong>在 Lux 插件商店添加地址</strong>管理员最多可添加 10 个其它 HTTPS 目录；默认目录之外，Lux 会按插件 ID 合并并按最高 SemVer 去重。</li>
+        <li><strong>安装并重启</strong>Lux 按当前平台选择 ZIP，校验大小、路径、manifest、平台入口和 SHA-256；商店安装会刷新目录，直接放目录的包则按第 8 节的启动扫描时机重启。</li>
+      </ol>
+      <div class="callout warn">不要把 ZIP 直接提交进 Git 仓库或放进 <code>index.json</code> 的正文；用 Release 资产或静态文件托管。目录地址和包 URL 都必须是 HTTPS，且不要在 URL 中放令牌。</div>
+
+      <h2 id="checklist">10. 发布前检查清单</h2>
+      <ul>
+        <li>☐ <code>formatVersion</code> 与 <code>apiVersion</code> 都是数字 <code>1</code>；<code>version</code> 是三段纯数字。</li>
+        <li>☐ <code>id</code> 只含允许字符、长度不超过 128，且不使用 <code>org.lux.*</code>。</li>
+        <li>☐ <code>type</code>、<code>category</code> 与 <code>capabilities</code> 的组合符合第 3.2 节；chapter_detector 已声明 <code>supportedMediaSourceKinds</code>。</li>
+        <li>☐ <code>configFields</code> 的 key 唯一；敏感字段标记 <code>sensitive: true</code>；通知插件只有 <code>secret</code> 是 password/sensitive 字段。</li>
+        <li>☐ <code>permissions.network</code> 只列确实需要的主机；插件自身仍执行 SSRF/私网/保留地址检查。</li>
+        <li>☐ <code>entrypoint</code> 是包内相对路径、不含 <code>..</code>、实际存在，并位于 <code>binaries/</code> 下以便获得执行位。</li>
+        <li>☐ 入口对所有输入都返回一行 JSON 响应，不因异常退出；对非 JSON、缺字段、未知方法、空字符串都有错误响应。</li>
+        <li>☐ stdout 只有协议 JSON；日志全部在 stderr；没有启动横幅或第三方库输出污染 stdout。</li>
+        <li>☐ 错误码使用稳定值，错误消息不含凭据、令牌、完整 URL、查询串或 stderr。</li>
+        <li>☐ ZIP 大小 ≤ 128 MiB、解压后 ≤ 256 MiB、文件数 ≤ 512、manifest ≤ 1 MiB；包里没有缓存和测试数据。</li>
+        <li>☐ 在 <code>linux-x86_64</code> 与 <code>linux-aarch64</code> 上分别安装并测试通过。</li>
+        <li>☐ <code>index.json</code> 的 <code>sha256</code> 与 <code>sha256sum</code> 输出一致，URL 是 HTTPS 且指向实际 Release 资产。</li>
+      </ul>
+
+      <h2 id="links">11. 相关文档</h2>
+      <p class="links"><a href="https://github.com/Qoo-330ml/Lux/blob/main/docs/PLUGIN-SDK.md" rel="noopener">完整 SDK 合同（字段级）</a> · <a href="https://github.com/Qoo-330ml/Lux/blob/main/docs/PLUGIN-DEVELOPER-GUIDE.md" rel="noopener">仓库内插件开发指南</a> · <a href="https://github.com/Qoo-330ml/Lux" rel="noopener">Lux 仓库</a></p>
+    </article>
+  </div>
+
+  <footer class="foot">
+    <span>© Lux</span>
+    <a href="https://github.com/Qoo-330ml/Lux" rel="noopener">GitHub</a>
+    <a href="./">返回首页</a>
+  </footer>
+  <script src="main.js" defer></script>
+</body>
+</html>

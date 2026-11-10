@@ -5,13 +5,22 @@ mod resume_visibility;
 pub(super) use resume_visibility::emby_hide_from_resume;
 
 use crate::application::playback::{
-    decision::ServerTier,
-    hls::{HlsSegmentContainer, HlsStartOptions},
-    session::{CreatedWebPlaybackSession, WebPlaybackPlan},
+    decision::{
+        MAX_MAX_BITRATE_BPS, MAX_MAX_HEIGHT, MIN_MAX_BITRATE_BPS, MIN_MAX_HEIGHT,
+        PlaybackBitrateLimit, PlaybackResolutionLimit, ServerTier, valid_max_bitrate_bps,
+        valid_max_height,
+    },
+    hls::{HlsSegmentContainer, HlsStartOptions, HlsWebStartOptions, effective_video_bitrate},
+    session::{
+        AuthorizedWebPlaybackResource, CreatedWebPlaybackSession, PlaybackAssetAdmission,
+        WebPlaybackPlan,
+    },
 };
+use crate::application::probe::PlaybackProbeOutcome;
 use crate::storage::{
     MAX_PLAYBACK_SESSION_WINDOW_SECONDS, PlaybackAdmissionDecision, PlaybackAdmissionDenialReason,
-    PlaybackAdmissionResult, StoredWebPlaybackSession, WebPlaybackTranscodingDetails,
+    PlaybackAdmissionResult, StoredWebPlaybackSession, UserPlaybackPolicy,
+    WebPlaybackTranscodingDetails,
 };
 
 /// Resolves the privilege snapshot for a signed playback resource.
@@ -93,53 +102,44 @@ pub(super) async fn emby_playback_info(
     } else {
         (vec![item.clone()], None, None)
     };
-    let mut sources = playback_items
-        .iter()
-        .flat_map(|source_item| {
-            source_item
-                .media_sources
-                .iter()
-                .map(move |source| (source_item, source))
-        })
-        .collect::<Vec<_>>();
-    if sources.is_empty() {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    let query_media_source_requested = query.media_source_id.is_some();
-    // Keep each version attached to its original item so the DTO, media URL,
-    // subtitle routes and HLS session all authorize against the real owner.
-    sources.sort_by_key(|(source_item, source)| {
-        let preferred_copy =
-            usize::from(preferred_source_item_id.as_deref() != Some(source_item.id.as_str()));
-        let preferred_source =
-            usize::from(preferred_media_source_id.as_deref() != Some(source.id.as_str()));
-        let default_version =
-            usize::from(!crate::application::catalog::belongs_to_default_version(
-                &source_item.media_sources,
-                source,
-            ));
-        (preferred_copy, preferred_source, default_version)
+    let mut playback_items = playback_items;
+    // The first play of a local file without media information pays one synchronous ffprobe so
+    // the response carries a runtime; sources that already have a probe result are untouched.
+    // Only the source this request would actually play is probed.
+    let probe_target = emby_ordered_playback_sources(
+        &playback_items,
+        preferred_source_item_id.as_deref(),
+        preferred_media_source_id.as_deref(),
+        query.media_source_id.as_deref(),
+        request.media_source_id.as_deref(),
+    )
+    .and_then(|sources| {
+        sources
+            .first()
+            .filter(|(_, source)| playback_source_missing_media_info(source))
+            .map(|(source_item, source)| (source_item.id.clone(), source.id.clone()))
     });
-    if let Some(source_id) = query.media_source_id {
-        let Some(index) = sources
-            .iter()
-            .position(|(_, source)| source.id == source_id)
-        else {
-            return StatusCode::NOT_FOUND.into_response();
-        };
-        let source = sources.remove(index);
-        sources.insert(0, source);
+    if let Some((item_id, source_id)) = probe_target {
+        probe_playback_source(
+            &state,
+            catalog,
+            principal,
+            &mut playback_items,
+            &item_id,
+            &source_id,
+        )
+        .await;
     }
-    if let Some(source_id) = request.media_source_id.as_deref() {
-        let Some(index) = sources
-            .iter()
-            .position(|(_, source)| source.id == source_id)
-        else {
-            return StatusCode::NOT_FOUND.into_response();
-        };
-        let source = sources.remove(index);
-        sources.insert(0, source);
-    }
+    let Some(sources) = emby_ordered_playback_sources(
+        &playback_items,
+        preferred_source_item_id.as_deref(),
+        preferred_media_source_id.as_deref(),
+        query.media_source_id.as_deref(),
+        request.media_source_id.as_deref(),
+    ) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let query_media_source_requested = query.media_source_id.is_some();
     let admission_service = state.web_playback();
     if let Err(response) =
         check_web_playback_admission(&headers, admission_service, &user.id.to_string()).await
@@ -995,11 +995,132 @@ fn normalize_emby_codec(value: &str) -> String {
     }
 }
 
+/// A local source is missing media information while its probe status is still `PENDING`: the
+/// scan created the source but no probe result has been stored yet. STRM sources keep their
+/// plugin-driven background probe and are never probed from a request.
+fn playback_source_missing_media_info(source: &crate::application::catalog::CatalogSource) -> bool {
+    source.source_kind == "LOCAL_FILE" && source.probe_status == "PENDING"
+}
+
+/// Builds the request's media source list in the order the client will see it: the preferred
+/// copy and source first, then the default version. `None` means "not found" (empty list or an
+/// explicitly requested source id that is absent).
+fn emby_ordered_playback_sources<'a>(
+    playback_items: &'a [CatalogItem],
+    preferred_source_item_id: Option<&str>,
+    preferred_media_source_id: Option<&str>,
+    query_media_source_id: Option<&str>,
+    body_media_source_id: Option<&str>,
+) -> Option<Vec<(&'a CatalogItem, &'a CatalogSource)>> {
+    let mut sources = playback_items
+        .iter()
+        .flat_map(|source_item| {
+            source_item
+                .media_sources
+                .iter()
+                .map(move |source| (source_item, source))
+        })
+        .collect::<Vec<_>>();
+    if sources.is_empty() {
+        return None;
+    }
+    // Keep each version attached to its original item so the DTO, media URL, subtitle routes
+    // and HLS session all authorize against the real owner.
+    sources.sort_by_key(|(source_item, source)| {
+        let preferred_copy = usize::from(preferred_source_item_id != Some(source_item.id.as_str()));
+        let preferred_source = usize::from(preferred_media_source_id != Some(source.id.as_str()));
+        let default_version =
+            usize::from(!crate::application::catalog::belongs_to_default_version(
+                &source_item.media_sources,
+                source,
+            ));
+        (preferred_copy, preferred_source, default_version)
+    });
+    for requested in [query_media_source_id, body_media_source_id]
+        .into_iter()
+        .flatten()
+    {
+        let index = sources
+            .iter()
+            .position(|(_, source)| source.id == requested)?;
+        let source = sources.remove(index);
+        sources.insert(0, source);
+    }
+    Some(sources)
+}
+
+/// Probes the source this request would play when it still lacks media information, then reloads
+/// its item so the response carries the freshly stored runtime and streams.
+///
+/// A failed or skipped probe leaves the source as it was and never fails the request: the client
+/// still gets a playable source, just without a runtime.
+async fn probe_playback_source(
+    state: &ReadyAppState,
+    catalog: &crate::application::catalog::CatalogService,
+    principal: AccessPrincipal,
+    playback_items: &mut [CatalogItem],
+    item_id: &str,
+    source_id: &str,
+) {
+    match state
+        .probe()
+        .probe_source_for_playback(item_id, source_id)
+        .await
+    {
+        Ok(PlaybackProbeOutcome::Probed) => {}
+        Ok(PlaybackProbeOutcome::Failed) => {
+            tracing::warn!(
+                event = "emby_playback_probe_failed",
+                item_id_prefix = %playback_identifier_prefix(item_id),
+                source_id_prefix = %playback_identifier_prefix(source_id),
+                "first-play media probe failed; using stored media information"
+            );
+            return;
+        }
+        Ok(PlaybackProbeOutcome::NotNeeded | PlaybackProbeOutcome::Skipped) => return,
+        Err(error) => {
+            tracing::warn!(
+                event = "emby_playback_probe_error",
+                item_id_prefix = %playback_identifier_prefix(item_id),
+                source_id_prefix = %playback_identifier_prefix(source_id),
+                %error,
+                "first-play media probe could not run; using stored media information"
+            );
+            return;
+        }
+    }
+    // Re-read through the same access path that produced the item, so a concurrent deletion or
+    // permission change keeps the response consistent with the caller's principal.
+    if let Some(item) = playback_items.iter_mut().find(|item| item.id == item_id)
+        && let Ok(Some(fresh)) = catalog.find_item(principal, &item.id).await
+    {
+        *item = fresh;
+    }
+}
+
 fn parse_emby_playback_info_request(body: &Bytes) -> Result<EmbyPlaybackInfoRequest, StatusCode> {
     if body.is_empty() || body.iter().all(u8::is_ascii_whitespace) {
         return Ok(EmbyPlaybackInfoRequest::default());
     }
-    serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)
+    let mut request: EmbyPlaybackInfoRequest =
+        serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    // Clients echo the id PlaybackInfo returned; STRM sources hand out a 32 hex public id, so the
+    // stored identifier has to be restored before any source lookup.
+    request.media_source_id = request
+        .media_source_id
+        .as_deref()
+        .map(emby_internal_source_id);
+    Ok(request)
+}
+
+fn deserialize_emby_optional_media_source_id<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    Ok(value.as_deref().map(emby_internal_source_id))
 }
 
 fn deserialize_emby_optional_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
@@ -1096,6 +1217,8 @@ async fn create_emby_transcoding_session(
                 capabilities: options
                     .request
                     .playback_capabilities_for_source(Some(source)),
+                bitrate: PlaybackBitrateLimit::NONE,
+                resolution: PlaybackResolutionLimit::NONE,
             },
             &input,
             video_bitrate,
@@ -1266,6 +1389,8 @@ pub(super) struct PlaybackEventRequest {
     #[serde(rename = "ItemId", alias = "itemId", alias = "mediaServerItemId")]
     item_id: String,
     #[serde(
+        default,
+        deserialize_with = "deserialize_emby_optional_media_source_id",
         rename = "MediaSourceId",
         alias = "mediaSourceId",
         alias = "mediaServerMediaSourceId"
@@ -1841,11 +1966,7 @@ pub(super) async fn handle_emby_playback_event(
                     &user.display_name,
                     AccessPrincipal::new(user.id, user.is_admin),
                     request.play_method.as_deref(),
-                    if event_type_is_stopped(event_type) {
-                        activity_remote_ip
-                    } else {
-                        None
-                    },
+                    activity_remote_ip,
                     resumed,
                 )
                 .await;
@@ -2000,10 +2121,6 @@ pub(super) fn playback_resumed(previous: Option<&StoredPlaybackSession>, state_n
     state_name == "PLAYING" && previous.is_some_and(|session| session.state == "PAUSED")
 }
 
-fn event_type_is_stopped(event_type: WebhookEventType) -> bool {
-    event_type == WebhookEventType::PlaybackStopped
-}
-
 #[derive(Clone, Debug, Default)]
 struct PlaybackNotificationContext {
     item_title: Option<String>,
@@ -2015,6 +2132,13 @@ struct PlaybackNotificationContext {
     bitrate: Option<i64>,
     overview: Option<String>,
     play_method: Option<String>,
+    item_type: Option<String>,
+    production_year: Option<i64>,
+    runtime_ticks: Option<i64>,
+    provider_ids: Option<serde_json::Map<String, Value>>,
+    item_path: Option<String>,
+    file_name: Option<String>,
+    media_source: Option<Value>,
 }
 
 async fn playback_notification_context(
@@ -2062,6 +2186,18 @@ async fn playback_notification_context(
         })
         .flatten()
         .and_then(|title| bounded_playback_text(Some(title)));
+    let location = match source {
+        Some(source) => state
+            .database()
+            .media_source_local_location(&source.id)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    let (item_path, file_name) = location
+        .map(|(root, relative_path)| local_item_path(&root, &relative_path))
+        .unwrap_or((None, None));
     PlaybackNotificationContext {
         item_title: bounded_playback_text(Some(&item.title)),
         series_title,
@@ -2074,7 +2210,54 @@ async fn playback_notification_context(
         bitrate: source.and_then(|source| source.bitrate.filter(|value| *value >= 0)),
         overview: bounded_playback_overview(item.overview.as_deref()),
         play_method,
+        item_path,
+        file_name,
+        media_source: source.map(|source| playback_media_source_json(item_id, source)),
+        item_type: bounded_playback_text(Some(&item.item_type)),
+        production_year: item.production_year.filter(|value| *value > 0),
+        runtime_ticks: item.runtime_ticks.filter(|value| *value >= 0),
+        provider_ids: (!item.provider_ids.is_empty()).then(|| {
+            item.provider_ids
+                .iter()
+                .map(|(key, value)| (key.clone(), json!(value)))
+                .collect()
+        }),
     }
+}
+
+/// Builds the Emby-style media source used by playback webhooks. It carries stream details and
+/// local container facts only; external `.strm` URLs and signed stream addresses are never included.
+fn playback_media_source_json(
+    item_id: &str,
+    source: &crate::application::catalog::CatalogSource,
+) -> Value {
+    let streams = source
+        .streams
+        .iter()
+        .map(super::emby_catalog::emby_media_stream_json)
+        .collect::<Vec<_>>();
+    json!({
+        "Id": emby_public_id(item_id),
+        "ItemId": emby_public_id(item_id),
+        "Protocol": "File",
+        "Type": "Default",
+        "Container": source.container,
+        "Size": source.size,
+        "Bitrate": source.bitrate,
+        "RunTimeTicks": source.duration_ticks,
+        "IsRemote": false,
+        "MediaStreams": streams,
+    })
+}
+
+/// Joins a library root with a root-relative file path for Emby-style `Item.Path` and `FileName`.
+fn local_item_path(root: &str, relative_path: &str) -> (Option<String>, Option<String>) {
+    let path = std::path::Path::new(root).join(relative_path);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned);
+    (path.to_str().map(str::to_owned), file_name)
 }
 
 fn normalize_play_method(value: &str) -> String {
@@ -2129,6 +2312,15 @@ pub(super) async fn publish_playback_webhook(
         "playback:{play_session_id}:{}:{occurred_at}:{position_ticks}",
         event_type.as_str(),
     );
+    let user_id = principal.user_id.map(|id| emby_public_id(&id.to_string()));
+    let server_name = state
+        .database()
+        .server_name()
+        .await
+        .ok()
+        .flatten()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| crate::application::admin_dashboard::DEFAULT_SERVER_NAME.to_owned());
     let context = playback_notification_context(
         state,
         principal,
@@ -2139,11 +2331,20 @@ pub(super) async fn publish_playback_webhook(
     .await;
     let data = json!({
         "itemId": emby_public_id(item_id),
+        "itemType": context.item_type,
+        "productionYear": context.production_year,
+        "runtimeTicks": context.runtime_ticks,
+        "providerIds": context.provider_ids,
+        "itemPath": context.item_path,
+        "fileName": context.file_name,
+        "mediaSource": context.media_source,
         "itemTitle": context.item_title,
         "seriesTitle": context.series_title,
         "seasonNumber": context.season_number,
         "seriesSeasonCount": context.series_season_count,
+        "userId": user_id,
         "userName": bounded_playback_text(Some(user_name)),
+        "serverName": server_name,
         "mediaSourceId": media_source_id,
         "playSessionId": play_session_id,
         "state": state_name,
@@ -2190,11 +2391,6 @@ pub(super) async fn emby_sessions(
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    let database = state.database();
-    let user_id = auth_principal
-        .user_id()
-        .map(|user_id| user_id.to_string())
-        .unwrap_or_default();
     let active_within_seconds = match query.active_within_seconds {
         Some(seconds) if (1..=MAX_PLAYBACK_SESSION_WINDOW_SECONDS).contains(&seconds) => {
             Some(seconds)
@@ -2202,41 +2398,58 @@ pub(super) async fn emby_sessions(
         Some(_) => return StatusCode::BAD_REQUEST.into_response(),
         None => None,
     };
-    let sessions = match state
+    match emby_session_entries(&state, &auth_principal, active_within_seconds).await {
+        Ok(entries) => Json(entries).into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+
+/// Builds the `Data` array of `GET /Sessions`, shared with the `/embywebsocket` `Sessions`
+/// message.
+///
+/// Keeping the one builder is what makes a pushed session identical to a polled one: the
+/// authorization scope (an administrator sees every session, everyone else only their own) and
+/// the `NowPlayingItem`/`PlayState` projection come from the same code path, so the WebSocket can
+/// never widen what the HTTP endpoint exposes.
+pub(super) async fn emby_session_entries(
+    state: &ReadyAppState,
+    auth_principal: &crate::auth::users::AuthenticationPrincipal,
+    active_within_seconds: Option<i64>,
+) -> Result<Vec<Value>, StatusCode> {
+    let database = state.database();
+    let user_id = auth_principal
+        .user_id()
+        .map(|user_id| user_id.to_string())
+        .unwrap_or_default();
+    let sessions = state
         .playback_progress()
         .list_sessions(
             (!auth_principal.is_admin()).then_some(user_id.as_str()),
             active_within_seconds,
         )
         .await
-    {
-        Ok(sessions) => sessions,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let emby_play_session_ids = sessions
         .iter()
         .filter(|session| session.play_session_id.starts_with("lux-emby:"))
         .map(|session| session.play_session_id.clone())
         .collect::<Vec<_>>();
-    let web_sessions = match database
+    let web_sessions = database
         .find_web_playback_sessions_for_playbacks(&emby_play_session_ids)
         .await
-    {
-        Ok(sessions) => sessions
-            .into_iter()
-            .map(|session| (session.play_session_id.clone(), session))
-            .collect::<std::collections::HashMap<_, _>>(),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .into_iter()
+        .map(|session| (session.play_session_id.clone(), session))
+        .collect::<std::collections::HashMap<_, _>>();
     let user_names = if auth_principal.is_admin() {
         let session_user_ids = sessions
             .iter()
             .map(|session| session.user_id.clone())
             .collect::<Vec<_>>();
-        match database.find_user_display_names(&session_user_ids).await {
-            Ok(user_names) => user_names,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        }
+        database
+            .find_user_display_names(&session_user_ids)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
     } else {
         auth_principal
             .user()
@@ -2253,29 +2466,23 @@ pub(super) async fn emby_sessions(
             .map(|session| session.item_id.clone())
             .collect::<Vec<_>>();
         let catalog = state.catalog();
-        let access_principal = match emby_access_principal(&auth_principal, None) {
-            Ok(principal) => principal,
-            Err(status) => return status.into_response(),
-        };
-        match catalog.find_items(access_principal, &item_ids).await {
-            Ok(items) => items,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        }
+        let access_principal = emby_access_principal(auth_principal, None)?;
+        catalog
+            .find_items(access_principal, &item_ids)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
     };
-    Json(
-        sessions
-            .iter()
-            .map(|session| {
-                emby_session_json(
-                    session,
-                    catalog_items.get(&session.item_id),
-                    web_sessions.get(&session.play_session_id),
-                    user_names.get(&session.user_id).map(String::as_str),
-                )
-            })
-            .collect::<Vec<_>>(),
-    )
-    .into_response()
+    Ok(sessions
+        .iter()
+        .map(|session| {
+            emby_session_json(
+                session,
+                catalog_items.get(&session.item_id),
+                web_sessions.get(&session.play_session_id),
+                user_names.get(&session.user_id).map(String::as_str),
+            )
+        })
+        .collect::<Vec<_>>())
 }
 
 pub(super) async fn emby_stop_session(
@@ -2688,6 +2895,12 @@ pub(super) struct WebPlaybackSessionRequest {
     capabilities: WebPlaybackCapabilitiesRequest,
     #[serde(default)]
     audio_stream_index: Option<i64>,
+    /// Optional user-selected output ceiling in bits per second.
+    #[serde(default)]
+    max_bitrate: Option<i64>,
+    /// Optional user-selected output height ceiling in pixels.
+    #[serde(default)]
+    max_height: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2751,7 +2964,7 @@ async fn authorize_web_playback_resource(
     resource: &str,
     expires_at: i64,
     signature: &str,
-) -> Result<StoredWebPlaybackSession, WebPlaybackSessionError> {
+) -> Result<AuthorizedWebPlaybackResource, WebPlaybackSessionError> {
     service.verify_resource_signature(session_id, resource, expires_at, signature)?;
     let client_ip = super::request_access_ip(headers, state)
         .await
@@ -3089,9 +3302,27 @@ fn emby_transcoding_audio_bitrate(
 /// Copied tracks (remux and audio-transcode) intentionally leave their codec empty: the Web
 /// session row does not duplicate the source streams, and the player reads those from the media
 /// source. Only codecs the server actually re-encodes are asserted here.
+/// The video bitrate a plan is started with, or `None` when its output copies the source track.
+///
+/// Only tiers 3 and 4 re-encode video, and only they are started with `-b:v`; everything else keeps
+/// the source bitrate and must not claim a target of its own.
+fn web_output_video_bitrate(
+    tier: ServerTier,
+    requested_bitrate_bps: Option<i64>,
+    admin_video_bitrate_cap: i64,
+) -> Option<i64> {
+    match tier {
+        ServerTier::HardwareTranscode | ServerTier::SoftwareTranscode => {
+            effective_video_bitrate(requested_bitrate_bps, admin_video_bitrate_cap)
+        }
+        ServerTier::Direct | ServerTier::Remux | ServerTier::AudioTranscode => None,
+    }
+}
+
 fn web_transcoding_output(
     tier: ServerTier,
     segment_container: HlsSegmentContainer,
+    target_video_bitrate_bps: Option<i64>,
 ) -> WebPlaybackTranscodingDetails {
     let video_transcoded = matches!(
         tier,
@@ -3104,7 +3335,14 @@ fn web_transcoding_output(
     WebPlaybackTranscodingDetails {
         video_codec: video_transcoded.then(|| "h264".to_owned()),
         audio_codec: audio_transcoded.then(|| "aac".to_owned()),
-        video_bitrate: None,
+        // Only a ceiling the server had to honour states an output bitrate; a transcode without
+        // one keeps the previous behaviour of leaving it unset, and a copied track keeps the
+        // source bitrate instead of a target of its own.
+        video_bitrate: if video_transcoded {
+            target_video_bitrate_bps
+        } else {
+            None
+        },
         audio_bitrate: audio_transcoded.then_some(192_000),
         transcoding_container: Some(segment_container.emby_container().to_owned()),
     }
@@ -3399,13 +3637,17 @@ async fn serve_emby_transcoding_asset(
         Ok(client_ip) => client_ip,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let session = match service
+    let authorized = match service
         .authorize_resource_with_ip(session_id, &resource, expires_at, signature, client_ip)
         .await
     {
-        Ok(session) => session,
+        Ok(authorized) => authorized,
         Err(error) => return emby_playback_session_error_status(error).into_response(),
     };
+    let AuthorizedWebPlaybackResource {
+        session,
+        policy: admission_policy,
+    } = authorized;
     if session.plan != "SERVER_HLS"
         || emby_internal_id(public_item_id) != session.item_id
         || query
@@ -3472,7 +3714,13 @@ async fn serve_emby_transcoding_asset(
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
         if method == Method::GET
             && response.status().is_success()
-            && let Err(response) = admit_web_playback_request(headers, service, &session).await
+            && let Err(response) = admit_web_playback_hls_request(
+                headers,
+                service,
+                &session,
+                admission_policy.as_ref(),
+            )
+            .await
         {
             return response;
         }
@@ -3518,7 +3766,9 @@ async fn serve_emby_transcoding_asset(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     if method == Method::GET
         && response.status().is_success()
-        && let Err(response) = admit_web_playback_request(headers, service, &session).await
+        && let Err(response) =
+            admit_web_playback_hls_request(headers, service, &session, admission_policy.as_ref())
+                .await
     {
         return response;
     }
@@ -3618,7 +3868,7 @@ pub(super) async fn admit_emby_direct_playback(
 ) -> Result<(), Response> {
     let service = state.web_playback();
     let result = service
-        .admit_playback_session(user_id, play_session_id)
+        .admit_playback_session(user_id, play_session_id, None)
         .await
         .map_err(|error| web_playback_error(headers, error))?
         .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
@@ -3632,9 +3882,10 @@ async fn admit_web_playback_request(
     headers: &HeaderMap,
     service: &crate::application::playback::session::WebPlaybackSessionService,
     session: &StoredWebPlaybackSession,
+    policy: Option<&UserPlaybackPolicy>,
 ) -> Result<(), Response> {
     let result = service
-        .admit_playback_session(&session.user_id, &session.play_session_id)
+        .admit_playback_session(&session.user_id, &session.play_session_id, policy)
         .await
         .map_err(|error| web_playback_error(headers, error))?
         .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
@@ -3645,6 +3896,38 @@ async fn admit_web_playback_request(
     Ok(())
 }
 
+/// Admits the segment or manifest request that is about to be served.
+///
+/// Unlike [`admit_web_playback_request`], which always runs the full admission, this one only
+/// checks the slot the stream already holds: a live slot admitted less than the re-check interval
+/// ago is served after one read, and everything else (reclaimed slot, expired interval, revoked
+/// `can_play`) runs the full admission. HLS requests arrive every few seconds, so the full
+/// admission is the exception here — but it does still run every interval, which is what keeps the
+/// limits from freezing for the whole playback.
+async fn admit_web_playback_hls_request(
+    headers: &HeaderMap,
+    service: &crate::application::playback::session::WebPlaybackSessionService,
+    session: &StoredWebPlaybackSession,
+    policy: Option<&UserPlaybackPolicy>,
+) -> Result<(), Response> {
+    match service
+        .admit_playback_asset_request(&session.user_id, &session.play_session_id, policy)
+        .await
+        .map_err(|error| web_playback_error(headers, error))?
+    {
+        PlaybackAssetAdmission::Fresh => Ok(()),
+        PlaybackAssetAdmission::NotFound => Err(StatusCode::NOT_FOUND.into_response()),
+        PlaybackAssetAdmission::Evaluated(result) => {
+            if let Some(response) = playback_admission_error(headers, &result) {
+                let _ = service.stop(&session.id, &session.user_id).await;
+                return Err(response);
+            }
+            Ok(())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn create_web_playback_session_json(
     headers: &HeaderMap,
     state: &ReadyAppState,
@@ -3653,6 +3936,8 @@ async fn create_web_playback_session_json(
     source: &crate::storage::StoredPlaybackSource,
     mut capabilities: PlaybackCapabilities,
     audio_stream_index: Option<i64>,
+    max_bitrate_bps: Option<i64>,
+    max_height: Option<i64>,
 ) -> Result<Value, Response> {
     let source_kind = match source.source_kind.as_str() {
         "LOCAL_FILE" => PlaybackSourceKind::LocalFile,
@@ -3668,16 +3953,38 @@ async fn create_web_playback_session_json(
         capabilities.direct_play = false;
     }
     let user_id = user.id.to_string();
+    // The ceilings apply to the measured container bitrate and picture of the source this request
+    // plays; an unprobed source simply leaves both sides unknown and changes nothing.
+    let bitrate = PlaybackBitrateLimit {
+        source_bitrate_bps: source.bitrate,
+        max_bitrate_bps,
+    };
+    let resolution = PlaybackResolutionLimit {
+        source_height: source.video_height,
+        max_height,
+    };
+    let transcoding_settings = service.transcoding_settings().await;
+    // The administrator cap is applied by the encoder itself; the response must report the same
+    // number, so both sides read it from the snapshot that is passed to the HLS start.
+    let admin_video_bitrate_cap = transcoding_settings
+        .max_video_bitrate_kbps
+        .saturating_mul(1_000);
+    let admin_max_height = transcoding_settings.max_output_height;
     let mut created = service
-        .create(CreateWebPlaybackSession {
-            user_id: &user_id,
-            is_admin: user.is_admin,
-            item_id,
-            media_source_id: &source.source_id,
-            play_session_prefix: "lux-web",
-            source_kind,
-            capabilities,
-        })
+        .create_with_settings(
+            CreateWebPlaybackSession {
+                user_id: &user_id,
+                is_admin: user.is_admin,
+                item_id,
+                media_source_id: &source.source_id,
+                play_session_prefix: "lux-web",
+                source_kind,
+                capabilities,
+                bitrate,
+                resolution,
+            },
+            &transcoding_settings,
+        )
         .await
         .map_err(|error| web_playback_error(headers, error))?;
     let mut authorization_device_id = None;
@@ -3731,13 +4038,18 @@ async fn create_web_playback_session_json(
         };
         let mut effective_tier = *tier;
         let start_failure = match service
-            .start_hls_with_audio(
+            .start_hls_with_settings(
+                &transcoding_settings,
                 &created.id,
                 effective_tier,
                 &input,
-                None,
-                None,
-                audio_stream_index,
+                HlsWebStartOptions {
+                    video_bitrate: created.target_video_bitrate_bps,
+                    video_height: output_scale_height(created.target_video_height),
+                    start_time_ticks: None,
+                    runtime_ticks: None,
+                    audio_stream_index,
+                },
             )
             .await
         {
@@ -3762,7 +4074,14 @@ async fn create_web_playback_session_json(
                 return Err(web_playback_error(headers, error));
             }
             match service
-                .restart_with_software(&created.id, &input, None, None, audio_stream_index)
+                .restart_with_software(
+                    &created.id,
+                    &input,
+                    created.target_video_bitrate_bps,
+                    output_scale_height(created.target_video_height),
+                    None,
+                    audio_stream_index,
+                )
                 .await
             {
                 Ok(tier) => effective_tier = tier,
@@ -3779,7 +4098,15 @@ async fn create_web_playback_session_json(
         };
         // Persist what the server actually produces so the admin dashboard and the player's
         // information panel describe the same session instead of guessing.
-        let output = web_transcoding_output(effective_tier, HlsSegmentContainer::FragmentedMp4);
+        let output = web_transcoding_output(
+            effective_tier,
+            HlsSegmentContainer::FragmentedMp4,
+            web_output_video_bitrate(
+                effective_tier,
+                created.target_video_bitrate_bps,
+                admin_video_bitrate_cap,
+            ),
+        );
         if let Err(error) = service
             .set_transcoding_details(&created.id, &user_id, &output)
             .await
@@ -3855,6 +4182,24 @@ async fn create_web_playback_session_json(
             "reason": reason.to_string(),
         }),
     };
+    // What the server actually decided about the caller's ceiling. Copy paths and Direct Play keep
+    // the source bitrate, so only a re-encode reports a target the player can show as "limited",
+    // and that target is exactly the `-b:v` FFmpeg was started with.
+    let target_video_bitrate_bps = web_output_video_bitrate(
+        created.plan.tier(),
+        created.target_video_bitrate_bps,
+        admin_video_bitrate_cap,
+    );
+    // What the server actually decided about the caller's resolution ceiling. Direct Play and the
+    // copy tiers hand over the source picture, so only a re-encode can land on another height; an
+    // unsupported decision produces no picture at all.
+    let (scales_video, output_height) = match created.plan {
+        WebPlaybackPlan::Unsupported { .. } => (false, None),
+        WebPlaybackPlan::ServerHls {
+            tier: ServerTier::HardwareTranscode | ServerTier::SoftwareTranscode,
+        } => (true, resolution.reencoded_height(admin_max_height)),
+        WebPlaybackPlan::Direct | WebPlaybackPlan::ServerHls { .. } => (false, source.video_height),
+    };
     Ok(json!({
         "sessionId": (!created.id.is_empty()).then_some(created.id),
         "playSessionId": (!created.play_session_id.is_empty()).then_some(created.play_session_id),
@@ -3862,7 +4207,26 @@ async fn create_web_playback_session_json(
         "expiresAt": created.expires_at,
         "plan": plan,
         "sourceId": created.media_source_id,
+        "bitrate": {
+            "sourceBitrate": source.bitrate,
+            "maxBitrate": max_bitrate_bps,
+            "targetBitrate": target_video_bitrate_bps,
+            "limited": target_video_bitrate_bps.is_some(),
+        },
+        "resolution": {
+            "sourceHeight": source.video_height,
+            "maxHeight": max_height,
+            "targetHeight": output_height,
+            // Only a plan the server actually re-encoded can be scaled: an unsupported decision
+            // scales nothing, so the ceiling changed nothing either.
+            "limited": scales_video && resolution.requires_scale(),
+        },
     }))
+}
+
+/// The scale cap one HLS start receives, from the height the decision committed to.
+fn output_scale_height(target_video_height: Option<i64>) -> Option<u32> {
+    target_video_height.and_then(|height| u32::try_from(height).ok())
 }
 
 /// Ordered Direct Play candidates: `proxy` is the standard Emby stream URL a 302 proxy intercepts
@@ -3951,6 +4315,54 @@ async fn web_proxy_candidate_url(
     )
 }
 
+/// Validates the optional user-selected output ceiling at the protocol boundary.
+///
+/// A ceiling outside the accepted range is a malformed request, not an unsupported playback, so it
+/// is refused with the standard Lux error body instead of reaching the decision.
+fn web_playback_max_bitrate(
+    headers: &HeaderMap,
+    requested: Option<i64>,
+) -> Result<Option<i64>, (StatusCode, Json<Value>)> {
+    let Some(value) = requested else {
+        return Ok(None);
+    };
+    if !valid_max_bitrate_bps(value) {
+        return Err(api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            &format!(
+                "码率上限必须在 {} kbps 到 {} kbps 之间",
+                MIN_MAX_BITRATE_BPS / 1_000,
+                MAX_MAX_BITRATE_BPS / 1_000
+            ),
+        ));
+    }
+    Ok(Some(value))
+}
+
+/// Validates the optional user-selected resolution ceiling at the protocol boundary.
+///
+/// A height outside the accepted range is a malformed request, not an unsupported playback, so it
+/// is refused with the standard Lux error body instead of reaching the decision.
+fn web_playback_max_height(
+    headers: &HeaderMap,
+    requested: Option<i64>,
+) -> Result<Option<i64>, (StatusCode, Json<Value>)> {
+    let Some(value) = requested else {
+        return Ok(None);
+    };
+    if !valid_max_height(value) {
+        return Err(api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            &format!("分辨率上限必须在 {MIN_MAX_HEIGHT}p 到 {MAX_MAX_HEIGHT}p 之间"),
+        ));
+    }
+    Ok(Some(value))
+}
+
 async fn validate_web_audio_stream(
     state: &ReadyAppState,
     principal: AccessPrincipal,
@@ -4015,6 +4427,14 @@ pub(super) async fn lux_create_web_playback_session(
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let max_bitrate_bps = match web_playback_max_bitrate(&headers, request.max_bitrate) {
+        Ok(max_bitrate_bps) => max_bitrate_bps,
+        Err(error) => return error.into_response(),
+    };
+    let max_height = match web_playback_max_height(&headers, request.max_height) {
+        Ok(max_height) => max_height,
+        Err(error) => return error.into_response(),
+    };
     let audio_stream_index = match validate_web_audio_stream(
         &state,
         principal,
@@ -4035,6 +4455,8 @@ pub(super) async fn lux_create_web_playback_session(
         &source,
         request.capabilities.into(),
         audio_stream_index,
+        max_bitrate_bps,
+        max_height,
     )
     .await
     {
@@ -4052,6 +4474,12 @@ pub(super) struct WebPlaybackBootstrapRequest {
     capabilities: WebPlaybackCapabilitiesRequest,
     #[serde(default)]
     audio_stream_index: Option<i64>,
+    /// Optional user-selected output ceiling in bits per second.
+    #[serde(default)]
+    max_bitrate: Option<i64>,
+    /// Optional user-selected output height ceiling in pixels.
+    #[serde(default)]
+    max_height: Option<i64>,
 }
 
 pub(super) async fn lux_create_web_playback_bootstrap(
@@ -4104,6 +4532,14 @@ pub(super) async fn lux_create_web_playback_bootstrap(
         Ok(session) => session,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let max_bitrate_bps = match web_playback_max_bitrate(&headers, request.max_bitrate) {
+        Ok(max_bitrate_bps) => max_bitrate_bps,
+        Err(error) => return error.into_response(),
+    };
+    let max_height = match web_playback_max_height(&headers, request.max_height) {
+        Ok(max_height) => max_height,
+        Err(error) => return error.into_response(),
+    };
     let audio_stream_index = match validate_web_audio_stream(
         &state,
         principal,
@@ -4124,6 +4560,8 @@ pub(super) async fn lux_create_web_playback_bootstrap(
         &source,
         request.capabilities.into(),
         audio_stream_index,
+        max_bitrate_bps,
+        max_height,
     )
     .await
     {
@@ -4156,7 +4594,7 @@ pub(super) async fn lux_web_playback_direct(
     State(state): State<ReadyAppState>,
 ) -> Response {
     let service = state.web_playback();
-    let session = match authorize_web_playback_resource(
+    let authorized = match authorize_web_playback_resource(
         &headers,
         &state,
         service,
@@ -4167,14 +4605,19 @@ pub(super) async fn lux_web_playback_direct(
     )
     .await
     {
-        Ok(session) => session,
+        Ok(authorized) => authorized,
         Err(error) => return web_playback_error(&headers, error),
     };
+    let AuthorizedWebPlaybackResource {
+        session,
+        policy: admission_policy,
+    } = authorized;
     if session.plan != "DIRECT" {
         return StatusCode::NOT_FOUND.into_response();
     }
     if method == Method::GET
-        && let Err(response) = admit_web_playback_request(&headers, service, &session).await
+        && let Err(response) =
+            admit_web_playback_request(&headers, service, &session, admission_policy.as_ref()).await
     {
         return response;
     }
@@ -4192,7 +4635,10 @@ pub(super) async fn lux_web_playback_direct(
         None,
     )
     .await;
-    if method == Method::GET && !response.status().is_success() {
+    // `.strm` direct responses are 307 redirects; players re-request the same URL
+    // (Range probes, moov seeks), so only real failures end the session.
+    let status = response.status();
+    if method == Method::GET && !(status.is_success() || status.is_redirection()) {
         let _ = service.stop(&session_id, &session.user_id).await;
     }
     response
@@ -4206,7 +4652,7 @@ pub(super) async fn lux_web_playback_range(
     State(state): State<ReadyAppState>,
 ) -> Response {
     let service = state.web_playback();
-    let session = match authorize_web_playback_resource(
+    let authorized = match authorize_web_playback_resource(
         &headers,
         &state,
         service,
@@ -4217,9 +4663,13 @@ pub(super) async fn lux_web_playback_range(
     )
     .await
     {
-        Ok(session) => session,
+        Ok(authorized) => authorized,
         Err(error) => return web_playback_error(&headers, error),
     };
+    let AuthorizedWebPlaybackResource {
+        session,
+        policy: admission_policy,
+    } = authorized;
     if session.plan != "DIRECT" {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -4256,7 +4706,9 @@ pub(super) async fn lux_web_playback_range(
         return StatusCode::NOT_IMPLEMENTED.into_response();
     }
     let resolver = require_service!(state.strm_playback);
-    if let Err(response) = admit_web_playback_request(&headers, service, &session).await {
+    if let Err(response) =
+        admit_web_playback_request(&headers, service, &session, admission_policy.as_ref()).await
+    {
         return response;
     }
     let user_agent = headers
@@ -4309,7 +4761,7 @@ pub(super) async fn lux_web_playback_hls(
 ) -> Response {
     let service = state.web_playback();
     let resource = format!("hls:{asset}");
-    let session = match authorize_web_playback_resource(
+    let authorized = match authorize_web_playback_resource(
         &headers,
         &state,
         service,
@@ -4320,9 +4772,13 @@ pub(super) async fn lux_web_playback_hls(
     )
     .await
     {
-        Ok(session) => session,
+        Ok(authorized) => authorized,
         Err(error) => return web_playback_error(&headers, error),
     };
+    let AuthorizedWebPlaybackResource {
+        session,
+        policy: admission_policy,
+    } = authorized;
     if session.plan != "SERVER_HLS" {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -4352,7 +4808,13 @@ pub(super) async fn lux_web_playback_hls(
             return StatusCode::BAD_GATEWAY.into_response();
         };
         if method == Method::GET
-            && let Err(response) = admit_web_playback_request(&headers, service, &session).await
+            && let Err(response) = admit_web_playback_hls_request(
+                &headers,
+                service,
+                &session,
+                admission_policy.as_ref(),
+            )
+            .await
         {
             return response;
         }
@@ -4395,7 +4857,9 @@ pub(super) async fn lux_web_playback_hls(
         }
     };
     if method == Method::GET
-        && let Err(response) = admit_web_playback_request(&headers, service, &session).await
+        && let Err(response) =
+            admit_web_playback_hls_request(&headers, service, &session, admission_policy.as_ref())
+                .await
     {
         return response;
     }
@@ -4613,11 +5077,7 @@ pub(super) async fn lux_web_playback_event(
                 &user.display_name,
                 AccessPrincipal::new(user.id, user.is_admin),
                 web_playback_notification_method(&session),
-                if event_type_is_stopped(event_type) {
-                    activity_remote_ip
-                } else {
-                    None
-                },
+                activity_remote_ip,
                 resumed,
             )
             .await;
@@ -4719,6 +5179,10 @@ pub(super) fn web_playback_stats_json(
             "audioCodec": session.audio_codec,
             "videoBitrate": session.video_bitrate,
             "audioBitrate": session.audio_bitrate,
+            // The stored plan does not carry dimensions, so they come from the source probe and
+            // the encoder's captured scale cap; both are `null` for an unprobed source.
+            "videoWidth": stats.video_width,
+            "videoHeight": stats.video_height,
         },
         "progress": stats.progress.as_ref().map(|progress| json!({
             "generation": progress.generation,
@@ -4931,11 +5395,7 @@ pub(super) async fn lux_post_progress(
                     &user.display_name,
                     AccessPrincipal::new(user.id, user.is_admin),
                     request.play_method.as_deref(),
-                    if event_type_is_stopped(event_type) {
-                        activity_remote_ip
-                    } else {
-                        None
-                    },
+                    activity_remote_ip,
                     resumed,
                 )
                 .await;
@@ -5201,8 +5661,8 @@ pub(super) async fn lux_set_played(
 mod emby_playback_tests {
     use super::{
         EmbyPlaybackInfoRequest, emby_force_transcode_from_raw, emby_hls_asset_kind,
-        emby_start_time_hint, is_emby_generation_init_asset, parse_emby_playback_info_request,
-        playback_resumed,
+        emby_start_time_hint, is_emby_generation_init_asset, local_item_path,
+        parse_emby_playback_info_request, playback_media_source_json, playback_resumed,
     };
     use crate::application::catalog::{CatalogSource, CatalogStream};
     use crate::application::playback::decision::{
@@ -5305,6 +5765,49 @@ mod emby_playback_tests {
             "a disabled user loses signed playback resources"
         );
         Ok(())
+    }
+
+    #[test]
+    fn local_item_path_joins_root_and_nested_relative_path() {
+        assert_eq!(
+            local_item_path("/media/movies", "剧场版/示例电影.mkv"),
+            (
+                Some("/media/movies/剧场版/示例电影.mkv".to_owned()),
+                Some("示例电影.mkv".to_owned()),
+            )
+        );
+        assert_eq!(
+            local_item_path("/media/strm", "show/S01E01.strm"),
+            (
+                Some("/media/strm/show/S01E01.strm".to_owned()),
+                Some("S01E01.strm".to_owned()),
+            )
+        );
+    }
+
+    #[test]
+    fn playback_media_source_json_carries_streams_and_never_external_urls() {
+        let mut source = profile_source("mkv", "hevc", "aac");
+        source.size = Some(1_234);
+        source.bitrate = Some(8_000_000);
+        source.duration_ticks = Some(72_000_000_000);
+        let value = playback_media_source_json("item-1", &source);
+        assert_eq!(value["Container"], "mkv");
+        assert_eq!(value["Size"], 1_234);
+        assert_eq!(value["Bitrate"], 8_000_000);
+        assert_eq!(value["RunTimeTicks"], 72_000_000_000_i64);
+        assert_eq!(value["Protocol"], "File");
+        assert_eq!(value["Type"], "Default");
+        assert_eq!(value["MediaStreams"][0]["Type"], "Video");
+        assert_eq!(value["MediaStreams"][0]["Codec"], "hevc");
+        assert_eq!(value["MediaStreams"][1]["Type"], "Audio");
+
+        let mut strm = profile_source("mkv", "hevc", "aac");
+        strm.source_kind = "STRM_URL".to_owned();
+        strm.external_url = Some("https://example.invalid/a.mkv?token=secret".to_owned());
+        let rendered = playback_media_source_json("item-1", &strm).to_string();
+        assert!(!rendered.contains("example.invalid"));
+        assert!(!rendered.contains("token=secret"));
     }
 
     fn profile_source(container: &str, video_codec: &str, audio_codec: &str) -> CatalogSource {
@@ -6355,5 +6858,48 @@ mod playback_duration_tests {
         assert_eq!(resolve_cold(&database, None, None).await, None);
         database.close().await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod playback_probe_selection_tests {
+    use super::playback_source_missing_media_info;
+    use crate::application::catalog::CatalogSource;
+
+    fn source(source_kind: &str, probe_status: &str) -> CatalogSource {
+        CatalogSource {
+            id: "source".to_owned(),
+            source_kind: source_kind.to_owned(),
+            file_name: Some("Movie.mkv".to_owned()),
+            container: Some("mkv".to_owned()),
+            size: Some(10),
+            external_url: None,
+            edition_name: None,
+            quality_label: None,
+            bitrate: None,
+            duration_ticks: None,
+            is_default: true,
+            probe_status: probe_status.to_owned(),
+            streams: Vec::new(),
+            chapters: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn only_pending_local_sources_are_probed_before_playback() {
+        assert!(playback_source_missing_media_info(&source(
+            "LOCAL_FILE",
+            "PENDING"
+        )));
+        for status in ["READY", "FAILED", "NOT_CONFIGURED"] {
+            assert!(
+                !playback_source_missing_media_info(&source("LOCAL_FILE", status)),
+                "{status} sources read their stored media information"
+            );
+        }
+        assert!(
+            !playback_source_missing_media_info(&source("STRM_URL", "PENDING")),
+            "STRM sources keep their non-blocking plugin probe"
+        );
     }
 }

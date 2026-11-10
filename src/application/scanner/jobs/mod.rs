@@ -53,6 +53,15 @@ pub struct ScanJobService {
     pub(super) metadata_notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     pub(super) local_metadata_image_notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     pub(super) local_metadata_outbox_worker_started: Arc<AtomicBool>,
+    /// Set once by the shutdown drain and never cleared.
+    ///
+    /// Clearing only [`Self::local_metadata_outbox_worker_started`] would let a scan that is still
+    /// finishing its postprocessing start a new worker after the drain, and that worker would keep
+    /// claiming batches while the database closes.
+    pub(super) local_metadata_outbox_worker_shutting_down: Arc<AtomicBool>,
+    /// Stop handle of the outbox worker loop, so a shutdown can drain it instead of abandoning it.
+    pub(super) local_metadata_outbox_worker:
+        Arc<tokio::sync::Mutex<Option<crate::application::background_loop::BackgroundLoop>>>,
     pub(super) local_metadata_outbox_notify: Arc<Notify>,
     pub(super) lite_manifest_discovery: Arc<Mutex<HashMap<String, LiteManifestDiscoverySession>>>,
     /// Wake-up handle for the automatic media identity merge worker (LUX-841).

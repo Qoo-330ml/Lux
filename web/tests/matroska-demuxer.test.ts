@@ -141,6 +141,47 @@ describe("Matroska demuxer", () => {
     expect(streamedSamples).toEqual([1000, 1000, 1040]);
   });
 
+  it("hands out owned byte arrays so MP4Box writes the right config record", () => {
+    // `ebml` yields Buffer views; MP4Box copies from `buffer` offset 0 and ignores `byteOffset`, so a
+    // codec/config record or sample that is still a view corrupts the fMP4 boxes it is written into.
+    const hvcC = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 153, 14]);
+    const videoTrack = element([0xae], concat(
+      element([0xd7], uint(1)),
+      element([0x83], uint(1)),
+      element([0x86], text("V_MPEGH/ISO/HEVC")),
+      element([0x63, 0xa2], hvcC),
+      element([0xe0], concat(element([0xb0], uint(3840, 2)), element([0xba], uint(2160, 2)))),
+    ));
+    const source = concat(
+      element([0x1a, 0x45, 0xdf, 0xa3], new Uint8Array()),
+      element([0x18, 0x53, 0x80, 0x67], concat(
+        element([0x15, 0x49, 0xa9, 0x66], element([0x2a, 0xd7, 0xb1], uint(1_000_000, 4))),
+        element([0x16, 0x54, 0xae, 0x6b], videoTrack),
+        element([0x1f, 0x43, 0xb6, 0x75], concat(
+          element([0xe7], uint(0)),
+          simpleBlock(1, 0, true, new Uint8Array([0, 0, 0, 2, 0x26, 0x01])),
+        )),
+      )),
+    );
+
+    const tracks: Array<{ codecPrivate: Uint8Array }> = [];
+    const samples: Array<{ data: Uint8Array }> = [];
+    const stream = new MatroskaStreamDemuxer({
+      onTrack: (track) => tracks.push(track),
+      // Write in odd chunks so the record and the sample start at non-zero buffer offsets.
+      onSample: (sample) => samples.push(sample),
+    });
+    for (let offset = 0; offset < source.byteLength; offset += 5) stream.write(source.subarray(offset, offset + 5));
+    stream.end();
+
+    expect([...tracks[0].codecPrivate]).toEqual([...hvcC]);
+    expect(tracks[0].codecPrivate.byteOffset).toBe(0);
+    expect(tracks[0].codecPrivate.buffer.byteLength).toBe(hvcC.byteLength);
+    expect([...samples[0].data]).toEqual([0, 0, 0, 2, 0x26, 0x01]);
+    expect(samples[0].data.byteOffset).toBe(0);
+    expect(samples[0].data.buffer.byteLength).toBe(samples[0].data.byteLength);
+  });
+
   it("uses the 1536-sample AC-3 frame duration when TrackEntry has no default duration", () => {
     const ac3Track = element([0xae], concat(
       element([0xd7], uint(1)),

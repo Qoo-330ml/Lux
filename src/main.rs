@@ -12,7 +12,16 @@ use luxd::{
 };
 use std::net::SocketAddr;
 use tokio::{net::TcpListener, sync::watch};
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+// The benchmark feature installs its own counting allocator in the library crate.
+#[cfg(all(
+    target_os = "linux",
+    target_env = "gnu",
+    not(feature = "performance-benchmarks")
+))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -193,7 +202,6 @@ async fn start_shared_workers(database: &Database) -> Result<(), BoxError> {
     database.spawn_task_history_retention();
     database.spawn_postgres_query_statistics_extension();
     database.spawn_database_maintenance();
-    database.spawn_detached_state_reconcile();
     database.spawn_query_statistics_refresh();
     let cancelled_jobs = database.cancel_incomplete_jobs_for_shutdown().await?;
     if cancelled_jobs > 0 {
@@ -285,6 +293,9 @@ async fn serve(
             Err(error) => error!(%error, "legacy media identity repair failed"),
         }
     });
+    // Started here rather than with the other shared workers so its stop handle can be awaited on
+    // shutdown; the reconciler waits a minute before its first pass, so nothing changes for it.
+    let detached_state_worker = database.spawn_detached_state_reconcile();
     let discovery = DiscoveryService::bind_with_database(discovery_config, &database).await?;
     let discovery_addr = discovery.local_addr()?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -313,16 +324,26 @@ async fn serve(
         control_rx,
         control_tx.clone(),
         shutdown_tx.clone(),
+        shutdown_state.clone(),
     ))
     .await;
     let _ = shutdown_tx.send(true);
     let _ = discovery_task.await;
     mail_worker.shutdown().await;
+    // An upgraded WebSocket connection is detached from the HTTP connection, so `axum::serve`
+    // does not wait for it. Close both realtime endpoints here (`/embywebsocket` and
+    // `/api/v1/ws`), before any worker or the database goes away, and do it whether or not
+    // `serve` returned an error: an error must not leave a connection pushing against a database
+    // that is about to close.
+    if !shutdown_state.shutdown_websocket_connections().await {
+        warn!("websocket connections outlived the shutdown drain timeout");
+    }
     serve_result?;
     let shutdown_reason = *control_tx.borrow();
     if let Err(error) = shutdown_state.shutdown_background_workers_checked().await {
         return Err(std::io::Error::other(error).into());
     }
+    detached_state_worker.shutdown().await;
     match database.cancel_incomplete_jobs_for_shutdown().await {
         Ok(cancelled_jobs) if cancelled_jobs > 0 => {
             info!(
@@ -345,6 +366,7 @@ async fn shutdown_signal(
     mut control_rx: watch::Receiver<ShutdownReason>,
     control_tx: watch::Sender<ShutdownReason>,
     shutdown: watch::Sender<bool>,
+    state: AppState,
 ) {
     let ctrl_c = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
@@ -392,6 +414,10 @@ async fn shutdown_signal(
         }
     }
 
+    // Long-lived responses (`/embywebsocket` and `/api/v1/ws`) do not end on their own, so they
+    // are told to close before the graceful drain starts waiting for in-flight requests.
+    // Background workers are drained once, after `serve` returns, by the caller below.
+    state.signal_websocket_shutdown();
     // Only signal the HTTP server to stop here. Workers are drained once, after `serve` returns
     // and no further requests can start work, by the caller below.
     let _ = shutdown.send(true);

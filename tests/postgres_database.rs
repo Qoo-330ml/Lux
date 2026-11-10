@@ -5012,3 +5012,225 @@ async fn postgres_pool_after_connect_applies_session_settings()
     drop_postgres_test_database(&database_name).await?;
     result
 }
+
+/// ADR-052 P5 adds `kind` and `provider` to the danmaku job tables with a plain `ADD COLUMN`.
+///
+/// The upgrade runs against a database that already holds a job and its item, so it also pins that
+/// the old rows stay library sweeps without a provider and that the partial unique index keeps
+/// allowing only one active job per library.
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_danmaku_provenance_migration_upgrades_a_populated_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database_url = connection.postgres_url()?.ok_or("missing PostgreSQL URL")?;
+    let migration_dir = temp_dir.path().join("migrations-v247");
+    fs::create_dir(&migration_dir)?;
+    let source_dir =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations-postgres");
+    for entry in fs::read_dir(&source_dir)? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let version = filename
+            .to_str()
+            .and_then(|name| name.split_once('_'))
+            .ok_or("invalid migration filename")?
+            .0
+            .parse::<i64>()?;
+        if version <= 247 {
+            fs::copy(entry.path(), migration_dir.join(filename))?;
+        }
+    }
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await?;
+    Migrator::new(migration_dir.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+    let old_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(old_version, 247);
+
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind) VALUES ('pg-legacy-library', 'Legacy', 'MOVIE')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO library_roots (
+             id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ('pg-legacy-root', 'pg-legacy-library', '/media', '/media', TRUE, TRUE)",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status, identity_key
+         ) VALUES ('pg-legacy-item', 'pg-legacy-library', 'MOVIE', 'Legacy Movie',
+                   'Legacy Movie', 'LOCAL_CONFIRMED', 'pg-legacy-item')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO filesystem_entries (
+             id, library_root_id, relative_path, entry_kind, size,
+             modified_at, last_seen_generation, is_missing
+         ) VALUES ('pg-legacy-entry', 'pg-legacy-root', 'Legacy.Movie.mkv', 'FILE', 1, 1, 'legacy', FALSE)",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_sources (
+             id, item_id, source_kind, filesystem_entry_id, container, size, is_default, probe_status
+         ) VALUES ('pg-legacy-source', 'pg-legacy-item', 'LOCAL_FILE', 'pg-legacy-entry', 'mkv', 1, TRUE, 'PENDING')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO danmaku_match_jobs (id, library_id, status, overwrite, concurrency, total_count)
+         VALUES ('pg-legacy-job', 'pg-legacy-library', 'FAILED', TRUE, 2, 1)",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO danmaku_match_job_items (
+             id, job_id, media_source_id, status, provider_episode_id
+         ) VALUES ('pg-legacy-job:pg-legacy-source', 'pg-legacy-job', 'pg-legacy-source',
+                   'WRITTEN', 'ep-old')",
+    )
+    .execute(&pool)
+    .await?;
+
+    fs::copy(
+        source_dir.join("0248_danmaku_manual_match_provenance.sql"),
+        migration_dir.join("0248_danmaku_manual_match_provenance.sql"),
+    )?;
+    Migrator::new(migration_dir.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+    let new_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(new_version, 248);
+
+    let (kind, status, concurrency): (String, String, i64) = sqlx::query_as(
+        "SELECT kind, status, concurrency FROM danmaku_match_jobs WHERE id = 'pg-legacy-job'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(kind, "SWEEP");
+    assert_eq!(status, "FAILED");
+    assert_eq!(concurrency, 2);
+    let (item_status, item_episode, item_provider): (String, Option<String>, Option<String>) =
+        sqlx::query_as(
+            "SELECT status, provider_episode_id, provider
+             FROM danmaku_match_job_items WHERE id = 'pg-legacy-job:pg-legacy-source'",
+        )
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(item_status, "WRITTEN");
+    assert_eq!(item_episode.as_deref(), Some("ep-old"));
+    assert_eq!(item_provider, None);
+
+    sqlx::query(
+        "INSERT INTO danmaku_match_jobs (
+             id, library_id, status, overwrite, concurrency, total_count, kind
+         ) VALUES ('pg-manual-job', 'pg-legacy-library', 'PENDING', FALSE, 2, 1, 'MANUAL')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO danmaku_match_job_items (
+             id, job_id, media_source_id, status, provider, provider_anime_id, provider_episode_id
+         ) VALUES ('pg-manual-job:pg-legacy-source', 'pg-manual-job', 'pg-legacy-source',
+                   'PENDING', 'dandanplay', 'anime-1', 'ep-1')",
+    )
+    .execute(&pool)
+    .await?;
+    let stored: (String, Option<String>) = sqlx::query_as(
+        "SELECT job.kind, item.provider
+         FROM danmaku_match_jobs job
+         JOIN danmaku_match_job_items item ON item.job_id = job.id
+         WHERE job.id = 'pg-manual-job'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(stored.0, "MANUAL");
+    assert_eq!(stored.1.as_deref(), Some("dandanplay"));
+    assert!(
+        sqlx::query(
+            "INSERT INTO danmaku_match_jobs (
+                 id, library_id, status, overwrite, concurrency, total_count, kind
+             ) VALUES ('pg-bad-kind', 'pg-legacy-library', 'FAILED', FALSE, 2, 0, 'OTHER')",
+        )
+        .execute(&pool)
+        .await
+        .is_err(),
+        "kind must stay constrained to the documented values"
+    );
+    let active_index: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND indexname = 'idx_danmaku_match_jobs_one_active_library'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(active_index, 1);
+    assert!(
+        sqlx::query(
+            "INSERT INTO danmaku_match_jobs (id, library_id, status, overwrite, concurrency, total_count)
+             VALUES ('pg-second-active', 'pg-legacy-library', 'PENDING', FALSE, 2, 0)",
+        )
+        .execute(&pool)
+        .await
+        .is_err(),
+        "one library must still have at most one active danmaku job"
+    );
+
+    pool.close().await;
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+/// A release before the placeholder fix wrote `server-state.json` for the wizard's throwaway SQLite
+/// database; choosing PostgreSQL afterwards then refused the empty database as a lost one.
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn a_marker_left_by_the_setup_placeholder_does_not_block_a_fresh_postgres_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    // The placeholder, opened the way the old code did (no selection marker): it records the marker.
+    Database::connect(&config).await?.close().await;
+    let placeholder_marker = fs::read(config.config_dir.join("server-state.json"))?;
+
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let result = async {
+        let database = Database::connect_with_configuration(&config, &connection).await?;
+        let server_id: String =
+            sqlx::query_scalar("SELECT value FROM lux_meta WHERE key = 'server_id'")
+                .fetch_one(database.pool())
+                .await?;
+        database.close().await;
+        let marker: serde_json::Value =
+            serde_json::from_slice(&fs::read(config.config_dir.join("server-state.json"))?)?;
+        assert_eq!(marker["serverId"], serde_json::json!(server_id));
+        assert_ne!(
+            fs::read(config.config_dir.join("server-state.json"))?,
+            placeholder_marker,
+            "the marker must now describe the PostgreSQL database"
+        );
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    drop_postgres_test_database(&database_name).await?;
+    result
+}

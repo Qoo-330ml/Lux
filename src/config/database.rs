@@ -175,6 +175,14 @@ impl Config {
             .is_err()
     }
 
+    /// True while the setup wizard still has to pick a database, so the one currently open is only
+    /// a placeholder.
+    pub async fn database_selection_pending(&self) -> bool {
+        fs::metadata(self.config_dir.join(DATABASE_SELECTION_MARKER_FILE))
+            .await
+            .is_ok()
+    }
+
     pub async fn mark_database_selection_pending(&self) -> Result<(), DatabaseConfigurationError> {
         fs::create_dir_all(&self.config_dir)
             .await

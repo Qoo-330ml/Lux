@@ -219,7 +219,7 @@ test("media file address and summary share one surface with an unboxed toggle", 
 
   assert.match(fileFactsRule, /display:\s*grid/);
   assert.match(addressRule, /grid-template-columns:\s*minmax\(0,\s*1fr\)\s+auto/);
-  assert.match(addressRule, /border-top:\s*1px solid/);
+  assert.doesNotMatch(addressRule, /border-top/);
   assert.doesNotMatch(addressRule, /border:\s*1px solid/);
   assert.match(toggleRule, /border:\s*0/);
   assert.match(toggleRule, /background:\s*transparent/);

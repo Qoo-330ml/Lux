@@ -87,6 +87,11 @@ pub(super) fn api_routes() -> (Router<ReadyAppState>, Vec<String>) {
         )
         .route("/ScheduledTasks", get(emby_scheduled_tasks))
         .route("/Persons", get(emby_persons))
+        .route("/Genres", get(emby_genres))
+        .route("/Studios", get(emby_studios))
+        .route("/Years", get(emby_years))
+        .route("/OfficialRatings", get(emby_official_ratings))
+        .route("/Tags", get(emby_tags))
         .route("/Persons/{person_id}", get(emby_person))
         .route(
             "/Users/{user_id}",
@@ -145,6 +150,7 @@ pub(super) fn api_routes() -> (Router<ReadyAppState>, Vec<String>) {
                 .post(emby_update_item)
                 .delete(emby_delete_item),
         )
+        .route("/Items/{item_id}/Similar", get(emby_item_similar))
         .route("/Items/{item_id}/Refresh", post(emby_refresh_item))
         .route("/Library/Refresh", post(emby_refresh_library))
         .route("/Items/{item_id}/Children", get(emby_collection_children))
@@ -164,6 +170,10 @@ pub(super) fn api_routes() -> (Router<ReadyAppState>, Vec<String>) {
         .route(
             "/Videos/{item_id}/{media_source_id}/Subtitles/{stream_index}/Stream",
             get(emby_subtitle_with_source).head(emby_subtitle_with_source),
+        )
+        .route(
+            "/Videos/{item_id}/{media_source_id}/Subtitles/{stream_index}/Stream.{format}",
+            get(emby_subtitle_with_source_and_format).head(emby_subtitle_with_source_and_format),
         )
         .route(
             "/Videos/{item_id}/original.strm",
@@ -227,6 +237,10 @@ pub(super) fn api_routes() -> (Router<ReadyAppState>, Vec<String>) {
             post(emby_mark_favorite).delete(emby_unmark_favorite),
         )
         .route("/Sessions/Logout", post(emby_logout))
+        // Yamby (and Emby clients with a server-status page) connect here for the realtime
+        // session list and scan state. Registered on both mounts like every other Emby route, so
+        // `/embywebsocket` and `/emby/embywebsocket` (any casing) both answer.
+        .route("/embywebsocket", get(emby_websocket))
         .finish();
     let routes = routes
         .route_layer(middleware::from_fn(credentials::normalize_credentials))

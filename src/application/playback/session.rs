@@ -16,11 +16,13 @@ use uuid::Uuid;
 use crate::storage::{
     Database, NewAuditEvent, NewEmbyDirectPlaybackTicket, NewTranscodingHistory,
     NewUserActivityEvent, NewWebPlaybackEvent, NewWebPlaybackSession, PlaybackAdmissionResult,
-    StorageError, StoredEmbyDirectPlaybackTicket, StoredWebPlaybackSession,
-    UserAccessBlacklistIpRuleQuery, UserAccessBlacklistRuleMatchQuery, UserPlaybackPolicy,
-    WebPlaybackEventClaim, WebPlaybackTranscodingDetails,
+    StorageError, StoredEmbyDirectPlaybackTicket, StoredTranscodingSessionRow,
+    StoredWebPlaybackAccessContext, StoredWebPlaybackSession, UserAccessBlacklistIpRuleQuery,
+    UserAccessBlacklistRuleMatchQuery, UserPlaybackPolicy, WebPlaybackEventClaim,
+    WebPlaybackTranscodingDetails,
 };
 
+use crate::application::transcoding::TranscodingSettings;
 use crate::application::user_access_rules::{
     IpBlacklistEvaluationError, MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST,
     UserAccessBlacklistRuleType, ip_blacklist_rules_match_address,
@@ -28,8 +30,9 @@ use crate::application::user_access_rules::{
 };
 
 use super::decision::{
-    PlaybackCapabilities, PlaybackDecisionInput, PlaybackPlan, PlaybackSourceKind, ServerTier,
-    UnsupportedReason, choose_plan,
+    PlaybackBitrateLimit, PlaybackCapabilities, PlaybackDecisionInput, PlaybackPlan,
+    PlaybackResolutionLimit, PlaybackSourceKind, ServerTier, UnsupportedReason,
+    choose_plan_with_limits, reencode_video_bitrate_bps, valid_max_bitrate_bps, valid_max_height,
 };
 use super::hls::{
     HlsError, HlsManager, HlsProgressSnapshot, HlsSegmentContainer, HlsStartOptions,
@@ -44,7 +47,13 @@ pub const WEB_PLAYBACK_SESSION_TTL_SECONDS: i64 = 15 * 60;
 pub const WEB_PLAYBACK_RESOURCE_TTL_SECONDS: i64 = 12 * 60 * 60;
 pub const EMBY_DIRECT_STREAM_TTL_SECONDS: i64 = 12 * 60 * 60;
 pub(crate) const EMBY_DIRECT_STREAM_TICKET_VERSION: &str = "2";
-const WEB_PLAYBACK_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
+/// Idle fallback for the session reaper.
+///
+/// The reaper sleeps until the nearest session deadline (`expires_at` or
+/// `last_heartbeat_at + WEB_PLAYBACK_STALE_AFTER_SECONDS`) and is woken when a session is created,
+/// so this only bounds how long a row written without a wake-up (there is no such production path;
+/// every session is created through [`WebPlaybackSessionService::create`]) could go unnoticed.
+const WEB_PLAYBACK_IDLE_FALLBACK: Duration = Duration::from_secs(60);
 const WEB_PLAYBACK_STALE_AFTER_SECONDS: i64 = 90;
 const EMBY_DIRECT_STREAM_SESSION_ID: &str = "emby-direct-stream";
 
@@ -90,6 +99,10 @@ pub struct CreateWebPlaybackSession<'a> {
     pub play_session_prefix: &'a str,
     pub source_kind: PlaybackSourceKind,
     pub capabilities: PlaybackCapabilities,
+    /// The user-selected output ceiling and the source bitrate it applies to.
+    pub bitrate: PlaybackBitrateLimit,
+    /// The user-selected resolution ceiling and the source height it applies to.
+    pub resolution: PlaybackResolutionLimit,
 }
 
 pub(crate) struct WebPlaybackEvent<'a> {
@@ -111,12 +124,47 @@ pub struct CreatedWebPlaybackSession {
     pub play_session_id: String,
     pub plan: WebPlaybackPlan,
     pub expires_at: i64,
+    /// Video bitrate the plan has to encode to, when the user's ceilings forced a re-encode.
+    ///
+    /// `None` means no ceiling was applied: the output either plays the original bytes or copies
+    /// the source video track, so there is no target bitrate of its own.
+    pub target_video_bitrate_bps: Option<i64>,
+    /// Output height the plan has to scale to, when the user's resolution ceiling forced it.
+    ///
+    /// `None` means the picture is not scaled by this request; the administrator's global cap is
+    /// still applied by the encoder when one is configured.
+    pub target_video_height: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SignedResource {
     pub expires_at: i64,
     pub signature: String,
+}
+
+/// A signed playback resource request that passed authorization.
+///
+/// `session` is the row authorization already read, and `policy` is the playback policy the same
+/// request read to check the HLS tier. Admission reuses that snapshot instead of reading the
+/// `users` row a second time; direct-play resources carry none because authorization does not read
+/// one for them.
+pub(crate) struct AuthorizedWebPlaybackResource {
+    pub(crate) session: StoredWebPlaybackSession,
+    pub(crate) policy: Option<UserPlaybackPolicy>,
+}
+
+/// The outcome of the admission an HLS segment or manifest request performs.
+///
+/// Steady-state assets only check the slot the stream already holds, so most requests carry no
+/// decision and write nothing. A decision appears when the periodic re-check ran the full
+/// admission instead.
+pub(crate) enum PlaybackAssetAdmission {
+    /// The slot was verified with a read; the limits were re-evaluated recently enough.
+    Fresh,
+    /// The full admission ran and produced a decision the caller has to enforce.
+    Evaluated(PlaybackAdmissionResult),
+    /// The full admission found no playback policy row for the session owner.
+    NotFound,
 }
 
 /// One session's stored plan plus whatever the running FFmpeg has reported so far.
@@ -127,6 +175,30 @@ pub(crate) struct WebPlaybackStats {
     /// Measured from the newest closed segment, because the HLS muxer reports no bitrate.
     pub(crate) latest_segment_bitrate_kbps: Option<f64>,
     /// Total bytes written by this session, from the quota cache when it is fresh.
+    pub(crate) directory_bytes: Option<u64>,
+    /// Width in pixels of what the session hands the browser.
+    ///
+    /// Derived from the source picture and the encoder's scale cap: a scaled output takes the
+    /// proportional `scale=-2` width, so it can differ from the real value by one rounding step.
+    pub(crate) video_width: Option<i64>,
+    /// Height in pixels of what the session hands the browser; the source height unless the
+    /// encoder was started with a smaller cap.
+    pub(crate) video_height: Option<i64>,
+}
+
+/// One active server-side transcode as the admin panel renders it.
+///
+/// The stored columns come from the listing query the caller's poll already ran; everything else
+/// is the in-memory FFmpeg snapshot, so a poll costs one statement no matter how many sessions
+/// are running.
+pub(crate) struct LiveTranscodingSession {
+    pub(crate) row: StoredTranscodingSessionRow,
+    /// `false` once the row's deadline passed before the reaper collected it: the panel reports
+    /// the row without live progress instead of resurrecting an already expired session.
+    pub(crate) live: bool,
+    pub(crate) progress: Option<HlsProgressSnapshot>,
+    pub(crate) latest_segment_bitrate_kbps: Option<f64>,
+    /// Total bytes from the session's quota cache; it may lag [`super::hls`]'s five second TTL.
     pub(crate) directory_bytes: Option<u64>,
 }
 
@@ -188,12 +260,26 @@ impl From<HlsError> for WebPlaybackSessionError {
     }
 }
 
+#[derive(Clone, Default)]
+struct WebPlaybackSessionCleanup {
+    /// Wakes the reaper so it recomputes the next deadline.
+    wake: Arc<tokio::sync::Notify>,
+    /// The stop handle of the reaper; `None` when the process has no runtime to run it.
+    worker: Arc<std::sync::Mutex<Option<crate::application::background_loop::BackgroundLoop>>>,
+}
+
 #[derive(Clone)]
 pub struct WebPlaybackSessionService {
     database: Database,
     signer: Arc<ResourceSigner>,
     hls: HlsManager,
     start_locks: SessionStartLocks,
+    cleanup: WebPlaybackSessionCleanup,
+}
+
+/// Wakes the reaper after a session was created, which is when the next deadline can move closer.
+fn notify_web_playback_sessions_changed(service: &WebPlaybackSessionService) {
+    service.cleanup.wake.notify_one();
 }
 
 /// Upper bound for the per-source start locks kept in memory.
@@ -232,57 +318,49 @@ fn emby_hls_start_key(user_id: &str, item_id: &str, media_source_id: &str) -> St
 impl WebPlaybackSessionService {
     pub(crate) fn new(database: Database, config_dir: std::path::PathBuf) -> Self {
         let hls = HlsManager::new(config_dir);
-        let cleanup = hls.clone();
-        let database_cleanup = database.clone();
-        tokio::spawn(async move {
-            if let Err(error) = cleanup.cleanup_orphans().await {
-                tracing::warn!(%error, "failed to clean orphaned Web HLS directories");
+        let wake = Arc::new(tokio::sync::Notify::new());
+        // The reaper used to be a bare `tokio::spawn` with a dropped handle: a shutdown could not
+        // stop it while it was stopping HLS sessions.
+        let worker = match tokio::runtime::Handle::try_current() {
+            Ok(_) => {
+                let reaper_database = database.clone();
+                let reaper_hls = hls.clone();
+                let reaper_wake = Arc::clone(&wake);
+                Some(crate::application::background_loop::BackgroundLoop::spawn(
+                    "web_playback_cleanup",
+                    move |shutdown| {
+                        let database = reaper_database.clone();
+                        let hls = reaper_hls.clone();
+                        let wake = Arc::clone(&reaper_wake);
+                        async move { run_web_playback_cleanup(database, hls, wake, shutdown).await }
+                    },
+                ))
             }
-            let mut interval = tokio::time::interval(WEB_PLAYBACK_CLEANUP_INTERVAL);
-            loop {
-                interval.tick().await;
-                let now = unix_timestamp();
-                match database_cleanup
-                    .take_inactive_web_playback_sessions(now, WEB_PLAYBACK_STALE_AFTER_SECONDS)
-                    .await
-                {
-                    Ok(sessions) => {
-                        record_and_stop_hls_sessions(
-                            &database_cleanup,
-                            &cleanup,
-                            sessions,
-                            TranscodingOutcome::Expired,
-                        )
-                        .await
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "failed to reap inactive Web HLS sessions")
-                    }
-                }
-                let sessions = match database_cleanup
-                    .take_expired_web_playback_sessions(now)
-                    .await
-                {
-                    Ok(sessions) => sessions,
-                    Err(error) => {
-                        tracing::warn!(%error, "failed to expire Web playback sessions");
-                        continue;
-                    }
-                };
-                record_and_stop_hls_sessions(
-                    &database_cleanup,
-                    &cleanup,
-                    sessions,
-                    TranscodingOutcome::Expired,
-                )
-                .await;
-            }
-        });
+            // Without a runtime (checkout-style construction in tests) there is nothing to stop.
+            Err(_) => None,
+        };
         Self {
             database,
             signer: Arc::new(ResourceSigner::random()),
             hls,
             start_locks: SessionStartLocks::default(),
+            cleanup: WebPlaybackSessionCleanup {
+                wake,
+                worker: Arc::new(std::sync::Mutex::new(worker)),
+            },
+        }
+    }
+
+    /// Stops the session reaper and waits for the current pass to finish.
+    pub(crate) async fn shutdown(&self) {
+        let worker = self
+            .cleanup
+            .worker
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(worker) = worker {
+            worker.shutdown().await;
         }
     }
 
@@ -326,14 +404,20 @@ impl WebPlaybackSessionService {
             .await?)
     }
 
+    /// Reserves one admission slot for the request that is about to read a playback resource.
+    ///
+    /// `known_policy` is the policy an earlier step of the same request already read; passing it
+    /// keeps the admission from reading the same `users` row twice (see
+    /// [`Database::reserve_playback_admission`]).
     pub(crate) async fn admit_playback_session(
         &self,
         user_id: &str,
         play_session_id: &str,
+        known_policy: Option<&UserPlaybackPolicy>,
     ) -> Result<Option<PlaybackAdmissionResult>, WebPlaybackSessionError> {
         Ok(self
             .database
-            .reserve_playback_admission(user_id, play_session_id, unix_timestamp())
+            .reserve_playback_admission(user_id, play_session_id, unix_timestamp(), known_policy)
             .await?)
     }
 
@@ -348,6 +432,67 @@ impl WebPlaybackSessionService {
             .await?)
     }
 
+    /// Admits one HLS segment or manifest request by checking the slot the stream already holds.
+    ///
+    /// A stream requests an asset every few seconds. Re-running the full admission (stale reclaim,
+    /// active count, upsert inside a write transaction) for each of them is what this path avoids,
+    /// but skipping it *entirely* would freeze the concurrent limit and `can_play` for the whole
+    /// playback: nothing else would ever re-evaluate them. So the request only verifies — with one
+    /// read and no write — that the slot is active and was admitted less than
+    /// [`Database::PLAYBACK_ADMISSION_RECHECK_INTERVAL_SECONDS`] ago; the first request after that
+    /// interval runs the full admission, which re-opens the interval. See
+    /// [`Database::has_fresh_playback_admission`].
+    ///
+    /// `known_policy` is the policy the same request already read. A revoked `can_play` skips the
+    /// cheap path immediately instead of waiting for the interval to expire, so the denial comes
+    /// from the same full admission as before.
+    pub(crate) async fn admit_playback_asset_request(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+        known_policy: Option<&UserPlaybackPolicy>,
+    ) -> Result<PlaybackAssetAdmission, WebPlaybackSessionError> {
+        self.admit_playback_asset_request_at(
+            user_id,
+            play_session_id,
+            unix_timestamp(),
+            known_policy,
+        )
+        .await
+    }
+
+    /// [`Self::admit_playback_asset_request`] with an explicit clock.
+    ///
+    /// The storage functions already take the timestamp, so passing it here keeps a streaming
+    /// session's periodic full admission deterministic in tests instead of tying it to wall time.
+    pub(crate) async fn admit_playback_asset_request_at(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+        now: i64,
+        known_policy: Option<&UserPlaybackPolicy>,
+    ) -> Result<PlaybackAssetAdmission, WebPlaybackSessionError> {
+        let play_allowed = known_policy.is_none_or(|policy| policy.can_play);
+        if play_allowed
+            && self
+                .database
+                .has_fresh_playback_admission(user_id, play_session_id, now)
+                .await?
+        {
+            return Ok(PlaybackAssetAdmission::Fresh);
+        }
+        Ok(
+            match self
+                .database
+                .reserve_playback_admission(user_id, play_session_id, now, known_policy)
+                .await?
+            {
+                Some(result) => PlaybackAssetAdmission::Evaluated(result),
+                None => PlaybackAssetAdmission::NotFound,
+            },
+        )
+    }
+
     pub(crate) async fn release_playback_session_admission(
         &self,
         user_id: &str,
@@ -359,9 +504,14 @@ impl WebPlaybackSessionService {
             .await?)
     }
 
-    pub(crate) async fn create(
+    /// Creates the session with a transcoding policy the caller already read.
+    ///
+    /// The HLS start that follows a creation applies the same policy, so a caller that runs both
+    /// steps reads the `server_settings` row once instead of twice.
+    pub(crate) async fn create_with_settings(
         &self,
         input: CreateWebPlaybackSession<'_>,
+        settings: &TranscodingSettings,
     ) -> Result<CreatedWebPlaybackSession, WebPlaybackSessionError> {
         if input.user_id.is_empty() || input.item_id.is_empty() || input.media_source_id.is_empty()
         {
@@ -369,6 +519,10 @@ impl WebPlaybackSessionService {
                 "playback session identifiers must not be empty".to_owned(),
             ));
         }
+        // Handlers validate the same ranges at the protocol boundary; keeping the checks here
+        // means no other caller can bypass them and silently lose a ceiling.
+        validate_bitrate_limit(input.bitrate)?;
+        validate_resolution_limit(input.resolution)?;
         let policy = self
             .database
             .get_user_playback_policy(input.user_id)
@@ -381,11 +535,33 @@ impl WebPlaybackSessionService {
                 source_kind: input.source_kind,
                 capabilities,
             },
+            input.bitrate,
+            input.resolution,
             policy,
         )?);
+        // A ceiling only exists when the chosen plan actually re-encodes video; a copied track
+        // keeps the source bitrate and picture and has no target of its own.
+        let re_encodes_video = matches!(
+            plan,
+            WebPlaybackPlan::ServerHls {
+                tier: ServerTier::HardwareTranscode | ServerTier::SoftwareTranscode,
+            }
+        );
+        let target_video_bitrate_bps = if re_encodes_video {
+            reencode_video_bitrate_bps(input.bitrate, input.resolution, settings.max_output_height)
+        } else {
+            None
+        };
+        // The scale filter is only added when this request actually narrowed the picture; the
+        // administrator's global cap is applied by the encoder on top of it.
+        let target_video_height = if re_encodes_video && input.resolution.requires_scale() {
+            input.resolution.scaled_height()
+        } else {
+            None
+        };
         // An administrator can turn server-side processing off entirely. The plan then degrades to
         // direct play (or an explicit unsupported reason) instead of starting FFmpeg.
-        let plan = if !self.transcoding_settings().await.enabled {
+        let plan = if !settings.enabled {
             match plan {
                 WebPlaybackPlan::ServerHls { .. } => WebPlaybackPlan::Unsupported {
                     reason: UnsupportedReason::ServerTranscodingDisabled,
@@ -415,6 +591,9 @@ impl WebPlaybackSessionService {
                     now,
                 })
                 .await?;
+            // A new session can be the earliest deadline, so let the reaper recompute it instead of
+            // waiting for its idle fallback.
+            notify_web_playback_sessions_changed(self);
             return Ok(CreatedWebPlaybackSession {
                 id,
                 user_id: input.user_id.to_owned(),
@@ -423,6 +602,8 @@ impl WebPlaybackSessionService {
                 play_session_id,
                 plan,
                 expires_at,
+                target_video_bitrate_bps,
+                target_video_height,
             });
         };
         Ok(CreatedWebPlaybackSession {
@@ -433,6 +614,8 @@ impl WebPlaybackSessionService {
             play_session_id: String::new(),
             plan,
             expires_at: unix_timestamp(),
+            target_video_bitrate_bps: None,
+            target_video_height: None,
         })
     }
 
@@ -452,12 +635,20 @@ impl WebPlaybackSessionService {
             ))
             .await;
         let user_id = input.user_id.to_owned();
-        let created = self.create(input).await?;
+        let settings = self.transcoding_settings().await;
+        let created = self.create_with_settings(input, &settings).await?;
         let WebPlaybackPlan::ServerHls { tier } = created.plan else {
             return Ok(created);
         };
         if let Err(error) = self
-            .start_emby_hls_with_runtime(&created.id, tier, media_path, video_bitrate, options)
+            .start_emby_hls_with_settings(
+                &settings,
+                &created.id,
+                tier,
+                media_path,
+                video_bitrate,
+                options,
+            )
             .await
         {
             let _ = self.fail(&created.id, &user_id, "HLS_START_FAILED").await;
@@ -879,10 +1070,14 @@ impl WebPlaybackSessionService {
         expires_at: i64,
         signature: &str,
         client_ip: Option<IpAddr>,
-    ) -> Result<StoredWebPlaybackSession, WebPlaybackSessionError> {
+    ) -> Result<AuthorizedWebPlaybackResource, WebPlaybackSessionError> {
         self.verify_resource_signature(session_id, resource, expires_at, signature)?;
         let now = unix_timestamp();
-        let Some(session) = self.database.find_web_playback_session(session_id).await? else {
+        let Some((session, access)) = self
+            .database
+            .find_web_playback_session_with_access_context(session_id)
+            .await?
+        else {
             return Err(WebPlaybackSessionError::NotFound);
         };
         if session.state != "ACTIVE" {
@@ -895,16 +1090,17 @@ impl WebPlaybackSessionService {
         if session.play_session_id.starts_with("lux-web:")
             || session.play_session_id.starts_with("lux-emby:")
         {
-            self.enforce_playback_access_rules(&session, client_ip)
+            self.enforce_playback_access_rules(&session, &access, client_ip)
                 .await?;
         }
+        let mut policy = None;
         if session.plan == "SERVER_HLS" {
-            let policy = self
+            let stored = self
                 .database
                 .get_user_playback_policy(&session.user_id)
                 .await?
                 .ok_or(WebPlaybackSessionError::NotFound)?;
-            if !playback_policy_allows_hls_tier(policy, session.tier) {
+            if !playback_policy_allows_hls_tier(stored, session.tier) {
                 if let Err(error) = self.stop(session_id, &session.user_id).await {
                     tracing::warn!(
                         session_id = %session.id,
@@ -914,30 +1110,23 @@ impl WebPlaybackSessionService {
                 }
                 return Err(WebPlaybackSessionError::PlaybackPolicyDenied);
             }
+            policy = Some(stored);
         }
-        Ok(session)
+        Ok(AuthorizedWebPlaybackResource { session, policy })
     }
 
     async fn enforce_playback_access_rules(
         &self,
         session: &StoredWebPlaybackSession,
+        access: &StoredWebPlaybackAccessContext,
         client_ip: Option<IpAddr>,
     ) -> Result<(), WebPlaybackSessionError> {
-        let context = self
-            .database
-            .find_web_playback_access_context(&session.id)
-            .await?
-            .ok_or(WebPlaybackSessionError::NotActive)?;
-        if context.user_id != session.user_id {
-            return Err(WebPlaybackSessionError::AccessRulesUnavailable);
-        }
-
-        let device_id = context.device_id.as_deref().map(|value| {
+        let device_id = access.device_id.as_deref().map(|value| {
             normalize_user_access_blacklist_value(UserAccessBlacklistRuleType::Device, value)
                 .map_err(|_| WebPlaybackSessionError::AccessRulesUnavailable)
         });
         let device_id = device_id.transpose()?;
-        let client_name = context.client_name.as_deref().map(|value| {
+        let client_name = access.client_name.as_deref().map(|value| {
             normalize_user_access_blacklist_value(UserAccessBlacklistRuleType::Client, value)
                 .map_err(|_| WebPlaybackSessionError::AccessRulesUnavailable)
         });
@@ -1022,38 +1211,50 @@ impl WebPlaybackSessionService {
         video_bitrate: Option<i64>,
         start_time_ticks: Option<i64>,
     ) -> Result<(), WebPlaybackSessionError> {
-        self.start_hls_with_audio(
-            session_id,
-            tier,
-            input,
-            video_bitrate,
-            start_time_ticks,
-            None,
-        )
-        .await
-    }
-
-    pub(crate) async fn start_hls_with_audio(
-        &self,
-        session_id: &str,
-        tier: ServerTier,
-        input: &std::path::Path,
-        video_bitrate: Option<i64>,
-        start_time_ticks: Option<i64>,
-        audio_stream_index: Option<i64>,
-    ) -> Result<(), WebPlaybackSessionError> {
-        self.start_hls_with_runtime(
+        let settings = self.transcoding_settings().await;
+        self.start_hls_with_settings(
+            &settings,
             session_id,
             tier,
             input,
             HlsWebStartOptions {
                 video_bitrate,
+                video_height: None,
                 start_time_ticks,
                 runtime_ticks: None,
-                audio_stream_index,
+                audio_stream_index: None,
             },
         )
         .await
+    }
+
+    /// Starts the Web HLS pipeline with a transcoding policy the caller already read.
+    ///
+    /// Every start re-applies the policy so a saved setting applies to the next session without a
+    /// restart, while running sessions keep their captured parameters.
+    pub(crate) async fn start_hls_with_settings(
+        &self,
+        settings: &TranscodingSettings,
+        session_id: &str,
+        tier: ServerTier,
+        input: &std::path::Path,
+        options: HlsWebStartOptions,
+    ) -> Result<(), WebPlaybackSessionError> {
+        self.hls.apply_settings(settings);
+        self.hls
+            .start_with_audio(session_id, tier, input, options)
+            .await?;
+        let directory = self.hls.session_directory(session_id).await?;
+        let now = unix_timestamp();
+        if !self
+            .database
+            .set_web_playback_temp_dir(session_id, &directory.to_string_lossy(), now)
+            .await?
+        {
+            let _ = self.hls.stop(session_id).await;
+            return Err(WebPlaybackSessionError::NotFound);
+        }
+        Ok(())
     }
 
     /// Current administrator transcoding policy; unreadable rows fall back to defaults.
@@ -1094,10 +1295,20 @@ impl WebPlaybackSessionService {
         let Some(session) = self.database.find_web_playback_session(session_id).await? else {
             return Err(WebPlaybackSessionError::NotFound);
         };
+        self.mark_known_session_tier(&session, tier).await
+    }
+
+    /// Records the tier for a session row the caller already read, avoiding a second read of the
+    /// row just to learn its owner and plan.
+    async fn mark_known_session_tier(
+        &self,
+        session: &StoredWebPlaybackSession,
+        tier: ServerTier,
+    ) -> Result<(), WebPlaybackSessionError> {
         if self
             .database
             .update_web_playback_session_tier(
-                session_id,
+                &session.id,
                 &session.user_id,
                 i64::from(tier.number()),
                 &session.plan,
@@ -1125,6 +1336,7 @@ impl WebPlaybackSessionService {
         session_id: &str,
         input: &std::path::Path,
         video_bitrate: Option<i64>,
+        video_height: Option<u32>,
         start_time_ticks: Option<i64>,
         audio_stream_index: Option<i64>,
     ) -> Result<ServerTier, WebPlaybackSessionError> {
@@ -1133,13 +1345,18 @@ impl WebPlaybackSessionService {
             return Err(WebPlaybackSessionError::Hls(HlsError::Limit));
         }
         let _ = self.hls.stop(session_id).await;
-        self.start_hls_with_audio(
+        self.start_hls_with_settings(
+            &settings,
             session_id,
             ServerTier::SoftwareTranscode,
             input,
-            video_bitrate,
-            start_time_ticks,
-            audio_stream_index,
+            HlsWebStartOptions {
+                video_bitrate,
+                video_height,
+                start_time_ticks,
+                runtime_ticks: None,
+                audio_stream_index,
+            },
         )
         .await?;
         self.mark_session_tier(session_id, ServerTier::SoftwareTranscode)
@@ -1147,41 +1364,16 @@ impl WebPlaybackSessionService {
         Ok(ServerTier::SoftwareTranscode)
     }
 
-    async fn start_hls_with_runtime(
+    async fn start_emby_hls_with_settings(
         &self,
-        session_id: &str,
-        tier: ServerTier,
-        input: &std::path::Path,
-        options: HlsWebStartOptions,
-    ) -> Result<(), WebPlaybackSessionError> {
-        // Every HLS start re-reads the policy so a saved setting applies to the next session
-        // without a restart, while running sessions keep their captured parameters.
-        self.hls.apply_settings(&self.transcoding_settings().await);
-        self.hls
-            .start_with_audio(session_id, tier, input, options)
-            .await?;
-        let directory = self.hls.session_directory(session_id).await?;
-        let now = unix_timestamp();
-        if !self
-            .database
-            .set_web_playback_temp_dir(session_id, &directory.to_string_lossy(), now)
-            .await?
-        {
-            let _ = self.hls.stop(session_id).await;
-            return Err(WebPlaybackSessionError::NotFound);
-        }
-        Ok(())
-    }
-
-    async fn start_emby_hls_with_runtime(
-        &self,
+        settings: &TranscodingSettings,
         session_id: &str,
         tier: ServerTier,
         input: &std::path::Path,
         video_bitrate: Option<i64>,
         options: HlsStartOptions,
     ) -> Result<(), WebPlaybackSessionError> {
-        self.hls.apply_settings(&self.transcoding_settings().await);
+        self.hls.apply_settings(settings);
         self.hls
             .start_emby_vod(session_id, tier, input, video_bitrate, options)
             .await?;
@@ -1313,7 +1505,7 @@ impl WebPlaybackSessionService {
             if error.is_terminal_process_failure()
                 && let Ok(Some(tier)) = self.hls.downgrade_to_software(session_id).await
             {
-                self.mark_session_tier(&session.id, tier).await?;
+                self.mark_known_session_tier(&session, tier).await?;
                 self.hls.start_for_initial_asset(session_id, asset).await?;
                 return Ok(());
             }
@@ -1372,12 +1564,87 @@ impl WebPlaybackSessionService {
             } else {
                 (None, None, None)
             };
+        let (video_width, video_height) = self.output_picture(&session).await;
         Ok(WebPlaybackStats {
             session,
             progress,
             latest_segment_bitrate_kbps,
             directory_bytes,
+            video_width,
+            video_height,
         })
+    }
+
+    /// The picture one session hands the browser, from the source probe and the encoder's cap.
+    ///
+    /// Nothing is probed here: the dimensions come from the stored stream details, and the cap
+    /// from the parameters the running FFmpeg was started with. A session that copies the video
+    /// track keeps the source picture, so only tiers 3 and 4 can be scaled down.
+    async fn output_picture(
+        &self,
+        session: &StoredWebPlaybackSession,
+    ) -> (Option<i64>, Option<i64>) {
+        let Some(source_id) = session.media_source_id.as_deref() else {
+            return (None, None);
+        };
+        let dimensions = self
+            .database
+            .find_media_source_video_dimensions(source_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let scales_video = session.plan == "SERVER_HLS" && session.tier >= 3;
+        let cap = if scales_video {
+            self.hls.output_height_cap(&session.id).await
+        } else {
+            None
+        };
+        match (dimensions.height, cap.map(i64::from).filter(|cap| *cap > 0)) {
+            (Some(source_height), Some(cap)) if cap < source_height => (
+                dimensions
+                    .width
+                    .and_then(|width| scaled_output_width(width, source_height, cap)),
+                Some(cap),
+            ),
+            _ => (dimensions.width, dimensions.height),
+        }
+    }
+
+    /// Active server-side transcodes with their live FFmpeg snapshot, for the admin page.
+    ///
+    /// The panel polls every two seconds, so the answer is built from the single listing query
+    /// plus in-memory state: no per-session read of the row the listing already returned.
+    pub(crate) async fn live_transcoding_sessions(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<LiveTranscodingSession>, WebPlaybackSessionError> {
+        let rows = self
+            .database
+            .active_server_transcoding_sessions(limit)
+            .await?;
+        let now = unix_timestamp();
+        let mut sessions = Vec::with_capacity(rows.len());
+        for row in rows {
+            let live = row.expires_at > now;
+            let (progress, latest_segment_bitrate_kbps, directory_bytes) = if live {
+                (
+                    self.hls.progress(&row.session_id).await,
+                    self.hls.latest_segment_bitrate_kbps(&row.session_id).await,
+                    self.hls.session_bytes_cached(&row.session_id).await,
+                )
+            } else {
+                (None, None, None)
+            };
+            sessions.push(LiveTranscodingSession {
+                row,
+                live,
+                progress,
+                latest_segment_bitrate_kbps,
+                directory_bytes,
+            });
+        }
+        Ok(sessions)
     }
 
     pub(crate) async fn heartbeat(
@@ -1693,6 +1960,87 @@ async fn record_transcoding_snapshot(
         .await;
 }
 
+/// Reaps inactive and expired Web playback sessions.
+///
+/// The pass itself is unchanged; what changed is when it runs. Instead of an unconditional 5 s
+/// tick (two queries per tick with nothing to reap), the loop reaps, then sleeps until the earliest
+/// moment a live session can become reapable, and is woken early when a session is created. With no
+/// active session the deadline is empty and the loop parks on its idle fallback.
+async fn run_web_playback_cleanup(
+    database: Database,
+    hls: HlsManager,
+    wake: std::sync::Arc<tokio::sync::Notify>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    if let Err(error) = hls.cleanup_orphans().await {
+        tracing::warn!(%error, "failed to clean orphaned Web HLS directories");
+    }
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        reap_web_playback_sessions(&database, &hls).await;
+        let wait = next_cleanup_wait(&database, unix_timestamp()).await;
+        if crate::application::background_loop::wait_for_wake_or_shutdown(
+            &mut shutdown,
+            &wake,
+            wait,
+        )
+        .await
+        {
+            return;
+        }
+    }
+}
+
+async fn reap_web_playback_sessions(database: &Database, hls: &HlsManager) {
+    let now = unix_timestamp();
+    match database
+        .take_inactive_web_playback_sessions(now, WEB_PLAYBACK_STALE_AFTER_SECONDS)
+        .await
+    {
+        Ok(sessions) => {
+            record_and_stop_hls_sessions(database, hls, sessions, TranscodingOutcome::Expired)
+                .await;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to reap inactive Web HLS sessions");
+        }
+    }
+    match database.take_expired_web_playback_sessions(now).await {
+        Ok(sessions) => {
+            record_and_stop_hls_sessions(database, hls, sessions, TranscodingOutcome::Expired)
+                .await;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to expire Web playback sessions");
+        }
+    }
+}
+
+/// How long the reaper may sleep: the nearest session deadline, bounded by the idle fallback.
+///
+/// A deadline is inclusive (`expires_at < now`), so one extra second guarantees the next pass sees
+/// the session as reapable; the lower bound keeps it out of a tight spin if a deadline ever lies in
+/// the past.
+async fn next_cleanup_wait(database: &Database, now: i64) -> Duration {
+    match database
+        .next_web_playback_session_deadline(WEB_PLAYBACK_STALE_AFTER_SECONDS)
+        .await
+    {
+        Ok(Some(deadline)) => {
+            let seconds = deadline.saturating_sub(now).saturating_add(1);
+            Duration::from_secs(u64::try_from(seconds).unwrap_or(1).max(1))
+                .min(WEB_PLAYBACK_IDLE_FALLBACK)
+        }
+        Ok(None) => WEB_PLAYBACK_IDLE_FALLBACK,
+        Err(error) => {
+            tracing::warn!(%error, "failed to compute the next Web playback session deadline");
+            WEB_PLAYBACK_IDLE_FALLBACK
+        }
+    }
+}
+
 async fn record_and_stop_hls_sessions(
     database: &Database,
     hls: &HlsManager,
@@ -1735,20 +2083,72 @@ fn apply_server_capabilities(
     capabilities
 }
 
+/// Width FFmpeg's `scale=-2` produces for a proportional downscale to `output_height`.
+///
+/// `-2` keeps the aspect ratio and makes the width divisible by two; the value can differ from
+/// FFmpeg's own rounding by one step, which is why it only appears in the statistics readout.
+fn scaled_output_width(source_width: i64, source_height: i64, output_height: i64) -> Option<i64> {
+    if source_width <= 0 || source_height <= 0 || output_height <= 0 {
+        return None;
+    }
+    let width = source_width.saturating_mul(output_height) / source_height;
+    Some(width - width % 2)
+}
+
+/// Rejects a ceiling outside the range a browser can decode, before any database work.
+fn validate_bitrate_limit(limit: PlaybackBitrateLimit) -> Result<(), WebPlaybackSessionError> {
+    match limit.max_bitrate_bps {
+        Some(max_bitrate_bps) if !valid_max_bitrate_bps(max_bitrate_bps) => {
+            Err(WebPlaybackSessionError::Invalid(
+                "max_bitrate_bps is outside the accepted range".to_owned(),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Rejects a resolution ceiling outside the range the Web ladder offers, before any database work.
+fn validate_resolution_limit(
+    limit: PlaybackResolutionLimit,
+) -> Result<(), WebPlaybackSessionError> {
+    match limit.max_height {
+        Some(max_height) if !valid_max_height(max_height) => Err(WebPlaybackSessionError::Invalid(
+            "max_height is outside the accepted range".to_owned(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn choose_plan_for_policy(
     input: PlaybackDecisionInput,
+    bitrate: PlaybackBitrateLimit,
+    resolution: PlaybackResolutionLimit,
     policy: UserPlaybackPolicy,
 ) -> Result<PlaybackPlan, WebPlaybackSessionError> {
-    let unrestricted_plan = choose_plan(input);
+    let plan = choose_plan_with_limits(input, bitrate, resolution);
     if input.source_kind == PlaybackSourceKind::Strm
-        || input.capabilities.direct_play
-        || !matches!(unrestricted_plan, PlaybackPlan::ServerHls { .. })
+        || !matches!(plan, PlaybackPlan::ServerHls { .. })
     {
-        return Ok(unrestricted_plan);
+        return Ok(plan);
     }
 
     let capabilities = input.capabilities;
-    let candidates = [
+    let video_transcode_allowed = policy.allow_video_transcode && policy.allow_audio_transcode;
+    // Tiers that re-encode video, lowest cost first.
+    let re_encode_tiers = [
+        (
+            capabilities.hardware_transcode,
+            video_transcode_allowed,
+            ServerTier::HardwareTranscode,
+        ),
+        (
+            capabilities.software_transcode,
+            video_transcode_allowed,
+            ServerTier::SoftwareTranscode,
+        ),
+    ];
+    // Tiers that may copy the video track; only usable while the ceiling needs no re-encode.
+    let copy_tiers = [
         (
             capabilities.video_copy_to_fmp4 && capabilities.audio_copy_to_fmp4,
             policy.allow_remux,
@@ -1762,20 +2162,28 @@ fn choose_plan_for_policy(
         ),
         (
             capabilities.hardware_transcode,
-            policy.allow_video_transcode && policy.allow_audio_transcode,
+            video_transcode_allowed,
             ServerTier::HardwareTranscode,
         ),
         (
             capabilities.software_transcode,
-            policy.allow_video_transcode && policy.allow_audio_transcode,
+            video_transcode_allowed,
             ServerTier::SoftwareTranscode,
         ),
     ];
+    let candidates: &[(bool, bool, ServerTier)] =
+        if bitrate.requires_video_transcode() || resolution.requires_scale() {
+            // Remux and audio transcode would keep the original video bitrate and picture, so a
+            // ceiling the source exceeds rules them out even when the user policy allows them.
+            &re_encode_tiers
+        } else {
+            &copy_tiers
+        };
     if let Some((_, _, tier)) = candidates
-        .into_iter()
+        .iter()
         .find(|(available, allowed, _)| *available && *allowed)
     {
-        return Ok(PlaybackPlan::ServerHls { tier });
+        return Ok(PlaybackPlan::ServerHls { tier: *tier });
     }
 
     Err(WebPlaybackSessionError::PlaybackPolicyDenied)
@@ -1893,16 +2301,17 @@ mod tests {
     use std::{os::unix::fs::PermissionsExt, path::Path, sync::Arc};
 
     use super::{
-        EMBY_DIRECT_STREAM_TTL_SECONDS, ResourceSigner, SessionStartLocks,
-        apply_server_capabilities, choose_plan_for_policy, emby_hls_start_key, unix_timestamp,
+        EMBY_DIRECT_STREAM_TTL_SECONDS, PlaybackAssetAdmission, ResourceSigner, SessionStartLocks,
+        apply_server_capabilities, emby_hls_start_key, unix_timestamp,
     };
     use crate::{
         application::{
             libraries::LibraryService,
             playback::{
                 decision::{
-                    PlaybackCapabilities, PlaybackDecisionInput, PlaybackPlan, PlaybackSourceKind,
-                    ServerTier, UnsupportedReason,
+                    PlaybackBitrateLimit, PlaybackCapabilities, PlaybackDecisionInput,
+                    PlaybackPlan, PlaybackResolutionLimit, PlaybackSourceKind, ServerTier,
+                    UnsupportedReason,
                 },
                 hls::{HlsManager, HlsSegmentContainer, HlsStartOptions},
                 session::{
@@ -1914,9 +2323,24 @@ mod tests {
         },
         config::Config,
         library::LibraryKind,
-        storage::{NewWebPlaybackSession, UserPlaybackPolicy, WebPlaybackEventClaim},
+        storage::{
+            NewWebPlaybackSession, PlaybackAdmissionDecision, PlaybackAdmissionDenialReason,
+            UserPlaybackPolicy, WebPlaybackEventClaim,
+        },
     };
     use uuid::Uuid;
+
+    /// The policy decision with no resolution ceiling.
+    ///
+    /// The call sites below predate `maxHeight` and keep their three-argument shape; the
+    /// resolution-aware cases call [`super::choose_plan_for_policy`] directly.
+    fn choose_plan_for_policy(
+        input: PlaybackDecisionInput,
+        bitrate: PlaybackBitrateLimit,
+        policy: UserPlaybackPolicy,
+    ) -> Result<PlaybackPlan, super::WebPlaybackSessionError> {
+        super::choose_plan_for_policy(input, bitrate, PlaybackResolutionLimit::NONE, policy)
+    }
 
     #[tokio::test]
     async fn session_start_locks_serialize_one_source_without_blocking_others() {
@@ -2120,6 +2544,7 @@ mod tests {
                     software_transcode: true,
                 },
             },
+            PlaybackBitrateLimit::NONE,
             UserPlaybackPolicy {
                 can_play: true,
                 max_simultaneous_playbacks: 2,
@@ -2151,6 +2576,7 @@ mod tests {
                     software_transcode: true,
                 },
             },
+            PlaybackBitrateLimit::NONE,
             UserPlaybackPolicy {
                 can_play: true,
                 max_simultaneous_playbacks: 2,
@@ -2166,6 +2592,213 @@ mod tests {
                 tier: ServerTier::HardwareTranscode
             })
         ));
+    }
+
+    #[test]
+    fn a_ceiling_the_source_exceeds_skips_copy_tiers_even_when_they_are_allowed() {
+        let input = PlaybackDecisionInput {
+            source_kind: PlaybackSourceKind::LocalFile,
+            capabilities: PlaybackCapabilities {
+                direct_play: true,
+                hls: true,
+                video_copy_to_fmp4: true,
+                audio_copy_to_fmp4: true,
+                hardware_transcode: true,
+                software_transcode: true,
+            },
+        };
+        let ceiling = PlaybackBitrateLimit {
+            source_bitrate_bps: Some(20_000_000),
+            max_bitrate_bps: Some(4_000_000),
+        };
+
+        assert!(matches!(
+            choose_plan_for_policy(
+                input,
+                ceiling,
+                UserPlaybackPolicy {
+                    can_play: true,
+                    max_simultaneous_playbacks: 2,
+                    allow_remux: true,
+                    allow_audio_transcode: true,
+                    allow_video_transcode: true,
+                },
+            ),
+            Ok(PlaybackPlan::ServerHls {
+                tier: ServerTier::HardwareTranscode
+            })
+        ));
+        assert!(
+            matches!(
+                choose_plan_for_policy(
+                    input,
+                    ceiling,
+                    UserPlaybackPolicy {
+                        can_play: true,
+                        max_simultaneous_playbacks: 2,
+                        allow_remux: true,
+                        allow_audio_transcode: true,
+                        allow_video_transcode: false,
+                    },
+                ),
+                Err(super::WebPlaybackSessionError::PlaybackPolicyDenied)
+            ),
+            "a remux cannot honour the ceiling, so the policy is asked for a re-encode"
+        );
+        assert!(
+            matches!(
+                choose_plan_for_policy(
+                    input,
+                    PlaybackBitrateLimit {
+                        source_bitrate_bps: Some(2_000_000),
+                        max_bitrate_bps: Some(4_000_000),
+                    },
+                    UserPlaybackPolicy {
+                        can_play: true,
+                        max_simultaneous_playbacks: 2,
+                        allow_remux: true,
+                        allow_audio_transcode: true,
+                        allow_video_transcode: false,
+                    },
+                ),
+                Ok(PlaybackPlan::Direct)
+            ),
+            "a source already inside the ceiling keeps Direct Play"
+        );
+    }
+
+    #[test]
+    fn a_ceiling_outside_the_accepted_range_is_invalid() {
+        let accepted = PlaybackBitrateLimit {
+            source_bitrate_bps: None,
+            max_bitrate_bps: Some(4_000_000),
+        };
+        assert!(super::validate_bitrate_limit(accepted).is_ok());
+        assert!(super::validate_bitrate_limit(PlaybackBitrateLimit::NONE).is_ok());
+        for rejected in [99_999, 200_000_001, 0, -4_000_000] {
+            assert!(
+                matches!(
+                    super::validate_bitrate_limit(PlaybackBitrateLimit {
+                        source_bitrate_bps: None,
+                        max_bitrate_bps: Some(rejected),
+                    }),
+                    Err(super::WebPlaybackSessionError::Invalid(_))
+                ),
+                "{rejected} bps must be rejected at the service boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resolution_ceiling_outside_the_accepted_range_is_invalid() {
+        let accepted = PlaybackResolutionLimit {
+            source_height: Some(2_160),
+            max_height: Some(1_080),
+        };
+        assert!(super::validate_resolution_limit(accepted).is_ok());
+        assert!(super::validate_resolution_limit(PlaybackResolutionLimit::NONE).is_ok());
+        for rejected in [143, 4_321, 0, -1] {
+            assert!(
+                matches!(
+                    super::validate_resolution_limit(PlaybackResolutionLimit {
+                        source_height: Some(2_160),
+                        max_height: Some(rejected),
+                    }),
+                    Err(super::WebPlaybackSessionError::Invalid(_))
+                ),
+                "{rejected}p must be rejected at the service boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resolution_ceiling_the_source_exceeds_skips_copy_tiers() {
+        let input = PlaybackDecisionInput {
+            source_kind: PlaybackSourceKind::LocalFile,
+            capabilities: PlaybackCapabilities {
+                direct_play: true,
+                hls: true,
+                video_copy_to_fmp4: true,
+                audio_copy_to_fmp4: true,
+                hardware_transcode: true,
+                software_transcode: true,
+            },
+        };
+        let resolution = PlaybackResolutionLimit {
+            source_height: Some(2_160),
+            max_height: Some(1_080),
+        };
+
+        assert!(matches!(
+            super::choose_plan_for_policy(
+                input,
+                PlaybackBitrateLimit::NONE,
+                resolution,
+                UserPlaybackPolicy {
+                    can_play: true,
+                    max_simultaneous_playbacks: 2,
+                    allow_remux: true,
+                    allow_audio_transcode: true,
+                    allow_video_transcode: true,
+                },
+            ),
+            Ok(PlaybackPlan::ServerHls {
+                tier: ServerTier::HardwareTranscode
+            })
+        ));
+        assert!(
+            matches!(
+                super::choose_plan_for_policy(
+                    input,
+                    PlaybackBitrateLimit::NONE,
+                    resolution,
+                    UserPlaybackPolicy {
+                        can_play: true,
+                        max_simultaneous_playbacks: 2,
+                        allow_remux: true,
+                        allow_audio_transcode: true,
+                        allow_video_transcode: false,
+                    },
+                ),
+                Err(super::WebPlaybackSessionError::PlaybackPolicyDenied)
+            ),
+            "a copy cannot shrink the picture, so the policy is asked for a re-encode"
+        );
+        assert!(
+            matches!(
+                super::choose_plan_for_policy(
+                    input,
+                    PlaybackBitrateLimit::NONE,
+                    PlaybackResolutionLimit {
+                        source_height: Some(720),
+                        max_height: Some(1_080),
+                    },
+                    UserPlaybackPolicy {
+                        can_play: true,
+                        max_simultaneous_playbacks: 2,
+                        allow_remux: true,
+                        allow_audio_transcode: true,
+                        allow_video_transcode: false,
+                    },
+                ),
+                Ok(PlaybackPlan::Direct)
+            ),
+            "a source inside its ceiling keeps the plain decision"
+        );
+    }
+
+    #[test]
+    fn the_statistics_width_follows_the_proportional_scale_rule() {
+        assert_eq!(super::scaled_output_width(3_840, 2_160, 1_080), Some(1_920));
+        assert_eq!(super::scaled_output_width(1_920, 1_080, 720), Some(1_280));
+        assert_eq!(
+            super::scaled_output_width(1_920, 1_080, 721),
+            Some(1_280),
+            "the derived width is rounded down to an even number"
+        );
+        assert_eq!(super::scaled_output_width(0, 1_080, 720), None);
+        assert_eq!(super::scaled_output_width(1_920, 0, 720), None);
+        assert_eq!(super::scaled_output_width(1_920, 1_080, 0), None);
     }
 
     #[test]
@@ -2192,6 +2825,7 @@ mod tests {
                     source_kind: PlaybackSourceKind::LocalFile,
                     capabilities,
                 },
+                PlaybackBitrateLimit::NONE,
                 policy,
             ),
             Err(super::WebPlaybackSessionError::PlaybackPolicyDenied)
@@ -2205,6 +2839,7 @@ mod tests {
                         ..capabilities
                     },
                 },
+                PlaybackBitrateLimit::NONE,
                 policy,
             ),
             Ok(PlaybackPlan::Direct)
@@ -2215,6 +2850,7 @@ mod tests {
                     source_kind: PlaybackSourceKind::Strm,
                     capabilities,
                 },
+                PlaybackBitrateLimit::NONE,
                 policy,
             ),
             Ok(PlaybackPlan::Unsupported {
@@ -2231,6 +2867,7 @@ mod tests {
                         ..capabilities
                     },
                 },
+                PlaybackBitrateLimit::NONE,
                 UserPlaybackPolicy {
                     allow_remux: false,
                     allow_audio_transcode: false,
@@ -2247,6 +2884,7 @@ mod tests {
                         source_kind: PlaybackSourceKind::LocalFile,
                         capabilities,
                     },
+                    PlaybackBitrateLimit::NONE,
                     UserPlaybackPolicy {
                         allow_remux: false,
                         allow_audio_transcode: false,
@@ -2341,6 +2979,7 @@ mod tests {
             signer: Arc::new(ResourceSigner::random()),
             hls: HlsManager::new_for_tests(config.config_dir.clone(), "/usr/bin/false".to_owned()),
             start_locks: SessionStartLocks::default(),
+            cleanup: Default::default(),
         };
         service.stop("session-a", &owner_id).await?;
 
@@ -2357,6 +2996,557 @@ mod tests {
             "stopping one session must leave another session's token alone"
         );
         Ok(())
+    }
+
+    /// An HLS asset request authorizes one stored session row. The access-rule check needs the
+    /// session's authorization device and client, which are columns of that same row, so the
+    /// request must not read the row a second time for them.
+    #[tokio::test]
+    async fn hls_resource_authorization_reads_the_session_row_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = crate::storage::Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let owner = setup.complete("Owner", "Owner", "correct password").await?;
+        let owner_id = owner.id.to_string();
+        database
+            .update_user_playback_policy(
+                &owner_id,
+                UserPlaybackPolicy {
+                    can_play: true,
+                    max_simultaneous_playbacks: 2,
+                    allow_remux: true,
+                    allow_audio_transcode: true,
+                    allow_video_transcode: true,
+                },
+            )
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Playback", LibraryKind::Movie, false)
+            .await?;
+        let item_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Playback', 'playback', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        let now = unix_timestamp();
+        database
+            .insert_web_playback_session(NewWebPlaybackSession {
+                id: "resource-session",
+                user_id: &owner_id,
+                item_id: &item_id,
+                media_source_id: None,
+                play_session_id: "lux-web:resource-session",
+                tier: i64::from(ServerTier::SoftwareTranscode.number()),
+                plan: "SERVER_HLS",
+                temp_dir: None,
+                is_admin: false,
+                expires_at: now + 900,
+                now,
+            })
+            .await?;
+        assert!(
+            database
+                .set_web_playback_access_context(
+                    "resource-session",
+                    &owner_id,
+                    Some("browser-device-id"),
+                    Some("Lux Web"),
+                    now,
+                )
+                .await?
+        );
+        let service = WebPlaybackSessionService {
+            database: database.clone(),
+            signer: Arc::new(ResourceSigner::random()),
+            hls: HlsManager::new_for_tests(config.config_dir.clone(), "/usr/bin/false".to_owned()),
+            start_locks: SessionStartLocks::default(),
+            cleanup: Default::default(),
+        };
+
+        let resource = "hls:index.m3u8";
+        let expires_at = now + 60;
+        let signature = service
+            .signer
+            .sign("resource-session", resource, expires_at)
+            .ok_or("the resource signature was not produced")?;
+        database.reset_query_count();
+        let authorized = service
+            .authorize_resource_with_ip("resource-session", resource, expires_at, &signature, None)
+            .await?;
+        assert_eq!(authorized.session.user_id, owner_id);
+        assert_eq!(
+            database.query_count(),
+            4,
+            "the session row, the device/client blacklist match, the IP rules and the policy"
+        );
+
+        // Admission reuses the policy this request already read instead of reading `users` again.
+        let session = authorized.session;
+        let policy = authorized.policy;
+        assert!(
+            policy.is_some(),
+            "a server-side HLS request authorizes with a playback policy"
+        );
+        database.reset_query_count();
+        let admitted = service
+            .admit_playback_session(&session.user_id, &session.play_session_id, policy.as_ref())
+            .await?
+            .ok_or("the admission must be recorded")?;
+        assert_eq!(admitted.decision, PlaybackAdmissionDecision::Admitted);
+        assert_eq!(admitted.active_playback_count, 1);
+        assert_eq!(
+            database.query_count(),
+            3,
+            "the stale reclaim, the active count and the upsert"
+        );
+        Ok(())
+    }
+
+    /// One user, one service and the concurrent playback limit the test picks.
+    async fn asset_admission_fixture(
+        max_simultaneous_playbacks: i64,
+    ) -> Result<
+        (
+            tempfile::TempDir,
+            crate::storage::Database,
+            WebPlaybackSessionService,
+            String,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = crate::storage::Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let user = setup.complete("Owner", "Owner", "correct password").await?;
+        let user_id = user.id.to_string();
+        database
+            .update_user_playback_policy(
+                &user_id,
+                UserPlaybackPolicy {
+                    can_play: true,
+                    max_simultaneous_playbacks,
+                    allow_remux: true,
+                    allow_audio_transcode: true,
+                    allow_video_transcode: true,
+                },
+            )
+            .await?;
+        let service = WebPlaybackSessionService {
+            database: database.clone(),
+            signer: Arc::new(ResourceSigner::random()),
+            hls: HlsManager::new_for_tests(config.config_dir.clone(), "/usr/bin/false".to_owned()),
+            start_locks: SessionStartLocks::default(),
+            cleanup: Default::default(),
+        };
+        Ok((temp_dir, database, service, user_id))
+    }
+
+    /// A streaming session requests an asset every few seconds. Inside the re-check interval the
+    /// admission must only *look*: one read, no write, and the stamp stays where the last full
+    /// admission put it — otherwise the interval would never expire.
+    #[tokio::test]
+    async fn hls_asset_requests_check_the_slot_without_writing_inside_the_interval()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database, service, user_id) = asset_admission_fixture(2).await?;
+        let play_session_id = "asset-check-play-session";
+        let policy = database
+            .get_user_playback_policy(&user_id)
+            .await?
+            .expect("the fixture user exists");
+        let started = 1_000_000_i64;
+
+        database.reset_query_count();
+        let first = service
+            .admit_playback_asset_request_at(&user_id, play_session_id, started, Some(&policy))
+            .await?;
+        let PlaybackAssetAdmission::Evaluated(result) = first else {
+            return Err("the first asset request must run the full admission".into());
+        };
+        assert_eq!(result.decision, PlaybackAdmissionDecision::Admitted);
+        assert_eq!(result.active_playback_count, 1);
+        assert_eq!(
+            database.query_count(),
+            4,
+            "the first request checks the slot, then runs the full admission"
+        );
+        assert_eq!(
+            asset_admission_row(&database, &user_id, play_session_id).await?,
+            (started, started),
+            "the full admission writes (admitted_at, last_seen_at) at the request time"
+        );
+
+        // Seven more segments, four seconds apart: all inside the interval, all write-free.
+        for segment in 1..=7 {
+            let now = started + segment * 4;
+            database.reset_query_count();
+            let outcome = service
+                .admit_playback_asset_request_at(&user_id, play_session_id, now, Some(&policy))
+                .await?;
+            assert!(
+                matches!(outcome, PlaybackAssetAdmission::Fresh),
+                "the segment at {now} is inside the interval"
+            );
+            assert_eq!(
+                database.query_count(),
+                1,
+                "the segment at {now} must be one read"
+            );
+            assert_eq!(
+                asset_admission_row(&database, &user_id, play_session_id).await?,
+                (started, started),
+                "the segment at {now} must not write the admission"
+            );
+        }
+
+        // The segment that crosses the thirty-second interval runs one full admission, which
+        // re-opens it.
+        database.reset_query_count();
+        let crossing = service
+            .admit_playback_asset_request_at(&user_id, play_session_id, started + 32, Some(&policy))
+            .await?;
+        assert!(
+            matches!(
+                crossing,
+                PlaybackAssetAdmission::Evaluated(ref result)
+                    if result.decision == PlaybackAdmissionDecision::Admitted
+            ),
+            "the segment crossing the interval re-evaluates the limits"
+        );
+        assert_eq!(
+            database.query_count(),
+            4,
+            "the crossing request checks the slot, then runs the full admission"
+        );
+        assert_eq!(
+            asset_admission_row(&database, &user_id, play_session_id).await?,
+            (started, started + 32),
+            "the full admission re-opens the interval at its own request time; admitted_at stays \
+             because the slot was never reclaimed"
+        );
+
+        // The re-opened interval is exactly thirty seconds long: 29 s later the request is still
+        // write-free, 30 s later it re-evaluates again.
+        database.reset_query_count();
+        assert!(
+            matches!(
+                service
+                    .admit_playback_asset_request_at(
+                        &user_id,
+                        play_session_id,
+                        started + 61,
+                        Some(&policy)
+                    )
+                    .await?,
+                PlaybackAssetAdmission::Fresh
+            ),
+            "one second inside the re-opened interval is fresh"
+        );
+        assert_eq!(database.query_count(), 1);
+        database.reset_query_count();
+        assert!(
+            matches!(
+                service
+                    .admit_playback_asset_request_at(
+                        &user_id,
+                        play_session_id,
+                        started + 62,
+                        Some(&policy)
+                    )
+                    .await?,
+                PlaybackAssetAdmission::Evaluated(_)
+            ),
+            "the interval expires exactly thirty seconds after the full admission"
+        );
+        assert_eq!(database.query_count(), 4);
+        Ok(())
+    }
+
+    /// Regression test for the defect the first version had: with a renewal that advances the
+    /// stamp, no interval ever expires and the limits are never re-evaluated again. Sustained
+    /// asset requests must produce a periodic full admission.
+    #[tokio::test]
+    async fn sustained_asset_requests_re_run_the_full_admission_every_interval()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database, service, user_id) = asset_admission_fixture(2).await?;
+        let play_session_id = "asset-periodic-play-session";
+        let policy = database
+            .get_user_playback_policy(&user_id)
+            .await?
+            .expect("the fixture user exists");
+        let started = 1_000_000_i64;
+
+        let mut full_admissions = Vec::new();
+        let mut write_free_requests = 0;
+        for step in 0..=30 {
+            let now = started + step * 4;
+            database.reset_query_count();
+            match service
+                .admit_playback_asset_request_at(&user_id, play_session_id, now, Some(&policy))
+                .await?
+            {
+                PlaybackAssetAdmission::Fresh => {
+                    write_free_requests += 1;
+                    assert_eq!(
+                        database.query_count(),
+                        1,
+                        "the write-free request at {now} is one read"
+                    );
+                }
+                PlaybackAssetAdmission::Evaluated(result) => {
+                    assert_eq!(result.decision, PlaybackAdmissionDecision::Admitted);
+                    full_admissions.push(now);
+                }
+                PlaybackAssetAdmission::NotFound => {
+                    return Err("the fixture user must exist".into());
+                }
+            }
+        }
+        assert_eq!(
+            full_admissions,
+            vec![started, started + 32, started + 64, started + 96],
+            "a two-minutes stream re-evaluates the limits every interval, not once"
+        );
+        assert_eq!(write_free_requests, 27);
+        for gap in full_admissions.windows(2).map(|pair| pair[1] - pair[0]) {
+            assert!(
+                (30..=34).contains(&gap),
+                "each interval is thirty seconds plus at most one segment ({gap} s)"
+            );
+        }
+        Ok(())
+    }
+
+    /// A revoked `can_play` is refused on the next asset request, not up to an interval later.
+    #[tokio::test]
+    async fn a_revoked_can_play_refuses_the_next_asset_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database, service, user_id) = asset_admission_fixture(2).await?;
+        let play_session_id = "asset-revoked-play-session";
+        let started = 1_000_000_i64;
+        let policy = database
+            .get_user_playback_policy(&user_id)
+            .await?
+            .expect("the fixture user exists");
+        let admitted = service
+            .admit_playback_asset_request_at(&user_id, play_session_id, started, Some(&policy))
+            .await?;
+        assert!(
+            matches!(
+                admitted,
+                PlaybackAssetAdmission::Evaluated(ref result)
+                    if result.decision == PlaybackAdmissionDecision::Admitted
+            ),
+            "the stream starts admitted"
+        );
+
+        // The administrator revokes playback one second into the stream.
+        database
+            .update_user_playback_policy(
+                &user_id,
+                UserPlaybackPolicy {
+                    can_play: false,
+                    ..policy
+                },
+            )
+            .await?;
+        let revoked_policy = database
+            .get_user_playback_policy(&user_id)
+            .await?
+            .expect("the fixture user exists");
+        assert!(!revoked_policy.can_play);
+        database.reset_query_count();
+        let refused = service
+            .admit_playback_asset_request_at(
+                &user_id,
+                play_session_id,
+                started + 1,
+                Some(&revoked_policy),
+            )
+            .await?;
+        assert!(
+            matches!(
+                refused,
+                PlaybackAssetAdmission::Evaluated(ref result)
+                    if result.decision
+                        == PlaybackAdmissionDecision::Denied(
+                            PlaybackAdmissionDenialReason::PlaybackDisabled
+                        )
+            ),
+            "the revoked policy is refused on the next segment, one second after the admission"
+        );
+        assert_eq!(
+            database.query_count(),
+            2,
+            "the revocation is decided by the full admission (stale reclaim and active count)"
+        );
+        assert_eq!(
+            asset_admission_row(&database, &user_id, play_session_id).await?,
+            (started, started),
+            "a refusal writes nothing"
+        );
+        Ok(())
+    }
+
+    /// A user at the limit is refused when the second playback session is created and again at
+    /// that session's first asset request; a reclaimed slot is refused at its very next request.
+    #[tokio::test]
+    async fn a_second_playback_is_refused_and_a_reclaimed_slot_falls_back()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database, service, user_id) = asset_admission_fixture(1).await?;
+        // `check_playback_admission` (the creation path) reads the wall clock, so this timeline
+        // has to be the wall clock too.
+        let started = unix_timestamp();
+        let policy = database
+            .get_user_playback_policy(&user_id)
+            .await?
+            .expect("the fixture user exists");
+        let admitted = service
+            .admit_playback_asset_request_at(&user_id, "first-play-session", started, Some(&policy))
+            .await?;
+        assert!(
+            matches!(
+                admitted,
+                PlaybackAssetAdmission::Evaluated(ref result)
+                    if result.decision == PlaybackAdmissionDecision::Admitted
+            ),
+            "the first playback takes the only slot"
+        );
+
+        // Session creation calls this before it writes the session row.
+        let creation_check = service
+            .check_playback_admission(&user_id)
+            .await?
+            .expect("the fixture user exists");
+        assert_eq!(
+            creation_check.decision,
+            PlaybackAdmissionDecision::Denied(PlaybackAdmissionDenialReason::ConcurrentLimit),
+            "the second playback is refused when its session is created"
+        );
+
+        // The refused playback never admitted, so its first asset request re-evaluates at once.
+        database.reset_query_count();
+        let refused = service
+            .admit_playback_asset_request_at(
+                &user_id,
+                "second-play-session",
+                started,
+                Some(&policy),
+            )
+            .await?;
+        assert!(
+            matches!(
+                refused,
+                PlaybackAssetAdmission::Evaluated(ref result)
+                    if result.decision
+                        == PlaybackAdmissionDecision::Denied(
+                            PlaybackAdmissionDenialReason::ConcurrentLimit
+                        )
+            ),
+            "the second playback's first asset request is refused, not waved through"
+        );
+        assert_eq!(
+            database.query_count(),
+            3,
+            "there is no fresh slot, so the refusal costs the check plus the full admission"
+        );
+
+        // A slot that keeps streaming is refreshed by the full admission, so it stays inside the
+        // active set; once it is reclaimed, the next asset request falls back and is refused.
+        let re_admitted = service
+            .admit_playback_asset_request_at(
+                &user_id,
+                "first-play-session",
+                started + 32,
+                Some(&policy),
+            )
+            .await?;
+        assert!(
+            matches!(
+                re_admitted,
+                PlaybackAssetAdmission::Evaluated(ref result)
+                    if result.decision == PlaybackAdmissionDecision::Admitted
+            ),
+            "the admitted stream re-evaluates its own slot and keeps it"
+        );
+        assert!(
+            database
+                .release_playback_admission(&user_id, "first-play-session", started + 33)
+                .await?
+        );
+        database.reset_query_count();
+        let reclaimed = service
+            .admit_playback_asset_request_at(
+                &user_id,
+                "first-play-session",
+                started + 34,
+                Some(&policy),
+            )
+            .await?;
+        assert!(
+            matches!(
+                reclaimed,
+                PlaybackAssetAdmission::Evaluated(ref result)
+                    if result.decision == PlaybackAdmissionDecision::Admitted
+            ),
+            "a reclaimed slot falls back to the full admission, which re-admits below the limit"
+        );
+        assert_eq!(
+            database.query_count(),
+            4,
+            "the fallback is the slot check plus the full admission"
+        );
+
+        // With another playback holding the slot, the same reclaim now refuses the request.
+        let second = service
+            .admit_playback_asset_request_at(
+                &user_id,
+                "third-play-session",
+                started + 35,
+                Some(&policy),
+            )
+            .await?;
+        assert!(
+            matches!(
+                second,
+                PlaybackAssetAdmission::Evaluated(ref result)
+                    if result.decision
+                        == PlaybackAdmissionDecision::Denied(
+                            PlaybackAdmissionDenialReason::ConcurrentLimit
+                        )
+            ),
+            "the limit is enforced again after the re-admission"
+        );
+        Ok(())
+    }
+
+    /// Reads `(admitted_at, last_seen_at)` so a test can prove a request wrote nothing.
+    async fn asset_admission_row(
+        database: &crate::storage::Database,
+        user_id: &str,
+        play_session_id: &str,
+    ) -> Result<(i64, i64), Box<dyn std::error::Error>> {
+        Ok(sqlx::query_as(
+            "SELECT admitted_at, last_seen_at FROM playback_admissions
+             WHERE user_id = ? AND play_session_id = ?",
+        )
+        .bind(user_id)
+        .bind(play_session_id)
+        .fetch_one(database.pool())
+        .await?)
     }
 
     #[cfg(unix)]
@@ -2393,6 +3583,7 @@ mod tests {
             signer: Arc::new(ResourceSigner::random()),
             hls: HlsManager::new_for_tests(config.config_dir.clone(), "/usr/bin/false".to_owned()),
             start_locks: SessionStartLocks::default(),
+            cleanup: Default::default(),
         };
         let owner_id = owner.id.to_string();
         service
@@ -2460,6 +3651,7 @@ mod tests {
             signer: Arc::new(ResourceSigner::random()),
             hls: HlsManager::new_for_tests(config.config_dir.clone(), "/usr/bin/false".to_owned()),
             start_locks: SessionStartLocks::default(),
+            cleanup: Default::default(),
         };
         let owner_id = owner.id.to_string();
         let now = unix_timestamp();
@@ -2517,6 +3709,101 @@ mod tests {
         Ok(())
     }
 
+    /// The admin panel polls this listing every two seconds, so its statement count must not grow
+    /// with the session count: the rows already carry every stored column the panel renders and
+    /// the rest of the answer is the in-memory FFmpeg snapshot.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn admin_transcoding_listing_costs_one_statement_regardless_of_session_count()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = crate::storage::Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let owner = setup.complete("Owner", "Owner", "correct password").await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Playback", LibraryKind::Movie, false)
+            .await?;
+        let item_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Playback', 'playback', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        let service = WebPlaybackSessionService {
+            database: database.clone(),
+            signer: Arc::new(ResourceSigner::random()),
+            hls: HlsManager::new_for_tests(config.config_dir.clone(), "/usr/bin/false".to_owned()),
+            start_locks: SessionStartLocks::default(),
+            cleanup: Default::default(),
+        };
+        let owner_id = owner.id.to_string();
+        let now = unix_timestamp();
+        for (session_id, expires_at) in [
+            ("admin-live-a", now + 900),
+            ("admin-live-b", now + 900),
+            // The reaper may not have collected this one yet; the panel still lists the row but
+            // must not report live progress for it.
+            ("admin-expired", now - 1),
+        ] {
+            let play_session_id = format!("lux-web:{session_id}");
+            service
+                .database
+                .insert_web_playback_session(NewWebPlaybackSession {
+                    id: session_id,
+                    user_id: &owner_id,
+                    item_id: &item_id,
+                    media_source_id: None,
+                    play_session_id: &play_session_id,
+                    tier: i64::from(ServerTier::Remux.number()),
+                    plan: "SERVER_HLS",
+                    temp_dir: None,
+                    is_admin: false,
+                    expires_at,
+                    now,
+                })
+                .await?;
+        }
+
+        database.reset_query_count();
+        let listing = service.live_transcoding_sessions(24).await?;
+        assert_eq!(
+            database.query_count(),
+            1,
+            "one poll is one statement: the listing rows carry the session columns the panel \
+             shows and the FFmpeg snapshot lives in memory"
+        );
+        assert_eq!(listing.len(), 3, "all three active rows are listed");
+        assert_eq!(
+            listing.iter().filter(|session| session.live).count(),
+            2,
+            "only the rows inside their deadline have a live snapshot"
+        );
+        for session in &listing {
+            assert_eq!(
+                session.row.play_session_id,
+                format!("lux-web:{}", session.row.session_id),
+                "the stored play session id comes from the listing row"
+            );
+            assert!(session.progress.is_none(), "no FFmpeg was started here");
+            assert!(
+                session.directory_bytes.is_none(),
+                "no session directory exists"
+            );
+            assert_eq!(session.row.item_title.as_deref(), Some("Playback"));
+            assert_eq!(session.row.user_name.as_deref(), Some("Owner"));
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn disabling_server_transcoding_degrades_plans_to_unsupported()
@@ -2569,16 +3856,22 @@ mod tests {
             hardware_transcode: false,
             software_transcode: true,
         };
+        let settings = service.transcoding_settings().await;
         let created = service
-            .create(CreateWebPlaybackSession {
-                user_id: &user_id,
-                is_admin: true,
-                item_id: &item_id,
-                media_source_id: &source_id,
-                play_session_prefix: "lux-web",
-                source_kind: PlaybackSourceKind::LocalFile,
-                capabilities: transcode_capabilities,
-            })
+            .create_with_settings(
+                CreateWebPlaybackSession {
+                    user_id: &user_id,
+                    is_admin: true,
+                    item_id: &item_id,
+                    media_source_id: &source_id,
+                    play_session_prefix: "lux-web",
+                    source_kind: PlaybackSourceKind::LocalFile,
+                    capabilities: transcode_capabilities,
+                    bitrate: PlaybackBitrateLimit::NONE,
+                    resolution: PlaybackResolutionLimit::NONE,
+                },
+                &settings,
+            )
             .await?;
         assert_eq!(
             created.plan,
@@ -2593,18 +3886,23 @@ mod tests {
         assert_eq!(stored, 0);
 
         let direct = service
-            .create(CreateWebPlaybackSession {
-                user_id: &user_id,
-                is_admin: true,
-                item_id: &item_id,
-                media_source_id: &source_id,
-                play_session_prefix: "lux-web",
-                source_kind: PlaybackSourceKind::LocalFile,
-                capabilities: PlaybackCapabilities {
-                    direct_play: true,
-                    ..transcode_capabilities
+            .create_with_settings(
+                CreateWebPlaybackSession {
+                    user_id: &user_id,
+                    is_admin: true,
+                    item_id: &item_id,
+                    media_source_id: &source_id,
+                    play_session_prefix: "lux-web",
+                    source_kind: PlaybackSourceKind::LocalFile,
+                    capabilities: PlaybackCapabilities {
+                        direct_play: true,
+                        ..transcode_capabilities
+                    },
+                    bitrate: PlaybackBitrateLimit::NONE,
+                    resolution: PlaybackResolutionLimit::NONE,
                 },
-            })
+                &settings,
+            )
             .await?;
         assert_eq!(direct.plan, WebPlaybackPlan::Direct);
         Ok(())
@@ -2653,6 +3951,7 @@ mod tests {
                 script.to_string_lossy().into_owned(),
             ),
             start_locks: SessionStartLocks::default(),
+            cleanup: Default::default(),
         };
         let user_id = user.id.to_string();
         service
@@ -2730,6 +4029,7 @@ mod tests {
             signer: Arc::new(ResourceSigner::random()),
             hls: HlsManager::new_for_tests(config.config_dir.clone(), "/usr/bin/false".to_owned()),
             start_locks: SessionStartLocks::default(),
+            cleanup: Default::default(),
         };
         let user_id = user.id.to_string();
         let now = unix_timestamp();
@@ -2776,6 +4076,119 @@ mod tests {
                 .join("web-playback/failed-manifest")
                 .exists()
         );
+        Ok(())
+    }
+
+    /// A server-side HLS start reads the transcoding policy once: `create` needs it to decide the
+    /// plan and the start step needs it to configure FFmpeg, and both run for one request.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn emby_hls_start_reads_the_transcoding_policy_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8099".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = crate::storage::Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let user = setup.complete("Admin", "Admin", "correct password").await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Playback", LibraryKind::Movie, false)
+            .await?;
+        let item_id = Uuid::now_v7().to_string();
+        let source_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Playback', 'playback', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_sources (id, item_id, source_kind)
+             VALUES (?, ?, 'LOCAL_FILE')",
+        )
+        .bind(&source_id)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+        let script = temp_dir.path().join("fake-ffmpeg-hls-start");
+        tokio::fs::write(
+            &script,
+            r##"#!/bin/sh
+set -eu
+manifest=""
+segment=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -hls_segment_filename) segment="$2"; shift 2 ;;
+    *.m3u8) manifest="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+directory=$(dirname "$manifest")
+mkdir -p "$directory"
+printf '#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:4,\nsegment_000000.m4s\n' > "$manifest"
+printf init > "$directory/init.mp4"
+printf segment > "$(printf '%s' "$segment" | sed 's/%06d/000000/')"
+while :; do sleep 1; done
+"##,
+        )
+        .await?;
+        let mut permissions = tokio::fs::metadata(&script).await?.permissions();
+        permissions.set_mode(0o700);
+        tokio::fs::set_permissions(&script, permissions).await?;
+        let service = WebPlaybackSessionService {
+            database: database.clone(),
+            signer: Arc::new(ResourceSigner::random()),
+            hls: HlsManager::new_for_tests(
+                config.config_dir.clone(),
+                script.to_string_lossy().into_owned(),
+            ),
+            start_locks: SessionStartLocks::default(),
+            cleanup: Default::default(),
+        };
+        let user_id = user.id.to_string();
+
+        database.reset_query_count();
+        let created = service
+            .create_and_start_emby_hls(
+                CreateWebPlaybackSession {
+                    user_id: &user_id,
+                    is_admin: true,
+                    item_id: &item_id,
+                    media_source_id: &source_id,
+                    play_session_prefix: "lux-emby",
+                    source_kind: PlaybackSourceKind::LocalFile,
+                    capabilities: PlaybackCapabilities {
+                        direct_play: false,
+                        hls: true,
+                        video_copy_to_fmp4: false,
+                        audio_copy_to_fmp4: false,
+                        hardware_transcode: false,
+                        software_transcode: true,
+                    },
+                    bitrate: PlaybackBitrateLimit::NONE,
+                    resolution: PlaybackResolutionLimit::NONE,
+                },
+                Path::new("input.mkv"),
+                Some(1_000_000),
+                HlsStartOptions {
+                    segment_container: HlsSegmentContainer::FragmentedMp4,
+                    start_time_ticks: None,
+                    runtime_ticks: Some(600 * 10_000_000),
+                },
+            )
+            .await?;
+        assert_eq!(
+            database.query_count(),
+            4,
+            "the user policy, one transcoding policy read, the session insert and the temp dir"
+        );
+        service.stop(&created.id, &user_id).await?;
         Ok(())
     }
 
@@ -2854,6 +4267,7 @@ while :; do sleep 1; done
                 script.to_string_lossy().into_owned(),
             ),
             start_locks: SessionStartLocks::default(),
+            cleanup: Default::default(),
         };
         let user_id = user.id.to_string();
         let created = service
@@ -2873,6 +4287,8 @@ while :; do sleep 1; done
                         hardware_transcode: false,
                         software_transcode: true,
                     },
+                    bitrate: PlaybackBitrateLimit::NONE,
+                    resolution: PlaybackResolutionLimit::NONE,
                 },
                 Path::new("input.mkv"),
                 Some(1_000_000),
@@ -2921,6 +4337,8 @@ while :; do sleep 1; done
                         hardware_transcode: false,
                         software_transcode: true,
                     },
+                    bitrate: PlaybackBitrateLimit::NONE,
+                    resolution: PlaybackResolutionLimit::NONE,
                 },
                 Path::new("input.mkv"),
                 Some(1_000_000),
@@ -3002,6 +4420,7 @@ while :; do sleep 1; done
                 script.to_string_lossy().into_owned(),
             ),
             start_locks: SessionStartLocks::default(),
+            cleanup: Default::default(),
         };
         let user_id = user.id.to_string();
         let capabilities = PlaybackCapabilities {
@@ -3022,6 +4441,8 @@ while :; do sleep 1; done
                     play_session_prefix: "lux-emby",
                     source_kind: PlaybackSourceKind::LocalFile,
                     capabilities,
+                    bitrate: PlaybackBitrateLimit::NONE,
+                    resolution: PlaybackResolutionLimit::NONE,
                 },
                 Path::new("input.mkv"),
                 Some(1_000_000),
@@ -3050,6 +4471,8 @@ while :; do sleep 1; done
                     play_session_prefix: "lux-emby",
                     source_kind: PlaybackSourceKind::LocalFile,
                     capabilities,
+                    bitrate: PlaybackBitrateLimit::NONE,
+                    resolution: PlaybackResolutionLimit::NONE,
                 },
                 Path::new("input.mkv"),
                 Some(2_000_000),
@@ -3095,6 +4518,191 @@ while :; do sleep 1; done
                 .exists()
         );
 
+        Ok(())
+    }
+
+    /// Builds a database with one user, one movie and a session row the reaper must observe.
+    async fn cleanup_fixture() -> Result<
+        (
+            tempfile::TempDir,
+            Config,
+            crate::storage::Database,
+            String,
+            String,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = crate::storage::Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let owner = setup.complete("Owner", "Owner", "correct password").await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Cleanup", LibraryKind::Movie, false)
+            .await?;
+        let item_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Cleanup', 'cleanup', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        Ok((temp_dir, config, database, owner.id.to_string(), item_id))
+    }
+
+    async fn insert_cleanup_session(
+        database: &crate::storage::Database,
+        user_id: &str,
+        item_id: &str,
+        session_id: &str,
+        expires_at: i64,
+        last_heartbeat_at: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        database
+            .insert_web_playback_session(NewWebPlaybackSession {
+                id: session_id,
+                user_id,
+                item_id,
+                media_source_id: None,
+                play_session_id: &format!("lux-web:{session_id}"),
+                tier: i64::from(ServerTier::Remux.number()),
+                plan: "SERVER_HLS",
+                temp_dir: None,
+                is_admin: false,
+                expires_at,
+                now: unix_timestamp(),
+            })
+            .await?;
+        // The insert stamps the current heartbeat, so the test rewinds it to make the session
+        // reapable.
+        sqlx::query("UPDATE web_playback_sessions SET last_heartbeat_at = ? WHERE id = ?")
+            .bind(last_heartbeat_at)
+            .bind(session_id)
+            .execute(database.pool())
+            .await?;
+        Ok(())
+    }
+
+    async fn session_state(
+        database: &crate::storage::Database,
+        session_id: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        Ok(
+            sqlx::query_scalar("SELECT state FROM web_playback_sessions WHERE id = ?")
+                .bind(session_id)
+                .fetch_one(database.pool())
+                .await?,
+        )
+    }
+
+    /// An idle reaper must not run a reaping pass before its fallback: the old loop ran two
+    /// queries every five seconds with no session to look at.
+    #[tokio::test]
+    async fn an_idle_reaper_does_not_poll() -> Result<(), Box<dyn std::error::Error>> {
+        assert!(
+            super::WEB_PLAYBACK_IDLE_FALLBACK >= std::time::Duration::from_secs(30),
+            "the idle fallback must stay far above the old 5 s poll"
+        );
+        let (_temp_dir, config, database, _user_id, _item_id) = cleanup_fixture().await?;
+        let service = WebPlaybackSessionService::new(database.clone(), config.config_dir.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        database.reset_query_count();
+        // Strictly longer than the five second tick this loop used to run.
+        tokio::time::sleep(std::time::Duration::from_millis(5_500)).await;
+        assert_eq!(
+            database.query_count(),
+            0,
+            "an idle reaper must not query sessions before the idle fallback"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), service.shutdown())
+            .await
+            .expect("shutdown must stop an idle reaper");
+        Ok(())
+    }
+
+    /// An expired session is reaped as soon as its deadline is reached, not on a fixed tick.
+    #[tokio::test]
+    async fn a_session_is_reaped_at_its_deadline() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, config, database, user_id, item_id) = cleanup_fixture().await?;
+        let service = WebPlaybackSessionService::new(database.clone(), config.config_dir.clone());
+        // Let the first pass find nothing and compute an empty deadline.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let now = unix_timestamp();
+        insert_cleanup_session(
+            &database,
+            &user_id,
+            &item_id,
+            "deadline-session",
+            now + 1,
+            now,
+        )
+        .await?;
+        // The session was created outside the service, so the enqueue wake-up has to stand in.
+        super::notify_web_playback_sessions_changed(&service);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while session_state(&database, "deadline-session").await? == "ACTIVE" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the session must be stopped once its deadline passed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), service.shutdown())
+            .await
+            .expect("shutdown must stop the reaper");
+        Ok(())
+    }
+
+    /// A stale session found while the reaper sleeps is reaped as soon as the producer wakes it,
+    /// instead of waiting for the idle fallback.
+    #[tokio::test]
+    async fn a_wake_up_reaps_a_stale_session_immediately() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_temp_dir, config, database, user_id, item_id) = cleanup_fixture().await?;
+        let service = WebPlaybackSessionService::new(database.clone(), config.config_dir.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let now = unix_timestamp();
+        insert_cleanup_session(
+            &database,
+            &user_id,
+            &item_id,
+            "stale-session",
+            now + 900,
+            now - super::WEB_PLAYBACK_STALE_AFTER_SECONDS - 10,
+        )
+        .await?;
+        super::notify_web_playback_sessions_changed(&service);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while session_state(&database, "stale-session").await? == "ACTIVE" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a wake-up must reap a stale session without waiting for the fallback"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), service.shutdown())
+            .await
+            .expect("shutdown must stop the reaper");
+        Ok(())
+    }
+
+    /// Shutdown must not wait for the idle fallback.
+    #[tokio::test]
+    async fn shutdown_stops_the_reaper_without_waiting_for_the_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, config, database, _user_id, _item_id) = cleanup_fixture().await?;
+        let service = WebPlaybackSessionService::new(database, config.config_dir.clone());
+        tokio::time::timeout(std::time::Duration::from_secs(2), service.shutdown())
+            .await
+            .expect("shutdown must stop the idle reaper");
         Ok(())
     }
 }

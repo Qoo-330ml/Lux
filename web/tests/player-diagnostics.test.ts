@@ -24,6 +24,15 @@ describe("LuxPlayer playback diagnostics", () => {
     });
   });
 
+  it("points every other-version suggestion back to the detail page", () => {
+    // The player page no longer offers a version dropdown, so guidance must send
+    // the viewer back to the detail page instead of implying an in-player switch.
+    for (const kind of ["BROWSER_UNSUPPORTED", "ENGINE_FAILED", "SERVER_PLAN_FAILED"] as const) {
+      expect(playerFailure(kind).message).toContain("返回详情页选择其他版本");
+    }
+    expect(playerFailure("PLAYBACK_EXPIRED").message).toContain("返回详情页");
+  });
+
   it("identifies expired playback failures without exposing the upstream reason", () => {
     const failure = classifyPlayerEngineFailure("signed playback session has expired");
 

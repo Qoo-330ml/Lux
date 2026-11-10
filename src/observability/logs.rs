@@ -18,6 +18,60 @@ pub const MAX_LOG_ARCHIVES: usize = 20;
 const DEFAULT_EXPORT_DAYS: i64 = 7;
 const MAX_DAILY_LOG_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXPORT_BYTES: u64 = 128 * 1024 * 1024;
+/// Byte budget for the polled activity list.
+///
+/// The admin dashboard asks for this list every 15 seconds, so the read must stay cheap even when
+/// the retained log volume is large. Daily files and archive members are read from their newest end
+/// first (see `read_daily_log_file` and `read_archive_member`), and the read gives up once the
+/// budget is spent. Two honest consequences, both accepted for the polling path: the list can come
+/// back shorter than the login/playback quotas when the newest bytes carry too few activity records,
+/// and the truncation flag returned by `scan_log_records` is not reported to anyone.
+///
+/// Admin pages that must not silently miss older records use `MAX_RETAINED_SCAN_BYTES` instead.
+const MAX_EVENT_SCAN_BYTES: u64 = 16 * 1024 * 1024;
+/// Byte ceiling for the admin pages that must not silently miss older records: the audit list and
+/// one job's event list.
+///
+/// Both are opened on demand instead of being polled, so they may cover the whole retained volume.
+/// The ceiling is derived from the retention constants rather than hand-picked so a large
+/// installation cannot lose older records from those pages. The audit list stops early once a page
+/// is complete and no older day can outrank it, so its common case only touches the newest segments.
+/// The job-event list never stops early because its response carries an exact `total`: even its
+/// first page reads the whole retained volume (up to this ceiling) while holding the log manager
+/// lock. Both reads are streamed with the byte prefilter and a page-sized buffer, so memory stays
+/// bounded even when the disk read grows with the retained volume.
+///
+/// The job-event `total` is exact within the steady-state retention (at most `MAX_LOG_ARCHIVES`
+/// archives plus the daily files). Log migration defers archive pruning
+/// (`storage::database_cleanup`), which can leave one extra archive per migrated day; while that
+/// happens the source count can exceed `MAX_EVENT_SCAN_FILES`, so `total` becomes a lower bound and
+/// the oldest events are unreachable. That window is transient and accepted.
+const MAX_RETAINED_SCAN_BYTES: u64 = LOG_SEGMENT_BYTES.saturating_mul(MAX_LOG_ARCHIVES as u64 + 2);
+/// Hard ceiling on the number of log files one page request may open: the retention keeps at most
+/// `MAX_LOG_ARCHIVES` archived segments plus the daily files still being written. Migration batches
+/// can leave one daily file per migrated day, and deferred pruning can leave extra archives, which
+/// is why a lower bound on `total` is possible (see `MAX_RETAINED_SCAN_BYTES`).
+const MAX_EVENT_SCAN_FILES: usize = MAX_LOG_ARCHIVES + 8;
+/// Deep pages are refused instead of materialised.
+///
+/// The admin console only requests the first page with at most 100 rows per page, so this still
+/// admits roughly the first hundred pages of the audit log while keeping one request from buffering
+/// the whole log (and holding the log mutex) for an arbitrarily large `offset`.
+const MAX_LOG_PAGE_WINDOW: usize = 10_000;
+/// A single JSONL record larger than this is skipped instead of being buffered in memory.
+const MAX_EVENT_LINE_BYTES: usize = 1024 * 1024;
+
+const _: () = assert!(
+    MAX_RETAINED_SCAN_BYTES >= LOG_SEGMENT_BYTES.saturating_mul(MAX_LOG_ARCHIVES as u64 + 1)
+);
+const _: () = assert!(MAX_EVENT_SCAN_FILES > MAX_LOG_ARCHIVES);
+
+const ACTIVITY_EVENT_TYPES: [&str; 4] = [
+    "AUTH_LOGIN",
+    "PLAYBACK_STARTED",
+    "PLAYBACK_PAUSED",
+    "PLAYBACK_STOPPED",
+];
 
 type SharedLogManager = Arc<StdMutex<Option<LogManager>>>;
 type LogManagerRegistry = StdMutex<HashMap<PathBuf, Weak<StdMutex<Option<LogManager>>>>>;
@@ -428,30 +482,61 @@ impl LogStore {
     }
 }
 
+/// Placeholder that replaces a whole sensitive key or value.
+pub(crate) const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
+
+/// Placeholder that replaces a whole string value carrying a URL.
+pub(crate) const REDACTED_URL_PLACEHOLDER: &str = "[REDACTED_URL]";
+
+/// Fragments a JSON key's normalized name (letters and digits only, lowercased) may contain for
+/// [`redact_sensitive_log_values`] to replace the whole value stored under that key.
+///
+/// This table, [`SENSITIVE_KEY_SUFFIXES`], [`SENSITIVE_VALUE_MARKERS`] and
+/// [`SENSITIVE_URL_MARKERS`] are the single source of the redaction rules:
+/// `redacting_writer::may_need_redaction` derives its fast pre-check from them. A rule added to
+/// these tables therefore cannot bypass the pre-check and silently stop redacting `tracing`
+/// output. Add rules here instead of writing literals inside the redactor.
+pub(crate) const SENSITIVE_KEY_FRAGMENTS: [&str; 7] = [
+    "password",
+    "token",
+    "secret",
+    "cookie",
+    "authorization",
+    "apikey",
+    "credential",
+];
+
+/// Normalized key suffixes that make the whole value sensitive regardless of the key's prefix.
+pub(crate) const SENSITIVE_KEY_SUFFIXES: [&str; 2] = ["url", "uri"];
+
+/// Markers that make a whole string value sensitive when they appear anywhere in its lowercased
+/// form.
+pub(crate) const SENSITIVE_VALUE_MARKERS: [&str; 8] = [
+    "token=",
+    "api_key=",
+    "apikey=",
+    "secret=",
+    "password=",
+    "cookie=",
+    "authorization:",
+    "bearer ",
+];
+
+/// Markers that make a whole string value a URL when they appear anywhere in its lowercased form.
+pub(crate) const SENSITIVE_URL_MARKERS: [&str; 2] = ["http://", "https://"];
+
+/// Replaces every sensitive key or value in `value`, recursing into nested objects and arrays.
+///
+/// The rules come from the `SENSITIVE_*` tables above and nowhere else, and every string
+/// comparison is case-insensitive: keys are normalized to letters and digits, value markers are
+/// matched against the lowercased string, and the URL markers likewise, so `HTTPS://EXAMPLE.COM/x`
+/// is replaced by [`REDACTED_URL_PLACEHOLDER`] just like its lowercase form.
 pub(crate) fn redact_sensitive_log_values(mut value: Value) -> Value {
     match &mut value {
         Value::Object(object) => {
             for (key, value) in object.iter_mut() {
-                let normalized_key = key
-                    .chars()
-                    .filter(|character| character.is_ascii_alphanumeric())
-                    .flat_map(char::to_lowercase)
-                    .collect::<String>();
-                if [
-                    "password",
-                    "token",
-                    "secret",
-                    "cookie",
-                    "authorization",
-                    "apikey",
-                    "credential",
-                ]
-                .iter()
-                .any(|needle| normalized_key.contains(needle))
-                    || normalized_key.ends_with("url")
-                    || normalized_key.ends_with("uri")
-                {
-                    *value = Value::String("[REDACTED]".to_owned());
+                if key_name_is_sensitive(key) {
+                    *value = Value::String(REDACTED_PLACEHOLDER.to_owned());
                 } else {
                     *value = redact_sensitive_log_values(value.clone());
                 }
@@ -464,27 +549,642 @@ pub(crate) fn redact_sensitive_log_values(mut value: Value) -> Value {
         }
         Value::String(value) => {
             let normalized = value.to_ascii_lowercase();
-            if value.contains("http://") || value.contains("https://") {
-                *value = "[REDACTED_URL]".to_owned();
-            } else if [
-                "token=",
-                "api_key=",
-                "apikey=",
-                "secret=",
-                "password=",
-                "cookie=",
-                "authorization:",
-                "bearer ",
-            ]
-            .iter()
-            .any(|needle| normalized.contains(needle))
+            if SENSITIVE_URL_MARKERS
+                .iter()
+                .any(|marker| normalized.contains(marker))
             {
-                *value = "[REDACTED]".to_owned();
+                *value = REDACTED_URL_PLACEHOLDER.to_owned();
+            } else if SENSITIVE_VALUE_MARKERS
+                .iter()
+                .any(|marker| normalized.contains(marker))
+            {
+                *value = REDACTED_PLACEHOLDER.to_owned();
             }
         }
         _ => {}
     }
     value
+}
+
+/// Whether the whole value stored under `key` is replaced.
+fn key_name_is_sensitive(key: &str) -> bool {
+    let normalized_key = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    SENSITIVE_KEY_FRAGMENTS
+        .iter()
+        .any(|fragment| normalized_key.contains(fragment))
+        || SENSITIVE_KEY_SUFFIXES
+            .iter()
+            .any(|suffix| normalized_key.ends_with(suffix))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Bounded event reads
+//
+// The page readers below must do work proportional to the requested page instead of the retained
+// log volume. Three properties make that possible:
+//
+// * a record is stored in the file named after the record's own UTC day:
+//   `LogManager::write_line_for_date` derives the file date from `timestamp`/`createdAt`, and the
+//   migration batches in `storage::database_cleanup` keep both fields identical, so a newer day
+//   file only holds newer `createdAt` values;
+// * inside one day the file name says nothing about ordering, so a whole day is always read;
+// * inside one segment (daily file or archive member) the JSONL is append-only, so the newest
+//   records sit at the end; a segment larger than the remaining budget is therefore read from its
+//   tail (`read_daily_log_file`, `read_archive_member`).
+//
+// Sources are therefore visited newest day first and a read stops once nothing left in an older day
+// can outrank the events already collected for the page. A stop is also refused when the weakest
+// retained record is older than the next unread day: that is what a migrated record with an old
+// timestamp inside a newer file looks like, and reading further is the only safe answer.
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum LogSourceKind {
+    /// Daily file the writer still appends to.
+    Daily,
+    /// Archived segment, `lux.YYYY-MM-DD.part-NNNNNN.log.zip`.
+    Archive,
+}
+
+#[derive(Debug)]
+struct LogSource {
+    /// UTC day encoded in the file name; `None` when the name carries no parseable day.
+    date: Option<Date>,
+    /// Segment number inside one day; a higher number was written later.
+    sequence: u64,
+    kind: LogSourceKind,
+    path: PathBuf,
+}
+
+/// One item handed to a bounded reader.
+enum ScanItem<'a> {
+    /// A JSONL record without its trailing newline.
+    Line(&'a [u8]),
+    /// Every source for `completed` has been read. `next` is `None` when nothing is left, and
+    /// `Some(None)` when the next older source carries no day we could order.
+    GroupCompleted {
+        completed: Option<Date>,
+        next: Option<Option<Date>>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScanControl {
+    Continue,
+    Stop,
+}
+
+/// Sort key shared by the file-backed event types: newest `created_at` first, then highest id.
+trait RankedLogEvent {
+    fn rank_id(&self) -> &str;
+    fn rank_created_at(&self) -> i64;
+}
+
+impl RankedLogEvent for AuditLogEvent {
+    fn rank_id(&self) -> &str {
+        &self.id
+    }
+
+    fn rank_created_at(&self) -> i64 {
+        self.created_at
+    }
+}
+
+impl RankedLogEvent for ScanJobLogEvent {
+    fn rank_id(&self) -> &str {
+        &self.id
+    }
+
+    fn rank_created_at(&self) -> i64 {
+        self.created_at
+    }
+}
+
+/// Sorts events by the shared ordering contract: newest `created_at` first, then highest id.
+fn sort_by_rank<T: RankedLogEvent>(events: &mut [T]) {
+    events.sort_by(|left, right| {
+        right
+            .rank_created_at()
+            .cmp(&left.rank_created_at())
+            .then_with(|| right.rank_id().cmp(left.rank_id()))
+    });
+}
+
+/// Keeps only the events that can still reach the requested page, so memory and sorting cost track
+/// the page size instead of the log volume.
+///
+/// `push` appends to a buffer and only folds the buffer into the sorted window once it is a window
+/// size long, so one event costs O(log window) amortised instead of moving the whole window.
+struct PageCollector<T> {
+    offset: usize,
+    limit: usize,
+    /// Distinct events already known to rank before the requested page.
+    settled: usize,
+    /// Best distinct events of the page window, highest rank first; only valid after `flush`.
+    retained: Vec<T>,
+    /// Events seen since the last `flush`, not sorted yet.
+    pending: Vec<T>,
+    seen_ids: HashSet<String>,
+}
+
+impl<T: RankedLogEvent> PageCollector<T> {
+    fn new(offset: usize, limit: usize) -> Self {
+        Self {
+            offset,
+            limit,
+            settled: 0,
+            retained: Vec::new(),
+            pending: Vec::new(),
+            seen_ids: HashSet::new(),
+        }
+    }
+
+    fn push(&mut self, event: T) {
+        if !self.seen_ids.insert(event.rank_id().to_owned()) {
+            return;
+        }
+        self.pending.push(event);
+        if self.pending.len() >= self.window().max(1) {
+            self.flush();
+        }
+    }
+
+    /// Folds the pending events into the sorted window and drops everything that cannot reach it.
+    fn flush(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        self.retained.append(&mut self.pending);
+        sort_by_rank(&mut self.retained);
+        let window = self.window();
+        self.retained.truncate(window);
+    }
+
+    fn window(&self) -> usize {
+        self.offset
+            .saturating_sub(self.settled)
+            .saturating_add(self.limit)
+    }
+
+    /// `true` once enough distinct events are buffered to fill the page. Requires a `flush` first.
+    fn is_page_complete(&self) -> bool {
+        self.settled.saturating_add(self.retained.len()) >= self.offset.saturating_add(self.limit)
+    }
+
+    /// Lowest `created_at` still inside the page window; `None` when the window is empty. Requires a
+    /// `flush` first.
+    fn floor_created_at(&self) -> Option<i64> {
+        self.retained.last().map(RankedLogEvent::rank_created_at)
+    }
+
+    /// Drops the events that certainly rank before the requested page.
+    ///
+    /// Only valid once a whole day has been read *and* the caller proved that the remaining days
+    /// cannot hold anything that outranks this window (`floor_dominates_older_days`): a migrated
+    /// record with an old `createdAt` can sit in a newer file, which reorders the window later.
+    fn settle(&mut self) {
+        let dropped = self
+            .offset
+            .saturating_sub(self.settled)
+            .min(self.retained.len());
+        if dropped > 0 {
+            self.retained.drain(..dropped);
+            self.settled = self.settled.saturating_add(dropped);
+        }
+    }
+
+    fn distinct_total(&self) -> usize {
+        self.seen_ids.len()
+    }
+
+    /// Applies a final `flush` and returns the requested page.
+    fn into_page(mut self) -> Vec<T> {
+        self.flush();
+        self.retained
+            .into_iter()
+            .skip(self.offset.saturating_sub(self.settled))
+            .take(self.limit)
+            .collect()
+    }
+}
+
+fn page_offset(offset: i64) -> usize {
+    usize::try_from(offset.max(0)).unwrap_or(usize::MAX)
+}
+
+fn page_limit(limit: i64) -> usize {
+    usize::try_from(limit.max(0)).unwrap_or(usize::MAX)
+}
+
+/// Resolves `offset`/`limit` into a page window, or `None` for pages deeper than
+/// `MAX_LOG_PAGE_WINDOW`, which are answered without touching the log files at all.
+fn bounded_page_window(offset: i64, limit: i64) -> Option<(usize, usize)> {
+    let offset = page_offset(offset);
+    let limit = page_limit(limit);
+    (offset.saturating_add(limit) <= MAX_LOG_PAGE_WINDOW).then_some((offset, limit))
+}
+
+fn day_start_timestamp(date: Date) -> i64 {
+    date.midnight().assume_utc().unix_timestamp()
+}
+
+/// True when every record still unread lives in an older day than the collected page floor.
+fn floor_dominates_older_days(floor: Option<i64>, next: Option<Option<Date>>) -> bool {
+    match next {
+        // Nothing left to read.
+        None => true,
+        // A source without a day is still unread: its records could rank anywhere, so keep going.
+        Some(None) => false,
+        Some(Some(next)) => {
+            floor.is_some_and(|floor| floor >= day_start_timestamp(add_days(next, 1)))
+        }
+    }
+}
+
+fn read_directory(directory: &Path) -> io::Result<Option<fs::ReadDir>> {
+    match fs::read_dir(directory) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn parse_archive_log_name(name: &str) -> Option<(Date, u64)> {
+    let date_and_part = name.strip_prefix("lux.")?.strip_suffix(".log.zip")?;
+    let (date, part) = date_and_part.split_once(".part-")?;
+    let date = parse_date(date).ok()?;
+    let sequence = part.parse::<u64>().ok()?;
+    Some((date, sequence))
+}
+
+fn compare_log_sources(left: &LogSource, right: &LogSource) -> std::cmp::Ordering {
+    let by_date = match (left.date, right.date) {
+        // Names without a day cannot be ordered: read them first instead of guessing.
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(left_date), Some(right_date)) => right_date.cmp(&left_date),
+    };
+    by_date
+        .then_with(|| left.kind.cmp(&right.kind))
+        .then_with(|| right.sequence.cmp(&left.sequence))
+        .then_with(|| left.path.cmp(&right.path))
+}
+
+fn collect_log_sources(log_dir: &Path, archive_dir: &Path) -> io::Result<Vec<LogSource>> {
+    let mut sources = Vec::new();
+    if let Some(entries) = read_directory(log_dir)? {
+        for entry in entries {
+            let path = entry?.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !(name.starts_with("lux.") && name.ends_with(".log")) {
+                continue;
+            }
+            sources.push(LogSource {
+                date: parse_daily_log_name(name),
+                sequence: 0,
+                kind: LogSourceKind::Daily,
+                path,
+            });
+        }
+    }
+    if let Some(entries) = read_directory(archive_dir)? {
+        for entry in entries {
+            let path = entry?.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(".log.zip") {
+                continue;
+            }
+            let parsed = parse_archive_log_name(name);
+            sources.push(LogSource {
+                date: parsed.map(|(date, _)| date),
+                sequence: parsed.map_or(0, |(_, sequence)| sequence),
+                kind: LogSourceKind::Archive,
+                path,
+            });
+        }
+    }
+    sources.sort_by(compare_log_sources);
+    Ok(sources)
+}
+
+/// Streams every candidate log source newest day first while the byte and file ceilings allow it.
+///
+/// Returns `true` when the scan stopped before visiting every source because a ceiling was reached.
+fn scan_log_records<F>(
+    log_dir: &Path,
+    archive_dir: &Path,
+    max_bytes: u64,
+    mut on_item: F,
+) -> io::Result<bool>
+where
+    F: FnMut(ScanItem<'_>) -> io::Result<ScanControl>,
+{
+    let sources = collect_log_sources(log_dir, archive_dir)?;
+    let mut remaining_bytes = max_bytes;
+    let mut opened_files = 0_usize;
+    let mut index = 0_usize;
+    while index < sources.len() {
+        let completed = sources[index].date;
+        let mut group_end = index + 1;
+        while group_end < sources.len() && sources[group_end].date == completed {
+            group_end += 1;
+        }
+        let next = sources.get(group_end).map(|source| source.date);
+        for source in &sources[index..group_end] {
+            if opened_files >= MAX_EVENT_SCAN_FILES || remaining_bytes == 0 {
+                return Ok(true);
+            }
+            opened_files = opened_files.saturating_add(1);
+            if read_log_source(source, &mut remaining_bytes, &mut on_item)? == ScanControl::Stop {
+                return Ok(true);
+            }
+        }
+        index = group_end;
+        if on_item(ScanItem::GroupCompleted { completed, next })? == ScanControl::Stop {
+            return Ok(false);
+        }
+    }
+    Ok(false)
+}
+
+fn read_log_source<F>(
+    source: &LogSource,
+    remaining_bytes: &mut u64,
+    on_item: &mut F,
+) -> io::Result<ScanControl>
+where
+    F: FnMut(ScanItem<'_>) -> io::Result<ScanControl>,
+{
+    let file = fs::File::open(&source.path)?;
+    match source.kind {
+        LogSourceKind::Daily => read_daily_log_file(file, remaining_bytes, on_item),
+        LogSourceKind::Archive => {
+            let mut archive = ZipArchive::new(file).map_err(zip_io_error)?;
+            for index in 0..archive.len() {
+                if *remaining_bytes == 0 {
+                    return Ok(ScanControl::Stop);
+                }
+                let member = archive.by_index(index).map_err(zip_io_error)?;
+                if !member.name().ends_with(".log") {
+                    continue;
+                }
+                let length = member.size();
+                if read_archive_member(member, length, remaining_bytes, on_item)?
+                    == ScanControl::Stop
+                {
+                    return Ok(ScanControl::Stop);
+                }
+            }
+            Ok(ScanControl::Continue)
+        }
+    }
+}
+
+/// Reads one daily file. When the remaining budget cannot cover the whole file only its tail is
+/// read, because append-only JSONL keeps the newest records there.
+fn read_daily_log_file<F>(
+    mut file: fs::File,
+    remaining_bytes: &mut u64,
+    on_item: &mut F,
+) -> io::Result<ScanControl>
+where
+    F: FnMut(ScanItem<'_>) -> io::Result<ScanControl>,
+{
+    let length = file.metadata()?.len();
+    if length <= *remaining_bytes {
+        let mut reader = io::BufReader::new(file);
+        return scan_jsonl(&mut reader, remaining_bytes, on_item);
+    }
+    // One byte before the budget window is kept so a record starting exactly at the cut survives
+    // (only the previous record's newline is then discarded by `scan_segment_tail`).
+    let skip = length.saturating_sub(remaining_bytes.saturating_add(1));
+    file.seek(SeekFrom::Start(skip))?;
+    scan_segment_tail(io::BufReader::new(file), skip > 0, remaining_bytes, on_item)
+}
+
+/// Reads one archive member, which is a segment of the same append-only JSONL as a daily file.
+///
+/// When the remaining budget cannot cover the member's uncompressed size, the head is decompressed
+/// and dropped in a fixed-size buffer instead of being parsed, so the request still returns the
+/// member's newest records. The decode cost stays bounded by one segment (`LOG_SEGMENT_BYTES`), and
+/// nothing beyond the buffer reaches memory or the parser. A member this large is the newest source
+/// left, so the caller must not continue with older sources afterwards: the result is `Stop`.
+fn read_archive_member<R, F>(
+    member: R,
+    length: u64,
+    remaining_bytes: &mut u64,
+    on_item: &mut F,
+) -> io::Result<ScanControl>
+where
+    R: io::Read,
+    F: FnMut(ScanItem<'_>) -> io::Result<ScanControl>,
+{
+    let mut reader = io::BufReader::new(member);
+    if length <= *remaining_bytes {
+        return scan_jsonl(&mut reader, remaining_bytes, on_item);
+    }
+    // Same one-byte back-off as `read_daily_log_file`: the cut must not swallow a whole record.
+    let skip = length.saturating_sub(remaining_bytes.saturating_add(1));
+    discard_bytes(&mut reader, skip)?;
+    scan_segment_tail(reader, skip > 0, remaining_bytes, on_item)
+}
+
+/// Parses a segment tail after its head was skipped: the skip can land inside a record, so that
+/// fragment is dropped instead of being parsed. Always reports `Stop` because the head was skipped,
+/// which means nothing older is reachable from this source.
+fn scan_segment_tail<R, F>(
+    mut reader: R,
+    head_skipped: bool,
+    remaining_bytes: &mut u64,
+    on_item: &mut F,
+) -> io::Result<ScanControl>
+where
+    R: io::BufRead,
+    F: FnMut(ScanItem<'_>) -> io::Result<ScanControl>,
+{
+    // The caller kept one byte before the budget window, so the parser may spend one extra byte: a
+    // record that starts exactly at the cut then survives intact.
+    let mut budget = (*remaining_bytes).saturating_add(1);
+    let parseable = !head_skipped || discard_partial_line(&mut reader)?;
+    if parseable {
+        scan_jsonl(&mut reader, &mut budget, on_item)?;
+    }
+    *remaining_bytes = 0;
+    Ok(ScanControl::Stop)
+}
+
+/// Advances a reader by `bytes` through a fixed-size buffer, decompressing but never buffering the
+/// skipped data.
+fn discard_bytes<R: io::Read>(reader: &mut R, mut bytes: u64) -> io::Result<()> {
+    let mut buffer = [0_u8; 8 * 1024];
+    while bytes > 0 {
+        let limit = usize::try_from(bytes.min(u64::try_from(buffer.len()).unwrap_or(u64::MAX)))
+            .unwrap_or(buffer.len());
+        if limit == 0 {
+            return Ok(());
+        }
+        let read = reader.read(&mut buffer[..limit])?;
+        if read == 0 {
+            return Ok(());
+        }
+        bytes = bytes.saturating_sub(u64::try_from(read).unwrap_or(0));
+    }
+    Ok(())
+}
+
+fn discard_partial_line<R: io::BufRead>(reader: &mut R) -> io::Result<bool> {
+    loop {
+        let (found, consumed) = {
+            let buffer = reader.fill_buf()?;
+            if buffer.is_empty() {
+                return Ok(false);
+            }
+            match buffer.iter().position(|byte| *byte == b'\n') {
+                Some(index) => (true, index.saturating_add(1)),
+                None => (false, buffer.len()),
+            }
+        };
+        reader.consume(consumed);
+        if found {
+            return Ok(true);
+        }
+    }
+}
+
+/// Streams newline-delimited records while enforcing the byte ceiling and the record size ceiling.
+fn scan_jsonl<R, F>(
+    reader: &mut R,
+    remaining_bytes: &mut u64,
+    on_item: &mut F,
+) -> io::Result<ScanControl>
+where
+    R: io::BufRead,
+    F: FnMut(ScanItem<'_>) -> io::Result<ScanControl>,
+{
+    let mut line = Vec::new();
+    let mut oversized = false;
+    loop {
+        let mut control = ScanControl::Continue;
+        let consumed = {
+            let chunk = reader.fill_buf()?;
+            if chunk.is_empty() {
+                if !line.is_empty() && !oversized {
+                    control = on_item(ScanItem::Line(&line))?;
+                }
+                return Ok(control);
+            }
+            let available = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+            let allowed = usize::try_from((*remaining_bytes).min(available)).unwrap_or(0);
+            if allowed == 0 {
+                return Ok(ScanControl::Stop);
+            }
+            let bytes = &chunk[..allowed];
+            let mut start = 0_usize;
+            for (index, byte) in bytes.iter().enumerate() {
+                if *byte != b'\n' {
+                    continue;
+                }
+                if oversized {
+                    oversized = false;
+                } else if line.is_empty() {
+                    control = on_item(ScanItem::Line(&bytes[start..index]))?;
+                } else {
+                    line.extend_from_slice(&bytes[start..index]);
+                    control = on_item(ScanItem::Line(&line))?;
+                    line.clear();
+                }
+                start = index.saturating_add(1);
+                if control == ScanControl::Stop {
+                    break;
+                }
+            }
+            if control == ScanControl::Continue && start < bytes.len() && !oversized {
+                let tail = &bytes[start..];
+                if line.len().saturating_add(tail.len()) > MAX_EVENT_LINE_BYTES {
+                    oversized = true;
+                    line.clear();
+                } else {
+                    line.extend_from_slice(tail);
+                }
+            }
+            allowed
+        };
+        reader.consume(consumed);
+        *remaining_bytes = (*remaining_bytes).saturating_sub(u64::try_from(consumed).unwrap_or(0));
+        if control == ScanControl::Stop {
+            return Ok(ScanControl::Stop);
+        }
+    }
+}
+
+/// Cheap prefilter so most non-matching JSONL records never reach the JSON parser.
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    let last_start = haystack.len().saturating_sub(needle.len());
+    let first = needle[0];
+    let mut index = 0_usize;
+    while index <= last_start {
+        match haystack[index..=last_start]
+            .iter()
+            .position(|byte| *byte == first)
+        {
+            Some(offset) => {
+                let start = index.saturating_add(offset);
+                let end = start.saturating_add(needle.len());
+                if &haystack[start..end] == needle {
+                    return true;
+                }
+                index = start.saturating_add(1);
+            }
+            None => return false,
+        }
+    }
+    false
+}
+
+fn parse_scan_job_event(
+    line: &[u8],
+    job_id: &str,
+    level: Option<&str>,
+    event_code: Option<&str>,
+) -> Option<ScanJobLogEvent> {
+    let record = serde_json::from_slice::<Value>(line).ok()?;
+    if record["recordType"] != "scan_job_event" || record["jobId"] != job_id {
+        return None;
+    }
+    let id = record["id"].as_str()?;
+    let event_level = record["level"].as_str()?;
+    let code = record["eventCode"].as_str()?;
+    if level.is_some_and(|value| !event_level.eq_ignore_ascii_case(value))
+        || event_code.is_some_and(|value| !code.eq_ignore_ascii_case(value))
+    {
+        return None;
+    }
+    let details_json =
+        serde_json::to_string(&record["details"]).unwrap_or_else(|_| "{}".to_owned());
+    Some(ScanJobLogEvent {
+        id: id.to_owned(),
+        job_id: job_id.to_owned(),
+        level: event_level.to_owned(),
+        event_code: code.to_owned(),
+        message: record["message"].as_str().unwrap_or_default().to_owned(),
+        details_json,
+        created_at: record["createdAt"].as_i64().unwrap_or_default(),
+    })
 }
 
 fn read_scan_job_events(
@@ -496,81 +1196,30 @@ fn read_scan_job_events(
     offset: i64,
     limit: i64,
 ) -> io::Result<(i64, Vec<ScanJobLogEvent>)> {
-    let mut events = Vec::new();
-    let active_entries = match fs::read_dir(log_dir) {
-        Ok(entries) => Some(entries),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
+    let Some((offset, limit)) = bounded_page_window(offset, limit) else {
+        // A page deeper than `MAX_LOG_PAGE_WINDOW` is refused instead of buffering the whole log;
+        // `total` reports the lower bound zero because counting it would need the declined scan.
+        return Ok((0, Vec::new()));
     };
-    if let Some(entries) = active_entries {
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default();
-            if name.starts_with("lux.") && name.ends_with(".log") {
-                let file = fs::File::open(path)?;
-                read_scan_job_event_lines(
-                    io::BufReader::new(file),
-                    job_id,
-                    level,
-                    event_code,
-                    &mut events,
-                )?;
-            }
+    let mut collector = PageCollector::new(offset, limit);
+    let job_id_bytes = job_id.as_bytes();
+    scan_log_records(log_dir, archive_dir, MAX_RETAINED_SCAN_BYTES, |item| {
+        if let ScanItem::Line(line) = item
+            && contains_bytes(line, b"scan_job_event")
+            && contains_bytes(line, job_id_bytes)
+            && let Some(event) = parse_scan_job_event(line, job_id, level, event_code)
+        {
+            collector.push(event);
         }
-    }
-    let archive_entries = match fs::read_dir(archive_dir) {
-        Ok(entries) => Some(entries),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
-    };
-    if let Some(entries) = archive_entries {
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            if !path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".log.zip"))
-            {
-                continue;
-            }
-            let file = fs::File::open(path)?;
-            let mut archive = ZipArchive::new(file)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            for index in 0..archive.len() {
-                let member = archive
-                    .by_index(index)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                if !member.name().ends_with(".log") {
-                    continue;
-                }
-                read_scan_job_event_lines(
-                    io::BufReader::new(member),
-                    job_id,
-                    level,
-                    event_code,
-                    &mut events,
-                )?;
-            }
-        }
-    }
-    events.sort_by(|left, right| {
-        right
-            .created_at
-            .cmp(&left.created_at)
-            .then_with(|| right.id.cmp(&left.id))
-    });
-    let mut seen_ids = std::collections::HashSet::with_capacity(events.len());
-    events.retain(|event| seen_ids.insert(event.id.clone()));
-    let total = i64::try_from(events.len()).unwrap_or(i64::MAX);
-    let start = usize::try_from(offset.max(0)).unwrap_or(usize::MAX);
-    let count = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
-    let page = events.into_iter().skip(start).take(count).collect();
-    Ok((total, page))
+        // The response carries a `total` that must be exact inside the steady-state retention, so
+        // every file still has to be visited (no date-based early stop on this path).
+        Ok(ScanControl::Continue)
+    })?;
+    // Exact for the steady-state retention; a lower bound when the scan was cut by the byte or file
+    // ceiling, which is only reachable while log migration defers archive pruning (see
+    // `MAX_RETAINED_SCAN_BYTES`).
+    let total = i64::try_from(collector.distinct_total()).unwrap_or(i64::MAX);
+    Ok((total, collector.into_page()))
 }
 
 fn verify_expected_log_ids(
@@ -689,53 +1338,28 @@ fn read_record_ids_from_lines<R: io::BufRead>(
     }
 }
 
-fn read_scan_job_event_lines<R: io::BufRead>(
-    mut reader: R,
-    job_id: &str,
-    level: Option<&str>,
-    event_code: Option<&str>,
-    events: &mut Vec<ScanJobLogEvent>,
-) -> io::Result<()> {
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        if reader.read_until(b'\n', &mut line)? == 0 {
-            return Ok(());
-        }
-        let Ok(record) = serde_json::from_slice::<Value>(&line) else {
-            continue;
-        };
-        if record["recordType"] != "scan_job_event" || record["jobId"] != job_id {
-            continue;
-        }
-        let Some(id) = record["id"].as_str() else {
-            continue;
-        };
-        let Some(event_level) = record["level"].as_str() else {
-            continue;
-        };
-        let Some(code) = record["eventCode"].as_str() else {
-            continue;
-        };
-        if level.is_some_and(|value| !event_level.eq_ignore_ascii_case(value))
-            || event_code.is_some_and(|value| !code.eq_ignore_ascii_case(value))
-        {
-            continue;
-        }
-        let created_at = record["createdAt"].as_i64().unwrap_or_default();
-        let message = record["message"].as_str().unwrap_or_default().to_owned();
-        let details_json =
-            serde_json::to_string(&record["details"]).unwrap_or_else(|_| "{}".to_owned());
-        events.push(ScanJobLogEvent {
-            id: id.to_owned(),
-            job_id: job_id.to_owned(),
-            level: event_level.to_owned(),
-            event_code: code.to_owned(),
-            message,
-            details_json,
-            created_at,
-        });
+fn parse_audit_event(line: &[u8], event_types: Option<&[&str]>) -> Option<AuditLogEvent> {
+    let record = serde_json::from_slice::<Value>(line).ok()?;
+    if record["recordType"] != "admin_audit_event" {
+        return None;
     }
+    let id = record["id"].as_str()?;
+    let event_type = record["eventType"].as_str()?;
+    if event_types.is_some_and(|allowed| !allowed.contains(&event_type)) {
+        return None;
+    }
+    let metadata_json =
+        serde_json::to_string(&record["metadata"]).unwrap_or_else(|_| "{}".to_owned());
+    Some(AuditLogEvent {
+        id: id.to_owned(),
+        actor_user_id: record["actorUserId"].as_str().map(str::to_owned),
+        actor_username: record["actorUsername"].as_str().map(str::to_owned),
+        event_type: event_type.to_owned(),
+        target_type: record["targetType"].as_str().map(str::to_owned),
+        target_id: record["targetId"].as_str().map(str::to_owned),
+        metadata_json,
+        created_at: record["createdAt"].as_i64().unwrap_or_default(),
+    })
 }
 
 fn read_audit_events(
@@ -745,110 +1369,55 @@ fn read_audit_events(
     limit: i64,
     event_types: Option<&[&str]>,
 ) -> io::Result<(i64, Vec<AuditLogEvent>)> {
-    let mut events = Vec::new();
-    let active_entries = match fs::read_dir(log_dir) {
-        Ok(entries) => Some(entries),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
+    let Some((offset, limit)) = bounded_page_window(offset, limit) else {
+        // A page deeper than `MAX_LOG_PAGE_WINDOW` is refused instead of buffering the whole log.
+        // `total` reports the lower bound zero because counting it would need the scan we declined;
+        // the only caller of this path (`admin_list_audit`) discards the total.
+        return Ok((0, Vec::new()));
     };
-    if let Some(entries) = active_entries {
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default();
-            if name.starts_with("lux.") && name.ends_with(".log") {
-                read_audit_event_lines(
-                    io::BufReader::new(fs::File::open(path)?),
-                    event_types,
-                    &mut events,
-                )?;
-            }
-        }
-    }
-    let archive_entries = match fs::read_dir(archive_dir) {
-        Ok(entries) => Some(entries),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
-    };
-    if let Some(entries) = archive_entries {
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            if !path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".log.zip"))
-            {
-                continue;
-            }
-            let mut archive = ZipArchive::new(fs::File::open(path)?)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            for index in 0..archive.len() {
-                let member = archive
-                    .by_index(index)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                if member.name().ends_with(".log") {
-                    read_audit_event_lines(io::BufReader::new(member), event_types, &mut events)?;
+    let mut collector = PageCollector::new(offset, limit);
+    // The audit page is opened on demand, never polled, so it must not silently miss older records
+    // just because the newest segments are full of other records: use the full-retention ceiling.
+    // The date-based early stop below keeps the common case to the newest segment(s).
+    scan_log_records(
+        log_dir,
+        archive_dir,
+        MAX_RETAINED_SCAN_BYTES,
+        |item| match item {
+            ScanItem::Line(line) => {
+                if contains_bytes(line, b"admin_audit_event")
+                    && let Some(event) = parse_audit_event(line, event_types)
+                {
+                    collector.push(event);
                 }
+                Ok(ScanControl::Continue)
             }
-        }
-    }
-    events.sort_by(|left, right| {
-        right
-            .created_at
-            .cmp(&left.created_at)
-            .then_with(|| right.id.cmp(&left.id))
-    });
-    let mut seen_ids = HashSet::with_capacity(events.len());
-    events.retain(|event| seen_ids.insert(event.id.clone()));
-    let total = i64::try_from(events.len()).unwrap_or(i64::MAX);
-    let start = usize::try_from(offset.max(0)).unwrap_or(usize::MAX);
-    let count = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
-    Ok((total, events.into_iter().skip(start).take(count).collect()))
-}
-
-fn read_audit_event_lines<R: io::BufRead>(
-    mut reader: R,
-    event_types: Option<&[&str]>,
-    events: &mut Vec<AuditLogEvent>,
-) -> io::Result<()> {
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        if reader.read_until(b'\n', &mut line)? == 0 {
-            return Ok(());
-        }
-        let Ok(record) = serde_json::from_slice::<Value>(&line) else {
-            continue;
-        };
-        if record["recordType"] != "admin_audit_event" {
-            continue;
-        }
-        let Some(id) = record["id"].as_str() else {
-            continue;
-        };
-        let Some(event_type) = record["eventType"].as_str() else {
-            continue;
-        };
-        if event_types.is_some_and(|allowed| !allowed.contains(&event_type)) {
-            continue;
-        }
-        let metadata_json =
-            serde_json::to_string(&record["metadata"]).unwrap_or_else(|_| "{}".to_owned());
-        events.push(AuditLogEvent {
-            id: id.to_owned(),
-            actor_user_id: record["actorUserId"].as_str().map(str::to_owned),
-            actor_username: record["actorUsername"].as_str().map(str::to_owned),
-            event_type: event_type.to_owned(),
-            target_type: record["targetType"].as_str().map(str::to_owned),
-            target_id: record["targetId"].as_str().map(str::to_owned),
-            metadata_json,
-            created_at: record["createdAt"].as_i64().unwrap_or_default(),
-        });
-    }
+            ScanItem::GroupCompleted { completed, next } => {
+                if completed.is_none() {
+                    // A name without a day cannot be ordered, so keep scanning instead of stopping.
+                    return Ok(ScanControl::Continue);
+                }
+                collector.flush();
+                // Only settle once the remaining days provably cannot outrank this window; a
+                // migrated record with an old `createdAt` in a newer file would reorder it.
+                let page_is_ordered =
+                    floor_dominates_older_days(collector.floor_created_at(), next);
+                if page_is_ordered {
+                    collector.settle();
+                }
+                let page_is_final = page_is_ordered && collector.is_page_complete();
+                Ok(if page_is_final {
+                    ScanControl::Stop
+                } else {
+                    ScanControl::Continue
+                })
+            }
+        },
+    )?;
+    // Exact while the scan reached every source, a lower bound once it was cut or stopped early.
+    // Every current caller of this path discards the total (see `admin_list_audit`).
+    let total = i64::try_from(collector.distinct_total()).unwrap_or(i64::MAX);
+    Ok((total, collector.into_page()))
 }
 
 fn read_activity_events(
@@ -856,126 +1425,66 @@ fn read_activity_events(
     archive_dir: &Path,
     limit: i64,
 ) -> io::Result<Vec<AuditLogEvent>> {
+    if bounded_page_window(0, limit).is_none() {
+        // Same refusal as the audit page: never buffer more than `MAX_LOG_PAGE_WINDOW` events.
+        return Ok(Vec::new());
+    }
     let category_limit = usize::try_from((limit / 2).max(1)).unwrap_or(usize::MAX);
-    let mut login_events = Vec::with_capacity(category_limit.min(12));
-    let mut playback_events = Vec::with_capacity(category_limit.min(12));
-    let active_entries = match fs::read_dir(log_dir) {
-        Ok(entries) => Some(entries),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
-    };
-    if let Some(entries) = active_entries {
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default();
-            if name.starts_with("lux.") && name.ends_with(".log") {
-                read_activity_event_lines(
-                    io::BufReader::new(fs::File::open(path)?),
-                    category_limit,
-                    &mut login_events,
-                    &mut playback_events,
-                )?;
-            }
-        }
-    }
-    let archive_entries = match fs::read_dir(archive_dir) {
-        Ok(entries) => Some(entries),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
-    };
-    if let Some(entries) = archive_entries {
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            if !path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".log.zip"))
-            {
-                continue;
-            }
-            let mut archive = ZipArchive::new(fs::File::open(path)?)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            for index in 0..archive.len() {
-                let member = archive
-                    .by_index(index)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                if member.name().ends_with(".log") {
-                    read_activity_event_lines(
-                        io::BufReader::new(member),
-                        category_limit,
-                        &mut login_events,
-                        &mut playback_events,
-                    )?;
+    let mut login_events = PageCollector::new(0, category_limit);
+    let mut playback_events = PageCollector::new(0, category_limit);
+    // Polled every 15 seconds, so this path keeps the small polling budget: when the newest 16 MiB
+    // hold too few activity records the result is shorter than the per-category quota instead of
+    // reading older segments, and the truncation flag returned by `scan_log_records` is ignored.
+    // The dashboard no longer calls this: it reads the SQLite activity index
+    // (`Database::list_activity_events`), so this reader is kept only for log-file tooling.
+    scan_log_records(
+        log_dir,
+        archive_dir,
+        MAX_EVENT_SCAN_BYTES,
+        |item| match item {
+            ScanItem::Line(line) => {
+                if contains_bytes(line, b"admin_audit_event")
+                    && let Some(event) = parse_audit_event(line, Some(&ACTIVITY_EVENT_TYPES))
+                {
+                    if event.event_type == "AUTH_LOGIN" {
+                        login_events.push(event);
+                    } else {
+                        playback_events.push(event);
+                    }
                 }
+                Ok(ScanControl::Continue)
             }
-        }
-    }
-    login_events.extend(playback_events);
-    sort_audit_events(&mut login_events);
-    let mut seen_ids = HashSet::with_capacity(login_events.len());
-    login_events.retain(|event| seen_ids.insert(event.id.clone()));
-    login_events.truncate(usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
-    Ok(login_events)
-}
-
-fn read_activity_event_lines<R: io::BufRead>(
-    mut reader: R,
-    category_limit: usize,
-    login_events: &mut Vec<AuditLogEvent>,
-    playback_events: &mut Vec<AuditLogEvent>,
-) -> io::Result<()> {
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        if reader.read_until(b'\n', &mut line)? == 0 {
-            return Ok(());
-        }
-        let Ok(record) = serde_json::from_slice::<Value>(&line) else {
-            continue;
-        };
-        if record["recordType"] != "admin_audit_event" {
-            continue;
-        }
-        let Some(event_type) = record["eventType"].as_str() else {
-            continue;
-        };
-        let category = match event_type {
-            "AUTH_LOGIN" => &mut *login_events,
-            "PLAYBACK_STARTED" | "PLAYBACK_PAUSED" | "PLAYBACK_STOPPED" => &mut *playback_events,
-            _ => continue,
-        };
-        let Some(id) = record["id"].as_str() else {
-            continue;
-        };
-        let metadata_json =
-            serde_json::to_string(&record["metadata"]).unwrap_or_else(|_| "{}".to_owned());
-        category.push(AuditLogEvent {
-            id: id.to_owned(),
-            actor_user_id: record["actorUserId"].as_str().map(str::to_owned),
-            actor_username: record["actorUsername"].as_str().map(str::to_owned),
-            event_type: event_type.to_owned(),
-            target_type: record["targetType"].as_str().map(str::to_owned),
-            target_id: record["targetId"].as_str().map(str::to_owned),
-            metadata_json,
-            created_at: record["createdAt"].as_i64().unwrap_or_default(),
-        });
-        sort_audit_events(category);
-        category.truncate(category_limit);
-    }
+            ScanItem::GroupCompleted { completed, next } => {
+                if completed.is_none() {
+                    return Ok(ScanControl::Continue);
+                }
+                login_events.flush();
+                playback_events.flush();
+                let category_is_final = |collector: &PageCollector<AuditLogEvent>| {
+                    collector.is_page_complete()
+                        && floor_dominates_older_days(collector.floor_created_at(), next)
+                };
+                let page_is_final =
+                    category_is_final(&login_events) && category_is_final(&playback_events);
+                Ok(if page_is_final {
+                    ScanControl::Stop
+                } else {
+                    ScanControl::Continue
+                })
+            }
+        },
+    )?;
+    let mut events = login_events.into_page();
+    events.extend(playback_events.into_page());
+    sort_audit_events(&mut events);
+    let mut seen_ids = HashSet::with_capacity(events.len());
+    events.retain(|event| seen_ids.insert(event.id.clone()));
+    events.truncate(page_limit(limit));
+    Ok(events)
 }
 
 fn sort_audit_events(events: &mut [AuditLogEvent]) {
-    events.sort_by(|left, right| {
-        right
-            .created_at
-            .cmp(&left.created_at)
-            .then_with(|| right.id.cmp(&left.id))
-    });
+    sort_by_rank(events);
 }
 
 pub(crate) struct LogWriter {
@@ -1704,15 +2213,20 @@ fn compact_date(date: Date) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashSet,
         fs,
-        io::{self, Write},
+        io::{self, Read, Write},
+        path::Path,
         sync::Arc,
     };
 
     use super::{
-        LogDateRange, LogExport, LogExportError, LogManager, LogStore, NewAuditLogEvent,
-        archive_dir, export_logs, log_dir, log_file_name, parse_date, read_audit_events,
-        read_scan_job_events, verify_archive,
+        AuditLogEvent, LOG_SEGMENT_BYTES, LogDateRange, LogExport, LogExportError, LogManager,
+        LogStore, MAX_EVENT_SCAN_BYTES, MAX_EVENT_SCAN_FILES, MAX_LOG_ARCHIVES,
+        MAX_LOG_PAGE_WINDOW, MAX_RETAINED_SCAN_BYTES, NewAuditLogEvent, ScanControl, ScanItem,
+        ScanJobLogEvent, archive_dir, export_logs, log_dir, log_file_name, log_segment_file_name,
+        parse_date, read_activity_events, read_archive_member, read_audit_events,
+        read_daily_log_file, read_scan_job_events, sort_audit_events, verify_archive,
     };
     use serde_json::Value;
     use time::{Date, Month, OffsetDateTime};
@@ -2096,6 +2610,1018 @@ mod tests {
         assert_eq!(events[0].event_type, "SETTINGS_UPDATED");
         Ok(())
     }
+
+    // ---------------------------------------------------------------------------------------
+    // Bounded event reads: the page readers must stay proportional to the requested page, so the
+    // fixtures below compare them against a naive "read every file, sort, then paginate" reference.
+    // ---------------------------------------------------------------------------------------
+
+    fn fixture_date(value: &str) -> Date {
+        parse_date(value).expect("fixture date")
+    }
+
+    fn day_start(date: Date) -> i64 {
+        date.midnight().assume_utc().unix_timestamp()
+    }
+
+    fn audit_fixture_line(id: &str, event_type: &str, created_at: i64) -> String {
+        serde_json::json!({
+            "recordType": "admin_audit_event",
+            "id": id,
+            "actorUserId": "user-1",
+            "actorUsername": "admin",
+            "eventType": event_type,
+            "targetType": "settings",
+            "targetId": null,
+            "metadata": {"event": id},
+            "createdAt": created_at,
+        })
+        .to_string()
+    }
+
+    fn scan_job_fixture_line(id: &str, created_at: i64) -> String {
+        serde_json::json!({
+            "recordType": "scan_job_event",
+            "id": id,
+            "jobId": "job-1",
+            "level": "WARN",
+            "eventCode": "SCAN_IO",
+            "message": format!("event {id}"),
+            "details": {"event": id},
+            "createdAt": created_at,
+        })
+        .to_string()
+    }
+
+    fn write_daily_segment(config_dir: &Path, date: Date, lines: &[String]) -> io::Result<()> {
+        let directory = log_dir(config_dir);
+        fs::create_dir_all(&directory)?;
+        let mut payload = String::new();
+        for line in lines {
+            payload.push_str(line);
+            payload.push('\n');
+        }
+        fs::write(directory.join(log_file_name(date)), payload)
+    }
+
+    fn write_log_archive(
+        config_dir: &Path,
+        date: Date,
+        sequence: u64,
+        lines: &[String],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = archive_dir(config_dir);
+        fs::create_dir_all(&directory)?;
+        let member = log_segment_file_name(date, sequence);
+        let file = fs::File::create(directory.join(format!("{member}.zip")))?;
+        let mut writer = zip::ZipWriter::new(file);
+        writer.start_file(
+            &member,
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated),
+        )?;
+        let mut payload = String::new();
+        for line in lines {
+            payload.push_str(line);
+            payload.push('\n');
+        }
+        writer.write_all(payload.as_bytes())?;
+        writer.finish()?;
+        Ok(())
+    }
+
+    /// Runs `read_daily_log_file` with an explicit budget and returns the parsed JSONL records.
+    fn scan_tail_lines(config_dir: &Path, date: Date, budget: u64) -> io::Result<Vec<String>> {
+        let file = fs::File::open(log_dir(config_dir).join(log_file_name(date)))?;
+        let mut remaining = budget;
+        let mut lines = Vec::new();
+        read_daily_log_file(file, &mut remaining, &mut |item| {
+            if let ScanItem::Line(line) = item {
+                lines.push(String::from_utf8_lossy(line).into_owned());
+            }
+            Ok(ScanControl::Continue)
+        })?;
+        Ok(lines)
+    }
+
+    /// Runs `read_archive_member` with an explicit budget and returns the parsed JSONL records.
+    fn scan_archive_tail_lines(
+        config_dir: &Path,
+        date: Date,
+        sequence: u64,
+        budget: u64,
+    ) -> io::Result<Vec<String>> {
+        let path =
+            archive_dir(config_dir).join(format!("{}.zip", log_segment_file_name(date, sequence)));
+        let mut archive = zip::ZipArchive::new(fs::File::open(path)?).map_err(io::Error::other)?;
+        let member = archive.by_index(0).map_err(io::Error::other)?;
+        let size = member.size();
+        let mut remaining = budget;
+        let mut lines = Vec::new();
+        read_archive_member(member, size, &mut remaining, &mut |item| {
+            if let ScanItem::Line(line) = item {
+                lines.push(String::from_utf8_lossy(line).into_owned());
+            }
+            Ok(ScanControl::Continue)
+        })?;
+        Ok(lines)
+    }
+
+    fn collect_reference_json_lines(payload: &[u8], lines: &mut Vec<Vec<u8>>) {
+        for line in payload.split(|byte| *byte == b'\n') {
+            if !line.is_empty() {
+                lines.push(line.to_vec());
+            }
+        }
+    }
+
+    /// Naive reference reader: every daily file and every archive member, fully loaded.
+    fn reference_json_lines(config_dir: &Path) -> io::Result<Vec<Vec<u8>>> {
+        let mut lines = Vec::new();
+        let mut daily = Vec::new();
+        if let Ok(entries) = fs::read_dir(log_dir(config_dir)) {
+            for entry in entries {
+                let path = entry?.path();
+                let is_daily = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("lux.") && name.ends_with(".log"));
+                if is_daily {
+                    daily.push(path);
+                }
+            }
+        }
+        for path in daily {
+            collect_reference_json_lines(&fs::read(path)?, &mut lines);
+        }
+        if let Ok(entries) = fs::read_dir(archive_dir(config_dir)) {
+            for entry in entries {
+                let path = entry?.path();
+                let is_archive = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".log.zip"));
+                if !is_archive {
+                    continue;
+                }
+                let mut archive =
+                    zip::ZipArchive::new(fs::File::open(&path)?).map_err(io::Error::other)?;
+                for index in 0..archive.len() {
+                    let mut member = archive.by_index(index).map_err(io::Error::other)?;
+                    if !member.name().ends_with(".log") {
+                        continue;
+                    }
+                    let mut payload = Vec::new();
+                    member.read_to_end(&mut payload)?;
+                    collect_reference_json_lines(&payload, &mut lines);
+                }
+            }
+        }
+        Ok(lines)
+    }
+
+    fn reference_audit_events(config_dir: &Path) -> io::Result<Vec<AuditLogEvent>> {
+        let mut events = Vec::new();
+        for line in reference_json_lines(config_dir)? {
+            let Ok(record) = serde_json::from_slice::<Value>(&line) else {
+                continue;
+            };
+            if record["recordType"] != "admin_audit_event" {
+                continue;
+            }
+            let (Some(id), Some(event_type), Some(created_at)) = (
+                record["id"].as_str(),
+                record["eventType"].as_str(),
+                record["createdAt"].as_i64(),
+            ) else {
+                continue;
+            };
+            events.push(AuditLogEvent {
+                id: id.to_owned(),
+                actor_user_id: record["actorUserId"].as_str().map(str::to_owned),
+                actor_username: record["actorUsername"].as_str().map(str::to_owned),
+                event_type: event_type.to_owned(),
+                target_type: record["targetType"].as_str().map(str::to_owned),
+                target_id: record["targetId"].as_str().map(str::to_owned),
+                metadata_json: String::new(),
+                created_at,
+            });
+        }
+        sort_audit_events(&mut events);
+        let mut seen_ids = HashSet::new();
+        events.retain(|event| seen_ids.insert(event.id.clone()));
+        Ok(events)
+    }
+
+    fn reference_audit_ids(
+        config_dir: &Path,
+        offset: usize,
+        limit: usize,
+    ) -> io::Result<Vec<String>> {
+        Ok(reference_audit_events(config_dir)?
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|event| event.id)
+            .collect())
+    }
+
+    fn reference_scan_job_events(config_dir: &Path) -> io::Result<Vec<ScanJobLogEvent>> {
+        let mut events = Vec::new();
+        for line in reference_json_lines(config_dir)? {
+            let Ok(record) = serde_json::from_slice::<Value>(&line) else {
+                continue;
+            };
+            if record["recordType"] != "scan_job_event" || record["jobId"] != "job-1" {
+                continue;
+            }
+            let (Some(id), Some(created_at)) =
+                (record["id"].as_str(), record["createdAt"].as_i64())
+            else {
+                continue;
+            };
+            events.push(ScanJobLogEvent {
+                id: id.to_owned(),
+                job_id: "job-1".to_owned(),
+                level: "WARN".to_owned(),
+                event_code: "SCAN_IO".to_owned(),
+                message: String::new(),
+                details_json: String::new(),
+                created_at,
+            });
+        }
+        events.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        let mut seen_ids = HashSet::new();
+        events.retain(|event| seen_ids.insert(event.id.clone()));
+        Ok(events)
+    }
+
+    fn reference_activity_ids(config_dir: &Path, limit: i64) -> io::Result<Vec<String>> {
+        let category_limit = usize::try_from((limit / 2).max(1)).unwrap_or(usize::MAX);
+        let mut login_events = Vec::new();
+        let mut playback_events = Vec::new();
+        for event in reference_audit_events(config_dir)? {
+            match event.event_type.as_str() {
+                "AUTH_LOGIN" => login_events.push(event),
+                "PLAYBACK_STARTED" | "PLAYBACK_PAUSED" | "PLAYBACK_STOPPED" => {
+                    playback_events.push(event);
+                }
+                _ => {}
+            }
+        }
+        login_events.truncate(category_limit);
+        playback_events.truncate(category_limit);
+        login_events.extend(playback_events);
+        sort_audit_events(&mut login_events);
+        let mut seen_ids = HashSet::new();
+        login_events.retain(|event| seen_ids.insert(event.id.clone()));
+        login_events.truncate(usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
+        Ok(login_events.into_iter().map(|event| event.id).collect())
+    }
+
+    fn event_ids<T>(events: &[T], id: impl Fn(&T) -> &str) -> Vec<String> {
+        events.iter().map(|event| id(event).to_owned()).collect()
+    }
+
+    #[test]
+    fn audit_pages_match_a_full_scan_across_days_and_archives()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path();
+        let first = fixture_date("2026-08-06");
+        let second = fixture_date("2026-08-07");
+        let third = fixture_date("2026-08-08");
+        let fourth = fixture_date("2026-08-09");
+        write_log_archive(
+            config_dir,
+            first,
+            1,
+            &[
+                audit_fixture_line("a1-0", "SETTINGS_UPDATED", day_start(first) + 60),
+                audit_fixture_line("a1-1", "USER_CREATED", day_start(first) + 120),
+                audit_fixture_line("a1-2", "SETTINGS_UPDATED", day_start(first) + 180),
+            ],
+        )?;
+        write_log_archive(
+            config_dir,
+            first,
+            2,
+            &[
+                audit_fixture_line("a2-0", "SETTINGS_UPDATED", day_start(first) + 240),
+                audit_fixture_line("a2-1", "SETTINGS_UPDATED", day_start(first) + 300),
+            ],
+        )?;
+        write_daily_segment(
+            config_dir,
+            second,
+            &[
+                audit_fixture_line("b-0", "SETTINGS_UPDATED", day_start(second) + 60),
+                audit_fixture_line("b-1", "SETTINGS_UPDATED", day_start(second) + 120),
+                audit_fixture_line("b-2", "USER_CREATED", day_start(second) + 180),
+            ],
+        )?;
+        write_log_archive(
+            config_dir,
+            third,
+            2,
+            &[
+                audit_fixture_line("c2-0", "SETTINGS_UPDATED", day_start(third) + 60),
+                audit_fixture_line("c-shared", "SETTINGS_UPDATED", day_start(third) + 120),
+            ],
+        )?;
+        // The same record written into the daily file and its archived segment: id dedupe must
+        // collapse it exactly once.
+        write_daily_segment(
+            config_dir,
+            third,
+            &[
+                audit_fixture_line("c-shared", "SETTINGS_UPDATED", day_start(third) + 120),
+                audit_fixture_line("c-1", "SETTINGS_UPDATED", day_start(third) + 180),
+            ],
+        )?;
+        write_daily_segment(
+            config_dir,
+            fourth,
+            &[
+                audit_fixture_line("d-0", "SETTINGS_UPDATED", day_start(fourth) + 60),
+                audit_fixture_line("d-1", "SETTINGS_UPDATED", day_start(fourth) + 120),
+            ],
+        )?;
+
+        for (offset, limit) in [(0_usize, 1_i64), (0, 30), (1, 2), (4, 3), (12, 5), (40, 5)] {
+            let (_, page) = read_audit_events(
+                &log_dir(config_dir),
+                &archive_dir(config_dir),
+                i64::try_from(offset).unwrap_or(i64::MAX),
+                limit,
+                None,
+            )?;
+            assert_eq!(
+                event_ids(&page, |event| event.id.as_str()),
+                reference_audit_ids(config_dir, offset, usize::try_from(limit).unwrap_or(0))?,
+                "offset={offset} limit={limit}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn scan_job_pages_match_a_full_scan_across_days_and_archives()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path();
+        let first = fixture_date("2026-08-07");
+        let second = fixture_date("2026-08-09");
+        write_log_archive(
+            config_dir,
+            first,
+            1,
+            &[
+                scan_job_fixture_line("job-a", day_start(first) + 60),
+                scan_job_fixture_line("job-b", day_start(first) + 120),
+            ],
+        )?;
+        write_daily_segment(
+            config_dir,
+            second,
+            &[
+                scan_job_fixture_line("job-c", day_start(second) + 60),
+                scan_job_fixture_line("job-d", day_start(second) + 120),
+                scan_job_fixture_line("job-e", day_start(second) + 180),
+            ],
+        )?;
+
+        let reference = reference_scan_job_events(config_dir)?;
+        for (offset, limit) in [(0_usize, 1_i64), (0, 10), (1, 2), (3, 5)] {
+            let (total, page) = read_scan_job_events(
+                &log_dir(config_dir),
+                &archive_dir(config_dir),
+                "job-1",
+                None,
+                None,
+                i64::try_from(offset).unwrap_or(i64::MAX),
+                limit,
+            )?;
+            assert_eq!(
+                usize::try_from(total).unwrap_or(usize::MAX),
+                reference.len(),
+                "the job-event total must stay exact"
+            );
+            let expected = reference
+                .iter()
+                .skip(offset)
+                .take(usize::try_from(limit).unwrap_or(0))
+                .map(|event| event.id.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                event_ids(&page, |event| event.id.as_str()),
+                expected,
+                "offset={offset} limit={limit}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn first_page_skips_older_archives_without_opening_them()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path();
+        let newest = fixture_date("2026-08-09");
+        write_daily_segment(
+            config_dir,
+            newest,
+            &[
+                audit_fixture_line("newest-audit", "SETTINGS_UPDATED", day_start(newest) + 10),
+                audit_fixture_line("login-1", "AUTH_LOGIN", day_start(newest) + 1),
+                audit_fixture_line("login-2", "AUTH_LOGIN", day_start(newest) + 2),
+                audit_fixture_line("playback-1", "PLAYBACK_STARTED", day_start(newest) + 3),
+                audit_fixture_line("playback-2", "PLAYBACK_STOPPED", day_start(newest) + 4),
+            ],
+        )?;
+        // A first page that only needs the newest day must never open this broken archive.
+        fs::create_dir_all(archive_dir(config_dir))?;
+        fs::write(
+            archive_dir(config_dir).join("lux.2026-08-08.part-000001.log.zip"),
+            b"not a zip archive",
+        )?;
+
+        let (_, page) =
+            read_audit_events(&log_dir(config_dir), &archive_dir(config_dir), 0, 1, None)?;
+        assert_eq!(
+            event_ids(&page, |event| event.id.as_str()),
+            ["newest-audit".to_owned()]
+        );
+
+        let activity = read_activity_events(&log_dir(config_dir), &archive_dir(config_dir), 4)?;
+        assert_eq!(activity.len(), 4);
+
+        // The job-event page keeps an exact `total`, so it still has to open every file and the
+        // broken archive is reported instead of silently skipped.
+        assert!(
+            read_scan_job_events(
+                &log_dir(config_dir),
+                &archive_dir(config_dir),
+                "job-1",
+                None,
+                None,
+                0,
+                10,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_timestamps_in_a_newer_file_keep_the_global_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path();
+        let newest = fixture_date("2026-08-09");
+        let previous = fixture_date("2026-08-08");
+        // Migrated/legacy records can be appended to a newer file while keeping their original
+        // `createdAt`; the file name must not be trusted over the record timestamp.
+        write_daily_segment(
+            config_dir,
+            newest,
+            &[audit_fixture_line(
+                "legacy",
+                "SETTINGS_UPDATED",
+                day_start(fixture_date("2026-08-01")),
+            )],
+        )?;
+        write_daily_segment(
+            config_dir,
+            previous,
+            &[audit_fixture_line(
+                "recent",
+                "SETTINGS_UPDATED",
+                day_start(newest) - 60,
+            )],
+        )?;
+
+        let (_, first_page) =
+            read_audit_events(&log_dir(config_dir), &archive_dir(config_dir), 0, 1, None)?;
+        assert_eq!(
+            event_ids(&first_page, |event| event.id.as_str()),
+            ["recent".to_owned()],
+            "an older file may still hold the newest record"
+        );
+        let (_, both) =
+            read_audit_events(&log_dir(config_dir), &archive_dir(config_dir), 0, 5, None)?;
+        assert_eq!(
+            event_ids(&both, |event| event.id.as_str()),
+            ["recent".to_owned(), "legacy".to_owned()]
+        );
+        assert_eq!(
+            event_ids(&both, |event| event.id.as_str()),
+            reference_audit_ids(config_dir, 0, 5)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn activity_quota_keeps_logins_and_playback_balanced() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path();
+        let newest = fixture_date("2026-08-09");
+        let previous = fixture_date("2026-08-08");
+        write_daily_segment(
+            config_dir,
+            newest,
+            &[
+                audit_fixture_line("login-a", "AUTH_LOGIN", day_start(newest) + 10),
+                audit_fixture_line("login-b", "AUTH_LOGIN", day_start(newest) + 20),
+                audit_fixture_line("login-c", "AUTH_LOGIN", day_start(newest) + 30),
+                audit_fixture_line("login-d", "AUTH_LOGIN", day_start(newest) + 40),
+                audit_fixture_line("login-e", "AUTH_LOGIN", day_start(newest) + 50),
+                audit_fixture_line("playback-a", "PLAYBACK_STARTED", day_start(newest) + 60),
+            ],
+        )?;
+        write_log_archive(
+            config_dir,
+            previous,
+            1,
+            &[
+                audit_fixture_line("playback-b", "PLAYBACK_STARTED", day_start(previous) + 10),
+                audit_fixture_line("playback-c", "PLAYBACK_PAUSED", day_start(previous) + 20),
+                audit_fixture_line("playback-d", "PLAYBACK_STOPPED", day_start(previous) + 30),
+                audit_fixture_line("playback-e", "PLAYBACK_STARTED", day_start(previous) + 40),
+                audit_fixture_line("playback-f", "PLAYBACK_STOPPED", day_start(previous) + 50),
+                audit_fixture_line("login-f", "AUTH_LOGIN", day_start(previous) + 60),
+            ],
+        )?;
+
+        for limit in [2_i64, 4, 5, 10] {
+            let events =
+                read_activity_events(&log_dir(config_dir), &archive_dir(config_dir), limit)?;
+            assert_eq!(
+                event_ids(&events, |event| event.id.as_str()),
+                reference_activity_ids(config_dir, limit)?,
+                "limit={limit}"
+            );
+            let logins = events
+                .iter()
+                .filter(|event| event.event_type == "AUTH_LOGIN")
+                .count();
+            let category_limit = usize::try_from((limit / 2).max(1)).unwrap_or(usize::MAX);
+            assert!(logins <= category_limit, "limit={limit} logins={logins}");
+            assert!(events.len() <= usize::try_from(limit.max(0)).unwrap_or(usize::MAX));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_newest_segment_stops_at_the_byte_ceiling() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path();
+        let newest = fixture_date("2026-08-09");
+        let previous = fixture_date("2026-08-08");
+        // The polled activity list keeps the small 16 MiB budget, so an oversized segment makes the
+        // ceiling observable end to end.
+        let padding = "p".repeat(48 * 1024);
+        let noise_lines = usize::try_from(MAX_EVENT_SCAN_BYTES / (48 * 1024)).unwrap_or(0) + 32;
+        let mut payload = Vec::with_capacity(noise_lines + 5);
+        payload.push(audit_fixture_line(
+            "head-login",
+            "AUTH_LOGIN",
+            day_start(newest) + 1,
+        ));
+        for index in 0..noise_lines {
+            payload.push(
+                serde_json::json!({"recordType": "program_log", "message": format!("{index}-{padding}")})
+                    .to_string(),
+            );
+        }
+        // The newest records sit at the end of the oversized segment: the tail must be read first.
+        payload.push(audit_fixture_line(
+            "login-1",
+            "AUTH_LOGIN",
+            day_start(newest) + 100,
+        ));
+        payload.push(audit_fixture_line(
+            "login-2",
+            "AUTH_LOGIN",
+            day_start(newest) + 120,
+        ));
+        payload.push(audit_fixture_line(
+            "playback-1",
+            "PLAYBACK_STARTED",
+            day_start(newest) + 140,
+        ));
+        payload.push(audit_fixture_line(
+            "playback-2",
+            "PLAYBACK_STOPPED",
+            day_start(newest) + 160,
+        ));
+        write_daily_segment(config_dir, newest, &payload)?;
+        write_daily_segment(
+            config_dir,
+            previous,
+            &[
+                audit_fixture_line("unreachable-login", "AUTH_LOGIN", day_start(previous) + 10),
+                audit_fixture_line(
+                    "unreachable-playback",
+                    "PLAYBACK_STARTED",
+                    day_start(previous) + 20,
+                ),
+            ],
+        )?;
+
+        let events = read_activity_events(&log_dir(config_dir), &archive_dir(config_dir), 4)?;
+        assert_eq!(
+            event_ids(&events, |event| event.id.as_str()),
+            [
+                "playback-2".to_owned(),
+                "playback-1".to_owned(),
+                "login-2".to_owned(),
+                "login-1".to_owned(),
+            ],
+            "the byte ceiling must return the newest records and stop before older segments"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_archive_member_returns_its_newest_records()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path();
+        let newest = fixture_date("2026-08-09");
+        let previous = fixture_date("2026-08-08");
+        // An archived segment is a rotated daily file: its oldest records come first. Reading it
+        // through the polled activity path keeps the 16 MiB budget observable end to end.
+        let padding = "p".repeat(48 * 1024);
+        let noise_lines = usize::try_from(MAX_EVENT_SCAN_BYTES / (48 * 1024)).unwrap_or(0) + 32;
+        let mut payload = Vec::with_capacity(noise_lines + 5);
+        payload.push(audit_fixture_line(
+            "head-login",
+            "AUTH_LOGIN",
+            day_start(newest) + 1,
+        ));
+        for index in 0..noise_lines {
+            payload.push(
+                serde_json::json!({"recordType": "program_log", "message": format!("{index}-{padding}")})
+                    .to_string(),
+            );
+        }
+        payload.push(audit_fixture_line(
+            "login-1",
+            "AUTH_LOGIN",
+            day_start(newest) + 100,
+        ));
+        payload.push(audit_fixture_line(
+            "login-2",
+            "AUTH_LOGIN",
+            day_start(newest) + 120,
+        ));
+        payload.push(audit_fixture_line(
+            "playback-1",
+            "PLAYBACK_STARTED",
+            day_start(newest) + 140,
+        ));
+        payload.push(audit_fixture_line(
+            "playback-2",
+            "PLAYBACK_STOPPED",
+            day_start(newest) + 160,
+        ));
+        write_log_archive(config_dir, newest, 1, &payload)?;
+        // The oversized member is the newest source: older archives must stay unopened.
+        fs::create_dir_all(archive_dir(config_dir))?;
+        fs::write(
+            archive_dir(config_dir).join(format!("{}.zip", log_segment_file_name(previous, 1))),
+            b"not a zip archive",
+        )?;
+
+        let events = read_activity_events(&log_dir(config_dir), &archive_dir(config_dir), 4)?;
+        assert_eq!(
+            event_ids(&events, |event| event.id.as_str()),
+            [
+                "playback-2".to_owned(),
+                "playback-1".to_owned(),
+                "login-2".to_owned(),
+                "login-1".to_owned(),
+            ],
+            "an over-budget archive member must be read from its newest end"
+        );
+        assert!(
+            !events.iter().any(|event| event.id == "head-login"),
+            "the skipped head must not leak its records"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_timestamp_with_offset_returns_the_globally_ordered_row()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path();
+        let newest = fixture_date("2026-08-09");
+        let previous = fixture_date("2026-08-08");
+        // `legacy` keeps an old `createdAt` inside the newer file (a migrated record), so the day
+        // order cannot be trusted before both files are read.
+        write_daily_segment(
+            config_dir,
+            newest,
+            &[audit_fixture_line(
+                "legacy",
+                "SETTINGS_UPDATED",
+                day_start(fixture_date("2026-08-01")),
+            )],
+        )?;
+        write_daily_segment(
+            config_dir,
+            previous,
+            &[audit_fixture_line(
+                "recent",
+                "SETTINGS_UPDATED",
+                day_start(newest) - 60,
+            )],
+        )?;
+
+        let (_, page) =
+            read_audit_events(&log_dir(config_dir), &archive_dir(config_dir), 1, 1, None)?;
+        assert_eq!(
+            event_ids(&page, |event| event.id.as_str()),
+            ["legacy".to_owned()],
+            "the second row of the globally ordered log is the migrated record"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_timestamp_pages_match_a_full_scan_for_every_offset()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path();
+        let newest = fixture_date("2026-08-09");
+        let middle = fixture_date("2026-08-08");
+        let oldest = fixture_date("2026-08-07");
+        write_daily_segment(
+            config_dir,
+            newest,
+            &[
+                audit_fixture_line("newest-a", "SETTINGS_UPDATED", day_start(newest) + 60),
+                audit_fixture_line("legacy-a", "SETTINGS_UPDATED", day_start(oldest) + 90),
+                audit_fixture_line("legacy-b", "SETTINGS_UPDATED", day_start(middle) + 30),
+            ],
+        )?;
+        write_log_archive(
+            config_dir,
+            middle,
+            1,
+            &[
+                audit_fixture_line("middle-a", "SETTINGS_UPDATED", day_start(middle) + 60),
+                audit_fixture_line("legacy-c", "SETTINGS_UPDATED", day_start(oldest) + 30),
+            ],
+        )?;
+        write_daily_segment(
+            config_dir,
+            oldest,
+            &[
+                audit_fixture_line("oldest-a", "SETTINGS_UPDATED", day_start(oldest) + 60),
+                audit_fixture_line("oldest-b", "SETTINGS_UPDATED", day_start(oldest) + 120),
+            ],
+        )?;
+
+        for offset in [0_usize, 1, 2, 3] {
+            for limit in [1_i64, 2, 5] {
+                let (_, page) = read_audit_events(
+                    &log_dir(config_dir),
+                    &archive_dir(config_dir),
+                    i64::try_from(offset).unwrap_or(i64::MAX),
+                    limit,
+                    None,
+                )?;
+                assert_eq!(
+                    event_ids(&page, |event| event.id.as_str()),
+                    reference_audit_ids(config_dir, offset, usize::try_from(limit).unwrap_or(0))?,
+                    "offset={offset} limit={limit}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retention_ceilings_cover_the_full_retained_log_volume() {
+        // Compile-time retention invariants, kept next to the readers so the relationship stays
+        // visible: the audit page and one job's event page share `MAX_RETAINED_SCAN_BYTES`, and it
+        // must cover every retained archive slot plus the daily files still being written, otherwise
+        // older records would silently disappear from those admin pages.
+        const {
+            assert!(MAX_RETAINED_SCAN_BYTES >= LOG_SEGMENT_BYTES * (MAX_LOG_ARCHIVES as u64 + 1));
+            assert!(MAX_EVENT_SCAN_FILES > MAX_LOG_ARCHIVES);
+            // The polled activity list deliberately keeps the smaller budget.
+            assert!(MAX_EVENT_SCAN_BYTES < MAX_RETAINED_SCAN_BYTES);
+            // The window must cover a full console page and stay small enough to stay bounded.
+            assert!(MAX_LOG_PAGE_WINDOW >= 100);
+            assert!(MAX_LOG_PAGE_WINDOW <= 10_000);
+        }
+    }
+
+    #[test]
+    fn deep_pages_are_refused_without_opening_log_files() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path();
+        fs::create_dir_all(archive_dir(config_dir))?;
+        fs::write(
+            archive_dir(config_dir).join("lux.2026-08-08.part-000001.log.zip"),
+            b"not a zip archive",
+        )?;
+        let deep_offset = i64::try_from(MAX_LOG_PAGE_WINDOW).unwrap_or(i64::MAX);
+
+        let (total, page) = read_audit_events(
+            &log_dir(config_dir),
+            &archive_dir(config_dir),
+            deep_offset,
+            1,
+            None,
+        )?;
+        assert_eq!(total, 0);
+        assert!(page.is_empty());
+        assert!(
+            read_activity_events(
+                &log_dir(config_dir),
+                &archive_dir(config_dir),
+                deep_offset.saturating_add(1),
+            )?
+            .is_empty()
+        );
+        let (total, events) = read_scan_job_events(
+            &log_dir(config_dir),
+            &archive_dir(config_dir),
+            "job-1",
+            None,
+            None,
+            deep_offset,
+            1,
+        )?;
+        assert_eq!(total, 0);
+        assert!(events.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn wide_page_windows_match_a_full_scan() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path();
+        let first = fixture_date("2026-08-06");
+        let second = fixture_date("2026-08-07");
+        let third = fixture_date("2026-08-08");
+        let mut first_day = Vec::with_capacity(2_000);
+        let mut second_day = Vec::with_capacity(2_000);
+        let mut third_day = Vec::with_capacity(2_000);
+        for index in 0..2_000 {
+            first_day.push(audit_fixture_line(
+                &format!("first-{index:05}"),
+                "SETTINGS_UPDATED",
+                day_start(first) + index,
+            ));
+            second_day.push(audit_fixture_line(
+                &format!("second-{index:05}"),
+                "SETTINGS_UPDATED",
+                day_start(second) + index,
+            ));
+            third_day.push(audit_fixture_line(
+                &format!("third-{index:05}"),
+                "SETTINGS_UPDATED",
+                day_start(third) + index,
+            ));
+        }
+        write_log_archive(config_dir, first, 1, &first_day)?;
+        write_daily_segment(config_dir, second, &second_day)?;
+        write_daily_segment(config_dir, third, &third_day)?;
+
+        for (offset, limit) in [(5_000_usize, 100_i64), (0, 100), (1_500, 100), (5_950, 100)] {
+            let (_, page) = read_audit_events(
+                &log_dir(config_dir),
+                &archive_dir(config_dir),
+                i64::try_from(offset).unwrap_or(i64::MAX),
+                limit,
+                None,
+            )?;
+            assert_eq!(
+                event_ids(&page, |event| event.id.as_str()),
+                reference_audit_ids(config_dir, offset, usize::try_from(limit).unwrap_or(0))?,
+                "offset={offset} limit={limit}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn audit_page_finds_events_behind_a_scan_heavy_newest_segment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path();
+        let newest = fixture_date("2026-08-09");
+        let previous = fixture_date("2026-08-08");
+        // A large scan can fill the newest segment with scan events alone. The polled 16 MiB budget
+        // would be spent before any audit record, so the audit page must use the retention ceiling.
+        let padding = "p".repeat(48 * 1024);
+        let noise_lines = usize::try_from(MAX_EVENT_SCAN_BYTES / (48 * 1024)).unwrap_or(0) + 32;
+        let mut payload = Vec::with_capacity(noise_lines);
+        for index in 0..noise_lines {
+            payload.push(
+                serde_json::json!({
+                    "recordType": "scan_job_event",
+                    "id": format!("scan-{index:05}"),
+                    "jobId": "job-1",
+                    "level": "INFO",
+                    "eventCode": "SCAN_IO",
+                    "message": format!("{index}-{padding}"),
+                    "details": {},
+                    "createdAt": day_start(newest) + i64::try_from(index).unwrap_or(0),
+                })
+                .to_string(),
+            );
+        }
+        write_daily_segment(config_dir, newest, &payload)?;
+        write_log_archive(
+            config_dir,
+            previous,
+            1,
+            &[
+                audit_fixture_line(
+                    "older-audit-1",
+                    "SETTINGS_UPDATED",
+                    day_start(previous) + 60,
+                ),
+                audit_fixture_line("older-audit-2", "USER_CREATED", day_start(previous) + 120),
+            ],
+        )?;
+
+        let (_, page) =
+            read_audit_events(&log_dir(config_dir), &archive_dir(config_dir), 0, 10, None)?;
+        assert_eq!(
+            event_ids(&page, |event| event.id.as_str()),
+            ["older-audit-2".to_owned(), "older-audit-1".to_owned()],
+            "the audit page must not return empty just because the newest segment is scan-only"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tail_segments_keep_the_record_that_starts_at_the_cut()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path();
+        let date = fixture_date("2026-08-09");
+        let first = audit_fixture_line("first", "SETTINGS_UPDATED", day_start(date) + 1);
+        let second = audit_fixture_line("second", "SETTINGS_UPDATED", day_start(date) + 2);
+        let third = audit_fixture_line("third", "SETTINGS_UPDATED", day_start(date) + 3);
+        let records = [first.clone(), second.clone(), third.clone()];
+        write_daily_segment(config_dir, date, &records)?;
+        write_log_archive(config_dir, date, 1, &records)?;
+
+        let total_length = u64::try_from(first.len() + second.len() + third.len() + 3).unwrap_or(0);
+        let second_start = u64::try_from(first.len() + 1).unwrap_or(0);
+        // The window starts exactly on the first byte of `second`; the one-byte back-off keeps that
+        // record and only the terminator of `first` is skipped.
+        let cut_at_record = total_length.saturating_sub(second_start);
+        let after_record_cut = vec![second.clone(), third.clone()];
+        assert_eq!(
+            scan_tail_lines(config_dir, date, cut_at_record)?,
+            after_record_cut,
+            "daily file: a record starting at the cut must survive"
+        );
+        assert_eq!(
+            scan_archive_tail_lines(config_dir, date, 1, cut_at_record)?,
+            after_record_cut,
+            "archive member: a record starting at the cut must survive"
+        );
+
+        // Control case: five bytes into `second` legitimately loses that record, not the later ones.
+        let cut_mid_record = cut_at_record.saturating_sub(5);
+        let mid_record_cut = vec![third.clone()];
+        assert_eq!(
+            scan_tail_lines(config_dir, date, cut_mid_record)?,
+            mid_record_cut
+        );
+        assert_eq!(
+            scan_archive_tail_lines(config_dir, date, 1, cut_mid_record)?,
+            mid_record_cut
+        );
+
+        // One byte short of the whole segment: nothing is skipped and every record survives.
+        let almost_whole = total_length.saturating_sub(1);
+        assert_eq!(scan_tail_lines(config_dir, date, almost_whole)?, records);
+        assert_eq!(
+            scan_archive_tail_lines(config_dir, date, 1, almost_whole)?,
+            records
+        );
+        Ok(())
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -2167,5 +3693,197 @@ mod export_redaction_tests {
         assert!(output.contains("plain text line"));
         assert!(output.contains("\"requestId\":\"abc\""));
         assert_eq!(output.lines().count(), 3);
+    }
+}
+
+#[cfg(test)]
+mod redaction_rule_tests {
+    use serde_json::{Value, json};
+
+    use super::{
+        REDACTED_PLACEHOLDER, REDACTED_URL_PLACEHOLDER, SENSITIVE_KEY_FRAGMENTS,
+        SENSITIVE_KEY_SUFFIXES, SENSITIVE_URL_MARKERS, SENSITIVE_VALUE_MARKERS,
+        redact_sensitive_log_values,
+    };
+
+    /// Redacts `{"<key>": "probe"}` and returns the value stored under `key`.
+    fn redact_under_key(key: &str) -> Value {
+        let mut object = serde_json::Map::new();
+        object.insert(key.to_owned(), Value::String("probe".to_owned()));
+        redact_sensitive_log_values(Value::Object(object))
+            .get(key)
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    #[test]
+    fn url_detection_ignores_case() {
+        for sample in [
+            "HTTPS://EXAMPLE.COM/a?token=abc",
+            "Http://x.test/",
+            "hTtPs://example.com/a",
+        ] {
+            assert_eq!(
+                redact_sensitive_log_values(Value::String(sample.to_owned())),
+                Value::String(REDACTED_URL_PLACEHOLDER.to_owned()),
+                "{sample}"
+            );
+        }
+        assert_eq!(
+            redact_sensitive_log_values(json!({"message": "Http://x.test/"})),
+            json!({"message": REDACTED_URL_PLACEHOLDER})
+        );
+    }
+
+    #[test]
+    fn value_markers_match_regardless_of_case() {
+        for marker in SENSITIVE_VALUE_MARKERS {
+            for marker in [marker.to_owned(), marker.to_uppercase()] {
+                let sample = format!("prefix {marker}suffix");
+                assert_eq!(
+                    redact_sensitive_log_values(Value::String(sample.clone())),
+                    Value::String(REDACTED_PLACEHOLDER.to_owned()),
+                    "{sample}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn key_rules_match_regardless_of_case_and_separators() {
+        for fragment in SENSITIVE_KEY_FRAGMENTS {
+            for key in [
+                fragment.to_owned(),
+                fragment.to_uppercase(),
+                format!("X-{fragment}Id"),
+            ] {
+                assert_eq!(
+                    redact_under_key(&key),
+                    Value::String(REDACTED_PLACEHOLDER.to_owned()),
+                    "{key}"
+                );
+            }
+        }
+        for suffix in SENSITIVE_KEY_SUFFIXES {
+            for key in [
+                format!("source{suffix}"),
+                format!("source{}", suffix.to_uppercase()),
+                format!("redirect_{suffix}"),
+            ] {
+                assert_eq!(
+                    redact_under_key(&key),
+                    Value::String(REDACTED_PLACEHOLDER.to_owned()),
+                    "{key}"
+                );
+            }
+        }
+        for key in ["requestId", "durationMs", "path", "method", "statusCode"] {
+            assert_eq!(
+                redact_under_key(key),
+                Value::String("probe".to_owned()),
+                "{key}"
+            );
+        }
+    }
+
+    /// The key rule re-stated from the shared tables only.
+    fn shared_table_redacts_key(key: &str) -> bool {
+        let normalized = key
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        SENSITIVE_KEY_FRAGMENTS
+            .iter()
+            .any(|fragment| normalized.contains(fragment))
+            || SENSITIVE_KEY_SUFFIXES
+                .iter()
+                .any(|suffix| normalized.ends_with(suffix))
+    }
+
+    /// The value rule re-stated from the shared tables only.
+    fn shared_table_redacts_value(value: &str) -> Option<&'static str> {
+        let normalized = value.to_ascii_lowercase();
+        if SENSITIVE_URL_MARKERS
+            .iter()
+            .any(|marker| normalized.contains(marker))
+        {
+            Some(REDACTED_URL_PLACEHOLDER)
+        } else if SENSITIVE_VALUE_MARKERS
+            .iter()
+            .any(|marker| normalized.contains(marker))
+        {
+            Some(REDACTED_PLACEHOLDER)
+        } else {
+            None
+        }
+    }
+
+    /// The redactor must agree with the shared tables on every sample, including samples that are
+    /// deliberately *not* redacted. Writing a rule inline in the redactor (for example a
+    /// `passwd=` marker) makes the two disagree and fails here.
+    #[test]
+    fn shared_tables_are_the_only_rule_source() {
+        let mut keys = Vec::new();
+        for fragment in SENSITIVE_KEY_FRAGMENTS {
+            keys.push(fragment.to_owned());
+            keys.push(fragment.to_uppercase());
+            keys.push(format!("X-{fragment}Id"));
+            keys.push(format!("{fragment}_value"));
+        }
+        for suffix in SENSITIVE_KEY_SUFFIXES {
+            keys.push(format!("source{suffix}"));
+            keys.push(format!("source{}", suffix.to_uppercase()));
+            keys.push(format!("redirect_{suffix}"));
+        }
+        for key in ["requestId", "durationMs", "path", "method", "statusCode"] {
+            keys.push(key.to_owned());
+        }
+
+        for key in keys {
+            let expected = if shared_table_redacts_key(&key) {
+                REDACTED_PLACEHOLDER
+            } else {
+                "probe"
+            };
+            assert_eq!(
+                redact_under_key(&key),
+                Value::String(expected.to_owned()),
+                "{key}"
+            );
+        }
+
+        let mut values = Vec::new();
+        for marker in SENSITIVE_VALUE_MARKERS {
+            values.push(format!("prefix {marker}suffix"));
+            values.push(format!("prefix {}suffix", marker.to_uppercase()));
+        }
+        for marker in SENSITIVE_URL_MARKERS {
+            values.push(format!("call {marker}example.test/a now"));
+            values.push(format!("call {}EXAMPLE.TEST/a now", marker.to_uppercase()));
+        }
+        for sample in [
+            "nothing to see",
+            "token expired",
+            "bearer",
+            "authorization header",
+            "https:/single-slash",
+            "ftp://example.com/a",
+            "passwd=abc",
+            "session=abc",
+            "private_key=abc",
+            "basic abc",
+        ] {
+            values.push(sample.to_owned());
+        }
+
+        for sample in values {
+            let expected = shared_table_redacts_value(&sample).unwrap_or(sample.as_str());
+            assert_eq!(
+                redact_sensitive_log_values(Value::String(sample.clone())),
+                Value::String(expected.to_owned()),
+                "{sample}"
+            );
+        }
     }
 }

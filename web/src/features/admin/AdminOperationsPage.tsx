@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   CalendarDays,
@@ -22,7 +22,7 @@ import { useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { LuxSelect } from "../../components/LuxSelect";
 import { api } from "../../lib/api/client";
-import { queryKeys } from "../../lib/api/query-keys";
+import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type {
   AdminAuditEvent,
   AdminChapterDetectionJob,
@@ -36,6 +36,7 @@ import type {
   AdminStrmProbeJob,
 } from "../../lib/api/types";
 import { formatAdminDate } from "./date";
+import { useAdminRealtimeConnectionState } from "./useAdminEvents";
 import { LuxButton, LuxIconButton, LuxSwitch, LuxTextField, useLuxConfirm } from "../../components/ui";
 
 type OperationsTab = "registered" | "runs" | "logs";
@@ -72,6 +73,7 @@ const JOB_TYPE_LABELS: Record<string, string> = {
   STRM_MEDIA_INFO: "STRM 媒体信息扫描",
   CHAPTER_DETECTION: "片头片尾检测",
   DANMAKU_MATCH: "弹幕匹配",
+  RATINGS_SYNC: "评分同步",
 };
 
 const AUDIT_EVENT_LABELS: Record<string, string> = {
@@ -109,6 +111,10 @@ const AUDIT_EVENT_LABELS: Record<string, string> = {
   DANMAKU_MATCH_STARTED: "开始弹幕匹配",
   DANMAKU_MATCH_CANCEL_REQUESTED: "取消弹幕匹配",
   DANMAKU_MATCH_RETRIED: "重试弹幕匹配",
+  PLAYBACK_STARTED: "开始播放",
+  PLAYBACK_PAUSED: "暂停播放",
+  PLAYBACK_STOPPED: "停止播放",
+  PLAYBACK_PROGRESS: "播放进度",
   ADMIN_API_KEY_REVOKED: "吊销管理 API 密钥",
   ADMIN_API_KEY_ROTATED: "轮换管理 API 密钥",
   COLLECTION_REFRESHED: "刷新合集",
@@ -195,6 +201,15 @@ const ERROR_LABELS: Record<string, string> = {
 
 export function AdminOperationsPage() {
   const queryClient = useQueryClient();
+  // LUX-898: the four runtime-record lists only *slow down* while the admin channel is connected.
+  // Only the scanner and the metadata reidentify service publish `jobs` frames; STRM probe, chapter
+  // detection, danmaku matching and library cover write progress to the database without an event,
+  // so stopping the timers would leave those rows at RUNNING. The badge counts keep coming from the
+  // same queries either way.
+  const adminRealtimeState = useAdminRealtimeConnectionState();
+  const jobsFallbackInterval = adminRealtimeState === "connected"
+    ? queryRefreshIntervals.adminJobsConnected
+    : queryRefreshIntervals.adminJobs;
   const [tab, setTab] = useState<OperationsTab>("registered");
   const [status, setStatus] = useState("");
   const [logLevel, setLogLevel] = useState("");
@@ -228,33 +243,42 @@ export function AdminOperationsPage() {
       : api.adminJobs(status || undefined),
     enabled: status !== "DEFERRED",
   });
+  // The pending aggregation only feeds the "低匹配 N 项" link on the runtime records rows, so it is
+  // requested only while that tab is on screen; the badge counts need no pending number.
+  const includePendingMetadataJobs = tab === "runs";
   const metadataJobs = useQuery({
-    queryKey: queryKeys.adminMetadataJobs(status),
-    queryFn: () => api.adminMetadataReidentifyJobs(metadataStatusFilter(status)),
+    queryKey: queryKeys.adminMetadataJobs(status, includePendingMetadataJobs),
+    queryFn: () =>
+      api.adminMetadataReidentifyJobs(metadataStatusFilter(status), {
+        includePending: includePendingMetadataJobs,
+      }),
+    // Switching to the runtime records keeps the rows already on screen while the pending
+    // counts arrive, instead of replacing them with a full loading state.
+    placeholderData: includePendingMetadataJobs ? keepPreviousData : undefined,
   });
   const strmJobs = useQuery({
     queryKey: queryKeys.adminStrmProbeJobs(status),
     queryFn: () => api.adminStrmProbeJobs(status || undefined),
     enabled: !isMetadataOnlyJobStatus(status),
-    refetchInterval: 5_000,
+    refetchInterval: jobsFallbackInterval,
   });
   const chapterJobs = useQuery({
     queryKey: queryKeys.adminChapterDetectionJobs(status),
     queryFn: () => api.adminChapterDetectionJobs(status || undefined),
     enabled: !isMetadataOnlyJobStatus(status),
-    refetchInterval: 5_000,
+    refetchInterval: jobsFallbackInterval,
   });
   const danmakuJobs = useQuery({
     queryKey: queryKeys.adminDanmakuMatchJobs(status),
     queryFn: () => api.adminDanmakuMatchJobs(status || undefined),
     enabled: !isMetadataOnlyJobStatus(status),
-    refetchInterval: 5_000,
+    refetchInterval: jobsFallbackInterval,
   });
   const libraryCoverJobs = useQuery({
     queryKey: queryKeys.adminLibraryCoverJobs(status),
     queryFn: () => api.adminLibraryCoverJobs(status || undefined),
     enabled: !isMetadataOnlyJobStatus(status),
-    refetchInterval: 5_000,
+    refetchInterval: jobsFallbackInterval,
   });
   const logs = useQuery({ queryKey: queryKeys.adminLogs, queryFn: () => api.adminLogs() });
   const cancel = useMutation({
@@ -611,7 +635,7 @@ function ScheduledTaskPlanRow({ plan, libraries, onSaved, onDeleted }: { plan: A
     mutationFn: () => globalPlan ? api.runAdminScheduledTask({ ownerType: "GLOBAL", ownerId: "global", taskType: plan.taskType }) : api.runAdminScheduledTaskPlan(plan.id),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminJobs() });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.adminMetadataJobs() });
+      void queryClient.invalidateQueries({ queryKey: ["admin", "metadata-jobs"] });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminStrmProbeJobs() });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminChapterDetectionJobs() });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminDanmakuMatchJobs() });
@@ -763,7 +787,7 @@ function RegisteredTaskRow({ task, onSaved }: { task: AdminScheduledTask; onSave
     mutationFn: () => runRegisteredTask(task),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminJobs() });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.adminMetadataJobs() });
+      void queryClient.invalidateQueries({ queryKey: ["admin", "metadata-jobs"] });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminStrmProbeJobs() });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminChapterDetectionJobs() });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminDanmakuMatchJobs() });
@@ -885,7 +909,10 @@ function LogRow({ log, libraryNames }: { log: AdminAuditEvent; libraryNames: Rea
   const level = auditLevel(log);
   const metadataRows = formatAuditMetadata(log.metadata ?? {}, libraryNames);
   const targetName = log.targetType === "library" && log.targetId ? libraryNames.get(log.targetId) ?? log.targetId : log.targetId;
-  return <article className={`lux-operations-log-row is-${level.toLowerCase()}`}><span className="lux-operations-log-level">{level}</span><div className="lux-operations-log-copy"><strong>{formatAuditEvent(log.eventType)}</strong><p>{log.actorUsername || "系统"}{log.targetType ? ` · ${formatTargetType(log.targetType)}` : ""}{targetName ? ` · ${targetName}` : ""}</p>{open && metadataRows.length > 0 ? <ul className="lux-operations-log-details">{metadataRows.map((row) => <li key={row.key}><span>{row.label}</span><strong>{row.value}</strong></li>)}</ul> : null}</div><time>{formatAdminDate(log.createdAt)}</time>{metadataRows.length > 0 ? <LuxIconButton className="lux-icon-button-small" type="button" aria-expanded={open} aria-label={open ? "收起日志详情" : "展开日志详情"} onClick={() => setOpen((current) => !current)}>{open ? <X size={15} /> : <FileClock size={15} />}</LuxIconButton> : null}</article>;
+  const deviceName = typeof log.metadata?.deviceName === "string" ? log.metadata.deviceName : "";
+  const itemTitle = typeof log.metadata?.itemTitle === "string" ? log.metadata.itemTitle : "";
+  const displayTarget = itemTitle || (targetName === log.targetId ? shortenLogTarget(targetName ?? "") : targetName);
+  return <article className={`lux-operations-log-row is-${level.toLowerCase()}`}><span className="lux-operations-log-level">{level}</span><div className="lux-operations-log-copy"><strong>{formatAuditEvent(log.eventType)}</strong><p>{log.actorUsername || "系统"}{log.targetType ? ` · ${formatTargetType(log.targetType)}` : ""}{displayTarget ? ` · ${displayTarget}` : ""}{deviceName ? ` · 设备 ${deviceName}` : ""}</p>{open && metadataRows.length > 0 ? <ul className="lux-operations-log-details">{metadataRows.map((row) => <li key={row.key}><span>{row.label}</span><strong>{row.value}</strong></li>)}</ul> : null}</div><time>{formatAdminDate(log.createdAt)}</time>{metadataRows.length > 0 ? <LuxIconButton className="lux-icon-button-small" type="button" aria-expanded={open} aria-label={open ? "收起日志详情" : "展开日志详情"} onClick={() => setOpen((current) => !current)}>{open ? <X size={15} /> : <FileClock size={15} />}</LuxIconButton> : null}</article>;
 }
 
 const AUDIT_METADATA_LABELS: Record<string, string> = {
@@ -912,9 +939,26 @@ const AUDIT_METADATA_LABELS: Record<string, string> = {
   failed: "失败",
   skipped: "跳过",
   elapsedMs: "耗时（毫秒）",
+  itemTitle: "条目名称",
+  client: "客户端",
+  clientVersion: "客户端版本",
+  deviceName: "设备名",
+  deviceType: "设备类型",
+  state: "状态",
+  remoteIp: "IP地址",
+};
+
+const PLAYBACK_STATE_LABELS: Record<string, string> = {
+  PLAYING: "播放中",
+  PAUSED: "已暂停",
+  STOPPED: "已停止",
 };
 
 type AuditMetadataRow = { key: string; label: string; value: string };
+
+function shortenLogTarget(value: string) {
+  return value.length > 16 ? `${value.slice(0, 8)}…` : value;
+}
 
 function formatAuditMetadata(metadata: Record<string, unknown>, libraryNames: ReadonlyMap<string, string>): AuditMetadataRow[] {
   return Object.entries(metadata).map(([key, value]) => ({
@@ -926,6 +970,7 @@ function formatAuditMetadata(metadata: Record<string, unknown>, libraryNames: Re
 
 function formatAuditMetadataValue(key: string, value: unknown, libraryNames: ReadonlyMap<string, string>): string {
   if (key === "libraryId" && typeof value === "string") return libraryNames.get(value) ?? value;
+  if (key === "state" && typeof value === "string") return PLAYBACK_STATE_LABELS[value] ?? value;
   if (typeof value === "boolean") return value ? "是" : "否";
   if (Array.isArray(value)) return value.map(String).join("、");
   if (value !== null && typeof value === "object") return JSON.stringify(value);
@@ -1113,7 +1158,9 @@ function isSchedulableTask(task: AdminScheduledTask) {
 }
 
 function isExternallyScheduledTask(task: AdminScheduledTask) {
-  return ["STRM_MEDIA_INFO", "CHAPTER_DETECTION", "DANMAKU_MATCH"].includes(task.taskType);
+  // These tasks keep their schedule in the owning plugin's configuration, so the page edits the
+  // plugin value instead of writing an enable flag next to it.
+  return ["STRM_MEDIA_INFO", "CHAPTER_DETECTION", "DANMAKU_MATCH", "RATINGS_SYNC"].includes(task.taskType);
 }
 
 async function runRegisteredTask(task: AdminScheduledTask) {
@@ -1192,6 +1239,7 @@ function formatTargetType(targetType: string) {
     plugin: "插件",
     scheduled_task: "注册任务",
     item: "媒体条目",
+    media_item: "媒体条目",
     items: "媒体条目",
     media_items: "媒体条目",
     metadata_items: "媒体条目",
@@ -1223,7 +1271,7 @@ function formatTargetType(targetType: string) {
 
 function auditLevel(log: AdminAuditEvent) {
   if (/FAILED|ERROR|DENIED/.test(log.eventType)) return "ERROR";
-  if (/CANCEL|DISABLED|REJECTED|REVOKED|STOPPED|DELETED|PURGED|UNINSTALLED|UNDONE/.test(log.eventType)) return "WARN";
+  if (/CANCEL|DISABLED|REJECTED|REVOKED|DELETED|PURGED|UNINSTALLED|UNDONE/.test(log.eventType)) return "WARN";
   return "INFO";
 }
 

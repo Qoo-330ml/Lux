@@ -1,7 +1,7 @@
-import { Download, Ellipsis, FileDown, Image as ImageIcon, Lock, Pencil, RefreshCw, ScanLine, ScanSearch, Subtitles, Trash2, Unlock, X } from "lucide-react";
+import { Download, Ellipsis, FileDown, Image as ImageIcon, Lock, MessageSquareText, Pencil, RefreshCw, ScanLine, ScanSearch, Subtitles, Trash2, Unlock, X } from "lucide-react";
 import { createPortal } from "react-dom";
-import { useRef, useState } from "react";
-import type { MediaItem } from "../../lib/api/types";
+import { useEffect, useRef, useState } from "react";
+import type { MediaItem, MetadataRefreshMode } from "../../lib/api/types";
 import { usePopoverPosition } from "./usePopoverPosition";
 
 type MediaActionMenuProps = {
@@ -9,15 +9,18 @@ type MediaActionMenuProps = {
   onEditMetadata: () => void;
   onEditImages: () => void;
   onEditSubtitles?: () => void;
+  onScrapeDanmaku?: () => void;
   onDelete?: () => void;
   onIdentify?: () => void;
   onLockMetadata?: () => void;
   onUnlockMetadata?: () => void;
   onRefreshMetadata?: () => void;
+  refreshMode?: MetadataRefreshMode;
   onScanFolder?: () => void;
   className?: string;
   sourceId?: string;
   showLabel?: boolean;
+  contextPoint?: { x: number; y: number } | null;
 };
 
 type MediaActionRect = Pick<DOMRect, "top" | "bottom" | "left" | "right">;
@@ -45,6 +48,22 @@ export function positionMediaActionMenu(
   return { left, top };
 }
 
+export function positionMediaActionMenuAtPoint(
+  point: { x: number; y: number },
+  menu: MediaActionSize,
+  viewport: MediaViewport,
+) {
+  const edge = 16;
+  const gap = 8;
+  const left = Math.min(Math.max(edge, point.x), Math.max(edge, viewport.width - menu.width - edge));
+  const below = point.y + gap;
+  const above = point.y - menu.height - gap;
+  const top = below + menu.height + edge <= viewport.height || above < edge
+    ? Math.min(below, Math.max(edge, viewport.height - menu.height - edge))
+    : Math.max(edge, above);
+  return { left, top };
+}
+
 export function mediaDownloadUrl(item: MediaItem, sourceId?: string) {
   const source = sourceId
     ? item.mediaSources?.find((entry) => entry.id === sourceId)
@@ -57,16 +76,21 @@ function canDeleteMediaSource(item: MediaItem) {
   return !NON_MEDIA_ITEM_TYPES.has(item.itemType ?? "");
 }
 
-export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubtitles, onDelete, onIdentify, onLockMetadata, onUnlockMetadata, onRefreshMetadata, onScanFolder, className = "", sourceId, showLabel = false }: MediaActionMenuProps) {
+export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubtitles, onScrapeDanmaku, onDelete, onIdentify, onLockMetadata, onUnlockMetadata, onRefreshMetadata, refreshMode, onScanFolder, className = "", sourceId, showLabel = false, contextPoint = null }: MediaActionMenuProps) {
   const [open, setOpen] = useState(false);
+  const [anchorPoint, setAnchorPoint] = useState<{ x: number; y: number } | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const { menuRef, position: menuPosition } = usePopoverPosition({
     open,
-    onClose: () => setOpen(false),
+    onClose: () => {
+      setOpen(false);
+      setAnchorPoint(null);
+    },
     isInside: (target) => Boolean(rootRef.current?.contains(target)),
     fallbackMenuSize: { width: 246, height: 360 },
     getPosition: (menu, viewport) => {
+      if (anchorPoint) return positionMediaActionMenuAtPoint(anchorPoint, menu, viewport);
       const trigger = triggerRef.current?.getBoundingClientRect();
       return trigger
         ? positionMediaActionMenu(trigger, menu, viewport)
@@ -80,6 +104,22 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubt
     ? `/api/v1/items/${encodeURIComponent(item.id)}/images/poster`
     : undefined;
   const downloadUrl = mediaDownloadUrl(item, sourceId);
+  const refreshLabel = refreshMode === "FULL_REFRESH"
+    ? "全量刷新元数据"
+    : refreshMode === "FILL_MISSING"
+      ? "补全缺失元数据"
+      : "刷新元数据";
+  const refreshTitle = refreshMode === "FULL_REFRESH"
+    ? "重新获取并覆盖未锁定的元数据和图片"
+    : refreshMode === "FILL_MISSING"
+      ? "只补全缺失的元数据和图片"
+      : undefined;
+
+  useEffect(() => {
+    if (!contextPoint) return;
+    setAnchorPoint(contextPoint);
+    setOpen(true);
+  }, [contextPoint]);
 
   if (isFolder) return null;
 
@@ -95,6 +135,7 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubt
         onClick={(event) => {
           event.preventDefault();
           event.stopPropagation();
+          setAnchorPoint(null);
           setOpen((value) => !value);
         }}
       >
@@ -159,6 +200,21 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubt
               <span>编辑字幕</span>
             </button>
           ) : null}
+          {onScrapeDanmaku && (item.itemType === "MOVIE" || item.itemType === "EPISODE") ? (
+            <button
+              className="lux-media-action"
+              data-action="scrape-danmaku"
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setOpen(false);
+                onScrapeDanmaku();
+              }}
+            >
+              <MessageSquareText size={17} aria-hidden="true" />
+              <span>刮削弹幕</span>
+            </button>
+          ) : null}
           {onDelete && canDeleteMediaSource(item) ? (
             <button
               className="lux-media-action lux-media-action-danger"
@@ -195,13 +251,14 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubt
               data-action="refresh-metadata"
               type="button"
               role="menuitem"
+              title={refreshTitle}
               onClick={() => {
                 setOpen(false);
                 onRefreshMetadata();
               }}
             >
               <RefreshCw size={17} aria-hidden="true" />
-              <span>刷新元数据</span>
+              <span>{refreshLabel}</span>
             </button>
           ) : null}
           {onScanFolder ? (

@@ -1366,6 +1366,8 @@ impl Database {
             if count == 0 {
                 break;
             }
+            // The delete cascades into the catalog/search outboxes; derived rows must follow.
+            self.signal_outbox_consumers();
             purged = purged.saturating_add(count);
             if !pause.is_zero() {
                 tokio::time::sleep(pause).await;
@@ -1512,6 +1514,9 @@ impl Database {
         }
         self.mark_startup_repair_completed(MEDIA_SOURCE_DEFAULT_REPAIR_MARKER)
             .await?;
+        if repaired > 0 {
+            self.signal_outbox_consumers();
+        }
         Ok(repaired)
     }
 
@@ -1927,6 +1932,88 @@ mod task_history_retention_tests {
             .fetch_all(&database.pool)
             .await?;
         assert_eq!(remaining, vec!["new-selected".to_owned()]);
+        Ok(())
+    }
+
+    /// The expired-PENDING sweep is the only candidate pass that orders by `expires_at`, so it was
+    /// the only one the status index could not answer: the planner collected every PENDING row into
+    /// a temp B-tree and only then took one batch. The partial
+    /// `(status, expires_at, id) WHERE status = 'PENDING'` index (migration 0244) supplies that
+    /// order for exactly the rows the statement touches.
+    #[tokio::test]
+    async fn retention_expired_pending_cleanup_orders_by_the_pending_expiry_index()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('retention-library', 'Retention', 'MOVIE')")
+            .execute(&database.pool)
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items (id, library_id, item_type, title, sort_title, identification_status)
+                 VALUES ('retention-item', 'retention-library', 'MOVIE', 'Retention', 'retention', 'LOCAL_CONFIRMED')",
+            )
+            .execute(&database.pool)
+            .await?;
+        // A backlog large enough that a sort of the whole PENDING set would dominate the batch, and
+        // with non-PENDING rows sprinkled in so the partial predicate has something to exclude.
+        let mut transaction = database.pool.begin().await?;
+        for index in 0..1_200 {
+            let status = match index % 4 {
+                0 => "REJECTED",
+                1 => "EXPIRED",
+                2 => "SELECTED",
+                _ => "PENDING",
+            };
+            let expires_at = if status == "PENDING" {
+                Some(1_600_000_000_i64 + i64::from(index % 300))
+            } else {
+                None
+            };
+            sqlx::query(
+                "INSERT INTO metadata_candidates (
+                     id, item_id, provider, provider_id, candidate_json, score, status,
+                     expires_at, created_at
+                 ) VALUES (?, 'retention-item', 'TMDB', ?, '{}', 50, ?, ?, ?)",
+            )
+            .bind(format!("backlog-{index:04}"))
+            .bind(format!("provider-{index:04}"))
+            .bind(status)
+            .bind(expires_at)
+            .bind(1_500_000_000_i64 + i64::from(index))
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+
+        let plan = database
+            .query(sqlx::AssertSqlSafe(format!(
+                "EXPLAIN QUERY PLAN {}",
+                super::prune_sql::METADATA_CANDIDATE_EXPIRED_PENDING
+            )))
+            .bind(1_600_000_100_i64)
+            .bind(200_i64)
+            .fetch_all(&database.pool)
+            .await?
+            .into_iter()
+            .filter_map(|row| row.try_get::<String, _>("detail").ok())
+            .collect::<Vec<_>>();
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_metadata_candidates_pending_expiry")),
+            "expired-PENDING sweep did not use the pending expiry index: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY")),
+            "expired-PENDING sweep still sorts the whole PENDING backlog: {plan:?}"
+        );
         Ok(())
     }
 

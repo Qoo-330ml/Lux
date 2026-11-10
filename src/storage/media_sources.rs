@@ -15,7 +15,7 @@ impl Database {
         .bind(item_id)
         .execute(&self.pool)
         .await
-        .map(|_| ())
+        .map(|result| self.signal_outbox_consumers_if_changed(result.rows_affected()))
         .map_err(self.sqlx_err())
     }
 
@@ -199,6 +199,23 @@ impl Database {
         transaction: &mut sqlx::Transaction<'_, Any>,
         entry_ids: &[String],
     ) -> Result<(), StorageError> {
+        self.restore_media_items_for_filesystem_entries_counted(transaction, entry_ids)
+            .await
+            .map(|_| ())
+    }
+
+    /// Same restore as [`Self::restore_media_items_for_filesystem_entries`], returning how many
+    /// items became visible again.
+    ///
+    /// The scan calls this for every discovered file. A file that was never missing restores
+    /// nothing, queues no catalog outbox row and must not cost the derived-data consumers a
+    /// wake-up, so the commit boundary only signals when the count is positive.
+    pub(crate) async fn restore_media_items_for_filesystem_entries_counted(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        entry_ids: &[String],
+    ) -> Result<u64, StorageError> {
+        let mut restored = 0_u64;
         for chunk in entry_ids.chunks(500) {
             if chunk.is_empty() {
                 continue;
@@ -232,12 +249,20 @@ impl Database {
             for entry_id in chunk {
                 statement = statement.bind(entry_id);
             }
-            statement
+            restored += statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(self.sqlx_err())?;
+                .map_err(self.sqlx_err())?
+                .rows_affected();
         }
-        Ok(())
+        if restored > 0 {
+            // Items became visible again, so their derived rows (read model, search index,
+            // collection membership) are stale. The signal is sent from the one place every scan
+            // path reaches; the caller commits immediately after, and a consumer that wakes inside
+            // that window simply finds nothing and looks again on the next signal or fallback.
+            self.signal_outbox_consumers();
+        }
+        Ok(restored)
     }
 
     pub(super) async fn refresh_removed_media_items_in_transaction(
@@ -372,7 +397,7 @@ impl Database {
         .bind(strm_target_kind)
         .execute(&self.pool)
         .await
-        .map(|_| ())
+        .map(|result| self.signal_outbox_consumers_if_changed(result.rows_affected()))
         .map_err(self.sqlx_err())
     }
 
@@ -396,7 +421,26 @@ impl Database {
         .bind(quality_label)
         .execute(&self.pool)
         .await
-        .map(|_| ())
+        .map(|result| self.signal_outbox_consumers_if_changed(result.rows_affected()))
+        .map_err(self.sqlx_err())
+    }
+
+    /// Returns the canonical library root and the root-relative path of a local media source.
+    /// `.strm` sources resolve to their local `.strm` file, never to the external URL.
+    pub(crate) async fn media_source_local_location(
+        &self,
+        source_id: &str,
+    ) -> Result<Option<(String, String)>, StorageError> {
+        self.query_as::<(String, String)>(
+            "SELECT root.canonical_path, fe.relative_path
+             FROM media_sources ms
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots root ON root.id = fe.library_root_id
+             WHERE ms.id = ?",
+        )
+        .bind(source_id)
+        .fetch_optional(&self.pool)
+        .await
         .map_err(self.sqlx_err())
     }
 
@@ -494,6 +538,7 @@ impl Database {
             .map_err(self.sqlx_err())?;
         }
         transaction.commit().await.map_err(self.sqlx_err())?;
+        self.signal_outbox_consumers();
         Ok(true)
     }
 

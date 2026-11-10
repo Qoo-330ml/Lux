@@ -1,5 +1,128 @@
 import { useEffect, useRef } from "react";
 
+/**
+ * The single source of truth for the player's keyboard shortcuts.
+ *
+ * The key handler dispatches on `action` and the help panel renders `group`,
+ * `keys` and `description`, so the documentation cannot drift from behaviour:
+ * adding a shortcut here both binds it and shows it in the panel.
+ */
+export type PlayerShortcutAction =
+  | "togglePlayPause"
+  | "seekBackward"
+  | "seekForward"
+  | "volumeUp"
+  | "volumeDown"
+  | "toggleInfo"
+  | "toggleMute"
+  | "toggleFullscreen"
+  | "toggleShortcutHelp"
+  | "closeOverlay";
+
+export type PlayerShortcutGroup = "播放" | "进度" | "音量" | "画面" | "面板";
+
+export type PlayerShortcut = {
+  action: PlayerShortcutAction;
+  group: PlayerShortcutGroup;
+  /** 帮助面板里展示的按键标签。 */
+  keys: readonly string[];
+  /** 与 KeyboardEvent.key 逐一匹配的取值；字母同时登记大小写，保持原有行为。 */
+  eventKeys: readonly string[];
+  description: string;
+};
+
+export const PLAYER_SHORTCUTS: readonly PlayerShortcut[] = [
+  {
+    action: "togglePlayPause",
+    group: "播放",
+    keys: ["空格", "K"],
+    eventKeys: [" ", "k", "K"],
+    description: "播放 / 暂停",
+  },
+  {
+    action: "seekBackward",
+    group: "进度",
+    keys: ["←", "J"],
+    eventKeys: ["ArrowLeft", "j", "J"],
+    description: "后退 10 秒",
+  },
+  {
+    action: "seekForward",
+    group: "进度",
+    keys: ["→", "L"],
+    eventKeys: ["ArrowRight", "l", "L"],
+    description: "前进 10 秒",
+  },
+  {
+    action: "volumeUp",
+    group: "音量",
+    keys: ["↑"],
+    eventKeys: ["ArrowUp"],
+    description: "音量 +5%",
+  },
+  {
+    action: "volumeDown",
+    group: "音量",
+    keys: ["↓"],
+    eventKeys: ["ArrowDown"],
+    description: "音量 −5%",
+  },
+  {
+    action: "toggleMute",
+    group: "音量",
+    keys: ["M"],
+    eventKeys: ["m", "M"],
+    description: "静音 / 取消静音",
+  },
+  {
+    action: "toggleFullscreen",
+    group: "画面",
+    keys: ["F"],
+    eventKeys: ["f", "F"],
+    description: "进入 / 退出全屏",
+  },
+  {
+    action: "toggleInfo",
+    group: "面板",
+    keys: ["I"],
+    eventKeys: ["i", "I"],
+    description: "显示 / 隐藏播放信息",
+  },
+  {
+    action: "toggleShortcutHelp",
+    group: "面板",
+    keys: ["?"],
+    eventKeys: ["?"],
+    description: "显示 / 隐藏键盘快捷键",
+  },
+  {
+    action: "closeOverlay",
+    group: "面板",
+    keys: ["Esc"],
+    eventKeys: ["Escape"],
+    description: "关闭当前浮层；没有浮层时返回上一页",
+  },
+];
+
+const actionByEventKey = new Map<string, PlayerShortcutAction>();
+for (const shortcut of PLAYER_SHORTCUTS) {
+  for (const eventKey of shortcut.eventKeys) actionByEventKey.set(eventKey, shortcut.action);
+}
+
+/** 把 KeyboardEvent.key 解析为数据源登记的动作；未登记返回 null。 */
+export function playerShortcutActionForEventKey(key: string): PlayerShortcutAction | null {
+  return actionByEventKey.get(key) ?? null;
+}
+
+/** 帮助浮层对话框节点上的标记；键盘处理器据此把对话框内部的按键放行。 */
+export const PLAYER_SHORTCUT_DIALOG_ATTRIBUTE = "data-player-shortcut-help";
+
+/** 判断按键是否来自帮助浮层内部（Space 激活按钮、方向键滚动列表等）。 */
+export function isPlayerShortcutDialogTarget(target: EventTarget | null): boolean {
+  if (typeof Element === "undefined" || !(target instanceof Element)) return false;
+  return target.closest(`[${PLAYER_SHORTCUT_DIALOG_ATTRIBUTE}]`) !== null;
+}
+
 type PlayerKeyboardShortcutOptions = {
   itemId: string;
   volume: number;
@@ -14,6 +137,9 @@ type PlayerKeyboardShortcutOptions = {
   setShowInfo: (value: boolean | ((visible: boolean) => boolean)) => void;
   setShowSettings: (value: boolean | ((visible: boolean) => boolean)) => void;
   navigate: (to: number | string) => void;
+  /** 帮助浮层打开时其余快捷键让位，避免在浮层后面误触发播放。 */
+  shortcutHelpOpen?: boolean;
+  setShortcutHelpOpen?: (value: boolean | ((open: boolean) => boolean)) => void;
 };
 
 /**
@@ -47,6 +173,8 @@ export function usePlayerKeyboardShortcuts(options: PlayerKeyboardShortcutOption
         resetControlsTimeout,
         setShowInfo,
         setShowSettings,
+        setShortcutHelpOpen,
+        shortcutHelpOpen,
         showInfo,
         showSettings,
         volume,
@@ -59,49 +187,65 @@ export function usePlayerKeyboardShortcuts(options: PlayerKeyboardShortcutOption
 
       resetControlsTimeout();
 
-      switch (e.key) {
-        case " ":
-        case "k":
-        case "K":
+      const action = playerShortcutActionForEventKey(e.key);
+      if (!action) return;
+
+      // The help panel is modal: shortcuts pressed on the player behind it are
+      // swallowed instead of reaching the video. Keys typed inside the dialog
+      // stay untouched though — Space must activate its buttons and the arrow /
+      // page keys must scroll the list — except for the dialog's own "?".
+      if (shortcutHelpOpen) {
+        if (isPlayerShortcutDialogTarget(target)) {
+          if (action === "toggleShortcutHelp") setShortcutHelpOpen?.((open) => !open);
+          return;
+        }
+        e.preventDefault();
+        if (action === "toggleShortcutHelp") {
+          setShortcutHelpOpen?.((open) => !open);
+        } else if (action === "closeOverlay") {
+          setShortcutHelpOpen?.(false);
+        }
+        return;
+      }
+
+      switch (action) {
+        case "togglePlayPause":
           e.preventDefault();
           togglePlayPause();
           break;
-        case "ArrowLeft":
-        case "j":
-        case "J":
+        case "seekBackward":
           e.preventDefault();
           seekRelative(-10);
           break;
-        case "ArrowRight":
-        case "l":
-        case "L":
+        case "seekForward":
           e.preventDefault();
           seekRelative(10);
           break;
-        case "ArrowUp":
+        case "volumeUp":
           e.preventDefault();
           changeVolume(volume + 0.05);
           break;
-        case "ArrowDown":
+        case "volumeDown":
           e.preventDefault();
           changeVolume(volume - 0.05);
           break;
-        case "i":
-        case "I":
+        case "toggleInfo":
           e.preventDefault();
           setShowInfo((visible) => !visible);
           break;
-        case "m":
-        case "M":
+        case "toggleMute":
           e.preventDefault();
           toggleMute();
           break;
-        case "f":
-        case "F":
+        case "toggleFullscreen":
           e.preventDefault();
           toggleFullscreen();
           break;
-        case "Escape":
+        case "toggleShortcutHelp":
+          e.preventDefault();
+          setShortcutHelpOpen?.((open) => !open);
+          break;
+        case "closeOverlay":
           if (showInfo) {
             e.preventDefault();
             setShowInfo(false);

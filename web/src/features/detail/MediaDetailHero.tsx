@@ -9,7 +9,7 @@ import { detailBackdropUrl, episodeTitle, imageUrl, mediaTitle, posterUrlWithFal
 import { useImageVariants } from "../home/image-variants";
 import { useMediaSource } from "./MediaSourcePanel";
 import { sourceBadges } from "./media-source";
-import { useSseConnectionState } from "../activity/useUserEvents";
+import { useRealtimeConnectionState } from "../activity/useUserEvents";
 
 export function detailAddedAt(media: MediaItem) {
   const addedAtCandidate = typeof media.addedAt === "number" && Number.isFinite(media.addedAt)
@@ -31,8 +31,8 @@ export function detailAddedAt(media: MediaItem) {
 const SeriesContext = createContext<MediaItem | undefined>(undefined);
 
 export function MediaSeriesProvider({ media, children }: { media: MediaItem; children: ReactNode }) {
-  const sseState = useSseConnectionState();
-  const refetchInterval = sseState === "connected" ? false : queryRefreshIntervals.mediaSurface;
+  const realtimeState = useRealtimeConnectionState();
+  const refetchInterval = realtimeState === "connected" ? false : queryRefreshIntervals.mediaSurface;
   const seriesId = media.itemType !== "SERIES" ? media.seriesId ?? media.parentId ?? undefined : undefined;
   const series = useQuery({
     queryKey: queryKeys.item(seriesId ?? ""), queryFn: () => api.item(seriesId ?? ""),
@@ -93,8 +93,8 @@ const selectLogo = (response: Awaited<ReturnType<typeof api.itemImages>>) =>
 export const MediaDetailHero = memo(function MediaDetailHero({ media, collectionId }: { media: MediaItem; collectionId?: string }) {
   const series = useSeriesContext();
   const { source, selectedAudioStreamIndex } = useMediaSource();
-  const sseState = useSseConnectionState();
-  const refetchInterval = sseState === "connected" ? false : queryRefreshIntervals.mediaSurface;
+  const realtimeState = useRealtimeConnectionState();
+  const refetchInterval = realtimeState === "connected" ? false : queryRefreshIntervals.mediaSurface;
   const logo = useQuery({
     queryKey: queryKeys.itemImages(media.id), queryFn: () => api.itemImages(media.id),
     refetchInterval, refetchIntervalInBackground: false, select: selectLogo,

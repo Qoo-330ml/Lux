@@ -21,12 +21,32 @@ const fallbackState = vi.hoisted(() => ({
   snapshotDuration: 8 as number | null,
 }));
 
+const selectionMocks = vi.hoisted(() => ({
+  shouldUseClientHevc: vi.fn(async () => true),
+  shouldUseClientMkv: vi.fn(async () => false),
+}));
+
 vi.mock("../src/features/player/playback-selection", () => ({
   isRemoteHttpStrmSource: (source: { sourceKind?: string; externalUrl?: string }) =>
     source.sourceKind === "STRM_URL" && /^https?:\/\//i.test(source.externalUrl ?? ""),
   canUseRemoteMkvCaptionSidecar: vi.fn().mockReturnValue(true),
-  shouldUseClientHevc: vi.fn().mockResolvedValue(true),
-  shouldUseClientMkv: vi.fn().mockResolvedValue(false),
+  shouldUseClientHevc: selectionMocks.shouldUseClientHevc,
+  shouldUseClientMkv: selectionMocks.shouldUseClientMkv,
+  // The runtime asks for one decision that also explains a rejection; these tests keep driving the
+  // two historical capability mocks instead of a real browser probe.
+  resolveClientDecode: async (source: unknown, video: unknown, options: unknown) => {
+    const container = String((source as { container?: string | null } | undefined)?.container ?? "").toLowerCase();
+    const matroska = container.split(",").some((part) => ["mkv", "matroska", "webm"].includes(part.trim()));
+    if (matroska && await selectionMocks.shouldUseClientMkv(source as never, video as never, options as never)) {
+      return { engine: "client-mkv", rejected: null };
+    }
+    if (await selectionMocks.shouldUseClientHevc(source as never, video as never)) {
+      return { engine: "client-hevc", rejected: null };
+    }
+    return { engine: null, rejected: "native-playback" };
+  },
+  clientDecodeRequiresServerFallback: (decision: { engine: string | null; rejected: string | null }) =>
+    decision.engine === null && decision.rejected !== "native-playback" && decision.rejected !== "no-candidate",
 }));
 
 vi.mock("../src/features/player/remote-mkv-caption-reader", () => ({
@@ -302,7 +322,7 @@ describe("PlayerPage client fallback status", () => {
     expect(shouldUseClientMkv).toHaveBeenCalled();
     expect(container?.textContent).not.toContain("播放器引擎失败");
 
-    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="字幕"]');
     expect(settings).not.toBeNull();
     await act(async () => settings?.click());
     const captionOptions = await luxOptions(container!, "选择字幕");
@@ -374,7 +394,7 @@ describe("PlayerPage client fallback status", () => {
       await new Promise((resolve) => setTimeout(resolve, 25));
     });
 
-    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="字幕"]');
     await act(async () => settings?.click());
     const captionChoices = await luxOptions(container, "选择字幕");
     await chooseLuxOptionByValue(container, "选择字幕", captionChoices[1]?.value ?? "");
@@ -461,7 +481,7 @@ describe("PlayerPage client fallback status", () => {
     });
     play.mockClear();
 
-    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="字幕"]');
     await act(async () => settings?.click());
     const captionChoices = await luxOptions(container, "选择字幕");
     await chooseLuxOptionByValue(container, "选择字幕", captionChoices[1]?.value ?? "");
@@ -527,7 +547,7 @@ describe("PlayerPage client fallback status", () => {
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 25));
     });
-    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="字幕"]');
     await act(async () => settings?.click());
     if (luxCombobox(container, "选择字幕")) {
       const captionChoices = await luxOptions(container, "选择字幕");
@@ -696,7 +716,7 @@ describe("PlayerPage client fallback status", () => {
       );
       await new Promise((resolve) => setTimeout(resolve, 25));
     });
-    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="字幕"]');
     await act(async () => settings?.click());
     if (luxCombobox(container, "选择字幕")) {
       const captionChoices = await luxOptions(container, "选择字幕");
@@ -709,7 +729,7 @@ describe("PlayerPage client fallback status", () => {
     expect(container.textContent).not.toContain("播放器引擎失败");
   });
 
-  it("shows safe Lux guidance instead of the fallback engine reason", async () => {
+  it("retries a Direct Play engine failure once server-side before the safe guidance", async () => {
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -733,6 +753,18 @@ describe("PlayerPage client fallback status", () => {
     const video = container.querySelector<HTMLVideoElement>("video");
     expect(video).not.toBeNull();
     await act(async () => video?.dispatchEvent(new Event("error")));
+    // A Direct Play engine failure now retries once server-side, so the failure screen must not
+    // appear after the first error.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    });
+    expect(container?.textContent).not.toContain("播放器引擎失败");
+    // The mocked server keeps planning Direct Play, so the second error has no fallback left.
+    const retriedVideo = container.querySelector<HTMLVideoElement>("video");
+    await act(async () => retriedVideo?.dispatchEvent(new Event("error")));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    });
 
     expect(container?.textContent).toContain("播放器引擎失败");
     expect(container?.textContent).not.toContain("MSE SourceBuffer append failed");

@@ -1,7 +1,11 @@
 import { Airplay, ArrowLeft, PictureInPicture2 } from "lucide-react";
+import { useState } from "react";
 
 type PlayerTopBarProps = {
   title: string;
+  /** Title logo; when absent or failing to load the text title is shown instead. */
+  logoUrl?: string | null;
+  /** Shown to the right of the title: the year for a film, season and episode for a series. */
   subtitle?: string | null;
   onBack: () => void;
   airPlayAvailable?: boolean;
@@ -12,6 +16,7 @@ type PlayerTopBarProps = {
 
 export function PlayerTopBar({
   title,
+  logoUrl = null,
   subtitle,
   onBack,
   airPlayAvailable = false,
@@ -19,6 +24,9 @@ export function PlayerTopBar({
   pictureInPictureEnabled = false,
   onTogglePictureInPicture = () => undefined,
 }: PlayerTopBarProps) {
+  // Remember which URL failed so a different item's logo is tried again.
+  const [failedLogoUrl, setFailedLogoUrl] = useState<string | null>(null);
+  const showLogo = Boolean(logoUrl) && failedLogoUrl !== logoUrl;
   return (
     <div className="lux-player-topbar">
       <div className="lux-player-topbar-left">
@@ -33,9 +41,18 @@ export function PlayerTopBar({
         </button>
         <div className="lux-player-meta">
           <div className="lux-player-title-row">
-            <span className="lux-player-title">{title}</span>
+            {showLogo && logoUrl ? (
+              <img
+                className="lux-player-title-logo"
+                src={logoUrl}
+                alt={title}
+                onError={() => setFailedLogoUrl(logoUrl)}
+              />
+            ) : (
+              <span className="lux-player-title">{title}</span>
+            )}
+            {subtitle ? <span className="lux-player-year">{subtitle}</span> : null}
           </div>
-          {subtitle ? <span className="lux-player-subtitle">{subtitle}</span> : null}
         </div>
       </div>
       {airPlayAvailable || pictureInPictureEnabled ? (

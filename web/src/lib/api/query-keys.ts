@@ -12,6 +12,7 @@ export const queryKeys = {
   homeContinueWatching: ["home", "continue-watching"] as const,
   homeLatestLibraries: (libraryIds: readonly string[]) => ["home", "latest-libraries", [...libraryIds]] as const,
   favorites: ["favorites"] as const,
+  watchHistory: ["watch-history"] as const,
   libraries: ["libraries"] as const,
   library: (
     libraryId: string,
@@ -21,9 +22,12 @@ export const queryKeys = {
     sortOrder = "Ascending",
     metadataStatus = "all",
     pageSize = 24,
-  ) => ["library", libraryId, page, pageSize, itemTypes ?? "root", sortBy, sortOrder, metadataStatus] as const,
+    filters = "none",
+  ) => ["library", libraryId, page, pageSize, itemTypes ?? "root", sortBy, sortOrder, metadataStatus, filters] as const,
   collection: (collectionId: string) => ["collection", collectionId] as const,
   item: (itemId: string) => ["item", itemId] as const,
+  // Nested under the item prefix so a detail refresh also refreshes its recommendations.
+  similar: (itemId: string, limit = 12) => ["item", itemId, "similar", limit] as const,
   person: (personId: string) => ["person", personId] as const,
   personItems: (personId: string) => ["person", personId, "items"] as const,
   itemImages: (itemId: string) => ["item-images", itemId] as const,
@@ -31,10 +35,43 @@ export const queryKeys = {
   children: (itemId: string, itemType?: string, seasonId?: string) =>
     ["children", itemId, itemType ?? "default", seasonId ?? "all"] as const,
   playback: (itemId: string) => ["playback", itemId] as const,
-  playbackBootstrap: (itemId: string, sourceId?: string | null, attempt = 0, audioStreamIndex?: string | null, subtitleStreamIndex?: string | null) =>
-    ["playback-bootstrap", itemId, sourceId ?? "default", audioStreamIndex ?? "default", subtitleStreamIndex ?? "default", attempt] as const,
-  webPlaybackSession: (itemId: string, sourceId: string, attempt: number, audioStreamIndex?: string | null, subtitleStreamIndex?: string | null) =>
-    ["web-playback-session", itemId, sourceId, audioStreamIndex ?? "default", subtitleStreamIndex ?? "default", attempt] as const,
+  // Key layout: prefix, item, source, audioStreamIndex, subtitleStreamIndex,
+  // maxHeight, attempt. Helpers reading a single slot live next to the feature
+  // that owns it (`audioParamFromQueryKey`, `maxHeightParamFromQueryKey`).
+  playbackBootstrap: (
+    itemId: string,
+    sourceId?: string | null,
+    attempt = 0,
+    audioStreamIndex?: string | null,
+    subtitleStreamIndex?: string | null,
+    maxHeight?: number | string | null,
+  ) =>
+    [
+      "playback-bootstrap",
+      itemId,
+      sourceId ?? "default",
+      audioStreamIndex ?? "default",
+      subtitleStreamIndex ?? "default",
+      maxHeight === null || maxHeight === undefined ? "default" : String(maxHeight),
+      attempt,
+    ] as const,
+  webPlaybackSession: (
+    itemId: string,
+    sourceId: string,
+    attempt: number,
+    audioStreamIndex?: string | null,
+    subtitleStreamIndex?: string | null,
+    maxHeight?: number | string | null,
+  ) =>
+    [
+      "web-playback-session",
+      itemId,
+      sourceId,
+      audioStreamIndex ?? "default",
+      subtitleStreamIndex ?? "default",
+      maxHeight === null || maxHeight === undefined ? "default" : String(maxHeight),
+      attempt,
+    ] as const,
   webPlaybackStats: (sessionId: string) => ["web-playback-stats", sessionId] as const,
   adminDashboard: ["admin", "dashboard"] as const,
   adminHealth: ["admin", "health"] as const,
@@ -56,10 +93,13 @@ export const queryKeys = {
   adminScheduledTasks: (page = 1) => ["admin", "scheduled-tasks", page] as const,
   adminScheduledTaskPlans: (page = 1, taskType = "", search = "") =>
     ["admin", "scheduled-task-plans", page, taskType, search] as const,
-  adminMetadataJobs: (status?: string) => ["admin", "metadata-jobs", status ?? "all"] as const,
+  adminMetadataJobs: (status?: string, includePending = false) =>
+    ["admin", "metadata-jobs", status ?? "all", includePending ? "pending" : "base"] as const,
   adminStrmProbeJobs: (status?: string) => ["admin", "strm-probe-jobs", status ?? "all"] as const,
   adminChapterDetectionJobs: (status?: string) => ["admin", "chapter-detection-jobs", status ?? "all"] as const,
   adminDanmakuMatchJobs: (status?: string) => ["admin", "danmaku-match-jobs", status ?? "all"] as const,
+  adminItemDanmakuSearch: (itemId: string, query: string, sourceId: string, limit: number) =>
+    ["admin", "item-danmaku-search", itemId, query, sourceId, limit] as const,
   adminLibraryCoverJobs: (status?: string) => ["admin", "library-cover-jobs", status ?? "all"] as const,
   adminLibraryDeletionJobs: (status?: string, page = 1) => ["admin", "library-deletion-jobs", status ?? "all", page] as const,
   adminUserInvitations: (status?: string, page = 1) => ["admin", "user-invitations", status ?? "all", page] as const,
@@ -81,5 +121,19 @@ export const queryKeys = {
 
 export const queryRefreshIntervals = {
   liveDashboard: 15_000,
+  /**
+   * LUX-898: with the admin channel connected the dashboard still polls, only slower. Uptime,
+   * CPU, memory and storage are sampled per request and the server publishes the `dashboard`
+   * scope on audit/activity events, so a quiet server never refreshes them through frames.
+   */
+  liveDashboardConnected: 60_000,
+  /**
+   * LUX-898 review: the four runtime-record job lists keep a 30 s fallback while the admin channel
+   * is connected. Only the scanner and the metadata reidentify service publish `jobs` frames; the
+   * STRM probe, chapter detection, danmaku matching, library cover and scheduled-task services
+   * only write progress to the database, so their rows would freeze at RUNNING without a timer.
+   */
+  adminJobs: 5_000,
+  adminJobsConnected: 30_000,
   mediaSurface: 30_000,
 } as const;

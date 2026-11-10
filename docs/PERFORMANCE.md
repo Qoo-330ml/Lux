@@ -778,14 +778,14 @@ LUX-271 的扫描配置优先级和目录替换安全检查已保留；并行目
 
 ## Web Bilibili 弹幕解析
 
-基准脚本为 `scripts/run-danmaku-performance.mjs`，从指定 Git revision 加载优化前解析器，并与当前工作树在相同 Node 进程中交替执行。输入包含 5,000 条合法弹幕和一个超过 4 MiB 的 ASCII XML；每组 5 批、每批 30 个样本，报告各批 p50/p95 的中位数。
+基准脚本为 `scripts/run-danmaku-performance.mjs`，从指定 Git revision 加载优化前解析器，并与当前工作树在相同 Node 进程中交替执行。解析器路径分别配置：baseline 默认取该 revision 的 `web/src/features/player/danmaku.ts`（该 revision 没有旧文件时回退到 `web/src/features/player/danmaku/parse.ts`），current 取工作树的 `web/src/features/player/danmaku/parse.ts`；`node scripts/run-danmaku-performance.mjs --check` 只校验路径解析与加载，不跑基准。输入包含 5,000 条合法弹幕和一个超过 16 MiB 客户端预算的 ASCII XML（默认 17 MiB，可用 `LUX_DANMAKU_OVERSIZED_BYTES` 覆盖）；每组 5 批、每批 30 个样本，报告各批 p50/p95 的中位数。
 
 | 日期 | 提交 | 硬件/运行时 | 命令 | 场景 | 优化前 p50/p95 | 优化后 p50/p95 | 结果 |
 |---|---|---|---|---|---:|---:|---|
 | 2026-08-28 | `85db4549` | macOS ARM64 (`uname -m=arm64`), Node 24.14.1 | `LUX_DANMAKU_BASELINE_REF=85db4549^ node --expose-gc scripts/run-danmaku-performance.mjs` | 5,000 条、2,540,007 bytes 合法 XML | 13.423 / 13.735 ms | 13.197 / 13.565 ms | 解析结果均为 5,000 条 |
 | 2026-08-28 | `85db4549` | macOS ARM64 (`uname -m=arm64`), Node 24.14.1 | 同上 | 4,194,311 bytes 超大 ASCII XML 大小检查 | 2.094 / 2.879 ms | 0.002 / 0.002 ms | 均返回 `INPUT_TOO_LARGE` |
 
-该结果只代表本机 ARM64 Node 基准，不外推 NAS/x86_64 或所有浏览器；Chrome 151 本地浏览器实测同一合法夹具 p50/p95 为 8.1/8.6 ms。
+下表两行对应重构前的解析器（`web/src/features/player/danmaku.ts`，4 MiB 上限）：现行解析器已把实现移到 `web/src/features/player/danmaku/parse.ts`，改为 16 MiB 客户端预算、超过 50,000 条时均匀抽样，并由 Worker 解码字节，因此这组数字不再代表当前代码，抽样开销与 17 MiB 大小检查的性能**待重测**。该结果只代表本机 ARM64 Node 基准，不外推 NAS/x86_64 或所有浏览器；Chrome 151 本地浏览器实测同一合法夹具 p50/p95 为 8.1/8.6 ms（重构前解析器）。
 
 ## 规则
 
@@ -3218,3 +3218,50 @@ debug profile（`cargo test`）下同样的五条用例耗时 1,599 / 6,526 / 10
   比值稳定）；NAS / x86_64 未测，不同架构的 `RwLock` 与哈希成本不同，但“命中与 SQL 长度无关”
   以及“8 线程不吃亏”的结构性结论与架构无关。
 - 超过 64 KiB 的静态语句不入缓存（当前代码里没有这种静态 SQL；最宽的 `IN` 列表都是动态构建的）。
+
+## 搜索取页查询去冗余回表（LUX-876，2026-10-31，arm64）
+
+动机：交接清单第 7 节把搜索成本记成"匹配 5.6 万行 + 计算总数 + 排序"，但没拆分每一步。本节先用
+`EXPLAIN QUERY PLAN` 与分步计时拆开，再只实施不改变结果的那一项（去掉取页查询里多余的第二次
+`JOIN media_items`）。完整分析、候选方案与取舍见 `docs/PERFORMANCE-SEARCH-ANALYSIS.md`。
+
+前提：
+
+| 项 | 值 |
+|---|---|
+| 机器 | Apple M4，`uname -m` = `arm64`，10 核，16 GiB，macOS 26.5 |
+| 夹具 | `tools/catalog-fixture/generate.py` 的 `seed_spec_target`：66,000 条 `media_items`（10k 电影 / 1k 剧集 / 5k 季 / 50k 集），`ANALYZE` 后 330 MB；FTS 由 `drain_search_reindex` 的同一段 SQL 重建 |
+| 查询 | `GET /api/v1/search?q=Spec`（`MOVIE/SERIES`，FTS 候选 66,000、命中 11,000）与含 `EPISODE` 的 61,000 命中形状 |
+| 测量 | 同一进程内 **交替** 执行 A/B，20 轮取中位数；分步成本用 `sqlite3` 直连同一夹具 |
+| 负载 | 测量期间同机有其它 worktree 的 `cargo test` / `clippy`（8 分钟负载一度到 10），**同一脚本两次运行差 20–30%**；±5% 内的差异按噪声处理 |
+| 数据来源 | arm64 开发机；**不得**据此推断 NAS / x86_64 |
+
+分步成本（66k 候选，`MOVIE/SERIES`，`LIMIT 24 OFFSET 0`）：
+
+| 步骤 | 中位数 |
+|---|---:|
+| FTS 匹配计数 | 2.1 ms |
+| + JOIN `media_items`（覆盖索引，只判存在） | 29.3 ms |
+| + `mi.item_type IN (...)`（**回表**，66k 次） | 91.3 ms |
+| + 库过滤 / 可见性谓词 | 91.2 ms |
+| + 排序与 `LIMIT`（不含总数） | 98.1 ms |
+| + `COUNT(*) OVER()` | 103.8 ms |
+
+取页查询 A/B（交替 20 轮中位数）：
+
+| 形状 | 改动前 | 改动后 | 变化 |
+|---|---:|---:|---:|
+| `MOVIE, SERIES`（11k 命中） | 98.5 ms | 93.7 ms | −4.9%（噪声边缘） |
+| `MOVIE+SERIES+EPISODE`（61k 命中） | 143.3 ms | 117.9 ms | **−17.8%** |
+
+结论与更正：
+
+- 交接清单与 LUX-869 段里"成本在 `COUNT(*) OVER()`"**只对命中集很大的形状成立**：总数在 11k 命中时
+  占 5.4 ms（约 5%），61k 命中时占 31.5 ms（约 19%）。主要成本是 66k 个 FTS 候选行的回表。
+- `COUNT(*) OVER()` 与 `ORDER BY` 共用同一趟排序，不是"COUNT 扫一遍、分页再扫一遍"；反过来拆成
+  "先 COUNT 再取页"要 222–249 ms（约 2.3 倍），不要改。
+- 改动只删掉取页查询里"为拿 `sort_title` 再 JOIN 一次 `media_items`"这一趟（匹配子查询刚刚读过该列）；
+  结果集、顺序、`UNION` 去重与总数都不变，测试先写后改（见 `docs/PERFORMANCE-SEARCH-ANALYSIS.md` 第 5 节）。
+- 试过但**没有**采纳：连接级 `temp_store=MEMORY` / `cache_size=200MB`（安静机器上交替 15 轮差异落在
+  噪声内，此前看到的"大收益"是并发负载的产物）、把过滤列复制进派生搜索表（需迁移）、
+  近似/延后总数（改 `total` 语义）。

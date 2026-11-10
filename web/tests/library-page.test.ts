@@ -9,38 +9,15 @@ import { LibraryPage, libraryItemTypeFilter } from "../src/features/library/Libr
 import { useUserEvents } from "../src/features/activity/useUserEvents";
 import { api } from "../src/lib/api/client";
 import type { LibrariesResponse } from "../src/lib/api/types";
+import { FakeWebSocket, installFakeWebSocket } from "./support/fake-websocket";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-class FakeUserEventSource {
-  static instances: FakeUserEventSource[] = [];
-  private listeners = new Map<string, Set<(event: Event) => void>>();
-
-  constructor(readonly url: string) {
-    FakeUserEventSource.instances.push(this);
-  }
-
-  addEventListener(type: string, listener: EventListenerOrEventListenerObject | null) {
-    if (!listener) return;
-    const handlers = this.listeners.get(type) ?? new Set<(event: Event) => void>();
-    handlers.add(typeof listener === "function" ? listener : (event) => listener.handleEvent(event));
-    this.listeners.set(type, handlers);
-  }
-
-  removeEventListener(type: string, listener: EventListenerOrEventListenerObject | null) {
-    if (!listener) return;
-    const handlers = this.listeners.get(type);
-    if (!handlers) return;
-    const handler = typeof listener === "function" ? listener : (event: Event) => listener.handleEvent(event);
-    handlers.delete(handler);
-  }
-
-  close() {}
-
-  emit(type: string, data: string) {
-    const event = new MessageEvent(type, { data });
-    for (const handler of this.listeners.get(type) ?? []) handler(event);
-  }
+/** The single realtime socket the library page owns. */
+function lastSocket(): FakeWebSocket {
+  const socket = FakeWebSocket.last();
+  if (!socket) throw new Error("no realtime socket was created");
+  return socket;
 }
 
 function ProgressiveLibraryPage() {
@@ -204,8 +181,8 @@ describe("LibraryPage infinite scroll", () => {
   });
 
   it("renders a newly indexed item and its poster after a scan invalidation", async () => {
-    vi.stubGlobal("EventSource", FakeUserEventSource);
-    FakeUserEventSource.instances = [];
+    installFakeWebSocket();
+    FakeWebSocket.reset();
     vi.spyOn(api, "libraries").mockResolvedValue({
       libraries: [{ id: "scan-library", name: "扫描中的电影", kind: "MOVIE" }],
     });
@@ -253,11 +230,11 @@ describe("LibraryPage infinite scroll", () => {
       await vi.waitFor(() => expect(container?.textContent).toContain("0 项内容"));
     });
     expect(container.textContent).not.toContain("扫描中出现的电影");
-    expect(FakeUserEventSource.instances).toHaveLength(1);
-    expect(FakeUserEventSource.instances[0].url).toBe("/api/v1/events");
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(lastSocket().url).toBe("ws://localhost:3000/api/v1/ws");
 
     await act(async () => {
-      FakeUserEventSource.instances[0].emit("invalidate", JSON.stringify({ scope: "home" }));
+      lastSocket().message({ type: "invalidate", channel: "user", scope: "home" });
       await vi.waitFor(() => expect(container?.textContent).toContain("扫描中出现的电影"));
     });
 

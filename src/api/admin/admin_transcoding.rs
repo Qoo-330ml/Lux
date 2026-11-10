@@ -1,4 +1,5 @@
 use super::*;
+use crate::application::playback::session::LiveTranscodingSession;
 
 pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new()
@@ -18,8 +19,10 @@ pub(super) fn api_routes() -> Router<ReadyAppState> {
 
 /// Live server-side transcoding progress for the admin transcoding page.
 ///
-/// Read-only: it lists active HLS sessions and reuses the session statistics service for the
-/// per-session FFmpeg snapshot. Expired or already stopped rows simply have no progress.
+/// Read-only: it lists active HLS sessions with the FFmpeg snapshot the service keeps in memory.
+/// The panel polls this every two seconds, so the listing row itself carries every stored column
+/// and the poll costs one statement however many sessions are running. Expired or already stopped
+/// rows simply have no progress.
 pub(crate) async fn admin_transcoding_sessions(
     headers: HeaderMap,
     State(state): State<ReadyAppState>,
@@ -27,18 +30,16 @@ pub(crate) async fn admin_transcoding_sessions(
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let database = state.database();
     let service = state.web_playback();
-    let rows = match database.active_server_transcoding_sessions(24).await {
-        Ok(rows) => rows,
+    let listing = match service.live_transcoding_sessions(24).await {
+        Ok(listing) => listing,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let mut sessions = Vec::with_capacity(rows.len());
+    let mut sessions = Vec::with_capacity(listing.len());
     let mut summary = TranscodingSummary::default();
-    for row in rows {
-        let stats = service.stats(&row.session_id, &row.user_id).await.ok();
-        summary.record(row.tier, stats.as_ref());
-        sessions.push(transcoding_session_json(&row, stats.as_ref()));
+    for session in &listing {
+        summary.record(session);
+        sessions.push(transcoding_session_json(session));
     }
     Json(json!({
         "sessions": sessions,
@@ -56,17 +57,13 @@ struct TranscodingSummary {
 }
 
 impl TranscodingSummary {
-    fn record(
-        &mut self,
-        tier: i64,
-        stats: Option<&crate::application::playback::session::WebPlaybackStats>,
-    ) {
-        match tier {
+    fn record(&mut self, session: &LiveTranscodingSession) {
+        match session.row.tier {
             tier if tier == i64::from(ServerTier::HardwareTranscode.number()) => self.hardware += 1,
             tier if tier == i64::from(ServerTier::SoftwareTranscode.number()) => self.software += 1,
             _ => self.stream_copy += 1,
         }
-        if let Some(bytes) = stats.and_then(|stats| stats.directory_bytes) {
+        if let Some(bytes) = session.directory_bytes {
             self.output_bytes = self.output_bytes.saturating_add(bytes);
         }
     }
@@ -82,16 +79,18 @@ impl TranscodingSummary {
     }
 }
 
-fn transcoding_session_json(
-    row: &crate::storage::StoredTranscodingSessionRow,
-    stats: Option<&crate::application::playback::session::WebPlaybackStats>,
-) -> Value {
-    let progress = stats.and_then(|stats| stats.progress.as_ref());
-    let latest_segment_bitrate = stats.and_then(|stats| stats.latest_segment_bitrate_kbps);
-    let directory_bytes = stats.and_then(|stats| stats.directory_bytes);
+fn transcoding_session_json(session: &LiveTranscodingSession) -> Value {
+    let row = &session.row;
+    let progress = session.progress.as_ref();
+    let latest_segment_bitrate = session.latest_segment_bitrate_kbps;
+    let directory_bytes = session.directory_bytes;
     json!({
         "sessionId": row.session_id,
-        "playSessionId": stats.map(|stats| stats.session.play_session_id.as_str()),
+        "playSessionId": if session.live {
+            Value::String(row.play_session_id.clone())
+        } else {
+            Value::Null
+        },
         "userId": row.user_id,
         "userName": row.user_name,
         "itemId": row.item_id,

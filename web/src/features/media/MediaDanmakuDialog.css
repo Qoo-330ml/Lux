@@ -1,0 +1,33 @@
+.lux-danmaku-dialog { width: min(780px, 100%); }
+.lux-danmaku-search { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 12px; padding: 20px 26px 12px; border-bottom: 1px solid var(--lux-line-soft); }
+.lux-danmaku-search > label:first-child { display: grid; gap: 7px; min-width: 0; color: var(--lux-muted); font-size: .76rem; }
+.lux-danmaku-overwrite { display: inline-flex; grid-column: 1 / -1; align-items: center; gap: 8px; width: fit-content; color: var(--lux-muted); font-size: .76rem; cursor: pointer; }
+.lux-danmaku-overwrite input { width: 15px; height: 15px; margin: 0; accent-color: var(--lux-accent); }
+.lux-danmaku-hint { margin: 0; padding: 10px 26px 0; color: var(--lux-subtle); font-size: .72rem; line-height: 1.5; }
+.lux-danmaku-dialog > .lux-editor-error { padding: 10px 26px 0; }
+.lux-danmaku-results { min-width: 0; width: 100%; max-height: min(560px, calc(100vh - 280px)); max-height: min(560px, calc(100dvh - 280px)); overflow-x: hidden; overflow-y: auto; padding: 16px 26px 26px; }
+.lux-danmaku-results-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.lux-danmaku-results-heading > span:last-child { color: var(--lux-subtle); font-size: .72rem; }
+.lux-danmaku-state { display: flex; align-items: center; gap: 9px; min-height: 58px; color: var(--lux-muted); font-size: .78rem; }
+.lux-danmaku-candidate-list { display: grid; gap: 10px; min-width: 0; }
+.lux-danmaku-candidate { display: grid; gap: 10px; min-width: 0; padding: 13px; border: 1px solid var(--lux-line-soft); border-radius: 11px; background: rgba(255,255,255,.025); }
+.lux-danmaku-candidate-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; min-width: 0; }
+.lux-danmaku-candidate-heading strong { overflow: hidden; color: var(--lux-text); font-size: .88rem; text-overflow: ellipsis; white-space: nowrap; }
+.lux-danmaku-candidate-heading small, .lux-danmaku-empty-episodes { flex: 0 0 auto; color: var(--lux-subtle); font-size: .7rem; }
+.lux-danmaku-episodes { display: flex; flex-wrap: wrap; gap: 7px; min-width: 0; }
+.lux-danmaku-episode { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; min-height: 32px; padding: 0 10px; border: 1px solid var(--lux-line-soft); border-radius: 999px; color: var(--lux-muted); background: rgba(255,255,255,.04); font-size: .74rem; text-align: left; }
+.lux-danmaku-episode span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lux-danmaku-episode:hover:not(:disabled), .lux-danmaku-episode:focus-visible:not(:disabled) { border-color: color-mix(in srgb, var(--lux-accent) 58%, var(--lux-line)); color: #fff; background: color-mix(in srgb, var(--lux-accent) 14%, transparent); }
+.lux-danmaku-episode:disabled { cursor: default; opacity: .62; }
+
+html[data-lux-theme="light"] .lux-danmaku-candidate { background: rgba(30,30,38,.025); }
+html[data-lux-theme="light"] .lux-danmaku-episode { color: var(--lux-muted); background: rgba(30,30,38,.04); }
+html[data-lux-theme="light"] .lux-danmaku-episode:hover:not(:disabled), html[data-lux-theme="light"] .lux-danmaku-episode:focus-visible:not(:disabled) { color: var(--lux-text); }
+
+@media (max-width: 560px) {
+  .lux-danmaku-search { grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 16px 16px 10px; }
+  .lux-danmaku-search .lux-button { justify-self: stretch; min-height: var(--lux-button-height-touch); }
+  .lux-danmaku-hint, .lux-danmaku-dialog > .lux-editor-error { padding-right: 16px; padding-left: 16px; }
+  .lux-danmaku-results { max-height: min(560px, calc(100vh - 230px)); max-height: min(560px, calc(100dvh - 230px)); padding: 14px 16px 20px; }
+  .lux-danmaku-episode { min-height: var(--lux-button-height-touch); }
+}

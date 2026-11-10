@@ -1,8 +1,9 @@
 import { useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
 import { Route, Routes, Navigate, useLocation, useParams } from "react-router-dom";
-import { Component, lazy, Suspense, useEffect } from "react";
+import { Component, lazy, Suspense, useEffect, useRef } from "react";
 import type { ReactNode } from "react";
 import { api, ApiError } from "../lib/api/client";
+import { clearUserCaches } from "../lib/api/session";
 import { queryKeys } from "../lib/api/query-keys";
 import type { LuxUser } from "../lib/api/types";
 import { LuxShell } from "../components/layout/LuxShell";
@@ -14,6 +15,8 @@ import { SetupPage } from "../features/auth/SetupPage";
 import { HomePage } from "../features/home/HomePage";
 import { ImageVariantsContext } from "../features/home/image-variants";
 import {
+  adminEntryPath,
+  prefetchAdminPage,
   loadAdminChangelogPage,
   loadAdminDashboardPage,
   loadAdminLibrariesPage,
@@ -30,6 +33,7 @@ const LibrariesPage = lazy(() => import("../features/library/LibrariesPage").the
 const LibraryPage = lazy(() => import("../features/library/LibraryPage").then(({ LibraryPage }) => ({ default: LibraryPage })));
 const SearchPage = lazy(() => import("../features/search/SearchPage").then(({ SearchPage }) => ({ default: SearchPage })));
 const FavoritesPage = lazy(() => import("../features/favorites/FavoritesPage").then(({ FavoritesPage }) => ({ default: FavoritesPage })));
+const WatchHistoryPage = lazy(() => import("../features/history/WatchHistoryPage").then(({ WatchHistoryPage }) => ({ default: WatchHistoryPage })));
 const MediaDetailPage = lazy(() => import("../features/detail/MediaDetailPage").then(({ MediaDetailPage }) => ({ default: MediaDetailPage })));
 const CollectionDetailPage = lazy(() => import("../features/detail/CollectionDetailPage").then(({ CollectionDetailPage }) => ({ default: CollectionDetailPage })));
 const PersonDetailPage = lazy(() => import("../features/detail/PersonDetailPage").then(({ PersonDetailPage }) => ({ default: PersonDetailPage })));
@@ -93,12 +97,32 @@ function ServerApp() {
 
 function SessionRoutes({ me }: { me: UseQueryResult<Awaited<ReturnType<typeof api.me>>, Error> }) {
   const location = useLocation();
+  const queryClient = useQueryClient();
+  const unauthorized = me.error instanceof ApiError && me.error.status === 401;
+  const clearedForRevocation = useRef(false);
+  // A 401 does not only arrive from the realtime channel: `refetchOnReconnect` (the tab was
+  // offline while the session was revoked) and the explicit `me` invalidations in the admin pages
+  // reach the same state. Whichever path got here, the previous account's cached pages must go, or
+  // the next login on this tab would read them within `staleTime`. One run per revocation, and
+  // nothing touches `me`: it already answers 401, so refetching it would only repeat the request.
+  useEffect(() => {
+    if (!unauthorized) {
+      clearedForRevocation.current = false;
+      return;
+    }
+    if (clearedForRevocation.current) return;
+    clearedForRevocation.current = true;
+    clearUserCaches(queryClient);
+  }, [queryClient, unauthorized]);
 
   if (me.isPending) return <LoadingScreen label="正在恢复会话" />;
-  if (me.error && !(me.error instanceof ApiError && me.error.status === 401)) {
+  if (me.error && !unauthorized) {
     return <ErrorScreen error={me.error} />;
   }
-  if (!me.data) {
+  // A revoked session can surface while the shell is already mounted: the realtime client
+  // invalidates queryKeys.me on a 1008 close (ADR-054 D11) and the refetch answers 401, but the
+  // cached session stays in `data`. That 401 means "no session", so it lands on the login page.
+  if (!me.data || unauthorized) {
     return (
       <Routes location={location}>
         <Route path="*" element={<LoginPage />} />
@@ -118,7 +142,17 @@ function SessionRoutes({ me }: { me: UseQueryResult<Awaited<ReturnType<typeof ap
 }
 
 function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?: string | null }) {
+  const queryClient = useQueryClient();
+  // Snapshot on purpose: a cold entry into the console should start the page chunk and its data
+  // once, in parallel with the AdminLayout chunk. In-app navigation is covered by the hover
+  // prefetch in LuxShell, so this must not re-run when the location changes later.
+  const entryPath = useRef(adminEntryPath(useLocation().pathname));
   useEffect(() => attachTouchCardHoverTracking(document, window), []);
+  useEffect(() => {
+    if (user.canManageServer && entryPath.current) {
+      prefetchAdminPage(queryClient, entryPath.current);
+    }
+  }, [queryClient, user.canManageServer]);
 
   return (
     <RouteErrorBoundary>
@@ -130,6 +164,7 @@ function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?:
             <Route path="libraries" element={<SuspensePage><LibrariesPage /></SuspensePage>} />
             <Route path="libraries/:libraryId" element={<SuspensePage><LibraryPage serverName={serverName} /></SuspensePage>} />
             <Route path="favorites" element={<SuspensePage><FavoritesPage /></SuspensePage>} />
+            <Route path="history" element={<SuspensePage><WatchHistoryPage /></SuspensePage>} />
             <Route path="items/:itemId" element={<SuspensePage><MediaDetailPage /></SuspensePage>} />
             <Route path="collections/:collectionId" element={<SuspensePage><CollectionDetailPage /></SuspensePage>} />
             <Route path="people/:personId" element={<SuspensePage><PersonDetailPage user={user} /></SuspensePage>} />

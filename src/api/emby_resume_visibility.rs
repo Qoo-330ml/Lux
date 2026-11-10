@@ -4,8 +4,12 @@ use super::*;
 pub(crate) struct ResumeVisibilityQuery {
     #[serde(flatten)]
     auth: EmbyTokenQuery,
-    #[serde(rename = "Hide")]
-    hide: Option<String>,
+    #[serde(
+        rename = "Hide",
+        default,
+        deserialize_with = "deserialize_optional_bool"
+    )]
+    hide: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -31,10 +35,9 @@ pub(in crate::api::legacy) async fn emby_hide_from_resume(
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    let query_hide = match query.hide.as_deref().map(str::parse::<bool>).transpose() {
-        Ok(value) => value,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-    };
+    // A blank `Hide=` is treated as an omitted value by the query helper; a non-empty value that is
+    // not `true`/`false` is rejected by the extractor with `400`.
+    let query_hide = query.hide;
     // Emby's documented query form and iOS Filmly's JSON body are both valid.
     let body_hide = if body.is_empty() {
         None
@@ -54,7 +57,7 @@ pub(in crate::api::legacy) async fn emby_hide_from_resume(
     let catalog = state.catalog();
     let item_id = emby_internal_id(&item_id);
     // Publish with the canonical user id: the path segment is a public Emby id
-    // and must not be used as the SSE routing key.
+    // and must not be used as the realtime routing key.
     let notification_user_id = principal.user_id.map(|user_id| user_id.to_string());
     match catalog.set_resume_hidden(principal, &item_id, hidden).await {
         Ok(user_state) => {

@@ -5,7 +5,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { SseConnectionContext, type SseConnectionState } from "../src/features/activity/useUserEvents";
+import { RealtimeConnectionContext, type RealtimeConnectionState } from "../src/features/activity/useUserEvents";
 import { MediaDetailPage } from "../src/features/detail/MediaDetailPage";
 import { HomePage } from "../src/features/home/HomePage";
 import { api } from "../src/lib/api/client";
@@ -44,17 +44,17 @@ async function advance(ms: number) {
   await act(async () => { await vi.advanceTimersByTimeAsync(ms); });
 }
 
-async function renderPage(page: "home" | "detail", state: SseConnectionState) {
+async function renderPage(page: "home" | "detail", state: RealtimeConnectionState) {
   await act(async () => {
     root.render(
       <QueryClientProvider client={client}>
-        <SseConnectionContext.Provider value={state}>
+        <RealtimeConnectionContext.Provider value={state}>
           <MemoryRouter initialEntries={["/items/movie-1"]}>
             <Routes><Route path="/items/:itemId" element={page === "home"
               ? <HomePage user={{ id: "viewer", usernameNormalized: "viewer" }} />
               : <MediaDetailPage />} /></Routes>
           </MemoryRouter>
-        </SseConnectionContext.Provider>
+        </RealtimeConnectionContext.Provider>
       </QueryClientProvider>,
     );
   });

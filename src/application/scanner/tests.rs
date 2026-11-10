@@ -657,7 +657,9 @@ async fn inferred_variant_counts_candidate_metadata_probes() {
     .await;
 
     assert_eq!(inferred_suffix.as_deref(), Some("Alternate-Cut"));
-    assert_eq!(probe_count.load(Ordering::Relaxed), 13);
+    // Two non-matching base candidates each probe all 22 unique sibling spellings (11 extensions
+    // in lower and upper case); the match then hits on the first probe: 2 * 22 + 1 = 45.
+    assert_eq!(probe_count.load(Ordering::Relaxed), 45);
 }
 
 #[tokio::test]
@@ -1776,6 +1778,10 @@ async fn local_metadata_worker_persists_capability_missing()
     .bind(library.id.to_string())
     .execute(database.pool())
     .await?;
+    // The raw UPDATE above bypasses the service write that signals the outbox worker. The worker
+    // otherwise only re-reads the queue after its 10 s idle fallback, which is this test's whole
+    // timeout budget.
+    jobs.notify_local_metadata_outbox_worker();
 
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
@@ -3480,5 +3486,103 @@ async fn batch_walker_canonicalizes_its_root_before_symlink_checks()
         files.contains(&aliased_root.join("Linked.Movie.2024.mkv")),
         "a file link inside the canonicalized root must be followed"
     );
+    Ok(())
+}
+
+#[test]
+fn season_directory_accepts_a_single_trailing_label_word() {
+    use super::names::parse_season_directory;
+
+    assert_eq!(parse_season_directory("Season 1"), Some((1, None)));
+    assert_eq!(parse_season_directory("season 01"), Some((1, None)));
+    assert_eq!(parse_season_directory("S2"), Some((2, None)));
+    assert_eq!(parse_season_directory("Specials"), Some((0, None)));
+    assert_eq!(parse_season_directory("Season 1 (2024)"), Some((1, None)));
+    assert_eq!(
+        parse_season_directory("Season 1(1)"),
+        Some((1, None)),
+        "a duplicated season folder is still that season without the copy marker"
+    );
+    assert_eq!(parse_season_directory("S01(2)"), Some((1, None)));
+    assert_eq!(
+        parse_season_directory("Season 1 DV"),
+        Some((1, Some("DV".to_owned())))
+    );
+    assert_eq!(
+        parse_season_directory("season 2 国语"),
+        Some((2, Some("国语".to_owned())))
+    );
+    assert_eq!(
+        parse_season_directory("S01 HDR"),
+        Some((1, Some("HDR".to_owned())))
+    );
+    assert_eq!(parse_season_directory("Season 1 Part Two"), None);
+    assert_eq!(parse_season_directory("Season 1DV"), None);
+    assert_eq!(parse_season_directory("Season DV"), None);
+    assert_eq!(parse_season_directory("Extras"), None);
+}
+
+#[tokio::test]
+async fn season_directories_with_a_label_merge_into_multi_version_episodes()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::{
+        application::libraries::LibraryService, config::Config, library::LibraryKind,
+        storage::Database,
+    };
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Shows");
+    let series_dir = media_root.join("Pride Show (2026)");
+    for label in ["DV", "HDR"] {
+        let season_dir = series_dir.join(format!("Season 1 {label}"));
+        tokio::fs::create_dir_all(&season_dir).await?;
+        tokio::fs::write(season_dir.join("Pride.Show.S01E01.mkv"), label).await?;
+    }
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-UTF8 media root")?,
+        )
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_series_library(library.id)
+        .await?;
+
+    let count = |item_type: &'static str| {
+        let database = database.clone();
+        let library_id = library.id.to_string();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM media_items WHERE library_id = ? AND item_type = ?",
+            )
+            .bind(library_id)
+            .bind(item_type)
+            .fetch_one(database.pool())
+            .await
+        }
+    };
+    assert_eq!(count("SERIES").await?, 1);
+    assert_eq!(count("SEASON").await?, 1);
+    assert_eq!(count("EPISODE").await?, 1);
+    let labels: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT s.edition_name FROM media_sources s
+         JOIN media_items i ON i.id = s.item_id
+         WHERE i.library_id = ? AND i.item_type = 'EPISODE'
+         ORDER BY s.edition_name",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(labels, vec![Some("DV".to_owned()), Some("HDR".to_owned())]);
     Ok(())
 }

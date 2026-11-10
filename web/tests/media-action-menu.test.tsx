@@ -104,6 +104,83 @@ describe("MediaActionMenu", () => {
     expect(onDelete).toHaveBeenCalledOnce();
   });
 
+  it("labels the refresh action from the resolved scrape mode", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <MediaActionMenu
+            item={{ id: "item-1", title: "二毛" }}
+            onEditMetadata={() => undefined}
+            onEditImages={() => undefined}
+            onRefreshMetadata={() => undefined}
+            refreshMode="FULL_REFRESH"
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    await act(async () => container.querySelector<HTMLButtonElement>(".lux-media-actions-trigger")?.click());
+
+    const action = document.body.querySelector<HTMLButtonElement>("[data-action=refresh-metadata]");
+    expect(action?.textContent?.replace(/\s+/g, " ").trim()).toBe("全量刷新元数据");
+    expect(action?.getAttribute("title")).toBe("重新获取并覆盖未锁定的元数据和图片");
+  });
+
+  it("labels a fill-missing refresh", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <MediaActionMenu
+            item={{ id: "item-1", title: "二毛" }}
+            onEditMetadata={() => undefined}
+            onEditImages={() => undefined}
+            onRefreshMetadata={() => undefined}
+            refreshMode="FILL_MISSING"
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    await act(async () => container.querySelector<HTMLButtonElement>(".lux-media-actions-trigger")?.click());
+
+    const action = document.body.querySelector<HTMLButtonElement>("[data-action=refresh-metadata]");
+    expect(action?.textContent?.replace(/\s+/g, " ").trim()).toBe("补全缺失元数据");
+    expect(action?.getAttribute("title")).toBe("只补全缺失的元数据和图片");
+  });
+
+  it("keeps the neutral label when no mode is resolved", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <MediaActionMenu
+            item={{ id: "item-1", title: "二毛" }}
+            onEditMetadata={() => undefined}
+            onEditImages={() => undefined}
+            onRefreshMetadata={() => undefined}
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    await act(async () => container.querySelector<HTMLButtonElement>(".lux-media-actions-trigger")?.click());
+
+    const action = document.body.querySelector<HTMLButtonElement>("[data-action=refresh-metadata]");
+    expect(action?.textContent?.replace(/\s+/g, " ").trim()).toBe("刷新元数据");
+    expect(action?.getAttribute("title")).toBeNull();
+  });
+
   it("offers deletion for series items", async () => {
     container = document.createElement("div");
     document.body.append(container);
@@ -220,6 +297,60 @@ describe("MediaActionMenu", () => {
       document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
     });
     expect(document.body.querySelector("[role=menu]")).toBeNull();
+  });
+
+  it("opens at a context-menu point and offers danmaku scraping for movies", async () => {
+    const onScrapeDanmaku = vi.fn();
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <MediaActionMenu
+            item={{ id: "item-1", title: "二毛", itemType: "MOVIE" }}
+            contextPoint={{ x: 220, y: 180 }}
+            onEditMetadata={() => undefined}
+            onEditImages={() => undefined}
+            onScrapeDanmaku={onScrapeDanmaku}
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    const menu = document.body.querySelector<HTMLElement>("[role=menu]");
+    expect(menu).not.toBeNull();
+    expect(menu?.textContent).toContain("刮削弹幕");
+    expect(menu?.style.left).toBe("220px");
+    expect(menu?.style.position).toBe("fixed");
+
+    await act(async () => document.body.querySelector<HTMLElement>("[data-action=scrape-danmaku]")?.click());
+    expect(onScrapeDanmaku).toHaveBeenCalledOnce();
+    expect(document.body.querySelector("[role=menu]")).toBeNull();
+  });
+
+  it("hides danmaku scraping for item types without a matchable source", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <MediaActionMenu
+            item={{ id: "series-1", title: "示例剧集", itemType: "SERIES" }}
+            onEditMetadata={() => undefined}
+            onEditImages={() => undefined}
+            onScrapeDanmaku={() => undefined}
+          />
+        </MemoryRouter>,
+      );
+    });
+    await act(async () => container.querySelector<HTMLButtonElement>(".lux-media-actions-trigger")?.click());
+
+    expect(document.body.querySelector("[role=menu]")?.textContent).not.toContain("刮削弹幕");
+    expect(document.body.querySelector("[data-action=scrape-danmaku]")).toBeNull();
   });
 
   it("keeps the portaled menu open for inside pointer events and closes outside", async () => {

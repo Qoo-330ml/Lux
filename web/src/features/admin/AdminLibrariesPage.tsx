@@ -1,6 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Copy,
   Database,
   HardDrive,
   Folder,
@@ -24,7 +23,7 @@ import type { LucideIcon } from "lucide-react";
 import { ChangeEvent, DragEvent, FormEvent, useEffect, useRef, useState } from "react";
 import { LuxSelect } from "../../components/LuxSelect";
 import { ImageLevelPolicyEditor } from "./ImageLevelPolicyEditor";
-import { flatCountOptions, flatWidthOptions } from "./image-policy-presets";
+import { flatCountOptions } from "./image-policy-presets";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { AdminLibrary, AdminLibraryDeletionJob, AdminLibraryDeletionJobsPage, AdminLibraryScraper, AdminPlugin, ChapterSource, LibraryKind, MediaImageVariantCacheSettings, MediaStrategySettings, MetadataRefreshMode } from "../../lib/api/types";
@@ -343,7 +342,6 @@ function GlobalStrategyPanel({
           />
           <div className="lux-library-strategy-form-grid lux-library-strategy-image-limits">
             <label>每项最大背景图数量<LuxSelectField aria-label="每项最大背景图数量" value={String(strategy.images.maxBackdropCount)} onChange={(event) => updateImages("maxBackdropCount", Number(event.target.value))}>{flatCountOptions(strategy.images.maxBackdropCount).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</LuxSelectField><small>0 张表示不下载背景图</small></label>
-            <label>最小下载宽度<LuxSelectField aria-label="最小下载宽度" value={String(strategy.images.minDownloadWidth)} onChange={(event) => updateImages("minDownloadWidth", Number(event.target.value))}>{flatWidthOptions(strategy.images.minDownloadWidth).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</LuxSelectField><small>“不限”表示不限制</small></label>
           </div>
           <div className="lux-setting-divider" />
           <div className="lux-library-strategy-image-variants">
@@ -472,8 +470,9 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy, on
   const addRoot = useMutation({ mutationFn: (path: string) => api.addAdminLibraryRoot(library.id, path.trim()), onSuccess: () => { setRootPath(""); setRootError(""); setDirectoryPickerOpen(false); void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraries }); }, onError: (error) => setRootError(error.message) });
   const removeRoot = useMutation({ mutationFn: (rootId: string) => api.deleteAdminLibraryRoot(library.id, rootId), onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraries }) });
   const scan = useMutation({ mutationFn: () => api.startAdminScan(library.id), onSuccess: () => { void queryClient.invalidateQueries({ queryKey: queryKeys.adminHealth }); void queryClient.invalidateQueries({ queryKey: queryKeys.adminJobs() }); } });
+  const refreshMode: MetadataRefreshMode = library.mediaStrategy?.metadataRefreshMode ?? globalStrategy?.metadataRefreshMode ?? "FILL_MISSING";
   const refresh = useMutation({
-    mutationFn: () => api.startLibraryMetadataRefresh(library.id, library.mediaStrategy?.metadataRefreshMode ?? globalStrategy?.metadataRefreshMode ?? "FILL_MISSING"),
+    mutationFn: () => api.startLibraryMetadataRefresh(library.id, refreshMode),
     onSuccess: () => { void queryClient.invalidateQueries({ queryKey: queryKeys.adminJobs() }); },
   });
   const remove = useMutation({
@@ -590,7 +589,7 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy, on
       </div>
       <div className="lux-admin-library-copy"><strong>{library.name}</strong><span>{libraryKindLabel(library.kind)}</span><small>{library.roots.length > 1 ? `${library.roots.length}个文件夹` : library.roots[0]?.displayPath ?? "尚未配置根路径"}</small></div>
       {removeError && !deleteOpen ? <p className="lux-error-copy" role="alert">{removeError}</p> : null}
-      {menuOpen ? <LibraryActionMenu library={library} onEdit={openEdit} onRefresh={() => { setMenuOpen(false); refresh.mutate(); }} refreshing={refresh.isPending} onScan={() => { setMenuOpen(false); scan.mutate(); }} onRemove={deleteLibrary} /> : null}
+      {menuOpen ? <LibraryActionMenu library={library} onEdit={openEdit} onRefresh={() => { setMenuOpen(false); refresh.mutate(); }} refreshMode={refreshMode} refreshing={refresh.isPending} onScan={() => { setMenuOpen(false); scan.mutate(); }} onRemove={deleteLibrary} /> : null}
       {editOpen ? <div className="lux-library-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setEditOpen(false); }} onKeyDown={(event) => { if (event.key === "Escape") setEditOpen(false); }}>
         <div className="lux-library-dialog" role="dialog" aria-modal="true" aria-labelledby={`edit-library-title-${library.id}`}>
           <div className="lux-library-dialog-header"><div><h2 id={`edit-library-title-${library.id}`}>{library.name}</h2></div><button ref={dialogCloseRef} className="lux-library-dialog-close" type="button" aria-label={`关闭 ${library.name} 编辑弹窗`} onClick={() => setEditOpen(false)}><X size={20} /></button></div>
@@ -716,7 +715,6 @@ function LibraryStrategyOverride({ library, globalStrategy, onSave }: { library:
       <div className="lux-library-override-fields">
         <StrategySelect label="元数据语言" value={draft.metadataLanguage} options={[["zh-CN", "简体中文"], ["en-US", "English"], ["ja-JP", "日本語"]]} onChange={(value) => setDraft((current) => ({ ...current, metadataLanguage: value }))} />
         <label>最大背景图数量<LuxSelectField aria-label="媒体库最大背景图数量" value={String(draft.images.maxBackdropCount)} onChange={(event) => updateImages("maxBackdropCount", Number(event.target.value))}>{flatCountOptions(draft.images.maxBackdropCount).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</LuxSelectField></label>
-        <label>最小下载宽度<LuxSelectField aria-label="媒体库最小下载宽度" value={String(draft.images.minDownloadWidth)} onChange={(event) => updateImages("minDownloadWidth", Number(event.target.value))}>{flatWidthOptions(draft.images.minDownloadWidth).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</LuxSelectField></label>
       </div>
       <ImageLevelPolicyEditor
         images={draft.images}
@@ -724,7 +722,7 @@ function LibraryStrategyOverride({ library, globalStrategy, onSave }: { library:
         emptySummary="全部跟随本库"
         onChange={(images) => setDraft((current) => ({ ...current, images }))}
       />
-    </> : <p className="lux-admin-muted lux-library-override-inherit-copy">当前使用全局默认：{globalStrategy.metadataLanguage} · {globalStrategy.images.minDownloadWidth || "不限"} px · {globalStrategy.images.maxBackdropCount} 张背景图。</p>}
+    </> : <p className="lux-admin-muted lux-library-override-inherit-copy">当前使用全局默认：{globalStrategy.metadataLanguage} · {globalStrategy.images.maxBackdropCount} 张背景图。</p>}
     {error ? <p className="lux-error-copy">{error}</p> : null}
     <div className="lux-library-override-actions"><span>{saved ? "策略覆盖已保存" : "覆盖只影响当前媒体库"}</span><button className="lux-library-toolbar-button" type="button" onClick={() => void save()} disabled={saved && mode === "inherit"}><Save size={14} /> {saved ? "已保存" : "保存策略"}</button></div>
   </section>;
@@ -734,17 +732,16 @@ function cloneStrategy(strategy: MediaStrategySettings): MediaStrategySettings {
   return { ...strategy, images: { ...strategy.images }, subtitles: { ...strategy.subtitles, languages: [...strategy.subtitles.languages] } };
 }
 
-function LibraryActionMenu({ library, onEdit, onRefresh, refreshing, onScan, onRemove }: { library: AdminLibrary; onEdit: () => void; onRefresh: () => void; refreshing: boolean; onScan: () => void; onRemove: () => void }) {
+function LibraryActionMenu({ library, onEdit, onRefresh, refreshMode, refreshing, onScan, onRemove }: { library: AdminLibrary; onEdit: () => void; onRefresh: () => void; refreshMode: MetadataRefreshMode; refreshing: boolean; onScan: () => void; onRemove: () => void }) {
   const actions: Array<{ label: string; icon: LucideIcon; onClick?: () => void; disabled?: boolean; title?: string }> = [
     { label: "添加到“合集”", icon: ListPlus, disabled: true, title: "合集功能将在后续版本提供" },
     { label: "更改内容类型", icon: Folder, onClick: onEdit },
     { label: "编辑", icon: Pencil, onClick: onEdit },
     { label: "编辑图像", icon: Image, onClick: onEdit },
-    { label: "刷新元数据", icon: RefreshCw, onClick: onRefresh, disabled: refreshing, title: refreshing ? "元数据刷新任务提交中" : undefined },
+    { label: refreshMode === "FULL_REFRESH" ? "全量刷新元数据" : "补全缺失元数据", icon: RefreshCw, onClick: onRefresh, disabled: refreshing, title: refreshing ? "元数据刷新任务提交中" : refreshMode === "FULL_REFRESH" ? "重新获取并覆盖未锁定的元数据和图片" : "只补全缺失的元数据和图片" },
     { label: "扫描媒体库文件", icon: RefreshCw, onClick: onScan },
     { label: "移除", icon: MinusCircle, onClick: onRemove },
     { label: "重命名", icon: Pencil, onClick: onEdit },
-    { label: "复制", icon: Copy, disabled: true, title: "复制媒体库功能暂未启用" },
   ];
   return <div className="lux-library-action-menu" role="menu" aria-label={`${library.name} 操作`}><div className="lux-library-action-menu-heading">{library.coverImageUrl ? <img src={library.coverImageUrl} alt="" /> : <span><Database size={16} /></span>}<strong>{library.name}</strong></div>{actions.map(({ label, icon: Icon, onClick, disabled, title }, index) => <span key={label}>{index === 6 ? <i className="lux-library-action-divider" aria-hidden="true" /> : null}<button type="button" role="menuitem" onClick={onClick} disabled={disabled} title={title}><Icon size={18} /><span>{label}</span></button></span>)}</div>;
 }
@@ -765,10 +762,17 @@ function normalizeLibraryScrapers(library: AdminLibrary): AdminLibraryScraper[] 
     }));
 }
 
+// A library scraper must declare metadata.search; the backend refuses selection otherwise (LUX-902).
+// A SCRAPER-category plugin with only ratings.* (e.g. the Trakt ratings plugin) is not offered.
+function isLibraryScraperPlugin(plugin: AdminPlugin): boolean {
+  return plugin.category.trim().toUpperCase() === "SCRAPER"
+    && (plugin.capabilities ?? []).some((capability) => capability.trim().toLowerCase() === "metadata.search");
+}
+
 function ScraperListEditor({ value, plugins, onChange }: { value: AdminLibraryScraper[]; plugins: AdminPlugin[]; onChange: (value: AdminLibraryScraper[]) => void }) {
   const [dragging, setDragging] = useState<number | null>(null);
   const selected = new Set(value.map((scraper) => scraper.scraperId));
-  const availablePlugins = plugins.filter((plugin) => plugin.category.trim().toUpperCase() === "SCRAPER");
+  const availablePlugins = plugins.filter(isLibraryScraperPlugin);
   const options = availablePlugins
     .filter((plugin) => plugin.available && !selected.has(plugin.id))
     .map((plugin) => ({ value: plugin.id, label: plugin.name }));
@@ -819,12 +823,23 @@ function ScraperListEditor({ value, plugins, onChange }: { value: AdminLibrarySc
 }
 
 function ScraperSelect({ id, value, plugins, onChange }: { id: string; value: string; plugins: AdminPlugin[]; onChange: (value: string) => void }) {
-  const visiblePlugins = plugins.filter((plugin) => plugin.category.trim().toUpperCase() === "SCRAPER" && (plugin.available || plugin.id === value));
-  const options = visiblePlugins.map((plugin) => ({
-    value: plugin.id,
-    label: `${plugin.name}${plugin.available ? "" : "（暂不可用）"}`,
-    disabled: !plugin.available,
-  }));
+  const capablePlugins = plugins.filter(isLibraryScraperPlugin);
+  const savedPlugin = plugins.find((plugin) => plugin.id === value);
+  // A scraper saved before the metadata.search rule can still be on disk. Keep it in the list and
+  // disable it instead of silently hiding the value the administrator already has.
+  const savedOption = value && !capablePlugins.some((plugin) => plugin.id === value)
+    ? [{ value, label: savedPlugin ? "已配置（不受支持）" : "已配置（暂不可用）", disabled: true }]
+    : [];
+  const options = [
+    ...capablePlugins
+      .filter((plugin) => plugin.available || plugin.id === value)
+      .map((plugin) => ({
+        value: plugin.id,
+        label: `${plugin.name}${plugin.available ? "" : "（暂不可用）"}`,
+        disabled: !plugin.available,
+      })),
+    ...savedOption,
+  ];
   return <label className="lux-admin-scraper-field" htmlFor={id}>
     刮削器
     <LuxSelect id={id} value={value} options={options} placeholder="未配置刮削器" disabled={options.length === 0} onChange={onChange} aria-label="刮削器" />

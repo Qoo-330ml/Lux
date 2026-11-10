@@ -258,10 +258,7 @@ impl ImageVariantService {
             return None;
         }
         let content_tag = valid_content_tag(source.content_tag.as_deref()?)?;
-        let (source_width, source_height) = match (source.width, source.height) {
-            (Some(width), Some(height)) if width > 0 && height > 0 => (width as u32, height as u32),
-            _ => return None,
-        };
+        let (source_width, source_height) = source_pixel_dimensions(source)?;
         if source_width.max(source_height) <= width {
             return None;
         }
@@ -553,6 +550,260 @@ fn is_supported_image_type(image_type: &str) -> bool {
     matches!(image_type, "POSTER" | "THUMB" | "FANART")
 }
 
+/// How an image endpoint asked for a derived variant.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ImageVariantRequest {
+    /// The response keeps the stored image bytes.
+    #[default]
+    Original,
+    /// Exact long-edge width requested by the Lux Web API (`w=360|720|1280`).
+    Width(u32),
+    /// Display box an Emby client scales the artwork into; the tier comes from the source size
+    /// through [`variant_width_for_display_size`].
+    DisplaySize {
+        width: Option<u32>,
+        height: Option<u32>,
+    },
+}
+
+impl ImageVariantRequest {
+    /// Cached variant width for this request, or `None` when the original bytes are served.
+    ///
+    /// `source` is the resolved source size, which the display-box form needs and the Web API
+    /// form ignores.
+    pub(crate) fn variant_width(self, source: Option<(u32, u32)>) -> Option<u32> {
+        match self {
+            Self::Original => None,
+            Self::Width(width) => Some(width),
+            Self::DisplaySize { width, height } => {
+                let (source_width, source_height) = source?;
+                variant_width_for_display_size(width, height, source_width, source_height)
+            }
+        }
+    }
+}
+
+/// Why an image request has to keep the stored bytes instead of a cached variant.
+///
+/// The variant cache is opaque JPEG without overlays, so the objections a client can raise are
+/// bounded and each one maps to one stable label in the Emby diagnostic log (LUX-882).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OriginalImageReason {
+    /// The client sent no usable size hint.
+    NoSizeHint,
+    /// The client asked for a format the JPEG-only cache cannot carry.
+    NonJpegFormat,
+    /// The client asked for an overlay (played indicator, blur, progress) baked into the image.
+    Overlay,
+    /// The image row carries no usable pixel size, so a display box cannot map onto a tier.
+    SourceSizeUnknown,
+    /// The needed long edge is not smaller than the source or is above the largest tier.
+    NeedsOriginal,
+    /// A tier was picked but the cache could not answer: switched off, unsupported image type,
+    /// generation in flight or cooling down after a failure, or a cache file that disappeared.
+    VariantUnavailable,
+}
+
+impl OriginalImageReason {
+    /// Stable label for the diagnostic log; these names are the documented RUST_LOG contract.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoSizeHint => "no_size_hint",
+            Self::NonJpegFormat => "non_jpeg_format",
+            Self::Overlay => "overlay",
+            Self::SourceSizeUnknown => "source_size_unknown",
+            Self::NeedsOriginal => "needs_original",
+            Self::VariantUnavailable => "variant_unavailable",
+        }
+    }
+}
+
+/// What one image request is served from: a cached tier, or the stored bytes plus the reason.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ImageVariantSelection {
+    Variant(u32),
+    Original(OriginalImageReason),
+}
+
+impl ImageVariantSelection {
+    pub(crate) const fn variant_width(self) -> Option<u32> {
+        match self {
+            Self::Variant(width) => Some(width),
+            Self::Original(_) => None,
+        }
+    }
+
+    pub(crate) const fn original_reason(self) -> Option<OriginalImageReason> {
+        match self {
+            Self::Variant(_) => None,
+            Self::Original(reason) => Some(reason),
+        }
+    }
+
+    pub(crate) const fn is_variant(self) -> bool {
+        matches!(self, Self::Variant(_))
+    }
+}
+
+/// How an image endpoint wants the stored image served, plus the objections an Emby image URL can
+/// raise against the JPEG-only variant cache.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ImageVariantIntent {
+    request: ImageVariantRequest,
+    overlay: bool,
+    non_jpeg_format: bool,
+}
+
+impl ImageVariantIntent {
+    /// Lux Web API request: an exact tier width, or the original when no width was asked for.
+    pub(crate) const fn exact(request: ImageVariantRequest) -> Self {
+        Self {
+            request,
+            overlay: false,
+            non_jpeg_format: false,
+        }
+    }
+
+    /// Emby image URL request: the parsed display box plus the overlay / format objections.
+    pub(crate) const fn display(
+        request: ImageVariantRequest,
+        overlay: bool,
+        non_jpeg_format: bool,
+    ) -> Self {
+        Self {
+            request,
+            overlay,
+            non_jpeg_format,
+        }
+    }
+
+    /// Tier this request can be served from, or the reason it keeps the stored image.
+    ///
+    /// Pure: it depends only on the request shape and the resolved source size, and the precedence
+    /// matches the serving path, so a reported reason always describes the bytes that went out.
+    /// Overlay and non-JPEG formats rule the cache out before the size hints; the display-box form
+    /// then needs a known source size and a needed long edge the tiers cover.
+    pub(crate) fn selection(self, source: Option<(u32, u32)>) -> ImageVariantSelection {
+        if self.overlay {
+            return ImageVariantSelection::Original(OriginalImageReason::Overlay);
+        }
+        if self.non_jpeg_format {
+            return ImageVariantSelection::Original(OriginalImageReason::NonJpegFormat);
+        }
+        match self.request {
+            ImageVariantRequest::Original => {
+                ImageVariantSelection::Original(OriginalImageReason::NoSizeHint)
+            }
+            ImageVariantRequest::Width(width) => ImageVariantSelection::Variant(width),
+            ImageVariantRequest::DisplaySize { .. } => {
+                let Some((source_width, source_height)) = source else {
+                    return ImageVariantSelection::Original(OriginalImageReason::SourceSizeUnknown);
+                };
+                match self
+                    .request
+                    .variant_width(Some((source_width, source_height)))
+                {
+                    Some(width) => ImageVariantSelection::Variant(width),
+                    None => ImageVariantSelection::Original(OriginalImageReason::NeedsOriginal),
+                }
+            }
+        }
+    }
+}
+
+/// Known dimensions of a resolved image as unsigned pixels, or `None` when the image row carries
+/// no usable size.
+pub(crate) fn source_pixel_dimensions(source: &ResolvedImage) -> Option<(u32, u32)> {
+    let (width, height) = (source.width?, source.height?);
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    Some((u32::try_from(width).ok()?, u32::try_from(height).ok()?))
+}
+
+/// Chooses the cached variant width for a client that scales the artwork into a
+/// `maxWidth` × `maxHeight` box, as Emby clients do.
+///
+/// The client keeps the aspect ratio, so the scale factor is the tighter of the two hints and
+/// the long edge it ends up needing is `source_long_edge × scale`. The result is the smallest
+/// tier whose long edge still covers that size (a tier never upscales: a client asking for a
+/// long edge at or above `max(source_width, source_height)` gets the original). `None` means
+/// "serve the original": no usable hint, an unknown source size, or a needed long edge above
+/// the largest tier.
+///
+/// `source_width` / `source_height` are the stored image dimensions, which come from the file
+/// header, while variant generation applies the EXIF orientation before resizing and the
+/// orientation is only known once the source is decoded (never on this request path). Both
+/// readings of the stored pair are therefore covered and the larger needed long edge wins: a
+/// source whose EXIF orientation swaps the axes can never be served from a tier that is too
+/// small for what the client renders.
+pub(crate) fn variant_width_for_display_size(
+    requested_width: Option<u32>,
+    requested_height: Option<u32>,
+    source_width: u32,
+    source_height: u32,
+) -> Option<u32> {
+    if source_width == 0 || source_height == 0 {
+        return None;
+    }
+    let source_long_edge = u64::from(source_width.max(source_height));
+    // `max(sw, sh)` is orientation invariant, so only the hint conversion can change.
+    let needed = [(source_width, source_height), (source_height, source_width)]
+        .into_iter()
+        .filter_map(|(width, height)| {
+            needed_long_edge(
+                requested_width,
+                requested_height,
+                source_long_edge,
+                width,
+                height,
+            )
+        })
+        .max()?;
+    if needed >= source_long_edge {
+        return None;
+    }
+    if needed > u64::from(*IMAGE_VARIANT_WIDTHS.last()?) {
+        return None;
+    }
+    IMAGE_VARIANT_WIDTHS
+        .into_iter()
+        .find(|width| u64::from(*width) >= needed)
+        .filter(|width| u64::from(*width) < source_long_edge)
+}
+
+/// Long edge one scaling of the client box needs for a single orientation reading, or `None`
+/// when neither hint carries a usable value.
+fn needed_long_edge(
+    requested_width: Option<u32>,
+    requested_height: Option<u32>,
+    source_long_edge: u64,
+    source_width: u32,
+    source_height: u32,
+) -> Option<u64> {
+    let by_width = requested_width
+        .filter(|requested| *requested > 0)
+        .map(|requested| scaled_long_edge(requested, source_long_edge, source_width));
+    let by_height = requested_height
+        .filter(|requested| *requested > 0)
+        .map(|requested| scaled_long_edge(requested, source_long_edge, source_height));
+    match (by_width, by_height) {
+        // Both hints describe the same box, so the smaller needed long edge is the one the
+        // client actually renders.
+        (Some(by_width), Some(by_height)) => Some(by_width.min(by_height)),
+        (Some(needed), None) | (None, Some(needed)) => Some(needed),
+        (None, None) => None,
+    }
+}
+
+/// Long edge the client renders after scaling `requested` onto `source_edge`, rounded up so a
+/// hint one pixel below a tier boundary still reaches that tier.
+fn scaled_long_edge(requested: u32, source_long_edge: u64, source_edge: u32) -> u64 {
+    source_long_edge
+        .saturating_mul(u64::from(requested))
+        .div_ceil(u64::from(source_edge))
+}
+
 fn valid_content_tag(value: &str) -> Option<String> {
     (value.len() == 64
         && value
@@ -725,6 +976,273 @@ mod tests {
             width: Some(i64::from(width)),
             height: Some(i64::from(height)),
         }
+    }
+
+    #[test]
+    fn variant_request_forms_resolve_to_a_tier_or_the_original() {
+        assert_eq!(
+            ImageVariantRequest::Original.variant_width(Some((1600, 2400))),
+            None
+        );
+        // The Web API width is exact and does not need the source size.
+        assert_eq!(
+            ImageVariantRequest::Width(720).variant_width(None),
+            Some(720)
+        );
+        assert_eq!(
+            ImageVariantRequest::DisplaySize {
+                width: Some(300),
+                height: None
+            }
+            .variant_width(Some((1600, 2400))),
+            Some(720)
+        );
+        // Without a known source size a display box cannot be mapped onto a tier.
+        assert_eq!(
+            ImageVariantRequest::DisplaySize {
+                width: Some(300),
+                height: None
+            }
+            .variant_width(None),
+            None
+        );
+    }
+
+    #[test]
+    fn variant_intent_reports_why_the_stored_image_is_served() {
+        assert_eq!(
+            ImageVariantIntent::exact(ImageVariantRequest::Original).selection(Some((1600, 2400))),
+            ImageVariantSelection::Original(OriginalImageReason::NoSizeHint)
+        );
+        // The Web API width is exact and does not need the source size.
+        assert_eq!(
+            ImageVariantIntent::exact(ImageVariantRequest::Width(720)).selection(None),
+            ImageVariantSelection::Variant(720)
+        );
+        let display = |width, height| {
+            ImageVariantIntent::display(
+                ImageVariantRequest::DisplaySize { width, height },
+                false,
+                false,
+            )
+        };
+        // A 300 px wide 2:3 poster needs a 450 px long edge, which the 720 tier covers.
+        assert_eq!(
+            display(Some(300), None).selection(Some((1600, 2400))),
+            ImageVariantSelection::Variant(720)
+        );
+        // Without a stored source size a display box cannot be mapped onto a tier.
+        assert_eq!(
+            display(Some(300), None).selection(None),
+            ImageVariantSelection::Original(OriginalImageReason::SourceSizeUnknown)
+        );
+        // A client box whose needed long edge is not smaller than the source keeps it.
+        assert_eq!(
+            display(Some(1600), None).selection(Some((1600, 2400))),
+            ImageVariantSelection::Original(OriginalImageReason::NeedsOriginal)
+        );
+        // A source already smaller than the smallest tier is never upscaled.
+        assert_eq!(
+            display(Some(50), None).selection(Some((80, 120))),
+            ImageVariantSelection::Original(OriginalImageReason::NeedsOriginal)
+        );
+    }
+
+    #[test]
+    fn overlay_and_format_objections_win_over_the_size_hints() {
+        let overlay = ImageVariantIntent::display(
+            ImageVariantRequest::DisplaySize {
+                width: Some(300),
+                height: None,
+            },
+            true,
+            false,
+        );
+        assert_eq!(
+            overlay.selection(Some((1600, 2400))),
+            ImageVariantSelection::Original(OriginalImageReason::Overlay)
+        );
+        let non_jpeg = ImageVariantIntent::display(
+            ImageVariantRequest::DisplaySize {
+                width: Some(300),
+                height: None,
+            },
+            false,
+            true,
+        );
+        assert_eq!(
+            non_jpeg.selection(Some((1600, 2400))),
+            ImageVariantSelection::Original(OriginalImageReason::NonJpegFormat)
+        );
+        // Overlay and format can both be set; the log reports the overlay first.
+        let both = ImageVariantIntent::display(
+            ImageVariantRequest::DisplaySize {
+                width: Some(300),
+                height: None,
+            },
+            true,
+            true,
+        );
+        assert_eq!(
+            both.selection(Some((1600, 2400))),
+            ImageVariantSelection::Original(OriginalImageReason::Overlay)
+        );
+        // The objections also win over the absence of a size hint.
+        assert_eq!(
+            overlay.selection(None),
+            ImageVariantSelection::Original(OriginalImageReason::Overlay)
+        );
+    }
+
+    #[test]
+    fn original_reasons_map_to_stable_log_labels() {
+        let labels = [
+            (OriginalImageReason::NoSizeHint, "no_size_hint"),
+            (OriginalImageReason::NonJpegFormat, "non_jpeg_format"),
+            (OriginalImageReason::Overlay, "overlay"),
+            (
+                OriginalImageReason::SourceSizeUnknown,
+                "source_size_unknown",
+            ),
+            (OriginalImageReason::NeedsOriginal, "needs_original"),
+            (
+                OriginalImageReason::VariantUnavailable,
+                "variant_unavailable",
+            ),
+        ];
+        for (reason, label) in labels {
+            assert_eq!(reason.as_str(), label);
+        }
+        assert_eq!(
+            ImageVariantSelection::Variant(720).variant_width(),
+            Some(720)
+        );
+        assert_eq!(
+            ImageVariantSelection::Original(OriginalImageReason::Overlay).original_reason(),
+            Some(OriginalImageReason::Overlay)
+        );
+        assert!(ImageVariantSelection::Variant(360).is_variant());
+        assert!(
+            !ImageVariantSelection::Variant(360)
+                .original_reason()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn display_box_selects_the_smallest_covering_tier() {
+        // A 2:3 poster asking for a 300 px wide thumbnail needs a 450 px long edge.
+        assert_eq!(
+            variant_width_for_display_size(Some(300), None, 1000, 1500),
+            Some(720)
+        );
+        // 16:9 fanart constrained by height: 1920 × 200 / 1080 ≈ 355.6 px → next tier 360.
+        assert_eq!(
+            variant_width_for_display_size(None, Some(200), 1920, 1080),
+            Some(360)
+        );
+        // Both hints describe one box, so the tighter one wins: a 1600×2400 poster in an
+        // 800×400 box needs a 1200 px long edge by width and 400 px by height; the client only
+        // ever sees the 400 px height, so the 720 tier is enough.
+        assert_eq!(
+            variant_width_for_display_size(Some(800), Some(400), 1600, 2400),
+            Some(720)
+        );
+    }
+
+    #[test]
+    fn display_box_scales_the_long_edge_from_either_hint() {
+        // 1600×2400 at 800 px wide → 1200 px long edge → 1280.
+        assert_eq!(
+            variant_width_for_display_size(Some(800), None, 1600, 2400),
+            Some(1280)
+        );
+        // 1600×2400 at 300 px high: the unrotated reading needs a 300 px long edge, but the
+        // rotated 2400×1600 reading needs 450 px, and the orientation is unknown here, so the
+        // coarser 720 tier is kept.
+        assert_eq!(
+            variant_width_for_display_size(None, Some(300), 1600, 2400),
+            Some(720)
+        );
+        // A width hint on the short stored edge reads the same in both orientations.
+        assert_eq!(
+            variant_width_for_display_size(Some(200), None, 1600, 2400),
+            Some(360)
+        );
+        // Ceiling rounding: 1500 × 299 / 1000 = 448.5 → 449 px → 720.
+        assert_eq!(
+            variant_width_for_display_size(Some(299), None, 1000, 1500),
+            Some(720)
+        );
+        // An exact tier boundary stays on that tier.
+        assert_eq!(
+            variant_width_for_display_size(Some(240), None, 1000, 1500),
+            Some(360)
+        );
+    }
+
+    #[test]
+    fn display_box_covers_both_exif_orientations() {
+        // The stored 2400×1600 comes from the file header; the variant pipeline applies the EXIF
+        // orientation before resizing, so the rendered artwork may be 1600×2400. A 1000 px wide
+        // client box then needs a 1500 px long edge, which no tier covers: serve the original
+        // instead of the 1280 tier an unrotated reading would pick.
+        assert_eq!(
+            variant_width_for_display_size(Some(1000), None, 2400, 1600),
+            None
+        );
+        // A rotated 2400×1600 poster rendered at 600 px wide needs 900 px, so the rotated
+        // reading forces the coarser 1280 tier.
+        assert_eq!(
+            variant_width_for_display_size(Some(600), None, 2400, 1600),
+            Some(1280)
+        );
+        // Square sources read the same in both orientations.
+        assert_eq!(
+            variant_width_for_display_size(Some(300), None, 1000, 1000),
+            Some(360)
+        );
+    }
+
+    #[test]
+    fn display_box_above_the_largest_tier_or_already_covered_keeps_the_original() {
+        // 1000 px wide on a 2:3 poster needs a 1500 px long edge, above 1280.
+        assert_eq!(
+            variant_width_for_display_size(Some(1000), None, 4000, 6000),
+            None
+        );
+        // The original is already smaller than the smallest tier.
+        assert_eq!(
+            variant_width_for_display_size(Some(300), None, 300, 200),
+            None
+        );
+        // Asking for the original size must not upsample into a tier.
+        assert_eq!(
+            variant_width_for_display_size(Some(1000), None, 1000, 1500),
+            None
+        );
+        // The covering tier is larger than the original, so no variant is smaller.
+        assert_eq!(
+            variant_width_for_display_size(Some(250), None, 400, 600),
+            None
+        );
+    }
+
+    #[test]
+    fn display_box_without_usable_hints_or_source_size_keeps_the_original() {
+        assert_eq!(variant_width_for_display_size(None, None, 1600, 2400), None);
+        assert_eq!(
+            variant_width_for_display_size(Some(0), Some(0), 1600, 2400),
+            None
+        );
+        assert_eq!(
+            variant_width_for_display_size(Some(300), None, 0, 1500),
+            None
+        );
+        assert_eq!(
+            variant_width_for_display_size(None, Some(300), 1600, 0),
+            None
+        );
     }
 
     #[test]

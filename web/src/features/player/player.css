@@ -22,7 +22,7 @@
 
 .lux-player-topbar-left { display: flex; align-items: center; gap: 16px; min-width: 0; }
 
-.lux-player-topbar-actions { display: none; align-items: center; gap: 8px; flex: 0 0 auto; }
+.lux-player-topbar-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 
 .lux-player-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 
@@ -30,7 +30,9 @@
 
 .lux-player-title { font-size: 1.15rem; font-weight: 600; color: #fff; text-shadow: 0 2px 10px rgba(0,0,0,.7); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-.lux-player-subtitle { font-size: .8rem; color: var(--lux-muted); text-shadow: 0 1px 6px rgba(0,0,0,.8); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lux-player-year { flex: 0 0 auto; font-size: .95rem; font-variant-numeric: tabular-nums; color: var(--lux-muted); text-shadow: 0 1px 6px rgba(0,0,0,.8); white-space: nowrap; }
+
+.lux-player-title-logo { display: block; flex: 0 1 auto; min-width: 0; max-width: min(300px, 50vw); max-height: 56px; width: auto; height: auto; object-fit: contain; object-position: left center; filter: drop-shadow(0 2px 10px rgba(0,0,0,.6)); }
 
 .lux-player-icon-btn { display: inline-grid; place-items: center; width: 42px; height: 42px; border: 1px solid var(--lux-line-soft); border-radius: 50%; color: #fff; background: rgba(20,20,26,.6); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); transition: transform .2s var(--lux-ease), background .2s ease, border-color .2s ease; cursor: pointer; }
 
@@ -40,15 +42,23 @@
 
 .lux-player-icon-btn.is-active { background: color-mix(in srgb, var(--lux-accent) 25%, rgba(20,20,26,.8)); border-color: var(--lux-accent); color: #fff; }
 
-.lux-player-center-play, .lux-player-center-splash { position: absolute; top: 50%; left: 50%; display: flex; align-items: center; justify-content: center; width: 88px; height: 88px; border-radius: 50%; transform: translate(-50%, -50%); color: rgba(58,82,130,.86); background: rgba(255,255,255,.86); box-shadow: 0 8px 26px rgba(0,0,0,.18); z-index: 6; }
+/* Centre play/pause control: the Lux mark folds into two bars while playing. */
+.lux-player-center-control { position: absolute; top: 50%; left: 50%; z-index: 6; display: grid; place-items: center; width: 104px; height: 104px; padding: 0; border: 0; background: none; color: #fff; cursor: pointer; transform: translate(-50%, -50%); transition: opacity .3s ease, transform .3s ease; }
 
-.lux-player-center-play { border: 0; cursor: pointer; transition: transform .18s var(--lux-ease), background .18s ease; }
+.lux-player-center-control svg { width: 80px; height: 80px; overflow: visible; filter: drop-shadow(0 4px 18px rgba(0,0,0,.45)); }
 
-.lux-player-center-play:hover, .lux-player-center-play:focus-visible { transform: translate(-50%, -50%) scale(1.06); background: #fff; }
+.lux-player-center-control:hover { transform: translate(-50%, -50%) scale(1.05); }
 
-.lux-player-center-play:focus-visible { outline: 3px solid rgba(255,255,255,.78); outline-offset: 5px; }
+.lux-player-center-control:focus-visible { outline: 3px solid rgba(255,255,255,.78); outline-offset: 5px; border-radius: 16px; }
 
-.lux-player-center-splash { pointer-events: none; background: rgba(255,255,255,.82); animation: lux-player-splash .6s var(--lux-ease) forwards; }
+.lux-player-center-control.is-loading svg { animation: lux-center-breathe 1.2s ease-in-out infinite; }
+
+/* While playing the pause bars follow the control bar: they fade out with it. */
+.lux-player-page.controls-hidden .lux-player-center-control.is-playing { opacity: 0; pointer-events: none; }
+
+@keyframes lux-center-breathe { 0%, 100% { transform: scale(.92); opacity: .7; } 50% { transform: scale(1.04); opacity: 1; } }
+
+@media (prefers-reduced-motion: reduce) { .lux-player-center-control.is-loading svg { animation: none; } }
 
 .lux-player-controls-wrap { position: absolute; right: calc(2% + env(safe-area-inset-right)); bottom: calc(10px + env(safe-area-inset-bottom)); left: calc(2% + env(safe-area-inset-left)); display: flex; flex-direction: column; z-index: 10; pointer-events: auto; transition: opacity .3s var(--lux-ease), transform .3s var(--lux-ease); }
 
@@ -80,9 +90,37 @@
 
 .lux-player-skip-intro:focus-visible { outline: 2px solid rgba(255,255,255,.82); outline-offset: 2px; }
 
-.lux-player-timeline-row { display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0; }
+/* 跳过片尾复用跳过片头的锚点位置：片头区间与片尾章节在时间上互斥，不会同时出现。 */
+.lux-player-skip-credits { position: absolute; right: 0; bottom: calc(73px + env(safe-area-inset-bottom)); z-index: 3; padding: 7px 12px; border: 1px solid rgba(255,255,255,.24); border-radius: 7px; color: #fff; background: rgba(18,18,24,.8); backdrop-filter: blur(12px); font-size: .76rem; font-weight: 600; cursor: pointer; }
 
-.lux-player-timeline { position: relative; flex: 1 1 auto; width: auto; min-width: 0; height: 21px; padding: 10px 0 5px; display: flex; align-items: center; touch-action: none; }
+.lux-player-skip-credits:hover, .lux-player-skip-credits:focus-visible { border-color: var(--lux-accent); background: rgba(30,30,40,.94); }
+
+.lux-player-skip-credits:focus-visible { outline: 2px solid rgba(255,255,255,.82); outline-offset: 2px; }
+
+.lux-player-auto-next { position: absolute; right: calc(2% + env(safe-area-inset-right)); bottom: calc(96px + env(safe-area-inset-bottom)); z-index: 16; display: flex; flex-direction: column; gap: 12px; width: min(320px, calc(100vw - 24px - env(safe-area-inset-left) - env(safe-area-inset-right))); padding: 14px 16px; border: 1px solid rgba(255,255,255,.16); border-radius: 14px; color: #fff; background: rgba(18,18,26,.88); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); box-shadow: 0 18px 40px rgba(0,0,0,.5); }
+
+.lux-player-auto-next-text { margin: 0; font-size: .85rem; font-weight: 600; line-height: 1.35; }
+
+.lux-player-auto-next-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+
+.lux-player-auto-next-play, .lux-player-auto-next-cancel { padding: 7px 14px; border-radius: 8px; font-size: .8rem; font-weight: 600; cursor: pointer; transition: background .16s ease, border-color .16s ease, color .16s ease; }
+
+.lux-player-auto-next-play { border: 1px solid var(--lux-accent); color: var(--lux-accent-foreground); background: var(--lux-accent); }
+
+.lux-player-auto-next-play:hover, .lux-player-auto-next-play:focus-visible { filter: brightness(1.08); }
+
+.lux-player-auto-next-cancel { border: 1px solid rgba(255,255,255,.24); color: #fff; background: rgba(30,30,40,.9); }
+
+.lux-player-auto-next-cancel:hover, .lux-player-auto-next-cancel:focus-visible { border-color: rgba(255,255,255,.4); background: rgba(44,44,56,.96); }
+
+.lux-player-auto-next-play:focus-visible, .lux-player-auto-next-cancel:focus-visible { outline: 2px solid rgba(255,255,255,.82); outline-offset: 2px; }
+
+.lux-player-timeline-row { display: flex; flex-direction: column; gap: 0; width: 100%; min-width: 0; }
+.lux-player-timeline-times { display: flex; align-items: center; justify-content: space-between; padding: 0 2px; font-size: 13px; font-variant-numeric: tabular-nums; color: rgba(255,255,255,.85); }
+.lux-player-time-total { border: 0; padding: 0; background: transparent; color: inherit; font: inherit; cursor: pointer; }
+.lux-player-time-total:hover, .lux-player-time-total:focus-visible { color: #fff; }
+
+.lux-player-timeline { position: relative; flex: 0 0 auto; width: 100%; min-width: 0; height: 21px; padding: 10px 0 5px; display: flex; align-items: center; touch-action: none; }
 
 .lux-player-timeline-rail { position: relative; width: 100%; height: 4px; background: rgba(255,255,255,.28); border-radius: 9999px; transition: height .15s ease; }
 
@@ -163,11 +201,72 @@
 
 .lux-player-danmaku-overlay { position: absolute; inset: clamp(88px, 12vh, 120px) 0 clamp(92px, 18vh, 156px) 0; z-index: 7; overflow: hidden; pointer-events: none; }
 
-.lux-player-danmaku-text { position: absolute; display: block; max-width: 90%; overflow: hidden; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-weight: 600; line-height: 1.2; text-shadow: 0 1px 2px rgba(0,0,0,.95), 1px 0 2px rgba(0,0,0,.7), -1px 0 2px rgba(0,0,0,.7); white-space: pre-line; }
+/* Positions come from the renderer as `transform: translate3d(...)`, so no layout is recalculated
+   per frame and the safe-area inset above keeps danmaku out of the title and control zones. */
+.lux-player-danmaku-text { position: absolute; top: 0; left: 0; display: block; max-width: 90%; overflow: hidden; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-weight: 600; line-height: 1.2; text-shadow: 0 1px 2px rgba(0,0,0,.95), 1px 0 2px rgba(0,0,0,.7), -1px 0 2px rgba(0,0,0,.7); white-space: pre-line; will-change: transform; }
 
-.lux-player-danmaku-top, .lux-player-danmaku-bottom { left: 50% !important; max-width: min(90%, 72rem); transform: translateX(-50%); text-align: center; }
+.lux-player-danmaku-top, .lux-player-danmaku-bottom { max-width: min(90%, 72rem); text-align: center; }
 
-.lux-player-settings-popover { position: absolute; right: calc(2% + env(safe-area-inset-right)); bottom: calc(70px + env(safe-area-inset-bottom)); width: 270px; max-height: calc(100vh - 32px); max-height: calc(100dvh - 32px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding: 16px; border: 1px solid rgba(255,255,255,.15); border-radius: 16px; background: rgba(18,18,26,.88); backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); box-shadow: 0 20px 50px rgba(0,0,0,.6); z-index: 20; color: #fff; animation: lux-popover-in .2s var(--lux-ease); }
+/* Load outcome for the danmaku track, mirroring the caption status: it must stay outside the
+   aria-hidden overlay so the reason (“加载失败” / “已截断” / “内容为空”) is announced once. */
+.lux-player-danmaku-status { position: absolute; top: calc(80px + env(safe-area-inset-top)); left: 50%; max-width: min(86vw, 460px); padding: 6px 11px; border: 1px solid rgba(255,255,255,.16); border-radius: 999px; transform: translateX(-50%); color: #fff; background: rgba(16,16,18,.72); box-shadow: 0 6px 18px rgba(0,0,0,.28); font-size: .76rem; line-height: 1.3; text-align: center; pointer-events: none; z-index: 8; }
+
+/* Settings drawer: slides in from the right with tabs for quality, aspect ratio and playback info. */
+.lux-player-settings-drawer { position: absolute; top: 0; right: 0; bottom: 0; z-index: 30; display: flex; flex-direction: column; width: min(340px, 100vw); padding: calc(28px + env(safe-area-inset-top)) calc(22px + env(safe-area-inset-right)) calc(22px + env(safe-area-inset-bottom)) 22px; border-left: 1px solid rgba(255,255,255,.08); background: rgba(18,18,22,.94); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); box-shadow: -20px 0 40px rgba(0,0,0,.4); color: #fff; animation: lux-drawer-in .3s ease; }
+
+@keyframes lux-drawer-in { from { transform: translateX(100%); } to { transform: none; } }
+
+.lux-player-settings-tabs { display: flex; gap: 6px; margin-bottom: 6px; }
+
+.lux-player-settings-tab { flex: 1 1 0; min-width: 0; padding: 8px 0; border: 0; border-radius: 6px; background: rgba(255,255,255,.05); color: rgba(255,255,255,.6); font: inherit; font-size: .8rem; cursor: pointer; white-space: nowrap; }
+
+.lux-player-settings-tab:hover { color: #fff; }
+
+.lux-player-settings-tab.is-active { color: #fff; background: color-mix(in srgb, var(--lux-accent) 30%, transparent); }
+
+.lux-player-settings-tab:focus-visible { outline: 2px solid rgba(255,255,255,.82); outline-offset: 1px; }
+
+.lux-player-settings-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+
+.lux-player-settings-close { display: inline-flex; align-items: center; gap: 4px; padding: 4px 6px; }
+
+/* Option rows used by the drawer and the subtitle and audio popovers. */
+.lux-player-option-list { display: flex; flex-direction: column; gap: 2px; }
+
+.lux-player-option { display: flex; align-items: center; gap: 8px; width: 100%; padding: 12px 10px; border: 0; border-radius: 8px; background: transparent; color: rgba(255,255,255,.85); font: inherit; font-size: .88rem; text-align: left; cursor: pointer; }
+
+.lux-player-option:hover:not(:disabled) { background: rgba(255,255,255,.06); }
+
+.lux-player-option:disabled { opacity: .45; cursor: not-allowed; }
+
+.lux-player-option:focus-visible { outline: 2px solid rgba(255,255,255,.82); outline-offset: -2px; }
+
+.lux-player-option.is-selected { color: #fff; background: color-mix(in srgb, var(--lux-accent) 22%, transparent); }
+
+.lux-player-option-label { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+
+.lux-player-option-note { flex: 0 0 auto; font-style: normal; font-size: .75rem; color: rgba(255,255,255,.5); }
+
+.lux-player-option-check { flex: 0 0 auto; color: var(--lux-accent); }
+
+/* Playback information inside the drawer. */
+.lux-player-info-section { user-select: text; font-size: .78rem; }
+
+.lux-player-info-section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+
+.lux-player-info-section-head .lux-player-settings-label { margin-bottom: 8px; }
+
+.lux-player-info-action { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 6px; color: rgba(255,255,255,.7); background: rgba(255,255,255,.08); cursor: pointer; }
+
+.lux-player-info-action:hover { color: #fff; background: rgba(255,255,255,.16); }
+
+.lux-player-info-action:focus-visible { outline: 2px solid rgba(255,255,255,.82); outline-offset: 1px; }
+
+.lux-player-info-group + .lux-player-info-group { margin-top: 10px; padding-top: 8px; border-top: 1px dashed rgba(255,255,255,.1); }
+
+.lux-player-info-group h5 { margin: 0 0 4px; color: rgba(255,255,255,.55); font-size: .68rem; font-weight: 600; letter-spacing: .08em; }
+
+.lux-player-info-list { margin: 0; }
 
 .lux-player-settings-header { display: flex; align-items: center; justify-content: space-between; font-size: .88rem; font-weight: 600; padding-bottom: 10px; border-bottom: 1px solid var(--lux-line-soft); }
 
@@ -196,6 +295,24 @@
 .lux-player-caption-offset { display: block; width: 100%; height: 20px; margin-top: 5px; accent-color: var(--lux-accent); cursor: pointer; }
 
 .lux-player-caption-offset:focus-visible { outline: 2px solid rgba(255,255,255,.82); outline-offset: 2px; }
+
+/* Danmaku settings reuse the subtitle offset/speed styles; only the keyword list and the two-column
+   label rows need their own rules. */
+.lux-player-danmaku-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.lux-player-danmaku-value { color: #fff; font-size: .78rem; font-variant-numeric: tabular-nums; }
+.lux-player-danmaku-row .lux-player-settings-label { margin-bottom: 0; }
+.lux-player-danmaku-settings > .lux-player-settings-label { margin-top: 4px; }
+.lux-player-danmaku-hint { margin: 2px 0 4px; color: var(--lux-muted); font-size: .68rem; line-height: 1.4; }
+.lux-player-danmaku-keyword-form { display: flex; gap: 6px; }
+.lux-player-danmaku-keyword-input { flex: 1; min-width: 0; height: 28px; padding: 0 8px; border: 1px solid var(--lux-line-soft); border-radius: 8px; background: rgba(255,255,255,.04); color: #fff; font: inherit; font-size: .78rem; }
+.lux-player-danmaku-keyword-input:focus-visible { outline: 2px solid rgba(255,255,255,.82); outline-offset: 2px; }
+.lux-player-danmaku-keyword-add { height: 28px; padding: 0 10px; border: 1px solid var(--lux-line-soft); border-radius: 8px; background: rgba(255,255,255,.06); color: #fff; font: inherit; font-size: .78rem; cursor: pointer; }
+.lux-player-danmaku-keyword-add:hover:not(:disabled) { background: rgba(255,255,255,.12); }
+.lux-player-danmaku-keyword-add:disabled { opacity: .45; cursor: not-allowed; }
+.lux-player-danmaku-keywords { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 0; padding: 0; list-style: none; }
+.lux-player-danmaku-keyword { display: flex; align-items: center; gap: 4px; padding: 2px 4px 2px 8px; border-radius: 999px; background: rgba(255,255,255,.08); font-size: .74rem; }
+.lux-player-danmaku-keyword-remove { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--lux-muted); cursor: pointer; }
+.lux-player-danmaku-keyword-remove:hover, .lux-player-danmaku-keyword-remove:focus-visible { color: #fff; background: rgba(255,255,255,.14); }
 
 .lux-player-speed-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
 
@@ -231,13 +348,9 @@
 
 
 /* Information panel ("stats for nerds"): opened by right-click, the I key or the control bar. */
-.lux-player-info { position: absolute; top: calc(78px + env(safe-area-inset-top)); right: calc(2% + env(safe-area-inset-right)); z-index: 26; display: flex; flex-direction: column; width: min(400px, calc(100vw - 24px)); max-height: calc(100vh - 170px); max-height: calc(100dvh - 170px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); overflow: hidden; border: 1px solid rgba(255,255,255,.15); border-radius: 14px; background: rgba(12,14,18,.9); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); box-shadow: 0 20px 50px rgba(0,0,0,.6); color: #fff; font-size: .76rem; animation: lux-popover-in .16s var(--lux-ease); }
 
-.lux-player-info-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,.1); }
 
-.lux-player-info-head h2 { margin: 0; font-size: .82rem; font-weight: 600; letter-spacing: .02em; }
 
-.lux-player-info-actions { display: flex; gap: 4px; }
 
 .lux-player-info-action { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 0; border: 1px solid rgba(255,255,255,.12); border-radius: 6px; color: rgba(255,255,255,.8); background: rgba(255,255,255,.06); cursor: pointer; }
 
@@ -245,13 +358,10 @@
 
 .lux-player-info-action:focus-visible { outline: 2px solid rgba(255,255,255,.82); outline-offset: 1px; }
 
-.lux-player-info-body { padding: 6px 12px 12px; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; user-select: text; }
 
 .lux-player-info-group + .lux-player-info-group { margin-top: 10px; padding-top: 8px; border-top: 1px dashed rgba(255,255,255,.1); }
 
-.lux-player-info-group h3 { margin: 0 0 4px; color: rgba(255,255,255,.55); font-size: .68rem; font-weight: 600; letter-spacing: .08em; }
 
-.lux-player-info-group dl { margin: 0; }
 
 .lux-player-info-row { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 8px; padding: 1.5px 0; }
 
@@ -260,8 +370,53 @@
 .lux-player-info-row dd { margin: 0; min-width: 0; overflow-wrap: anywhere; color: rgba(255,255,255,.94); font-variant-numeric: tabular-nums; }
 
 @media (max-width: 560px) {
-  .lux-player-info { top: calc(64px + env(safe-area-inset-top)); right: calc(10px + env(safe-area-inset-right)); left: calc(10px + env(safe-area-inset-left)); width: auto; max-height: calc(100vh - 150px); max-height: calc(100dvh - 150px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); }
   .lux-player-info-row { grid-template-columns: 76px minmax(0, 1fr); }
+}
+
+/* Keyboard shortcut reference ("?" or the control-bar entry). It is modal, so it sits above
+   the settings popover and the info panel. */
+.lux-player-shortcut-help-layer { position: absolute; inset: 0; z-index: 27; display: grid; place-items: center; padding: calc(72px + env(safe-area-inset-top)) calc(16px + env(safe-area-inset-right)) calc(88px + env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left)); }
+
+.lux-player-shortcut-help { position: relative; z-index: 28; display: flex; flex-direction: column; width: min(460px, 100%); max-height: 100%; overflow: hidden; border: 1px solid rgba(255,255,255,.15); border-radius: 16px; background: rgba(12,14,18,.94); backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); box-shadow: 0 24px 60px rgba(0,0,0,.6); color: #fff; font-size: .8rem; animation: lux-popover-in .16s var(--lux-ease); }
+
+.lux-player-shortcut-help:focus-visible { outline: 2px solid rgba(255,255,255,.72); outline-offset: 3px; }
+
+.lux-player-shortcut-help-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 14px 16px 10px; border-bottom: 1px solid rgba(255,255,255,.1); }
+
+.lux-player-shortcut-help-head h2 { margin: 0; font-size: .92rem; font-weight: 600; letter-spacing: .02em; }
+
+.lux-player-shortcut-help-hint { margin: 4px 0 0; color: rgba(255,255,255,.55); font-size: .7rem; line-height: 1.45; }
+
+.lux-player-shortcut-help-close { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 26px; height: 26px; padding: 0; border: 1px solid rgba(255,255,255,.12); border-radius: 7px; color: rgba(255,255,255,.8); background: rgba(255,255,255,.06); cursor: pointer; }
+
+.lux-player-shortcut-help-close:hover { color: #fff; background: rgba(255,255,255,.16); }
+
+.lux-player-shortcut-help-close:focus-visible { outline: 2px solid rgba(255,255,255,.82); outline-offset: 2px; }
+
+.lux-player-shortcut-help-body { padding: 8px 16px 14px; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+
+.lux-player-shortcut-help-group + .lux-player-shortcut-help-group { margin-top: 10px; padding-top: 8px; border-top: 1px dashed rgba(255,255,255,.1); }
+
+.lux-player-shortcut-help-group h3 { margin: 0 0 5px; color: rgba(255,255,255,.55); font-size: .68rem; font-weight: 600; letter-spacing: .08em; }
+
+.lux-player-shortcut-help-group dl { margin: 0; }
+
+.lux-player-shortcut-help-row { display: grid; grid-template-columns: 106px minmax(0, 1fr); gap: 10px; align-items: baseline; padding: 3px 0; }
+
+.lux-player-shortcut-help-row dt { display: flex; flex-wrap: wrap; gap: 4px; margin: 0; }
+
+.lux-player-shortcut-help-row dd { margin: 0; min-width: 0; color: rgba(255,255,255,.92); line-height: 1.45; }
+
+.lux-player-shortcut-help-row kbd { display: inline-block; min-width: 20px; padding: 1px 5px; border: 1px solid rgba(255,255,255,.22); border-bottom-width: 2px; border-radius: 5px; color: #fff; background: rgba(255,255,255,.09); font-family: inherit; font-size: .72rem; line-height: 1.4; text-align: center; }
+
+@media (max-width: 560px) {
+  .lux-player-shortcut-help-layer { padding: calc(56px + env(safe-area-inset-top)) calc(10px + env(safe-area-inset-right)) calc(64px + env(safe-area-inset-bottom)) calc(10px + env(safe-area-inset-left)); }
+  .lux-player-shortcut-help-row { grid-template-columns: 92px minmax(0, 1fr); }
+}
+
+/* 触屏设备没有实体键盘，控制条不强制展示快捷键入口。 */
+@media (pointer: coarse) {
+  .lux-player-controls .lux-player-shortcut-help-btn { display: none; }
 }
 
 @media (max-width: 560px) {
@@ -272,15 +427,26 @@
   .lux-player-controls-right { flex: 1 1 auto; width: auto; max-width: none; overflow-x: auto; overscroll-behavior-inline: contain; scrollbar-width: none; }
   .lux-player-controls-right::-webkit-scrollbar { display: none; }
   .lux-player-time { gap: 4px; padding: 0 2px 0 0; font-size: 13px; }
-  .lux-player-center-play, .lux-player-center-splash { width: 68px; height: 68px; }
-  .lux-player-center-play svg { width: 28px; height: 28px; }
-  .lux-player-settings-popover { right: calc(10px + env(safe-area-inset-right)); bottom: calc(62px + env(safe-area-inset-bottom)); width: min(270px, calc(100vw - 20px - env(safe-area-inset-left) - env(safe-area-inset-right))); max-height: calc(100vh - 86px); max-height: calc(100dvh - 86px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); }
+  .lux-player-center-control { width: 76px; height: 76px; }
+  .lux-player-center-control svg { width: 58px; height: 58px; }
 }
 
 /* Playback controls always sit on a dark surface, including in light mode. */
 html[data-lux-accent="silver"] .lux-player-page { --lux-accent: #cbd5e1; --lux-accent-foreground: #181b22; }
 
 @media (max-width: 720px) and (orientation: portrait) {
-  .lux-player-topbar-actions { display: flex; }
   .lux-player-controls .lux-player-mobile-top-control { display: none; }
 }
+
+/* Narrow screens: double-tap seeks, so the 10 s buttons give way to the fullscreen button. */
+@media (max-width: 560px) {
+  .lux-player-controls .lux-player-seek-btn { display: none; }
+}
+
+.lux-player-track-popover .lux-player-caption-offset-heading { margin-top: 14px; }
+
+/* Control-bar track popovers (subtitles, audio) and speed toggle. */
+.lux-player-track-anchor { position: relative; display: flex; align-items: center; }
+.lux-player-track-popover { position: absolute; bottom: calc(100% + 12px); left: 0; z-index: 30; width: min(320px, calc(100vw - 32px)); padding: 14px; border: 1px solid rgba(255,255,255,.12); border-radius: 12px; background: rgba(18,18,24,.95); box-shadow: 0 14px 40px rgba(0,0,0,.5); backdrop-filter: blur(18px); }
+.lux-player-controls-right .lux-player-track-popover { left: auto; right: 0; }
+.lux-player-subtitle-btn.is-active, .lux-player-audio-btn.is-active { color: var(--lux-accent); }

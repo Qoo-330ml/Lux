@@ -21,10 +21,11 @@ use crate::{
         actor_enrichment::ActorEnrichmentQueue,
         admin_events::{AdminEventHub, AdminEventScope},
         candidates::{
-            FillMissingRequestPlan, ImageSelectionPolicy, MetadataCandidateError,
-            MetadataCandidatePage, MetadataCandidateService, MetadataCandidateView,
-            MetadataRequestPlan, MetadataSelectionError, MetadataSelectionMode,
-            MetadataSelectionService, has_selected_provider_id,
+            FillMissingRequestPlan, ImageSelectionPolicy, MetadataAttemptHistory,
+            MetadataCandidateError, MetadataCandidatePage, MetadataCandidateService,
+            MetadataCandidateView, MetadataRequestPlan, MetadataSelectionError,
+            MetadataSelectionMode, MetadataSelectionService, SelectionInputs,
+            has_selected_provider_id,
         },
         notification_template::bounded_display_text,
         scraper::{ResolvedScraper, ScraperError, ScraperProvider, ScraperResolver},
@@ -61,6 +62,58 @@ pub type MetadataBenchmarkItemTimings = Arc<Mutex<Vec<(String, u128)>>>;
 static METADATA_GLOBAL_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static METADATA_FILL_MISSING_GLOBAL_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static METADATA_FILL_MISSING_CONFIGURED_WORKER_LIMIT: OnceLock<usize> = OnceLock::new();
+
+/// One item's configured library scrapers plus its legacy `libraries.scraper_id`.
+///
+/// This is one entry of `Database::list_item_scraper_configurations_by_ids`.
+type StoredItemScraperConfiguration = (Vec<crate::storage::StoredLibraryScraper>, Option<String>);
+
+/// Rows one claim batch reads for all of its items instead of one read per item.
+///
+/// `docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S4: a job claims up to
+/// `worker_permits.len()` items at once, so the per-item configuration and retry-history reads can
+/// be two statements per batch.
+///
+/// Both snapshots are safe because a worker only writes rows keyed by the item it owns:
+///
+/// - Scraper configurations come from `media_items`/`libraries`/`library_scrapers`. A metadata job
+///   never writes those rows, so the snapshot stays valid for the item's whole lifetime.
+/// - Attempt history (`metadata_capability_attempts`/`metadata_image_attempts`) is written by the
+///   item's own search/selection. The snapshot is therefore only handed to the request plan that
+///   runs before the item's first attempt; every later read (see the backup fallback loop) still
+///   goes to the database.
+#[derive(Default)]
+struct ClaimBatchPrefetch {
+    /// `None` when the batch has no resolver or the batch read failed; the worker then falls back
+    /// to the per-item read it used before.
+    scraper_configurations: Option<HashMap<String, StoredItemScraperConfiguration>>,
+    /// `None` when the batch did not prefetch history (other modes, or the read failed).
+    metadata_attempts: Option<HashMap<String, MetadataAttemptHistory>>,
+}
+
+/// One item's slice of [`ClaimBatchPrefetch`].
+#[derive(Default)]
+struct ItemPrefetch {
+    /// `Some(..)` replaces the per-item configuration read; an empty row set means the item has no
+    /// configured scrapers, exactly like a batch read that returned no rows for it.
+    scraper_configuration: Option<StoredItemScraperConfiguration>,
+    metadata_attempts: Option<MetadataAttemptHistory>,
+}
+
+impl ClaimBatchPrefetch {
+    fn for_item(&self, item_id: &str) -> ItemPrefetch {
+        ItemPrefetch {
+            scraper_configuration: self
+                .scraper_configurations
+                .as_ref()
+                .map(|configurations| configurations.get(item_id).cloned().unwrap_or_default()),
+            metadata_attempts: self
+                .metadata_attempts
+                .as_ref()
+                .map(|attempts| attempts.get(item_id).cloned().unwrap_or_default()),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MetadataConcurrencySettingSource {
@@ -742,12 +795,15 @@ enum RefreshItemOutcome {
     NeedsReview(i64),
 }
 
-struct RefreshItemOptions {
+struct RefreshItemOptions<'a> {
     scraper_id: Option<String>,
     supplemental: bool,
     preserve_identity: bool,
     request_plan: Option<MetadataRequestPlan>,
     image_policy: Option<ImageSelectionPolicy>,
+    /// The item snapshot to reuse for the selection step, when the caller can prove nothing
+    /// rewrote the row since it was read (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` M8).
+    current: Option<&'a crate::storage::StoredMediaMetadata>,
 }
 
 impl Drop for MetadataJobOwnerGuard {
@@ -1129,23 +1185,26 @@ impl MetadataReidentifyService {
         query: &str,
         year: Option<i32>,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
-        let kind = self
+        // The search needs the item's type and metadata; read the wide row once and hand it to
+        // the candidate search instead of reading kind and metadata separately
+        // (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S3).
+        let current = self
             .database
-            .find_media_item_kind(item_id)
+            .find_media_item_metadata(item_id)
             .await
             .map_err(MetadataCandidateError::Storage)?
             .ok_or(MetadataCandidateError::ItemNotFound)?;
-        if kind.item_type == "VIDEO" {
+        if current.item_type == "VIDEO" {
             return Err(MetadataCandidateError::Scraper(
                 ScraperError::UnsupportedCapability("metadata.search".to_owned()),
             ));
         }
         let scrapers = self
-            .providers_for_item(item_id, false)
+            .providers_for_item(item_id, false, None)
             .await
             .map_err(MetadataCandidateError::Scraper)?
             .unwrap_or_default();
-        self.search_item_candidates_with_scrapers(item_id, query, year, &scrapers)
+        self.search_item_candidates_with_scrapers(item_id, query, year, &scrapers, &current)
             .await
     }
 
@@ -1155,6 +1214,7 @@ impl MetadataReidentifyService {
         query: &str,
         year: Option<i32>,
         scrapers: &[ResolvedScraper],
+        current: &crate::storage::StoredMediaMetadata,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
         let mut last_page = None;
         let mut last_scraper_error = None;
@@ -1172,7 +1232,7 @@ impl MetadataReidentifyService {
             attempted = true;
             match self
                 .candidates
-                .search_and_store(item_id, query, year, &scraper.provider)
+                .search_and_store_for_current(item_id, query, year, &scraper.provider, current)
                 .await
             {
                 Ok(page) if !page.items.is_empty() => {
@@ -1237,7 +1297,7 @@ impl MetadataReidentifyService {
                 MetadataSelectionError::CandidateNotFound,
             ))?;
         let scrapers = self
-            .providers_for_item(item_id, false)
+            .providers_for_item(item_id, false, None)
             .await
             .map_err(MetadataReidentifyError::Scraper)?
             .unwrap_or_default();
@@ -1429,6 +1489,11 @@ impl MetadataReidentifyService {
             };
         if matches!(mode, MetadataRefreshMode::FullRefresh) {
             self.scraper.clear_response_cache().await;
+            if let Some(resolver) = &self.resolver {
+                // The production assembly scrapes through the resolver, so the placeholder
+                // `self.scraper` above has no cache to clear.
+                resolver.clear_response_cache().await;
+            }
         }
         let mut workers = JoinSet::new();
         let mut last_concurrency = None;
@@ -1507,14 +1572,20 @@ impl MetadataReidentifyService {
                     self.resources
                         .record_metadata_stage("queue_wait", queue_wait);
                 }
+                // Two batch reads for the whole claim instead of two reads per item
+                // (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S4). The reads happen right
+                // after the claim and before any worker for this batch starts, so each item's
+                // snapshot still reflects everything earlier batches wrote to it.
+                let prefetch = self.prefetch_claimed_items(&item_ids, mode).await;
                 for (item_id, worker_permit) in item_ids.into_iter().zip(worker_permits) {
                     let service = self.clone();
                     let job_id = job_id.to_owned();
                     let job_library_name = job_library_name.clone();
+                    let item_prefetch = prefetch.for_item(&item_id);
                     workers.spawn(async move {
                         let _worker_permit = worker_permit;
                         service
-                            .process_item(&job_id, &item_id, mode, job_library_name)
+                            .process_item(&job_id, &item_id, mode, job_library_name, &item_prefetch)
                             .await;
                     });
                 }
@@ -1663,6 +1734,7 @@ impl MetadataReidentifyService {
         item_id: &str,
         mode: MetadataRefreshMode,
         job_library_name: Option<Option<String>>,
+        prefetch: &ItemPrefetch,
     ) {
         let item_started = Instant::now();
         let mut item_title = None;
@@ -1680,7 +1752,11 @@ impl MetadataReidentifyService {
                     let request_plan = if matches!(mode, MetadataRefreshMode::FillMissing) {
                         if let Some(selection) = self.selection.as_ref() {
                             selection
-                                .fill_missing_request_plan_for_current(item_id, &item)
+                                .fill_missing_request_plan_for_current(
+                                    item_id,
+                                    &item,
+                                    prefetch.metadata_attempts.as_ref(),
+                                )
                                 .await
                                 .map_err(MetadataReidentifyError::Selection)
                                 .map(Some)
@@ -1702,6 +1778,7 @@ impl MetadataReidentifyService {
                                 .providers_for_item(
                                     item_id,
                                     !matches!(mode, MetadataRefreshMode::Reidentify),
+                                    prefetch.scraper_configuration.as_ref(),
                                 )
                                 .await
                             {
@@ -1977,10 +2054,56 @@ impl MetadataReidentifyService {
         self.admin_events.publish(AdminEventScope::Jobs);
     }
 
+    /// Reads the claimed batch's scraper configurations and retry history once per batch.
+    ///
+    /// Every read is best effort: a failed batch read leaves that snapshot empty, so the affected
+    /// workers keep the per-item read (and its per-item error handling) they had before
+    /// `docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S4.
+    async fn prefetch_claimed_items(
+        &self,
+        item_ids: &[String],
+        mode: MetadataRefreshMode,
+    ) -> ClaimBatchPrefetch {
+        let mut prefetch = ClaimBatchPrefetch::default();
+        if item_ids.is_empty() {
+            return prefetch;
+        }
+        if self.resolver.is_some() {
+            match self
+                .database
+                .list_item_scraper_configurations_by_ids(item_ids)
+                .await
+            {
+                Ok(configurations) => prefetch.scraper_configurations = Some(configurations),
+                Err(error) => tracing::warn!(
+                    item_count = item_ids.len(),
+                    %error,
+                    "metadata refresh could not prefetch scraper configurations; reading them per item"
+                ),
+            }
+        }
+        if matches!(mode, MetadataRefreshMode::FillMissing) && self.selection.is_some() {
+            match self
+                .database
+                .list_metadata_attempts_by_item_ids(item_ids)
+                .await
+            {
+                Ok(attempts) => prefetch.metadata_attempts = Some(attempts),
+                Err(error) => tracing::warn!(
+                    item_count = item_ids.len(),
+                    %error,
+                    "metadata refresh could not prefetch attempt history; reading it per item"
+                ),
+            }
+        }
+        prefetch
+    }
+
     async fn providers_for_item(
         &self,
         item_id: &str,
         require_selected_scraper: bool,
+        prefetched_configuration: Option<&StoredItemScraperConfiguration>,
     ) -> Result<Option<Vec<ResolvedScraper>>, ScraperError> {
         let Some(resolver) = &self.resolver else {
             return Ok(Some(vec![ResolvedScraper {
@@ -1993,7 +2116,16 @@ impl MetadataReidentifyService {
                 provider: self.scraper.clone(),
             }]));
         };
-        let clients = resolver.for_item_ordered(item_id).await?;
+        let clients = match prefetched_configuration {
+            // The claim batch read this item's configuration together with the rest of the batch
+            // (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S4).
+            Some((configured, legacy_scraper_id)) => {
+                resolver
+                    .for_prefetched_configuration(configured, legacy_scraper_id.as_deref())
+                    .await?
+            }
+            None => resolver.for_item_ordered(item_id).await?,
+        };
         if require_selected_scraper && clients.is_empty() {
             return Ok(None);
         }
@@ -2059,6 +2191,10 @@ impl MetadataReidentifyService {
         });
         let mut last_recoverable_error = None;
         let mut saw_needs_review = false;
+        // Nothing rewrites the item row until an attempt reaches selection, but a failed or
+        // needs-review attempt may already have rewritten the NFO projection, so the caller's
+        // snapshot is only reusable for the first primary attempt.
+        let mut current_snapshot = Some(item);
         let should_refresh_primary = !already_confirmed
             || request_plan.is_none_or(|plan| !metadata_request_plan_is_complete(plan));
         if should_refresh_primary {
@@ -2086,6 +2222,7 @@ impl MetadataReidentifyService {
                             preserve_identity: false,
                             request_plan,
                             image_policy: request_plan.and_then(|plan| plan.image_policy),
+                            current: current_snapshot.take(),
                         },
                     )
                     .await
@@ -2136,6 +2273,13 @@ impl MetadataReidentifyService {
         }
         if !matches!(mode, MetadataRefreshMode::Reidentify) {
             if let Some(selection) = self.selection.as_ref() {
+                // The caller's `item` predates the primary attempts, which may have rewritten the
+                // row, so the first fallback reads it. A fallback attempt that misses before
+                // selection writes nothing, so the next backup reuses that snapshot instead of
+                // re-reading the same row (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S2).
+                // Any other outcome -- a selection, or an error raised after a partial write --
+                // invalidates the snapshot and forces the next backup to re-read.
+                let mut reusable_snapshot: Option<crate::storage::StoredMediaMetadata> = None;
                 for scraper in scrapers.iter().filter(|scraper| {
                     matches!(
                         scraper.role,
@@ -2143,11 +2287,16 @@ impl MetadataReidentifyService {
                             | crate::library::LibraryScraperRole::Both
                     )
                 }) {
-                    let current = self
-                        .database
-                        .find_media_item_metadata(item_id)
-                        .await?
-                        .ok_or_else(|| MetadataReidentifyError::ItemNotFound(item_id.to_owned()))?;
+                    let current = match reusable_snapshot.take() {
+                        Some(current) => current,
+                        None => self
+                            .database
+                            .find_media_item_metadata(item_id)
+                            .await?
+                            .ok_or_else(|| {
+                                MetadataReidentifyError::ItemNotFound(item_id.to_owned())
+                            })?,
+                    };
                     let fallback_plan = selection
                         .fallback_request_plan_for_current(item_id, &current)
                         .await
@@ -2155,7 +2304,7 @@ impl MetadataReidentifyService {
                     if metadata_request_plan_is_complete(fallback_plan) {
                         break;
                     }
-                    match self
+                    let outcome = self
                         .refresh_item(
                             item_id,
                             &current,
@@ -2167,10 +2316,19 @@ impl MetadataReidentifyService {
                                 preserve_identity: true,
                                 request_plan: Some(fallback_plan),
                                 image_policy: fallback_plan.image_policy,
+                                current: Some(&current),
                             },
                         )
-                        .await
-                    {
+                        .await;
+                    let row_untouched = matches!(
+                        outcome,
+                        Err(MetadataReidentifyError::NoCandidate)
+                            | Err(MetadataReidentifyError::LowConfidence)
+                    );
+                    if row_untouched {
+                        reusable_snapshot = Some(current);
+                    }
+                    match outcome {
                         Ok(
                             RefreshItemOutcome::Confirmed(count)
                             | RefreshItemOutcome::NeedsReview(count),
@@ -2223,6 +2381,9 @@ impl MetadataReidentifyService {
                             preserve_identity: false,
                             request_plan: supplemental_plan,
                             image_policy: supplemental_plan.and_then(|plan| plan.image_policy),
+                            // Supplemental attempts run after earlier writers, so `item` is stale
+                            // here; the selection must re-read the row.
+                            current: None,
                         },
                     )
                     .await
@@ -2256,7 +2417,7 @@ impl MetadataReidentifyService {
         item: &crate::storage::StoredMediaMetadata,
         mode: MetadataRefreshMode,
         provider: &ScraperProvider,
-        options: RefreshItemOptions,
+        options: RefreshItemOptions<'_>,
     ) -> Result<RefreshItemOutcome, MetadataReidentifyError> {
         let page = if matches!(mode, MetadataRefreshMode::FillMissing)
             || options.supplemental
@@ -2330,13 +2491,17 @@ impl MetadataReidentifyService {
                 MetadataRefreshMode::Reidentify => return Ok(RefreshItemOutcome::Confirmed(0)),
             }
         };
+        let inputs = SelectionInputs {
+            image_policy: options.image_policy,
+            current: options.current,
+        };
         if options.preserve_identity {
             selection
                 .select_fallback_with_scraper_and_policy(
                     item_id,
                     &candidate.id,
                     options.scraper_id.as_deref().unwrap_or_default(),
-                    options.image_policy,
+                    inputs,
                 )
                 .await
         } else if needs_review {
@@ -2347,7 +2512,7 @@ impl MetadataReidentifyService {
                     selection_mode,
                     options.scraper_id.as_deref(),
                     options.supplemental,
-                    options.image_policy,
+                    inputs,
                 )
                 .await
         } else {
@@ -2358,7 +2523,7 @@ impl MetadataReidentifyService {
                     selection_mode,
                     options.scraper_id.as_deref(),
                     options.supplemental,
-                    options.image_policy,
+                    inputs,
                 )
                 .await
         }
@@ -2702,7 +2867,8 @@ pub struct MetadataReidentifyJob {
     pub cancel_requested: bool,
     pub library_id: Option<String>,
     pub job_scope: String,
-    pub pending_count: i64,
+    /// `None` when the list was requested without pending counts; job details always fill it.
+    pub pending_count: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2901,6 +3067,8 @@ fn scraper_failure_reason(error: &ScraperError) -> &'static str {
         ScraperError::Plugin(error) => match error {
             PluginServiceError::UnknownPlugin(_) => "PLUGIN_UNKNOWN",
             PluginServiceError::Unavailable(_) => "PLUGIN_UNAVAILABLE",
+            PluginServiceError::Unsupported(_) => "PLUGIN_UNSUPPORTED",
+            PluginServiceError::InvalidRequest(_) => "PLUGIN_INVALID_REQUEST",
             PluginServiceError::InvalidConfig => "PLUGIN_CONFIG_INVALID",
             PluginServiceError::NoUpdate => "PLUGIN_NOT_READY",
             PluginServiceError::InvalidResponse => "PLUGIN_INVALID_RESPONSE",
@@ -3182,7 +3350,7 @@ fn deduplicate_item_ids_preserving_first_occurrence(item_ids: Vec<String>) -> Ve
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeMap, VecDeque},
+        collections::{BTreeMap, HashMap, VecDeque},
         error::Error,
         io::{self, Write},
         sync::{Arc, Mutex},
@@ -3516,6 +3684,66 @@ mod tests {
         Ok((temp_dir, config, database, item_id))
     }
 
+    /// Two scanned movies in one library, so a test can process one item with prefetched rows and
+    /// the other with the per-item reads it replaced, then compare the two results.
+    async fn two_movie_fixture() -> Result<(TempDir, Config, Database, Vec<String>), Box<dyn Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let root = temp_dir.path().join("Movies");
+        for (directory, file_name) in [
+            ("Example Movie (2020)", "Example.Movie.2020.mkv"),
+            ("Second Movie (2021)", "Second.Movie.2021.mkv"),
+        ] {
+            let movie_dir = root.join(directory);
+            tokio::fs::create_dir_all(&movie_dir).await?;
+            tokio::fs::write(movie_dir.join(file_name), b"fixture").await?;
+            tokio::fs::write(movie_dir.join("backdrop.jpg"), b"local backdrop").await?;
+        }
+
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        LibraryService::new(database.clone())
+            .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        sqlx::query("UPDATE libraries SET media_strategy_json = ? WHERE id = ?")
+            .bind(
+                serde_json::json!({
+                    "images": {
+                        "poster": false,
+                        "artwork": false,
+                        "banner": false,
+                        "logo": false,
+                        "thumbnail": false,
+                        "disc": false,
+                        "wallpaper": false
+                    }
+                })
+                .to_string(),
+            )
+            .bind(library.id.to_string())
+            .execute(database.pool())
+            .await?;
+        let item_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY id",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await?;
+        if item_ids.len() != 2 {
+            return Err("two-movie fixture did not scan two movies".into());
+        }
+        Ok((temp_dir, config, database, item_ids))
+    }
+
     #[tokio::test]
     async fn metadata_job_creation_validates_items_with_one_batch_read()
     -> Result<(), Box<dyn Error>> {
@@ -3560,6 +3788,517 @@ mod tests {
         Ok(())
     }
 
+    /// The real assembly passes `ScraperProvider::unconfigured()` and scrapes through the resolver,
+    /// so `FULL_REFRESH` must clear the cache owned by the resolver's `PluginService`. Clearing the
+    /// placeholder adapter alone left every cached response in place and reproduced the field
+    /// report: a full refresh kept writing the pre-config-change plugin output for up to 24 hours.
+    #[tokio::test]
+    async fn full_refresh_clears_the_resolver_provider_response_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::application::provider_cache::{CacheLookup, cache_key};
+
+        let (_temp_dir, config, database, item_id) = role_test_fixture().await?;
+        let library_id = fixture_library_id(&database, &item_id).await?;
+        let plugins = crate::application::plugins::PluginService::new_without_login_background_worker_for_test(
+            database.clone(),
+            config.config_dir.clone(),
+        );
+        let cache = plugins.provider_cache();
+        let key = cache_key(
+            "org.lux.tmdb",
+            "metadata.images",
+            &serde_json::json!({"providerId": "603", "language": "zh-CN"}),
+        )
+        .ok_or("cache key should serialize")?;
+        let CacheLookup::Owner(owner) = cache.begin(&key).await else {
+            return Err("cache key should start empty".into());
+        };
+        cache
+            .store_shared(&key, Arc::new(serde_json::json!({"images": []})), 60)
+            .await;
+        owner.finish();
+        assert!(
+            matches!(cache.begin(&key).await, CacheLookup::Hit(_)),
+            "the fixture should start with a warm response cache"
+        );
+
+        let resolver = crate::application::scraper::ScraperResolver::new(database.clone(), plugins);
+        let service = super::MetadataReidentifyService::with_resolver(
+            database,
+            super::ScraperProvider::unconfigured(),
+            resolver,
+        );
+        let job = service
+            .create_library_refresh_job(&library_id, super::MetadataRefreshMode::FullRefresh)
+            .await?;
+        tokio::time::timeout(Duration::from_secs(30), service.run(&job.id))
+            .await
+            .expect("full refresh should finish");
+
+        assert!(
+            matches!(cache.begin(&key).await, CacheLookup::Owner(_)),
+            "FULL_REFRESH must drop the responses the resolver clients cached"
+        );
+        Ok(())
+    }
+
+    /// Inserts `count` identical movies next to the fixture's scanned movie.
+    ///
+    /// The rows are byte-for-byte identical apart from their ids, so processing one of them costs
+    /// the same statements as processing any other.
+    async fn insert_identical_movies(
+        database: &Database,
+        library_id: &str,
+        count: usize,
+    ) -> Result<Vec<String>, Box<dyn Error>> {
+        let mut item_ids = Vec::with_capacity(count);
+        for index in 0..count {
+            let item_id = format!("identical-fixture-movie-{index:03}");
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'MOVIE', 'Example Movie', 'Example Movie', 'LOCAL_CONFIRMED')",
+            )
+            .bind(&item_id)
+            .bind(library_id)
+            .execute(database.pool())
+            .await?;
+            item_ids.push(item_id);
+        }
+        Ok(item_ids)
+    }
+
+    async fn fixture_library_id(
+        database: &Database,
+        item_id: &str,
+    ) -> Result<String, Box<dyn Error>> {
+        sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+            .bind(item_id)
+            .fetch_one(database.pool())
+            .await
+            .map_err(Into::into)
+    }
+
+    /// S4: one batch read per claim replaces two keyed reads per claimed item.
+    #[tokio::test]
+    async fn claim_batch_prefetch_reads_configuration_and_attempt_history_once_per_batch()
+    -> Result<(), Box<dyn Error>> {
+        const ITEM_COUNT: usize = 6;
+
+        let (_temp_dir, config, database, item_id) = role_test_fixture().await?;
+        let library_id = fixture_library_id(&database, &item_id).await?;
+        let item_ids = insert_identical_movies(&database, &library_id, ITEM_COUNT).await?;
+        for item_id in &item_ids {
+            sqlx::query(
+                "INSERT INTO metadata_capability_attempts
+                     (item_id, provider, provider_id, capability, status)
+                 VALUES (?, 'tmdb', '603', 'CREDITS', 'UNAVAILABLE')",
+            )
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+        }
+        let resolver = crate::application::scraper::ScraperResolver::new(
+            database.clone(),
+            crate::application::plugins::PluginService::new(
+                database.clone(),
+                config.config_dir.clone(),
+            ),
+        );
+        let selection = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new(database.clone())?,
+            config.config_dir.clone(),
+        );
+        let service = super::MetadataReidentifyService::with_resolver_and_selection(
+            database.clone(),
+            crate::application::scraper::ScraperProvider::unconfigured(),
+            resolver,
+            Some(selection),
+        );
+
+        // Warm the pooled connection so the counters below measure only this test's statements.
+        database.list_metadata_attempts(&item_ids[0]).await?;
+
+        // The pre-S4 shape: one configuration read and one attempt-history read per item.
+        let mut per_item_configurations = HashMap::new();
+        let mut per_item_attempts = HashMap::new();
+        database.reset_query_count();
+        for item_id in &item_ids {
+            let mut configurations = database
+                .list_item_scraper_configurations_by_ids(std::slice::from_ref(item_id))
+                .await?;
+            per_item_configurations.insert(
+                item_id.clone(),
+                configurations.remove(item_id).unwrap_or_default(),
+            );
+            per_item_attempts.insert(
+                item_id.clone(),
+                database.list_metadata_attempts(item_id).await?,
+            );
+        }
+        assert_eq!(
+            database.query_count(),
+            ITEM_COUNT * 2,
+            "the per-item path costs two keyed reads per claimed item"
+        );
+
+        database.reset_query_count();
+        let prefetch = service
+            .prefetch_claimed_items(&item_ids, super::MetadataRefreshMode::FillMissing)
+            .await;
+        assert_eq!(
+            database.query_count(),
+            2,
+            "a claim batch reads configuration and attempt history once"
+        );
+        assert_eq!(
+            prefetch.scraper_configurations.as_ref(),
+            Some(&per_item_configurations),
+            "the batch read returns the same configuration rows as the per-item reads"
+        );
+        assert_eq!(
+            prefetch.metadata_attempts.as_ref(),
+            Some(&per_item_attempts),
+            "the batch read returns the same attempt rows as the per-item reads"
+        );
+
+        database.reset_query_count();
+        for item_id in &item_ids {
+            let item_prefetch = prefetch.for_item(item_id);
+            assert_eq!(
+                item_prefetch.scraper_configuration.as_ref(),
+                per_item_configurations.get(item_id)
+            );
+            assert_eq!(
+                item_prefetch.metadata_attempts.as_ref(),
+                per_item_attempts.get(item_id)
+            );
+        }
+        assert_eq!(
+            database.query_count(),
+            0,
+            "handing an item its slice of the batch costs no statements"
+        );
+        Ok(())
+    }
+
+    /// S4: the attempt-history snapshot replaces the per-item read of the request plan and is
+    /// authoritative while the plan is computed, but never after the item's own writes.
+    #[tokio::test]
+    async fn fill_missing_plan_uses_the_prefetched_attempt_history_without_reading_it()
+    -> Result<(), Box<dyn Error>> {
+        let (_temp_dir, config, database, item_id) = role_test_fixture().await?;
+        sqlx::query(
+            "UPDATE media_items SET
+                original_title = 'Example Movie', overview = 'Existing overview',
+                production_year = 2020, premiere_date = '2020-01-01',
+                original_language = 'en',
+                provider_ids_json = ?, metadata_scraper_id = 'tmdb',
+                identification_status = 'ONLINE_CONFIRMED'
+             WHERE id = ?",
+        )
+        .bind(serde_json::json!({ "tmdb": "603" }).to_string())
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO metadata_capability_attempts
+                 (item_id, provider, provider_id, capability, status)
+             VALUES (?, 'tmdb', '603', 'CREDITS', 'UNAVAILABLE')",
+        )
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+        let current = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("fixture movie is missing")?;
+        let selection = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new(database.clone())?,
+            config.config_dir.clone(),
+        );
+
+        database.reset_query_count();
+        let live_plan = selection
+            .fill_missing_request_plan_for_current(&item_id, &current, None)
+            .await?;
+        let per_item_statements = database.query_count();
+        assert!(
+            !live_plan.requestable.needs_credits,
+            "an unavailable credits attempt suppresses the credits request: {live_plan:?}"
+        );
+
+        let history = database.list_metadata_attempts(&item_id).await?;
+        database.reset_query_count();
+        let prefetched_plan = selection
+            .fill_missing_request_plan_for_current(&item_id, &current, Some(&history))
+            .await?;
+        assert_eq!(
+            prefetched_plan, live_plan,
+            "the prefetched plan must match the plan built from the per-item read"
+        );
+        assert_eq!(
+            database.query_count(),
+            per_item_statements - 1,
+            "the prefetched history removes the attempt-history statement"
+        );
+
+        // The snapshot is authoritative, not a hint: the empty history a claim batch saw before
+        // this item's first search still requests the credits the live row suppresses.
+        database.reset_query_count();
+        let before_first_search = selection
+            .fill_missing_request_plan_for_current(
+                &item_id,
+                &current,
+                Some(&(Vec::new(), Vec::new())),
+            )
+            .await?;
+        assert!(before_first_search.requestable.needs_credits);
+        assert_eq!(
+            database.query_count(),
+            per_item_statements - 1,
+            "an empty snapshot still skips the attempt-history statement"
+        );
+        Ok(())
+    }
+
+    /// S4: the job worker resolves the claimed batch's configuration instead of re-reading the
+    /// library scrapers for every item.
+    #[tokio::test]
+    async fn process_item_uses_the_claim_batch_scraper_configuration_without_a_per_item_read()
+    -> Result<(), Box<dyn Error>> {
+        let (_temp_dir, config, database, item_ids) = two_movie_fixture().await?;
+        let resolver = crate::application::scraper::ScraperResolver::new(
+            database.clone(),
+            crate::application::plugins::PluginService::new(
+                database.clone(),
+                config.config_dir.clone(),
+            ),
+        );
+        let service = super::MetadataReidentifyService::with_resolver(
+            database.clone(),
+            crate::application::scraper::ScraperProvider::unconfigured(),
+            resolver,
+        );
+        let job = service.create_fill_missing_job(item_ids.clone()).await?;
+        assert_eq!(
+            database
+                .claim_next_metadata_reidentify_items(&job.id, item_ids.len())
+                .await?
+                .len(),
+            item_ids.len()
+        );
+        let prefetch = service
+            .prefetch_claimed_items(&item_ids, super::MetadataRefreshMode::FillMissing)
+            .await;
+
+        database.reset_query_count();
+        service
+            .process_item(
+                &job.id,
+                &item_ids[0],
+                super::MetadataRefreshMode::FillMissing,
+                None,
+                &prefetch.for_item(&item_ids[0]),
+            )
+            .await;
+        let prefetched_statements = database.query_count();
+
+        database.reset_query_count();
+        service
+            .process_item(
+                &job.id,
+                &item_ids[1],
+                super::MetadataRefreshMode::FillMissing,
+                None,
+                &super::ItemPrefetch::default(),
+            )
+            .await;
+        let per_item_statements = database.query_count();
+
+        assert_eq!(
+            per_item_statements,
+            prefetched_statements + 1,
+            "only the per-item configuration read disappeared"
+        );
+        assert_eq!(
+            metadata_job_item_rows(&database, &job.id).await?,
+            vec![
+                ("COMPLETED".to_owned(), 0_i64, None),
+                ("COMPLETED".to_owned(), 0_i64, None)
+            ],
+            "both items finish the same way without a configured scraper"
+        );
+        assert_eq!(
+            media_item_identity_rows(&database, &item_ids).await?,
+            vec![
+                (None, None, "LOCAL_CONFIRMED".to_owned()),
+                (None, None, "LOCAL_CONFIRMED".to_owned())
+            ]
+        );
+        Ok(())
+    }
+
+    /// S4: the same call site uses the batch attempt history for the pre-attempt request plan.
+    #[tokio::test]
+    async fn process_item_uses_the_claim_batch_attempt_history_without_a_per_item_read()
+    -> Result<(), Box<dyn Error>> {
+        let (_temp_dir, config, database, item_ids) = two_movie_fixture().await?;
+        for item_id in &item_ids {
+            sqlx::query(
+                "UPDATE media_items SET
+                    provider_ids_json = ?, metadata_scraper_id = 'tmdb',
+                    identification_status = 'ONLINE_CONFIRMED'
+                 WHERE id = ?",
+            )
+            .bind(serde_json::json!({ "tmdb": "603" }).to_string())
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+            sqlx::query(
+                "INSERT INTO metadata_capability_attempts
+                     (item_id, provider, provider_id, capability, status)
+                 VALUES (?, 'tmdb', '603', 'CREDITS', 'UNAVAILABLE')",
+            )
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+        }
+        let resolver = crate::application::scraper::ScraperResolver::new(
+            database.clone(),
+            crate::application::plugins::PluginService::new(
+                database.clone(),
+                config.config_dir.clone(),
+            ),
+        );
+        let selection = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new(database.clone())?,
+            config.config_dir.clone(),
+        );
+        let service = super::MetadataReidentifyService::with_resolver_and_selection(
+            database.clone(),
+            crate::application::scraper::ScraperProvider::unconfigured(),
+            resolver,
+            Some(selection),
+        );
+        let job = service.create_fill_missing_job(item_ids.clone()).await?;
+        assert_eq!(
+            database
+                .claim_next_metadata_reidentify_items(&job.id, item_ids.len())
+                .await?
+                .len(),
+            item_ids.len()
+        );
+        let prefetch = service
+            .prefetch_claimed_items(&item_ids, super::MetadataRefreshMode::FillMissing)
+            .await;
+        let prefetched_item = prefetch.for_item(&item_ids[0]);
+        assert!(
+            prefetched_item.metadata_attempts.is_some(),
+            "a fill-missing batch prefetches attempt history"
+        );
+
+        database.reset_query_count();
+        service
+            .process_item(
+                &job.id,
+                &item_ids[0],
+                super::MetadataRefreshMode::FillMissing,
+                None,
+                &prefetched_item,
+            )
+            .await;
+        let prefetched_statements = database.query_count();
+
+        database.reset_query_count();
+        service
+            .process_item(
+                &job.id,
+                &item_ids[1],
+                super::MetadataRefreshMode::FillMissing,
+                None,
+                &super::ItemPrefetch {
+                    scraper_configuration: prefetch.for_item(&item_ids[1]).scraper_configuration,
+                    metadata_attempts: None,
+                },
+            )
+            .await;
+        let per_item_statements = database.query_count();
+
+        assert_eq!(
+            per_item_statements,
+            prefetched_statements + 1,
+            "only the per-item attempt-history read disappeared"
+        );
+        assert_eq!(
+            metadata_job_item_rows(&database, &job.id).await?,
+            vec![
+                ("COMPLETED".to_owned(), 0_i64, None),
+                ("COMPLETED".to_owned(), 0_i64, None)
+            ],
+            "both items finish the same way"
+        );
+        assert_eq!(
+            media_item_identity_rows(&database, &item_ids).await?,
+            vec![
+                (
+                    Some(serde_json::json!({ "tmdb": "603" }).to_string()),
+                    Some("tmdb".to_owned()),
+                    "ONLINE_CONFIRMED".to_owned()
+                ),
+                (
+                    Some(serde_json::json!({ "tmdb": "603" }).to_string()),
+                    Some("tmdb".to_owned()),
+                    "ONLINE_CONFIRMED".to_owned()
+                )
+            ]
+        );
+        Ok(())
+    }
+
+    async fn metadata_job_item_rows(
+        database: &Database,
+        job_id: &str,
+    ) -> Result<Vec<(String, i64, Option<String>)>, Box<dyn Error>> {
+        sqlx::query_as(
+            "SELECT status, candidate_count, error
+             FROM metadata_reidentify_job_items
+             WHERE job_id = ?
+             ORDER BY item_id",
+        )
+        .bind(job_id)
+        .fetch_all(database.pool())
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn media_item_identity_rows(
+        database: &Database,
+        item_ids: &[String],
+    ) -> Result<Vec<(Option<String>, Option<String>, String)>, Box<dyn Error>> {
+        let placeholders = std::iter::repeat_n("?", item_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut statement = sqlx::query_as::<_, (Option<String>, Option<String>, String)>(
+            sqlx::AssertSqlSafe(format!(
+                "SELECT provider_ids_json, metadata_scraper_id, identification_status
+                 FROM media_items
+                 WHERE id IN ({placeholders})
+                 ORDER BY id"
+            )),
+        );
+        for item_id in item_ids {
+            statement = statement.bind(item_id);
+        }
+        statement
+            .fetch_all(database.pool())
+            .await
+            .map_err(Into::into)
+    }
+
     #[tokio::test]
     async fn fill_missing_plan_skips_attempt_history_reads_without_provider_identity()
     -> Result<(), Box<dyn Error>> {
@@ -3577,7 +4316,7 @@ mod tests {
 
         database.reset_query_count();
         let plan = selection
-            .fill_missing_request_plan_for_current(&item_id, &current)
+            .fill_missing_request_plan_for_current(&item_id, &current, None)
             .await?;
 
         assert!(plan.requestable.needs_metadata);
@@ -3672,7 +4411,7 @@ mod tests {
             .ok_or("fixture episode is missing")?;
         database.reset_query_count();
         let plan = selection
-            .fill_missing_request_plan_for_current(&item_id, &current)
+            .fill_missing_request_plan_for_current(&item_id, &current, None)
             .await?;
         assert!(
             super::metadata_request_plan_is_complete(plan.requestable),
@@ -3890,7 +4629,7 @@ mod tests {
         let primary = RoleRecordingAdapter::with_search_failure("primary", Arc::clone(&calls));
         let backup = RoleRecordingAdapter::new("backup", Arc::clone(&calls));
         let service = super::MetadataReidentifyService::new(
-            database,
+            database.clone(),
             super::ScraperProvider::from_adapter(primary.clone()),
         );
         let scrapers = vec![
@@ -3906,8 +4645,18 @@ mod tests {
             },
         ];
 
+        let current = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("item metadata missing")?;
         let page = service
-            .search_item_candidates_with_scrapers(&item_id, "Example Movie", Some(2020), &scrapers)
+            .search_item_candidates_with_scrapers(
+                &item_id,
+                "Example Movie",
+                Some(2020),
+                &scrapers,
+                &current,
+            )
             .await?;
 
         assert!(page.items.iter().any(|item| item.provider == "backup"));
@@ -4008,6 +4757,119 @@ mod tests {
             .filter(|call| call.starts_with("backup:"))
             .collect::<Vec<_>>();
         assert_eq!(backup_calls, ["backup:search", "backup:images"]);
+        Ok(())
+    }
+
+    /// S2: a backup attempt that misses before selection writes nothing, so the next backup reuses
+    /// the snapshot instead of re-reading the same item row.
+    #[tokio::test]
+    async fn backup_attempts_reuse_the_item_snapshot_until_an_attempt_can_write()
+    -> Result<(), Box<dyn Error>> {
+        let (_temp_dir, config, database, item_id) = role_test_fixture().await?;
+        sqlx::query(
+            "UPDATE media_items SET
+                original_title = 'Example Movie', overview = 'Existing overview',
+                production_year = 2020, premiere_date = '2020-01-01',
+                original_language = 'en', rating = 8.0,
+                provider_ids_json = ?, metadata_scraper_id = 'primary',
+                identification_status = 'ONLINE_CONFIRMED'
+             WHERE id = ?",
+        )
+        .bind(serde_json::json!({ "primary": "primary-1", "imdb": "tt-example" }).to_string())
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let primary = RoleRecordingAdapter::with_get_failure("primary", Arc::clone(&calls));
+        let first_backup =
+            RoleRecordingAdapter::with_match("backup-one", Arc::clone(&calls), false);
+        let second_backup =
+            RoleRecordingAdapter::with_match("backup-two", Arc::clone(&calls), false);
+        let service = super::MetadataReidentifyService::with_selection(
+            database.clone(),
+            super::ScraperProvider::from_adapter(primary.clone()),
+            Some(MetadataSelectionService::with_config_dir(
+                database.clone(),
+                ImageWriteService::new(database.clone())?,
+                config.config_dir,
+            )),
+        );
+        let item = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("fixture movie is missing")?;
+        let scrapers = vec![
+            super::ResolvedScraper {
+                scraper_id: "primary".to_owned(),
+                role: LibraryScraperRole::Primary,
+                provider: super::ScraperProvider::from_adapter(primary),
+            },
+            super::ResolvedScraper {
+                scraper_id: "backup-one".to_owned(),
+                role: LibraryScraperRole::Backup,
+                provider: super::ScraperProvider::from_adapter(first_backup),
+            },
+            super::ResolvedScraper {
+                scraper_id: "backup-two".to_owned(),
+                role: LibraryScraperRole::Backup,
+                provider: super::ScraperProvider::from_adapter(second_backup),
+            },
+        ];
+        let before = media_item_identity_rows(&database, std::slice::from_ref(&item_id)).await?;
+
+        database.reset_query_count();
+        let outcome = service
+            .refresh_with_scraper_roles(
+                "metadata-test-job",
+                &item_id,
+                &item,
+                super::MetadataRefreshMode::FullRefresh,
+                &scrapers,
+                None,
+            )
+            .await?;
+        let statements = database.query_count();
+
+        assert!(
+            matches!(outcome, super::RefreshItemOutcome::Confirmed(0)),
+            "outcome: {}",
+            match outcome {
+                super::RefreshItemOutcome::Confirmed(count) => format!("confirmed {count}"),
+                super::RefreshItemOutcome::NeedsReview(count) => format!("review {count}"),
+            }
+        );
+        let calls = calls
+            .lock()
+            .expect("role scraper call list should not be poisoned")
+            .clone();
+        let providers = calls
+            .iter()
+            .map(|call| call.split(':').next().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            providers,
+            [
+                "primary",
+                "backup-one",
+                "backup-one",
+                "backup-two",
+                "backup-two"
+            ],
+            "the fallback loop tries each backup once, in order"
+        );
+        assert_eq!(
+            media_item_identity_rows(&database, std::slice::from_ref(&item_id)).await?,
+            before,
+            "a pre-selection miss must not rewrite the item row"
+        );
+        // Before the snapshot was reused the same loop cost 17 statements: the second backup
+        // re-read the item row it was about to plan against (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md`
+        // S2). One item read remains for the first backup, which runs after the primary attempts.
+        assert_eq!(
+            statements, 16,
+            "one fallback-loop statement is the item read; the second backup reuses it"
+        );
         Ok(())
     }
 

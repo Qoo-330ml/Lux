@@ -126,6 +126,7 @@ pub(crate) const MEDIA_ITEM_CHILD_DELETES: &[(&str, &str, DeletionParent)] = &[
         "item_id",
         DeletionParent::MediaItems,
     ),
+    ("media_item_facets", "item_id", DeletionParent::MediaItems),
     (
         "media_content_restriction_index_queue",
         "item_id",
@@ -922,6 +923,9 @@ impl Database {
             .map_err(self.sqlx_err())?;
         }
         transaction.commit().await.map_err(self.sqlx_err())?;
+        // Deleting a library batch cascades into the catalog/search outboxes and can remove the
+        // collection references the global collection sync watches.
+        self.signal_outbox_consumers_if_changed(deleted);
         Ok(Some(deleted))
     }
 

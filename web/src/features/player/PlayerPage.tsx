@@ -6,15 +6,17 @@ import {
   useRef,
   useState,
 } from "react";
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { ApiError } from "../../lib/api/client";
 import { imageUrl, mediaTitle } from "../home/media";
 import { usePlayerPlaybackControls } from "./usePlayerPlaybackControls";
+import { usePlayerTitleLogo } from "./usePlayerTitleLogo";
 import { usePlayerTimelineScrubber } from "./usePlayerTimelineScrubber";
 import { usePlayerKeyboardShortcuts } from "./usePlayerKeyboardShortcuts";
-import { usePlayerScreenshot } from "./usePlayerScreenshot";
 import { usePlayerInfoPanel } from "./usePlayerInfoPanel";
 import { usePlayerPlaybackSession } from "./usePlayerPlaybackSession";
+import { useAudioTrackSwitch } from "./useAudioTrackSwitch";
+import { useQualitySwitch } from "./useQualitySwitch";
 import { usePlayerVideoElement } from "./usePlayerVideoElement";
 import { usePlayerNavigation } from "./usePlayerNavigation";
 import { usePlaybackSessionGate } from "./usePlaybackSessionGate";
@@ -29,10 +31,13 @@ import {
 import { canUseRemoteMkvCaptionSidecar, isRemoteHttpStrmSource } from "./playback-selection";
 import { LuxPlayerRuntime } from "./core/player-runtime";
 import { PlayerControls } from "./components/player-controls";
-import { PlayerSettingsPanel } from "./components/player-settings-panel";
-import { PlayerInfoPanel } from "./components/player-info-panel";
+import { PlayerSettingsPanel, type PlayerSettingsTab } from "./components/player-settings-panel";
+import { PlayerSubtitleMenu } from "./components/player-subtitle-menu";
+import type { TrackMenu } from "./components/player-controls";
+import { PlayerAudioTrackSelector } from "./components/player-audio-track-selector";
+import { shouldShowAudioTrackSelector } from "./audio-track-selection";
+import { PlayerShortcutHelp } from "./components/player-shortcut-help";
 import { playerInfoCopyText } from "./player-stats";
-import type { PlayerSettingsSourceOption } from "./components/player-settings-panel";
 import { PlayerErrorState, PlayerLoadingState } from "./components/player-state";
 import { LuxPlayer } from "./components/lux-player";
 import { PlayerTopBar } from "./components/player-top-bar";
@@ -43,30 +48,40 @@ import type {
 } from "./components/player-presentation";
 import { PlayerCaptionOverlay } from "./components/player-caption-overlay";
 import { PlayerDanmakuOverlay } from "./components/player-danmaku-overlay";
+import { useDanmakuSettings } from "./danmaku/useDanmakuSettings";
 import { usePlayerAirPlay } from "./components/player-airplay";
 import { PlayerMiniProgressBar } from "./components/player-mini-progress";
+import { PlayerAutoNextCard } from "./components/player-auto-next-card";
 import { normalizePlayerChapters } from "./player-chapters";
+import { creditsSkipAction, creditsStartSeconds } from "./player-autoplay";
+import { requestsAutoStartPlayback } from "./player-autostart";
 import {
   classifyPlayerEngineFailure,
   playerFailure,
   type PlayerFailure,
 } from "./components/player-diagnostics";
+import { playbackNoticeFor, playbackNoticeSummary } from "./playback-notices";
+import type { ClientDecodeFallbackReason, PlaybackFallbackOptions } from "./client-decode-fallback";
 import { usePlayerPlatform } from "./components/player-platform";
 import { usePlaybackReporting } from "./usePlaybackReporting";
 import { useCaptionSelection } from "./useCaptionSelection";
 import { useRuntimeCaptionReader } from "./useRuntimeCaptionReader";
 import { usePlaybackRuntime } from "./usePlaybackRuntime";
+import { useAutoPlayNextPreference } from "./useAutoPlayNextPreference";
+import { useAutoPlayNext } from "./useAutoPlayNext";
 import {
   getSubtitleInfo,
   isMatroskaSource,
 } from "./player-page-helpers";
 
-const PLAYBACK_SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+// Order matters: the control-bar speed button cycles through these in turn.
+const PLAYBACK_SPEEDS = [1.0, 1.25, 1.5, 2.0, 0.75];
 
 export function PlayerPage() {
   const { itemId = "" } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
+  const location = useLocation();
 
   const [playing, setPlaying] = useState(false);
   const [playbackAttempt, setPlaybackAttempt] = useState(0);
@@ -76,6 +91,9 @@ export function PlayerPage() {
   const [fallbackLoading, setFallbackLoading] = useState(false);
   const [fallbackSpeedX, setFallbackSpeedX] = useState<number | null>(null);
   const [clientEngineActive, setClientEngineActive] = useState(false);
+  const [clientDecodeFallback, setClientDecodeFallback] = useState<ClientDecodeFallbackReason | null>(null);
+  // Set when the native element decoded no audio frame: the fallback session must re-encode audio.
+  const [forceAudioTranscode, setForceAudioTranscode] = useState(false);
 
   // Playback control states
   const [currentTime, setCurrentTime] = useState(0);
@@ -85,19 +103,64 @@ export function PlayerPage() {
   const [aspectRatio, setAspectRatio] = useState<PlayerAspectRatio>("default");
   const [flip, setFlip] = useState<PlayerFlip>("normal");
   const [showSettings, setShowSettings] = useState(false);
-  const [showInfo, setShowInfo] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<PlayerSettingsTab>("quality");
+  // Playback information is the settings drawer's 播放信息 tab, so "info is open" is derived from it.
+  const showInfo = showSettings && settingsTab === "info";
+  const setShowInfo = useCallback((value: boolean | ((visible: boolean) => boolean)) => {
+    const next = typeof value === "function" ? value(showInfo) : value;
+    if (next) {
+      setSettingsTab("info");
+      setShowSettings(true);
+    } else if (showInfo) {
+      setShowSettings(false);
+    }
+  }, [showInfo]);
+  const [trackMenu, setTrackMenu] = useState<TrackMenu | null>(null);
+  // A pointer press outside the settings panel closes it. The settings button toggles it itself, and
+  // LuxSelect renders its option list into document.body, so both count as inside.
+  useEffect(() => {
+    if (!showSettings) return undefined;
+    const closeOnOutside = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      if (target.closest('.lux-player-settings-drawer, .lux-select-menu, button[aria-label="播放器设置"]')) return;
+      setShowSettings(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutside);
+    return () => document.removeEventListener("pointerdown", closeOnOutside);
+  }, [showSettings]);
+  const [showShortcutHelp, setShowShortcutHelp] = useState(false);
   const [isRemainingTime, setIsRemainingTime] = useState(false);
   const [isPointerInteracting, setIsPointerInteracting] = useState(false);
   const [danmuVisible, setDanmuVisible] = useState(true);
+  // Browser-local danmaku preferences (opacity, scale, area, blocks, keywords, offset). The overlay
+  // applies them live and the settings panel edits the same store; nothing is uploaded.
+  const {
+    settings: danmakuSettings,
+    updateSettings: updateDanmakuSettings,
+    resetSettings: resetDanmakuSettings,
+  } = useDanmakuSettings();
+  // Danmaku load outcome (“加载失败” / “已截断” / “内容为空”), shown next to the player like the
+  // caption status; the overlay clears it whenever it starts a new load or is hidden.
+  const [danmakuStatus, setDanmakuStatus] = useState<string | null>(null);
   const [airPlayVideo, setAirPlayVideo] = useState<HTMLVideoElement | null>(null);
   const currentTimeRef = useRef(0);
   const durationRef = useRef(0);
   const bufferedEndRef = useRef(0);
   const engineRef = useRef<PlaybackEngine | null>(null);
 
+  // The automatic episode jumps carry a one-shot marker. It is stripped right
+  // after mount so a refresh or a later source switch cannot replay it.
+  const autoStartPlayback = requestsAutoStartPlayback(location.state);
+  useEffect(() => {
+    if (!autoStartPlayback) return;
+    navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
+  }, [autoStartPlayback, location.pathname, location.search, navigate]);
+
   const requestedSourceId = searchParams.get("sourceId");
   const requestedAudioStreamIndex = searchParams.get("audioStreamIndex");
   const requestedSubtitleStreamIndex = searchParams.get("subtitleStreamIndex");
+  const requestedMaxHeight = searchParams.get("maxHeight");
   const {
     playbackBootstrap,
     item,
@@ -120,9 +183,12 @@ export function PlayerPage() {
     requestedSourceId,
     requestedAudioStreamIndex,
     requestedSubtitleStreamIndex,
+    requestedMaxHeight,
     playbackAttempt,
+    forceAudioTranscode,
   });
 
+  const sessionFailed = Boolean(playbackBootstrap.error || webPlaybackSession.error);
   const nativeCaptionTracksSupported = typeof HTMLTrackElement !== "undefined";
   const {
     controlsVisible,
@@ -183,6 +249,7 @@ export function PlayerPage() {
     && canUseRemoteMkvCaptionSidecar(source)
     && Boolean(clientMkvSourceUrl);
   const poster = media ? imageUrl(media, "fanart") ?? imageUrl(media) : null;
+  const titleLogoUrl = usePlayerTitleLogo(media);
   const chapterTimeline = useMemo(
     () => normalizePlayerChapters(source?.chapters, duration),
     [duration, source?.chapters],
@@ -190,6 +257,10 @@ export function PlayerPage() {
   const activeIntroRange = chapterTimeline.introRanges.find(
     (range) => currentTime >= range.start && currentTime < range.end,
   ) ?? null;
+  const creditsStart = useMemo(
+    () => creditsStartSeconds(chapterTimeline.segments),
+    [chapterTimeline.segments],
+  );
 
   const playerContainerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -218,7 +289,6 @@ export function PlayerPage() {
     isMuted,
     playbackRate,
     isFullscreen,
-    centerSplash,
     togglePlayPause,
     seekTo,
     seekRelative,
@@ -254,6 +324,89 @@ export function PlayerPage() {
     resetControlsTimeout,
   });
 
+  const {
+    audioTracks,
+    selectedAudioStreamIndex,
+    switching: switchingAudioTrack,
+    notice: audioTrackNotice,
+    switchAudioTrack,
+  } = useAudioTrackSwitch({
+    itemId,
+    playbackKey,
+    source,
+    requestedAudioStreamIndex,
+    playbackPlan,
+    searchParams,
+    setSearchParams,
+    streamUrl,
+    playing,
+    playbackRate,
+    sessionFailed: sessionFailed || playbackPlan?.type === "UNSUPPORTED",
+    videoRef,
+    reportPlayback,
+    resetControlsTimeout,
+  });
+  const {
+    options: qualityOptions,
+    selectedValue: selectedQualityValue,
+    status: qualityStatus,
+    switching: switchingQuality,
+    notice: qualityNotice,
+    switchQuality,
+  } = useQualitySwitch({
+    itemId,
+    playbackKey,
+    source,
+    requestedMaxHeight,
+    playbackResolution: playbackSession?.resolution,
+    searchParams,
+    setSearchParams,
+    streamUrl,
+    playing,
+    playbackRate,
+    sessionFailed: sessionFailed || playbackPlan?.type === "UNSUPPORTED",
+    videoRef,
+    reportPlayback,
+    resetControlsTimeout,
+  });
+  // Both selectors rebuild the session, so each is locked while either switch
+  // is in flight; otherwise the two URL rewrites could drop one another.
+  const switchingSession = switchingAudioTrack || switchingQuality;
+
+  const nextEpisodeId = episodeNavigation?.nextEpisodeId ?? null;
+  const { autoPlayEnabled, setAutoPlayEnabled } = useAutoPlayNextPreference();
+  const { handleBack, navigateToEpisode } = usePlayerNavigation({
+    itemId,
+    navigate: (to, options) => navigate(to as never, options as never),
+    setShowSettings,
+  });
+  const {
+    countdown: autoPlayNextCountdown,
+    handleEnded: handlePlaybackEnded,
+    playNow: playNextEpisodeNow,
+    cancel: cancelAutoPlayNext,
+    interrupt: interruptAutoPlayNext,
+  } = useAutoPlayNext({
+    playbackKey,
+    nextEpisodeId,
+    enabled: autoPlayEnabled,
+    onNavigateNextEpisode: (episodeId) => navigateToEpisode(episodeId, { autoStart: true }),
+  });
+
+  const handleSkipCredits = useCallback(() => {
+    const action = creditsSkipAction({
+      creditsStart,
+      duration,
+      hasNextEpisode: Boolean(nextEpisodeId),
+    });
+    if (!action) return;
+    if (action.kind === "next-episode") {
+      if (nextEpisodeId) navigateToEpisode(nextEpisodeId, { autoStart: true });
+      return;
+    }
+    seekTo(action.seconds);
+  }, [creditsStart, duration, navigateToEpisode, nextEpisodeId, seekTo]);
+
   const { infoGroups } = usePlayerInfoPanel({
     playbackSessionId,
     showInfo,
@@ -286,9 +439,11 @@ export function PlayerPage() {
     setShowInfo,
     setShowSettings,
     navigate: (to) => navigate(to as never),
+    shortcutHelpOpen: showShortcutHelp,
+    setShortcutHelpOpen: setShowShortcutHelp,
   });
 
-  const setVideoRef = usePlayerVideoElement({
+  const { setVideoRef, videoElement } = usePlayerVideoElement({
     videoRef,
     lastVideoRef,
     engineRef,
@@ -297,18 +452,32 @@ export function PlayerPage() {
     setNativeCaptionTracks,
   });
 
-  const requestServerFallback = useCallback(async (reason?: unknown) => {
+  /**
+   * Reacts to a failed Direct Play attempt. Returns true only when this same
+   * episode is reloaded (next candidate, or the server fallback session); every
+   * terminal path shows the failure instead and returns false, so callers can drop
+   * state that must not leak into a later session.
+   */
+  const requestServerFallback = useCallback(async (
+    reason?: unknown,
+    clientDecodeFallbackReason?: ClientDecodeFallbackReason,
+    options?: PlaybackFallbackOptions,
+  ): Promise<boolean> => {
+    if (clientDecodeFallbackReason) setClientDecodeFallback(clientDecodeFallbackReason);
+    // A silent native audio track is not a container/codec guess any more: the retry must re-encode
+    // the audio track even when the browser claims to decode it.
+    if (options?.forceAudioTranscode) setForceAudioTranscode(true);
     if (playbackPlan?.type === "DIRECT" && hasNextCandidate) {
       if (candidate && candidate.kind === rememberedCandidate()) clearRememberedCandidate();
       setCandidateOffset((offset) => offset + 1);
       setFailedStreamUrl(null);
       setPlaybackFailure(null);
-      return;
+      return true;
     }
     if (remoteHttpSource) {
       setFailedStreamUrl(streamUrl || null);
       setPlaybackFailure(classifyPlayerEngineFailure(reason));
-      return;
+      return false;
     }
     if (
       playbackAttempt !== 0 ||
@@ -317,13 +486,13 @@ export function PlayerPage() {
     ) {
       setFailedStreamUrl(streamUrl || null);
       setPlaybackFailure(classifyPlayerEngineFailure(reason));
-      return;
+      return false;
     }
     fallbackRequestedRef.current = true;
     const sessionId = playbackSessionIdRef.current;
     const fallbackGeneration = fallbackGenerationRef.current;
     if (sessionId) await stopActiveSession(sessionId);
-    if (fallbackGeneration !== fallbackGenerationRef.current) return;
+    if (fallbackGeneration !== fallbackGenerationRef.current) return false;
     if (playbackSessionIdRef.current === sessionId) {
       playbackSessionIdRef.current = null;
       resetSequence();
@@ -331,6 +500,7 @@ export function PlayerPage() {
     setPlaybackFailure(null);
     setFailedStreamUrl(null);
     setPlaybackAttempt(1);
+    return true;
   }, [candidate, hasNextCandidate, playbackAttempt, playbackPlan?.type, remoteHttpSource, resetSequence, stopActiveSession, streamUrl]);
 
   useEffect(() => {
@@ -345,13 +515,15 @@ export function PlayerPage() {
     setFallbackLoading(false);
     setClientEngineActive(false);
     setFallbackSpeedX(null);
+    setClientDecodeFallback(null);
+    setForceAudioTranscode(false);
     currentTimeRef.current = 0;
     durationRef.current = 0;
     bufferedEndRef.current = 0;
     setCurrentTime(0);
     setDuration(0);
     setBufferedEnd(0);
-  }, [itemId, requestedAudioStreamIndex, requestedSourceId]);
+  }, [itemId, requestedAudioStreamIndex, requestedMaxHeight, requestedSourceId]);
 
   usePlaybackSessionGate({
     playbackKey,
@@ -378,6 +550,7 @@ export function PlayerPage() {
     playbackDataRef,
     hasRestoredPositionRef,
     videoRef,
+    videoElement,
     engineRef,
     runtimeRef,
     currentTimeRef,
@@ -388,7 +561,10 @@ export function PlayerPage() {
     reportPlayback,
     stopActiveSession,
     markStarted,
-    requestServerFallback: requestServerFallback as (reason?: unknown) => Promise<void>,
+    onPlaybackEnded: handlePlaybackEnded,
+    onPlaybackInterrupted: interruptAutoPlayNext,
+    autoStartPlayback,
+    requestServerFallback,
     setCurrentTime,
     setDuration,
     setBufferedEnd,
@@ -443,13 +619,6 @@ export function PlayerPage() {
     clearCues: clearRuntimeCaptionCues,
   });
 
-  const { screenshotStatus, takeScreenshot } = usePlayerScreenshot({ videoRef, media });
-
-  const { handleBack, navigateToEpisode } = usePlayerNavigation({
-    itemId,
-    navigate: (to) => navigate(to as never),
-    setShowSettings,
-  });
 
   if (playbackBootstrap.isPending || (useLegacyPlaybackQueries && item.isPending)) {
     return <PlayerLoadingState message="正在准备播放器…" />;
@@ -476,32 +645,48 @@ export function PlayerPage() {
   }
 
   if (useLegacyPlaybackQueries && webPlaybackSession.error) {
-    const sessionFailure = webPlaybackSession.error instanceof ApiError
-      && [401, 403, 410].includes(webPlaybackSession.error.status)
-      ? classifyPlayerEngineFailure(webPlaybackSession.error, webPlaybackSession.error.status)
-      : playerFailure("SERVER_PLAN_FAILED");
+    // A rejected session is a blocking notice too: the same reason copy explains a 403 policy
+    // denial or a 502 transcode-slot exhaustion here and inside the player surface.
+    const sessionError = webPlaybackSession.error;
+    const sessionNotice = sessionError instanceof ApiError
+      ? playbackNoticeFor({ status: sessionError.status, errorCode: sessionError.code })
+      : null;
+    // Every status this page can name (401/403/404/410/502/503/400) already produces a notice, so
+    // an unknown rejection is the only case that still needs the generic plan-failure copy.
+    const sessionFailure = sessionNotice ? null : playerFailure("SERVER_PLAN_FAILED");
     return (
       <PlayerErrorState
-        title={sessionFailure.title}
-        message={sessionFailure.message}
+        title={sessionNotice?.title ?? sessionFailure?.title ?? ""}
+        message={sessionNotice ? playbackNoticeSummary(sessionNotice) : sessionFailure?.message ?? ""}
         onBack={handleBack}
+        onRetry={() => window.location.reload()}
       />
     );
   }
 
   const subtitleInfo = getSubtitleInfo(media);
-  const planFailure = playbackPlan?.type === "UNSUPPORTED"
-    ? playerFailure("BROWSER_UNSUPPORTED")
-    : null;
-  const surfaceFailure = playbackFailure
-    ?? planFailure
-    ?? (!streamUrl ? playerFailure("SERVER_PLAN_FAILED") : null);
-  const sourceOptions: PlayerSettingsSourceOption[] = (media.mediaSources ?? []).map((entry, index) => ({
-    id: entry.id,
-    label: entry.qualityLabel || `版本 ${index + 1}`,
-    detail: entry.sourceKind === "STRM_URL" ? "STRM" : entry.container || "直链",
-  }));
-
+  // A failed bootstrap or session only describes the current playback when no plan won; otherwise
+  // a recovered second request would show a stale failure over a playable stream.
+  const sessionError = playbackPlan ? null : playbackBootstrap.error ?? webPlaybackSession.error;
+  // One mapping for the plan, its UNSUPPORTED reason, the transcode tier and a rejected session;
+  // a track/quality switch clears the plan on purpose, so it must not flash a notice.
+  const playbackNotice = switchingSession
+    ? null
+    : playbackNoticeFor({
+      planType: playbackPlan?.type ?? null,
+      reason: playbackPlan?.type === "UNSUPPORTED" ? playbackPlan.reason : null,
+      tier: playbackSession?.tier ?? null,
+      status: sessionError instanceof ApiError ? sessionError.status : null,
+      errorCode: sessionError instanceof ApiError ? sessionError.code : null,
+      degraded: playbackAttempt !== 0,
+      clientDecodeFallback,
+    });
+  // A track switch intentionally clears the session plan while the replacement
+  // session starts; keep the existing surface mounted without a failure layer.
+  const surfaceFailure = switchingSession
+    ? null
+    : playbackFailure
+      ?? (!streamUrl && !playbackNotice?.blocking ? playerFailure("SERVER_PLAN_FAILED") : null);
   return (
     <LuxPlayer
       containerRef={playerContainerRef}
@@ -517,6 +702,7 @@ export function PlayerPage() {
     >
       <PlayerVideoSurface
         streamUrl={streamUrl}
+        keepVideoMounted={switchingSession}
         deferNativeSource={isMatroskaSource(source) && !remoteHttpSource}
         corsEnabled={source?.sourceKind !== "STRM_URL"}
         poster={poster}
@@ -544,7 +730,6 @@ export function PlayerPage() {
           onActivity: resetControlsTimeout,
           onInteractionChange: setIsPointerInteracting,
         }}
-        centerSplash={centerSplash}
         fallbackLoading={fallbackLoading}
         fallbackSpeedX={fallbackSpeedX}
         captionTrack={captionTrack}
@@ -558,7 +743,9 @@ export function PlayerPage() {
         onCaptionTrackError={() => setCaptionStatus("字幕加载失败")}
         errorMessage={null}
         failure={surfaceFailure}
-        showError={failedStreamUrl === streamUrl || !streamUrl}
+        notice={playbackNotice}
+        noticeLifecycleKey={playbackKey}
+        showError={!switchingSession && (failedStreamUrl === streamUrl || !streamUrl)}
         onRetry={() => window.location.reload()}
         onBack={handleBack}
       />
@@ -578,7 +765,13 @@ export function PlayerPage() {
         currentTime={currentTime}
         playbackRate={playbackRate}
         lifecycleKey={playbackKey}
+        playing={playing}
+        settings={danmakuSettings}
+        onStatusChange={setDanmakuStatus}
       />
+      {danmakuStatus ? (
+        <p className="lux-player-danmaku-status" role="status">{danmakuStatus}</p>
+      ) : null}
       <PlayerMiniProgressBar
         controlsVisible={controlsVisible}
         currentTime={currentTime}
@@ -592,6 +785,7 @@ export function PlayerPage() {
 
       <PlayerTopBar
         title={mediaTitle(media)}
+        logoUrl={titleLogoUrl}
         subtitle={subtitleInfo}
         onBack={handleBack}
         airPlayAvailable={airPlay.available}
@@ -602,12 +796,18 @@ export function PlayerPage() {
 
       {showSettings ? (
         <PlayerSettingsPanel
-          playbackRates={PLAYBACK_SPEEDS}
-          playbackRate={playbackRate}
-          onChangeRate={changePlaybackRate}
-          sources={sourceOptions}
-          selectedSourceId={source?.id ?? ""}
-          onSourceChange={(sourceId) => setSearchParams({ sourceId })}
+          tab={settingsTab}
+          onTabChange={setSettingsTab}
+          info={{ groups: infoGroups, copyText: playerInfoCopyText(infoGroups) }}
+          quality={{
+            options: qualityOptions,
+            selectedValue: selectedQualityValue,
+            switching: switchingQuality,
+            disabled: switchingAudioTrack,
+            notice: qualityNotice,
+            status: qualityStatus,
+            onSelect: switchQuality,
+          }}
           presentation={{
             loop: loopPlayback,
             aspectRatio,
@@ -616,28 +816,29 @@ export function PlayerPage() {
             onChangeAspectRatio: setAspectRatio,
             onChangeFlip: setFlip,
           }}
-          captions={captionOptions}
-          selectedCaptionId={captionSourceId === source?.id ? selectedCaptionId : null}
-          captionStatus={captionStatus}
-          onSelectCaption={selectCaption}
-          captionOffset={captionOffset}
-          onChangeCaptionOffset={changeCaptionOffset}
+          autoPlay={{
+            enabled: autoPlayEnabled,
+            onToggle: () => setAutoPlayEnabled(!autoPlayEnabled),
+          }}
+          danmaku={{
+            settings: danmakuSettings,
+            onChange: updateDanmakuSettings,
+            onReset: resetDanmakuSettings,
+          }}
           onClose={() => setShowSettings(false)}
         />
       ) : null}
 
-      {showInfo ? (
-        <PlayerInfoPanel
-          groups={infoGroups}
-          copyText={playerInfoCopyText(infoGroups)}
-          onClose={() => setShowInfo(false)}
-        />
+      {showShortcutHelp ? (
+        <PlayerShortcutHelp onClose={() => setShowShortcutHelp(false)} />
       ) : null}
 
-      {screenshotStatus ? (
-        <div className="lux-player-screenshot-status" role="status">
-          {screenshotStatus}
-        </div>
+      {autoPlayNextCountdown ? (
+        <PlayerAutoNextCard
+          secondsLeft={autoPlayNextCountdown.secondsLeft}
+          onPlayNow={playNextEpisodeNow}
+          onCancel={cancelAutoPlayNext}
+        />
       ) : null}
 
       <PlayerControls
@@ -648,14 +849,41 @@ export function PlayerPage() {
         volume={volume}
         muted={isMuted}
         fullscreen={isFullscreen}
-        pictureInPictureEnabled={Boolean(document.pictureInPictureEnabled)}
         danmuVisible={danmuVisible}
         episodeNavigation={episodeNavigation}
         airPlayAvailable={airPlay.available}
         chapters={chapterTimeline.segments}
         introSkip={activeIntroRange}
+        creditsStart={creditsStart}
+        hasNextEpisode={Boolean(nextEpisodeId)}
         settingsOpen={showSettings}
-        infoOpen={showInfo}
+        trackMenu={trackMenu}
+        onTrackMenuChange={setTrackMenu}
+        subtitleMenu={(
+          <PlayerSubtitleMenu
+            captions={captionOptions}
+            selectedCaptionId={captionSourceId === source?.id ? selectedCaptionId : null}
+            captionStatus={captionStatus}
+            onSelectCaption={selectCaption}
+            captionOffset={captionOffset}
+            onChangeCaptionOffset={changeCaptionOffset}
+          />
+        )}
+        subtitleActive={captionSourceId === source?.id && selectedCaptionId !== null}
+        audioMenu={shouldShowAudioTrackSelector(audioTracks) ? (
+          <PlayerAudioTrackSelector
+            tracks={audioTracks}
+            selectedIndex={selectedAudioStreamIndex}
+            switching={switchingAudioTrack}
+            disabled={switchingQuality}
+            notice={audioTrackNotice}
+            onSelect={switchAudioTrack}
+          />
+        ) : undefined}
+        playbackRate={playbackRate}
+        playbackRates={PLAYBACK_SPEEDS}
+        onChangeRate={changePlaybackRate}
+        onSeekBy={(delta) => seekTo(currentTime + delta)}
         remainingTime={isRemainingTime}
         hoverTime={hoverTime}
         hoverPercent={hoverPercent}
@@ -679,11 +907,10 @@ export function PlayerPage() {
         onAirPlay={airPlay.showPicker}
         onChapterSeek={seekTo}
         onSkipIntro={seekTo}
-        onTakeScreenshot={takeScreenshot}
+        onSkipCredits={handleSkipCredits}
         onToggleSettings={() => setShowSettings((visible) => !visible)}
-        onToggleInfo={() => setShowInfo((visible) => !visible)}
-        onTogglePictureInPicture={togglePictureInPicture}
         onToggleFullscreen={toggleFullscreen}
+
       />
     </LuxPlayer>
   );

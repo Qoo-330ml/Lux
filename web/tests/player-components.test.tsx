@@ -58,7 +58,6 @@ describe("LuxPlayer state components", () => {
         onPause={() => undefined}
         onTimeUpdate={() => undefined}
         onEnded={() => undefined}
-        centerSplash="play"
         fallbackLoading
         fallbackSpeedX={0.5}
         errorMessage="客户端解码失败"
@@ -87,7 +86,6 @@ describe("LuxPlayer state components", () => {
         videoRef={() => undefined}
         onClick={() => undefined}
         onDoubleClick={() => undefined}
-        centerSplash={null}
         fallbackLoading={false}
         fallbackSpeedX={null}
         errorMessage={null}
@@ -118,7 +116,6 @@ describe("LuxPlayer state components", () => {
         onClick={() => undefined}
         onDoubleClick={() => undefined}
         presentation={{ loop: true, aspectRatio: "16:9", flip: "vertical" }}
-        centerSplash={null}
         fallbackLoading={false}
         fallbackSpeedX={null}
         errorMessage={null}
@@ -141,7 +138,6 @@ describe("LuxPlayer state components", () => {
         videoRef={() => undefined}
         onClick={() => undefined}
         onDoubleClick={() => undefined}
-        centerSplash={null}
         fallbackLoading={false}
         fallbackSpeedX={null}
         errorMessage="decoder token https://example.test/private"
@@ -157,6 +153,27 @@ describe("LuxPlayer state components", () => {
     expect(markup).not.toContain("https://example.test/private");
   });
 
+  it("points the generic surface fallback at the detail page version list", () => {
+    const markup = renderToStaticMarkup(
+      <PlayerVideoSurface
+        streamUrl="/signed/movie-1"
+        title="示例电影"
+        videoRef={() => undefined}
+        onClick={() => undefined}
+        onDoubleClick={() => undefined}
+        fallbackLoading={false}
+        fallbackSpeedX={null}
+        errorMessage={null}
+        showError
+        onRetry={() => undefined}
+        onBack={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain("请返回详情页选择其他版本");
+    expect(markup).not.toContain("请尝试其他版本");
+  });
+
   it("renders top-level media context and source selection as presentation", () => {
     const markup = renderToStaticMarkup(
       <PlayerTopBar
@@ -166,7 +183,6 @@ describe("LuxPlayer state components", () => {
         airPlayAvailable
         pictureInPictureEnabled
         onAirPlay={() => undefined}
-        onTogglePictureInPicture={() => undefined}
       />,
     );
 
@@ -178,51 +194,69 @@ describe("LuxPlayer state components", () => {
     expect(markup).toContain('aria-label="画中画"');
   });
 
-  it("keeps settings actions in a focused, keyboard-addressable panel", () => {
+  const presentation = {
+    loop: true,
+    aspectRatio: "4:3" as const,
+    flip: "horizontal" as const,
+    onToggleLoop: () => undefined,
+    onChangeAspectRatio: () => undefined,
+    onChangeFlip: () => undefined,
+  };
+
+  it("renders the settings drawer with quality, aspect ratio and playback information tabs", () => {
     const markup = renderToStaticMarkup(
-      <PlayerSettingsPanel
-        playbackRates={[0.5, 1, 1.5]}
-        playbackRate={1}
-        onChangeRate={() => undefined}
-        sources={[{ id: "source-1", label: "1080P", detail: "MP4" }]}
-        selectedSourceId="source-1"
-        onSourceChange={() => undefined}
-        captionOffset={-1.2}
-        onChangeCaptionOffset={() => undefined}
-        presentation={{
-          loop: true,
-          aspectRatio: "4:3",
-          flip: "horizontal",
-          onToggleLoop: () => undefined,
-          onChangeAspectRatio: () => undefined,
-          onChangeFlip: () => undefined,
-        }}
-        onClose={() => undefined}
-      />,
+      <PlayerSettingsPanel presentation={presentation} onClose={() => undefined} />,
     );
 
     expect(markup).toContain('role="dialog"');
     expect(markup).toContain('aria-label="播放设置"');
-    expect(markup).toContain('aria-label="选择播放版本"');
-    expect(markup).toContain("1080P (MP4)");
-    expect(markup).toContain("标准");
+    expect(markup).toContain('role="tablist"');
+    for (const label of ["画质", "长宽比", "播放信息"]) expect(markup).toContain(`>${label}</button>`);
+    expect(markup).not.toContain(">弹幕</button>");
+    // The played version is chosen on the detail page; the panel must not repeat it.
+    expect(markup).not.toContain("播放版本");
+    expect(markup).not.toContain("播放速度");
+    expect(markup).not.toContain("快捷键提示");
+    expect(markup).toContain('aria-label="关闭播放设置"');
+  });
+
+  it("shows loop and auto-play switches on the quality tab", () => {
+    const markup = renderToStaticMarkup(
+      <PlayerSettingsPanel
+        tab="quality"
+        presentation={presentation}
+        autoPlay={{ enabled: false, onToggle: () => undefined }}
+        onClose={() => undefined}
+      />,
+    );
     expect(markup).toContain("循环播放");
+    expect(markup).toContain("自动连播下一集");
     expect(markup).toContain('role="switch"');
     expect(markup).toContain('aria-checked="true"');
-    expect(markup).toContain("画面比例");
-    expect(markup).toContain("4:3");
+    expect(markup).not.toContain('id="lux-player-caption-offset"');
+  });
+
+  it("lists aspect ratios with fill and the flip choices on the aspect tab", () => {
+    const markup = renderToStaticMarkup(
+      <PlayerSettingsPanel tab="aspect" presentation={presentation} onClose={() => undefined} />,
+    );
+    expect(markup).toContain('aria-label="长宽比"');
+    for (const label of ["默认", "16:9", "4:3", "填充"]) expect(markup).toContain(label);
     expect(markup).toContain("画面翻转");
     expect(markup).toContain("水平镜像");
-    expect(markup).toContain('id="lux-player-caption-offset"');
-    expect(markup).toContain('min="-10"');
-    expect(markup).toContain('max="10"');
-    expect(markup).toContain('step="0.1"');
-    expect(markup).toContain('value="-1.2"');
-    expect(markup).toContain('aria-valuetext="-1.2s"');
-    expect(markup).toContain("正值延后，负值提前");
-    expect(markup).not.toContain("快捷键提示");
-    expect(markup).not.toContain("空格 / K");
-    expect(markup).toContain('aria-label="关闭播放设置"');
+    expect(markup).toMatch(/data-value="4:3"[^>]*>|aria-checked="true"[^>]*data-value="4:3"/);
+  });
+
+  it("shows playback information on its own tab", () => {
+    const markup = renderToStaticMarkup(
+      <PlayerSettingsPanel
+        tab="info"
+        info={{ groups: [{ title: "播放", rows: [{ label: "方式", value: "直连播放" }] }], copyText: "方式: 直连播放" }}
+        onClose={() => undefined}
+      />,
+    );
+    expect(markup).toContain('aria-label="复制播放信息"');
+    expect(markup).toContain("直连播放");
   });
 
   it("exposes a labeled keyboard timeline alongside the playback controls", () => {
@@ -239,7 +273,6 @@ describe("LuxPlayer state components", () => {
         volume={1}
         muted={false}
         fullscreen={false}
-        pictureInPictureEnabled
         danmuVisible
         chapters={chapters}
         introSkip={{ start: 0, end: 20 }}
@@ -264,7 +297,6 @@ describe("LuxPlayer state components", () => {
         onChapterSeek={() => undefined}
         onSkipIntro={() => undefined}
         onAirPlay={() => undefined}
-        onTakeScreenshot={() => undefined}
         onToggleSettings={() => undefined}
         onTogglePictureInPicture={() => undefined}
         onToggleFullscreen={() => undefined}
@@ -278,12 +310,12 @@ describe("LuxPlayer state components", () => {
     expect(markup).toContain('aria-valuemax="100"');
     const timelineRowStart = markup.indexOf('<div class="lux-player-timeline-row">');
     const controlsStart = markup.indexOf('<div class="lux-player-controls">');
-    const timeDisplayIndex = markup.indexOf('class="lux-player-time"');
+    const timeDisplayIndex = markup.indexOf('class="lux-player-timeline-times"');
     expect(timelineRowStart).toBeGreaterThanOrEqual(0);
     expect(timeDisplayIndex).toBeGreaterThan(timelineRowStart);
     expect(timeDisplayIndex).toBeLessThan(controlsStart);
-    expect(markup).toMatch(/<div class="lux-player-timeline-row"><button type="button" class="lux-player-time"/);
-    expect(markup).not.toMatch(/<div class="lux-player-controls-left">[\s\S]*lux-player-time/);
+    expect(markup).toMatch(/<div class="lux-player-timeline-row"><div class="lux-player-timeline-times"><span class="lux-player-time-current">/);
+    expect(markup).not.toMatch(/<div class="lux-player-controls-left">[\s\S]*lux-player-timeline-times/);
     const timelineRailIndex = markup.indexOf('class="lux-player-timeline-rail"');
     const chapterRailIndex = markup.indexOf('class="lux-player-chapter-rail"');
     expect(timelineRailIndex).toBeGreaterThanOrEqual(0);
@@ -301,7 +333,6 @@ describe("LuxPlayer state components", () => {
     expect(markup).toContain('data-marker-type="CREDITS_START"');
     expect(markup).toContain('aria-label="跳过片头"');
     expect(markup).not.toContain('aria-label="选择播放版本"');
-    expect(markup).toContain('aria-label="截图"');
     expect(markup).toContain('aria-label="播放器设置"');
     expect(markup).not.toContain("发送弹幕");
     expect(markup).not.toContain("热力图");

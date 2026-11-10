@@ -112,3 +112,21 @@ async fn an_existing_database_keeps_its_identity_across_restarts()
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn the_setup_placeholder_database_does_not_mark_the_directory_as_initialized()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = config_for(&temp_dir).await?;
+
+    // First start with nothing chosen: the placeholder database only exists so the wizard can run.
+    config.mark_database_selection_pending().await?;
+    Database::connect(&config).await?.close().await;
+
+    assert!(
+        !config.config_dir.join("server-state.json").exists(),
+        "a placeholder is not an initialized server, and the marker would make the database the \
+         operator picks next look like a lost one"
+    );
+    Ok(())
+}

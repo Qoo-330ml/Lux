@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
-import { act, memo } from "react";
+import { act, memo, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
 import { MediaCard } from "../src/features/home/media";
@@ -19,21 +20,27 @@ vi.mock("../src/features/home/media-card-overlay", async (importOriginal) => {
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 let root: Root | undefined;
 let container: HTMLDivElement;
-afterEach(() => { act(() => root?.unmount()); container?.remove(); overlayRenders.count = 0; vi.restoreAllMocks(); });
+let client: QueryClient;
+afterEach(() => { act(() => root?.unmount()); client?.clear(); container?.remove(); overlayRenders.count = 0; vi.restoreAllMocks(); });
 
 function mount() {
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
+  client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+}
+
+function withClient(children: ReactNode) {
+  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
 }
 
 it("skips unchanged cards on parent updates and still reflects a new item snapshot", () => {
   mount();
   let visualReads = 0;
   const item: MediaItem = { id: "movie", title: "旧标题", itemType: "MOVIE", get productionYear() { visualReads++; return 2026; } };
-  const render = (tick: number, media = item) => act(() => root?.render(
+  const render = (tick: number, media = item) => act(() => root?.render(withClient(
     <MemoryRouter><span>{tick}</span><MediaCard item={media} /></MemoryRouter>,
-  ));
+  )));
   render(0);
   const initialReads = visualReads;
   render(1);
@@ -49,7 +56,7 @@ it("keeps the visual subtree unchanged when an action notice or error changes", 
   let visualReads = 0;
   const item: MediaItem = { id: "movie", title: "电影", itemType: "MOVIE", get rating() { visualReads++; return 8.4; } };
   const refresh = vi.spyOn(api, "startItemMetadataRefresh").mockResolvedValue({ jobId: "refresh" } as never);
-  await act(async () => root?.render(<MemoryRouter><MediaCard item={item} /></MemoryRouter>));
+  await act(async () => root?.render(withClient(<MemoryRouter><MediaCard item={item} /></MemoryRouter>)));
   const initialReads = visualReads;
   const initialOverlayRenders = overlayRenders.count;
   async function triggerRefresh() {
@@ -69,10 +76,10 @@ it("keeps the visual subtree unchanged when an action notice or error changes", 
 
 it("keeps folder and read-only links and suppresses their interactive controls", () => {
   mount();
-  act(() => root?.render(<MemoryRouter>
+  act(() => root?.render(withClient(<MemoryRouter>
     <MediaCard item={{ id: "folder", title: "旅行", itemType: "FOLDER" }} folderHref="/libraries/videos?folderPath=trips" selectionMode metadataAttention />
     <MediaCard item={{ id: "collection", title: "合集", itemType: "BOX_SET", memberCount: 3 }} readOnly detailHref="/collections/collection" selectionMode />
-  </MemoryRouter>));
+  </MemoryRouter>)));
   expect(container.querySelector('a[aria-label="打开文件夹 旅行"]')?.getAttribute("href")).toBe("/libraries/videos?folderPath=trips");
   expect(container.querySelector('a[aria-label="查看 合集 详情"]')?.getAttribute("href")).toBe("/collections/collection");
   expect(container.querySelector(".lux-media-selection-checkbox")).toBeNull();
@@ -84,7 +91,7 @@ it("keeps folder and read-only links and suppresses their interactive controls",
 it("preserves landscape artwork, progress, metadata attention, and selection identity", () => {
   mount();
   const selection = vi.fn();
-  act(() => root?.render(<MemoryRouter><MediaCard item={{ id: "episode", title: "第一集", itemType: "EPISODE", productionYear: 2026, rating: 8.1, runtimeTicks: 1000, userData: { positionTicks: 250 }, imageTags: { poster: "poster-v1", thumb: "thumb-v2" } }} landscape metadataAttention selectionMode detailSearch="?metadataStatus=pending" onSelectionChange={selection} /></MemoryRouter>));
+  act(() => root?.render(withClient(<MemoryRouter><MediaCard item={{ id: "episode", title: "第一集", itemType: "EPISODE", productionYear: 2026, rating: 8.1, runtimeTicks: 1000, userData: { positionTicks: 250 }, imageTags: { poster: "poster-v1", thumb: "thumb-v2" } }} landscape metadataAttention selectionMode detailSearch="?metadataStatus=pending" onSelectionChange={selection} /></MemoryRouter>)));
   expect(container.querySelector(".lux-media-card-landscape")).not.toBeNull();
   expect(container.querySelector("img")?.getAttribute("src")).toBe("/api/v1/items/episode/images/thumb?tag=thumb-v2");
   expect(container.querySelector(".lux-progress span")?.getAttribute("style")).toContain("25%");

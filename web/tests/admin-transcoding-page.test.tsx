@@ -162,6 +162,7 @@ describe("AdminTranscodingPage", () => {
     vi.spyOn(api, "adminSettings").mockResolvedValue(SETTINGS);
     vi.spyOn(api, "adminTranscodingSessions").mockResolvedValue(SESSIONS);
     vi.spyOn(api, "adminTranscodingHistory").mockResolvedValue(HISTORY);
+    vi.spyOn(api, "item").mockRejectedValue(new Error("not found"));
   });
 
   afterEach(() => {
@@ -244,6 +245,51 @@ describe("AdminTranscodingPage", () => {
     });
     expect(stop).not.toHaveBeenCalled();
     vi.unstubAllGlobals();
+  });
+
+  it("shows the item's own poster for a movie and the series poster for an episode", async () => {
+    const base = SESSIONS.sessions[0]!;
+    vi.spyOn(api, "adminTranscodingSessions").mockResolvedValue({
+      ...SESSIONS,
+      sessions: [
+        { ...base, sessionId: "s-movie", itemId: "movie-1", title: "Movie One", itemType: "MOVIE" },
+        { ...base, sessionId: "s-ep", itemId: "episode-1", title: "Pilot", itemType: "EPISODE" },
+      ],
+    });
+    vi.mocked(api.item).mockImplementation(async (id: string) =>
+      (id === "episode-1"
+        ? { id, itemType: "EPISODE", seriesId: "series-1", seriesName: "Great Show", parentIndexNumber: 1, indexNumber: 2 }
+        : { id, itemType: "MOVIE" }) as never,
+    );
+    await render();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const posters = [...container.querySelectorAll<HTMLImageElement>(".lux-tc-poster img")].map((img) => img.getAttribute("src"));
+    expect(posters).toEqual(["/api/v1/items/movie-1/images/poster", "/api/v1/items/series-1/images/poster"]);
+    const text = container.querySelector("[aria-label='转码会话']")?.textContent ?? "";
+    expect(text).toContain("Great Show");
+    expect(text).toContain("S01E02 Pilot");
+  });
+
+  it("only calls out a tier on the live heading when it reaches its concurrency cap", async () => {
+    await render();
+    const status = container.querySelector("[aria-label='转码会话汇总']");
+    expect(status?.textContent).toContain("活动会话 1");
+    expect(status?.textContent).not.toContain("已达上限");
+
+    vi.spyOn(api, "adminTranscodingSessions").mockResolvedValue({
+      ...SESSIONS,
+      summary: { ...SESSIONS.summary, hardwareCount: 2 },
+    });
+    await act(async () => {
+      await queryClient.invalidateQueries();
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(container.querySelector("[aria-label='转码会话汇总']")?.textContent).toContain("硬件转码已达上限 2/2");
   });
 
   it("shows an empty state when nothing is transcoding", async () => {

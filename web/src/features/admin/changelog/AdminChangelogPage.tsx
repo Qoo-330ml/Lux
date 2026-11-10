@@ -12,7 +12,7 @@ export function AdminChangelogPage() {
         <div>
           <span className="lux-eyebrow">项目历史</span>
           <h1>更新日志</h1>
-          <p>记录 Lux 每一次让媒体管理更清晰、更可靠的更新。</p>
+          <p>每个版本改了什么，都记在这里。</p>
         </div>
         <div className="lux-changelog-current" aria-label={`当前版本 ${latestRelease.version}`}>
           <span>当前版本</span>

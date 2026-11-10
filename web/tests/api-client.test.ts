@@ -1403,22 +1403,25 @@ describe("LuxApiClient", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("starts item metadata refresh and library scan jobs through the admin API", async () => {
+  it("starts item metadata refresh with the requested mode and library scan jobs through the admin API", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);
       expect(init?.method).toBe("POST");
       if (path === "/api/v1/admin/items/item-1/metadata/refresh") {
-        expect(JSON.parse(String(init?.body))).toEqual({ mode: "FILL_MISSING" });
-        return new Response(JSON.stringify({ mode: "FILL_MISSING", totalCount: 1, job: { id: "metadata-job-1" } }), { status: 202 });
+        const body = JSON.parse(String(init?.body)) as { mode: string };
+        return new Response(JSON.stringify({ mode: body.mode, totalCount: 1, job: { id: "metadata-job-1" } }), { status: 202 });
       }
       expect(path).toBe("/api/v1/admin/items/item-1/scan");
       return new Response(JSON.stringify({ job: { id: "scan-job-1" } }), { status: 202 });
     });
 
     const client = new LuxApiClient();
-    await expect(client.startItemMetadataRefresh("item-1")).resolves.toEqual({ mode: "FILL_MISSING", totalCount: 1, job: { id: "metadata-job-1" } });
+    await expect(client.startItemMetadataRefresh("item-1", "FILL_MISSING")).resolves.toEqual({ mode: "FILL_MISSING", totalCount: 1, job: { id: "metadata-job-1" } });
+    await expect(client.startItemMetadataRefresh("item-1", "FULL_REFRESH")).resolves.toEqual({ mode: "FULL_REFRESH", totalCount: 1, job: { id: "metadata-job-1" } });
     await expect(client.startItemFolderScan("item-1")).resolves.toEqual({ job: { id: "scan-job-1" } });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls.slice(0, 2).map(([, init]) => JSON.parse(String(init?.body))))
+      .toEqual([{ mode: "FILL_MISSING" }, { mode: "FULL_REFRESH" }]);
   });
 
   it("starts a whole-library metadata reidentification batch", async () => {
@@ -1450,6 +1453,20 @@ describe("LuxApiClient", () => {
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
       "/api/v1/admin/metadata/reidentify?page=1&pageSize=50&status=RUNNING",
+    );
+  });
+
+  it("asks for the pending count only when the caller opts in", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ jobs: [{ id: "metadata-job-1", pendingCount: null }] }), { status: 200 }),
+    );
+
+    await expect(
+      new LuxApiClient().adminMetadataReidentifyJobs("RUNNING", { includePending: true }),
+    ).resolves.toMatchObject({ jobs: [{ id: "metadata-job-1", pendingCount: null }] });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/admin/metadata/reidentify?page=1&pageSize=50&status=RUNNING&includePending=1",
     );
   });
 
@@ -2503,6 +2520,57 @@ describe("LuxApiClient", () => {
       session: { sessionId: "session-1" },
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("forwards the maxHeight selection into session and bootstrap bodies", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return new Response(JSON.stringify({
+        item: { id: "item-1", mediaSources: [{ id: "source-1", isDefault: true }] },
+        playback: { itemId: "item-1", positionTicks: 0, isPlayed: false },
+        session: {
+          sessionId: "session-1",
+          playSessionId: "lux-web:session-1",
+          sourceId: "source-1",
+          tier: 0,
+          expiresAt: 1_900_000_000,
+          plan: { type: "DIRECT", url: "/api/v1/playback/sessions/session-1/direct" },
+        },
+      }), { status: 200 });
+    });
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+    const capabilities = {
+      directPlay: true,
+      hls: true,
+      videoCopyToFmp4: true,
+      audioCopyToFmp4: true,
+      hardwareTranscode: false,
+      softwareTranscode: true,
+    };
+
+    const client = new LuxApiClient();
+    await client.createWebPlaybackSession("item-1", "source-1", capabilities, undefined, {
+      maxHeight: 720,
+      audioStreamIndex: 2,
+    });
+    await client.createWebPlaybackBootstrap("item-1", "source-1", capabilities, undefined, {
+      maxHeight: 1080,
+    });
+
+    expect(bodies[0]).toMatchObject({
+      itemId: "item-1",
+      sourceId: "source-1",
+      maxHeight: 720,
+      audioStreamIndex: 2,
+    });
+    expect(bodies[1]).toMatchObject({ itemId: "item-1", sourceId: "source-1", maxHeight: 1080 });
+    // The legacy bitrate ceiling is no longer part of the player's request.
+    expect(bodies[0]).not.toHaveProperty("maxBitrate");
+    expect(bodies[1]).not.toHaveProperty("maxBitrate");
   });
 
   it("forwards cancellation to playback bootstrap requests", async () => {
