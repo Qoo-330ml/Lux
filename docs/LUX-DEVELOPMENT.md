@@ -21644,9 +21644,43 @@ ADR-053 重复，且 ADR-053 不建表、不加迁移。已取消，不实施。
 
 ADR-053 明确 v1 不提供评分界面。若需要，等待 ADR 增补后另立任务。
 
-#### LUX-908：Lux 条目详情返回本地文件路径
+#### LUX-908：宿主侧 ffprobe 推导 VideoRange / VideoRangeType（仅 stream 级）
 
-状态：已实施，待提交（2026-11-11，负责人确认范围并批准先更新规范）。依赖：无。验证：`library catalog::` 6/6、`strm` 42/42、`--lib application::catalog` 43/43、fmt、`clippy --all-targets --all-features -D warnings`、`build`、`cargo test --locked --all-targets` 全部通过，`check-migration-parity.py` 与 `check-backend-branches.py` 通过。
+背景：`ffprobe -show_streams` 不输出 `VideoRange`/`VideoRangeType`，宿主当前只保存 `ColorTransfer`、
+`ColorSpace`、`ColorPrimaries`。Emby 客户端依赖 `VideoRange` 显示 HDR 信息，因此由 ffprobe 的流级
+信息推导这两个字段。实测（2026-11-09，本机 ffprobe）：HDR10/HLG 的静态元数据（mastering display、
+content light level）只出现在帧级 side data，`-show_streams` 的 `side_data_list` 为空；而
+`color_transfer` 在流级稳定存在。因此 HDR10 只依据 `color_transfer`，不依赖静态元数据。
+
+范围（只改 `src/application/probe.rs` 与对应测试）：
+
+- 解析 `side_data_list`，只识别 `side_data_type == "DOVI configuration record"` 的条目。
+- 只对视频流推导；推导结果只补充缺失键（`or_insert`），不改写已有值。
+- 推导规则（优先级从上到下）：
+  - 存在杜比视界配置记录：`VideoRange = Dolby Vision`；`VideoRangeType` 按
+    `dv_bl_signal_compatibility_id` 取 `1 → DOVIWithHDR10`、`2 → DOVIWithSDR`、`4 → DOVIWithHLG`，
+    其他或缺失取 `DOVI`。
+  - `color_transfer = smpte2084`：`HDR10` / `HDR10`。
+  - `color_transfer = arib-std-b67`：`HLG` / `HLG`。
+  - `color_transfer` 为 `bt709`、`smpte170m`、`iec61966-2-1`、`bt2020-10`、`bt2020-12` 之一：`SDR` / `SDR`。
+  - 其他或缺失：不输出两个键，不猜测。
+- **不做** HDR10+ 识别：它需要逐帧读取动态元数据，本任务不引入 `-show_frames`，也不增加 ffprobe 调用。
+  PQ 流统一输出 `HDR10`。
+- 不改数据库、迁移、Emby 输出逻辑（`VideoRange` 的规范化沿用 LUX-878 词表）、插件仓库。
+
+验收：
+
+- [x] `cargo test --locked --test strm probe::` 30/30 通过，新增用例覆盖：SDR、HLG、HDR10、杜比视界（兼容 ID 1/2/4/缺失）、
+  无信号的未知 transfer 不输出、音频流不推导、`side_data_list` 为非数组或条目畸形时不 panic 并回退到 transfer 规则。
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo clippy --locked --all-targets --all-features -- -D warnings` 零警告（2026-11-09）。
+- [x] 全量 `cargo test --locked --all-targets --no-fail-fast`：库 129、各集成 target 全部通过（`api_web` 需要 `web/dist`，已 `pnpm --dir web build` 后通过）。
+- [x] `COMPATIBILITY.md` 记录推导规则与 HDR10+ 的未覆盖说明。
+- [x] 本任务不改 `Lux-plugins` 仓库中的 STRM 插件；插件侧需另立任务（它有独立的 `probe.rs` 副本）。
+
+#### LUX-909：Lux 条目详情返回本地文件路径
+
+状态：已完成（2026-11-11，提交 `c3c6b099`）。原编号 `LUX-908` 与上一节登记的 HDR 任务重号，按登记顺序改为 `LUX-909`。依赖：无。验证：`library catalog::` 6/6、`strm` 42/42、`--lib application::catalog` 43/43、fmt、`clippy --all-targets --all-features -D warnings`、`build`、`cargo test --locked --all-targets` 全部通过，`check-migration-parity.py` 与 `check-backend-branches.py` 通过。
 
 背景：Emby 兼容层已在条目 `Path` 中返回本地文件系统路径，Lux 自有条目详情仍只返回 `mediaSources[].externalUrl`
 （`.strm` 原始目标）。负责人确认 Lux 条目详情也要返回本地路径，使 Lux 客户端与 Emby 客户端对同一条目拿到一致的本地位置。
@@ -21679,7 +21713,7 @@ ADR-053 明确 v1 不提供评分界面。若需要，等待 ADR 增补后另立
 - [x] `docs/API.md` 记录字段语义与 ACL 规则。
 - [x] 相关 `cargo test --locked --test library catalog::`、`--lib` 过滤、fmt、clippy 通过。
 
-预计文件：`src/api/media.rs`、`src/application/catalog.rs`、`tests/catalog.rs`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`、`docs/TEST-TARGETS.md`。
+预计文件：`src/api/media.rs`、`src/application/catalog.rs`、`tests/library/catalog.rs`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`、`docs/TEST-TARGETS.md`。
 
 ## 31. 参考资料
 

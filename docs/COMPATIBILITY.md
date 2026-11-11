@@ -232,6 +232,12 @@ Lux 侧改动（`src/api/emby_catalog.rs`、`src/application/probe.rs`，无迁�
   `Unknown`/`und` 占位。
 - 新增流级 `Title`：优先使用探测保存的原始轨道名；旧数据回退为旧 `DisplayTitle` 基础部分；缺失时省略键。
 - `VideoRange` 规范化为 `SDR`/`HDR10`/`HDR10+`/`HLG`/`Dolby Vision`，无法识别的值保持原值。
+- `VideoRange`/`VideoRangeType`（LUX-908）：`ffprobe -show_streams` 不提供这两个键，宿主按流级数据推导，
+  只作用于视频流：存在 `DOVI configuration record` 时为 `Dolby Vision`，`VideoRangeType` 按
+  `dv_bl_signal_compatibility_id` 取 `DOVIWithHDR10`/`DOVIWithSDR`/`DOVIWithHLG`，其他取 `DOVI`；否则
+  `color_transfer` 为 `smpte2084` 取 `HDR10`、`arib-std-b67` 取 `HLG`、已知 SDR 传递函数取 `SDR`；缺失或未知时
+  不输出。HDR10+ 不做识别（需要逐帧动态元数据），PQ 流统一输出 `HDR10`。`VideoRangeType` 取值为 Emby 习惯写法，
+  尚未与真实 Emby 客户端对照，也未用真实杜比视界文件验证。
 - 语言：`chs`/`cht`/`zh-cn`/`zh-tw`/`zh-hk`/`zh-hans`/`zh-hant`/`cmn`/`yue` 输出 `Language: chi`，
   `DisplayLanguage` 区分简体、繁体与粤语；补充 `fin`、`swe`、`dan`、`gre`/`ell`、`heb`、`hun`、
   `cze`/`ces`、`rum`/`ron`、`ukr`、`nor`/`nob`、`hrv`、`may`/`msa`、`fil`、`slo`/`slk`。
