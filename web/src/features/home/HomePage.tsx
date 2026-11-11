@@ -1,7 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Info, Play } from "lucide-react";
 import { Link } from "react-router-dom";
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
@@ -17,6 +17,7 @@ import {
 } from "./carousel";
 import { useImageVariants } from "./image-variants";
 import { nextCarouselIndex, useDocumentHidden, useHeroCarouselAutoplay } from "./hero-carousel-autoplay";
+import { useHeroOrientation } from "./hero-orientation";
 import { heroBackdropUrl, useHeroBackdropPreload } from "./hero-preload";
 import { ContinueWatchingRail, imageUrl, LibraryCard, MediaRail, mediaTitle, mediaTypeLabel, playbackPositionTicks, runtimeLabel } from "./media";
 import { useRealtimeConnectionState, type RealtimeConnectionState } from "../activity/useUserEvents";
@@ -228,8 +229,11 @@ const HeroCarousel = memo(function HeroCarousel({ items, continueWatching, isLoa
   const safeIndex = items.length ? activeIndex % items.length : 0;
   const item = items[safeIndex];
   const logo = item ? imageUrl(item, "logo") : undefined;
-  const image = heroBackdropUrl(item, enabled);
-  useHeroBackdropPreload({ items, activeIndex: safeIndex, variantsEnabled: enabled });
+  // The artwork follows the shape of the hero box: poster in a tall box, fanart in a wide one.
+  const heroRef = useRef<HTMLElement>(null);
+  const orientation = useHeroOrientation(heroRef);
+  const image = orientation ? heroBackdropUrl(item, enabled, orientation) : undefined;
+  useHeroBackdropPreload({ items, activeIndex: safeIndex, variantsEnabled: enabled, orientation });
   const title = item ? mediaTitle(item) : "你的私人影院";
   const titleClassName = logo
     ? "lux-hero-title has-logo"
@@ -245,6 +249,7 @@ const HeroCarousel = memo(function HeroCarousel({ items, continueWatching, isLoa
 
   return (
     <section
+      ref={heroRef}
       className="lux-hero"
       aria-label="精选媒体轮播"
       aria-roledescription="carousel"
@@ -269,7 +274,7 @@ const HeroCarousel = memo(function HeroCarousel({ items, continueWatching, isLoa
       {image ? (
         <img
           key={`backdrop-${item?.id}`}
-          className="lux-hero-backdrop lux-hero-backdrop-animated"
+          className={orientation === "portrait" ? "lux-hero-backdrop lux-hero-backdrop-animated lux-hero-backdrop-portrait" : "lux-hero-backdrop lux-hero-backdrop-animated"}
           src={image}
           alt=""
           decoding="async"

@@ -12,10 +12,39 @@ import { imageUrl } from "./media-display";
 
 export const HERO_BACKDROP_VARIANT_WIDTH = 1280;
 
-/** The single source of truth for the hero backdrop: fanart first, then the poster. */
-export function heroBackdropUrl(item: MediaItem | undefined, variantsEnabled: boolean): string | undefined {
+export type HeroOrientation = "landscape" | "portrait";
+
+/**
+ * Width / height below which the hero box is tall enough that a portrait poster crops less than a
+ * 16:9 backdrop does (the geometric mean of 2:3 and 16:9 is about 1.09).
+ */
+export const HERO_PORTRAIT_MAX_ASPECT = 1.1;
+/** Dead band around the threshold so a slide with a longer synopsis cannot flip the artwork. */
+const HERO_ORIENTATION_HYSTERESIS = 0.05;
+
+/** Orientation of the hero box. An unmeasurable box counts as landscape (the desktop default). */
+export function heroOrientation(width: number, height: number, previous?: HeroOrientation): HeroOrientation {
+  if (!(width > 0 && height > 0)) return "landscape";
+  const aspect = width / height;
+  if (previous === "portrait" && aspect < HERO_PORTRAIT_MAX_ASPECT + HERO_ORIENTATION_HYSTERESIS) return "portrait";
+  if (previous === "landscape" && aspect >= HERO_PORTRAIT_MAX_ASPECT - HERO_ORIENTATION_HYSTERESIS) return "landscape";
+  return aspect < HERO_PORTRAIT_MAX_ASPECT ? "portrait" : "landscape";
+}
+
+/**
+ * The single source of truth for the hero artwork. A landscape box takes fanart first, then the
+ * poster; a portrait box takes the poster first, then the landscape images.
+ */
+export function heroBackdropUrl(
+  item: MediaItem | undefined,
+  variantsEnabled: boolean,
+  orientation: HeroOrientation = "landscape",
+): string | undefined {
   if (!item) return undefined;
   const width = variantsEnabled ? HERO_BACKDROP_VARIANT_WIDTH : undefined;
+  if (orientation === "portrait") {
+    return imageUrl(item, "poster", width) ?? imageUrl(item, "fanart", width);
+  }
   return imageUrl(item, "fanart", width) ?? imageUrl(item, "poster", width);
 }
 
@@ -23,10 +52,11 @@ export function nextHeroBackdropUrl(
   items: MediaItem[],
   activeIndex: number,
   variantsEnabled: boolean,
+  orientation: HeroOrientation = "landscape",
 ): string | undefined {
   if (items.length < 2) return undefined;
   const nextIndex = (activeIndex + 1) % items.length;
-  return heroBackdropUrl(items[nextIndex], variantsEnabled);
+  return heroBackdropUrl(items[nextIndex], variantsEnabled, orientation);
 }
 
 /** Warm the browser cache for `url`. Never rejects and never renders an element. */
@@ -62,12 +92,14 @@ export interface HeroBackdropPreloadOptions {
   items: MediaItem[];
   activeIndex: number;
   variantsEnabled: boolean;
+  /** `undefined` while the hero box is not measured yet: nothing is warmed for a guess. */
+  orientation: HeroOrientation | undefined;
 }
 
-export function useHeroBackdropPreload({ items, activeIndex, variantsEnabled }: HeroBackdropPreloadOptions) {
+export function useHeroBackdropPreload({ items, activeIndex, variantsEnabled, orientation }: HeroBackdropPreloadOptions) {
   const nextUrl = useMemo(
-    () => nextHeroBackdropUrl(items, activeIndex, variantsEnabled),
-    [items, activeIndex, variantsEnabled],
+    () => (orientation ? nextHeroBackdropUrl(items, activeIndex, variantsEnabled, orientation) : undefined),
+    [items, activeIndex, variantsEnabled, orientation],
   );
 
   useEffect(() => {

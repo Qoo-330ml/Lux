@@ -245,6 +245,12 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 
 .lux-hero-backdrop { position: absolute; z-index: -3; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: center; filter: saturate(.82) brightness(.74); transform: scale(1.015); }
 
+/* Portrait artwork (a poster in a tall hero box): keep the top, where the faces are, and darken the
+   lower half more so the copy stays readable over printed poster titles. */
+.lux-hero-backdrop-portrait { object-position: center top; }
+
+.lux-hero-backdrop-portrait + .lux-hero-overlay { background: linear-gradient(90deg, rgba(0,0,0,.5) 0%, rgba(0,0,0,.2) 60%, transparent 100%), linear-gradient(0deg, #050506 2%, rgba(5,5,6,.78) 34%, rgba(5,5,6,.2) 62%, transparent 82%); }
+
 .lux-hero-backdrop-animated { animation: lux-hero-backdrop-in .55s ease-out both; }
 
 @keyframes lux-hero-backdrop-in { from { opacity: 0; transform: scale(1.04); } to { opacity: 1; transform: scale(1.015); } }
@@ -1956,3 +1962,5 @@ html[data-lux-theme="light"] .lux-library-dialog-section h3 { color: var(--lux-t
 }
 
 .lux-load-more-row { display: flex; justify-content: center; padding: 18px 0 6px; }
+
+html[data-lux-theme="light"] .lux-hero-backdrop-portrait + .lux-hero-overlay { background: linear-gradient(90deg, rgba(244,243,241,.5) 0%, rgba(244,243,241,.2) 60%, transparent 100%), linear-gradient(0deg, rgba(244,243,241,.99) 2%, rgba(244,243,241,.82) 34%, rgba(244,243,241,.2) 62%, transparent 82%); }
