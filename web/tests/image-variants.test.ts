@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { imageUrl } from "../src/features/home/media-display";
+import { episodeCardImageUrl, imageUrl } from "../src/features/home/media-display";
 import { imageVariantWidth, withImageWidth } from "../src/features/home/image-variants";
 import type { MediaItem } from "../src/lib/api/types";
 
@@ -11,6 +11,16 @@ const item = {
 } as MediaItem;
 
 describe("image variant URLs", () => {
+  it("asks episode cards for the small 360 variant, and no width while disabled", () => {
+    const episode = { ...item, itemType: "EPISODE" } as MediaItem;
+    expect(episodeCardImageUrl(episode, true)).toBe(
+      "/api/v1/items/item-1/images/fanart?tag=fanart-tag&w=360",
+    );
+    expect(episodeCardImageUrl(episode, false)).toBe(
+      "/api/v1/items/item-1/images/fanart?tag=fanart-tag",
+    );
+  });
+
   it("keeps the existing URL byte-for-byte when no width is requested", () => {
     expect(imageUrl(item)).toBe("/api/v1/items/item-1/images/poster?tag=poster-tag");
     expect(imageUrl(item, "fanart")).toBe("/api/v1/items/item-1/images/fanart?tag=fanart-tag");
