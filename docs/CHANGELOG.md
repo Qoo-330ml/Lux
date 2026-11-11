@@ -6,6 +6,31 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 >
 > 发版时两处都要改：本文档，以及应用内「设置 → 更新日志」页面使用的内置列表：新版本条目追加到 `web/src/features/admin/changelog/releases/` 下对应大版本的文件（如 `v0-7.ts`）；新大版本需新增文件，并在 `releases/index.ts` 中按倒序插入（该页面不读取本文件）。
 
+## [0.7.17] - 2026-11-11
+
+这版两个改动都不大，但都能马上看到：Lux 自己的条目详情开始返回本地文件路径 `path`，和 Emby 的 `Path`
+对齐；探测结果补上了 HDR 信息，Emby 客户端终于能在片源上标出 HDR10、HLG 和杜比视界，而不是因为拿不到值
+一律按未知处理。
+
+### 新增
+
+- **条目详情返回本地文件路径**：`GET /api/v1/items/{itemId}` 新增顶层字段 `path`，值是默认文件型媒体源的
+  服务端规范化绝对路径；`.strm` 条目给的是已索引的 `.strm` 文件本身，不是它指向的目标。没有本地文件（例如
+  只有 SMB/FTP/URL 源）时返回 `null`，不伪造路径。字段受与详情查询同一套媒体库 ACL 保护，无权或条目不存在
+  仍按既有 404 处理，不新增探测面；只在这个详情接口返回，列表、搜索、卡片、继续观看等响应保持不变，
+  `mediaSources[].externalUrl` 也不变，服务端不把该字段写进日志。数据只来自已有的文件系统索引，不写库、
+  不迁移、不改扫描。规范中 LUX-213（弹幕读取）与 LUX-215（字幕/弹幕兼容门）的“不泄露文件路径”收窄为只管
+  各自的端点，LUX-317 与 LUX-260 的插件接口条款不变。该任务登记时原编号 `LUX-908` 与同时期的 HDR 任务重号，
+  按登记顺序改为 `LUX-909`。
+- **探测结果补上 HDR 信息**：`ffprobe -show_streams` 不输出 `VideoRange` / `VideoRangeType`，宿主以前只存
+  `ColorTransfer`、`ColorSpace`、`ColorPrimaries`，Emby 客户端因此拿不到这两项。现在由流级数据推导，只作用于
+  视频流、只补缺失的键（已有值不覆盖）：存在 `DOVI configuration record` 时 `VideoRange` 为 `Dolby Vision`，
+  `VideoRangeType` 按 `dv_bl_signal_compatibility_id` 取 `DOVIWithHDR10`（1）、`DOVIWithSDR`（2）、
+  `DOVIWithHLG`（4），其它或缺失取 `DOVI`；否则按 `color_transfer` 判断，`smpte2084` 是 `HDR10`、
+  `arib-std-b67` 是 `HLG`、`bt709`/`smpte170m`/`iec61966-2-1`/`bt2020-10`/`bt2020-12` 是 `SDR`；缺失或未知的
+  传递函数不猜，两个键都不输出。HDR10+ 不做识别（需要逐帧动态元数据，代价是引入 `-show_frames`），PQ 流统一
+  记 `HDR10`。不增加 ffprobe 调用、不改数据库、不改 Emby 输出层，`VideoRange` 的规范化仍走 LUX-878 的词表。
+
 ## [0.7.16] - 2026-11-09
 
 这版把「相似推荐」和标签从 Emby 兼容层搬进了 Lux 自己的接口：`GET /api/v1/items/{id}/similar` 与

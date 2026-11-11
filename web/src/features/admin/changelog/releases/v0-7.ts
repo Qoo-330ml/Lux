@@ -2,6 +2,16 @@ import type { ChangelogRelease } from "../types";
 
 export const changelogReleases07: ChangelogRelease[] = [
   {
+    version: "0.7.17",
+    date: "2026-11-11",
+    sections: [
+      { kind: "added", items: [
+        "条目详情会告诉你文件在哪：GET /api/v1/items/{id} 多了一个 path 字段，值是这条片子默认媒体源在服务器上的绝对路径；.strm 条目给的是 .strm 文件本身，不是它指向的地址。没有本地文件时是 null，不会编一个出来。字段只在详情接口出现，受同一套媒体库权限保护，列表、搜索和卡片不会带上它，也不会写进日志。",
+        "片源现在能标出 HDR 了：ffprobe 的流信息里本来没有 VideoRange，以前这两个键基本是空的，Emby 客户端只能按未知（通常显示成 SDR）处理。现在宿主自己推导：有杜比视界配置记录就标 Dolby Vision，再按兼容 ID 区分 HDR10、SDR 或 HLG；否则看 color_transfer——PQ 记 HDR10、ARIB STD-B67 记 HLG、常见的 SDR 传递函数记 SDR，认不出来就不猜。不额外调用 ffprobe，也不改数据库。HDR10+ 暂时识别不了，它需要逐帧数据。",
+      ] },
+    ],
+  },
+  {
     version: "0.7.16",
     date: "2026-11-09",
     sections: [
