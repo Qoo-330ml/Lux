@@ -1094,7 +1094,17 @@ pub(super) async fn lux_get_item(
     match catalog.find_item(principal, &item_id).await {
         Ok(Some(item)) => {
             match load_lux_item_detail(&state, database, &item, &user.id.to_string()).await {
-                Ok(detail) => Json(detail.body).into_response(),
+                Ok(mut detail) => {
+                    // The local path is authorized by the same item ACL that gated the lookup
+                    // above; it is never logged and is absent from list/search payloads.
+                    let Ok(path) = catalog.item_local_file_path(&item).await else {
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    };
+                    if let Value::Object(object) = &mut detail.body {
+                        object.insert("path".to_owned(), json!(path));
+                    }
+                    Json(detail.body).into_response()
+                }
                 Err(()) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
             }
         }

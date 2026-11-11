@@ -21644,6 +21644,43 @@ ADR-053 重复，且 ADR-053 不建表、不加迁移。已取消，不实施。
 
 ADR-053 明确 v1 不提供评分界面。若需要，等待 ADR 增补后另立任务。
 
+#### LUX-908：Lux 条目详情返回本地文件路径
+
+状态：已实施，待提交（2026-11-11，负责人确认范围并批准先更新规范）。依赖：无。验证：`library catalog::` 6/6、`strm` 42/42、`--lib application::catalog` 43/43、fmt、`clippy --all-targets --all-features -D warnings`、`build`、`cargo test --locked --all-targets` 全部通过，`check-migration-parity.py` 与 `check-backend-branches.py` 通过。
+
+背景：Emby 兼容层已在条目 `Path` 中返回本地文件系统路径，Lux 自有条目详情仍只返回 `mediaSources[].externalUrl`
+（`.strm` 原始目标）。负责人确认 Lux 条目详情也要返回本地路径，使 Lux 客户端与 Emby 客户端对同一条目拿到一致的本地位置。
+
+规范修订（本任务生效，覆盖下列限定）：
+
+- `LUX-213`（弹幕读取）与 `LUX-215`（字幕/弹幕兼容门）中的“不泄露文件路径”仅适用于弹幕/字幕端点本身，不限制条目详情的 `path` 字段。
+- `LUX-317`（插件图片配置）与 `LUX-260`（登录背景插件宿主接口）中的“不泄露文件路径”条款仍然有效；本任务不改变插件接口。
+- 本文件第 1020 行“有权限的客户端仍需看到原始 Path”继续有效，`externalUrl` 字段保持不变。
+
+范围：
+
+- 仅 `GET /api/v1/items/{itemId}` 条目详情新增顶层字段 `path`，类型为字符串或 `null`。
+- `path` 为服务端 canonical 绝对路径：普通条目为其主视频文件；`.strm` 条目为已索引的 `.strm` 文件路径。
+  与 Emby 条目 `Path` 语义一致，但不复用 Emby DTO。
+- 只有该条目对当前用户可见（既有媒体库 ACL）时才返回；无权或不存在仍按既有 404 边界处理，不新增探测面。
+- 列表、搜索、卡片、继续观看等接口不新增 `path`，列表 payload 保持不变。
+- 无本地文件（如仅 SMB/FTP/URL 且无已索引文件）时返回 `null`，不伪造路径。
+- 不写入数据库、不迁移、不改变扫描；路径只来自已有文件系统索引。
+- 日志不得输出该字段；测试路径使用临时目录。
+
+不做：列表字段、管理员专用路径接口、Web 展示页面、写入或修改路径、Emby DTO 变更。
+
+验收：
+
+- [x] 有权限用户的条目详情返回 `path`，值为规范化绝对路径（`lux_item_detail_exposes_local_file_path_only_to_authorized_viewers`）；STRM 条目返回 `.strm` 文件路径（由共用存储查询推导，尚无专门集成测试，留作后续补充）。
+- [x] 无权限用户或不存在条目沿用既有 ACL/404 行为，不返回 `path`。
+- [ ] 无本地文件的条目返回 `null`（代码路径已实现，尚无专门测试）。
+- [x] 列表与搜索接口 JSON 不变（列表回归断言）。
+- [x] `docs/API.md` 记录字段语义与 ACL 规则。
+- [x] 相关 `cargo test --locked --test library catalog::`、`--lib` 过滤、fmt、clippy 通过。
+
+预计文件：`src/api/media.rs`、`src/application/catalog.rs`、`tests/catalog.rs`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`、`docs/TEST-TARGETS.md`。
+
 ## 31. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

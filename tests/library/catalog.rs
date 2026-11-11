@@ -2588,3 +2588,125 @@ async fn emby_clients_receive_the_rating_written_in_an_emby_ratings_container()
     assert_eq!(page_body["Items"][0]["CommunityRating"], 7.6);
     Ok(())
 }
+
+#[tokio::test]
+async fn lux_item_detail_exposes_local_file_path_only_to_authorized_viewers()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let users = UserStore::new(database.clone())?;
+    let viewer = users
+        .create_user("viewer", "Viewer", "viewer password", false)
+        .await?;
+    sqlx::query("UPDATE users SET library_access_mode = 'SELECTED' WHERE id = ?")
+        .bind(viewer.id.to_string())
+        .execute(database.pool())
+        .await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Solo Movie (2022)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    let movie_file = movie_dir.join("Solo.Movie.2022.mkv");
+    tokio::fs::write(&movie_file, b"solo").await?;
+    libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE sort_title = 'solo movie'")
+            .fetch_one(database.pool())
+            .await?;
+    let expected_path = std::fs::canonicalize(&movie_file)?;
+
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+
+    let admin_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    let admin_cookies = format!(
+        "lux_session={}; lux_csrf={}",
+        cookie_value(admin_login.headers(), "lux_session"),
+        cookie_value(admin_login.headers(), "lux_csrf")
+    );
+    let detail = client
+        .get(format!("{base_url}/api/v1/items/{item_id}"))
+        .header(COOKIE, &admin_cookies)
+        .send()
+        .await?;
+    assert_eq!(detail.status(), reqwest::StatusCode::OK);
+    let detail_body: Value = detail.json().await?;
+    assert_eq!(
+        detail_body["path"].as_str(),
+        expected_path.to_str(),
+        "authorized detail must carry the canonical local file path"
+    );
+
+    let list = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?pageSize=1",
+            library.id
+        ))
+        .header(COOKIE, &admin_cookies)
+        .send()
+        .await?;
+    assert_eq!(list.status(), reqwest::StatusCode::OK);
+    let list_body: Value = list.json().await?;
+    assert!(
+        list_body["items"][0].get("path").is_none(),
+        "list payloads must not gain a path field"
+    );
+
+    let viewer_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "viewer", "password": "viewer password" }))
+        .send()
+        .await?;
+    let viewer_cookies = format!(
+        "lux_session={}; lux_csrf={}",
+        cookie_value(viewer_login.headers(), "lux_session"),
+        cookie_value(viewer_login.headers(), "lux_csrf")
+    );
+    let denied = client
+        .get(format!("{base_url}/api/v1/items/{item_id}"))
+        .header(COOKIE, &viewer_cookies)
+        .send()
+        .await?;
+    assert_eq!(denied.status(), reqwest::StatusCode::NOT_FOUND);
+    let denied_body = denied.text().await?;
+    assert!(
+        !denied_body.contains(expected_path.to_str().unwrap_or_default()),
+        "denied response must not leak the local path"
+    );
+
+    server.abort();
+    Ok(())
+}
