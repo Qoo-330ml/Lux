@@ -2645,6 +2645,9 @@ pub(super) async fn lux_download(
     if !user.can_download {
         return StatusCode::FORBIDDEN.into_response();
     }
+    if let Some(response) = strm_download_redirect(&state, &source).await {
+        return response;
+    }
     let downloads = require_service!(state.downloads);
     let artifact = match downloads.prepare_authorized_source(&source).await {
         Ok(artifact) => artifact,
@@ -3503,27 +3506,8 @@ pub(super) async fn emby_download(
     if !auth_principal.can_download() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    // Mirror the playback route: URL and SMB/FTP `.strm` targets are handed to the client (or an
-    // external proxy) as a redirect, so Lux never relays their bytes. Path targets and local files
-    // are served by Lux below.
-    if source.source_kind == "STRM_URL" {
-        let Some(external_url) = source.external_url.as_deref() else {
-            return StatusCode::NOT_FOUND.into_response();
-        };
-        match classify_strm_target(external_url).kind {
-            StrmTargetKind::Url => return redirect_emby_strm_playback(external_url),
-            StrmTargetKind::Smb | StrmTargetKind::Ftp => {
-                return match state.plugins().resolve_strm_target(external_url).await {
-                    Ok(Some(location)) => redirect_emby_strm_playback(&location),
-                    Ok(None) => StatusCode::NOT_IMPLEMENTED.into_response(),
-                    Err(PluginServiceError::InvalidResponse) => {
-                        StatusCode::BAD_GATEWAY.into_response()
-                    }
-                    Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                };
-            }
-            StrmTargetKind::Path | StrmTargetKind::Empty | StrmTargetKind::Unsupported => {}
-        }
+    if let Some(response) = strm_download_redirect(&state, &source).await {
+        return response;
     }
     let downloads = require_service!(state.downloads);
     let artifact = match downloads.prepare_authorized_source(&source).await {
@@ -3533,6 +3517,33 @@ pub(super) async fn emby_download(
     let mut response = serve_download_artifact(downloads, &artifact, &method, &headers).await;
     add_download_header_with_name(&mut response, artifact.file_name());
     response
+}
+
+/// Mirrors the playback route for `.strm` downloads: URL and SMB/FTP targets are handed to the
+/// client (or an external proxy) as a redirect, so Lux never relays their bytes. Path targets and
+/// local files return `None` and are served by Lux.
+async fn strm_download_redirect(
+    state: &ReadyAppState,
+    source: &crate::storage::StoredPlaybackSource,
+) -> Option<Response> {
+    if source.source_kind != "STRM_URL" {
+        return None;
+    }
+    let Some(external_url) = source.external_url.as_deref() else {
+        return Some(StatusCode::NOT_FOUND.into_response());
+    };
+    match classify_strm_target(external_url).kind {
+        StrmTargetKind::Url => Some(redirect_emby_strm_playback(external_url)),
+        StrmTargetKind::Smb | StrmTargetKind::Ftp => Some(
+            match state.plugins().resolve_strm_target(external_url).await {
+                Ok(Some(location)) => redirect_emby_strm_playback(&location),
+                Ok(None) => StatusCode::NOT_IMPLEMENTED.into_response(),
+                Err(PluginServiceError::InvalidResponse) => StatusCode::BAD_GATEWAY.into_response(),
+                Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            },
+        ),
+        StrmTargetKind::Path | StrmTargetKind::Empty | StrmTargetKind::Unsupported => None,
+    }
 }
 
 pub(super) fn add_download_header_with_name(response: &mut Response, file_name: &str) {

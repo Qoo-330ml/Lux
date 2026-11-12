@@ -294,35 +294,30 @@ async fn download_returns_selected_local_and_strm_sources_without_archiving()
     assert_eq!(response.headers()["content-type"], "video/x-matroska");
     assert_eq!(response.bytes().await?.as_ref(), b"selected video");
 
-    let response = client
-        .get(format!(
-            "{base_url}/api/v1/items/{remote_item_id}/download?sourceId={remote_source_id}"
-        ))
-        .header(COOKIE, &cookie)
-        .header("Range", "bytes=0-5")
-        .send()
-        .await?;
-    assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
-    assert_eq!(response.headers()["content-type"], "video/x-matroska");
-    assert_eq!(response.headers()["content-range"], "bytes 0-5/17");
-    assert!(
-        response.headers()["content-disposition"]
-            .to_str()?
-            .contains("Remote.Movie.2024.mkv")
-    );
-    assert_eq!(response.bytes().await?.as_ref(), b"remote");
-
-    let response = client
-        .head(format!(
-            "{base_url}/api/v1/items/{remote_item_id}/download?sourceId={remote_source_id}"
-        ))
-        .header(COOKIE, &cookie)
-        .send()
-        .await?;
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(response.headers()["content-type"], "video/x-matroska");
-    assert_eq!(response.headers()["content-length"], "17");
-    assert!(response.bytes().await?.is_empty());
+    // The Lux download API hands URL-type `.strm` targets to the client as well.
+    let no_redirect_client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("test client");
+    for method in [reqwest::Method::GET, reqwest::Method::HEAD] {
+        let response = no_redirect_client
+            .request(
+                method,
+                format!(
+                    "{base_url}/api/v1/items/{remote_item_id}/download?sourceId={remote_source_id}"
+                ),
+            )
+            .header(COOKIE, &cookie)
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        assert_eq!(
+            response.headers()["location"],
+            "http://1.1.1.1/Remote.Movie.2024.mkv"
+        );
+        assert!(response.bytes().await?.is_empty());
+    }
 
     let response = client
         .get(format!(
@@ -392,11 +387,6 @@ async fn download_returns_selected_local_and_strm_sources_without_archiving()
 
     // Emby clients can follow a redirect themselves, so the URL-type `.strm` download hands the
     // original target to the client instead of relaying the bytes through Lux.
-    let no_redirect_client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("test client");
     for method in [reqwest::Method::GET, reqwest::Method::HEAD] {
         let response = no_redirect_client
             .request(
