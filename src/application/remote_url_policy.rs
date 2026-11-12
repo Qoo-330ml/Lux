@@ -1,66 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-
-use reqwest::Url;
-use tokio::net::lookup_host;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RemoteMediaUrlError {
-    Invalid,
-    BlockedHost,
-    ResolutionFailed,
-}
-
-pub async fn validate_and_resolve_remote_media_url(
-    value: &str,
-) -> Result<(Url, SocketAddr), RemoteMediaUrlError> {
-    if !validate_remote_media_url(value) {
-        return Err(RemoteMediaUrlError::Invalid);
-    }
-    let url = Url::parse(value).map_err(|_| RemoteMediaUrlError::Invalid)?;
-    let host = url.host_str().ok_or(RemoteMediaUrlError::Invalid)?;
-    let port = url
-        .port_or_known_default()
-        .ok_or(RemoteMediaUrlError::Invalid)?;
-    let addresses = lookup_host((host, port))
-        .await
-        .map_err(|_| RemoteMediaUrlError::ResolutionFailed)?
-        .collect::<Vec<_>>();
-    let Some(address) = addresses.first().copied() else {
-        return Err(RemoteMediaUrlError::ResolutionFailed);
-    };
-    if addresses
-        .iter()
-        .any(|address| is_private_or_reserved(address.ip()))
-    {
-        return Err(RemoteMediaUrlError::BlockedHost);
-    }
-    Ok((url, address))
-}
-
-fn validate_remote_media_url(value: &str) -> bool {
-    if value.chars().count() > 8 * 1024 {
-        return false;
-    }
-    let Ok(url) = Url::parse(value) else {
-        return false;
-    };
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-    {
-        return false;
-    }
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    !(host.eq_ignore_ascii_case("localhost")
-        || host.ends_with(".localhost")
-        || host.eq_ignore_ascii_case("metadata.google.internal")
-        || host.ends_with(".metadata.google.internal")
-        || host.parse::<IpAddr>().is_ok_and(is_private_or_reserved))
-}
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 pub(crate) fn is_private_or_reserved(address: IpAddr) -> bool {
     match address {
@@ -135,27 +73,7 @@ pub(crate) fn ipv4_compatible_target(address: Ipv6Addr) -> Option<Ipv4Addr> {
 mod tests {
     use std::net::IpAddr;
 
-    use super::{is_private_or_reserved, validate_remote_media_url};
-
-    #[test]
-    fn download_url_policy_rejects_credentials_fragments_and_private_hosts() {
-        for value in [
-            "http://user:password@example.com/video.mkv",
-            "https://example.com/video.mkv#fragment",
-            "http://127.0.0.1/video.mkv",
-            "http://192.168.1.10/video.mkv",
-            "http://metadata.google.internal/video.mkv",
-        ] {
-            assert!(!validate_remote_media_url(value), "URL should be rejected");
-        }
-    }
-
-    #[test]
-    fn download_url_policy_accepts_public_http_url_with_query() {
-        assert!(validate_remote_media_url(
-            "https://example.com/video.mkv?signature=fixture"
-        ));
-    }
+    use super::is_private_or_reserved;
 
     #[test]
     fn mapped_and_tunnelled_addresses_are_treated_as_private() {

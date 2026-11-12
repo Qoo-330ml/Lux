@@ -2,7 +2,7 @@ import { createContext, memo, useContext, useEffect, useState, type ReactNode } 
 import { Link, useNavigate } from "react-router-dom";
 import { Play } from "lucide-react";
 import type { MediaItem } from "../../lib/api/types";
-import { EpisodeCount, Rating, episodeTitle, imageUrl, mediaTitle, posterUrlWithFallback } from "../home/media-display";
+import { EpisodeCount, Rating, episodeCardImageUrl, episodeTitle, mediaTitle, posterUrlWithFallback } from "../home/media-display";
 import { useImageVariants } from "../home/image-variants";
 import { useMediaEpisodes } from "./useMediaEpisodes";
 import { LuxButton , luxButtonClass } from "../../components/ui";
@@ -183,8 +183,7 @@ function SeasonEpisodes({
 
 function SeasonEpisodeRow({ episode, seasonNumber, fallbackNumber }: { episode: MediaItem; seasonNumber?: number | null; fallbackNumber: number }) {
   const { enabled } = useImageVariants();
-  const image = imageUrl(episode, "fanart", enabled ? 720 : undefined)
-    ?? imageUrl(episode, "poster", enabled ? 720 : undefined);
+  const image = episodeCardImageUrl(episode, enabled);
   const number = episode.indexNumber ?? fallbackNumber;
   const detailHref = `/items/${episode.id}`;
   const watchHref = `/watch/${episode.id}`;
@@ -229,8 +228,7 @@ function EpisodeRail({
       </div>
       <div className="lux-episode-card-rail" role="list">
         {otherEpisodes.map((episode) => {
-          const image = imageUrl(episode, "fanart", enabled ? 720 : undefined)
-            ?? imageUrl(episode, "poster", enabled ? 720 : undefined);
+          const image = episodeCardImageUrl(episode, enabled);
           const detailHref = `/items/${episode.id}`;
           return (
             <article className="lux-episode-card" role="listitem" key={episode.id}>

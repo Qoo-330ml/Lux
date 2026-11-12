@@ -198,6 +198,9 @@ pub fn parse_probe_json(bytes: &[u8]) -> Result<MediaProbeResult, ProbeError> {
             }
             let tags = stream.get("tags").and_then(Value::as_object);
             let mut details = ffprobe_stream_details(stream);
+            if matches!(stream_type, StreamType::Video) {
+                derive_video_range(stream, &mut details);
+            }
             if let Some(disposition) = disposition
                 && disposition.contains_key("hearing_impaired")
             {
@@ -649,6 +652,64 @@ fn integer_field(object: &serde_json::Map<String, Value>, key: &str) -> Option<i
         Value::String(value) => value.parse().ok(),
         _ => None,
     })
+}
+
+/// `color_transfer` values that describe an SDR signal. Other values (including missing ones) are
+/// not guessed into a dynamic range.
+const SDR_COLOR_TRANSFERS: [&str; 5] = [
+    "bt709",
+    "smpte170m",
+    "iec61966-2-1",
+    "bt2020-10",
+    "bt2020-12",
+];
+
+/// Derives Emby-style `VideoRange` / `VideoRangeType` from stream-level ffprobe data only.
+///
+/// A Dolby Vision configuration record takes precedence over the transfer function. PQ is reported
+/// as HDR10 without inspecting static metadata, because ffprobe's stream-level `side_data_list`
+/// usually omits it (it appears per frame). HDR10+ is intentionally not detected here.
+fn derive_video_range(
+    stream: &serde_json::Map<String, Value>,
+    details: &mut BTreeMap<String, Value>,
+) {
+    let (range, range_type) = match dolby_vision_record(stream) {
+        Some(record) => ("Dolby Vision", dolby_vision_range_type(record)),
+        None => match stream.get("color_transfer").and_then(Value::as_str) {
+            Some("smpte2084") => ("HDR10", "HDR10"),
+            Some("arib-std-b67") => ("HLG", "HLG"),
+            Some(transfer) if SDR_COLOR_TRANSFERS.contains(&transfer) => ("SDR", "SDR"),
+            _ => return,
+        },
+    };
+    details
+        .entry("VideoRange".to_owned())
+        .or_insert_with(|| Value::from(range));
+    details
+        .entry("VideoRangeType".to_owned())
+        .or_insert_with(|| Value::from(range_type));
+}
+
+fn dolby_vision_record(
+    stream: &serde_json::Map<String, Value>,
+) -> Option<&serde_json::Map<String, Value>> {
+    stream
+        .get("side_data_list")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_object)
+        .find(|entry| {
+            entry.get("side_data_type").and_then(Value::as_str) == Some("DOVI configuration record")
+        })
+}
+
+fn dolby_vision_range_type(record: &serde_json::Map<String, Value>) -> &'static str {
+    match integer_field(record, "dv_bl_signal_compatibility_id") {
+        Some(1) => "DOVIWithHDR10",
+        Some(2) => "DOVIWithSDR",
+        Some(4) => "DOVIWithHLG",
+        _ => "DOVI",
+    }
 }
 
 fn ffprobe_stream_details(stream: &serde_json::Map<String, Value>) -> BTreeMap<String, Value> {

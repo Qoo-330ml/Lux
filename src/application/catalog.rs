@@ -2930,33 +2930,52 @@ impl CatalogService {
         let source_ids = source_to_item.keys().cloned().collect::<Vec<_>>();
         let stored_paths = self
             .database
-            .list_strm_source_paths_by_ids(&source_ids)
+            .list_local_source_paths_by_ids(&source_ids)
             .await?;
         let mut item_paths = HashMap::new();
         for stored_path in stored_paths {
             let Some(item_id) = source_to_item.get(&stored_path.source_id) else {
                 continue;
             };
-            let root = std::path::Path::new(&stored_path.root_path);
-            let relative = std::path::Path::new(&stored_path.relative_path);
-            if !root.is_absolute()
-                || relative.as_os_str().is_empty()
-                || !relative
-                    .components()
-                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+            if let Some(full_path) =
+                joined_local_path(&stored_path.root_path, &stored_path.relative_path)
             {
-                continue;
+                item_paths.insert(item_id.clone(), full_path);
             }
-            let full_path = root.join(relative);
-            if !full_path.starts_with(root) {
-                continue;
-            }
-            let Some(full_path) = full_path.to_str() else {
-                continue;
-            };
-            item_paths.insert(item_id.clone(), full_path.to_owned());
         }
         Ok(item_paths)
+    }
+
+    /// Returns the canonical local path of the item's default file-backed source, or `None` when
+    /// the item has no indexed local file (for example SMB/FTP or URL-only sources).
+    pub(crate) async fn item_local_file_path(
+        &self,
+        item: &CatalogItem,
+    ) -> Result<Option<String>, CatalogError> {
+        // Default source first, then the remaining versions in their stored order.
+        let mut ordered = item.media_sources.iter().collect::<Vec<_>>();
+        ordered.sort_by_key(|source| !source.is_default);
+        if ordered.is_empty() {
+            return Ok(None);
+        }
+        let source_ids = ordered
+            .iter()
+            .map(|source| source.id.clone())
+            .collect::<Vec<_>>();
+        let stored_paths = self
+            .database
+            .list_local_source_paths_by_ids(&source_ids)
+            .await?;
+        for source_id in &source_ids {
+            let local = stored_paths
+                .iter()
+                .filter(|stored| &stored.source_id == source_id)
+                .find_map(|stored| joined_local_path(&stored.root_path, &stored.relative_path));
+            if local.is_some() {
+                return Ok(local);
+            }
+        }
+        Ok(None)
     }
 
     pub(crate) async fn find_items(
@@ -3884,6 +3903,28 @@ impl From<AccessError> for CatalogError {
             AccessError::Storage(error) => Self::Storage(error),
         }
     }
+}
+
+/// Joins an indexed library root and a relative entry path into an absolute UTF-8 path.
+///
+/// Returns `None` unless the root is absolute, the relative path is a non-empty chain of normal
+/// components, and the result stays under the root.
+fn joined_local_path(root_path: &str, relative_path: &str) -> Option<String> {
+    let root = std::path::Path::new(root_path);
+    let relative = std::path::Path::new(relative_path);
+    if !root.is_absolute()
+        || relative.as_os_str().is_empty()
+        || !relative
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let full_path = root.join(relative);
+    if !full_path.starts_with(root) {
+        return None;
+    }
+    full_path.to_str().map(str::to_owned)
 }
 
 #[cfg(test)]

@@ -61,6 +61,15 @@ export function posterUrlWithFallback(item: MediaItem, series?: MediaItem, width
 }
 
 /**
+ * The image of one episode card in a season's list: a small landscape box, so it asks for the 360
+ * variant (the season poster keeps 720). Falls back to the poster when the episode has no fanart.
+ */
+export function episodeCardImageUrl(episode: MediaItem, enabled: boolean) {
+  return imageUrl(episode, "fanart", enabled ? 360 : undefined)
+    ?? imageUrl(episode, "poster", enabled ? 360 : undefined);
+}
+
+/**
  * Detail-page backdrop: series, seasons and episodes share the series artwork, and any landscape
  * image (fanart, then thumb) wins over a poster. Seasons and episodes wait for the series to load
  * rather than flashing their own still first.

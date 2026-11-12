@@ -6368,7 +6368,9 @@ impl Database {
         Ok(row.map(MovieNfoWritebackRow::into_parts))
     }
 
-    pub(crate) async fn list_strm_source_paths_by_ids(
+    /// Reads the indexed filesystem location of the given sources. Callers pass only the source
+    /// ids they need; non-file sources have no `filesystem_entry_id` and are excluded by the join.
+    pub(crate) async fn list_local_source_paths_by_ids(
         &self,
         source_ids: &[String],
     ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
@@ -6383,8 +6385,7 @@ impl Database {
                  FROM media_sources ms
                  JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
                  JOIN library_roots lr ON lr.id = fe.library_root_id
-                 WHERE ms.source_kind = 'STRM_URL'
-                   AND fe.is_missing = 0
+                 WHERE fe.is_missing = 0
                    AND ms.id IN ({placeholders})
                  ORDER BY ms.item_id, ms.is_default DESC, ms.id"
             );

@@ -1395,8 +1395,8 @@ TMDb 插件可选启用“原语言”模式。电影和剧集的标题优先使
 - 客户端断开时及时取消读取。
 - 不在日志中记录含令牌的完整 URL。
 - 路径必须由数据库中的 source ID 解析，客户端不能提交任意磁盘路径。
-- `.strm` 下载读取首个非空 URL，使用上游 GET/HEAD 和单 Range 流式转发；不转发入站 Authorization/Cookie，不自动跟随重定向。
-- `.strm` 下载的 URL 仅允许 HTTP/HTTPS，拒绝凭据、fragment、localhost、元数据主机以及 DNS 解析到私网或保留地址的主机；连接和读取必须有超时。
+- `.strm` 下载读取首个非空行并按目标类型分流：URL 型直接 302 到原始目标，SMB/FTP 经插件解析器后 302，路径型按本地文件由 Lux 提供；Lux 不对 URL 型目标做上游流式转发，也不访问目标、不做 SSRF 校验。
+- Emby 兼容下载入口（`/Items/{Id}/Download`）与 Lux 自有入口（`/api/v1/items/{id}/download`）共用播放同款 `.strm` 路线，只多 `can_download` 检查：URL 型原样 302（内网地址也原样交接），SMB/FTP 经插件解析器后 302，路径型由 Lux 提供本地文件；均不转发上游媒体字节，避免双倍流量。Web 以 `<a href download>` 导航触发，浏览器跟随 302。
 
 多 Range 可在实际客户端证明确有需要时加入；不要首版预先实现复杂 multipart/byteranges。
 
@@ -1405,7 +1405,7 @@ TMDb 插件可选启用“原语言”模式。电影和剧集的标题优先使
 - 读取文件的首个非空行并 trim BOM 与首尾空白，保存为原始播放目标。
 - 目标只做词法分类：HTTP(S) URL、路径、未知/其他目标；不在扫描或 PlaybackInfo 请求中访问目标。
 - URL 和路径型目标都保留原始 `Path`；`PlaybackInfo` 对这两类目标使用标准带短期 Lux 播放票据的 `DirectStreamUrl`，并使用 `Protocol=File`、`IsRemote=false` 的代理兼容表示。为兼容所有可能忽略 `AddApiKeyToDirectStreamUrl` 的第三方播放器，URL/路径型目标统一将该字段设为 `true`，并从本次标准 Emby 鉴权提取用户 token 作为 `api_key` 写入签名 URL；本地文件和 SMB/FTP 解析源不携带长期 token。无论该提示取值如何，Lux 都要求绑定用户、条目和媒体源的短期 HMAC 票据，由外部代理从原始 `Path` 执行映射或 302 解析。直接请求 Lux 时，路径型目标按本地文件处理，URL 型目标仍可由 Lux 使用入站播放器 User-Agent 有限跟随重定向并返回 307；该回退不改变扫描和 `PlaybackInfo` 不访问目标的边界，含 token 的兼容 URL 不得进入公开日志。
-- 下载路径按 LUX-091 使用独立的 URL 安全策略和上游流式转发，不能把路径型目标直接当作远程 URL 请求。
+- 下载路径对 URL 型目标只做重定向交接，不能把路径型目标直接当作远程 URL 请求。
 
 ### 14.3 PlaybackInfo
 
@@ -21643,6 +21643,77 @@ ADR-053 重复，且 ADR-053 不建表、不加迁移。已取消，不实施。
 #### LUX-907：Web 评分展示（暂缓）
 
 ADR-053 明确 v1 不提供评分界面。若需要，等待 ADR 增补后另立任务。
+
+#### LUX-908：宿主侧 ffprobe 推导 VideoRange / VideoRangeType（仅 stream 级）
+
+背景：`ffprobe -show_streams` 不输出 `VideoRange`/`VideoRangeType`，宿主当前只保存 `ColorTransfer`、
+`ColorSpace`、`ColorPrimaries`。Emby 客户端依赖 `VideoRange` 显示 HDR 信息，因此由 ffprobe 的流级
+信息推导这两个字段。实测（2026-11-09，本机 ffprobe）：HDR10/HLG 的静态元数据（mastering display、
+content light level）只出现在帧级 side data，`-show_streams` 的 `side_data_list` 为空；而
+`color_transfer` 在流级稳定存在。因此 HDR10 只依据 `color_transfer`，不依赖静态元数据。
+
+范围（只改 `src/application/probe.rs` 与对应测试）：
+
+- 解析 `side_data_list`，只识别 `side_data_type == "DOVI configuration record"` 的条目。
+- 只对视频流推导；推导结果只补充缺失键（`or_insert`），不改写已有值。
+- 推导规则（优先级从上到下）：
+  - 存在杜比视界配置记录：`VideoRange = Dolby Vision`；`VideoRangeType` 按
+    `dv_bl_signal_compatibility_id` 取 `1 → DOVIWithHDR10`、`2 → DOVIWithSDR`、`4 → DOVIWithHLG`，
+    其他或缺失取 `DOVI`。
+  - `color_transfer = smpte2084`：`HDR10` / `HDR10`。
+  - `color_transfer = arib-std-b67`：`HLG` / `HLG`。
+  - `color_transfer` 为 `bt709`、`smpte170m`、`iec61966-2-1`、`bt2020-10`、`bt2020-12` 之一：`SDR` / `SDR`。
+  - 其他或缺失：不输出两个键，不猜测。
+- **不做** HDR10+ 识别：它需要逐帧读取动态元数据，本任务不引入 `-show_frames`，也不增加 ffprobe 调用。
+  PQ 流统一输出 `HDR10`。
+- 不改数据库、迁移、Emby 输出逻辑（`VideoRange` 的规范化沿用 LUX-878 词表）、插件仓库。
+
+验收：
+
+- [x] `cargo test --locked --test strm probe::` 30/30 通过，新增用例覆盖：SDR、HLG、HDR10、杜比视界（兼容 ID 1/2/4/缺失）、
+  无信号的未知 transfer 不输出、音频流不推导、`side_data_list` 为非数组或条目畸形时不 panic 并回退到 transfer 规则。
+- [x] `cargo fmt --all -- --check` 通过。
+- [x] `cargo clippy --locked --all-targets --all-features -- -D warnings` 零警告（2026-11-09）。
+- [x] 全量 `cargo test --locked --all-targets --no-fail-fast`：库 129、各集成 target 全部通过（`api_web` 需要 `web/dist`，已 `pnpm --dir web build` 后通过）。
+- [x] `COMPATIBILITY.md` 记录推导规则与 HDR10+ 的未覆盖说明。
+- [x] 本任务不改 `Lux-plugins` 仓库中的 STRM 插件；插件侧需另立任务（它有独立的 `probe.rs` 副本）。
+
+#### LUX-909：Lux 条目详情返回本地文件路径
+
+状态：已完成（2026-11-11，提交 `c3c6b099`）。原编号 `LUX-908` 与上一节登记的 HDR 任务重号，按登记顺序改为 `LUX-909`。依赖：无。验证：`library catalog::` 6/6、`strm` 42/42、`--lib application::catalog` 43/43、fmt、`clippy --all-targets --all-features -D warnings`、`build`、`cargo test --locked --all-targets` 全部通过，`check-migration-parity.py` 与 `check-backend-branches.py` 通过。
+
+背景：Emby 兼容层已在条目 `Path` 中返回本地文件系统路径，Lux 自有条目详情仍只返回 `mediaSources[].externalUrl`
+（`.strm` 原始目标）。负责人确认 Lux 条目详情也要返回本地路径，使 Lux 客户端与 Emby 客户端对同一条目拿到一致的本地位置。
+
+规范修订（本任务生效，覆盖下列限定）：
+
+- `LUX-213`（弹幕读取）与 `LUX-215`（字幕/弹幕兼容门）中的“不泄露文件路径”仅适用于弹幕/字幕端点本身，不限制条目详情的 `path` 字段。
+- `LUX-317`（插件图片配置）与 `LUX-260`（登录背景插件宿主接口）中的“不泄露文件路径”条款仍然有效；本任务不改变插件接口。
+- 本文件第 1020 行“有权限的客户端仍需看到原始 Path”继续有效，`externalUrl` 字段保持不变。
+
+范围：
+
+- 仅 `GET /api/v1/items/{itemId}` 条目详情新增顶层字段 `path`，类型为字符串或 `null`。
+- `path` 为服务端 canonical 绝对路径：普通条目为其主视频文件；`.strm` 条目为已索引的 `.strm` 文件路径。
+  与 Emby 条目 `Path` 语义一致，但不复用 Emby DTO。
+- 只有该条目对当前用户可见（既有媒体库 ACL）时才返回；无权或不存在仍按既有 404 边界处理，不新增探测面。
+- 列表、搜索、卡片、继续观看等接口不新增 `path`，列表 payload 保持不变。
+- 无本地文件（如仅 SMB/FTP/URL 且无已索引文件）时返回 `null`，不伪造路径。
+- 不写入数据库、不迁移、不改变扫描；路径只来自已有文件系统索引。
+- 日志不得输出该字段；测试路径使用临时目录。
+
+不做：列表字段、管理员专用路径接口、Web 展示页面、写入或修改路径、Emby DTO 变更。
+
+验收：
+
+- [x] 有权限用户的条目详情返回 `path`，值为规范化绝对路径（`lux_item_detail_exposes_local_file_path_only_to_authorized_viewers`）；STRM 条目返回 `.strm` 文件路径（由共用存储查询推导，尚无专门集成测试，留作后续补充）。
+- [x] 无权限用户或不存在条目沿用既有 ACL/404 行为，不返回 `path`。
+- [ ] 无本地文件的条目返回 `null`（代码路径已实现，尚无专门测试）。
+- [x] 列表与搜索接口 JSON 不变（列表回归断言）。
+- [x] `docs/API.md` 记录字段语义与 ACL 规则。
+- [x] 相关 `cargo test --locked --test library catalog::`、`--lib` 过滤、fmt、clippy 通过。
+
+预计文件：`src/api/media.rs`、`src/application/catalog.rs`、`tests/library/catalog.rs`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`、`docs/TEST-TARGETS.md`。
 
 ## 31. 参考资料
 
