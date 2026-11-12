@@ -1,19 +1,14 @@
 use std::{
     fmt,
-    net::SocketAddr,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
-use reqwest::{Method, Response, Url, header::RANGE, redirect::Policy};
 use tokio::{fs, io::AsyncReadExt};
 
 use crate::{
-    application::remote_url_policy::{RemoteMediaUrlError, validate_and_resolve_remote_media_url},
     application::strm_target::{
         StrmLocalPathError, StrmTargetKind, canonical_local_strm_target, classify_strm_target,
     },
-    network::{NetworkProxyError, client_builder_from_env_or},
     storage::{Database, StorageError, StoredPlaybackSource},
 };
 
@@ -22,57 +17,29 @@ const MAX_STRM_BYTES: u64 = 8 * 1024;
 #[derive(Clone)]
 pub struct DownloadService {
     database: Database,
-    proxy_url: Option<String>,
 }
 
+/// A file Lux serves itself. URL and SMB/FTP `.strm` targets never become artifacts: the API
+/// layer redirects them to the client instead of relaying their bytes.
 #[derive(Debug)]
-pub enum DownloadArtifact {
-    LocalFile {
-        path: PathBuf,
-        file_name: String,
-    },
-    Remote {
-        url: Url,
-        address: SocketAddr,
-        file_name: String,
-    },
+pub struct DownloadArtifact {
+    path: PathBuf,
+    file_name: String,
 }
 
 impl DownloadArtifact {
-    pub fn local_path(&self) -> Option<&Path> {
-        match self {
-            Self::LocalFile { path, .. } => Some(path),
-            Self::Remote { .. } => None,
-        }
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn file_name(&self) -> &str {
-        match self {
-            Self::LocalFile { file_name, .. } | Self::Remote { file_name, .. } => file_name,
-        }
+        &self.file_name
     }
 }
 
 impl DownloadService {
     pub fn new(database: Database) -> Self {
-        Self {
-            database,
-            proxy_url: None,
-        }
-    }
-
-    pub fn new_with_proxy(
-        database: Database,
-        proxy_url: Option<String>,
-    ) -> Result<Self, DownloadError> {
-        client_builder_from_env_or(proxy_url.as_deref())
-            .map_err(DownloadError::ProxyConfiguration)?
-            .build()
-            .map_err(|error| DownloadError::ClientBuild(error.to_string()))?;
-        Ok(Self {
-            database,
-            proxy_url,
-        })
+        Self { database }
     }
 
     pub async fn prepare(
@@ -161,67 +128,24 @@ impl DownloadService {
                         .and_then(|value| value.to_str())
                         .ok_or_else(|| DownloadError::InvalidFileName(target_path.clone()))?
                         .to_owned();
-                    Ok(DownloadArtifact::LocalFile {
+                    Ok(DownloadArtifact {
                         path: target_path,
                         file_name,
                     })
                 }
-                StrmTargetKind::Url => {
-                    let (url, address) = validate_and_resolve_remote_media_url(&strm_target)
-                        .await
-                        .map_err(DownloadError::RemoteUrl)?;
-                    let file_name = remote_file_name(&url).unwrap_or(file_name);
-                    Ok(DownloadArtifact::Remote {
-                        url,
-                        address,
-                        file_name,
-                    })
-                }
-                StrmTargetKind::Smb
+                // Redirected by the API layer before it reaches this point.
+                StrmTargetKind::Url
+                | StrmTargetKind::Smb
                 | StrmTargetKind::Ftp
                 | StrmTargetKind::Empty
                 | StrmTargetKind::Unsupported => Err(DownloadError::UnsupportedStrmTarget),
             }
         } else {
-            Ok(DownloadArtifact::LocalFile {
+            Ok(DownloadArtifact {
                 path: media_path,
                 file_name,
             })
         }
-    }
-
-    pub async fn fetch_remote(
-        &self,
-        artifact: &DownloadArtifact,
-        method: &Method,
-        range: Option<&str>,
-    ) -> Result<Response, DownloadError> {
-        let DownloadArtifact::Remote { url, address, .. } = artifact else {
-            return Err(DownloadError::RemoteRequest);
-        };
-        let host = url
-            .host_str()
-            .ok_or(DownloadError::RemoteUrl(RemoteMediaUrlError::Invalid))?;
-        let client = client_builder_from_env_or(self.proxy_url.as_deref())
-            .map_err(DownloadError::ProxyConfiguration)?
-            .redirect(Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(30))
-            .resolve(host, *address)
-            .build()
-            .map_err(|error| DownloadError::ClientBuild(error.to_string()))?;
-        let mut request = match *method {
-            Method::GET => client.get(url.clone()),
-            Method::HEAD => client.head(url.clone()),
-            _ => return Err(DownloadError::RemoteRequest),
-        };
-        if let Some(range) = range {
-            request = request.header(RANGE, range);
-        }
-        request
-            .send()
-            .await
-            .map_err(|_| DownloadError::RemoteRequest)
     }
 }
 
@@ -232,29 +156,15 @@ async fn read_strm_target(path: &Path) -> Result<String, DownloadError> {
         .read_to_end(&mut contents)
         .await?;
     if contents.len() as u64 > MAX_STRM_BYTES {
-        return Err(DownloadError::RemoteUrl(RemoteMediaUrlError::Invalid));
+        return Err(DownloadError::UnsupportedStrmTarget);
     }
-    let contents = String::from_utf8(contents)
-        .map_err(|_| DownloadError::RemoteUrl(RemoteMediaUrlError::Invalid))?;
+    let contents = String::from_utf8(contents).map_err(|_| DownloadError::UnsupportedStrmTarget)?;
     contents
         .lines()
         .map(|line| line.trim_start_matches('\u{feff}').trim())
         .find(|line| !line.is_empty())
         .map(str::to_owned)
-        .ok_or(DownloadError::RemoteUrl(RemoteMediaUrlError::Invalid))
-}
-
-fn remote_file_name(url: &Url) -> Option<String> {
-    url.path_segments()
-        .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
-        .filter(|segment| {
-            *segment != "."
-                && *segment != ".."
-                && segment.chars().all(|character| {
-                    !character.is_control() && !matches!(character, '/' | '\\' | '"')
-                })
-        })
-        .map(str::to_owned)
+        .ok_or(DownloadError::UnsupportedStrmTarget)
 }
 
 pub(crate) fn is_matching_sidecar(selected_name: &str, candidate_name: &str) -> bool {
@@ -306,11 +216,7 @@ pub enum DownloadError {
     PathOutsideRoot(PathBuf),
     Io(std::io::Error),
     Storage(StorageError),
-    ProxyConfiguration(NetworkProxyError),
-    ClientBuild(String),
-    RemoteUrl(RemoteMediaUrlError),
     UnsupportedStrmTarget,
-    RemoteRequest,
 }
 
 impl fmt::Display for DownloadError {
@@ -327,21 +233,7 @@ impl fmt::Display for DownloadError {
             ),
             Self::Io(error) => write!(formatter, "download file operation failed: {error}"),
             Self::Storage(error) => error.fmt(formatter),
-            Self::ProxyConfiguration(_) => {
-                formatter.write_str("download proxy configuration is invalid")
-            }
-            Self::ClientBuild(_) => formatter.write_str("download client could not be created"),
-            Self::RemoteUrl(error) => match error {
-                RemoteMediaUrlError::Invalid => formatter.write_str("STRM remote URL is invalid"),
-                RemoteMediaUrlError::BlockedHost => {
-                    formatter.write_str("STRM remote host is blocked")
-                }
-                RemoteMediaUrlError::ResolutionFailed => {
-                    formatter.write_str("STRM remote host could not be resolved")
-                }
-            },
             Self::UnsupportedStrmTarget => formatter.write_str("STRM target is not downloadable"),
-            Self::RemoteRequest => formatter.write_str("STRM remote request failed"),
         }
     }
 }
@@ -357,12 +249,6 @@ impl From<std::io::Error> for DownloadError {
 impl From<StorageError> for DownloadError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
-    }
-}
-
-impl From<NetworkProxyError> for DownloadError {
-    fn from(error: NetworkProxyError) -> Self {
-        Self::ProxyConfiguration(error)
     }
 }
 

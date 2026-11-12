@@ -37,7 +37,7 @@ use crate::{
     application::danmaku::{DanmakuService, DanmakuServiceError, DanmakuSidecarScope},
     application::database_setup::{DatabaseSetupError, DatabaseSetupService},
     application::deletion::{MediaDeleteError, MediaDeleteService},
-    application::downloads::{DownloadArtifact, DownloadError, DownloadService},
+    application::downloads::{DownloadError, DownloadService},
     application::embedded_subtitle::EmbeddedSubtitleService,
     application::home::{HomeError, HomeService},
     application::playback::decision::{PlaybackCapabilities, PlaybackSourceKind, ServerTier},
@@ -1107,8 +1107,7 @@ impl AppState {
                 database.clone(),
                 config_dir.clone(),
             ),
-            downloads: DownloadService::new_with_proxy(database.clone(), network_proxy_url.clone())
-                .ok(),
+            downloads: Some(DownloadService::new(database.clone())),
             // STRM targets can be internal NAS services. This resolver is
             // deliberately outside the global proxy configuration.
             strm_playback: StrmPlaybackResolver::new().ok(),
