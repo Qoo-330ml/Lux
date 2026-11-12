@@ -1395,9 +1395,8 @@ TMDb 插件可选启用“原语言”模式。电影和剧集的标题优先使
 - 客户端断开时及时取消读取。
 - 不在日志中记录含令牌的完整 URL。
 - 路径必须由数据库中的 source ID 解析，客户端不能提交任意磁盘路径。
-- `.strm` 下载读取首个非空 URL，使用上游 GET/HEAD 和单 Range 流式转发；不转发入站 Authorization/Cookie，不自动跟随重定向。
-- Emby 兼容下载入口（`/Items/{Id}/Download`）与播放入口走同一条 `.strm` 路线，只多 `can_download` 检查：URL 型直接 302 到原始目标（不做 SSRF 校验、不预探测，内网地址也原样交接），SMB/FTP 经插件解析器解析后 302，路径型按本地文件由 Lux 提供；均不转发上游媒体字节，避免双倍流量。Lux 自有 `/api/v1/items/{id}/download` 使用同一规则（Web 以 `<a href download>` 导航触发，浏览器跟随 302）；上文的上游流式转发仅作为 `DownloadService` 的内部能力保留，不再被这两个入口使用。
-- `.strm` 下载的 URL 仅允许 HTTP/HTTPS，拒绝凭据、fragment、localhost、元数据主机以及 DNS 解析到私网或保留地址的主机；连接和读取必须有超时。
+- `.strm` 下载读取首个非空行并按目标类型分流：URL 型直接 302 到原始目标，SMB/FTP 经插件解析器后 302，路径型按本地文件由 Lux 提供；Lux 不对 URL 型目标做上游流式转发，也不访问目标、不做 SSRF 校验。
+- Emby 兼容下载入口（`/Items/{Id}/Download`）与 Lux 自有入口（`/api/v1/items/{id}/download`）共用播放同款 `.strm` 路线，只多 `can_download` 检查：URL 型原样 302（内网地址也原样交接），SMB/FTP 经插件解析器后 302，路径型由 Lux 提供本地文件；均不转发上游媒体字节，避免双倍流量。Web 以 `<a href download>` 导航触发，浏览器跟随 302。
 
 多 Range 可在实际客户端证明确有需要时加入；不要首版预先实现复杂 multipart/byteranges。
 
@@ -1406,7 +1405,7 @@ TMDb 插件可选启用“原语言”模式。电影和剧集的标题优先使
 - 读取文件的首个非空行并 trim BOM 与首尾空白，保存为原始播放目标。
 - 目标只做词法分类：HTTP(S) URL、路径、未知/其他目标；不在扫描或 PlaybackInfo 请求中访问目标。
 - URL 和路径型目标都保留原始 `Path`；`PlaybackInfo` 对这两类目标使用标准带短期 Lux 播放票据的 `DirectStreamUrl`，并使用 `Protocol=File`、`IsRemote=false` 的代理兼容表示。为兼容所有可能忽略 `AddApiKeyToDirectStreamUrl` 的第三方播放器，URL/路径型目标统一将该字段设为 `true`，并从本次标准 Emby 鉴权提取用户 token 作为 `api_key` 写入签名 URL；本地文件和 SMB/FTP 解析源不携带长期 token。无论该提示取值如何，Lux 都要求绑定用户、条目和媒体源的短期 HMAC 票据，由外部代理从原始 `Path` 执行映射或 302 解析。直接请求 Lux 时，路径型目标按本地文件处理，URL 型目标仍可由 Lux 使用入站播放器 User-Agent 有限跟随重定向并返回 307；该回退不改变扫描和 `PlaybackInfo` 不访问目标的边界，含 token 的兼容 URL 不得进入公开日志。
-- 下载路径按 LUX-091 使用独立的 URL 安全策略和上游流式转发，不能把路径型目标直接当作远程 URL 请求。
+- 下载路径对 URL 型目标只做重定向交接，不能把路径型目标直接当作远程 URL 请求。
 
 ### 14.3 PlaybackInfo
 
