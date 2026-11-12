@@ -139,6 +139,11 @@ async fn download_returns_selected_local_and_strm_sources_without_archiving()
         b"http://1.1.1.1/Remote.Movie.2024.mkv\nignored\n",
     )
     .await?;
+    tokio::fs::write(
+        root.join("Lan.Movie.2024.strm"),
+        b"http://192.168.1.50:5244/d/Lan.Movie.2024.mkv?sign=abc\n",
+    )
+    .await?;
     libraries
         .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
         .await?;
@@ -163,6 +168,16 @@ async fn download_returns_selected_local_and_strm_sources_without_archiving()
          WHERE fe.relative_path = ?",
     )
     .bind("Remote.Movie.2024.strm")
+    .fetch_one(database.pool())
+    .await?;
+    let (lan_item_id, lan_source_id): (String, String) = sqlx::query_as(
+        "SELECT mi.id, ms.id
+         FROM media_items mi
+         JOIN media_sources ms ON ms.item_id = mi.id
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path = ?",
+    )
+    .bind("Lan.Movie.2024.strm")
     .fetch_one(database.pool())
     .await?;
     sqlx::query("UPDATE users SET can_download = 1 WHERE username_normalized = 'admin'")
@@ -375,22 +390,48 @@ async fn download_returns_selected_local_and_strm_sources_without_archiving()
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(response.headers()["content-type"], "video/x-matroska");
 
-    let response = client
-        .get(format!("{base_url}/Items/{remote_item_id}/Download"))
+    // Emby clients can follow a redirect themselves, so the URL-type `.strm` download hands the
+    // original target to the client instead of relaying the bytes through Lux.
+    let no_redirect_client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("test client");
+    for method in [reqwest::Method::GET, reqwest::Method::HEAD] {
+        let response = no_redirect_client
+            .request(
+                method,
+                format!("{base_url}/Items/{remote_item_id}/Download"),
+            )
+            .query(&[
+                ("api_key", emby_token.as_str()),
+                ("mediaSourceId", remote_source_id.as_str()),
+            ])
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        assert_eq!(
+            response.headers()["location"],
+            "http://1.1.1.1/Remote.Movie.2024.mkv"
+        );
+        assert!(response.bytes().await?.is_empty());
+    }
+
+    // Like playback, the redirect is not gated on the target's address: LAN targets are handed
+    // over untouched for the client or an external proxy to resolve.
+    let response = no_redirect_client
+        .get(format!("{base_url}/Items/{lan_item_id}/Download"))
         .query(&[
             ("api_key", emby_token.as_str()),
-            ("mediaSourceId", remote_source_id.as_str()),
+            ("mediaSourceId", lan_source_id.as_str()),
         ])
         .send()
         .await?;
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(response.headers()["content-type"], "video/x-matroska");
-    assert!(
-        response.headers()["content-disposition"]
-            .to_str()?
-            .contains("Remote.Movie.2024.mkv")
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+    assert_eq!(
+        response.headers()["location"],
+        "http://192.168.1.50:5244/d/Lan.Movie.2024.mkv?sign=abc"
     );
-    assert_eq!(response.bytes().await?.as_ref(), b"remote video data");
 
     server.abort();
     proxy_task.abort();
