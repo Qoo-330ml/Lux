@@ -2,6 +2,18 @@ import type { ChangelogRelease } from "../types";
 
 export const changelogReleases07: ChangelogRelease[] = [
   {
+    version: "0.7.18",
+    date: "2026-11-12",
+    sections: [
+      { kind: "added", items: [
+        "✨ feat(emby): Emby 下载 .strm 不再由 Lux 中转 — Emby 客户端点下载时，以前 Lux 会把上游字节再转发一遍，出口流量直接翻倍。现在 .strm 条目和播放走同一条路：URL 型目标直接 302 到原始地址，SMB/FTP 目标先交给插件解析再 302，路径型和本地文件仍由 Lux 从磁盘给。网页的下载按钮不变，还是走 Lux 的流式转发。",
+      ] },
+      { kind: "fixed", items: [
+        "🐛 fix(web): 季度页的分集卡片改用 360 的图 — 季度详情里那排分集卡片其实很小，以前却和季海报一样请求 720 的图，白白多下几倍数据。现在分集卡片请求 360 变体，没有横图就退回 360 的海报；季海报和剧照还是 720，详情页的海报与背景图不变。",
+      ] },
+    ],
+  },
+  {
     version: "0.7.17",
     date: "2026-11-11",
     sections: [
