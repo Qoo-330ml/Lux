@@ -23,7 +23,7 @@ export function AdminChangelogPage() {
 
       <div className="lux-changelog-intro">
         <div className="lux-changelog-intro-line" aria-hidden="true"><GitBranch size={16} /></div>
-        <p>从 <strong>0.1.0</strong> 开始，按版本倒序整理项目主要的用户可见变化。</p>
+        <p>从 <strong>0.1.0</strong> 开始，按版本倒序整理项目主要的用户可见变化，条目按 git-cz 类型标注。</p>
         <span>{changelogReleases.length} 个版本</span>
       </div>
 
