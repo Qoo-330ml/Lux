@@ -41,10 +41,15 @@ impl Database {
         transaction.commit().await.map_err(self.sqlx_err())
     }
 
-    pub(crate) async fn has_active_strm_probe_jobs(&self) -> Result<bool, StorageError> {
+    /// Whether a library-wide job is active.
+    ///
+    /// Playback-triggered jobs are single-source and short-lived; they must neither block a new
+    /// bulk job nor count as the library-wide job that such a job would duplicate.
+    pub(crate) async fn has_active_bulk_strm_probe_jobs(&self) -> Result<bool, StorageError> {
         self.query_scalar(
             "SELECT CASE WHEN EXISTS(
-                SELECT 1 FROM strm_probe_jobs WHERE status IN ('PENDING', 'RUNNING')
+                SELECT 1 FROM strm_probe_jobs
+                WHERE status IN ('PENDING', 'RUNNING') AND target_source_id IS NULL
             ) THEN 1 ELSE 0 END",
         )
         .fetch_one(&self.pool)

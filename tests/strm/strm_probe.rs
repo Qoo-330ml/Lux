@@ -783,9 +783,6 @@ async fn playback_probe_fills_only_missing_info_even_when_policy_overwrites()
     let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)
         .await?;
-    let unselected_library = libraries
-        .create_library("Unselected", LibraryKind::Movie, false)
-        .await?;
     libraries
         .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
         .await?;
@@ -867,34 +864,6 @@ async fn playback_probe_fills_only_missing_info_even_when_policy_overwrites()
             .await?,
         0,
         "disabled media-info extraction must not enqueue a playback probe"
-    );
-
-    plugins
-        .update_dynamic_config(
-            MEDIA_INFO_PLUGIN_ID,
-            serde_json::Map::from_iter([
-                (
-                    "libraryIds".to_owned(),
-                    json!([unselected_library.id.to_string()]),
-                ),
-                ("concurrency".to_owned(), json!(2)),
-                ("mediaInfoEnabled".to_owned(), json!(true)),
-                ("thumbnailEnabled".to_owned(), json!(false)),
-                ("thumbnailPositionPercent".to_owned(), json!(30)),
-                ("existingInfoPolicy".to_owned(), json!("OVERWRITE")),
-                ("writeSidecars".to_owned(), json!(false)),
-                ("schedule".to_owned(), json!("0 3 * * *")),
-            ]),
-        )
-        .await?;
-    assert!(service.schedule_playback_probe(&missing_item_id, &missing_source_id));
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM strm_probe_jobs")
-            .fetch_one(database.pool())
-            .await?,
-        0,
-        "an unselected media library must not enqueue a playback probe"
     );
 
     plugins.set_enabled(MEDIA_INFO_PLUGIN_ID, false).await?;
@@ -990,47 +959,25 @@ async fn playback_probe_fills_only_missing_info_even_when_policy_overwrites()
         .await?;
     assert!(service.schedule_playback_probe(&missing_item_id, &missing_source_id));
     assert!(!service.schedule_playback_probe(&missing_item_id, &missing_source_id));
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM strm_probe_jobs WHERE status IN ('PENDING', 'RUNNING')",
-        )
-        .fetch_one(database.pool())
-        .await?,
-        1,
-        "playback-triggered work must wait behind the existing job"
-    );
-    sqlx::query(
-        "UPDATE strm_probe_jobs SET status = 'COMPLETED', finished_at = unixepoch() WHERE id = ?",
-    )
-    .bind(&blocker[0].id)
-    .execute(database.pool())
-    .await?;
     let mut finished_job = None;
     for _ in 0..250 {
-        let job: Option<(String, String, Option<String>, i64, i64)> = sqlx::query_as(
-            "SELECT id, status, target_source_id, include_ready, thumbnail_enabled
+        let job: Option<(String, String, Option<String>, i64, i64, i64)> = sqlx::query_as(
+            "SELECT id, status, target_source_id, include_ready, thumbnail_enabled, concurrency
              FROM strm_probe_jobs WHERE target_source_id = ?
              ORDER BY created_at DESC, id DESC LIMIT 1",
         )
         .bind(&missing_source_id)
         .fetch_optional(database.pool())
         .await?;
-        if let Some((id, status, target_source_id, include_ready, thumbnail_enabled)) = job
-            && matches!(status.as_str(), "COMPLETED" | "FAILED")
+        if let Some(row) = job
+            && matches!(row.1.as_str(), "COMPLETED" | "FAILED")
         {
-            finished_job = Some((
-                id,
-                status,
-                target_source_id,
-                include_ready,
-                thumbnail_enabled,
-            ));
+            finished_job = Some(row);
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    let (_, status, target_source_id, include_ready, thumbnail_enabled) =
+    let (_, status, target_source_id, include_ready, thumbnail_enabled, concurrency) =
         finished_job.ok_or("playback-triggered STRM job did not finish")?;
     assert_eq!(status, "COMPLETED");
     assert_eq!(
@@ -1039,6 +986,18 @@ async fn playback_probe_fills_only_missing_info_even_when_policy_overwrites()
     );
     assert_eq!(include_ready, 0);
     assert_eq!(thumbnail_enabled, 0);
+    assert_eq!(
+        concurrency, 1,
+        "playback probes add one plugin slot next to the bulk job"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM strm_probe_jobs WHERE id = ?")
+            .bind(&blocker[0].id)
+            .fetch_one(database.pool())
+            .await?,
+        "PENDING",
+        "a queued bulk job must not hold the played source back"
+    );
 
     let metadata: Vec<(String, Option<String>, i64)> = sqlx::query_as(
         "SELECT ms.id, ms.container,
@@ -1060,6 +1019,165 @@ async fn playback_probe_fills_only_missing_info_even_when_policy_overwrites()
     assert_eq!(
         metadata_by_source.get(&missing_source_id),
         Some(&(Some("matroska".to_owned()), 2))
+    );
+
+    database.close().await;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn playback_probe_ignores_the_plugin_library_selection()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    let plugin_dir = config_dir.join("plugins/org.lux.strm-media-info");
+    let binary_dir = plugin_dir.join("binaries");
+    tokio::fs::create_dir_all(&binary_dir).await?;
+    write_fake_media_probe_plugin(&binary_dir.join("plugin"), "h264")?;
+    fs::write(
+        plugin_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "formatVersion": 1,
+            "id": MEDIA_INFO_PLUGIN_ID,
+            "name": "strm媒体信息提取",
+            "version": "1.0.0",
+            "apiVersion": 1,
+            "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+            "type": "media_probe",
+            "category": "MEDIA",
+            "capabilities": ["media.probe"],
+            "configFields": [
+                {"key": "libraryIds", "label": "媒体库", "type": "select", "multiple": true, "required": true, "optionsSource": "media-libraries"},
+                {"key": "concurrency", "label": "并发数", "type": "number", "required": true, "defaultValue": 2, "minimum": 1, "maximum": 64},
+                {"key": "mediaInfoEnabled", "label": "提取媒体信息", "type": "toggle", "defaultValue": true},
+                {"key": "thumbnailEnabled", "label": "补全 STRM 缩略图", "type": "toggle", "defaultValue": false},
+                {"key": "thumbnailPositionPercent", "label": "缩略图位置", "type": "number", "required": true, "defaultValue": 30, "minimum": 1, "maximum": 99},
+                {"key": "existingInfoPolicy", "label": "已有媒体信息处理方式", "type": "select", "defaultValue": "SKIP", "options": [{"value": "SKIP", "label": "跳过已有媒体信息"}, {"value": "OVERWRITE", "label": "覆盖已有媒体信息"}]},
+                {"key": "writeSidecars", "label": "写入旁车", "type": "toggle", "defaultValue": false},
+                {"key": "schedule", "label": "执行计划", "type": "text", "required": true, "defaultValue": "0 3 * * *"}
+            ],
+            "permissions": {"network": ["media-source"], "filesystem": []},
+            "files": []
+        }))?,
+    )?;
+
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = luxd::application::libraries::LibraryService::new(database.clone());
+    let played_library = libraries
+        .create_library("Played", LibraryKind::Movie, false)
+        .await?;
+    let selected_library = libraries
+        .create_library("Selected", LibraryKind::Movie, false)
+        .await?;
+    let played_root = temp_dir.path().join("Played");
+    tokio::fs::create_dir_all(&played_root).await?;
+    tokio::fs::write(
+        played_root.join("Played.Movie.2024.strm"),
+        "https://media.example.invalid/played.mkv",
+    )
+    .await?;
+    libraries
+        .add_root(
+            played_library.id,
+            played_root.to_str().ok_or("non-utf8 path")?,
+        )
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(played_library.id)
+        .await?;
+    let (played_item_id, played_source_id): (String, String) = sqlx::query_as(
+        "SELECT ms.item_id, ms.id FROM media_sources ms
+         JOIN media_items mi ON mi.id = ms.item_id
+         WHERE ms.source_kind = 'STRM_URL' AND mi.library_id = ?",
+    )
+    .bind(played_library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+
+    let plugins = PluginService::new(database.clone(), config_dir);
+    plugins.install(MEDIA_INFO_PLUGIN_ID).await?;
+    plugins
+        .update_dynamic_config(
+            MEDIA_INFO_PLUGIN_ID,
+            serde_json::Map::from_iter([
+                (
+                    "libraryIds".to_owned(),
+                    json!([selected_library.id.to_string()]),
+                ),
+                ("concurrency".to_owned(), json!(2)),
+                ("mediaInfoEnabled".to_owned(), json!(true)),
+                ("thumbnailEnabled".to_owned(), json!(false)),
+                ("thumbnailPositionPercent".to_owned(), json!(30)),
+                ("existingInfoPolicy".to_owned(), json!("OVERWRITE")),
+                ("writeSidecars".to_owned(), json!(true)),
+                ("schedule".to_owned(), json!("0 3 * * *")),
+            ]),
+        )
+        .await?;
+    let service = StrmProbeService::new(database.clone(), plugins.clone());
+
+    // A queued bulk job counts as active work for the configured libraries; the source the user
+    // actually played lives in an unselected library and must still be probed right away.
+    sqlx::query(
+        "INSERT INTO strm_probe_jobs (
+             id, operation_id, library_id, status, concurrency,
+             include_ready, write_sidecars, media_info_enabled,
+             thumbnail_enabled, thumbnail_position_percent, total_count, updated_at
+         ) VALUES ('playback-scope-blocker', 'op', ?, 'RUNNING', 2, 0, 0, 1, 0, 30, 0, unixepoch())",
+    )
+    .bind(selected_library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    assert!(service.schedule_playback_probe(&played_item_id, &played_source_id));
+    let mut finished = None;
+    for _ in 0..250 {
+        let job: Option<(String, i64, i64)> = sqlx::query_as(
+            "SELECT status, concurrency, write_sidecars FROM strm_probe_jobs
+             WHERE target_source_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(&played_source_id)
+        .fetch_optional(database.pool())
+        .await?;
+        if let Some((status, concurrency, write_sidecars)) = job
+            && matches!(status.as_str(), "COMPLETED" | "FAILED")
+        {
+            finished = Some((status, concurrency, write_sidecars));
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let (status, concurrency, write_sidecars) =
+        finished.ok_or("unselected library playback probe did not run")?;
+    assert_eq!(status, "COMPLETED");
+    assert_eq!(concurrency, 1, "playback probes add a single plugin slot");
+    assert_eq!(
+        write_sidecars, 1,
+        "playback follows the plugin's sidecar setting"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT duration_ticks FROM media_sources WHERE id = ?",
+        )
+        .bind(&played_source_id)
+        .fetch_one(database.pool())
+        .await?,
+        Some(125_000_000),
+        "the probe must persist media info in the unselected library"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM strm_probe_jobs WHERE id = 'playback-scope-blocker'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        "RUNNING",
+        "the bulk job keeps running and is not consumed by the playback probe"
     );
 
     database.close().await;

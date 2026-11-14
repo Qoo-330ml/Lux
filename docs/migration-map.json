@@ -899,6 +899,11 @@
       "name": "media_item_facets_tag",
       "sqlite": 249,
       "postgres": 249
+    },
+    {
+      "name": "playback_probe_jobs_concurrent_scope",
+      "sqlite": 250,
+      "postgres": 250
     }
   ],
   "sqlite_only": [
@@ -1251,7 +1256,7 @@
     }
   ],
   "ordering": {
-    "shared_names": 180,
+    "shared_names": 181,
     "rank_mismatches": 84,
     "note": "Migration histories evolved with different SQLite-only/PostgreSQL-only interleaving, so the shared names are not in the same relative order. New migrations must keep a pair adjacent in both directories, which keeps this count from growing."
   }
