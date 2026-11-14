@@ -1,14 +1,17 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
-    sync::Arc,
+    sync::{Arc, OnceLock, Weak},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::{sync::Semaphore, task::JoinSet};
+use tokio::{
+    sync::{Mutex, OwnedMutexGuard, Semaphore},
+    task::JoinSet,
+};
 
 use crate::{
     application::{
@@ -57,6 +60,28 @@ const CAPABILITY_EXTERNAL_IDS: &str = "EXTERNAL_IDS";
 const CAPABILITY_TRAILERS: &str = "TRAILERS";
 const CANDIDATE_METADATA_DETAILS_VERSION: u64 = 2;
 const COMPLETENESS_INPUT_VERSION: u64 = 1;
+
+static METADATA_SELECTION_ITEM_LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> =
+    OnceLock::new();
+
+/// Serializes the complete read/write/select sequence for one item across every service clone.
+/// The database update remains the final cross-process guard; this lock prevents another Lux
+/// writer in the same process from turning an ordinary concurrent confirmation into an NFO race.
+async fn acquire_metadata_selection_lock(item_id: &str) -> OwnedMutexGuard<()> {
+    let locks = METADATA_SELECTION_ITEM_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let lock = {
+        let mut locks = locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(item_id).and_then(Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(Mutex::new(()));
+            locks.insert(item_id.to_owned(), Arc::downgrade(&lock));
+            lock
+        }
+    };
+    lock.lock_owned().await
+}
 
 /// Capability and image attempt history for one item.
 ///
@@ -3124,6 +3149,7 @@ impl MetadataSelectionService {
         mode: MetadataSelectionMode,
         options: MetadataSelectionOptions<'_>,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
+        let _selection_guard = acquire_metadata_selection_lock(item_id).await;
         let fetched_current;
         let current = match options.current {
             Some(current) => current,
