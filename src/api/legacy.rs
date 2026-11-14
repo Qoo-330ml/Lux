@@ -2660,6 +2660,21 @@ mod tests {
                 "SCRAPER_UNAVAILABLE",
             ),
             (
+                MetadataCandidateError::ScraperFailed(Vec::new()),
+                MetadataCandidateFailureKind::ScraperUnavailable,
+                "SCRAPER_UNAVAILABLE",
+            ),
+            (
+                MetadataCandidateError::ScraperNotConfigured,
+                MetadataCandidateFailureKind::ScraperNotConfigured,
+                "SCRAPER_NOT_CONFIGURED",
+            ),
+            (
+                MetadataCandidateError::VideoItemUnsupported,
+                MetadataCandidateFailureKind::ScraperNotConfigured,
+                "SCRAPER_NOT_CONFIGURED",
+            ),
+            (
                 MetadataCandidateError::Storage(StorageError::LastManager),
                 MetadataCandidateFailureKind::StorageUnavailable,
                 "STORAGE_UNAVAILABLE",
@@ -2672,6 +2687,214 @@ mod tests {
             assert_eq!(kind.as_str(), expected_label);
             assert!(!kind.as_str().contains("secret detail"));
         }
+    }
+
+    #[tokio::test]
+    async fn metadata_candidate_errors_name_the_real_scraper_cause() {
+        use crate::application::candidates::ScraperAttemptFailure;
+        use crate::application::scraper::ScraperFailureCause;
+
+        fn attempt(
+            scraper_id: &str,
+            label: Option<&str>,
+            cause: ScraperFailureCause,
+        ) -> MetadataCandidateError {
+            MetadataCandidateError::ScraperFailed(vec![ScraperAttemptFailure {
+                scraper_id: scraper_id.to_owned(),
+                label: label.map(str::to_owned),
+                cause,
+            }])
+        }
+
+        async fn body_of(error: MetadataCandidateError) -> (StatusCode, serde_json::Value) {
+            let response = metadata_candidate_error(&HeaderMap::new(), error);
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("metadata candidate error body should be readable");
+            let body = serde_json::from_slice(&body).expect("metadata candidate error is JSON");
+            (status, body)
+        }
+
+        let cases = vec![
+            (
+                MetadataCandidateError::ScraperNotConfigured,
+                StatusCode::CONFLICT,
+                "PLUGIN_UNAVAILABLE",
+                "还没有可用的元数据刮削器",
+            ),
+            (
+                MetadataCandidateError::VideoItemUnsupported,
+                StatusCode::CONFLICT,
+                "INVALID_REQUEST",
+                "家庭视频",
+            ),
+            (
+                attempt(
+                    "org.lux.tmdb",
+                    Some("TMDb 元数据插件"),
+                    ScraperFailureCause::PluginNotInstalled,
+                ),
+                StatusCode::CONFLICT,
+                "PLUGIN_UNAVAILABLE",
+                "未安装",
+            ),
+            (
+                attempt(
+                    "org.lux.tmdb",
+                    Some("TMDb 元数据插件"),
+                    ScraperFailureCause::PluginDisabled,
+                ),
+                StatusCode::CONFLICT,
+                "PLUGIN_UNAVAILABLE",
+                "已停用或不可用",
+            ),
+            (
+                attempt(
+                    "org.lux.tmdb",
+                    Some("TMDb 元数据插件"),
+                    ScraperFailureCause::PluginConfigInvalid,
+                ),
+                StatusCode::CONFLICT,
+                "PLUGIN_UNAVAILABLE",
+                "配置未完成",
+            ),
+            (
+                attempt(
+                    "org.lux.tmdb",
+                    Some("TMDb 元数据插件"),
+                    ScraperFailureCause::UnsupportedCapability,
+                ),
+                StatusCode::CONFLICT,
+                "PLUGIN_UNAVAILABLE",
+                "不支持元数据搜索",
+            ),
+            (
+                attempt(
+                    "org.lux.tmdb",
+                    Some("TMDb 元数据插件"),
+                    ScraperFailureCause::UpstreamAuthFailed,
+                ),
+                StatusCode::CONFLICT,
+                "PLUGIN_UNAVAILABLE",
+                "鉴权失败",
+            ),
+            (
+                attempt(
+                    "org.lux.tmdb",
+                    Some("TMDb 元数据插件"),
+                    ScraperFailureCause::PluginTimeout,
+                ),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "PLUGIN_UNAVAILABLE",
+                "请求超时",
+            ),
+            (
+                attempt(
+                    "org.lux.tmdb",
+                    Some("TMDb 元数据插件"),
+                    ScraperFailureCause::UpstreamTimeout,
+                ),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "PLUGIN_UNAVAILABLE",
+                "请求超时",
+            ),
+            (
+                attempt(
+                    "org.lux.tmdb",
+                    Some("TMDb 元数据插件"),
+                    ScraperFailureCause::UpstreamRateLimited,
+                ),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "PLUGIN_UNAVAILABLE",
+                "限流",
+            ),
+            (
+                attempt(
+                    "org.lux.tmdb",
+                    Some("TMDb 元数据插件"),
+                    ScraperFailureCause::UpstreamUnavailable,
+                ),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "PLUGIN_UNAVAILABLE",
+                "网络或代理",
+            ),
+            (
+                attempt(
+                    "org.lux.tmdb",
+                    Some("TMDb 元数据插件"),
+                    ScraperFailureCause::PluginExited,
+                ),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "PLUGIN_UNAVAILABLE",
+                "进程已退出",
+            ),
+            (
+                attempt(
+                    "org.lux.tmdb",
+                    Some("TMDb 元数据插件"),
+                    ScraperFailureCause::PluginStartFailed,
+                ),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "PLUGIN_UNAVAILABLE",
+                "启动失败",
+            ),
+            (
+                attempt(
+                    "org.lux.tmdb",
+                    Some("TMDb 元数据插件"),
+                    ScraperFailureCause::InvalidResponse,
+                ),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "PLUGIN_UNAVAILABLE",
+                "无法解析",
+            ),
+            (
+                attempt(
+                    "org.lux.tmdb",
+                    Some("TMDb 元数据插件"),
+                    ScraperFailureCause::PluginInternal,
+                ),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "PLUGIN_UNAVAILABLE",
+                "内部错误",
+            ),
+            (
+                attempt(
+                    "org.lux.tmdb",
+                    Some("TMDb 元数据插件"),
+                    ScraperFailureCause::Storage,
+                ),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "DATABASE_UNAVAILABLE",
+                "数据库",
+            ),
+        ];
+
+        for (error, expected_status, expected_code, expected_fragment) in cases {
+            let (status, body) = body_of(error).await;
+            assert_eq!(status, expected_status);
+            assert_eq!(body["error"]["code"], expected_code);
+            let message = body["error"]["message"]
+                .as_str()
+                .expect("metadata candidate error message is a string");
+            assert!(
+                message.contains(expected_fragment),
+                "message {message:?} does not mention {expected_fragment:?}"
+            );
+            assert!(!message.contains("secret detail"));
+        }
+
+        let (_, body) = body_of(attempt(
+            "org.lux.tmdb",
+            Some("TMDb 元数据插件"),
+            ScraperFailureCause::PluginTimeout,
+        ))
+        .await;
+        assert_eq!(
+            body["error"]["message"],
+            "元数据刮削器「TMDb 元数据插件」请求超时，请稍后重试"
+        );
     }
 
     #[tokio::test]

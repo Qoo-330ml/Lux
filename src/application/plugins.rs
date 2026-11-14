@@ -2676,6 +2676,17 @@ impl PluginService {
             .map(|plugin| plugin.manifest.capabilities.clone())
     }
 
+    /// The manifest display name for a scraper id (a plugin id or a known alias).
+    ///
+    /// Only the host-owned catalog name is returned; unknown ids and blank names yield `None` so a
+    /// caller can fall back to a generic label instead of echoing arbitrary input.
+    pub(crate) async fn scraper_display_name(&self, scraper_id: &str) -> Option<String> {
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(scraper_id, &catalog);
+        let name = catalog.get(&plugin_id)?.manifest.name.trim();
+        (!name.is_empty()).then(|| name.to_owned())
+    }
+
     pub async fn restart(&self, plugin_id: &str) {
         let catalog = self.catalog_snapshot().await;
         let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);

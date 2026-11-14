@@ -487,8 +487,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        PluginServiceError, ScraperError, ScraperPluginClient, ScraperResolver,
-        ScraperSearchResult, declares_metadata_search, decode_bundle_response,
+        PluginServiceError, ScraperError, ScraperFailureCause, ScraperPluginClient,
+        ScraperResolver, ScraperSearchResult, declares_metadata_search, decode_bundle_response,
         decode_bundle_response_ref, decode_credits_response, decode_credits_response_ref,
         decode_images_response, decode_images_response_ref, decode_metadata_response,
         decode_metadata_response_ref, decode_search_response, decode_search_response_ref,
@@ -499,6 +499,120 @@ mod tests {
     use crate::{application::plugins::PluginService, config::Config, storage::Database};
     use serde_json::json;
     use tokio::sync::OnceCell;
+
+    #[test]
+    fn scraper_failure_cause_names_the_real_reason_without_plugin_text() {
+        let reported = |code: &str| {
+            ScraperError::Plugin(PluginServiceError::Runtime(PluginRuntimeError::Plugin {
+                code: code.to_owned(),
+                message: "https://api.example/3/search?api_key=secret".to_owned(),
+            }))
+        };
+        let cases = vec![
+            (
+                ScraperError::Provider("upstream failed".to_owned()),
+                ScraperFailureCause::ProviderFailed,
+                "PROVIDER_ERROR",
+            ),
+            (
+                ScraperError::UnsupportedCapability("metadata.search".to_owned()),
+                ScraperFailureCause::UnsupportedCapability,
+                "UNSUPPORTED_CAPABILITY",
+            ),
+            (
+                ScraperError::InvalidResponse("bad body".to_owned()),
+                ScraperFailureCause::InvalidResponse,
+                "SCRAPER_INVALID_RESPONSE",
+            ),
+            (
+                ScraperError::Plugin(PluginServiceError::UnknownPlugin("org.lux.tmdb".to_owned())),
+                ScraperFailureCause::PluginNotInstalled,
+                "PLUGIN_UNKNOWN",
+            ),
+            (
+                ScraperError::Plugin(PluginServiceError::Unavailable("org.lux.tmdb".to_owned())),
+                ScraperFailureCause::PluginDisabled,
+                "PLUGIN_UNAVAILABLE",
+            ),
+            (
+                ScraperError::Plugin(PluginServiceError::InvalidConfig),
+                ScraperFailureCause::PluginConfigInvalid,
+                "PLUGIN_CONFIG_INVALID",
+            ),
+            (
+                ScraperError::Plugin(PluginServiceError::Unsupported("metadata.search")),
+                ScraperFailureCause::PluginUnsupported,
+                "PLUGIN_UNSUPPORTED",
+            ),
+            (
+                ScraperError::Plugin(PluginServiceError::Runtime(PluginRuntimeError::Timeout)),
+                ScraperFailureCause::PluginTimeout,
+                "PLUGIN_TIMEOUT",
+            ),
+            (
+                ScraperError::Plugin(PluginServiceError::Runtime(PluginRuntimeError::Exited)),
+                ScraperFailureCause::PluginExited,
+                "PLUGIN_EXITED",
+            ),
+            (
+                ScraperError::Plugin(PluginServiceError::Runtime(PluginRuntimeError::Io(
+                    std::io::Error::other("spawn denied"),
+                ))),
+                ScraperFailureCause::PluginStartFailed,
+                "PLUGIN_IO_FAILED",
+            ),
+            (
+                reported("PLUGIN_TIMEOUT"),
+                ScraperFailureCause::UpstreamTimeout,
+                "PLUGIN_REPORTED_TIMEOUT",
+            ),
+            (
+                reported("PLUGIN_UNAVAILABLE"),
+                ScraperFailureCause::UpstreamUnavailable,
+                "PLUGIN_REPORTED_UNAVAILABLE",
+            ),
+            (
+                reported("PLUGIN_RATE_LIMITED"),
+                ScraperFailureCause::UpstreamRateLimited,
+                "PLUGIN_REPORTED_RATE_LIMITED",
+            ),
+            (
+                reported("PLUGIN_AUTH_FAILED"),
+                ScraperFailureCause::UpstreamAuthFailed,
+                "PLUGIN_REPORTED_AUTH_FAILED",
+            ),
+            (
+                reported("PLUGIN_PROVIDER_NOT_FOUND"),
+                ScraperFailureCause::UpstreamNotFound,
+                "PLUGIN_REPORTED_NOT_FOUND",
+            ),
+            (
+                reported("PLUGIN_INVALID_RESPONSE"),
+                ScraperFailureCause::UpstreamInvalidResponse,
+                "PLUGIN_REPORTED_INVALID_RESPONSE",
+            ),
+            (
+                reported("PLUGIN_INTERNAL_ERROR"),
+                ScraperFailureCause::PluginInternal,
+                "PLUGIN_REPORTED_INTERNAL_ERROR",
+            ),
+            (
+                reported("PLUGIN_SOMETHING_NEW"),
+                ScraperFailureCause::PluginReportedUnknown,
+                "PLUGIN_REPORTED_ERROR",
+            ),
+        ];
+
+        for (error, expected, expected_code) in cases {
+            let cause = ScraperFailureCause::from_error(&error);
+            assert_eq!(cause, expected, "{error}");
+            assert_eq!(cause.as_str(), expected_code);
+            // Only the stable host code is exposed; the plugin message (with an upstream URL and a
+            // key) must never reach a response body or a log field.
+            assert!(!cause.as_str().contains("api.example"));
+            assert!(!cause.as_str().contains("api_key"));
+        }
+    }
 
     #[test]
     fn selects_the_id_for_the_configured_scraper() {
@@ -1526,6 +1640,11 @@ impl ScraperResolver {
         }
     }
 
+    /// The plugin display name for a configured scraper, when the plugin catalog knows it.
+    pub(crate) async fn scraper_display_name(&self, scraper_id: &str) -> Option<String> {
+        self.plugins.scraper_display_name(scraper_id).await
+    }
+
     async fn resolve_configured_scrapers(
         &self,
         configured: &[StoredLibraryScraper],
@@ -1768,5 +1887,140 @@ impl std::error::Error for ScraperError {}
 impl From<StorageError> for ScraperError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
+    }
+}
+
+/// Stable, host-owned classification of a scraper failure.
+///
+/// Administrators get one specific reason instead of "the scraper is unavailable": was the plugin
+/// never installed, disabled, missing configuration, out of capabilities, timed out, crashed, or
+/// did the upstream reject the request? The variants are translated from [`ScraperError`] and from
+/// the plugin-reported codes documented in `docs/PLUGIN-SDK.md` §5.4, so neither an upstream URL nor
+/// a plugin-supplied message ever reaches a response body or a log line.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ScraperFailureCause {
+    /// The installed plugin does not declare the capability the host asked for.
+    UnsupportedCapability,
+    Storage,
+    /// A provider implementation reported a request failure without a stable plugin code.
+    ProviderFailed,
+    InvalidResponse,
+    PluginNotInstalled,
+    PluginDisabled,
+    PluginUnsupported,
+    PluginInvalidRequest,
+    PluginConfigInvalid,
+    PluginNotReady,
+    PluginInvalidResponse,
+    PluginAssetFailed,
+    PluginConfigIoFailed,
+    /// The plugin process could not be started (`RuntimeError::Io`).
+    PluginStartFailed,
+    PluginProtocolFailed,
+    PluginTimeout,
+    PluginExited,
+    PluginStoreFailed,
+    /// The plugin reported `PLUGIN_TIMEOUT` (upstream timeout inside the plugin).
+    UpstreamTimeout,
+    /// The plugin reported `PLUGIN_UNAVAILABLE` (upstream unreachable).
+    UpstreamUnavailable,
+    UpstreamRateLimited,
+    UpstreamAuthFailed,
+    UpstreamNotFound,
+    UpstreamInvalidResponse,
+    PluginInternal,
+    PluginReportedUnknown,
+}
+
+impl ScraperFailureCause {
+    pub fn from_error(error: &ScraperError) -> Self {
+        use crate::application::{plugin_runtime::PluginRuntimeError, plugins::PluginServiceError};
+
+        match error {
+            ScraperError::UnsupportedCapability(_) => Self::UnsupportedCapability,
+            ScraperError::Storage(_) => Self::Storage,
+            ScraperError::Provider(_) => Self::ProviderFailed,
+            ScraperError::InvalidResponse(_) => Self::InvalidResponse,
+            ScraperError::Plugin(error) => match error {
+                PluginServiceError::UnknownPlugin(_) => Self::PluginNotInstalled,
+                PluginServiceError::Unavailable(_) => Self::PluginDisabled,
+                PluginServiceError::Unsupported(_) => Self::PluginUnsupported,
+                PluginServiceError::InvalidRequest(_) => Self::PluginInvalidRequest,
+                PluginServiceError::InvalidConfig => Self::PluginConfigInvalid,
+                PluginServiceError::NoUpdate => Self::PluginNotReady,
+                PluginServiceError::InvalidResponse => Self::PluginInvalidResponse,
+                PluginServiceError::ImageAsset(_) => Self::PluginAssetFailed,
+                PluginServiceError::ConfigIo(_) => Self::PluginConfigIoFailed,
+                PluginServiceError::Runtime(error) => match error {
+                    PluginRuntimeError::UnknownPlugin(_) => Self::PluginNotInstalled,
+                    PluginRuntimeError::Io(_) => Self::PluginStartFailed,
+                    PluginRuntimeError::Json(_) | PluginRuntimeError::Protocol(_) => {
+                        Self::PluginProtocolFailed
+                    }
+                    PluginRuntimeError::Timeout => Self::PluginTimeout,
+                    PluginRuntimeError::Exited => Self::PluginExited,
+                    PluginRuntimeError::Plugin { code, .. } => Self::reported(code),
+                },
+                PluginServiceError::Store(_) => Self::PluginStoreFailed,
+                PluginServiceError::Storage(_) => Self::Storage,
+            },
+        }
+    }
+
+    /// Classifies the stable codes a plugin may return in `error.code`.
+    ///
+    /// Unknown codes stay generic: the host never echoes plugin-supplied text.
+    fn reported(code: &str) -> Self {
+        match code.trim().to_ascii_uppercase().as_str() {
+            "PLUGIN_TIMEOUT" => Self::UpstreamTimeout,
+            "PLUGIN_UNAVAILABLE" => Self::UpstreamUnavailable,
+            "PLUGIN_RATE_LIMITED" => Self::UpstreamRateLimited,
+            "PLUGIN_AUTH_FAILED" => Self::UpstreamAuthFailed,
+            "PLUGIN_PROVIDER_NOT_FOUND" | "NOT_FOUND" | "NOTFOUND" | "404" => {
+                Self::UpstreamNotFound
+            }
+            "PLUGIN_INVALID_RESPONSE" => Self::UpstreamInvalidResponse,
+            "PLUGIN_INVALID_REQUEST" => Self::PluginInvalidRequest,
+            "PLUGIN_INTERNAL_ERROR" => Self::PluginInternal,
+            _ => Self::PluginReportedUnknown,
+        }
+    }
+
+    /// The stable code used in logs and in job failure records.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedCapability => "UNSUPPORTED_CAPABILITY",
+            Self::Storage => "STORAGE_ERROR",
+            Self::ProviderFailed => "PROVIDER_ERROR",
+            Self::InvalidResponse => "SCRAPER_INVALID_RESPONSE",
+            Self::PluginNotInstalled => "PLUGIN_UNKNOWN",
+            Self::PluginDisabled => "PLUGIN_UNAVAILABLE",
+            Self::PluginUnsupported => "PLUGIN_UNSUPPORTED",
+            Self::PluginInvalidRequest => "PLUGIN_INVALID_REQUEST",
+            Self::PluginConfigInvalid => "PLUGIN_CONFIG_INVALID",
+            Self::PluginNotReady => "PLUGIN_NOT_READY",
+            Self::PluginInvalidResponse => "PLUGIN_INVALID_RESPONSE",
+            Self::PluginAssetFailed => "PLUGIN_ASSET_FAILED",
+            Self::PluginConfigIoFailed => "PLUGIN_CONFIG_IO_FAILED",
+            Self::PluginStartFailed => "PLUGIN_IO_FAILED",
+            Self::PluginProtocolFailed => "PLUGIN_PROTOCOL_FAILED",
+            Self::PluginTimeout => "PLUGIN_TIMEOUT",
+            Self::PluginExited => "PLUGIN_EXITED",
+            Self::PluginStoreFailed => "PLUGIN_STORE_FAILED",
+            Self::UpstreamTimeout => "PLUGIN_REPORTED_TIMEOUT",
+            Self::UpstreamUnavailable => "PLUGIN_REPORTED_UNAVAILABLE",
+            Self::UpstreamRateLimited => "PLUGIN_REPORTED_RATE_LIMITED",
+            Self::UpstreamAuthFailed => "PLUGIN_REPORTED_AUTH_FAILED",
+            Self::UpstreamNotFound => "PLUGIN_REPORTED_NOT_FOUND",
+            Self::UpstreamInvalidResponse => "PLUGIN_REPORTED_INVALID_RESPONSE",
+            Self::PluginInternal => "PLUGIN_REPORTED_INTERNAL_ERROR",
+            Self::PluginReportedUnknown => "PLUGIN_REPORTED_ERROR",
+        }
+    }
+}
+
+impl fmt::Display for ScraperFailureCause {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }

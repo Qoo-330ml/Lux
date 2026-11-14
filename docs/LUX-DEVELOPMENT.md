@@ -21721,6 +21721,53 @@ content light level）只出现在帧级 side data，`-show_streams` 的 `side_d
 
 预计文件：`src/api/media.rs`、`src/application/catalog.rs`、`tests/library/catalog.rs`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`、`docs/TEST-TARGETS.md`。
 
+#### LUX-910：候选搜索失败提示真实原因
+
+状态：已完成（2026-11-15）。依赖：无。验证：`--lib reidentify::` 51/51、`--test metadata metadata_api::` 10/10、
+`--test reidentify` 25/25、`--lib legacy::tests::` 57/57、`--lib scraper::tests::` 1/1、fmt、
+`clippy --all-targets --all-features -D warnings`、`check-migration-parity.py`、`check-backend-branches.py` 通过。
+
+背景：管理员在详情页点「元数据匹配 → 搜索候选」时，只要刮削器这一层没有可用结果，接口一律返回
+`503 PLUGIN_UNAVAILABLE` 和「刮削器暂时不可用，请稍后重试」。插件未安装、被停用、配置未完成、进程崩溃、
+调用超时、上游 401/429/网络不通全部长成同一句话，日志也只有 `error_kind=SCRAPER_UNAVAILABLE`，无法判断
+该去插件库、检查代理还是等一会儿再试。项目所有者要求提示实际原因。
+
+范围：
+
+- 新增宿主自有的 `ScraperFailureCause`（`src/application/scraper.rs`）：从 `ScraperError` 与
+  `docs/PLUGIN-SDK.md` §5.4 的稳定插件错误码分类，输出固定原因码。插件 `error.message`（可能含上游 URL
+  或 API Key）永不进入响应体或日志字段；未知插件错误码保持笼统分类。
+- `MetadataCandidateError` 新增 `ScraperFailed(Vec<ScraperAttemptFailure>)`（每条带 scraper ID、插件显示名、
+  原因）、`ScraperNotConfigured` 和 `VideoItemUnsupported`。手动候选搜索按来源收集全部失败，不再只保留
+  最后一个错误；媒体库没有可用刮削器（含宿主未配置占位）与 VIDEO 家庭视频条目单独区分。
+- 管理 API 按原因返回：配置类 `409 PLUGIN_UNAVAILABLE`（未安装 / 已停用 / 配置未完成 / 不支持
+  `metadata.search` / 上游鉴权失败 / 无该媒体类型）、家庭视频 `409 INVALID_REQUEST`、瞬态类
+  `503 PLUGIN_UNAVAILABLE`（超时 / 进程退出 / 启动失败 / 无法解析 / 上游不可达 / 限流 / 内部错误）、
+  数据库 `503 DATABASE_UNAVAILABLE`。消息为宿主文案，插件显示名取自 catalog manifest。
+- 失败日志新增 `failure_reason` 与 `scraper_id`；`error_kind` 保留并新增 `SCRAPER_NOT_CONFIGURED`。
+  后台任务诊断复用同一分类，插件上报码从笼统的 `PLUGIN_REPORTED_ERROR` 细化为具体 `PLUGIN_REPORTED_*`。
+
+不做：不新增 HTTP 错误码、不改数据库与迁移、不改插件协议与 Web 组件（匹配对话框继续显示 `error.message`）。
+
+验收：
+
+- [x] 分类覆盖宿主错误与全部文档化插件错误码，且不输出插件文本
+  （`scraper_failure_cause_names_the_real_reason_without_plugin_text`）。
+- [x] 媒体库没有可用刮削器时返回 `409 PLUGIN_UNAVAILABLE` 并说明原因
+  （`candidate_search_names_the_missing_scraper_instead_of_a_generic_outage`）。
+- [x] 每个失败来源都带 scraper ID 与原因（`manual_candidate_search_reports_each_failed_scraper`）。
+- [x] 家庭视频条目返回 `409 INVALID_REQUEST`（`manual_candidate_search_rejects_home_video_items`）。
+- [x] 每个原因的状态码、错误码与文案由 `metadata_candidate_errors_name_the_real_scraper_cause` 固定，
+  `PLUGIN_UNAVAILABLE` 与 `DATABASE_UNAVAILABLE` 不混用。
+- [x] `docs/API.md` 记录候选搜索失败的状态码、消息与日志字段。
+- [x] 相关测试、fmt、clippy、迁移与后端分支检查通过。
+- [ ] 未验证：真实 `org.lux.tmdb` 插件在 fnOS 上返回 `PLUGIN_RATE_LIMITED` / `PLUGIN_AUTH_FAILED` 的端到端
+  提示（需要所有者环境）。
+
+预计文件：`src/application/scraper.rs`、`src/application/candidates.rs`、`src/application/reidentify.rs`、
+`src/application/plugins.rs`、`src/api/admin/admin_metadata.rs`、`src/api/legacy.rs`、
+`tests/metadata/metadata_api.rs`、`docs/API.md`、`docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
+
 ## 31. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

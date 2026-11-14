@@ -25,9 +25,9 @@ use crate::{
         },
         people::{ActorCredit, LocalActorRelationPageCache, PeopleError},
         scraper::{
-            ScraperError, ScraperGetRequest, ScraperImageRequest, ScraperItemType, ScraperMetadata,
-            ScraperProvider, ScraperSearchResponse, ScraperSearchResult, provider_id_for_key,
-            provider_key_from_plugin_id,
+            ScraperError, ScraperFailureCause, ScraperGetRequest, ScraperImageRequest,
+            ScraperItemType, ScraperMetadata, ScraperProvider, ScraperSearchResponse,
+            ScraperSearchResult, provider_id_for_key, provider_key_from_plugin_id,
         },
         thumbnail_policy::ThumbnailScrapingMode,
     },
@@ -2274,12 +2274,31 @@ pub struct MetadataFieldDiff {
     pub provenance: Option<String>,
 }
 
+/// One configured scraper that could not answer a candidate search.
+#[derive(Debug)]
+pub struct ScraperAttemptFailure {
+    /// The configured scraper id (the plugin id when the plugin store resolved it).
+    pub scraper_id: String,
+    /// The plugin's display name when the host knows it, so the administrator can act on the right
+    /// plugin instead of reading a raw id.
+    pub label: Option<String>,
+    pub cause: ScraperFailureCause,
+}
+
 #[derive(Debug)]
 pub enum MetadataCandidateError {
     ItemNotFound,
     InvalidSearch,
     InvalidCandidateJson(String),
+    /// A single scraper call failed before the caller aggregated per-source failures.
     Scraper(crate::application::scraper::ScraperError),
+    /// Every configured scraper failed; each entry names the source and the stable cause.
+    ScraperFailed(Vec<ScraperAttemptFailure>),
+    /// The item has no usable online scraper: none is configured for the library, or the library
+    /// fell back to the host's unconfigured placeholder.
+    ScraperNotConfigured,
+    /// Home video items never have an online metadata source.
+    VideoItemUnsupported,
     Storage(StorageError),
 }
 
@@ -2292,6 +2311,24 @@ impl fmt::Display for MetadataCandidateError {
                 write!(formatter, "candidate JSON is invalid: {error}")
             }
             Self::Scraper(error) => error.fmt(formatter),
+            Self::ScraperFailed(failures) => {
+                formatter.write_str("every configured scraper failed")?;
+                for failure in failures {
+                    let source = failure
+                        .label
+                        .as_deref()
+                        .filter(|label| !label.trim().is_empty())
+                        .unwrap_or(&failure.scraper_id);
+                    write!(formatter, " [{source}: {}]", failure.cause)?;
+                }
+                Ok(())
+            }
+            Self::ScraperNotConfigured => {
+                formatter.write_str("no usable metadata scraper is configured for the item")
+            }
+            Self::VideoItemUnsupported => {
+                formatter.write_str("home video items have no online metadata source")
+            }
             Self::Storage(error) => error.fmt(formatter),
         }
     }
