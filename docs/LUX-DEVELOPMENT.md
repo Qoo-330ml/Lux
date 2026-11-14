@@ -21723,7 +21723,7 @@ content light level）只出现在帧级 side data，`-show_streams` 的 `side_d
 
 #### LUX-910：候选搜索失败提示真实原因
 
-状态：已完成（2026-11-15）。依赖：无。验证：`--lib reidentify::` 51/51、`--test metadata metadata_api::` 10/10、
+状态：已完成（2026-11-15，提交 `aff4aaba`）。依赖：无。验证：`--lib reidentify::` 51/51、`--test metadata metadata_api::` 10/10、
 `--test reidentify` 25/25、`--lib legacy::tests::` 57/57、`--lib scraper::tests::` 1/1、fmt、
 `clippy --all-targets --all-features -D warnings`、`check-migration-parity.py`、`check-backend-branches.py` 通过。
 
