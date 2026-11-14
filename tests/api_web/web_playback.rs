@@ -1743,6 +1743,96 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
         reqwest::StatusCode::SERVICE_UNAVAILABLE
     );
 
+    // A remote `.strm` played from its own URL never requests Lux's media entry, so the media GET
+    // cannot be the only probe trigger. Entering playback must fill the played source's media
+    // information exactly like the Emby `PLAYING` callback.
+    tokio::fs::write(
+        root.join("Origin Only 2026.strm"),
+        "http://media.example.test/origin.mp4\n",
+    )
+    .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let (origin_item_id, origin_source_id): (String, String) = sqlx::query_as(
+        "SELECT mi.id, ms.id
+         FROM media_sources ms
+         JOIN media_items mi ON mi.id = ms.item_id
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path = 'Origin Only 2026.strm'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let origin_create = client
+        .post(format!("{base_url}/api/v1/playback/sessions"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf_cookie)
+        .json(&json!({
+            "itemId": origin_item_id,
+            "sourceId": origin_source_id,
+            "capabilities": {
+                "directPlay": true,
+                "hls": true,
+                "videoCopyToFmp4": true,
+                "audioCopyToFmp4": true,
+                "softwareTranscode": true
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(origin_create.status(), reqwest::StatusCode::OK);
+    let origin_body = origin_create.json::<Value>().await?;
+    assert_eq!(origin_body["plan"]["type"], "DIRECT");
+    let origin_session_id = origin_body["sessionId"]
+        .as_str()
+        .ok_or("missing origin session id")?;
+    let origin_user_agent = "Mozilla/5.0  (Linux; Android 14; Pixel 8)  AppleWebKit/537.36";
+    let origin_playing = client
+        .post(format!(
+            "{base_url}/api/v1/playback/sessions/{origin_session_id}/events"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf_cookie)
+        .header("user-agent", origin_user_agent)
+        .json(&json!({
+            "eventId": "origin-event-1",
+            "sequence": 1,
+            "state": "PLAYING",
+            "positionTicks": 0,
+            "durationTicks": 1_000
+        }))
+        .send()
+        .await?;
+    assert_eq!(origin_playing.status(), reqwest::StatusCode::OK);
+    let mut origin_job = None;
+    for _ in 0..250 {
+        origin_job = sqlx::query_as::<_, (String, i64, Option<String>, Option<String>)>(
+            "SELECT status, concurrency, target_source_id, target_user_agent
+             FROM strm_probe_jobs
+             WHERE target_source_id = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(&origin_source_id)
+        .fetch_optional(database.pool())
+        .await?;
+        if origin_job.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let (status, concurrency, target_source_id, target_user_agent) =
+        origin_job.ok_or("web PLAYING event did not enqueue a playback probe")?;
+    assert!(matches!(
+        status.as_str(),
+        "PENDING" | "RUNNING" | "COMPLETED" | "FAILED"
+    ));
+    assert_eq!(concurrency, 1);
+    assert_eq!(target_source_id.as_deref(), Some(origin_source_id.as_str()));
+    assert_eq!(
+        target_user_agent.as_deref(),
+        Some(origin_user_agent),
+        "the playback event's exact User-Agent must reach the probe job"
+    );
+
     server.abort();
     peer_server.abort();
     receiver_server.abort();

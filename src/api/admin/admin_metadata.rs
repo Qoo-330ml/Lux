@@ -1,4 +1,5 @@
 use super::*;
+use crate::application::metadata::NfoError;
 
 pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new()
@@ -531,10 +532,25 @@ pub(crate) async fn admin_confirm_metadata(
     };
     let mut confirmed_count = 0_usize;
     let mut failed_item_ids = Vec::new();
+    let mut single_error = None;
     for item_id in &item_ids {
         match selection.confirm_best_pending(item_id).await {
             Ok(_) => confirmed_count += 1,
-            Err(_) => failed_item_ids.push(item_id.clone()),
+            Err(error) => {
+                let is_writeback_error = matches!(
+                    &error,
+                    MetadataSelectionError::Nfo(_)
+                        | MetadataSelectionError::Image(_)
+                        | MetadataSelectionError::People(_)
+                        | MetadataSelectionError::Storage(_)
+                );
+                if item_ids.len() == 1 && is_writeback_error {
+                    single_error = Some((item_id.clone(), error));
+                } else {
+                    log_metadata_selection_failure(&headers, item_id, &error);
+                }
+                failed_item_ids.push(item_id.clone());
+            }
         }
     }
     record_audit_event(
@@ -551,6 +567,9 @@ pub(crate) async fn admin_confirm_metadata(
         .to_string(),
     )
     .await;
+    if let Some((item_id, error)) = single_error {
+        return metadata_selection_error(&headers, &item_id, error);
+    }
     Json(json!({
         "confirmedCount": confirmed_count,
         "failedCount": failed_item_ids.len(),
@@ -955,14 +974,119 @@ pub(crate) async fn admin_select_candidate(
             }))
             .into_response()
         }
-        Err(error) => metadata_selection_error(&headers, error),
+        Err(error) => metadata_selection_error(&headers, &item_id, error),
     }
+}
+
+fn selection_error_diagnostic(
+    error: &MetadataSelectionError,
+) -> (&'static str, Option<String>, Option<String>) {
+    let path = |path: &std::path::Path| Some(path.to_string_lossy().into_owned());
+    let io_kind = |error: &std::io::Error| Some(format!("{:?}", error.kind()));
+    match error {
+        MetadataSelectionError::ItemNotFound => ("ITEM_NOT_FOUND", None, None),
+        MetadataSelectionError::CandidateNotFound => ("CANDIDATE_NOT_FOUND", None, None),
+        MetadataSelectionError::CandidateNotPending(_) => ("CANDIDATE_NOT_PENDING", None, None),
+        MetadataSelectionError::InvalidCandidate(_) => ("INVALID_CANDIDATE", None, None),
+        MetadataSelectionError::Nfo(NfoWriteError::Nfo(NfoError::TooLarge)) => {
+            ("NFO_TOO_LARGE", None, None)
+        }
+        MetadataSelectionError::Nfo(NfoWriteError::TooLarge(target)) => {
+            ("NFO_TOO_LARGE", path(target), None)
+        }
+        MetadataSelectionError::Nfo(NfoWriteError::Nfo(NfoError::TooManyEvents)) => {
+            ("NFO_TOO_MANY_EVENTS", None, None)
+        }
+        MetadataSelectionError::Nfo(NfoWriteError::Nfo(NfoError::FieldTooLarge)) => {
+            ("NFO_FIELD_TOO_LARGE", None, None)
+        }
+        MetadataSelectionError::Nfo(NfoWriteError::Nfo(NfoError::DocTypeNotAllowed)) => {
+            ("NFO_DOCTYPE_NOT_ALLOWED", None, None)
+        }
+        MetadataSelectionError::Nfo(NfoWriteError::Nfo(
+            NfoError::Unbalanced | NfoError::Xml(_),
+        ))
+        | MetadataSelectionError::Nfo(NfoWriteError::InvalidXml(_)) => {
+            ("NFO_INVALID_XML", None, None)
+        }
+        MetadataSelectionError::Nfo(NfoWriteError::Nfo(NfoError::Io(error))) => {
+            ("NFO_READ_IO", None, io_kind(error))
+        }
+        MetadataSelectionError::Nfo(NfoWriteError::Io {
+            path: target,
+            source,
+        }) => ("NFO_IO", path(target), io_kind(source)),
+        MetadataSelectionError::Nfo(NfoWriteError::PathOutsideRoot(target)) => {
+            ("NFO_PATH_OUTSIDE_ROOT", path(target), None)
+        }
+        MetadataSelectionError::Nfo(NfoWriteError::SymlinkTarget(target)) => {
+            ("NFO_SYMLINK_TARGET", path(target), None)
+        }
+        MetadataSelectionError::Nfo(NfoWriteError::ConcurrentModification(target)) => {
+            ("NFO_CONCURRENT_MODIFICATION", path(target), None)
+        }
+        MetadataSelectionError::Nfo(NfoWriteError::Storage(_)) => ("NFO_STORAGE", None, None),
+        MetadataSelectionError::Nfo(_) => ("NFO_WRITE", None, None),
+        MetadataSelectionError::Image(ImageWriteError::Io {
+            path: target,
+            source,
+        }) => ("IMAGE_IO", path(target), io_kind(source)),
+        MetadataSelectionError::Image(ImageWriteError::PathOutsideRoot(target)) => {
+            ("IMAGE_PATH_OUTSIDE_ROOT", path(target), None)
+        }
+        MetadataSelectionError::Image(ImageWriteError::SymlinkTarget(target)) => {
+            ("IMAGE_SYMLINK_TARGET", path(target), None)
+        }
+        MetadataSelectionError::Image(ImageWriteError::ConcurrentModification(target)) => {
+            ("IMAGE_CONCURRENT_MODIFICATION", path(target), None)
+        }
+        MetadataSelectionError::Image(ImageWriteError::Storage(_)) => ("IMAGE_STORAGE", None, None),
+        MetadataSelectionError::Image(_) => ("IMAGE_WRITE", None, None),
+        MetadataSelectionError::People(PeopleError::Io {
+            path: target,
+            source,
+        }) => ("PEOPLE_IO", path(target), io_kind(source)),
+        MetadataSelectionError::People(PeopleError::Symlink(target)) => {
+            ("PEOPLE_SYMLINK", path(target), None)
+        }
+        MetadataSelectionError::People(PeopleError::Storage(_)) => ("PEOPLE_STORAGE", None, None),
+        MetadataSelectionError::People(_) => ("PEOPLE_WRITE", None, None),
+        MetadataSelectionError::Storage(_) => ("STORAGE", None, None),
+    }
+}
+
+fn log_metadata_selection_failure(
+    headers: &HeaderMap,
+    item_id: &str,
+    error: &MetadataSelectionError,
+) {
+    if !matches!(
+        error,
+        MetadataSelectionError::Nfo(_)
+            | MetadataSelectionError::Image(_)
+            | MetadataSelectionError::People(_)
+            | MetadataSelectionError::Storage(_)
+    ) {
+        return;
+    }
+    let (error_kind, path, io_kind) = selection_error_diagnostic(error);
+    tracing::error!(
+        event = "metadata_selection_write_failed",
+        request_id = header_str(headers, "x-request-id").unwrap_or("unknown"),
+        item_id,
+        error_kind,
+        path = path.as_deref().unwrap_or(""),
+        io_kind = io_kind.as_deref().unwrap_or(""),
+        "metadata selection write-back failed"
+    );
 }
 
 pub(crate) fn metadata_selection_error(
     headers: &HeaderMap,
+    item_id: &str,
     error: MetadataSelectionError,
 ) -> Response {
+    log_metadata_selection_failure(headers, item_id, &error);
     match error {
         MetadataSelectionError::ItemNotFound | MetadataSelectionError::CandidateNotFound => {
             api_error(
@@ -987,15 +1111,40 @@ pub(crate) fn metadata_selection_error(
             "候选数据无效",
         )
         .into_response(),
-        MetadataSelectionError::Nfo(_)
-        | MetadataSelectionError::Image(_)
-        | MetadataSelectionError::People(_) => api_error(
-            headers,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            lux::ApiErrorCode::Internal,
-            "元数据写回失败，可重试",
-        )
-        .into_response(),
+        MetadataSelectionError::Nfo(error) => metadata_write_error(headers, error),
+        MetadataSelectionError::Image(error) => image_write_error(headers, error),
+        MetadataSelectionError::People(error) => match error {
+            PeopleError::InvalidComponent(_)
+            | PeopleError::MetadataPath(_)
+            | PeopleError::Serialization(_) => api_error(
+                headers,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                lux::ApiErrorCode::InvalidRequest,
+                "演职员元数据无效，请检查配置目录后再试",
+            )
+            .into_response(),
+            PeopleError::Symlink(_) => api_error(
+                headers,
+                StatusCode::FORBIDDEN,
+                lux::ApiErrorCode::PermissionDenied,
+                "演职员元数据路径不安全，请检查配置目录后再试",
+            )
+            .into_response(),
+            PeopleError::Storage(_) => api_error(
+                headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "元数据保存暂时不可用，可重试",
+            )
+            .into_response(),
+            _ => api_error(
+                headers,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                lux::ApiErrorCode::Internal,
+                "元数据写回失败，可重试",
+            )
+            .into_response(),
+        },
         MetadataSelectionError::Storage(_) => api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1027,6 +1176,13 @@ pub(crate) fn image_write_error(headers: &HeaderMap, error: ImageWriteError) -> 
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,
             "图片操作暂时失败",
+        )
+        .into_response(),
+        ImageWriteError::ConcurrentModification(_) => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "图片在写入时发生变化，请重试",
         )
         .into_response(),
         ImageWriteError::AttemptInProgress => api_error(
@@ -1166,24 +1322,45 @@ pub(crate) fn metadata_write_error(headers: &HeaderMap, error: NfoWriteError) ->
             "元数据路径不在媒体根目录内",
         )
         .into_response(),
+        NfoWriteError::Nfo(NfoError::TooLarge) | NfoWriteError::TooLarge(_) => api_error(
+            headers,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            lux::ApiErrorCode::InvalidRequest,
+            "本地 NFO 文件过大，请先清理或改名后再试",
+        )
+        .into_response(),
+        NfoWriteError::Nfo(NfoError::TooManyEvents | NfoError::FieldTooLarge) => api_error(
+            headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            lux::ApiErrorCode::InvalidRequest,
+            "本地 NFO 内容超出解析限制，请修复或改名后再试",
+        )
+        .into_response(),
+        NfoWriteError::Nfo(
+            NfoError::DocTypeNotAllowed | NfoError::Unbalanced | NfoError::Xml(_),
+        )
+        | NfoWriteError::InvalidXml(_) => api_error(
+            headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            lux::ApiErrorCode::InvalidRequest,
+            "本地 NFO 格式无效，请修复或改名后再试",
+        )
+        .into_response(),
         NfoWriteError::Storage(_) => api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,
-            "元数据保存暂时不可用",
+            "元数据保存暂时不可用，可重试",
         )
         .into_response(),
-        NfoWriteError::TooLarge(_) => api_error(
+        NfoWriteError::ConcurrentModification(_) => api_error(
             headers,
-            StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::CONFLICT,
             lux::ApiErrorCode::InvalidRequest,
-            "本地 NFO 文件过大，无法安全写入",
+            "本地 NFO 在写入时发生变化，请重试",
         )
         .into_response(),
-        NfoWriteError::Nfo(_)
-        | NfoWriteError::InvalidXml(_)
-        | NfoWriteError::Io { .. }
-        | NfoWriteError::ConcurrentModification(_) => api_error(
+        NfoWriteError::Nfo(NfoError::Io(_)) | NfoWriteError::Io { .. } => api_error(
             headers,
             StatusCode::INTERNAL_SERVER_ERROR,
             lux::ApiErrorCode::Internal,
@@ -1482,4 +1659,148 @@ pub(crate) async fn admin_start_item_metadata_refresh(
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod selection_error_tests {
+    use std::{
+        io::{self, Write},
+        sync::{Arc, Mutex},
+    };
+
+    use super::*;
+
+    async fn response_parts(response: Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("error response body");
+        let body = serde_json::from_slice(&bytes).expect("JSON error response");
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn permanent_nfo_errors_do_not_claim_that_a_retry_will_fix_them() {
+        let cases = [
+            (
+                NfoWriteError::InvalidXml("private candidate text".to_owned()),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "本地 NFO 格式无效，请修复或改名后再试",
+            ),
+            (
+                NfoWriteError::TooLarge(PathBuf::from("/media/movie.nfo")),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "本地 NFO 文件过大，请先清理或改名后再试",
+            ),
+            (
+                NfoWriteError::PathOutsideRoot(PathBuf::from("/outside/movie.nfo")),
+                StatusCode::FORBIDDEN,
+                "元数据路径不在媒体根目录内",
+            ),
+            (
+                NfoWriteError::SymlinkTarget(PathBuf::from("/media/movie.nfo")),
+                StatusCode::FORBIDDEN,
+                "元数据路径不在媒体根目录内",
+            ),
+            (
+                NfoWriteError::Nfo(crate::application::metadata::NfoError::TooLarge),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "本地 NFO 文件过大，请先清理或改名后再试",
+            ),
+            (
+                NfoWriteError::Nfo(crate::application::metadata::NfoError::Unbalanced),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "本地 NFO 格式无效，请修复或改名后再试",
+            ),
+        ];
+
+        for (error, expected_status, expected_message) in cases {
+            let (status, body) = response_parts(metadata_selection_error(
+                &HeaderMap::new(),
+                "item-1",
+                MetadataSelectionError::Nfo(error),
+            ))
+            .await;
+            assert_eq!(status, expected_status);
+            assert_eq!(body["error"]["message"], expected_message);
+        }
+    }
+
+    #[derive(Clone)]
+    struct CapturedLogWriterFactory(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogWriterFactory {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedLogWriter(Arc::clone(&self.0))
+        }
+    }
+
+    impl Write for CapturedLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| io::Error::other("captured log buffer is unavailable"))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn selection_failures_emit_structured_sanitized_diagnostics() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(CapturedLogWriterFactory(Arc::clone(&captured)))
+            .finish();
+        let (io_response, invalid_response) = tracing::subscriber::with_default(subscriber, || {
+            (
+                metadata_selection_error(
+                    &HeaderMap::new(),
+                    "item-1",
+                    MetadataSelectionError::Nfo(NfoWriteError::Io {
+                        path: PathBuf::from("/media/movie.nfo"),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "private filesystem detail",
+                        ),
+                    }),
+                ),
+                metadata_selection_error(
+                    &HeaderMap::new(),
+                    "item-1",
+                    MetadataSelectionError::Nfo(NfoWriteError::InvalidXml(
+                        "private candidate text".to_owned(),
+                    )),
+                ),
+            )
+        });
+        assert_eq!(io_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(invalid_response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let output =
+            String::from_utf8(captured.lock().expect("captured logs").clone()).expect("UTF-8 logs");
+        assert!(!output.contains("private candidate text"));
+        assert!(!output.contains("private filesystem detail"));
+        let events = output
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<Value>(line).expect("structured log"))
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["fields"]["item_id"], "item-1");
+        assert_eq!(events[0]["fields"]["error_kind"], "NFO_IO");
+        assert_eq!(events[0]["fields"]["path"], "/media/movie.nfo");
+        assert_eq!(events[0]["fields"]["io_kind"], "PermissionDenied");
+        assert_eq!(events[1]["fields"]["error_kind"], "NFO_INVALID_XML");
+    }
 }

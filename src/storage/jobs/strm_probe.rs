@@ -11,8 +11,8 @@ impl Database {
                 id, operation_id, library_id, status, concurrency,
                 include_ready, write_sidecars, media_info_enabled,
                 thumbnail_enabled, thumbnail_position_percent, target_scan_job_id,
-                target_source_id, total_count
-             ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                target_source_id, target_user_agent, total_count
+             ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(job.id)
         .bind(job.operation_id)
@@ -25,6 +25,7 @@ impl Database {
         .bind(job.thumbnail_position_percent)
         .bind(job.target_scan_job_id)
         .bind(job.target_source_id)
+        .bind(job.target_user_agent)
         .bind(job.total_count)
         .execute(&mut *transaction)
         .await
@@ -41,10 +42,15 @@ impl Database {
         transaction.commit().await.map_err(self.sqlx_err())
     }
 
-    pub(crate) async fn has_active_strm_probe_jobs(&self) -> Result<bool, StorageError> {
+    /// Whether a library-wide job is active.
+    ///
+    /// Playback-triggered jobs are single-source and short-lived; they must neither block a new
+    /// bulk job nor count as the library-wide job that such a job would duplicate.
+    pub(crate) async fn has_active_bulk_strm_probe_jobs(&self) -> Result<bool, StorageError> {
         self.query_scalar(
             "SELECT CASE WHEN EXISTS(
-                SELECT 1 FROM strm_probe_jobs WHERE status IN ('PENDING', 'RUNNING')
+                SELECT 1 FROM strm_probe_jobs
+                WHERE status IN ('PENDING', 'RUNNING') AND target_source_id IS NULL
             ) THEN 1 ELSE 0 END",
         )
         .fetch_one(&self.pool)
@@ -78,7 +84,7 @@ impl Database {
             "SELECT id, operation_id, library_id, status, concurrency,
                     include_ready, write_sidecars, media_info_enabled,
                     thumbnail_enabled, thumbnail_position_percent, target_scan_job_id,
-                    target_source_id, cursor, processed_count,
+                    target_source_id, target_user_agent, cursor, processed_count,
                     total_count, cancel_requested, error,
                     created_at, started_at, finished_at
              FROM strm_probe_jobs WHERE id = ?",
@@ -103,7 +109,7 @@ impl Database {
                 "SELECT id, operation_id, library_id, status, concurrency,
                         include_ready, write_sidecars, media_info_enabled,
                         thumbnail_enabled, thumbnail_position_percent, target_scan_job_id,
-                        target_source_id, cursor, processed_count,
+                        target_source_id, target_user_agent, cursor, processed_count,
                         total_count, cancel_requested, error,
                         created_at, started_at, finished_at
                  FROM strm_probe_jobs WHERE status = ?
@@ -119,7 +125,7 @@ impl Database {
                 "SELECT id, operation_id, library_id, status, concurrency,
                         include_ready, write_sidecars, media_info_enabled,
                         thumbnail_enabled, thumbnail_position_percent, target_scan_job_id,
-                        target_source_id, cursor, processed_count,
+                        target_source_id, target_user_agent, cursor, processed_count,
                         total_count, cancel_requested, error,
                         created_at, started_at, finished_at
                  FROM strm_probe_jobs
@@ -385,6 +391,7 @@ mod playback_scope_tests {
                 thumbnail_position_percent: 30,
                 target_scan_job_id: None,
                 target_source_id: Some(target_source_id),
+                target_user_agent: None,
                 total_count: 1,
             })
             .await?;

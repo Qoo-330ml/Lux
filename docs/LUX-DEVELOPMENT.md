@@ -17713,11 +17713,14 @@ Toshiba 已挂载，本机 `uname -m` 为 `arm64`；所有 Cargo 命令使用 To
 
 #### LUX-840：播放时补全选中媒体库的 STRM 媒体信息
 
-范围：插件已安装、启用、开启媒体信息提取且选中资源所在媒体库时，实际播放 GET 或已授权的
-PLAYING 回调可提交当前 STRM 来源的后台补提取。只补缺失信息，即使全库任务配置为 OVERWRITE，
-播放也不重复覆盖已有信息。不因播放启动截图，不等待插件执行，不改变播放响应或失败处理。
-PlaybackInfo、HEAD、浏览详情、PAUSED/STOPPED 回调不触发。重复播放请求去重，后台等待有界；
-沿用现有作业、插件执行、旁车写回、取消和并发限制，不把单个播放扩展成全库探测。
+范围：插件已安装、启用且开启媒体信息提取时，实际播放 GET、已授权的 Emby `PLAYING` 回调，或 Web
+播放事件进入 `PLAYING`，都可提交当前 STRM 来源的后台补提取；插件的媒体库选择只约束定时与增量任务。
+只补缺失信息，即使全库任务配置为 OVERWRITE，播放也不重复覆盖已有信息。不因播放启动截图，不等待
+插件执行，不改变播放响应或失败处理。PlaybackInfo、HEAD、浏览详情、PAUSED/STOPPED 回调不触发。
+重复播放请求去重；播放补提取不与全库或增量作业排队，固定并发 1，最多额外占一个插件名额。播放触发的探测
+把客户端请求媒体时的 User-Agent 原文传给插件（不裁剪、不改写、不归一化），插件用它请求直链并作为
+`ffprobe`/`ffmpeg` 的 `-user_agent`；定时与增量任务不带该值，插件使用自己的默认 UA。沿用现有作业、插件执行、
+旁车写回、取消和并发限制，不把单个播放扩展成全库探测。
 
 按五个可独立验证的增量实施（各至多五个文件）：
 
@@ -17736,11 +17739,14 @@ PlaybackInfo、HEAD、浏览详情、PAUSED/STOPPED 回调不触发。重复播�
 验收：
 
 - [x] 新迁移可从空库执行，普通全库/增量作业范围不变，单来源范围持久化且可重试。
-- [x] 当前来源缺少信息才提取；未选库、禁用插件、关闭媒体信息提取及已有信息均跳过。
-- [x] Web/Emby 实际播放和外部代理播放回调可触发；PlaybackInfo、HEAD 和非播放状态不触发。
-- [x] 重复请求合并，已有其他作业时有界等待后重新检查；任务只覆盖当前来源，失败不阻断播放。
+- [x] 当前来源缺少信息才提取；禁用插件、关闭媒体信息提取及已有信息跳过，播放补提取不受插件媒体库选择限制。
+- [x] Web/Emby 实际播放、外部代理播放回调与 Web `PLAYING` 事件可触发；PlaybackInfo、HEAD 和非播放状态不触发。
+- [x] 播放触发的探测把客户端 User-Agent 逐字节传给插件；空值、超长或含控制字符的值被拒绝且不写日志，批量任务不使用客户端 UA。
+- [x] 重复请求合并；播放补提取作为独立单来源作业并发运行（固定并发 1，最多额外占一个插件名额），不等待全库或增量作业。
 - [x] `strm_probe`、`strm_probe_api`、`strm`、`web_playback`、`playback` 及 `playback_strm_probe` 定向检查通过。
 - [ ] 完整 Rust 门禁通过（本轮全量测试在干净 `test` 基线上同样有 4 项既有失败，详见结果；完整 Clippy 另有既有诊断）。
+
+结果（2026-11-14，播放补提取范围与并发修订）：播放触发的补提取不再要求来源所在媒体库被插件选中，`libraryIds` 只约束定时与增量任务；同时移除播放路径对 `has_active_strm_probe_jobs` 的 30 秒有界等待，改为固定并发 1 的独立单来源作业，`playback_probe_slot` 保证一次播放潮最多额外占用一个插件并发。为允许单来源作业与同库批量作业并存，`0250_playback_probe_jobs_concurrent_scope` 把活动作业唯一索引从 `(library_id)` 改为 `(library_id, coalesce(target_source_id, ''))`，批量与增量任务的创建闸门改为只看批量作业。验证：`cargo test --locked --test strm strm_probe::` 5/5（新增 `playback_probe_ignores_the_plugin_library_selection`）、`strm_probe_api::` 2/2、`--test playback playback_strm_probe::` 2/2、`--test api_web web_playback::web_playback_uses_signed_direct_urls_and_monotonic_events` 1/1，迁移奇偶校验通过。同日补充：网页播放器可能从 `.strm` 原始地址直连播放（`origin` 候选），Lux 收不到媒体 GET；Web 播放事件进入 `PLAYING` 现在也触发同一单来源作业（`src/api/playback.rs`），回归扩展在同一 `web_playback` 用例中，断言仅发 `PLAYING` 事件、不发生媒体请求也会建出 `concurrency = 1` 的单来源作业。随后补充客户端 UA 透传：迁移 `0251_strm_probe_job_user_agent` 给 `strm_probe_jobs` 增加可空的 `target_user_agent`，三条触发路径把请求头的 UA 原值写入作业并传给插件 `media.probe` 的 `userAgent`；插件用该值替换固定 UA 请求直链并执行 ffprobe/ffmpeg。回归：`strm_probe::` 5/5（新增断言作业列与插件请求中的 UA 完全一致）、`strm_probe_api::` 2/2（媒体 GET 的 UA）、`playback_strm_probe` 2/2（PLAYING 回调的 UA）、`web_playback` 1/1（Web PLAYING 事件的 UA）；插件仓库 `lux-plugin-strm-media-info` 7/7（新增 UA 逐字节断言）。PostgreSQL 迁移按仓库惯例未在本机执行；FNOS 部署、真实插件和第三方播放器未复测。
 
 结果（2026-10-21；本机 macOS `arm64`，Toshiba 已挂载，Cargo 使用 `/Volumes/Toshiba/mywork/Lux/target`）：六个定向集成目标共 14/14 通过；新增扫描范围失败任务重试串行回归 1/1 通过（实现前按 RED 复现，补锁后 GREEN），`cargo fmt --all -- --check` 通过。全量 Rust 测试为 1,157 passed、31 ignored、4 failed；四项失败在干净 `test` 基线上复现，分别为 `scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo`、`automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`、`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`、`changed_local_fill_request_during_running_item_is_not_lost`，全量命令因此未继续执行 integration targets。完整 Clippy 仍有 10 项既有诊断（5 项 `too_many_arguments`、2 项 `useless_conversion`、1 项 `cloned_ref_to_slice_refs`、2 项 `type_complexity`）；本任务早期提交引入的测试模块顺序诊断已通过移动模块修正。全量门禁不记为通过。
 

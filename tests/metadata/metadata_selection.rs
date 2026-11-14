@@ -19,7 +19,10 @@ use axum::{
 use luxd::{
     api::{AppState, app_with_state},
     application::{
-        candidates::{MetadataCandidateService, MetadataSelectionMode, MetadataSelectionService},
+        candidates::{
+            MetadataCandidateService, MetadataSelectionError, MetadataSelectionMode,
+            MetadataSelectionService,
+        },
         images::ImageWriteService,
         libraries::LibraryService,
         metadata::MetadataEnricher,
@@ -1450,6 +1453,125 @@ async fn batch_confirmation_selects_the_highest_scored_pending_candidate()
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_selections_for_one_item_are_serialized()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    let first_candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "First Selection",
+            "images": { "POSTER": ["http://127.0.0.1/replaced-below"] }
+        }),
+    )
+    .await?;
+    let second_candidate_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO metadata_candidates
+         (id, item_id, provider, provider_id, candidate_json, score, status)
+         VALUES (?, ?, 'TMDB', '604', ?, 99, 'PENDING')",
+    )
+    .bind(&second_candidate_id)
+    .bind(&fixture.item_id)
+    .bind(json!({ "title": "Second Selection" }).to_string())
+    .execute(fixture.database.pool())
+    .await?;
+
+    let download_started = Arc::new(Notify::new());
+    let release_download = Arc::new(Notify::new());
+    let app = Router::new().route(
+        "/poster",
+        get({
+            let download_started = Arc::clone(&download_started);
+            let release_download = Arc::clone(&release_download);
+            move || {
+                let download_started = Arc::clone(&download_started);
+                let release_download = Arc::clone(&release_download);
+                async move {
+                    download_started.notify_one();
+                    release_download.notified().await;
+                    Response::builder()
+                        .header(CONTENT_TYPE, "image/png")
+                        .body(Body::from(PNG_1X1.to_vec()))
+                        .unwrap()
+                }
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let image_server = tokio::spawn(async move { axum::serve(listener, app).await });
+    sqlx::query("UPDATE metadata_candidates SET candidate_json = ? WHERE id = ?")
+        .bind(
+            json!({
+                "title": "First Selection",
+                "images": { "POSTER": [format!("http://{address}/poster")] }
+            })
+            .to_string(),
+        )
+        .bind(&first_candidate_id)
+        .execute(fixture.database.pool())
+        .await?;
+
+    let selection = MetadataSelectionService::with_config_dir(
+        fixture.database.clone(),
+        ImageWriteService::with_config_and_config_dir(
+            fixture.database.clone(),
+            local_image_config(),
+            fixture.config.config_dir.clone(),
+        )?,
+        fixture.config.config_dir.clone(),
+    );
+    let first_selection = {
+        let selection = selection.clone();
+        let item_id = fixture.item_id.clone();
+        let candidate_id = first_candidate_id.clone();
+        tokio::spawn(async move {
+            selection
+                .select(&item_id, &candidate_id, MetadataSelectionMode::FillMissing)
+                .await
+        })
+    };
+    download_started.notified().await;
+    let second_selection = {
+        let item_id = fixture.item_id.clone();
+        let candidate_id = second_candidate_id.clone();
+        tokio::spawn(async move {
+            selection
+                .select(&item_id, &candidate_id, MetadataSelectionMode::FillMissing)
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let second_finished_before_first = second_selection.is_finished();
+    release_download.notify_one();
+
+    let first_result = first_selection.await?;
+    let second_result = second_selection.await?;
+    assert!(
+        !second_finished_before_first,
+        "the second selection must wait for the first item write-back"
+    );
+    assert!(
+        first_result.is_ok(),
+        "the first selection must win instead of failing with a concurrent write"
+    );
+    assert!(matches!(
+        second_result,
+        Err(MetadataSelectionError::CandidateNotPending(_))
+    ));
+    let first_status: String =
+        sqlx::query_scalar("SELECT status FROM metadata_candidates WHERE id = ?")
+            .bind(first_candidate_id)
+            .fetch_one(fixture.database.pool())
+            .await?;
+    assert_eq!(first_status, "SELECTED");
+
+    image_server.abort();
+    Ok(())
+}
+
 #[tokio::test]
 async fn admin_can_batch_confirm_pending_metadata_items() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -1485,6 +1607,65 @@ async fn admin_can_batch_confirm_pending_metadata_items() -> Result<(), Box<dyn 
         .fetch_one(fixture.database.pool())
         .await?;
     assert_eq!(status, "SELECTED");
+
+    // A stale pending page still receives the original 200 result so the detail UI invalidates
+    // its queries; only actual write-back failures become single-item HTTP errors.
+    let response = client
+        .post(format!("{base_url}/api/v1/admin/metadata/confirm"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "itemIds": [fixture.item_id] }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await?;
+    assert_eq!(body["confirmedCount"], 0);
+    assert_eq!(body["failedCount"], 1);
+    assert_eq!(body["failedItemIds"], json!([fixture.item_id]));
+
+    lux_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn single_batch_confirmation_explains_a_permanent_nfo_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    tokio::fs::write(
+        fixture.movie_dir.join("movie.nfo"),
+        vec![b'x'; 1024 * 1024 + 1],
+    )
+    .await?;
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({ "title": "Still Pending" }),
+    )
+    .await?;
+    let (base_url, lux_server) = start_lux(&fixture).await?;
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let (cookies, csrf) = login(&client, &base_url).await?;
+
+    let response = client
+        .post(format!("{base_url}/api/v1/admin/metadata/confirm"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "itemIds": [fixture.item_id] }))
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body: Value = response.json().await?;
+    assert_eq!(
+        body["error"]["message"],
+        "本地 NFO 文件过大，请先清理或改名后再试"
+    );
+    let candidate_status: String =
+        sqlx::query_scalar("SELECT status FROM metadata_candidates WHERE id = ?")
+            .bind(candidate_id)
+            .fetch_one(fixture.database.pool())
+            .await?;
+    assert_eq!(candidate_status, "PENDING");
 
     lux_server.abort();
     Ok(())
@@ -1862,7 +2043,9 @@ async fn selection_failure_after_writeback_checks_does_not_confirm_candidate()
         .json(&json!({ "mode": "refreshUnlocked" }))
         .send()
         .await?;
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body: Value = response.json().await?;
+    assert_eq!(body["error"]["message"], "图片路径不在媒体根目录内");
 
     let item_status: String =
         sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
@@ -1870,6 +2053,54 @@ async fn selection_failure_after_writeback_checks_does_not_confirm_candidate()
             .fetch_one(fixture.database.pool())
             .await?;
     assert_eq!(item_status, "LOCAL_CONFIRMED");
+    let candidate_status: String =
+        sqlx::query_scalar("SELECT status FROM metadata_candidates WHERE id = ?")
+            .bind(&candidate_id)
+            .fetch_one(fixture.database.pool())
+            .await?;
+    assert_eq!(candidate_status, "PENDING");
+
+    lux_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_local_nfo_is_a_permanent_selection_error_and_preserves_the_candidate()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    let original_nfo = "<movie><title>broken</movie>";
+    tokio::fs::write(fixture.movie_dir.join("movie.nfo"), original_nfo).await?;
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({ "title": "Must Not Confirm" }),
+    )
+    .await?;
+    let (base_url, lux_server) = start_lux(&fixture).await?;
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let (cookies, csrf) = login(&client, &base_url).await?;
+
+    let response = client
+        .post(format!(
+            "{base_url}/api/v1/admin/items/{}/identify/candidates/{candidate_id}/select",
+            fixture.item_id
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "mode": "fillMissing" }))
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: Value = response.json().await?;
+    assert_eq!(
+        body["error"]["message"],
+        "本地 NFO 格式无效，请修复或改名后再试"
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(fixture.movie_dir.join("movie.nfo")).await?,
+        original_nfo
+    );
     let candidate_status: String =
         sqlx::query_scalar("SELECT status FROM metadata_candidates WHERE id = ?")
             .bind(&candidate_id)

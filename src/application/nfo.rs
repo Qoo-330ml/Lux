@@ -3,7 +3,7 @@ use std::{
     fmt,
     io::Cursor,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
     time::UNIX_EPOCH,
 };
 
@@ -19,7 +19,7 @@ use time::OffsetDateTime;
 use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{Mutex, OnceCell},
+    sync::{Mutex, OnceCell, OwnedMutexGuard},
 };
 use uuid::Uuid;
 
@@ -35,6 +35,24 @@ use crate::storage::{
     Database, MediaMetadataUpdate, StorageError, StoredMediaItemKind, StoredMediaSourcePath,
     StoredMediaWritebackContext,
 };
+
+static NFO_TARGET_WRITE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+
+async fn acquire_nfo_target_write_lock(target: &Path) -> OwnedMutexGuard<()> {
+    let locks = NFO_TARGET_WRITE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let lock = {
+        let mut locks = locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(target).and_then(Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(Mutex::new(()));
+            locks.insert(target.to_path_buf(), Arc::downgrade(&lock));
+            lock
+        }
+    };
+    lock.lock_owned().await
+}
 
 mod ratings;
 
@@ -3808,6 +3826,7 @@ async fn write_nfo_atomically_with_rewriter<F>(
 where
     F: Fn(&[u8]) -> Result<Vec<u8>, NfoWriteError>,
 {
+    let _write_guard = acquire_nfo_target_write_lock(target).await;
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     let target_is_symlink = fs::symlink_metadata(target)
         .await
@@ -5076,6 +5095,41 @@ mod tests {
         let error = parse_local_nfo_details(oversized.as_bytes())
             .expect_err("an oversized tag is rejected like the other detail fields");
         assert!(matches!(error, NfoError::FieldTooLarge));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_atomic_writes_to_one_nfo_are_serialized() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = directory.path().join("movie.nfo");
+        tokio::fs::write(&target, b"<movie><title>initial</title></movie>")
+            .await
+            .expect("initial NFO");
+        let barrier = Arc::new(tokio::sync::Barrier::new(17));
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..16 {
+            let target = target.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.spawn(async move {
+                barrier.wait().await;
+                write_nfo_atomically(
+                    &target,
+                    &NfoMetadata {
+                        title: Some(format!("title-{index}")),
+                        ..NfoMetadata::default()
+                    },
+                )
+                .await
+            });
+        }
+        barrier.wait().await;
+
+        while let Some(result) = tasks.join_next().await {
+            result.expect("NFO writer task").expect(
+                "concurrent writers must wait instead of reporting concurrent modification",
+            );
+        }
+        let final_nfo = tokio::fs::read_to_string(&target).await.expect("final NFO");
+        assert!(final_nfo.contains("<title>title-"));
     }
 
     #[test]

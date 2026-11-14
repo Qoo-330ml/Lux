@@ -2494,17 +2494,30 @@ impl PluginService {
     }
 
     pub async fn probe_media(&self, url: &str) -> Result<MediaProbeResult, PluginServiceError> {
-        self.probe_media_with_options(url, true, false, DEFAULT_STRM_THUMBNAIL_POSITION_PERCENT)
-            .await
-            .map(|output| output.media)
+        self.probe_media_with_options(
+            url,
+            true,
+            false,
+            DEFAULT_STRM_THUMBNAIL_POSITION_PERCENT,
+            None,
+        )
+        .await
+        .map(|output| output.media)
     }
 
+    /// Probes one media URL through the media-info plugin.
+    ///
+    /// `user_agent` is the exact User-Agent the client used to obtain the target, when the probe
+    /// was triggered by a user's playback. Some providers bind a short-lived link to the requesting
+    /// UA, so the plugin must reuse the same bytes; a normalization or a fallback would break the
+    /// binding. Bulk probes pass `None` and let the plugin use its default UA.
     pub async fn probe_media_with_options(
         &self,
         url: &str,
         include_media_info: bool,
         include_thumbnail: bool,
         thumbnail_position_percent: i64,
+        user_agent: Option<&str>,
     ) -> Result<MediaProbeOutput, PluginServiceError> {
         let catalog = self.catalog_snapshot().await;
         let plugin = catalog
@@ -2529,12 +2542,13 @@ impl PluginService {
             .call_isolated_with_timeout(
                 MEDIA_INFO_PLUGIN_ID,
                 "media.probe",
-                serde_json::json!({
-                    "url": url,
-                    "includeMediaInfo": include_media_info,
-                    "includeThumbnail": include_thumbnail,
-                    "thumbnailPositionPercent": thumbnail_position_percent,
-                }),
+                media_probe_params(
+                    url,
+                    include_media_info,
+                    include_thumbnail,
+                    thumbnail_position_percent,
+                    user_agent,
+                ),
                 MEDIA_PROBE_CALL_TIMEOUT,
             )
             .await
@@ -3678,6 +3692,46 @@ impl std::error::Error for PluginServiceError {
             | Self::InvalidResponse => None,
         }
     }
+}
+
+/// Maximum length of a client User-Agent forwarded to the media-info plugin.
+///
+/// The value is echoed verbatim, never trimmed or normalized, because providers that bind a link
+/// to the requesting UA compare it byte for byte.
+pub(crate) const MAX_MEDIA_PROBE_USER_AGENT_LEN: usize = 1024;
+
+/// Whether a client User-Agent can be forwarded verbatim.
+///
+/// Control characters are rejected because the value ends up as an ffprobe argv entry, and the
+/// length bound keeps a hostile client from inflating every probe request.
+pub(crate) fn valid_media_probe_user_agent(user_agent: &str) -> bool {
+    !user_agent.is_empty()
+        && user_agent.len() <= MAX_MEDIA_PROBE_USER_AGENT_LEN
+        && !user_agent.chars().any(char::is_control)
+}
+
+fn media_probe_params(
+    url: &str,
+    include_media_info: bool,
+    include_thumbnail: bool,
+    thumbnail_position_percent: i64,
+    user_agent: Option<&str>,
+) -> serde_json::Value {
+    let mut params = serde_json::json!({
+        "url": url,
+        "includeMediaInfo": include_media_info,
+        "includeThumbnail": include_thumbnail,
+        "thumbnailPositionPercent": thumbnail_position_percent,
+    });
+    if let Some(user_agent) = user_agent.filter(|value| valid_media_probe_user_agent(value))
+        && let Some(object) = params.as_object_mut()
+    {
+        object.insert(
+            "userAgent".to_owned(),
+            serde_json::Value::String(user_agent.to_owned()),
+        );
+    }
+    params
 }
 
 fn media_probe_output(response: MediaProbeRpcResult) -> Option<MediaProbeOutput> {

@@ -3378,6 +3378,8 @@ pub(crate) struct StoredStrmProbeJob {
     pub(crate) thumbnail_position_percent: i64,
     pub(crate) target_scan_job_id: Option<String>,
     pub(crate) target_source_id: Option<String>,
+    /// Exact client User-Agent of a playback-triggered probe; `None` for bulk jobs.
+    pub(crate) target_user_agent: Option<String>,
     pub(crate) cursor: Option<String>,
     pub(crate) processed_count: i64,
     pub(crate) total_count: i64,
@@ -3400,6 +3402,7 @@ pub(crate) struct NewStrmProbeJob<'a> {
     pub(crate) thumbnail_position_percent: i64,
     pub(crate) target_scan_job_id: Option<&'a str>,
     pub(crate) target_source_id: Option<&'a str>,
+    pub(crate) target_user_agent: Option<&'a str>,
     pub(crate) total_count: i64,
 }
 
@@ -3552,6 +3555,7 @@ struct StoredStrmProbeJobRow {
     thumbnail_position_percent: i64,
     target_scan_job_id: Option<String>,
     target_source_id: Option<String>,
+    target_user_agent: Option<String>,
     cursor: Option<String>,
     processed_count: i64,
     total_count: i64,
@@ -3577,6 +3581,7 @@ fn stored_strm_probe_job(row: sqlx::any::AnyRow) -> Result<StoredStrmProbeJob, s
         thumbnail_position_percent: row.thumbnail_position_percent,
         target_scan_job_id: row.target_scan_job_id,
         target_source_id: row.target_source_id,
+        target_user_agent: row.target_user_agent,
         cursor: row.cursor,
         processed_count: row.processed_count,
         total_count: row.total_count,
@@ -7597,6 +7602,7 @@ mod stored_row_decoding_tests {
                 thumbnail_position_percent: 25,
                 target_scan_job_id: None,
                 target_source_id: None,
+                target_user_agent: None,
                 total_count: 3,
             })
             .await?;

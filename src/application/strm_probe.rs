@@ -52,8 +52,6 @@ const MAX_STRM_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
 const PROGRESS_UPDATE_EVERY: usize = 32;
 const CANCEL_CHECK_EVERY: usize = 32;
 const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
-const PLAYBACK_PROBE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
-const PLAYBACK_PROBE_WAIT_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_PENDING_PLAYBACK_PROBES: usize = 128;
 
 #[derive(Clone, Copy, Debug)]
@@ -75,6 +73,15 @@ struct ProbeSourceOptions {
     thumbnail_mode: ThumbnailScrapingMode,
 }
 
+/// Where a probe job points: a whole library, one incremental-scan path set, or one source.
+#[derive(Clone, Copy, Default)]
+struct ProbeJobTarget<'a> {
+    scan_job_id: Option<&'a str>,
+    source_id: Option<&'a str>,
+    /// Exact client User-Agent for a playback-triggered source probe.
+    user_agent: Option<&'a str>,
+}
+
 #[derive(Clone)]
 pub struct StrmProbeService {
     database: Database,
@@ -85,6 +92,9 @@ pub struct StrmProbeService {
     incremental_creation_lock: Arc<Mutex<()>>,
     configured_start_scheduled: Arc<AtomicBool>,
     playback_probe_sources: Arc<StdMutex<HashSet<String>>>,
+    /// Serializes playback-triggered probes so a burst of plays adds at most one extra plugin
+    /// process to whatever bulk job is running.
+    playback_probe_slot: Arc<Semaphore>,
     resources: ResourceMetrics,
 }
 
@@ -98,6 +108,7 @@ impl StrmProbeService {
             incremental_creation_lock: Arc::new(Mutex::new(())),
             configured_start_scheduled: Arc::new(AtomicBool::new(false)),
             playback_probe_sources: Arc::new(StdMutex::new(HashSet::new())),
+            playback_probe_slot: Arc::new(Semaphore::new(1)),
             resources: ResourceMetrics::new(),
         }
     }
@@ -124,7 +135,7 @@ impl StrmProbeService {
         {
             return Err(StrmProbeError::InvalidThumbnailPosition);
         }
-        if self.database.has_active_strm_probe_jobs().await? {
+        if self.database.has_active_bulk_strm_probe_jobs().await? {
             return Err(StrmProbeError::AlreadyActive);
         }
         let mut unique_ids = HashSet::new();
@@ -157,8 +168,7 @@ impl StrmProbeService {
                 self.create_job_record(
                     &operation_id,
                     &library_id,
-                    None,
-                    None,
+                    ProbeJobTarget::default(),
                     total_count,
                     options,
                 )
@@ -201,7 +211,7 @@ impl StrmProbeService {
             return Ok(None);
         }
         let _creation_guard = self.incremental_creation_lock.lock().await;
-        if self.database.has_active_strm_probe_jobs().await? {
+        if self.database.has_active_bulk_strm_probe_jobs().await? {
             return Err(StrmProbeError::AlreadyActive);
         }
         let total_count = self
@@ -216,8 +226,10 @@ impl StrmProbeService {
             .create_job_record(
                 &operation_id,
                 &library_id_text,
-                Some(scan_job_id),
-                None,
+                ProbeJobTarget {
+                    scan_job_id: Some(scan_job_id),
+                    ..ProbeJobTarget::default()
+                },
                 total_count,
                 StrmProbeOptions {
                     concurrency: settings.concurrency,
@@ -236,8 +248,7 @@ impl StrmProbeService {
         &self,
         operation_id: &str,
         library_id: &str,
-        target_scan_job_id: Option<&str>,
-        target_source_id: Option<&str>,
+        target: ProbeJobTarget<'_>,
         total_count: i64,
         options: StrmProbeOptions,
     ) -> Result<StrmProbeJob, StrmProbeError> {
@@ -253,8 +264,9 @@ impl StrmProbeService {
                 media_info_enabled: options.media_info_enabled,
                 thumbnail_enabled: options.thumbnail_enabled,
                 thumbnail_position_percent: options.thumbnail_position_percent,
-                target_scan_job_id,
-                target_source_id,
+                target_scan_job_id: target.scan_job_id,
+                target_source_id: target.source_id,
+                target_user_agent: target.user_agent,
                 total_count,
             })
             .await?;
@@ -266,7 +278,12 @@ impl StrmProbeService {
         Ok(strm_probe_job(job))
     }
 
-    pub fn schedule_playback_probe(&self, item_id: &str, source_id: &str) -> bool {
+    pub fn schedule_playback_probe(
+        &self,
+        item_id: &str,
+        source_id: &str,
+        user_agent: Option<&str>,
+    ) -> bool {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return false;
         };
@@ -283,10 +300,20 @@ impl StrmProbeService {
         let service = self.clone();
         let item_id = item_id.to_owned();
         let source_id = source_id.to_owned();
+        // Keep the exact client UA bytes: providers that bind a link to the UA compare it as-is.
+        let user_agent = user_agent
+            .filter(|value| crate::application::plugins::valid_media_probe_user_agent(value))
+            .map(str::to_owned);
         runtime.spawn(async move {
             let result = async {
+                // Playback is the strongest interest signal, so this probe does not queue behind a
+                // bulk job. One slot keeps a burst of plays to at most one extra plugin process
+                // next to whatever scheduled or incremental job is running.
+                let Ok(_slot) = service.playback_probe_slot.clone().acquire_owned().await else {
+                    return Ok(());
+                };
                 if let Some(job_id) = service
-                    .enqueue_playback_probe_after_wait(&item_id, &source_id)
+                    .enqueue_playback_probe(&item_id, &source_id, user_agent.as_deref())
                     .await?
                 {
                     service.run(&job_id).await?;
@@ -307,66 +334,51 @@ impl StrmProbeService {
         true
     }
 
-    async fn enqueue_playback_probe_after_wait(
+    /// Queues the single-source probe for a played item.
+    ///
+    /// A bulk job never blocks this path: the source the user just played is probed right away,
+    /// independently of the scheduled and incremental scopes. The plugin's library selection
+    /// stays the scope of those bulk jobs; playback only requires the plugin to be installed and
+    /// enabled, media-info extraction to be on, the library to be enabled, and the source to
+    /// still lack media information.
+    async fn enqueue_playback_probe(
         &self,
         item_id: &str,
         source_id: &str,
+        user_agent: Option<&str>,
     ) -> Result<Option<String>, StrmProbeError> {
-        let deadline = Instant::now() + PLAYBACK_PROBE_WAIT_TIMEOUT;
-        loop {
-            if self
-                .playback_probe_settings_for_source(item_id, source_id)
-                .await?
-                .is_none()
-            {
-                return Ok(None);
-            }
-            if self.database.has_active_strm_probe_jobs().await? {
-                if Instant::now() >= deadline {
-                    return Ok(None);
-                }
-                tokio::time::sleep(PLAYBACK_PROBE_WAIT_INTERVAL).await;
-                continue;
-            }
-
-            let creation_guard = self.incremental_creation_lock.lock().await;
-            let Some((library_id, settings)) = self
-                .playback_probe_settings_for_source(item_id, source_id)
-                .await?
-            else {
-                drop(creation_guard);
-                return Ok(None);
-            };
-            if self.database.has_active_strm_probe_jobs().await? {
-                drop(creation_guard);
-                if Instant::now() >= deadline {
-                    return Ok(None);
-                }
-                tokio::time::sleep(PLAYBACK_PROBE_WAIT_INTERVAL).await;
-                continue;
-            }
-
-            let operation_id = Uuid::now_v7().to_string();
-            let job = self
-                .create_job_record(
-                    &operation_id,
-                    &library_id,
-                    None,
-                    Some(source_id),
-                    1,
-                    StrmProbeOptions {
-                        concurrency: settings.concurrency,
-                        include_ready: false,
-                        write_sidecars: settings.write_sidecars,
-                        media_info_enabled: true,
-                        thumbnail_enabled: false,
-                        thumbnail_position_percent: settings.thumbnail_position_percent,
-                    },
-                )
-                .await?;
+        let creation_guard = self.incremental_creation_lock.lock().await;
+        let Some((library_id, settings)) = self
+            .playback_probe_settings_for_source(item_id, source_id)
+            .await?
+        else {
             drop(creation_guard);
-            return Ok(Some(job.id));
-        }
+            return Ok(None);
+        };
+
+        let operation_id = Uuid::now_v7().to_string();
+        let job = self
+            .create_job_record(
+                &operation_id,
+                &library_id,
+                ProbeJobTarget {
+                    source_id: Some(source_id),
+                    user_agent,
+                    ..ProbeJobTarget::default()
+                },
+                1,
+                StrmProbeOptions {
+                    concurrency: 1,
+                    include_ready: false,
+                    write_sidecars: settings.write_sidecars,
+                    media_info_enabled: true,
+                    thumbnail_enabled: false,
+                    thumbnail_position_percent: settings.thumbnail_position_percent,
+                },
+            )
+            .await?;
+        drop(creation_guard);
+        Ok(Some(job.id))
     }
 
     async fn playback_probe_settings_for_source(
@@ -378,13 +390,12 @@ impl StrmProbeService {
         let Some(library_id) = self.database.find_item_library_id(item_id).await? else {
             return Ok(None);
         };
-        let Ok(parsed_library_id) = library_id.parse::<LibraryId>() else {
-            return Ok(None);
-        };
         let Some(settings) = self.plugins.enabled_media_info_settings().await? else {
             return Ok(None);
         };
-        if !settings.media_info_enabled || !settings.library_ids.contains(&parsed_library_id) {
+        // The plugin's library selection scopes the scheduled and incremental jobs; playback
+        // probes the one source the user actually started, in whichever library it lives.
+        if !settings.media_info_enabled {
             return Ok(None);
         }
         let Some(library) = self.database.find_library(&library_id).await? else {
@@ -592,7 +603,7 @@ impl StrmProbeService {
         };
         if let Some(source_id) = job.target_source_id.as_deref() {
             let _creation_guard = self.incremental_creation_lock.lock().await;
-            if self.database.has_active_strm_probe_jobs().await? {
+            if self.database.has_active_bulk_strm_probe_jobs().await? {
                 return Err(StrmProbeError::AlreadyActive);
             }
             let operation_id = Uuid::now_v7().to_string();
@@ -600,15 +611,18 @@ impl StrmProbeService {
             self.create_job_record(
                 &operation_id,
                 &library_id_text,
-                None,
-                Some(source_id),
+                ProbeJobTarget {
+                    source_id: Some(source_id),
+                    user_agent: job.target_user_agent.as_deref(),
+                    ..ProbeJobTarget::default()
+                },
                 1,
                 options,
             )
             .await
         } else if let Some(scan_job_id) = job.target_scan_job_id.as_deref() {
             let _creation_guard = self.incremental_creation_lock.lock().await;
-            if self.database.has_active_strm_probe_jobs().await? {
+            if self.database.has_active_bulk_strm_probe_jobs().await? {
                 return Err(StrmProbeError::AlreadyActive);
             }
             let total_count = self
@@ -620,8 +634,10 @@ impl StrmProbeService {
             self.create_job_record(
                 &operation_id,
                 &library_id_text,
-                Some(scan_job_id),
-                None,
+                ProbeJobTarget {
+                    scan_job_id: Some(scan_job_id),
+                    ..ProbeJobTarget::default()
+                },
                 total_count,
                 options,
             )
@@ -735,6 +751,7 @@ impl StrmProbeService {
                 }
                 let service = self.clone();
                 let semaphore = operation_semaphore.clone();
+                let user_agent = job.target_user_agent.clone();
                 let options = ProbeSourceOptions {
                     include_ready: job.target_source_id.is_none() && job.include_ready,
                     media_info_enabled: job.media_info_enabled,
@@ -742,8 +759,11 @@ impl StrmProbeService {
                     thumbnail_position_percent: job.thumbnail_position_percent,
                     thumbnail_mode,
                 };
-                pending
-                    .spawn(async move { service.probe_source(source, semaphore, options).await });
+                pending.spawn(async move {
+                    service
+                        .probe_source(source, semaphore, options, user_agent)
+                        .await
+                });
             }
             if cancelled {
                 break;
@@ -807,13 +827,16 @@ impl StrmProbeService {
         source: StoredStrmMediaSource,
         semaphore: Arc<Semaphore>,
         options: ProbeSourceOptions,
+        user_agent: Option<String>,
     ) -> SourceOutcome {
         let relative_path = source.relative_path.clone();
         let target_kind = source.external_url.as_deref().map_or("none", |target| {
             target_kind_label(classify_strm_target(target).kind)
         });
         let started = Instant::now();
-        let mut outcome = self.probe_source_inner(source, semaphore, options).await;
+        let mut outcome = self
+            .probe_source_inner(source, semaphore, options, user_agent.as_deref())
+            .await;
         outcome.relative_path = relative_path;
         outcome.target_kind = target_kind;
         outcome.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -825,6 +848,7 @@ impl StrmProbeService {
         source: StoredStrmMediaSource,
         semaphore: Arc<Semaphore>,
         options: ProbeSourceOptions,
+        user_agent: Option<&str>,
     ) -> SourceOutcome {
         let path = match safe_media_path(&source.root_path, &source.relative_path) {
             Ok(path) => path,
@@ -919,6 +943,7 @@ impl StrmProbeService {
                 media_info_needed,
                 thumbnail_needed,
                 options.thumbnail_position_percent,
+                user_agent,
             )
             .await;
         drop(permit);
@@ -1660,6 +1685,7 @@ mod tests {
                     thumbnail_position_percent: 30,
                     thumbnail_mode: ThumbnailScrapingMode::default(),
                 },
+                None,
             )
             .await;
 

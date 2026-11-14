@@ -161,9 +161,11 @@ async fn only_authorized_playing_callback_triggers_strm_probe()
         .ok_or("missing Emby token")?
         .to_owned();
 
+    let client_user_agent = "Emby-Client/4.9  (Android 14; Pixel 8)";
     let playing = client
         .post(format!("{base_url}/Sessions/Playing"))
         .query(&[("api_key", token.as_str())])
+        .header("user-agent", client_user_agent)
         .json(&json!({
             "ItemId": playing_item,
             "MediaSourceId": playing_source,
@@ -209,18 +211,25 @@ async fn only_authorized_playing_callback_triggers_strm_probe()
 
     let mut target_source = None;
     for _ in 0..100 {
-        target_source = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT target_source_id FROM strm_probe_jobs ORDER BY created_at DESC LIMIT 1",
+        target_source = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT target_source_id, target_user_agent FROM strm_probe_jobs
+             ORDER BY created_at DESC LIMIT 1",
         )
         .fetch_optional(database.pool())
-        .await?
-        .flatten();
+        .await?;
         if target_source.is_some() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    let (target_source, target_user_agent) =
+        target_source.ok_or("PLAYING callback did not enqueue a playback probe")?;
     assert_eq!(target_source.as_deref(), Some(playing_source.as_str()));
+    assert_eq!(
+        target_user_agent.as_deref(),
+        Some(client_user_agent),
+        "the PLAYING callback's exact User-Agent must reach the probe job"
+    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM strm_probe_jobs")
             .fetch_one(database.pool())
