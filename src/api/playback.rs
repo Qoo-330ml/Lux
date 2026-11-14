@@ -1973,7 +1973,11 @@ pub(super) async fn handle_emby_playback_event(
             }
             if let Some(source_id) = playback_probe_source_id {
                 let strm_probe = state.strm_probe();
-                strm_probe.schedule_playback_probe(&internal_item_id, &source_id);
+                strm_probe.schedule_playback_probe(
+                    &internal_item_id,
+                    &source_id,
+                    client_user_agent(&headers),
+                );
             }
             tracing::info!(
                 event = "emby_playback_callback_recorded",
@@ -4733,7 +4737,11 @@ pub(super) async fn lux_web_playback_range(
     };
     {
         let strm_probe = state.strm_probe();
-        strm_probe.schedule_playback_probe(&session.item_id, &source.source_id);
+        strm_probe.schedule_playback_probe(
+            &session.item_id,
+            &source.source_id,
+            client_user_agent(&headers),
+        );
     }
     let mut response = Response::builder()
         .status(StatusCode::PARTIAL_CONTENT)
@@ -4920,6 +4928,18 @@ pub(super) struct WebPlaybackEventRequest {
     duration_ticks: Option<i64>,
 }
 
+/// The client's User-Agent exactly as received, when it can be forwarded to a media probe.
+///
+/// The value is never trimmed or normalized: providers that bind a media link to the requesting
+/// UA compare the bytes, so any rewrite would break the binding. Only values that a plugin can
+/// safely receive as an argv entry are forwarded, and the value is never logged.
+pub(super) fn client_user_agent(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| crate::application::plugins::valid_media_probe_user_agent(value))
+}
+
 pub(super) async fn lux_web_playback_event(
     headers: HeaderMap,
     Path(session_id): Path<String>,
@@ -5025,6 +5045,21 @@ pub(super) async fn lux_web_playback_event(
                 .is_err()
         {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        // A remote `.strm` may play from its own URL, so the browser never requests Lux's media
+        // entry and the media-info probe would never run. Entering playback is the web equivalent
+        // of the Emby `PLAYING` callback: it fills the played source's media information even
+        // when the bytes come straight from the target.
+        let entering_playback = matches!(request.state, LuxPlaybackState::Playing)
+            && previous_session
+                .as_ref()
+                .is_none_or(|previous| previous.state != "PLAYING");
+        if entering_playback && let Some(source_id) = session.media_source_id.as_deref() {
+            state.strm_probe().schedule_playback_probe(
+                &session.item_id,
+                source_id,
+                client_user_agent(&headers),
+            );
         }
         // Progress and played flags only change this user's rails; other users keep their cached
         // home snapshots.

@@ -1621,7 +1621,9 @@ Web 将这些任务显示为“已完成，有问题”，提示“索引已完�
 
 播放补提取不受插件媒体库选择约束：`libraryIds` 只决定定时与增量任务的范围。播放触发的单来源作业也不再等待全库或增量作业，它以固定并发 1 运行，一次播放潮最多额外占用一个插件并发；活动作业唯一索引因此从 `(library_id)` 改为 `(library_id, coalesce(target_source_id, ''))`，允许同库批量作业与单来源作业并存，批量与增量任务的创建闸门只看批量作业（2026-11-14 修订，定向回归 `strm_probe` 5/5、`strm_probe_api` 2/2、`playback_strm_probe` 2/2、`web_playback` 1/1；PostgreSQL 迁移未在本机执行）。
 
-可触发入口为已授权的 Web/Emby 实际播放 GET，以及已授权的 Emby `PLAYING` 回调；PlaybackInfo、HEAD、浏览详情、暂停和停止回调不触发。播放只排队当前来源，不扩展为全库扫描。单来源范围由 SQLite/PostgreSQL 迁移持久化，普通全库与扫描增量任务范围保持不变。
+可触发入口为已授权的 Web/Emby 实际播放 GET、已授权的 Emby `PLAYING` 回调，以及 Web 播放事件进入 `PLAYING`（网页可能从 `.strm` 原始地址直连播放，此时 Lux 收不到媒体 GET）；PlaybackInfo、HEAD、浏览详情、暂停和停止回调不触发。
+
+播放触发的探测会把客户端请求媒体时的 User-Agent 原文传给插件（迁移 `0251_strm_probe_job_user_agent` 持久化在播放作业上），插件用它请求直链并作为 `ffprobe`/`ffmpeg` 的 `-user_agent`；宿主不裁剪、不改写、不归一化，空值、超过 1024 字节或含控制字符的值被丢弃且不写日志。定时与增量任务不带该值，插件继续使用自己的默认 UA。这样 115 等把短期直链绑定到请求 UA 的网盘不会因为服务端换 UA 而在播放期间取链失败；旧版插件忽略未知的 `userAgent` 字段，继续使用默认 UA。播放只排队当前来源，不扩展为全库扫描。单来源范围由 SQLite/PostgreSQL 迁移持久化，普通全库与扫描增量任务范围保持不变。
 
 本机 macOS `arm64` 服务端验证：`playback` 5/5、`playback_strm_probe` 1/1、`strm` 1/1、`strm_probe` 4/4、`strm_probe_api` 2/2、`web_playback` 1/1；另有扫描范围重试锁回归 1/1。完整 Rust 门禁的 4 个失败已在干净 `test` 基线上复现，完整 Clippy 尚有既有诊断；未验证 FNOS/NAS、真实远程媒体服务器或第三方播放器，因此不代表部署环境链路已验证。
 

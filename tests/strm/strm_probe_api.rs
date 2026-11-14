@@ -420,22 +420,34 @@ async fn only_authorized_strm_media_get_triggers_playback_probe()
         0
     );
 
-    let stream = client.get(format!("{base_url}{direct_url}")).send().await?;
+    let client_user_agent = "Infuse-Direct/8.0  (Apple TV; tvOS 17.0)";
+    let stream = client
+        .get(format!("{base_url}{direct_url}"))
+        .header("user-agent", client_user_agent)
+        .send()
+        .await?;
     assert_eq!(stream.status(), reqwest::StatusCode::FOUND);
     let mut target_source = None;
     for _ in 0..100 {
-        target_source = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT target_source_id FROM strm_probe_jobs ORDER BY created_at DESC LIMIT 1",
+        target_source = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT target_source_id, target_user_agent FROM strm_probe_jobs
+             ORDER BY created_at DESC LIMIT 1",
         )
         .fetch_optional(database.pool())
-        .await?
-        .flatten();
+        .await?;
         if target_source.is_some() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    let (target_source, target_user_agent) =
+        target_source.ok_or("media GET did not enqueue a playback probe")?;
     assert_eq!(target_source.as_deref(), Some(source_id.as_str()));
+    assert_eq!(
+        target_user_agent.as_deref(),
+        Some(client_user_agent),
+        "the media GET's exact User-Agent must reach the probe job"
+    );
 
     for _ in 0..100 {
         let active_jobs = sqlx::query_scalar::<_, i64>(

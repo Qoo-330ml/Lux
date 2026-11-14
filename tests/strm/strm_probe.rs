@@ -856,7 +856,7 @@ async fn playback_probe_fills_only_missing_info_even_when_policy_overwrites()
             ]),
         )
         .await?;
-    assert!(service.schedule_playback_probe(&missing_item_id, &missing_source_id));
+    assert!(service.schedule_playback_probe(&missing_item_id, &missing_source_id, None));
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM strm_probe_jobs")
@@ -867,7 +867,7 @@ async fn playback_probe_fills_only_missing_info_even_when_policy_overwrites()
     );
 
     plugins.set_enabled(MEDIA_INFO_PLUGIN_ID, false).await?;
-    assert!(service.schedule_playback_probe(&missing_item_id, &missing_source_id));
+    assert!(service.schedule_playback_probe(&missing_item_id, &missing_source_id, None));
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM strm_probe_jobs")
@@ -893,7 +893,7 @@ async fn playback_probe_fills_only_missing_info_even_when_policy_overwrites()
         )
         .await?;
 
-    assert!(service.schedule_playback_probe(&existing_item_id, &existing_source_id));
+    assert!(service.schedule_playback_probe(&existing_item_id, &existing_source_id, None));
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM strm_probe_jobs")
@@ -902,7 +902,7 @@ async fn playback_probe_fills_only_missing_info_even_when_policy_overwrites()
         0
     );
 
-    assert!(service.schedule_playback_probe(&local_item_id, &local_source_id));
+    assert!(service.schedule_playback_probe(&local_item_id, &local_source_id, None));
     let mut local_probe_job = None;
     for _ in 0..250 {
         local_probe_job = sqlx::query_as::<_, (String, String)>(
@@ -957,8 +957,8 @@ async fn playback_probe_fills_only_missing_info_even_when_policy_overwrites()
             },
         )
         .await?;
-    assert!(service.schedule_playback_probe(&missing_item_id, &missing_source_id));
-    assert!(!service.schedule_playback_probe(&missing_item_id, &missing_source_id));
+    assert!(service.schedule_playback_probe(&missing_item_id, &missing_source_id, None));
+    assert!(!service.schedule_playback_probe(&missing_item_id, &missing_source_id, None));
     let mut finished_job = None;
     for _ in 0..250 {
         let job: Option<(String, String, Option<String>, i64, i64, i64)> = sqlx::query_as(
@@ -1134,7 +1134,13 @@ async fn playback_probe_ignores_the_plugin_library_selection()
     .execute(database.pool())
     .await?;
 
-    assert!(service.schedule_playback_probe(&played_item_id, &played_source_id));
+    let client_user_agent =
+        "Mozilla/5.0  (iPhone; CPU iPhone OS 17_0 like Mac OS X)  AppleWebKit/605.1.15";
+    assert!(service.schedule_playback_probe(
+        &played_item_id,
+        &played_source_id,
+        Some(client_user_agent)
+    ));
     let mut finished = None;
     for _ in 0..250 {
         let job: Option<(String, i64, i64)> = sqlx::query_as(
@@ -1159,6 +1165,28 @@ async fn playback_probe_ignores_the_plugin_library_selection()
     assert_eq!(
         write_sidecars, 1,
         "playback follows the plugin's sidecar setting"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT target_user_agent FROM strm_probe_jobs WHERE target_source_id = ?",
+        )
+        .bind(&played_source_id)
+        .fetch_one(database.pool())
+        .await?
+        .as_deref(),
+        Some(client_user_agent),
+        "the played client's User-Agent must be stored byte for byte"
+    );
+    let probe_requests = tokio::fs::read_to_string(binary_dir.join("requests.log")).await?;
+    let probe_ua = probe_requests
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|request| request["method"] == "media.probe")
+        .and_then(|request| request["params"]["userAgent"].as_str().map(str::to_owned))
+        .ok_or("media.probe request did not carry a user agent")?;
+    assert_eq!(
+        probe_ua, client_user_agent,
+        "the plugin must receive the exact client User-Agent"
     );
     assert_eq!(
         sqlx::query_scalar::<_, Option<i64>>(
@@ -1192,6 +1220,7 @@ fn write_fake_media_probe_plugin(
     let script = format!(
         r#"#!/bin/sh
 while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$(dirname "$0")/requests.log"
   id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
   method=$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
   case "$method" in

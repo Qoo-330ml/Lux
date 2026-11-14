@@ -3828,7 +3828,11 @@ async fn admit_emby_media_response(
     }
     if let Some((item_id, source_id)) = playback_probe_source {
         let strm_probe = state.strm_probe();
-        strm_probe.schedule_playback_probe(item_id, source_id);
+        strm_probe.schedule_playback_probe(
+            item_id,
+            source_id,
+            super::playback::client_user_agent(headers),
+        );
     }
     response
 }

@@ -11,8 +11,8 @@ impl Database {
                 id, operation_id, library_id, status, concurrency,
                 include_ready, write_sidecars, media_info_enabled,
                 thumbnail_enabled, thumbnail_position_percent, target_scan_job_id,
-                target_source_id, total_count
-             ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                target_source_id, target_user_agent, total_count
+             ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(job.id)
         .bind(job.operation_id)
@@ -25,6 +25,7 @@ impl Database {
         .bind(job.thumbnail_position_percent)
         .bind(job.target_scan_job_id)
         .bind(job.target_source_id)
+        .bind(job.target_user_agent)
         .bind(job.total_count)
         .execute(&mut *transaction)
         .await
@@ -83,7 +84,7 @@ impl Database {
             "SELECT id, operation_id, library_id, status, concurrency,
                     include_ready, write_sidecars, media_info_enabled,
                     thumbnail_enabled, thumbnail_position_percent, target_scan_job_id,
-                    target_source_id, cursor, processed_count,
+                    target_source_id, target_user_agent, cursor, processed_count,
                     total_count, cancel_requested, error,
                     created_at, started_at, finished_at
              FROM strm_probe_jobs WHERE id = ?",
@@ -108,7 +109,7 @@ impl Database {
                 "SELECT id, operation_id, library_id, status, concurrency,
                         include_ready, write_sidecars, media_info_enabled,
                         thumbnail_enabled, thumbnail_position_percent, target_scan_job_id,
-                        target_source_id, cursor, processed_count,
+                        target_source_id, target_user_agent, cursor, processed_count,
                         total_count, cancel_requested, error,
                         created_at, started_at, finished_at
                  FROM strm_probe_jobs WHERE status = ?
@@ -124,7 +125,7 @@ impl Database {
                 "SELECT id, operation_id, library_id, status, concurrency,
                         include_ready, write_sidecars, media_info_enabled,
                         thumbnail_enabled, thumbnail_position_percent, target_scan_job_id,
-                        target_source_id, cursor, processed_count,
+                        target_source_id, target_user_agent, cursor, processed_count,
                         total_count, cancel_requested, error,
                         created_at, started_at, finished_at
                  FROM strm_probe_jobs
@@ -390,6 +391,7 @@ mod playback_scope_tests {
                 thumbnail_position_percent: 30,
                 target_scan_job_id: None,
                 target_source_id: Some(target_source_id),
+                target_user_agent: None,
                 total_count: 1,
             })
             .await?;

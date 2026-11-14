@@ -289,7 +289,10 @@ Actions 在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` runner 上分别构建。Relea
 - `ratings.lookup` / `ratings.batch` / `ratings.search`：只读评分查询，只由声明 `ratings.*` 的 `metadata`
   插件提供，见下文“评分查询调用约定”。
 - `media.probe`：接收一个已由 Lux 宿主校验的媒体地址，以及 `includeMediaInfo`、
-  `includeThumbnail` 和 `thumbnailPositionPercent`。媒体信息由 `ffprobe` 返回受限的 format/stream 信息；
+  `includeThumbnail`、`thumbnailPositionPercent` 和可选的 `userAgent`。`userAgent` 只在播放触发的探测中出现，
+  是客户端请求媒体时使用的 User-Agent 原文：宿主不裁剪、不改写、不归一化，插件必须把它逐字节用于直链请求和
+  `ffprobe`/`ffmpeg` 的 `-user_agent`，因为部分网盘会把短期直链绑定到该 UA，换成默认 UA 会取链失败。缺省时
+  插件使用自己的默认 UA（定时/增量探测）。宿主拒绝空值、超过 1024 字节或含控制字符的值，且不记录该值。媒体信息由 `ffprobe` 返回受限的 format/stream 信息；
   缩略图由 `ffmpeg` 在 duration 的 `thumbnailPositionPercent` 百分比位置生成 JPEG（缺省为 30），并通过受限的
   `thumbnailJpegBase64` 返回。宿主可以把成功截图以同一文件同时登记为 `POSTER` 和 `THUMB`。插件不解析 `.strm` 内容，也不因地址类型拒绝输入。
 - `emby.route`：由插件 manifest 的 `embyRoutes` 声明精确的 Emby 方法和路径。宿主只向已安装、已启用且
