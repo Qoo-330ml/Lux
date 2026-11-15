@@ -21814,6 +21814,46 @@ content light level）只出现在帧级 side data，`-show_streams` 的 `side_d
 `tests/images/image_api.rs`、`web/tests/media-editors.test.tsx`、`docs/API.md`、`docs/TEST-TARGETS.md`、
 `docs/LUX-DEVELOPMENT.md`。
 
+#### LUX-912：带版本标签的季目录写回剧集级元数据
+
+状态：已完成（2026-11-15，提交 `fe623a24`）。依赖：LUX-883 的 `Season N <标签>` 季目录。验证：
+`--lib application::metadata` 31/31、`--test metadata metadata_selection::` 50/50、
+`--test metadata scanned_series_metadata::` 3/3、`--test metadata series_metadata::` 6/6、
+`--test images image_writer::` 21/21、`--lib application::images` 36/36、fmt、
+`clippy --all-targets --all-features -D warnings` 通过。
+
+背景：`Season 1 DV`、`Season 1 HDR`、`Season1 SDR` 这类同季多版本目录在扫描阶段已经合并成一个剧集
+（LUX-883），但元数据写回用的是另一套季目录判断（`src/application/metadata.rs` 的 `is_season_directory`），
+只认 `Season N`、`SN`、`Specials` 和 `Season N (数字)`。于是 `series_directory` 找不到季目录并返回 `None`，
+剧集级 `tvshow.nfo` 与海报写回都被判成 `PathOutsideRoot`（403 `NFO_PATH_OUTSIDE_ROOT` /
+`IMAGE_PATH_OUTSIDE_ROOT`「元数据路径不在媒体根目录内」）。同一个 helper 也用于本地元数据读取，带标签目录里
+已有的 `tvshow.nfo` 和剧集图片同样被跳过；集与季的写回不受影响。
+
+范围：
+
+- `src/application/metadata.rs` 的 `series_directory` 改用扫描器的 `parse_season_directory`，删除重复的
+  `is_season_directory`，让扫描、写回和本地读取共用同一套季目录规则。
+- `parse_season_directory` 从 `pub(super)` 提为 `pub(crate)`，由 `application::scanner` 以
+  `pub(crate) use` 重导出，避免两套规则再次漂移。
+- 行为对齐扫描器：`Season 1 DV`、`S01 HDR`、`Season 1 国语` 算季目录；`Season 1DV`、`Season 1 Part Two`、
+  `Season DV`、`Extras` 仍不算。集和季的写回路径不变。
+
+不做：不改变季目录标签的语义与多版本合并规则（LUX-883 已定），不改数据库、API 与 Web，不迁移旧版已经
+拆成多个条目的库。
+
+验收：
+
+- [x] `series_directory` 对带标签季目录返回剧集目录
+  （`series_directory_stops_at_a_labelled_season_directory`）。
+- [x] `Season 1 DV` 下选择剧集候选能写出 `tvshow.nfo`，且不会凭空创建 `Season 01`
+  （`series_selection_writes_tvshow_nfo_when_the_season_directory_has_a_version_label`）。
+- [x] 既有集/季写回与本地 NFO/图片读取用例全部通过（`metadata_selection::`、`scanned_series_metadata::`、
+  `series_metadata::`、`image_writer::`）。
+- [ ] 未验证：真实 115 挂载上对既有剧集重新刮削（需要所有者环境）。本任务只保证路径推导正确。
+
+预计文件：`src/application/metadata.rs`、`src/application/scanner.rs`、`src/application/scanner/names.rs`、
+`tests/metadata/metadata_selection.rs`、`docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
+
 ## 31. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
