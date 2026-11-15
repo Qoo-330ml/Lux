@@ -437,7 +437,7 @@ pub(super) fn parse_season_directory_name(value: &str) -> Option<u32> {
 /// `Season N <label>` where `<label>` is exactly one whitespace-free word (for
 /// example `DV`, `HDR` or `国语`). Directories sharing a season number belong to
 /// the same season; the label only names the media version.
-pub(super) fn parse_season_directory(value: &str) -> Option<(u32, Option<String>)> {
+pub(crate) fn parse_season_directory(value: &str) -> Option<(u32, Option<String>)> {
     let trimmed = value.trim();
     if trimmed.eq_ignore_ascii_case("specials") {
         return Some((0, None));

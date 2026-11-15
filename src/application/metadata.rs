@@ -16,7 +16,7 @@ use tokio::{
 
 use crate::{
     application::background_work::{BackgroundWorkStage, run_process_background_blocking},
-    application::scanner::compute_file_fingerprint,
+    application::scanner::{compute_file_fingerprint, parse_season_directory},
     application::{
         images::{
             background_image_content_tag_and_dimensions_from_bytes,
@@ -6610,6 +6610,36 @@ mod tests {
         assert!(message.contains("current_item_id=current-item"));
         assert!(message.contains("conflicting_item_id=conflicting-item"));
     }
+
+    #[test]
+    fn series_directory_stops_at_a_labelled_season_directory() {
+        let root = Path::new("/media/shows");
+        for season in [
+            "Season 1",
+            "S1",
+            "Season 01 (1)",
+            "Specials",
+            "Season 1 DV",
+            "Season1 SDR",
+            "S01 HDR",
+        ] {
+            assert_eq!(
+                series_directory(
+                    root,
+                    &format!("国产剧集/剧 (2025) {{tmdbid-278577}}/{season}/剧.S01E01.mkv"),
+                ),
+                Some(root.join("国产剧集/剧 (2025) {tmdbid-278577}")),
+                "season directory '{season}' must resolve to the series directory"
+            );
+        }
+        for directory in ["Season 1DV", "Season 1 Part Two", "Season DV", "Extras"] {
+            assert_eq!(
+                series_directory(root, &format!("剧 (2025)/{directory}/ep.mkv")),
+                None,
+                "'{directory}' is not a season directory"
+            );
+        }
+    }
 }
 
 pub(crate) async fn find_nfo_path(media_path: &Path) -> Option<PathBuf> {
@@ -6807,32 +6837,13 @@ pub(crate) fn series_directory(root: &Path, relative_path: &str) -> Option<PathB
     for component in Path::new(relative_path).parent()?.components() {
         let value = component.as_os_str();
         let value_text = value.to_str()?;
-        if is_season_directory(value_text) {
+        if parse_season_directory(value_text).is_some() {
             return saw_series_component.then_some(series_dir);
         }
         series_dir.push(value);
         saw_series_component = true;
     }
     None
-}
-
-fn is_season_directory(value: &str) -> bool {
-    let normalized = value.trim().to_ascii_lowercase();
-    if normalized == "specials" {
-        return true;
-    }
-    let Some(number) = normalized
-        .strip_prefix("season")
-        .or_else(|| normalized.strip_prefix('s'))
-    else {
-        return false;
-    };
-    let number = number.trim();
-    let number = number
-        .split_once('(')
-        .and_then(|(prefix, suffix)| suffix.strip_suffix(')').map(|_| prefix.trim()))
-        .unwrap_or(number);
-    !number.is_empty() && number.chars().all(|character| character.is_ascii_digit())
 }
 
 async fn find_tvshow_nfo(series_dir: &Path) -> Option<PathBuf> {
