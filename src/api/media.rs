@@ -2341,8 +2341,12 @@ pub(super) async fn lux_search_item_images(
         )
         .await
     {
-        Ok(images) => Json(json!({
-            "images": images.iter().map(image_candidate_json).collect::<Vec<_>>()
+        Ok(outcome) => Json(json!({
+            "images": outcome.images.iter().map(image_candidate_json).collect::<Vec<_>>(),
+            // An empty list is ambiguous without these: the scraper may have returned logos in
+            // other languages that the language filter removed.
+            "availableLanguages": outcome.available_languages,
+            "filteredByLanguage": outcome.filtered_by_language,
         }))
         .into_response(),
         Err(error) => image_candidate_error(&headers, error),

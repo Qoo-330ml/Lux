@@ -1273,6 +1273,13 @@ pub(crate) fn image_candidate_error(headers: &HeaderMap, error: ImageCandidateEr
             "媒体条目尚未完成元数据匹配，暂时无法搜索图片",
         )
         .into_response(),
+        ImageCandidateError::ItemNotScrapable => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "该条目类型没有在线图片：家庭视频和其他本地条目不支持在线图片搜索",
+        )
+        .into_response(),
         ImageCandidateError::InvalidItem
         | ImageCandidateError::InvalidImageType(_)
         | ImageCandidateError::InvalidLanguage
@@ -1283,13 +1290,15 @@ pub(crate) fn image_candidate_error(headers: &HeaderMap, error: ImageCandidateEr
             "图片搜索请求无效",
         )
         .into_response(),
-        ImageCandidateError::Scraper(_) => api_error(
+        // Image search talks to the same scraper layer as metadata search, so it reports the same
+        // concrete cause instead of one generic "scraper unavailable" line.
+        ImageCandidateError::Scraper(error) => scraper_failure_response(
             headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::Internal,
-            "刮削器暂时不可用",
-        )
-        .into_response(),
+            ScraperFailureCause::from_error(&error),
+            None,
+            1,
+            ScraperRequestKind::ImageSearch,
+        ),
         ImageCandidateError::Storage(_) => api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1655,15 +1664,20 @@ pub(crate) fn metadata_candidate_error(
             "候选数据损坏",
         )
         .into_response(),
-        MetadataCandidateError::Scraper(error) => {
-            scraper_failure_response(headers, ScraperFailureCause::from_error(&error), None, 1)
-        }
+        MetadataCandidateError::Scraper(error) => scraper_failure_response(
+            headers,
+            ScraperFailureCause::from_error(&error),
+            None,
+            1,
+            ScraperRequestKind::MetadataSearch,
+        ),
         MetadataCandidateError::ScraperFailed(failures) => match failures.first() {
             Some(first) => scraper_failure_response(
                 headers,
                 first.cause,
                 first.label.as_deref(),
                 failures.len(),
+                ScraperRequestKind::MetadataSearch,
             ),
             None => api_error(
                 headers,
@@ -1697,6 +1711,22 @@ pub(crate) fn metadata_candidate_error(
     }
 }
 
+/// Whether the failed scraper call was a metadata search or an image search.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ScraperRequestKind {
+    MetadataSearch,
+    ImageSearch,
+}
+
+impl ScraperRequestKind {
+    fn unsupported_capability(self) -> &'static str {
+        match self {
+            Self::MetadataSearch => "不支持元数据搜索",
+            Self::ImageSearch => "不支持图片搜索",
+        }
+    }
+}
+
 /// Maps one stable scraper failure cause to the status, error code and message an administrator
 /// sees, naming the plugin when the host knows its display name.
 fn scraper_failure_response(
@@ -1704,6 +1734,7 @@ fn scraper_failure_response(
     cause: ScraperFailureCause,
     label: Option<&str>,
     failed_sources: usize,
+    kind: ScraperRequestKind,
 ) -> Response {
     let source = scraper_source_label(label);
     let (status, code, message) = match cause {
@@ -1730,7 +1761,7 @@ fn scraper_failure_response(
         ScraperFailureCause::PluginUnsupported | ScraperFailureCause::UnsupportedCapability => (
             StatusCode::CONFLICT,
             lux::ApiErrorCode::PluginUnavailable,
-            format!("元数据刮削器{source}不支持元数据搜索"),
+            format!("元数据刮削器{source}{}", kind.unsupported_capability()),
         ),
         ScraperFailureCause::UpstreamAuthFailed => (
             StatusCode::CONFLICT,

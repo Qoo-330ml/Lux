@@ -64,7 +64,22 @@ async fn image_stub(request: axum::http::Request<axum::body::Body>) -> Json<Valu
     Json(json!({
         "posters": posters,
         "backdrops": [],
-        "logos": []
+        "logos": [
+            {
+                "file_path": "/logo-ko.png",
+                "iso_639_1": "ko",
+                "width": 800,
+                "height": 310,
+                "vote_average": 6.0
+            },
+            {
+                "file_path": "/logo-en.png",
+                "iso_639_1": "en",
+                "width": 800,
+                "height": 310,
+                "vote_average": 6.0
+            }
+        ]
     }))
 }
 
@@ -181,6 +196,137 @@ async fn image_search_returns_filtered_scraper_candidates() -> Result<(), Box<dy
         .filter_map(|image| image["language"].as_str())
         .collect::<Vec<_>>();
     assert_eq!(languages, vec!["zh", "en", "ja"]);
+
+    server.abort();
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn logo_search_reports_the_languages_it_filtered_out()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let tmdb_app = Router::new().fallback(any(image_stub));
+    let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let tmdb_address = tmdb_listener.local_addr()?;
+    let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
+
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Example Movie (2020)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Example.Movie.2020.mkv"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+    sqlx::query("UPDATE media_items SET provider_ids_json = '{\"tmdb\":\"999\"}' WHERE id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+
+    let tmdb = TestScraper::new(TestScraperConfig {
+        base_url: format!("http://{tmdb_address}"),
+        read_access_token: Some("stub-token".to_owned()),
+        requests_per_second: 0,
+        max_retries: 0,
+        ..TestScraperConfig::default()
+    })?;
+    let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(
+        AppState::ready(config, database.clone(), setup, auth, emby_auth)
+            .with_scraper(tmdb.provider()),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    let csrf = cookie_value(login.headers(), "lux_csrf");
+    let cookie = format!(
+        "lux_session={}; lux_csrf={csrf}",
+        cookie_value(login.headers(), "lux_session"),
+    );
+
+    // The stub only has Korean and English logos, so a Simplified Chinese search is empty — the
+    // response must say which languages were dropped instead of leaving the administrator guessing.
+    let response = client
+        .post(format!("{base_url}/api/v1/items/{item_id}/images/search"))
+        .header(COOKIE, cookie.clone())
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "imageType": "LOGO", "language": "zh-CN", "source": "" }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await?;
+    assert_eq!(body["images"].as_array().map(Vec::len), Some(0));
+    assert_eq!(body["availableLanguages"], json!(["en", "ko"]));
+    assert_eq!(body["filteredByLanguage"], 2);
+
+    let response = client
+        .post(format!("{base_url}/api/v1/items/{item_id}/images/search"))
+        .header(COOKIE, cookie.clone())
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "imageType": "LOGO", "language": "", "source": "" }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await?;
+    let languages = body["images"]
+        .as_array()
+        .ok_or("logo result list is missing")?
+        .iter()
+        .filter_map(|image| image["language"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(languages, vec!["ko", "en"]);
+    assert_eq!(body["filteredByLanguage"], 0);
+
+    // Home video items have no online image source; an empty list would look like a silent failure.
+    sqlx::query("UPDATE media_items SET item_type = 'VIDEO' WHERE id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    let response = client
+        .post(format!("{base_url}/api/v1/items/{item_id}/images/search"))
+        .header(COOKIE, cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "imageType": "LOGO", "language": "" }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    let body: Value = response.json().await?;
+    assert_eq!(body["error"]["code"], "INVALID_REQUEST");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("家庭视频")
+    );
 
     server.abort();
     tmdb_server.abort();

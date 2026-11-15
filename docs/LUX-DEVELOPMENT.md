@@ -21768,6 +21768,52 @@ content light level）只出现在帧级 side data，`-show_streams` 的 `side_d
 `src/application/plugins.rs`、`src/api/admin/admin_metadata.rs`、`src/api/legacy.rs`、
 `tests/metadata/metadata_api.rs`、`docs/API.md`、`docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
 
+#### LUX-911：图片搜索空结果说明原因
+
+状态：已完成（2026-11-15）。依赖：LUX-910 的 `ScraperFailureCause`。验证：`--test images` 67/67、
+`pnpm --dir web test` 1619/1619、`pnpm --dir web build`、fmt、`clippy --all-targets --all-features -D warnings`
+通过。
+
+背景：管理员给「黑暗荣耀」搜徽标，结果为空，界面却仍显示搜索前的提示「选择语言和来源后搜索徽标。」，
+无法判断是没搜到、被语言过滤掉还是刮削器坏了。实际链路是插件先按请求语言取图，宿主再按
+`image_language_matches` 过滤一次；仅当原语言模式开启时才保留原语言/英语/无语言图片。徽标多为韩语或英语，
+默认「简体中文」下会被宿主全部丢弃，而空列表与「还没搜索」在 Web 上长得一样。另外家庭视频等条目类型静默
+返回空列表，图片搜索的刮削器失败仍返回笼统的 `503 INTERNAL`「刮削器暂时不可用」。
+
+范围：
+
+- `ImageCandidateService::search` 返回 `ImageSearchOutcome`：匹配图片、语言过滤前的刮削器语言码
+  `available_languages`（小写、排序、去重、最多 8 个）和 `filtered_by_language` 计数。不增加上游请求。
+- 条目类型不是电影/剧集/季/集时返回 `ImageCandidateError::ItemNotScrapable`（409 `INVALID_REQUEST`
+  「家庭视频和其他本地条目不支持在线图片搜索」），不再用空列表冒充成功。
+- `POST /api/v1/items/{itemId}/images/search` 响应新增 `availableLanguages` 与 `filteredByLanguage`；
+  `images` 上限 50 不变。
+- 图片搜索的刮削器失败复用 LUX-910 的原因分类与日志/文案，并新增 `ScraperRequestKind` 让「不支持能力」
+  区分「不支持元数据搜索 / 不支持图片搜索」；错误码从 `INTERNAL` 改为 `PLUGIN_UNAVAILABLE`。
+- Web 图像编辑器区分「未搜索」和「搜索后为空」：空结果按诊断显示
+  「没有「简体中文」的徽标；刮削器返回的徽标是 en / ko，可以换成「不限语言」或其他语言再搜索。」
+  之类的原因；切换语言/来源时，只要该图片类型搜索过就自动重搜（原实现仅在已有结果时才重搜，空结果会卡住）。
+
+不做：不改变图片语言匹配语义、不自动放宽语言过滤、不新增 HTTP 错误码、不改数据库与插件协议。
+
+验收：
+
+- [x] 简体中文搜徽标返回空时给出 en/ko 语言列表和过滤计数
+  （`logo_search_reports_the_languages_it_filtered_out`）。
+- [x] 不限语言能拿到 ko/en 徽标且 `filteredByLanguage` 为 0（同上）。
+- [x] 家庭视频条目返回 `409 INVALID_REQUEST` 并说明原因（同上）。
+- [x] 空结果提示不再是搜索前占位文案，且包含可用语言
+  （Web `explains why image search came back empty instead of repeating the pre-search hint`）。
+- [x] `docs/API.md` 记录响应字段与错误语义；`docs/TEST-TARGETS.md` 更新计数。
+- [x] `cargo test --locked --test images`、`pnpm --dir web test`、`pnpm --dir web build`、fmt、clippy 通过。
+- [ ] 未验证：真实 TMDb 上「黑暗荣耀」的徽标语言分布（需要所有者环境与出网）。本任务只保证 Lux 能如实
+  报告过滤情况，不宣称上游存在某种语言的徽标。
+
+预计文件：`src/application/images.rs`、`src/api/media.rs`、`src/api/admin/admin_metadata.rs`、
+`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/src/features/media/MediaImageEditor.tsx`、
+`tests/images/image_api.rs`、`web/tests/media-editors.test.tsx`、`docs/API.md`、`docs/TEST-TARGETS.md`、
+`docs/LUX-DEVELOPMENT.md`。
+
 ## 31. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

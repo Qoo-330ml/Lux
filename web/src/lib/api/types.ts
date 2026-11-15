@@ -390,6 +390,14 @@ export type ImageSearchResult = {
   url: string;
 };
 
+export type ImageSearchResponse = {
+  images?: ImageSearchResult[];
+  /** Language codes the scraper returned for this image type before the language filter. */
+  availableLanguages?: string[];
+  /** How many scraper images the language filter removed from the result. */
+  filteredByLanguage?: number;
+};
+
 export type HomeResponse = {
   libraries?: Library[];
   recommended?: MediaItem[];

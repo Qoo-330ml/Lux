@@ -15,7 +15,7 @@
 | `--test scanner` | 媒体库扫描、增量/混合扫描、计划任务、作业事件与关停 | 7 | 152 |
 | `--test library` | 媒体库生命周期、合并/拆分、集合、目录与系列 API | 12 | 62 |
 | `--test metadata` | 元数据抓取与选择、NFO 回写、扫描后剧集元数据、人物、字幕 | 14 | 161 |
-| `--test images` | 图片变体、写回、缩略图与图片 API | 6 | 66 |
+| `--test images` | 图片变体、写回、缩略图与图片 API | 6 | 67 |
 | `--test playback` | 播放、播放令牌/历史/续播、观看状态归档、章节与片头片尾检测 | 10 | 35 |
 | `--test storage` | SQLite/PostgreSQL 存储、迁移、WAL、数据库维护与启动守卫 | 9 | 118 |
 | `--test plugins` | 插件协议与运行时、弹幕、IP 属地、媒体信息插件配置 | 11 | 129 |
@@ -130,7 +130,7 @@ cargo test --locked --test <新 target> <旧名>::
 | `scraper` | 4 | `cargo test --locked --test metadata scraper::` |
 | `series_metadata` | 3 | `cargo test --locked --test metadata series_metadata::` |
 | `subtitles` | 1 | `cargo test --locked --test metadata subtitles::` |
-| `image_api` | 1 | `cargo test --locked --test images image_api::` |
+| `image_api` | 2 | `cargo test --locked --test images image_api::` |
 | `image_variants` | 19 | `cargo test --locked --test images image_variants::` |
 | `image_writer` | 21 | `cargo test --locked --test images image_writer::` |
 | `images` | 3 | `cargo test --locked --test images images::` |

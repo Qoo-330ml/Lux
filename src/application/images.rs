@@ -1577,6 +1577,20 @@ pub struct ImageCandidateService {
     resolver: Option<ScraperResolver>,
 }
 
+/// One interactive image search.
+///
+/// `images` holds the candidates that passed every filter. The diagnostics describe what the
+/// scraper returned before the language filter, so an empty result can say why it is empty instead
+/// of looking like a broken search.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ImageSearchOutcome {
+    pub images: Vec<ImageCandidate>,
+    /// Language codes of the scraper images of the requested type, before the language filter.
+    pub available_languages: Vec<String>,
+    /// How many typed scraper images the language filter removed.
+    pub filtered_by_language: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImageCandidate {
     pub id: String,
@@ -1618,7 +1632,7 @@ impl ImageCandidateService {
         image_type: &str,
         language: Option<&str>,
         source: Option<&str>,
-    ) -> Result<Vec<ImageCandidate>, ImageCandidateError> {
+    ) -> Result<ImageSearchOutcome, ImageCandidateError> {
         let image_type = normalize_image_type(image_type)
             .ok_or_else(|| ImageCandidateError::InvalidImageType(image_type.to_owned()))?;
         let source = source.map(str::trim).filter(|value| !value.is_empty());
@@ -1644,7 +1658,7 @@ impl ImageCandidateService {
             "SERIES" => ScraperItemType::Series,
             "SEASON" => ScraperItemType::Season,
             "EPISODE" => ScraperItemType::Episode,
-            _ => return Ok(Vec::new()),
+            _ => return Err(ImageCandidateError::ItemNotScrapable),
         };
         let scraper = self.provider_for_item(item_id).await?;
         let mut image_request = ScraperImageRequest::new(item_type, provider_id, language);
@@ -1664,11 +1678,10 @@ impl ImageCandidateService {
         let original_language_mode = image_response.original_language_mode;
         let images = image_response.images;
         let requested_language = language.split('-').next().filter(|value| !value.is_empty());
-        Ok(images
+        let typed_images = images
             .into_iter()
-            .enumerate()
-            .filter(|(_, image)| matches_image_type(image, image_type))
-            .filter(|(_, image)| {
+            .filter(|image| matches_image_type(image, image_type))
+            .filter(|image| {
                 source.is_none_or(|source| {
                     image
                         .provider_name
@@ -1676,14 +1689,25 @@ impl ImageCandidateService {
                         .is_some_and(|value| value.eq_ignore_ascii_case(source))
                 })
             })
+            .collect::<Vec<_>>();
+        let available_languages = available_image_languages(&typed_images);
+        let original_language_for_filter = original_language_mode
+            .then_some(identity.original_language.as_deref())
+            .flatten();
+        let mut filtered_by_language = 0;
+        let images = typed_images
+            .into_iter()
+            .enumerate()
             .filter(|(_, image)| {
-                image_language_matches(
+                let matches = image_language_matches(
                     image.language.as_deref(),
                     requested_language,
-                    original_language_mode
-                        .then_some(identity.original_language.as_deref())
-                        .flatten(),
-                )
+                    original_language_for_filter,
+                );
+                if !matches {
+                    filtered_by_language += 1;
+                }
+                matches
             })
             .map(|(index, image)| {
                 let provider_name = image
@@ -1706,7 +1730,12 @@ impl ImageCandidateService {
                 }
             })
             .take(50)
-            .collect())
+            .collect();
+        Ok(ImageSearchOutcome {
+            images,
+            available_languages,
+            filtered_by_language,
+        })
     }
 
     async fn provider_for_item(
@@ -1726,6 +1755,23 @@ impl ImageCandidateService {
                     .unwrap_or_else(|| self.scraper.clone())
             })
     }
+}
+
+/// The language codes the scraper returned for one image type, sorted and bounded.
+///
+/// Only codes reach a response body: they are short upstream values, never URLs or free text.
+fn available_image_languages(images: &[ScraperImage]) -> Vec<String> {
+    let mut languages = images
+        .iter()
+        .filter_map(|image| image.language.as_deref())
+        .map(str::trim)
+        .filter(|language| !language.is_empty() && language.len() <= 32)
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    languages.sort();
+    languages.dedup();
+    languages.truncate(8);
+    languages
 }
 
 fn image_language_matches(
@@ -1763,6 +1809,8 @@ fn matches_image_type(image: &ScraperImage, image_type: &str) -> bool {
 pub enum ImageCandidateError {
     ItemNotFound,
     ItemNotIdentified,
+    /// The item type has no online image source (home videos, folders and unresolved items).
+    ItemNotScrapable,
     InvalidItem,
     InvalidImageType(String),
     InvalidLanguage,
@@ -1776,6 +1824,9 @@ impl fmt::Display for ImageCandidateError {
         match self {
             Self::ItemNotFound => formatter.write_str("media item not found"),
             Self::ItemNotIdentified => formatter.write_str("media item has no provider identity"),
+            Self::ItemNotScrapable => {
+                formatter.write_str("media item type has no online image source")
+            }
             Self::InvalidItem => formatter.write_str("media item image identity is invalid"),
             Self::InvalidImageType(_) => formatter.write_str("unsupported image type"),
             Self::InvalidLanguage => formatter.write_str("image language is invalid"),

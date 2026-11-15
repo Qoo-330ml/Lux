@@ -44,6 +44,9 @@ export function MediaImageEditor({ item, onClose }: MediaImageEditorProps) {
   const [source, setSource] = useState("");
   const [images, setImages] = useState<ItemImage[]>([]);
   const [results, setResults] = useState<ImageSearchResult[]>([]);
+  const [searched, setSearched] = useState<{ imageType: string; language: string; source: string }>();
+  const [availableLanguages, setAvailableLanguages] = useState<string[]>([]);
+  const [filteredByLanguage, setFilteredByLanguage] = useState(0);
   const [loading, setLoading] = useState(true);
   const [searching, setSearching] = useState(false);
   const [selecting, setSelecting] = useState<string>();
@@ -81,9 +84,15 @@ export function MediaImageEditor({ item, onClose }: MediaImageEditorProps) {
       const response = await api.searchItemImages(item.id, { imageType, language: nextLanguage, source: nextSource });
       if (generation === searchGeneration.current && requestedImageType === imageType) {
         setResults(response.images ?? []);
+        setAvailableLanguages(response.availableLanguages ?? []);
+        setFilteredByLanguage(response.filteredByLanguage ?? 0);
+        setSearched({ imageType: requestedImageType, language: nextLanguage, source: nextSource });
       }
     } catch (cause) {
-      if (generation === searchGeneration.current) setError(cause instanceof Error ? cause.message : "图片搜索失败，请重试。");
+      if (generation === searchGeneration.current) {
+        setSearched(undefined);
+        setError(cause instanceof Error ? cause.message : "图片搜索失败，请重试。");
+      }
     } finally {
       if (generation === searchGeneration.current) setSearching(false);
     }
@@ -122,14 +131,14 @@ export function MediaImageEditor({ item, onClose }: MediaImageEditorProps) {
         <div className="lux-image-editor-body">
           <div className="lux-image-type-tabs" role="tablist" aria-label="图像类型">
             {imageTypes.map((entry) => (
-              <button key={entry.value} className={entry.value === imageType ? "is-active" : ""} type="button" role="tab" aria-selected={entry.value === imageType} onClick={() => { searchGeneration.current += 1; setImageType(entry.value); setResults([]); setSearching(false); }}>
+              <button key={entry.value} className={entry.value === imageType ? "is-active" : ""} type="button" role="tab" aria-selected={entry.value === imageType} onClick={() => { searchGeneration.current += 1; setImageType(entry.value); setResults([]); setSearched(undefined); setAvailableLanguages([]); setFilteredByLanguage(0); setSearching(false); }}>
                 <ImageIcon size={15} /> {entry.label}
               </button>
             ))}
           </div>
           <div className="lux-image-editor-toolbar">
-            <label><span>语言</span><LuxSelect value={language} options={languageOptions} onChange={(value) => { setLanguage(value); if (results.length) void searchWithFilters(value, source); }} aria-label="图片语言" /></label>
-            <label><span>来源</span><LuxSelect value={source} options={sourceOptions} onChange={(value) => { setSource(value); if (results.length) void searchWithFilters(language, value); }} aria-label="图片来源" /></label>
+            <label><span>语言</span><LuxSelect value={language} options={languageOptions} onChange={(value) => { setLanguage(value); if (searched?.imageType === imageType) void searchWithFilters(value, source); }} aria-label="图片语言" /></label>
+            <label><span>来源</span><LuxSelect value={source} options={sourceOptions} onChange={(value) => { setSource(value); if (searched?.imageType === imageType) void searchWithFilters(language, value); }} aria-label="图片来源" /></label>
             <LuxButton tone="primary" type="button" disabled={searching} onClick={() => void search()}><Search size={16} /> {searching ? "搜索中…" : "搜索"}</LuxButton>
           </div>
           {error ? <p className="lux-editor-error" role="alert">{error}</p> : null}
@@ -142,7 +151,11 @@ export function MediaImageEditor({ item, onClose }: MediaImageEditorProps) {
           <div className="lux-image-results" aria-busy={searching}>
             <span className="lux-editor-section-label">搜索结果</span>
             {searching ? <div className="lux-image-result-state"><LoaderCircle className="lux-spin" size={21} /> 正在搜索图片…</div> : null}
-            {!searching && !results.length ? <div className="lux-image-result-state">选择语言和来源后搜索{selectedLabel}。</div> : null}
+            {!searching && !results.length ? (
+              searched?.imageType === imageType
+                ? <div className="lux-image-result-state" role="status">{emptySearchMessage(selectedLabel, searched.language, availableLanguages, filteredByLanguage)}</div>
+                : <div className="lux-image-result-state">选择语言和来源后搜索{selectedLabel}。</div>
+            ) : null}
             <div className="lux-image-result-grid">
               {results.map((result) => (
                 <button className="lux-image-result" type="button" key={result.id} data-image-type={imageType} disabled={Boolean(selecting)} onClick={() => void select(result)}>
@@ -157,4 +170,28 @@ export function MediaImageEditor({ item, onClose }: MediaImageEditorProps) {
       </section>
     </div>
   );
+}
+
+function languageLabel(value: string) {
+  return languageOptions.find((option) => option.value === value)?.label ?? (value || "不限语言");
+}
+
+/**
+ * Explains an empty image search instead of showing the pre-search placeholder again.
+ *
+ * The backend reports the languages the scraper returned for this image type, so the most common
+ * reason — the language filter dropped every logo — becomes visible and actionable.
+ */
+function emptySearchMessage(label: string, language: string, availableLanguages: string[], filteredByLanguage: number) {
+  const requested = languageLabel(language);
+  if (filteredByLanguage > 0) {
+    if (availableLanguages.length) {
+      return `没有「${requested}」的${label}；刮削器返回的${label}是 ${availableLanguages.join(" / ")}，可以换成「不限语言」或其他语言再搜索。`;
+    }
+    return `刮削器返回的${label}没有标注语言，被语言筛选排除了；换成「不限语言」再搜索。`;
+  }
+  if (language) {
+    return `刮削器没有返回这个条目的${label}；可以换「不限语言」或 English 再试一次。`;
+  }
+  return `刮削器没有返回这个条目的${label}。`;
 }
