@@ -2,6 +2,18 @@ import type { ChangelogRelease } from "../types";
 
 export const changelogReleases07: ChangelogRelease[] = [
   {
+    version: "0.7.21",
+    date: "2026-11-15",
+    sections: [
+      { kind: "fixed", items: [
+        "🐛 fix(metadata): 候选搜索失败时说清是哪种失败 — 以前「搜索候选」失败一律是 503 PLUGIN_UNAVAILABLE +「刮削器暂时不可用，请稍后重试」，插件没装、被禁用、没配置、进程崩溃或超时、上游 401/429/网络失败看起来完全一样。现在宿主把刮削器错误和插件 SDK 的稳定错误码归成自己的分类：配置类问题返回 409 并点名插件，家庭视频这类条目返回 409 INVALID_REQUEST，插件或上游的临时故障返回 503，存储问题返回 503 DATABASE_UNAVAILABLE；「没有可用刮削器」和「刮削器报错」也分开，失败来源全部收集起来而不是只留最后一个。日志多了 failure_reason 和 scraper_id。",
+        "🐛 fix(metadata): 带版本标签的季目录也能定位剧集目录 — 上一版允许 Season 1 DV、S01 HDR 这类目录作为同一季的多个版本，但剧集元数据写回还在用旧的季目录判断（只认纯数字的 Season N），认不出带标签的目录就找不到剧集目录，tvshow.nfo 和剧集级字段写不进去。现在两边共用同一个解析函数，Season 1 DV、Season1 SDR、S01 HDR、Season 01 (1) 都能正确定位；Season 1DV、Season 1 Part Two、Extras 仍不算季目录。",
+        "🐛 fix(images): 空的图片搜索不再和「还没搜」长得一样 — 用默认简体中文筛选搜徽标时，韩国剧集拿回来的韩文/英文 logo 会被语言过滤掉，网格一片空白，界面又跳回搜索前的占位。现在接口多返回 availableLanguages（过滤前、去重、最多 8 个）和被语言过滤掉的数量 filteredByLanguage，家庭视频、文件夹这类没有在线图片来源的条目返回 ItemNotScrapable，不再静默给空数组。前端能区分「还没搜」和「搜了但是空」，列出实际返回的语言，语言或来源改了之后自动重搜，失败时显示具体的刮削器原因。",
+        "🐛 fix(images): 图片搜索会告诉你哪个来源回答的、返回了什么 — 「语言和来源都不限」还是空的时候看不出为什么：豆瓣插件只返回 Primary 海报，本来就没有徽标和背景图；图片搜索又总是用媒体库配置里的第一个刮削器，哪怕条目存的是别家的 provider id（拿 TMDb id 去问豆瓣）。现在按存储的主 provider id 命名空间挑刮削器（TMDb 走 tmdb 插件、豆瓣走 douban 插件），没有匹配再退回配置顺序；响应里多出 availableImageTypes 和实际回答的插件名 source。前端按优先级解释空结果：先看语言过滤，再提示「「豆瓣元数据插件」没有返回这个条目的徽标（它返回了海报）」，最后才是「什么都没返回」。",
+      ] },
+    ],
+  },
+  {
     version: "0.7.20",
     date: "2026-11-15",
     sections: [
