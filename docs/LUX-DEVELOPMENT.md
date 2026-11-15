@@ -21854,6 +21854,45 @@ content light level）只出现在帧级 side data，`-show_streams` 的 `side_d
 预计文件：`src/application/metadata.rs`、`src/application/scanner.rs`、`src/application/scanner/names.rs`、
 `tests/metadata/metadata_selection.rs`、`docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
 
+#### LUX-912：图片搜索按来源说明空结果
+
+状态：已完成（2026-11-15）。依赖：LUX-911。验证：`--test images` 67/67、`--lib images::tests::`、
+`pnpm --dir web test` 1620/1620、`pnpm --dir web build`、fmt、`clippy --all-targets --all-features -D warnings` 通过。
+
+背景：LUX-911 之后仍有一类空结果无法解释——把语言改成「不限语言」、来源改成「不限来源」仍然没有徽标。
+两个真实原因此前都不可见：
+
+- 豆瓣插件（`Lux-plugins` 的 `lux-plugin-douban.rs`）的 `image_payload` 只返回一张 `Primary` 海报，
+  不提供 `Logo`/`Backdrop`/`Thumb`，所以豆瓣库的徽标搜索永远是空；
+- 图片请求原先固定发给媒体库顺序里的第一个刮削器，但 provider ID 取自条目保存的命名空间。两者不一致时
+  （例如条目按 TMDb 匹配、媒体库首位是豆瓣），请求会带着 TMDb ID 去问豆瓣，或反之。
+
+范围：
+
+- `ImageSearchOutcome` 增加 `available_image_types`（`POSTER`/`LOGO`/`BACKDROP`，来自本次响应，不额外
+  请求）和 `source`（实际应答的刮削器显示名，取自插件清单；无解析器时用 provider key）。
+- 图片搜索按条目 provider ID 的命名空间选择已配置刮削器：`Tmdb` → `tmdb` 插件、`Douban` → `douban`
+  插件；没有匹配时退回媒体库顺序第一位（`pick_scraper_index` 单测固定）。条目不是电影/剧集/季/集时
+  仍返回 `ItemNotScrapable`。
+- API 响应新增 `availableImageTypes` 与 `source`；Web 空结果按优先级解释：语言过滤 → 来源没有该图片类型
+  （例如「「豆瓣元数据插件」没有返回这个条目的徽标（它返回了海报）」）→ 来源没有返回任何在线图片。
+- 不改变图片语言匹配语义、不新增错误码、不改数据库与插件协议；豆瓣插件补齐徽标需要在 `Lux-plugins` 仓库另立任务。
+
+验收：
+
+- [x] 图片搜索按 provider 命名空间选择刮削器（`image_search_uses_the_scraper_that_owns_the_stored_provider_id`）。
+- [x] 响应包含 `availableImageTypes` 与 `source`（`logo_search_reports_the_languages_it_filtered_out`）。
+- [x] Web 能指出「来源只返回海报」，并点名插件
+  （Web `names a source that only returns posters instead of leaving the logo search unexplained`）。
+- [x] `docs/API.md` 记录两个新字段与来源选择规则。
+- [x] 相关 Rust/Web 测试、fmt、clippy 通过。
+- [ ] 未验证：真实豆瓣库与真实 TMDb 库上的端到端表现（需要所有者环境）；豆瓣插件本身不支持徽标，
+  本任务只保证 Lux 如实说明。
+
+预计文件：`src/application/images.rs`、`src/api/media.rs`、`web/src/lib/api/types.ts`、
+`web/src/features/media/MediaImageEditor.tsx`、`tests/images/image_api.rs`、`web/tests/media-editors.test.tsx`、
+`docs/API.md`、`docs/LUX-DEVELOPMENT.md`。
+
 ## 31. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

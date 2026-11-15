@@ -287,6 +287,8 @@ async fn logo_search_reports_the_languages_it_filtered_out()
     assert_eq!(body["images"].as_array().map(Vec::len), Some(0));
     assert_eq!(body["availableLanguages"], json!(["en", "ko"]));
     assert_eq!(body["filteredByLanguage"], 2);
+    assert_eq!(body["availableImageTypes"], json!(["LOGO", "POSTER"]));
+    assert_eq!(body["source"], "tmdb");
 
     let response = client
         .post(format!("{base_url}/api/v1/items/{item_id}/images/search"))
@@ -305,6 +307,7 @@ async fn logo_search_reports_the_languages_it_filtered_out()
         .collect::<Vec<_>>();
     assert_eq!(languages, vec!["ko", "en"]);
     assert_eq!(body["filteredByLanguage"], 0);
+    assert_eq!(body["availableImageTypes"], json!(["LOGO", "POSTER"]));
 
     // Home video items have no online image source; an empty list would look like a silent failure.
     sqlx::query("UPDATE media_items SET item_type = 'VIDEO' WHERE id = ?")

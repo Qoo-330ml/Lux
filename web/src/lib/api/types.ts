@@ -396,6 +396,10 @@ export type ImageSearchResponse = {
   availableLanguages?: string[];
   /** How many scraper images the language filter removed from the result. */
   filteredByLanguage?: number;
+  /** Normalized image types the scraper returned for the item (POSTER, LOGO, BACKDROP). */
+  availableImageTypes?: string[];
+  /** Display name of the scraper that answered, when known. */
+  source?: string | null;
 };
 
 export type HomeResponse = {

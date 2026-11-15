@@ -46,6 +46,8 @@ export function MediaImageEditor({ item, onClose }: MediaImageEditorProps) {
   const [results, setResults] = useState<ImageSearchResult[]>([]);
   const [searched, setSearched] = useState<{ imageType: string; language: string; source: string }>();
   const [availableLanguages, setAvailableLanguages] = useState<string[]>([]);
+  const [availableImageTypes, setAvailableImageTypes] = useState<string[]>([]);
+  const [searchedSource, setSearchedSource] = useState<string>();
   const [filteredByLanguage, setFilteredByLanguage] = useState(0);
   const [loading, setLoading] = useState(true);
   const [searching, setSearching] = useState(false);
@@ -85,6 +87,8 @@ export function MediaImageEditor({ item, onClose }: MediaImageEditorProps) {
       if (generation === searchGeneration.current && requestedImageType === imageType) {
         setResults(response.images ?? []);
         setAvailableLanguages(response.availableLanguages ?? []);
+        setAvailableImageTypes(response.availableImageTypes ?? []);
+        setSearchedSource(response.source ?? undefined);
         setFilteredByLanguage(response.filteredByLanguage ?? 0);
         setSearched({ imageType: requestedImageType, language: nextLanguage, source: nextSource });
       }
@@ -131,7 +135,7 @@ export function MediaImageEditor({ item, onClose }: MediaImageEditorProps) {
         <div className="lux-image-editor-body">
           <div className="lux-image-type-tabs" role="tablist" aria-label="图像类型">
             {imageTypes.map((entry) => (
-              <button key={entry.value} className={entry.value === imageType ? "is-active" : ""} type="button" role="tab" aria-selected={entry.value === imageType} onClick={() => { searchGeneration.current += 1; setImageType(entry.value); setResults([]); setSearched(undefined); setAvailableLanguages([]); setFilteredByLanguage(0); setSearching(false); }}>
+              <button key={entry.value} className={entry.value === imageType ? "is-active" : ""} type="button" role="tab" aria-selected={entry.value === imageType} onClick={() => { searchGeneration.current += 1; setImageType(entry.value); setResults([]); setSearched(undefined); setAvailableLanguages([]); setAvailableImageTypes([]); setSearchedSource(undefined); setFilteredByLanguage(0); setSearching(false); }}>
                 <ImageIcon size={15} /> {entry.label}
               </button>
             ))}
@@ -153,7 +157,7 @@ export function MediaImageEditor({ item, onClose }: MediaImageEditorProps) {
             {searching ? <div className="lux-image-result-state"><LoaderCircle className="lux-spin" size={21} /> 正在搜索图片…</div> : null}
             {!searching && !results.length ? (
               searched?.imageType === imageType
-                ? <div className="lux-image-result-state" role="status">{emptySearchMessage(selectedLabel, searched.language, availableLanguages, filteredByLanguage)}</div>
+                ? <div className="lux-image-result-state" role="status">{emptySearchMessage({ imageType, label: selectedLabel, language: searched.language, availableLanguages, filteredByLanguage, availableImageTypes, source: searchedSource })}</div>
                 : <div className="lux-image-result-state">选择语言和来源后搜索{selectedLabel}。</div>
             ) : null}
             <div className="lux-image-result-grid">
@@ -176,22 +180,55 @@ function languageLabel(value: string) {
   return languageOptions.find((option) => option.value === value)?.label ?? (value || "不限语言");
 }
 
+const imageTypeBuckets: Record<string, string> = {
+  POSTER: "POSTER",
+  DISC: "POSTER",
+  LOGO: "LOGO",
+  THUMB: "BACKDROP",
+  BANNER: "BACKDROP",
+  FANART: "BACKDROP",
+  ART: "BACKDROP",
+  WALLPAPER: "BACKDROP",
+};
+
+const imageTypeBucketLabels: Record<string, string> = {
+  POSTER: "海报",
+  LOGO: "徽标",
+  BACKDROP: "背景图",
+};
+
 /**
  * Explains an empty image search instead of showing the pre-search placeholder again.
  *
- * The backend reports the languages the scraper returned for this image type, so the most common
- * reason — the language filter dropped every logo — becomes visible and actionable.
+ * The backend reports which scraper answered and which image types it returned, so both common
+ * reasons — the language filter dropped everything, or the source has no logos at all (the Douban
+ * plugin only returns posters) — become visible and actionable.
  */
-function emptySearchMessage(label: string, language: string, availableLanguages: string[], filteredByLanguage: number) {
+function emptySearchMessage(input: {
+  imageType: string;
+  label: string;
+  language: string;
+  availableLanguages: string[];
+  filteredByLanguage: number;
+  availableImageTypes: string[];
+  source?: string;
+}) {
+  const { imageType, label, language, availableLanguages, filteredByLanguage, availableImageTypes, source } = input;
   const requested = languageLabel(language);
+  const sourceLabel = source ? `「${source}」` : "刮削器";
   if (filteredByLanguage > 0) {
     if (availableLanguages.length) {
-      return `没有「${requested}」的${label}；刮削器返回的${label}是 ${availableLanguages.join(" / ")}，可以换成「不限语言」或其他语言再搜索。`;
+      return `${sourceLabel}返回的${label}是 ${availableLanguages.join(" / ")}，没有「${requested}」的${label}；可以换成「不限语言」或其他语言再搜索。`;
     }
-    return `刮削器返回的${label}没有标注语言，被语言筛选排除了；换成「不限语言」再搜索。`;
+    return `${sourceLabel}返回的${label}没有标注语言，被语言筛选排除了；换成「不限语言」再搜索。`;
   }
-  if (language) {
-    return `刮削器没有返回这个条目的${label}；可以换「不限语言」或 English 再试一次。`;
+  const wanted = imageTypeBuckets[imageType];
+  const returned = availableImageTypes.map((type) => imageTypeBucketLabels[type]).filter(Boolean);
+  if (returned.length && wanted && !availableImageTypes.includes(wanted)) {
+    return `${sourceLabel}没有返回这个条目的${label}（它返回了${returned.join("、")}）。换一个提供${label}的刮削器再试。`;
   }
-  return `刮削器没有返回这个条目的${label}。`;
+  if (!returned.length) {
+    return `${sourceLabel}没有返回这个条目的任何在线图片。`;
+  }
+  return `${sourceLabel}没有返回这个条目的${label}。`;
 }
