@@ -21770,7 +21770,7 @@ content light level）只出现在帧级 side data，`-show_streams` 的 `side_d
 
 #### LUX-911：图片搜索空结果说明原因
 
-状态：已完成（2026-11-15）。依赖：LUX-910 的 `ScraperFailureCause`。验证：`--test images` 67/67、
+状态：已完成（2026-11-15，提交 `7a959ddb`）。依赖：LUX-910 的 `ScraperFailureCause`。验证：`--test images` 67/67、
 `pnpm --dir web test` 1619/1619、`pnpm --dir web build`、fmt、`clippy --all-targets --all-features -D warnings`
 通过。
 
