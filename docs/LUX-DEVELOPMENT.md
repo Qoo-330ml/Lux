@@ -21854,9 +21854,10 @@ content light level）只出现在帧级 side data，`-show_streams` 的 `side_d
 预计文件：`src/application/metadata.rs`、`src/application/scanner.rs`、`src/application/scanner/names.rs`、
 `tests/metadata/metadata_selection.rs`、`docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
 
-#### LUX-912：图片搜索按来源说明空结果
+#### LUX-913：图片搜索按来源说明空结果
 
-状态：已完成（2026-11-15）。依赖：LUX-911。验证：`--test images` 67/67、`--lib images::tests::`、
+状态：已完成（2026-11-15，提交 `483b484f`）。原编号 LUX-912 与并发登记的「带版本标签的季目录写回剧集级
+元数据」重号，按登记顺序改为 LUX-913。依赖：LUX-911。验证：`--test images` 67/67、`--lib images::tests::`、
 `pnpm --dir web test` 1620/1620、`pnpm --dir web build`、fmt、`clippy --all-targets --all-features -D warnings` 通过。
 
 背景：LUX-911 之后仍有一类空结果无法解释——把语言改成「不限语言」、来源改成「不限来源」仍然没有徽标。
