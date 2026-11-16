@@ -1,5 +1,34 @@
 # Lux 客户端兼容性矩阵
 
+## 网易爆米花演员署名与背景图（2026-11-16）
+
+分级：**静态确认 + 隔离实例回归**。客户端侧证据来自 iOS 2.15.14 的 `MediaServerAPI` 导出符号，
+以及 macOS 2.9.0 未加密构建的反汇编（两者 DTO 属性逐字段一致）；本机以真实条目对照线上 Lux 响应，
+**未**在 iOS 真机复测。
+
+爆米花详情页的 `backdropImageTag` 与 `primaryImageTag` 都是计算属性，读的是 `imageTags["Backdrop"]`
+和 `imageTags["Primary"]`（`MediaItemDetailResult` 0x37c70 / `MediaResumeItem` 0x3335c），
+不是 JSON 顶层的 `PrimaryImageTag` / `BackdropImageTag`。据此修两处 DTO：
+
+- 条目内 `People[].Type` 由 `Person` 改为 `Actor`。Emby 的 `BaseItemPerson.Type` 是条目里的**署名类型**，
+  不是人物条目类型；`/Persons` 列表、`/Persons/{id}` 和 `/Users/{id}/Items/{personId}` 仍返回 `Person`，
+  NFO crew 仍为 `Director` / `Writer`。此前所有演员都是 `Person`，只认 `Actor`/`Director` 的客户端
+  因此拿不到演员区块。
+- `ImageTags` 增加 `Backdrop`，取第一张背景图的 tag；`BackdropImageTags` 保持原样（全部背景图）。
+  之前只有 `BackdropImageTags`，客户端拼不出带 `tag=` 的背景图 URL，详情页与继续观看的背景条为空。
+  `/Items/{id}/Similar` 的 `EnableImageTypes` / `ImageTypeLimit` 过滤仍会移除或清空该键。
+
+未修（缺数据面，不是 DTO 投影问题）：
+
+- `ProductionLocations`：条目级没有存储制作地区（只有人物 DTO 有），要补得改刮削与 schema。
+- `Chapters`（片头/片尾标记）：依赖章节检测插件产出 `INTRO_START`/`INTRO_END`；没有检测结果时为空。
+- 详情接口的 `MediaSources[].MediaStreams`：首次播放前未探测媒体信息时为空，属既有的“按需探测”设计；
+  播放过一次后同一请求会带上流信息。
+
+自动化：`cargo test --locked --test library catalog::` 6/6、`cargo test --locked --test metadata people_api::`
+10/10、`cargo test --locked --lib emby_catalog` 48/48；`cargo fmt --all -- --check` 与
+`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。
+
 ## LUX-915 `Shows/{seriesId}/Episodes` 的季作用域（2026-11-16）
 
 分级：**隔离实例核实 + 回归固定**。在自建「两季各两集」的剧上逐条核对；**未**在真机 APK 上复测。

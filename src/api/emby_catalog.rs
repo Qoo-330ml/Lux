@@ -2078,7 +2078,7 @@ pub(super) async fn emby_catalog_items_for_user_with_preferred_source(
         if include_people && let Value::Object(object) = &mut value {
             let mut people = actors
                 .into_iter()
-                .map(|actor| emby_person_json(actor, &state.server_id))
+                .map(|actor| emby_credit_person_json(actor, &state.server_id))
                 .collect::<Vec<_>>();
             if let Some(nfo) = nfo.as_ref() {
                 people.extend(emby_nfo_crew_json(nfo));
@@ -2603,7 +2603,7 @@ pub(super) async fn emby_single_id_lookup_response(
         if let Value::Object(object) = &mut item_json {
             let mut people = actors
                 .into_iter()
-                .map(|actor| emby_person_json(actor, &state.server_id))
+                .map(|actor| emby_credit_person_json(actor, &state.server_id))
                 .collect::<Vec<_>>();
             if let Some(nfo) = nfo.as_ref() {
                 people.extend(emby_nfo_crew_json(nfo));
@@ -3254,7 +3254,7 @@ pub(super) async fn emby_item_response(
             {
                 let mut people = actors
                     .into_iter()
-                    .map(|actor| emby_person_json(actor, &state.server_id))
+                    .map(|actor| emby_credit_person_json(actor, &state.server_id))
                     .collect::<Vec<_>>();
                 if let Some(nfo) = nfo.as_ref() {
                     people.extend(emby_nfo_crew_json(nfo));
@@ -3393,6 +3393,20 @@ pub(super) fn emby_person_json(
     server_id: &str,
 ) -> Value {
     emby_person_json_with_fields(actor, server_id, None)
+}
+
+/// A cast credit inside a media item. Emby's `BaseItemPerson.Type` is the
+/// credit type (`Actor`), not the person item type (`Person`); the standalone
+/// `/Persons` entries keep using [`emby_person_json`].
+pub(super) fn emby_credit_person_json(
+    actor: crate::application::people::ActorView,
+    server_id: &str,
+) -> Value {
+    let mut value = emby_person_json(actor, server_id);
+    if let Value::Object(object) = &mut value {
+        object.insert("Type".to_owned(), json!("Actor"));
+    }
+    value
 }
 
 pub(super) fn emby_person_json_with_fields(
@@ -3778,6 +3792,17 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
     }
     if let Some(tag) = item.wallpaper_image_tag.as_ref() {
         image_tags.insert("Wallpaper".to_owned(), json!(tag));
+    }
+    if let Some(tag) = item
+        .fanart_image_tags
+        .first()
+        .or(item.fanart_image_tag.as_ref())
+    {
+        // Emby exposes the first backdrop through `ImageTags` as well as the
+        // full list in `BackdropImageTags`. Filmly derives its backdrop tag
+        // from `ImageTags["Backdrop"]`, so an item without this key renders no
+        // background even though `BackdropImageTags` is populated.
+        image_tags.insert("Backdrop".to_owned(), json!(tag));
     }
     let parent_id = emby_public_id(item.parent_id.as_deref().unwrap_or(&item.library_id));
     let child_count = match item.item_type.as_str() {
