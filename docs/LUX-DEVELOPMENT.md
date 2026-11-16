@@ -21925,8 +21925,8 @@ PascalCase（`ParentId`/`IncludeItemTypes`/`Limit`），Entryway 1.0.18 的 Emby
 
 不做：不支持**任意**大小写（全大写 `PARENTID` 仍不识别，serde 别名只能枚举拼写，本任务只补客户端实际会发
 的 camelCase）；不改 JSON 请求体字段名（`Username`/`Pw`/`Hide` 等，客户端发的就是 PascalCase）；不改
-`/Shows/{id}/Episodes` 对 `SeasonId` 的忽略行为（P3 遗留），也不补 Entryway 会用到的 `MediaSegments`、
-`QuickConnect` 等缺失端点。
+`/Shows/{id}/Episodes` 的季过滤语义（该端点的季作用域在 LUX-915 核实本来生效，本任务只补别名），也不补
+Entryway 会用到的 `MediaSegments`、`QuickConnect` 等缺失端点。
 
 验收：
 
@@ -21948,6 +21948,46 @@ PascalCase（`ParentId`/`IncludeItemTypes`/`Limit`），Entryway 1.0.18 的 Emby
 预计文件：`src/api/emby_catalog.rs`、`src/api/emby_similar.rs`、`src/api/emby_handlers.rs`、
 `src/api/emby_resume_visibility.rs`、`tests/emby/query_case.rs`、`tests/emby/main.rs`、
 `docs/COMPATIBILITY.md`、`docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-915：`Shows/{seriesId}/Episodes` 季作用域核实
+
+状态：已完成（2026-11-16）。依赖：LUX-914（`seasonId` 别名）。验证：
+`--test emby emby_season_scope::` 8/8、`--test emby` 100/100、`--test emby -- --list` 100 例 /
+18 个模块、fmt、`clippy --all-targets --all-features -D warnings` 通过。
+
+背景：LUX-914 记录把「`/Shows/{id}/Episodes` 对 `SeasonId` 的过滤在两种拼写下都被忽略」写成了遗留缺口。
+复核后这句话是错的。季过滤一直在 `ApplicationCatalog::list_series_episodes` 里（`mi.parent_id = ?`），
+先前的实测现象来自 `emby_show_episodes` 的 VidHub 兼容分支：季 id 解析不到时
+（`Err(CatalogError::LibraryNotFound) if season_id.is_some()`）去掉季选择器重取整剧，理由是库重扫后客户端
+可能留着旧选择器，不该把页面清空。真正缺的只有 camelCase 别名，已由 LUX-914 补上。
+
+范围：
+
+- 不改产品行为：合法季 id 继续按季过滤；空值、`null`、`undefined` 继续按「没选季」；失效或跨剧的季 id
+  继续回退到本剧全集（VidHub 兼容，本次把它写成测试合同，避免以后被误判成 bug 改掉）。
+- 新增 `tests/emby/emby_season_scope.rs`（`tests/emby/main.rs` 追加 `mod emby_season_scope;`）8 例：
+  无选择器返回整剧、合法 `SeasonId` 分季、`seasonId` 与 `SeasonId` 等价、空/占位值回退、失效 id 回退、
+  季内分页与季集数总数、跨剧季 id 不泄漏、`/emby` 前缀一致。
+- 修正 `docs/COMPATIBILITY.md` 的 LUX-914 小节里那句错误推断，并新增 LUX-915 小节。
+
+不做：不改季过滤的 SQL 与兼容回退策略；不新增 `SeasonIndex` 之类的季号选择器；不补缺失端点。
+
+验收：
+
+- [x] 合法 `SeasonId` 只返回该季的集，`TotalRecordCount` 是季内集数
+  （`season_id_scopes_the_episode_list`）。
+- [x] `seasonId` 与 `SeasonId` 返回同一份列表且都真的过滤（`season_id_accepts_camel_case`）。
+- [x] 空值/`null`/`undefined` 按没选季处理，不返回空页（`blank_season_selector_means_every_season`）。
+- [x] 失效季 id 回退到整剧，两种拼写一致（`stale_season_id_falls_back_to_the_whole_show`）。
+- [x] 季内分页与总数正确（`season_scope_and_paging_combine`）；跨剧季 id 不泄漏别的季的集
+  （`season_id_from_another_show_does_not_leak_episodes`）；根路径与 `/emby` 一致
+  （`season_scope_is_the_same_under_the_emby_prefix`）。
+- [x] `cargo test --locked --test emby` 100 passed、0 failed；fmt 与 clippy 全 target 通过。
+- [ ] 未验证：Entryway 真机上传的 `seasonId` 是季条目 id 还是季号（静态看是 `px5.K` 的 `str2` 位置参数）。
+  若某些路径传季号，Lux 会回退到整剧，客户端需自行过滤；这需要真机抓包确认。
+
+预计文件：`tests/emby/emby_season_scope.rs`、`tests/emby/main.rs`、`docs/COMPATIBILITY.md`、
+`docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
 
 ## 31. 参考资料
 

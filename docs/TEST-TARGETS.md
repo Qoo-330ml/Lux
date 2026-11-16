@@ -11,7 +11,7 @@
 | `--test admin` | 管理后台、日志导出、可观测性与运维事件 | 14 | 60 |
 | `--test api_web` | HTTP 契约（错误/限流/压缩/健康/远程策略）、Web 会话、Webhook | 13 | 57 |
 | `--test auth_users` | 认证、会话、登录背景、用户与用户设置、设备配对、界面偏好迁移 | 10 | 73 |
-| `--test emby` | Emby 兼容层（认证、系统信息、增量刷新、发现、多段播放、检索、下载、WebSocket、查询参数大小写） | 17 | 92 |
+| `--test emby` | Emby 兼容层（认证、系统信息、增量刷新、发现、多段播放、检索、下载、WebSocket、查询参数大小写、季作用域） | 18 | 100 |
 | `--test scanner` | 媒体库扫描、增量/混合扫描、计划任务、作业事件与关停 | 7 | 152 |
 | `--test library` | 媒体库生命周期、合并/拆分、集合、目录与系列 API | 12 | 62 |
 | `--test metadata` | 元数据抓取与选择、NFO 回写、扫描后剧集元数据、人物、字幕 | 14 | 162 |
@@ -20,7 +20,7 @@
 | `--test storage` | SQLite/PostgreSQL 存储、迁移、WAL、数据库维护与启动守卫 | 9 | 118 |
 | `--test plugins` | 插件协议与运行时、弹幕、IP 属地、媒体信息插件配置 | 11 | 129 |
 | `--test strm` | STRM 目标解析/探测/播放与 ffprobe | 9 | 42 |
-| 合计（12 组） |  | 132 | 1045 |
+| 合计（12 组） |  | 133 | 1053 |
 
 另有 8 个 binary 因为进程级共享状态或外部服务依赖保持独立，见第 4 节：`--test background_work_budget`、`--test filmly_image_diag`、`--test image_variants_perf`、`--test performance`、`--test postgres_database`、`--test reidentify`、`--test scanned_metadata`、`--test shutdown`。合计 12 + 8 = 20 个集成测试 target。
 
@@ -96,6 +96,7 @@ cargo test --locked --test <新 target> <旧名>::
 | † `emby_similar` | 6 | `cargo test --locked --test emby emby_similar::` |
 | † `emby_websocket` | 24 | `cargo test --locked --test emby emby_websocket::` |
 | † `query_case` | 7 | `cargo test --locked --test emby query_case::` |
+| † `emby_season_scope` | 8 | `cargo test --locked --test emby emby_season_scope::` |
 | `job_events_api` | 2 | `cargo test --locked --test scanner job_events_api::` |
 | `mixed_scanner` | 1 | `cargo test --locked --test scanner mixed_scanner::` |
 | `scanner` | 18 | `cargo test --locked --test scanner scanner::` |
@@ -256,7 +257,7 @@ cargo test --locked --test scanner
 | `admin` | 22 | 60 | 新增 38 例（LUX-894 的 `lux_websocket` 30 例、LUX-897 的实时通道相关模块 5 例、其余 3 例为先前任务） |
 | `api_web` | 39 | 57 | 新增 18 例（后续任务） |
 | `auth_users` | 70 | 73 | 新增 3 例（后续任务） |
-| `emby` | 38 | 92 | 新增 54 例（LUX-914 的 `query_case` 7 例、LUX-900 第五增量的 `emby_filter_metadata` 2 例、`emby_websocket` 1 例未同步，其余为先前任务） |
+| `emby` | 38 | 100 | 新增 62 例（LUX-914 的 `query_case` 7 例、LUX-915 的 `emby_season_scope` 8 例、LUX-900 第五增量的 `emby_filter_metadata` 2 例、`emby_websocket` 1 例未同步，其余为先前任务） |
 | `scanner` | 137 | 152 | 新增 15 例（后续任务） |
 | `library` | 49 | 62 | 新增 13 例（LUX-899 的 `similar_api` 6 例、LUX-900 的 `tags_api` 5 例、其余 2 例为先前任务） |
 | `metadata` | 143 | 157 | 新增 14 例（LUX-886 6 例、LUX-887 1 例，其余为先前任务） |
@@ -266,7 +267,7 @@ cargo test --locked --test scanner
 | `plugins` | 84 | 128 | 新增 44 例（后续任务） |
 | `strm` | 42 | 42 | 一致 |
 | 独立 binary 合计 | 112 | 117 | 新增 5 例（后续任务） |
-| **合计** | **934** | **1159** | 差异均为合并后新增用例 |
+| **合计** | **934** | **1167** | 差异均为合并后新增用例 |
 
 ### 5.2 单个用例稳定性复核
 
@@ -473,3 +474,19 @@ Emby `GET /Tags` 改读标签投影，测试仍在既有模块 `tests/emby/emby_
 - 三处数字同步：第 1 节 `emby` 行 16 模块 85 例 → **17 模块 92 例**、12 组合计 131/1038 → **132/1045**
   （沿用 LUX-900 第五增量记下的 +3 口径偏差：按第 2 节模块行之和是 1035 → **1042**）；第 2 节新增
   `query_case` 一行；第 5.1 节 `emby` 85 → **92**、合计 1152 → **1159**。
+
+## 14. LUX-915 追加（2026-11-16）
+
+`tests/emby/emby_season_scope.rs` 是 LUX-915（`Shows/{seriesId}/Episodes` 季作用域核实）新增的模块
+（`tests/emby/main.rs` 追加一行 `mod emby_season_scope;`），命令为
+`cargo test --locked --test emby emby_season_scope::`，共 **8** 例：无选择器返回整剧、合法 `SeasonId`
+分季、`seasonId` 与 `SeasonId` 等价、空/`null`/`undefined` 回退整剧、失效季 id 回退整剧、季内分页与季集数
+总数、跨剧季 id 不泄漏、根路径与 `/emby` 前缀一致。
+
+- 模块按路由所在域放在 `emby` 分组，没有新建顶层 target，也没有改其他分组的归属。
+- 实测：`cargo test --locked --test emby emby_season_scope::` 8/8、整组 `cargo test --locked --test emby`
+  为 **100 passed、0 failed**（92 例基线 + 本任务 8 例），`cargo test --locked --test emby -- --list` 为
+  100 例 / 18 个模块。
+- 三处数字同步：第 1 节 `emby` 行 17 模块 92 例 → **18 模块 100 例**、12 组合计 132/1045 → **133/1053**
+  （沿用 LUX-900 第五增量记下的 +3 口径偏差：按第 2 节模块行之和是 1042 → **1050**）；第 2 节新增
+  `emby_season_scope` 一行；第 5.1 节 `emby` 92 → **100**、合计 1159 → **1167**。

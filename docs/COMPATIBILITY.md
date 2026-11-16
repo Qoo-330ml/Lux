@@ -1,5 +1,25 @@
 # Lux 客户端兼容性矩阵
 
+## LUX-915 `Shows/{seriesId}/Episodes` 的季作用域（2026-11-16）
+
+分级：**隔离实例核实 + 回归固定**。在自建「两季各两集」的剧上逐条核对；**未**在真机 APK 上复测。
+
+这条复核纠正了 LUX-914 记录里的一句错误推断。上一轮实测到的「`SeasonId=deadbeef` 仍返回 2 集」不是季
+过滤失效，而是 `emby_show_episodes` 的既有 VidHub 兼容分支：季 id 解析不到时
+（`Err(CatalogError::LibraryNotFound) if season_id.is_some()`）去掉季选择器重取整剧，理由是「库重扫后
+客户端可能留着旧选择器，不该把页面清空」。季过滤本身一直在（`mi.parent_id = ?`），真正缺的只有 camelCase
+别名，已由 LUX-914 补上。
+
+- 合法季 id：`SeasonId` 与 `seasonId` 都把结果缩到该季，`TotalRecordCount` 是该季的集数，分页在季内生效。
+- 空/占位值：`SeasonId=`、`seasonId=`、`null`、`undefined` 都按「没选季」返回整剧（与既有行为一致）。
+- 失效或跨剧的季 id：维持 VidHub 兼容回退——返回本剧全集，不 404，也不会把另一个季的集带进来。
+- 根路径与 `/emby` 前缀行为一致。
+- 自动化：`cargo test --locked --test emby emby_season_scope::`（8 例）固定上述六种情形，其中
+  `stale_season_id_falls_back_to_the_whole_show` 明确把兼容回退写成合同，避免以后被当成 bug 改掉。
+- 未验证：Entryway 真机上传的 `seasonId` 到底是季条目 id 还是季号。静态看它是 `px5.K` 的 `str2`
+  位置参数（来自季列表对象）；若某些路径传的是季号，Lux 会走回退分支返回整剧，客户端需自行按条目的
+  `SeasonId` 过滤。
+
 ## LUX-914 Emby 查询参数大小写（2026-11-16）
 
 分级：**请求形态静态确认 + 隔离实例复现**。请求形态来自 Entryway 1.0.18 反编译的 Emby 适配层
@@ -31,9 +51,9 @@ fields, …)`）；复现与回归在项目内起了一次隔离 `luxd`（`LUX_C
   都和 PascalCase 完全一致，两种拼写对同一请求必须返回逐字节相同的响应。
 - 未覆盖：**任意大小写**仍不识别（例如全大写 `PARENTID`）；serde 别名只能枚举拼写，本任务只补客户端实际
   会发的 camelCase。JSON 请求体（`Username`/`Pw`/`Hide` 等）不在本次范围，客户端发的就是 PascalCase。
-- 剩余缺口（未在本任务修改）：`/Shows/{id}/Episodes` 对 `SeasonId` 的过滤在两种拼写下都被忽略（始终返回
-  整剧集），客户端仍可自行按条目的 `SeasonId` 过滤；`Items/{id}/Refresh` 与 `POST /Items/{id}` 对普通条目
-  返回 404（P3，编辑/刷新入口）。
+- 剩余缺口（未在本任务修改）：`Items/{id}/Refresh` 与 `POST /Items/{id}` 对普通条目返回 404（P3，编辑/
+  刷新入口）。`/Shows/{id}/Episodes` 的季作用域在 LUX-915 核实**本来就生效**，本任务那条「两种拼写都被
+  忽略」的推断是错的，详见上方的 LUX-915 小节。
 - 自动化：`cargo test --locked --test emby query_case::`（7 例）覆盖「16 组 camelCase/PascalCase 响应逐字节
   相等（根路径与 `/emby` 前缀）」、按库/按类型的范围收缩、三页分页覆盖全集、非法分页仍 400、`fields` 投影
   生效、详情投影等价、`Similar` 的 `limit`/`fields`、`hide=` 隐藏。整组 `cargo test --locked --test emby`
