@@ -21896,7 +21896,7 @@ content light level）只出现在帧级 side data，`-show_streams` 的 `side_d
 
 #### LUX-914：Emby 查询参数大小写兼容
 
-状态：已完成（2026-11-16）。依赖：无。验证：`--test emby` 92/92、`--test emby query_case::` 7/7、
+状态：已完成（2026-11-16，提交 `6ac1a8bd`）。依赖：无。验证：`--test emby` 92/92、`--test emby query_case::` 7/7、
 `--test emby -- --list` 92 例 / 17 个模块、fmt、`clippy --all-targets --all-features -D warnings` 通过。
 
 背景：标准 Emby 是 ASP.NET，查询字符串绑定不区分大小写，客户端因此各有各的拼写。Hills/Yamby 发
