@@ -13,4 +13,5 @@ mod emby_similar;
 mod emby_system;
 mod emby_websocket;
 mod mixed_library_api;
+mod query_case;
 mod search;

@@ -2450,7 +2450,7 @@ pub(super) struct EmbyTokenQuery {
     pub(super) api_key: Option<String>,
     #[serde(rename = "tag", alias = "Tag")]
     pub(super) tag: Option<String>,
-    #[serde(rename = "Fields", default)]
+    #[serde(rename = "Fields", alias = "fields", default)]
     pub(super) fields: Option<String>,
     #[serde(
         rename = "ActiveWithinSeconds",

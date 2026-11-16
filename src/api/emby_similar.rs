@@ -30,10 +30,11 @@ pub(super) struct EmbySimilarQuery {
     pub(super) api_key: Option<String>,
     #[serde(rename = "UserId", alias = "userId", alias = "userid", default)]
     pub(super) user_id: Option<String>,
-    #[serde(rename = "Fields", default)]
+    #[serde(rename = "Fields", alias = "fields", default)]
     pub(super) fields: Option<String>,
     #[serde(
         rename = "Limit",
+        alias = "limit",
         default,
         deserialize_with = "deserialize_optional_i64"
     )]
@@ -47,11 +48,12 @@ pub(super) struct EmbySimilarQuery {
     pub(super) enable_user_data: Option<bool>,
     #[serde(
         rename = "ImageTypeLimit",
+        alias = "imageTypeLimit",
         default,
         deserialize_with = "deserialize_optional_i64"
     )]
     pub(super) image_type_limit: Option<i64>,
-    #[serde(rename = "EnableImageTypes", default)]
+    #[serde(rename = "EnableImageTypes", alias = "enableImageTypes", default)]
     pub(super) enable_image_types: Option<String>,
 }
 

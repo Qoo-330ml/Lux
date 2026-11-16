@@ -21894,6 +21894,61 @@ content light level）只出现在帧级 side data，`-show_streams` 的 `side_d
 `web/src/features/media/MediaImageEditor.tsx`、`tests/images/image_api.rs`、`web/tests/media-editors.test.tsx`、
 `docs/API.md`、`docs/LUX-DEVELOPMENT.md`。
 
+#### LUX-914：Emby 查询参数大小写兼容
+
+状态：已完成（2026-11-16）。依赖：无。验证：`--test emby` 92/92、`--test emby query_case::` 7/7、
+`--test emby -- --list` 92 例 / 17 个模块、fmt、`clippy --all-targets --all-features -D warnings` 通过。
+
+背景：标准 Emby 是 ASP.NET，查询字符串绑定不区分大小写，客户端因此各有各的拼写。Hills/Yamby 发
+PascalCase（`ParentId`/`IncludeItemTypes`/`Limit`），Entryway 1.0.18 的 Emby 适配层
+（`02-反编译/entryway-phone/1.0.18/jadx/sources/defpackage/zy5.java` 的 `@jx7` 参数名，浏览入口
+`defpackage/px5.java` 的 `zy5.c0`）发 camelCase（`parentId`/`includeItemTypes`/`limit`/`startIndex`/
+`fields`）。Lux 的 Emby 查询结构体只有 serde `rename`，camelCase 键被**静默丢弃**：`/Users/{userId}/Items`
+因此丢掉媒体库范围、类型过滤和分页——媒体库页退化成「全服所有库混在一起、电影格里混进剧集、翻页无效」，
+而且返回 200，客户端无从判断。Entryway 此前只被记录为「未适配」，本任务把它固化成合同。
+
+范围（只加 camelCase 别名，不改既有拼写、路由、默认值或错误码）：
+
+- `EmbyItemsQuery`（`src/api/emby_catalog.rs`）：`parentId`、`ids`、`includeItemTypes`、`excludeItemTypes`、
+  `seasonId`、`startIndex`、`limit`、`isPlayed`、`isFavorite`、`years`、`genres`、`studios`、`fields`、
+  `groupItems`、`enableTotalRecordCount`、`recursive`。该结构体是 `/Items`、`/Users/{id}/Items` 及
+  `Resume`/`Latest`/`NextUp`、`/Shows/{id}/Episodes`、`/Shows/{id}/Seasons`、`/Items/{id}/Children` 共用的
+  查询类型，一处改动覆盖全部列表端点。
+- `EmbySimilarQuery`（`src/api/emby_similar.rs`）：`fields`、`limit`、`imageTypeLimit`、`enableImageTypes`
+  （Entryway 的 `Items/{id}/Similar` 带 `limit`/`fields`；此前 `limit` 被忽略，`limit=-1` 不再是 400）。
+- `EmbyTokenQuery`（`src/api/emby_handlers.rs`）：`fields`，用于 `GET /Items/{id}` 与
+  `GET /Users/{userId}/Items/{id}` 的详情投影。
+- `ResumeVisibilityQuery`（`src/api/emby_resume_visibility.rs`）：`hide`（此前只认 `Hide=`，小写被当成没给，
+  直接 400）。
+- 校验规则逐端点保持原样：`limit=0` 的计数语义、`limit>1000`/`startIndex=-1`/`startIndex=abc` 的 400、
+  空 `Limit=`（LUX-888）按未提供处理，两种拼写对同一请求必须返回逐字节相同的响应。
+
+不做：不支持**任意**大小写（全大写 `PARENTID` 仍不识别，serde 别名只能枚举拼写，本任务只补客户端实际会发
+的 camelCase）；不改 JSON 请求体字段名（`Username`/`Pw`/`Hide` 等，客户端发的就是 PascalCase）；不改
+`/Shows/{id}/Episodes` 对 `SeasonId` 的忽略行为（P3 遗留），也不补 Entryway 会用到的 `MediaSegments`、
+`QuickConnect` 等缺失端点。
+
+验收：
+
+- [x] 16 组 camelCase/PascalCase 参数对同一请求返回逐字节相同的响应，根路径与 `/emby` 前缀各一遍
+  （`item_list_accepts_camel_case_query_parameters`）。
+- [x] `parentId` + `includeItemTypes` 真正把列表缩小到目标库与目标类型，不再跨库
+  （`camel_case_parent_id_and_type_filter_scope_the_list`）。
+- [x] `limit`/`startIndex` 三页覆盖全集；`limit=2001`、`startIndex=-1`、`startIndex=abc` 仍 400
+  （`camel_case_paging_parameters_page_and_validate`）。
+- [x] `fields` 控制列表与详情的投影（`camel_case_fields_selects_the_list_projection`、
+  `item_detail_accepts_camel_case_fields`），`Similar` 的 `limit`/`fields` 等价且 `limit=-1` 仍 400
+  （`similar_accepts_camel_case_limit_and_fields`）。
+- [x] `hide=`/`Hide=` 都能隐藏继续观看（`hide_from_resume_accepts_camel_case_hide`）。
+- [x] `cargo test --locked --test emby` 92 passed、0 failed；fmt 与 clippy 全 target 通过。
+- [x] `docs/COMPATIBILITY.md` 记录分级、范围与剩余缺口；`docs/TEST-TARGETS.md` 三处计数闭合。
+- [ ] 未验证：Entryway 1.0.18 / TV 1.0.17 真机 APK 上重测媒体库页与翻页（需要所有者设备）。本任务只保证
+  Lux 侧按 Emby 的大小写不敏感语义解析参数。
+
+预计文件：`src/api/emby_catalog.rs`、`src/api/emby_similar.rs`、`src/api/emby_handlers.rs`、
+`src/api/emby_resume_visibility.rs`、`tests/emby/query_case.rs`、`tests/emby/main.rs`、
+`docs/COMPATIBILITY.md`、`docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
+
 ## 31. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

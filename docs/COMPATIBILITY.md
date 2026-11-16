@@ -1,5 +1,44 @@
 # Lux 客户端兼容性矩阵
 
+## LUX-914 Emby 查询参数大小写（2026-11-16）
+
+分级：**请求形态静态确认 + 隔离实例复现**。请求形态来自 Entryway 1.0.18 反编译的 Emby 适配层
+（`02-反编译/entryway-phone/1.0.18/jadx/sources/defpackage/zy5.java` 的 31 个 `@jx7` 参数名，浏览入口是
+`defpackage/px5.java` 的 `zy5.c0(userId, parentId, …, includeItemTypes, recursive, …, limit, startIndex,
+fields, …)`）；复现与回归在项目内起了一次隔离 `luxd`（`LUX_CONFIG_DIR` 指向 `.tmp/`，自建电影/剧集夹具），
+**尚未**在 Entryway 真机 APK 上复测。
+
+标准 Emby 服务端是 ASP.NET，查询字符串绑定不区分大小写；Lux 的 Emby 适配层用 serde `rename` 逐字段命名，
+因此只接受那一种拼写，其余拼写被**静默丢弃**（既不 400 也不生效）。Hills/Yamby 发 PascalCase，所以此前
+没有暴露；Entryway 发 camelCase，于是 `/Users/{userId}/Items` 的 `parentId`、`includeItemTypes`、`limit`、
+`startIndex`、`fields` 全部失效：媒体库页退化成「全服所有库混在一起、电影格里混进剧集、翻页无效」，
+而且响应仍是 200，客户端无从判断。
+
+- 范围（只加 camelCase 别名，不改既有拼写，不改路由）：
+  - `EmbyItemsQuery`（`src/api/emby_catalog.rs`）：`parentId`、`ids`、`includeItemTypes`、`excludeItemTypes`、
+    `seasonId`、`startIndex`、`limit`、`isPlayed`、`isFavorite`、`years`、`genres`、`studios`、`fields`、
+    `groupItems`、`enableTotalRecordCount`、`recursive`。该结构体是 `/Items`、`/Users/{id}/Items` 及
+    `Resume`/`Latest`/`NextUp`、`/Shows/{id}/Episodes`、`/Shows/{id}/Seasons`、`/Items/{id}/Children` 共用的
+    查询类型，因此这一处改动覆盖上述全部列表端点。
+  - `EmbySimilarQuery`（`src/api/emby_similar.rs`）：`fields`、`limit`、`imageTypeLimit`、`enableImageTypes`。
+    Entryway 的 `Items/{id}/Similar` 带 `limit`/`fields`；此前 `limit` 被忽略，`limit=-1` 不再是 400。
+  - `EmbyTokenQuery`（`src/api/emby_handlers.rs`）：`fields`，用于 `GET /Items/{id}` 与
+    `GET /Users/{userId}/Items/{id}` 的详情投影（此前 camelCase 的 `fields` 退化成「不带 Fields」）。
+  - `ResumeVisibilityQuery`（`src/api/emby_resume_visibility.rs`）：`hide`；此前只认 `Hide=`，小写 `hide=`
+    被当成「没给」，直接 400。
+- 语义不变：别名只影响「能不能读到这个值」。校验规则、默认值、上限与错误码逐端点保持原样——`limit=0`
+  的计数语义、`limit>1000`/`startIndex=-1`/`startIndex=abc` 的 400、空 `Limit=`（LUX-888）按「未提供」处理
+  都和 PascalCase 完全一致，两种拼写对同一请求必须返回逐字节相同的响应。
+- 未覆盖：**任意大小写**仍不识别（例如全大写 `PARENTID`）；serde 别名只能枚举拼写，本任务只补客户端实际
+  会发的 camelCase。JSON 请求体（`Username`/`Pw`/`Hide` 等）不在本次范围，客户端发的就是 PascalCase。
+- 剩余缺口（未在本任务修改）：`/Shows/{id}/Episodes` 对 `SeasonId` 的过滤在两种拼写下都被忽略（始终返回
+  整剧集），客户端仍可自行按条目的 `SeasonId` 过滤；`Items/{id}/Refresh` 与 `POST /Items/{id}` 对普通条目
+  返回 404（P3，编辑/刷新入口）。
+- 自动化：`cargo test --locked --test emby query_case::`（7 例）覆盖「16 组 camelCase/PascalCase 响应逐字节
+  相等（根路径与 `/emby` 前缀）」、按库/按类型的范围收缩、三页分页覆盖全集、非法分页仍 400、`fields` 投影
+  生效、详情投影等价、`Similar` 的 `limit`/`fields`、`hide=` 隐藏。整组 `cargo test --locked --test emby`
+  为 92 passed、0 failed。
+
 ## LUX-897 SSE 端点删除（2026-11-06）
 
 分级：**服务端 404 由自动化测试固定；未在真实第三方客户端上复测**。

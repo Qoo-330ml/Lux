@@ -9,6 +9,14 @@ pub(super) const EMBY_MAX_PAGE_LIMIT: i64 = 1_000;
 use crate::application::catalog::CatalogItemCounts;
 use crate::storage::{GLOBAL_COLLECTION_LIBRARY_ID, MediaFacetKind};
 
+/// Emby 条目列表端点共用的查询参数（`/Items`、`/Users/{id}/Items` 及其
+/// `Resume`/`Latest`/`NextUp`、`/Shows/{id}/Episodes`、`/Shows/{id}/Seasons`）。
+///
+/// Emby 本身是 ASP.NET，查询绑定不区分大小写，客户端因此各有各的拼写：Hills/Yamby 发
+/// `ParentId`/`IncludeItemTypes`，Entryway 1.0.18 的 Emby 适配层发
+/// `parentId`/`includeItemTypes`/`limit`/`startIndex`/`fields`。只有 `rename` 的 serde 字段会
+/// **静默丢弃** camelCase 键：媒体库范围、类型过滤和分页同时失效，而且返回 200，客户端无从察觉
+/// （LUX-914）。所以每个改名的字段都带 camelCase `alias`，两种拼写必须完全等价。
 #[derive(Deserialize, Default)]
 pub(super) struct EmbyItemsQuery {
     #[serde(
@@ -26,40 +34,44 @@ pub(super) struct EmbyItemsQuery {
     pub(super) user_id: Option<String>,
     #[serde(rename = "SeriesId", alias = "seriesId", default)]
     pub(super) series_id: Option<String>,
-    #[serde(rename = "ParentId", default)]
+    #[serde(rename = "ParentId", alias = "parentId", default)]
     pub(super) parent_id: Option<String>,
-    #[serde(rename = "Ids", default)]
+    #[serde(rename = "Ids", alias = "ids", default)]
     pub(super) ids: Option<String>,
     #[serde(rename = "AnyProviderIdEquals", alias = "anyProviderIdEquals", default)]
     pub(super) any_provider_id_equals: Option<String>,
-    #[serde(rename = "IncludeItemTypes", default)]
+    #[serde(rename = "IncludeItemTypes", alias = "includeItemTypes", default)]
     pub(super) include_item_types: Option<String>,
-    #[serde(rename = "ExcludeItemTypes", default)]
+    #[serde(rename = "ExcludeItemTypes", alias = "excludeItemTypes", default)]
     pub(super) exclude_item_types: Option<String>,
-    #[serde(rename = "SeasonId", default)]
+    #[serde(rename = "SeasonId", alias = "seasonId", default)]
     pub(super) season_id: Option<String>,
     #[serde(rename = "SearchTerm", alias = "searchTerm", default)]
     pub(super) search_term: Option<String>,
     #[serde(
         rename = "StartIndex",
+        alias = "startIndex",
         default,
         deserialize_with = "deserialize_optional_i64"
     )]
     pub(super) start_index: Option<i64>,
     #[serde(
         rename = "Limit",
+        alias = "limit",
         default,
         deserialize_with = "deserialize_optional_i64"
     )]
     pub(super) limit: Option<i64>,
     #[serde(
         rename = "IsPlayed",
+        alias = "isPlayed",
         default,
         deserialize_with = "deserialize_optional_bool"
     )]
     pub(super) is_played: Option<bool>,
     #[serde(
         rename = "IsFavorite",
+        alias = "isFavorite",
         default,
         deserialize_with = "deserialize_optional_bool"
     )]
@@ -73,33 +85,36 @@ pub(super) struct EmbyItemsQuery {
         deserialize_with = "deserialize_optional_emby_timestamp"
     )]
     pub(super) min_date_last_saved: Option<i64>,
-    #[serde(rename = "Years", default)]
+    #[serde(rename = "Years", alias = "years", default)]
     pub(super) years: Option<String>,
     /// Emby separates several values with `|`; an item matches when it has any of them.
-    #[serde(rename = "Genres", default)]
+    #[serde(rename = "Genres", alias = "genres", default)]
     pub(super) genres: Option<String>,
-    #[serde(rename = "Studios", default)]
+    #[serde(rename = "Studios", alias = "studios", default)]
     pub(super) studios: Option<String>,
     #[serde(rename = "SortBy", alias = "sortBy", default)]
     pub(super) sort_by: Option<String>,
     #[serde(rename = "SortOrder", alias = "sortOrder", default)]
     pub(super) sort_order: Option<String>,
-    #[serde(rename = "Fields", default)]
+    #[serde(rename = "Fields", alias = "fields", default)]
     pub(super) fields: Option<String>,
     #[serde(
         rename = "GroupItems",
+        alias = "groupItems",
         default,
         deserialize_with = "deserialize_optional_bool"
     )]
     pub(super) group_items: Option<bool>,
     #[serde(
         rename = "EnableTotalRecordCount",
+        alias = "enableTotalRecordCount",
         default,
         deserialize_with = "deserialize_optional_bool"
     )]
     pub(super) enable_total_record_count: Option<bool>,
     #[serde(
         rename = "Recursive",
+        alias = "recursive",
         default,
         deserialize_with = "deserialize_optional_bool"
     )]

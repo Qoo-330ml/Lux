@@ -11,7 +11,7 @@
 | `--test admin` | 管理后台、日志导出、可观测性与运维事件 | 14 | 60 |
 | `--test api_web` | HTTP 契约（错误/限流/压缩/健康/远程策略）、Web 会话、Webhook | 13 | 57 |
 | `--test auth_users` | 认证、会话、登录背景、用户与用户设置、设备配对、界面偏好迁移 | 10 | 73 |
-| `--test emby` | Emby 兼容层（认证、系统信息、增量刷新、发现、多段播放、检索、下载、WebSocket） | 16 | 85 |
+| `--test emby` | Emby 兼容层（认证、系统信息、增量刷新、发现、多段播放、检索、下载、WebSocket、查询参数大小写） | 17 | 92 |
 | `--test scanner` | 媒体库扫描、增量/混合扫描、计划任务、作业事件与关停 | 7 | 152 |
 | `--test library` | 媒体库生命周期、合并/拆分、集合、目录与系列 API | 12 | 62 |
 | `--test metadata` | 元数据抓取与选择、NFO 回写、扫描后剧集元数据、人物、字幕 | 14 | 162 |
@@ -20,7 +20,7 @@
 | `--test storage` | SQLite/PostgreSQL 存储、迁移、WAL、数据库维护与启动守卫 | 9 | 118 |
 | `--test plugins` | 插件协议与运行时、弹幕、IP 属地、媒体信息插件配置 | 11 | 129 |
 | `--test strm` | STRM 目标解析/探测/播放与 ffprobe | 9 | 42 |
-| 合计（12 组） |  | 131 | 1038 |
+| 合计（12 组） |  | 132 | 1045 |
 
 另有 8 个 binary 因为进程级共享状态或外部服务依赖保持独立，见第 4 节：`--test background_work_budget`、`--test filmly_image_diag`、`--test image_variants_perf`、`--test performance`、`--test postgres_database`、`--test reidentify`、`--test scanned_metadata`、`--test shutdown`。合计 12 + 8 = 20 个集成测试 target。
 
@@ -95,6 +95,7 @@ cargo test --locked --test <新 target> <旧名>::
 | † `emby_filter_metadata` | 5 | `cargo test --locked --test emby emby_filter_metadata::` |
 | † `emby_similar` | 6 | `cargo test --locked --test emby emby_similar::` |
 | † `emby_websocket` | 24 | `cargo test --locked --test emby emby_websocket::` |
+| † `query_case` | 7 | `cargo test --locked --test emby query_case::` |
 | `job_events_api` | 2 | `cargo test --locked --test scanner job_events_api::` |
 | `mixed_scanner` | 1 | `cargo test --locked --test scanner mixed_scanner::` |
 | `scanner` | 18 | `cargo test --locked --test scanner scanner::` |
@@ -255,7 +256,7 @@ cargo test --locked --test scanner
 | `admin` | 22 | 60 | 新增 38 例（LUX-894 的 `lux_websocket` 30 例、LUX-897 的实时通道相关模块 5 例、其余 3 例为先前任务） |
 | `api_web` | 39 | 57 | 新增 18 例（后续任务） |
 | `auth_users` | 70 | 73 | 新增 3 例（后续任务） |
-| `emby` | 38 | 85 | 新增 47 例（LUX-900 第五增量的 `emby_filter_metadata` 2 例、`emby_websocket` 1 例未同步，其余为先前任务） |
+| `emby` | 38 | 92 | 新增 54 例（LUX-914 的 `query_case` 7 例、LUX-900 第五增量的 `emby_filter_metadata` 2 例、`emby_websocket` 1 例未同步，其余为先前任务） |
 | `scanner` | 137 | 152 | 新增 15 例（后续任务） |
 | `library` | 49 | 62 | 新增 13 例（LUX-899 的 `similar_api` 6 例、LUX-900 的 `tags_api` 5 例、其余 2 例为先前任务） |
 | `metadata` | 143 | 157 | 新增 14 例（LUX-886 6 例、LUX-887 1 例，其余为先前任务） |
@@ -265,7 +266,7 @@ cargo test --locked --test scanner
 | `plugins` | 84 | 128 | 新增 44 例（后续任务） |
 | `strm` | 42 | 42 | 一致 |
 | 独立 binary 合计 | 112 | 117 | 新增 5 例（后续任务） |
-| **合计** | **934** | **1152** | 差异均为合并后新增用例 |
+| **合计** | **934** | **1159** | 差异均为合并后新增用例 |
 
 ### 5.2 单个用例稳定性复核
 
@@ -453,3 +454,22 @@ Emby `GET /Tags` 改读标签投影，测试仍在既有模块 `tests/emby/emby_
   合计 **1152**，与第 2 节相同（第 5.1 节“合并前”的 934 是基线口径，不参与本次闭合）。
 - 8 个独立 binary 的数字沿用既有记录，本次未逐个重测（其中 `postgres_database` 需要外部 PostgreSQL、
   `performance`/`image_variants_perf` 需要性能环境）；三张表对它们使用同一组 117，因此不影响上述闭合。
+
+## 13. LUX-914 追加（2026-11-16）
+
+`tests/emby/query_case.rs` 是 LUX-914（Emby 查询参数大小写兼容）新增的模块（`tests/emby/main.rs` 追加一行
+`mod query_case;`），命令为 `cargo test --locked --test emby query_case::`，共 **7** 例：
+`item_list_accepts_camel_case_query_parameters`（16 组 camelCase/PascalCase 参数的响应逐字节相等，根路径与
+`/emby` 前缀各一遍）、`camel_case_parent_id_and_type_filter_scope_the_list`（按库、按类型、按库+类型三种
+范围）、`camel_case_paging_parameters_page_and_validate`（三页覆盖全集、`limit=2001`/`startIndex=-1`/
+`startIndex=abc` 仍 400）、`camel_case_fields_selects_the_list_projection`（顶层 `MediaStreams` 只在点名时
+出现）、`item_detail_accepts_camel_case_fields`、`similar_accepts_camel_case_limit_and_fields`
+（`limit=-1` 仍 400）、`hide_from_resume_accepts_camel_case_hide`。
+
+- 模块按路由所在域放在 `emby` 分组，没有新建顶层 target，也没有改其他分组的归属。
+- 实测：`cargo test --locked --test emby query_case::` 7/7、整组 `cargo test --locked --test emby` 为
+  **92 passed、0 failed**（85 例基线 + 本任务 7 例），`cargo test --locked --test emby -- --list` 为 92 例 /
+  17 个模块。
+- 三处数字同步：第 1 节 `emby` 行 16 模块 85 例 → **17 模块 92 例**、12 组合计 131/1038 → **132/1045**
+  （沿用 LUX-900 第五增量记下的 +3 口径偏差：按第 2 节模块行之和是 1035 → **1042**）；第 2 节新增
+  `query_case` 一行；第 5.1 节 `emby` 85 → **92**、合计 1152 → **1159**。

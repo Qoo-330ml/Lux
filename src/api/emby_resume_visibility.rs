@@ -6,6 +6,7 @@ pub(crate) struct ResumeVisibilityQuery {
     auth: EmbyTokenQuery,
     #[serde(
         rename = "Hide",
+        alias = "hide",
         default,
         deserialize_with = "deserialize_optional_bool"
     )]
