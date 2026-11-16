@@ -21951,7 +21951,7 @@ Entryway 会用到的 `MediaSegments`、`QuickConnect` 等缺失端点。
 
 #### LUX-915：`Shows/{seriesId}/Episodes` 季作用域核实
 
-状态：已完成（2026-11-16）。依赖：LUX-914（`seasonId` 别名）。验证：
+状态：已完成（2026-11-16，提交 `72907db2`）。依赖：LUX-914（`seasonId` 别名）。验证：
 `--test emby emby_season_scope::` 8/8、`--test emby` 100/100、`--test emby -- --list` 100 例 /
 18 个模块、fmt、`clippy --all-targets --all-features -D warnings` 通过。
 
