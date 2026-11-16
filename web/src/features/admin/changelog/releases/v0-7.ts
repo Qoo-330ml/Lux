@@ -2,6 +2,16 @@ import type { ChangelogRelease } from "../types";
 
 export const changelogReleases07: ChangelogRelease[] = [
   {
+    version: "0.7.22",
+    date: "2026-11-16",
+    sections: [
+      { kind: "fixed", items: [
+        "🐛 fix(emby): camelCase 查询参数不再被静默丢弃",
+        "🐛 fix(emby): 演员署名改成 Actor，并补上 ImageTags.Backdrop",
+      ] },
+    ],
+  },
+  {
     version: "0.7.21",
     date: "2026-11-15",
     sections: [
