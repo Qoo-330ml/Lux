@@ -8,6 +8,7 @@ export const changelogReleases07: ChangelogRelease[] = [
       { kind: "fixed", items: [
         "🐛 fix(emby): camelCase 查询参数不再被静默丢弃",
         "🐛 fix(emby): 演员署名改成 Actor，并补上 ImageTags.Backdrop",
+        "🐛 fix(home): 每日推荐与首页轮播的行带上外部 ID",
       ] },
     ],
   },
