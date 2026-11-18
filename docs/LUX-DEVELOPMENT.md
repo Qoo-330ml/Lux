@@ -1562,6 +1562,11 @@ COMPATIBILITY.md 是唯一兼容性事实来源。不能因为实现了官方 Sw
 - Years、Genres、Tags 等筛选辅助端点。（Years、Genres、Studios、OfficialRatings 已实现，见 `docs/COMPATIBILITY.md`；Tags 已由 LUX-900 的 TAG 投影提供，Lux 原生 `GET /api/v1/tags` 与 Emby `/Tags` 读取同一数据；`/Items` 的标签筛选仍未实现。）
 - Collections 与合集成员。
 - 多版本选择所需的 AlternateSources 等端点。
+- 管理员任务、条目刷新、识别（RemoteSearch）与远程图片端点，仅在目标客户端确有依赖时实现。
+  （**已因 Yamby/Hills 实现**：Yamby 2.1.0.11 的条目菜单与“管理服务器”面板会点
+  `POST /Items/{id}/Refresh`、`POST /Items/RemoteSearch/*`、`GET /Items/{id}/RemoteImages`、
+  `GET /ScheduledTasks` 与 `POST /ScheduledTasks/Running/{id}`，Hills 1.11.0 另有媒体库列表与删除；
+  LUX-916/917 实现了前者，媒体库删除与服务器重启/日志仍缺，见 `docs/COMPATIBILITY.md`。）
 - Sessions WebSocket 或实时消息，仅在目标客户端确有依赖时实现。（**已因 Yamby 实现**：Yamby 2.1.0.11 的「服务器状态」页固定连接 `/embywebsocket` 并依赖 `Sessions`/`ScheduledTasksInfo` 推送，失败后无退避重连，见 `docs/COMPATIBILITY.md` 的 LUX-891 一节与 `docs/reviews/2026-11-06-hills-yamby-static-analysis.md` §9.6。其余实时消息类型仍按"仅在有依赖时实现"处理。）
 - 图片变体、尺寸和索引端点。
 
@@ -20706,8 +20711,9 @@ LUX-890 合并后的去重与 P3 修正（2026-11-06）：
   `LibraryChanged` 等不推送（客户端对这些类型本就忽略）。若将来某个客户端依赖它们，需要另开任务。
 - 推送是"按客户端要求的间隔轮询现有应用服务"，不是事件驱动：最小间隔 1 s，因此最多 1 s 的额外延迟；
   每次推送还会做一次 token 校验（一次或两次数据库读），在 32 条连接、1 s 间隔的上限下属于可接受量级。
-- `ScheduledTasksInfo` 只有一个 `RefreshMediaLibrary` 任务项（与 HTTP 端点一致），不是 Emby 的完整任务
-  列表；`Sessions` 条目来自 Lux 的现有投影，没有为 WebSocket 增加字段。
+- `ScheduledTasksInfo` 只有一个扫描任务项（与 HTTP 端点一致），不是 Emby 的完整任务列表；`Sessions` 条目
+  来自 Lux 的现有投影，没有为 WebSocket 增加字段。该任务项的 `Key` 自 LUX-916 起为 `RefreshLibrary`
+  （原 `RefreshMediaLibrary`，改名原因见 COMPATIBILITY.md 的 LUX-916/917 小节）。
 - 空闲超时依赖客户端回应心跳 ping（Yamby 用 OkHttp，读取线程会自动回 pong）；如果某个客户端完全不读
   连接，120 s 后会被关闭——这是有意的资源保护。
 
@@ -21987,6 +21993,103 @@ Entryway 会用到的 `MediaSegments`、`QuickConnect` 等缺失端点。
   若某些路径传季号，Lux 会回退到整剧，客户端需自行过滤；这需要真机抓包确认。
 
 预计文件：`tests/emby/emby_season_scope.rs`、`tests/emby/main.rs`、`docs/COMPATIBILITY.md`、
+`docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-916：Emby 管理员任务端点与条目刷新语义
+
+状态：已完成（2026-11-18）。依赖：无。验证：`--test emby emby_admin_tasks::` 5/5、`--test emby` 111/111、
+fmt、`clippy --all-targets --all-features -D warnings` 通过。
+
+背景：Yamby 2.1.0.11 的管理员“扫描/刷新元数据”与任务面板分别落在 `POST /Items/{id}/Refresh` 和
+`GET+POST /ScheduledTasks*` 上。Lux 此前只实现了一部分，并且两处语义不成立：普通电影/剧集的
+`/Items/{id}/Refresh` 返回 404，`MetadataRefreshMode`/`ReplaceAll*` 参数被静默丢弃；扫描任务的 `Key`
+是 `RefreshMediaLibrary`，而 Yamby 的 `ScheduledTasksInfo.m4370()` 用 `Collection.contains` 精确比对
+`markers`/`RefreshLibrary`/`RefreshChapterImages`/`RestartPlugins`，旧键名会让任务面板为空。
+
+范围：
+
+- `src/api/emby_handlers.rs`：扫描任务的 `Key` 改为 `RefreshLibrary`、`Id` 保持
+  `lux-refresh-media-library`（`EMBY_SCAN_TASK_KEY`/`EMBY_SCAN_TASK_ID`）；新增
+  `POST /ScheduledTasks/Running/{taskId}`，管理员启动唯一扫描任务（等同 `POST /Library/Refresh` 的排队/复用
+  逻辑，抽成 `queue_all_library_scans`），成功 204、未知任务 404、普通用户 403；`POST /Items/{id}/Refresh`
+  读取 `MetadataRefreshMode`/`ImageRefreshMode`/`ReplaceAllMetadata`/`ReplaceAllImages`（PascalCase 与
+  camelCase），全量刷新入队条目元数据任务（202 + `scope: ITEM_METADATA`），其余走文件系统扫描并新增
+  `scope: ITEM_FOLDER`（媒体源所在文件夹）；`Recursive=false` 仍 422，既有 `FOLDER`/`LIBRARY_ROOT` 语义不变。
+- `src/api/emby.rs`：注册 `POST /ScheduledTasks/Running/{task_id}` 与 `DELETE /Items/{item_id}/Delete`。
+- `src/api/emby_catalog.rs`：删除处理器先把公共条目 id（十进制 u128）与 `MediaSourceId`（STRM 的 32 位
+  十六进制）还原为内部标识；此前合法删除请求会返回 400。
+- `src/api/admin.rs`：导出 `metadata_reidentify_job_json`，让 Emby 适配层复用同一个作业 DTO。
+- `tests/emby/emby_admin_tasks.rs`（新模块，5 例）：任务键与启动、重复启动复用活动任务、未知任务/普通用户、
+  全量刷新入队元数据任务、默认模式走条目文件夹扫描、`/Delete` 别名删除。
+
+不做：不实现 `POST /System/Restart`、`System/Logs`、`ActivityLog/Entries`、`Library/VirtualFolders` 的删除；
+不按 Hills 字符串表里的 `RefreshMetadataMode` 分流（不是 Emby 参数，抓包无法证明用途）；不改
+`/Library/Refresh` 的 202 body。
+
+验收：
+
+- [x] `GET /emby/ScheduledTasks` 的任务 `Key` 为 `RefreshLibrary`，且该 `Id` 可被
+  `POST /emby/ScheduledTasks/Running/{id}` 启动，返回 204（`scan_task_key_is_startable_and_queues_every_enabled_library`）。
+- [x] 启动任务为每个启用库排队全库校验，重复启动不重复排队；未知任务 404，普通用户 403
+  （`scan_task_start_rejects_unknown_tasks_and_non_administrators`）。
+- [x] `MetadataRefreshMode=FullRefresh` + `ReplaceAll*` 入队 `FULL_REFRESH` 元数据任务并返回
+  `scope: ITEM_METADATA`（`item_refresh_full_refresh_queues_a_metadata_job`）。
+- [x] `MetadataRefreshMode=Default` 只做条目所在文件夹的增量扫描（`scope: ITEM_FOLDER`，不创建元数据任务）
+  （`item_refresh_default_mode_scans_the_item_folder`）。
+- [x] `DELETE /emby/Items/{id}/Delete` 返回 204 并删除媒体文件，未知条目 404，普通用户 403
+  （`item_delete_accepts_the_emby_delete_suffix`）。
+- [x] `cargo test --locked --test emby` 111 passed、0 failed；fmt 与 clippy 全 target 通过。
+- [ ] 未验证：Yamby/Hills 真机上按钮点击后的完整 UI 反馈（需要所有者设备）。
+
+预计文件：`src/api/emby.rs`、`src/api/emby_handlers.rs`、`src/api/emby_catalog.rs`、`src/api/admin.rs`、
+`tests/emby/emby_admin_tasks.rs`、`tests/emby/main.rs`、`docs/API.md`、`docs/COMPATIBILITY.md`、
+`docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-917：Emby 识别与远程图片端点
+
+状态：已完成（2026-11-18）。依赖：LUX-916（公共 id 还原、管理员鉴权模式）。验证：
+`--test emby emby_admin_media::` 6/6、`--lib emby_admin_media` 3/3、`--test emby` 111/111、fmt、clippy 通过。
+
+背景：Yamby 的“识别”与“编辑图片”分别使用 `POST /Items/RemoteSearch/{Movie|Series}` +
+`POST /Items/RemoteSearch/Apply/{id}`、`GET /Items/{id}/RemoteImages` + `/RemoteImages/Download` +
+`DELETE /Items/{id}/Images/{Type}/{Index}/Delete`（Hills 1.11.0 的字符串表同样包含这些路径）。Lux 已有
+候选搜索/选择、图片候选搜索与图片写回服务，缺的只是 Emby 协议层。
+
+范围：
+
+- 新模块 `src/api/emby_admin_media.rs`（`src/api/legacy.rs` 注册 `mod emby_admin_media`）：
+  `POST /Items/RemoteSearch/{type}`（解析 `RemoteSearchQuery`，返回 `RemoteSearchResult[]`，带 `ProviderIds`
+  时匹配候选置顶）、`POST /Items/RemoteSearch/Apply/{itemId}`（按候选 id → provider id → 重新搜索的顺序解析，
+  选中复用 `select_metadata_candidate`，成功 204）、`GET /Items/{id}/RemoteImages`（Emby 图片类型映射到 Lux
+  的 POSTER/BACKDROP/LOGO/THUMB/BANNER/DISC/ART，分页限幅）、`POST /Items/{id}/RemoteImages/Download`、
+  `DELETE /Items/{id}/Images/{Type}/{Index}/Delete`（按类型与序号定位已存储图片）。
+- `src/api/emby.rs`：注册上述五条路由（JSON body 上限 64 KiB）。
+- 错误映射沿用应用服务：未知条目 404、非法请求 400、视频/家庭视频条目 422、库无可用刮削器 409、
+  刮削器失败 503；配置问题不会伪装成“没有候选”的空数组。
+- `tests/emby/emby_admin_media.rs`（新模块，6 例）：识别鉴权/未知条目/空标题/非法类型/无刮削器 409；Apply
+  未知候选与未知条目 404；RemoteImages 类型校验与未识别条目冲突态；Download body 校验；图片删除的类型/
+  序号解析与缺失 404。模块内另有 3 例单元测试覆盖 DTO 映射、图片类型双向映射与 provider id 匹配。
+
+不做：不实现条目自由字段编辑（`POST /Items/{id}` 对电影/剧集仍只处理 `Person`，需要独立的 Lux 元数据
+编辑用例与 NFO 写回设计）；不实现 `Library/VirtualFolders` 的增删；不新增 Lux 侧端点（Emby 适配层只调用
+既有应用服务）。
+
+验收：
+
+- [x] 识别端点要求管理员，未知条目 404，空标题/非法类型 400，库无刮削器 409
+  （`remote_search_validates_the_client_and_the_item`）。
+- [x] 非管理员访问识别、Apply、RemoteImages 一律 403（`remote_search_rejects_non_administrators`）。
+- [x] Apply 对未知候选与未知条目返回 404（`remote_search_apply_rejects_unknown_candidates`）。
+- [x] RemoteImages 校验图片类型，未识别条目返回 409/503 而不是空数组
+  （`remote_images_validate_type_and_item`）。
+- [x] Download 缺 URL 或类型非法返回 400（`remote_image_download_validates_the_body`）。
+- [x] 删除图片按类型与序号定位，非法序号/类型 400，无图片 404（`image_delete_maps_type_and_index`）。
+- [x] `RemoteSearchResult` 的字段名与 Emby 一致（`remote_search_result_uses_the_emby_field_names`）。
+- [x] `cargo test --locked --test emby` 111 passed、0 failed；fmt 与 clippy 全 target 通过。
+- [ ] 未验证：Yamby/Hills 真机上的识别结果列表、图片选择与删除流程；当前只固定服务端合同。
+
+预计文件：`src/api/emby_admin_media.rs`、`src/api/emby.rs`、`src/api/legacy.rs`、
+`tests/emby/emby_admin_media.rs`、`tests/emby/main.rs`、`docs/API.md`、`docs/COMPATIBILITY.md`、
 `docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
 
 ## 31. 参考资料

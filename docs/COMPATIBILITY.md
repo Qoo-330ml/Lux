@@ -1,5 +1,84 @@
 # Lux 客户端兼容性矩阵
 
+## LUX-916/LUX-917 Emby 管理员端点（2026-11-18）
+
+分级：**请求形态来自静态反编译 + 服务端合同由自动化测试固定；未在 Yamby/Hills 真机复测**。请求形态来自
+Yamby 2.1.0.11（`ScheduledTasksInfo.m4370()`、`gb/C2482.java`、`ic/C3003.java`、`dd/C1544.java`）与
+Hills 1.11.0 的 `libapp.so` 字符串表；所有响应只按 Emby 公开 DTO 形状实现，不代表任一客户端的管理菜单已经
+在真机上跑通。
+
+背景：两家客户端都没有自带刮削器，管理员登录后只是替用户点服务器上的管理端点。Yamby 的“扫描/刷新元数据/
+识别/编辑图片/任务面板”分别落在 `POST /Items/{id}/Refresh`、`POST /Items/RemoteSearch/*`、
+`GET /Items/{id}/RemoteImages`、`GET+POST /ScheduledTasks*` 上。此前 Lux 只实现了其中一部分，且两处语义
+不成立：普通条目的 `/Items/{id}/Refresh` 返回 404，`MetadataRefreshMode` 被丢弃。
+
+### 任务与扫描
+
+- `GET /ScheduledTasks`（含 `/emby` 前缀）返回的单个任务 `Key` 由 `RefreshMediaLibrary` 改为
+  **`RefreshLibrary`**。依据：Yamby 的 `ScheduledTasksInfo.m4370()` 用 `Collection.contains` 精确比对
+  `markers`/`RefreshLibrary`/`RefreshChapterImages`/`RestartPlugins` 四个键，其余键一律丢弃；旧键名会让
+  管理员的任务面板为空列表。`Id` 保持 `lux-refresh-media-library`（客户端只把它当作不透明句柄）。
+- 新增 `POST /ScheduledTasks/Running/{taskId}`：管理员 token/API key 启动唯一的扫描任务，行为与
+  `POST /Library/Refresh` 相同（为每个启用库排队或复用全库校验任务），成功返回 **204**（与 Emby 一致，
+  不返回 Lux 的 202 body）；未知任务 404；普通用户 403；服务未就绪 503。任务 id 接受 `lux-refresh-media-library`
+  或 `RefreshLibrary`，大小写不敏感。
+
+### 条目刷新与删除
+
+- `POST /Items/{id}/Refresh` 现在按客户端意图分流（`Recursive=false` 仍为 422）：
+  - `MetadataRefreshMode=FullRefresh` 或 `ImageRefreshMode=FullRefresh` 或 `ReplaceAllMetadata=true` /
+    `ReplaceAllImages=true` → 入队条目元数据刷新（`FULL_REFRESH`），返回 202 与
+    `scope: "ITEM_METADATA"`，不在请求内扫描或调用刮削器；条目不存在 404，视频/家庭视频条目 422。
+  - 其余（含 Yamby 的“扫描”`MetadataRefreshMode=Default`）→ 文件系统扫描：已登记 `FOLDER` 返回
+    `scope: "FOLDER"`（既有行为不变），普通条目按媒体源所在文件夹返回 `scope: "ITEM_FOLDER"`，媒体库 id
+    返回 `scope: "LIBRARY_ROOT"`。三者都只入队增量扫描，不做在线刮削。
+  - 有意忽略 Hills 字符串表里的 `RefreshMetadataMode=FullRefresh`：该名不是 Emby 参数，且抓包无法证明它
+    属于“刷新元数据”还是“扫描媒体库”，按它分流会把扫描静默升级成刮削。
+- `DELETE /Items/{id}/Delete` 与既有 `DELETE /Items/{id}` 等价（Yamby 用带 `/Delete` 后缀的写法）。同时修正
+  一个既有缺陷：删除处理器此前把 DTO 的公共 id（十进制 u128）直接交给删除服务，导致合法请求返回
+  `400`；现在条目 id 与 `MediaSourceId`（STRM 的 32 位十六进制）都会先还原成内部标识。成功 204，未知条目
+  404，非管理员 403。
+
+### 识别（RemoteSearch）
+
+- `POST /Items/RemoteSearch/{Movie|Series}`：管理员请求体按 Emby `RemoteSearchQuery` 解析（PascalCase，
+  兼容 camelCase），`ItemId` + `SearchInfo.Name/Year/ProviderIds` 驱动现有的候选搜索服务，返回
+  `RemoteSearchResult[]`：`Id`（Lux 候选行 id，供 Apply 回传）、`Name`、`OriginalTitle`、`Overview`、
+  `ProductionYear`、`PremiereDate`、`ImageUrl`、`ProviderIds`、`SearchProviderName`、`SearchProviderId`。
+  请求带 `ProviderIds` 时，provider id 匹配的候选排在最前。
+  - 错误：未知条目 404；空标题或非法类型 400；`VIDEO`/家庭视频条目 422；库没有可用刮削器 409；刮削器全部
+    失败 503。空列表只表示“搜到了但没有候选”，配置问题绝不伪装成空结果。
+- `POST /Items/RemoteSearch/Apply/{ItemId}`：客户端回传的 `RemoteSearchResult` 先按 `Id`，再按
+  `ProviderIds` 的值匹配该条目的 pending 候选；候选已过期时用 body 里的 `Name`/`ProductionYear` 重新搜一次
+  并选中首个候选；仍无匹配则 404。选中走与 Lux 管理 API 相同的用例（NFO/图片写回、锁定字段、低置信度
+  规则完全一致），成功 **204**。
+
+### 远程图片
+
+- `GET /Items/{id}/RemoteImages`：`Type` 接受 Emby 的 Primary/Backdrop/Logo/Thumb/Banner/Disc/Art（大小写
+  不敏感，映射到 Lux 的 POSTER/BACKDROP/LOGO/THUMB/BANNER/DISC/ART），返回
+  `{Images: [{Url, Type, Language, ProviderName, Width, Height, ImageIndex}], TotalRecordCount}`；
+  `StartIndex`/`Limit` 在服务端限幅（默认 100，上限 1000）。非法类型 400；条目不存在 404；条目尚未完成
+  元数据匹配或库没有刮削器时沿用图片搜索服务的 409。`IncludeAllLanguages` 被忽略：Lux 的图片语言来自
+  媒体库策略，客户端提示不改变结果。
+- `POST /Items/{id}/RemoteImages/Download`：body `{Type, ImageUrl}`（`Url` 亦可），写入该条目并返回 204；
+  缺 URL 或非法类型 400。
+- `DELETE /Items/{id}/Images/{Type}/{Index}/Delete`：按类型与序号定位已存储图片并删除，返回 204；类型无法
+  映射或序号非数字 400；没有对应图片 404。
+
+### 未实现（本任务范围外）
+
+- `POST /Items/{id}` 对电影/剧集的自由字段编辑仍只处理 `Person`（Yamby/Hills 的“编辑元数据”会 400/404）。
+  这需要一条 Lux 侧的条目元数据编辑用例（锁定字段、NFO 原子写回、低置信度规则），属独立任务。
+- `POST /System/Restart`、`GET /System/Logs/...`、`GET /System/ActivityLog/Entries`、
+  `DELETE /Library/VirtualFolders`：Lux 有等价的 `/api/v1/admin/*`（任务日志、审计、异步删库）但没有 Emby
+  形状，且重启与删库是破坏性运维动作，需要单独设计后再补。
+
+自动化：`cargo test --locked --test emby emby_admin_tasks::` 5/5、
+`cargo test --locked --test emby emby_admin_media::` 6/6、`cargo test --locked --lib emby_admin_media` 3/3，
+整组 `cargo test --locked --test emby` 111/111；`cargo fmt --all -- --check` 与
+`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。
+
 ## 网易爆米花演员署名与背景图（2026-11-16）
 
 分级：**静态确认 + 隔离实例回归**。客户端侧证据来自 iOS 2.15.14 的 `MediaServerAPI` 导出符号，
@@ -852,11 +931,11 @@ Emby 兼容层提供 `DELETE /Items/{itemId}`。拥有服务器管理权限的 E
 
 ## Emby 增量同步状态兼容合同
 
-Lux 兼容 `GET /ScheduledTasks` 和 `/emby/ScheduledTasks`，返回标准的 `RefreshMediaLibrary` 任务项。
+Lux 兼容 `GET /ScheduledTasks` 和 `/emby/ScheduledTasks`，返回标准的 `RefreshLibrary` 任务项（LUX-916 由 `RefreshMediaLibrary` 更名，原因见上）。
 排队或运行中的非 `INCREMENTAL_SCAN` 任务报告为 `Running`，没有全库扫描任务时报告为 `Idle`；增量扫描本身不会
 阻塞该全库状态判断。该接口只提供状态观察，不会因为查询而启动扫描。
 
-自动化回归覆盖 `/emby/ScheduledTasks` 的管理员 API Key 调用、`RefreshMediaLibrary` 任务形状和排队全库扫描的
+自动化回归覆盖 `/emby/ScheduledTasks` 的管理员 API Key 调用、`RefreshLibrary` 任务形状和排队全库扫描的
 `Running` 状态；这证明 Lux 服务端协议，不代表 Nextfind 已在 FNOS 部署实例上重新验证。
 
 ## Qmby 使用的 Emby 接口补齐（2026-09-23）
@@ -2035,7 +2114,7 @@ Lux 当时返回 404 空响应，客户端页面不报错、推荐区整块缺�
 - 只实现 `Sessions` 与 `ScheduledTasksInfo` 两类推送；`ForceKeepAlive`、`UserDataChanged`、
   `LibraryChanged` 等其它 Emby WebSocket 消息一律不推送（客户端对这些类型本就忽略）。
 - `Sessions` 的条目来自 Lux 现有的 `GET /Sessions` 投影（`NowPlayingItem`/`PlayState` 完整），没有为了
-  WebSocket 增加额外字段；`ScheduledTasksInfo` 复用 `GET /ScheduledTasks` 的单一 `RefreshMediaLibrary`
+  WebSocket 增加额外字段；`ScheduledTasksInfo` 复用 `GET /ScheduledTasks` 的单一 `RefreshLibrary`
   任务项。
 - 推送是"按客户端要求的间隔轮询现有应用服务"，不是事件驱动；两个客户端请求的 1.5 s / 1 s 间隔都在
   钳制范围内，因此行为与 Emby 原生推送在观感上一致，但延迟上限由间隔决定。

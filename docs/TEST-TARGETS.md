@@ -11,7 +11,7 @@
 | `--test admin` | 管理后台、日志导出、可观测性与运维事件 | 14 | 60 |
 | `--test api_web` | HTTP 契约（错误/限流/压缩/健康/远程策略）、Web 会话、Webhook | 13 | 57 |
 | `--test auth_users` | 认证、会话、登录背景、用户与用户设置、设备配对、界面偏好迁移 | 10 | 73 |
-| `--test emby` | Emby 兼容层（认证、系统信息、增量刷新、发现、多段播放、检索、下载、WebSocket、查询参数大小写、季作用域） | 18 | 100 |
+| `--test emby` | Emby 兼容层（认证、系统信息、增量刷新、发现、多段播放、检索、下载、WebSocket、查询参数大小写、季作用域、管理员任务与识别/图片端点） | 20 | 111 |
 | `--test scanner` | 媒体库扫描、增量/混合扫描、计划任务、作业事件与关停 | 7 | 152 |
 | `--test library` | 媒体库生命周期、合并/拆分、集合、目录与系列 API | 12 | 62 |
 | `--test metadata` | 元数据抓取与选择、NFO 回写、扫描后剧集元数据、人物、字幕 | 14 | 162 |
@@ -20,7 +20,7 @@
 | `--test storage` | SQLite/PostgreSQL 存储、迁移、WAL、数据库维护与启动守卫 | 9 | 118 |
 | `--test plugins` | 插件协议与运行时、弹幕、IP 属地、媒体信息插件配置 | 11 | 129 |
 | `--test strm` | STRM 目标解析/探测/播放与 ffprobe | 9 | 42 |
-| 合计（12 组） |  | 133 | 1053 |
+| 合计（12 组） |  | 135 | 1064 |
 
 另有 8 个 binary 因为进程级共享状态或外部服务依赖保持独立，见第 4 节：`--test background_work_budget`、`--test filmly_image_diag`、`--test image_variants_perf`、`--test performance`、`--test postgres_database`、`--test reidentify`、`--test scanned_metadata`、`--test shutdown`。合计 12 + 8 = 20 个集成测试 target。
 
@@ -97,6 +97,8 @@ cargo test --locked --test <新 target> <旧名>::
 | † `emby_websocket` | 24 | `cargo test --locked --test emby emby_websocket::` |
 | † `query_case` | 7 | `cargo test --locked --test emby query_case::` |
 | † `emby_season_scope` | 8 | `cargo test --locked --test emby emby_season_scope::` |
+| `emby_admin_media` | 6 | `cargo test --locked --test emby emby_admin_media::` |
+| `emby_admin_tasks` | 5 | `cargo test --locked --test emby emby_admin_tasks::` |
 | `job_events_api` | 2 | `cargo test --locked --test scanner job_events_api::` |
 | `mixed_scanner` | 1 | `cargo test --locked --test scanner mixed_scanner::` |
 | `scanner` | 18 | `cargo test --locked --test scanner scanner::` |
@@ -257,7 +259,7 @@ cargo test --locked --test scanner
 | `admin` | 22 | 60 | 新增 38 例（LUX-894 的 `lux_websocket` 30 例、LUX-897 的实时通道相关模块 5 例、其余 3 例为先前任务） |
 | `api_web` | 39 | 57 | 新增 18 例（后续任务） |
 | `auth_users` | 70 | 73 | 新增 3 例（后续任务） |
-| `emby` | 38 | 100 | 新增 62 例（LUX-914 的 `query_case` 7 例、LUX-915 的 `emby_season_scope` 8 例、LUX-900 第五增量的 `emby_filter_metadata` 2 例、`emby_websocket` 1 例未同步，其余为先前任务） |
+| `emby` | 38 | 111 | 新增 73 例（LUX-914 的 `query_case` 7 例、LUX-915 的 `emby_season_scope` 8 例、LUX-916/917 的 `emby_admin_tasks` 5 例与 `emby_admin_media` 6 例、LUX-900 第五增量的 `emby_filter_metadata` 2 例、`emby_websocket` 1 例未同步，其余为先前任务） |
 | `scanner` | 137 | 152 | 新增 15 例（后续任务） |
 | `library` | 49 | 62 | 新增 13 例（LUX-899 的 `similar_api` 6 例、LUX-900 的 `tags_api` 5 例、其余 2 例为先前任务） |
 | `metadata` | 143 | 157 | 新增 14 例（LUX-886 6 例、LUX-887 1 例，其余为先前任务） |
@@ -267,7 +269,7 @@ cargo test --locked --test scanner
 | `plugins` | 84 | 128 | 新增 44 例（后续任务） |
 | `strm` | 42 | 42 | 一致 |
 | 独立 binary 合计 | 112 | 117 | 新增 5 例（后续任务） |
-| **合计** | **934** | **1167** | 差异均为合并后新增用例 |
+| **合计** | **934** | **1178** | 差异均为合并后新增用例 |
 
 ### 5.2 单个用例稳定性复核
 
@@ -490,3 +492,25 @@ Emby `GET /Tags` 改读标签投影，测试仍在既有模块 `tests/emby/emby_
 - 三处数字同步：第 1 节 `emby` 行 17 模块 92 例 → **18 模块 100 例**、12 组合计 132/1045 → **133/1053**
   （沿用 LUX-900 第五增量记下的 +3 口径偏差：按第 2 节模块行之和是 1042 → **1050**）；第 2 节新增
   `emby_season_scope` 一行；第 5.1 节 `emby` 92 → **100**、合计 1159 → **1167**。
+
+## 15. LUX-916/LUX-917 追加（2026-11-18）
+
+`tests/emby/emby_admin_tasks.rs`（LUX-916）与 `tests/emby/emby_admin_media.rs`（LUX-917）是新增的两个
+模块（`tests/emby/main.rs` 各追加一行 `mod`），命令分别为
+`cargo test --locked --test emby emby_admin_tasks::` 与
+`cargo test --locked --test emby emby_admin_media::`。
+
+- `emby_admin_tasks`（5 例）：扫描任务 `Key=RefreshLibrary` 可被 `POST /ScheduledTasks/Running/{id}` 启动并
+  为每个启用库排队全库校验（重复启动复用活动任务）、未知任务 404 与普通用户 403、
+  `MetadataRefreshMode=FullRefresh` 入队条目元数据任务（`scope=ITEM_METADATA`、`mode=FULL_REFRESH`）、
+  `MetadataRefreshMode=Default` 走条目所在文件夹增量扫描（`scope=ITEM_FOLDER`）、
+  `DELETE /Items/{id}/Delete` 别名删除并以公共 id 解析。
+- `emby_admin_media`（6 例）：`RemoteSearch` 的鉴权、未知条目、空标题、非法类型与无刮削器 409，`Apply` 的
+  未知候选/未知条目 404，`RemoteImages` 的类型校验与未识别条目冲突态，`RemoteImages/Download` 的 body
+  校验，`Images/{Type}/{Index}/Delete` 的类型/序号解析与缺失 404；另在 `src/api/emby_admin_media.rs` 内
+  有 3 例单元测试覆盖 Emby DTO 映射、图片类型双向映射与 provider id 匹配。
+- 实测：`cargo test --locked --test emby emby_admin_tasks::` 5/5、`emby_admin_media::` 6/6、
+  `cargo test --locked --lib emby_admin_media` 3/3，整组 `cargo test --locked --test emby` 为
+  **111 passed、0 failed**（100 例基线 + 本任务 11 例），`--list` 为 111 例 / 20 个模块。
+- 三处数字同步：第 1 节 `emby` 行 18 模块 100 例 → **20 模块 111 例**、12 组合计 133/1053 → **135/1064**；
+  第 2 节新增上述两行；第 5.1 节 `emby` 100 → **111**、合计 1167 → **1178**。
