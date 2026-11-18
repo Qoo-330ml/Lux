@@ -2908,7 +2908,11 @@ pub(super) async fn emby_delete_item(
     if let Err(status) = emby_access_principal(&auth_principal, None) {
         return status.into_response();
     }
-    delete_media_item(&headers, &state, &item_id, query.source_id.as_deref()).await
+    // Emby clients send the public item id (a decimal u128) and the public source id (32 hex for
+    // STRM sources); the deletion service needs the stored identifiers.
+    let item_id = emby_internal_id(&item_id);
+    let source_id = query.source_id.as_deref().map(emby_internal_source_id);
+    delete_media_item(&headers, &state, &item_id, source_id.as_deref()).await
 }
 
 #[derive(Deserialize)]

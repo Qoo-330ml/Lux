@@ -5,6 +5,9 @@ use axum::extract::DefaultBodyLimit;
 mod credentials;
 pub(super) const NORMALIZED_CREDENTIAL_HEADER: &str = "x-lux-internal-emby-credential";
 
+/// Upper bound for the JSON bodies of the Emby administrator media endpoints.
+const EMBY_REMOTE_SEARCH_BODY_BYTES: usize = 64 * 1024;
+
 struct EmbyRouteBuilder {
     router: Router<ReadyAppState>,
     path_templates: Vec<String>,
@@ -86,6 +89,10 @@ pub(super) fn api_routes() -> (Router<ReadyAppState>, Vec<String>) {
             post(emby_media_updated).layer(DefaultBodyLimit::max(64 * 1024)),
         )
         .route("/ScheduledTasks", get(emby_scheduled_tasks))
+        .route(
+            "/ScheduledTasks/Running/{task_id}",
+            post(emby_run_scheduled_task),
+        )
         .route("/Persons", get(emby_persons))
         .route("/Genres", get(emby_genres))
         .route("/Studios", get(emby_studios))
@@ -150,7 +157,28 @@ pub(super) fn api_routes() -> (Router<ReadyAppState>, Vec<String>) {
                 .post(emby_update_item)
                 .delete(emby_delete_item),
         )
+        // Yamby deletes through the legacy `/Items/{Id}/Delete` suffix.
+        .route("/Items/{item_id}/Delete", delete(emby_delete_item))
         .route("/Items/{item_id}/Similar", get(emby_item_similar))
+        .route(
+            "/Items/RemoteSearch/{search_type}",
+            post(emby_remote_search).layer(DefaultBodyLimit::max(EMBY_REMOTE_SEARCH_BODY_BYTES)),
+        )
+        .route(
+            "/Items/RemoteSearch/Apply/{item_id}",
+            post(emby_remote_search_apply)
+                .layer(DefaultBodyLimit::max(EMBY_REMOTE_SEARCH_BODY_BYTES)),
+        )
+        .route("/Items/{item_id}/RemoteImages", get(emby_remote_images))
+        .route(
+            "/Items/{item_id}/RemoteImages/Download",
+            post(emby_remote_image_download)
+                .layer(DefaultBodyLimit::max(EMBY_REMOTE_SEARCH_BODY_BYTES)),
+        )
+        .route(
+            "/Items/{item_id}/Images/{image_type}/{image_index}/Delete",
+            delete(emby_delete_item_image),
+        )
         .route("/Items/{item_id}/Refresh", post(emby_refresh_item))
         .route("/Library/Refresh", post(emby_refresh_library))
         .route("/Items/{item_id}/Children", get(emby_collection_children))

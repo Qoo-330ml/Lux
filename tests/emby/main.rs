@@ -1,5 +1,7 @@
 mod discovery;
 mod download_api;
+mod emby_admin_media;
+mod emby_admin_tasks;
 mod emby_auth;
 mod emby_counts;
 mod emby_empty_numeric_params;

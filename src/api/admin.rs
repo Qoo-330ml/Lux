@@ -38,7 +38,8 @@ mod admin_people;
 mod admin_plugins;
 pub(super) use admin_metadata::{
     ItemImageSearchRequest, ItemImageSelectRequest, MetadataCandidateQuery, image_candidate_error,
-    image_candidate_json, image_write_error, item_image_json, metadata_write_error,
+    image_candidate_json, image_write_error, item_image_json, metadata_reidentify_job_json,
+    metadata_write_error,
 };
 #[cfg(test)]
 pub(super) use admin_metadata::{

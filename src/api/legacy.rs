@@ -136,6 +136,9 @@ mod emby;
 #[path = "emby_handlers.rs"]
 mod emby_handlers;
 use emby_handlers::*;
+#[path = "emby_admin_media.rs"]
+mod emby_admin_media;
+use emby_admin_media::*;
 #[path = "emby_catalog.rs"]
 mod emby_catalog;
 #[path = "emby_similar.rs"]
