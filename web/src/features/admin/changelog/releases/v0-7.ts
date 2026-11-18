@@ -2,6 +2,21 @@ import type { ChangelogRelease } from "../types";
 
 export const changelogReleases07: ChangelogRelease[] = [
   {
+    version: "0.7.23",
+    date: "2026-11-18",
+    sections: [
+      { kind: "added", items: [
+        "✨ feat(emby): 扫描任务改名 RefreshLibrary，并支持从任务面板启动",
+        "✨ feat(emby): /Items/{id}/Refresh 按客户端意图分流为元数据刷新与文件扫描",
+        "✨ feat(emby): 新增 POST /Items/RemoteSearch/{Type} 与 Apply",
+        "✨ feat(emby): 新增 RemoteImages 列表、下载与图片删除端点",
+      ] },
+      { kind: "fixed", items: [
+        "🐛 fix(emby): DELETE /Items/{id} 的 id 映射修正，并接受 /Delete 后缀",
+      ] },
+    ],
+  },
+  {
     version: "0.7.22",
     date: "2026-11-16",
     sections: [

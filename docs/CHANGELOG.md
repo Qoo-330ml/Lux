@@ -8,6 +8,21 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 >
 > 发版时两处都要改：本文档，以及应用内「设置 → 更新日志」页面使用的内置列表：新版本条目追加到 `web/src/features/admin/changelog/releases/` 下对应大版本的文件（如 `v0-7.ts`）；新大版本需新增文件，并在 `releases/index.ts` 中按倒序插入（该页面不读取本文件）。
 
+## [0.7.23] - 2026-11-18
+
+Emby 管理端补齐了 Yamby、Hills 会去点的那些入口：任务面板、条目刷新与删除、远程搜索和远程图片。
+
+### ✨ feat
+
+* **emby:** 扫描任务改名 `RefreshLibrary`，并支持从任务面板启动
+* **emby:** `/Items/{id}/Refresh` 按客户端意图分流为元数据刷新与文件扫描
+* **emby:** 新增 `POST /Items/RemoteSearch/{Type}` 与 `Apply`
+* **emby:** 新增 `RemoteImages` 列表、下载与图片删除端点
+
+### 🐛 fix
+
+* **emby:** `DELETE /Items/{id}` 的 id 映射修正，并接受 `/Delete` 后缀
+
 ## [0.7.22] - 2026-11-16
 
 Emby 兼容层修了两处 camelCase 与演员署名/背景图，首页轮播的推荐条目也带上了外部 ID。
