@@ -1,5 +1,6 @@
 mod discovery;
 mod download_api;
+mod emby_admin_item_update;
 mod emby_admin_media;
 mod emby_admin_tasks;
 mod emby_auth;

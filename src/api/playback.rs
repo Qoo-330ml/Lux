@@ -2425,10 +2425,12 @@ pub(super) async fn emby_session_entries(
         .user_id()
         .map(|user_id| user_id.to_string())
         .unwrap_or_default();
+    // Server managers (`can_manage_server`) poll every session, exactly like
+    // `/api/v1/admin/playback-sessions`; everyone else only sees their own.
     let sessions = state
         .playback_progress()
         .list_sessions(
-            (!auth_principal.is_admin()).then_some(user_id.as_str()),
+            (!auth_principal.can_manage_server()).then_some(user_id.as_str()),
             active_within_seconds,
         )
         .await
@@ -2445,7 +2447,7 @@ pub(super) async fn emby_session_entries(
         .into_iter()
         .map(|session| (session.play_session_id.clone(), session))
         .collect::<std::collections::HashMap<_, _>>();
-    let user_names = if auth_principal.is_admin() {
+    let user_names = if auth_principal.can_manage_server() {
         let session_user_ids = sessions
             .iter()
             .map(|session| session.user_id.clone())
@@ -2506,9 +2508,12 @@ pub(super) async fn emby_stop_session(
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    if let Some(user) = auth_principal.user()
-        && !user.is_admin
-        && session.user_id != user.id.to_string()
+    // Stopping another user's session is the same server-management capability the Lux admin
+    // playback-session endpoint requires; a plain user may only stop their own.
+    if !auth_principal.can_manage_server()
+        && auth_principal
+            .user()
+            .is_some_and(|user| session.user_id != user.id.to_string())
     {
         return StatusCode::NOT_FOUND.into_response();
     }
