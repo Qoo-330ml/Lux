@@ -94,34 +94,17 @@ pub(super) async fn emby_remote_search(
         return StatusCode::BAD_REQUEST.into_response();
     };
     let search_info = request.search_info.unwrap_or_default();
-    let search = search_info
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty());
-    // Provider ids are an alternative search key: a client that already knows the TMDb/IMDb id can
-    // ask for the match directly, without a name. Blank ids are dropped so they cannot turn an
-    // otherwise empty request into a search.
-    let provider_ids = search_info
-        .provider_ids
-        .into_iter()
-        .filter(|(key, value)| !key.trim().is_empty() && !value.trim().is_empty())
-        .collect::<BTreeMap<_, _>>();
-    if search.is_none() && provider_ids.is_empty() {
+    let (search, provider_ids, lookup_provider_ids) = resolve_remote_search_input(&search_info);
+    if search.is_none() && provider_ids.is_none() {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let provider_ids = (!provider_ids.is_empty()).then_some(provider_ids);
-    // Only a provider-id-only request is a direct id lookup. When the client sends a name, the
-    // administrator is searching by title (for example after correcting it), so the ids must not
-    // replace the name query; they still rank the returned candidates below.
-    let lookup_provider_ids = direct_provider_ids(search, provider_ids.as_ref());
     let reidentify = state.metadata_reidentify();
     let page = match reidentify
         .search_item_candidates_with_provider_ids(
             &item_id,
             search,
             search_info.year,
-            lookup_provider_ids,
+            lookup_provider_ids.as_ref(),
         )
         .await
     {
@@ -143,15 +126,40 @@ pub(super) async fn emby_remote_search(
     Json(results).into_response()
 }
 
-/// Provider ids used as a direct-lookup key: only when the request has no usable name.
-fn direct_provider_ids<'a>(
-    search: Option<&str>,
-    provider_ids: Option<&'a BTreeMap<String, String>>,
-) -> Option<&'a BTreeMap<String, String>> {
-    if search.is_some() {
-        return None;
-    }
-    provider_ids
+/// `(search, provider_ids, lookup_provider_ids)` returned by [`resolve_remote_search_input`].
+type ResolvedRemoteSearchInput<'a> = (
+    Option<&'a str>,
+    Option<BTreeMap<String, String>>,
+    Option<BTreeMap<String, String>>,
+);
+
+/// Parsed RemoteSearch terms: `(search, provider_ids, lookup_provider_ids)`.
+///
+/// `search` is the trimmed, non-empty `SearchInfo.Name`; `provider_ids` are the non-blank ids,
+/// which also rank the returned candidates. `lookup_provider_ids` is `Some` only when there is no
+/// usable name: a provider-id-only request performs a direct id lookup, while a name request still
+/// searches by title (for example after the administrator corrects it).
+fn resolve_remote_search_input(
+    search_info: &EmbyRemoteSearchInfo,
+) -> ResolvedRemoteSearchInput<'_> {
+    let search = search_info
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let provider_ids = search_info
+        .provider_ids
+        .iter()
+        .filter(|(key, value)| !key.trim().is_empty() && !value.trim().is_empty())
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let provider_ids = (!provider_ids.is_empty()).then_some(provider_ids);
+    let lookup_provider_ids = if search.is_none() {
+        provider_ids.clone()
+    } else {
+        None
+    };
+    (search, provider_ids, lookup_provider_ids)
 }
 
 fn provider_id_matches(
@@ -597,12 +605,45 @@ mod tests {
     }
 
     #[test]
-    fn provider_ids_are_a_direct_lookup_only_without_a_name() {
+    fn remote_search_input_separates_name_queries_from_id_lookups() {
         let mut ids = BTreeMap::new();
         ids.insert("Tmdb".to_owned(), "550".to_owned());
-        assert!(direct_provider_ids(Some("Fight Club"), Some(&ids)).is_none());
-        assert_eq!(direct_provider_ids(None, Some(&ids)), Some(&ids));
-        assert!(direct_provider_ids(None, None).is_none());
+
+        // A name plus provider ids stays a name search; the ids only rank the candidates.
+        let with_name = EmbyRemoteSearchInfo {
+            name: Some("  Fight Club  ".to_owned()),
+            provider_ids: ids.clone(),
+            ..Default::default()
+        };
+        let (search, provider_ids, lookup_provider_ids) = resolve_remote_search_input(&with_name);
+        assert_eq!(search, Some("Fight Club"));
+        assert_eq!(provider_ids.as_ref(), Some(&ids));
+        assert!(lookup_provider_ids.is_none());
+
+        // Without a name the ids become the direct lookup key.
+        let provider_only = EmbyRemoteSearchInfo {
+            provider_ids: ids.clone(),
+            ..Default::default()
+        };
+        let (search, provider_ids, lookup_provider_ids) =
+            resolve_remote_search_input(&provider_only);
+        assert_eq!(search, None);
+        assert_eq!(provider_ids.as_ref(), Some(&ids));
+        assert_eq!(lookup_provider_ids.as_ref(), Some(&ids));
+
+        // A blank name and blank provider ids carry no search terms; the handler rejects them.
+        let empty = EmbyRemoteSearchInfo {
+            name: Some("   ".to_owned()),
+            provider_ids: BTreeMap::from([
+                ("Tmdb".to_owned(), "   ".to_owned()),
+                (String::new(), "550".to_owned()),
+            ]),
+            ..Default::default()
+        };
+        let (search, provider_ids, lookup_provider_ids) = resolve_remote_search_input(&empty);
+        assert_eq!(search, None);
+        assert!(provider_ids.is_none());
+        assert!(lookup_provider_ids.is_none());
     }
 
     #[test]

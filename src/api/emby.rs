@@ -9,10 +9,11 @@ pub(super) const NORMALIZED_CREDENTIAL_HEADER: &str = "x-lux-internal-emby-crede
 const EMBY_REMOTE_SEARCH_BODY_BYTES: usize = 64 * 1024;
 
 /// Transport limit for Emby image uploads. Clients may send either the raw image or a Base64 text
-/// body, so the route limit leaves room for the 4/3 encoding expansion plus line breaks; the image
-/// services still enforce the decoded 5 MiB item/cover limit (and answer 413 when it is exceeded).
+/// body, so the route limit leaves room for the 4/3 encoding expansion plus 76-column CRLF line
+/// breaks; the image services still enforce the decoded 5 MiB item/cover limit (and answer 413
+/// when it is exceeded).
 const EMBY_IMAGE_UPLOAD_BODY_BYTES: usize =
-    crate::application::images::MAX_MANUAL_ITEM_IMAGE_BYTES as usize * 4 / 3 + 64 * 1024;
+    crate::application::images::MAX_MANUAL_ITEM_IMAGE_BYTES as usize * 4 / 3 + 256 * 1024;
 
 struct EmbyRouteBuilder {
     router: Router<ReadyAppState>,

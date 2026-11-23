@@ -1248,7 +1248,8 @@ pub(super) async fn emby_user(
 /// GET /Users/Me: the authenticated user, in exactly the shape `GET /Users/{Id}` returns.
 ///
 /// Emby clients (and Yamby) resolve the signed-in account through this alias instead of caching
-/// the user id from the login response. A disabled account answers 404 like the by-id route.
+/// the user id from the login response. Disabled accounts are rejected during token resolution
+/// (401), so the disabled check below is only a defensive fallback.
 pub(super) async fn emby_current_user(
     headers: HeaderMap,
     Query(query): Query<EmbyTokenQuery>,

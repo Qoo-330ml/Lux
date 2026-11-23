@@ -667,3 +667,104 @@ async fn item_image_upload_body_limit_covers_base64_expansion()
     assert_eq!(served.bytes().await?.as_ref(), jpeg);
     Ok(())
 }
+
+#[tokio::test]
+async fn indexed_backdrop_upload_replaces_the_requested_slot()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture().await?;
+    let client = test_client();
+    let item_id = fixture.public_item_id.as_str();
+    let backdrop_url = format!(
+        "{base_url}/emby/Items/{item_id}/Images/Backdrop",
+        base_url = fixture.base_url
+    );
+
+    // No-index backdrop uploads append index 0 and then index 1.
+    for (body, content_type) in [(PNG_1X1, "image/png"), (JPEG_1X1, "image/jpeg")] {
+        let response = client
+            .post(&backdrop_url)
+            .query(&[("api_key", fixture.key.as_str())])
+            .header("Content-Type", content_type)
+            .body(body.to_vec())
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+    let first = client
+        .get(format!("{backdrop_url}/0"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(first.bytes().await?.as_ref(), PNG_1X1);
+    let second = client
+        .get(format!("{backdrop_url}/1"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(second.bytes().await?.as_ref(), JPEG_1X1);
+
+    // Backdrop/0 replaces the first slot in place: index 1 is untouched and no index 2 appears.
+    let mut replacement = PNG_1X1.to_vec();
+    replacement.push(0);
+    let replaced = client
+        .post(format!("{backdrop_url}/0"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .header("Content-Type", "image/png")
+        .body(replacement.clone())
+        .send()
+        .await?;
+    assert_eq!(replaced.status(), StatusCode::NO_CONTENT);
+
+    let first = client
+        .get(format!("{backdrop_url}/0"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(first.bytes().await?.as_ref(), replacement.as_slice());
+    let second = client
+        .get(format!("{backdrop_url}/1"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(second.bytes().await?.as_ref(), JPEG_1X1);
+    let absent = client
+        .get(format!("{backdrop_url}/2"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+
+    // Single-slot types have no index 1, for media items as well as library covers and person ids;
+    // the rule is checked before the target is resolved.
+    let library_id: String = sqlx::query_scalar("SELECT id FROM libraries LIMIT 1")
+        .fetch_one(fixture.database.pool())
+        .await?;
+    for target in [
+        format!(
+            "{base_url}/emby/Items/{item_id}/Images/Primary/1",
+            base_url = fixture.base_url
+        ),
+        format!(
+            "{base_url}/emby/Items/{library_id}/Images/Primary/1",
+            base_url = fixture.base_url
+        ),
+        format!(
+            "{base_url}/emby/Items/104/Images/Primary/1",
+            base_url = fixture.base_url
+        ),
+    ] {
+        let response = client
+            .post(&target)
+            .query(&[("api_key", fixture.key.as_str())])
+            .header("Content-Type", "image/png")
+            .body(PNG_1X1)
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{target}");
+    }
+    Ok(())
+}

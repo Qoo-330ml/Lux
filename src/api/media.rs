@@ -3000,6 +3000,67 @@ pub(super) async fn emby_update_person_or_library_image(
     State(state): State<ReadyAppState>,
     body: Bytes,
 ) -> Response {
+    update_emby_person_or_library_image(headers, item_id, image_type, None, query, state, body)
+        .await
+}
+
+/// `POST /Items/{item_id}/Images/{image_type}/{image_index}`: the indexed spelling of the image
+/// upload route.
+///
+/// Emby clients append `/0` to the same upload endpoint. The index is validated before the shared
+/// handler runs: single-slot types only have index 0 (so `Primary/1` is a missing image, 404),
+/// while fanart accepts `0..=MAX_MANUAL_IMAGE_INDEX` and replaces that slot in place instead of
+/// appending. Malformed and negative indices are rejected as 400.
+pub(super) async fn emby_update_person_or_library_image_at_index(
+    headers: HeaderMap,
+    Path((item_id, image_type, image_index)): Path<(String, String, String)>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<ReadyAppState>,
+    body: Bytes,
+) -> Response {
+    let Ok(image_index) = image_index.trim().parse::<i64>() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if let Err(status) = validate_emby_image_upload_index(&image_type, image_index) {
+        return status.into_response();
+    }
+    update_emby_person_or_library_image(
+        headers,
+        item_id,
+        image_type,
+        Some(image_index),
+        query,
+        state,
+        body,
+    )
+    .await
+}
+
+fn validate_emby_image_upload_index(image_type: &str, image_index: i64) -> Result<(), StatusCode> {
+    if image_index < 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    match normalize_image_type(image_type) {
+        Some("FANART") if image_index > crate::application::images::MAX_MANUAL_IMAGE_INDEX => {
+            Err(StatusCode::BAD_REQUEST)
+        }
+        Some("FANART") => Ok(()),
+        // Every other image type has a single slot at index 0, so an out-of-range index names no
+        // image; GET on the same path answers the same way.
+        _ if image_index > 0 => Err(StatusCode::NOT_FOUND),
+        _ => Ok(()),
+    }
+}
+
+async fn update_emby_person_or_library_image(
+    headers: HeaderMap,
+    item_id: String,
+    image_type: String,
+    target_index: Option<i64>,
+    query: EmbyTokenQuery,
+    state: ReadyAppState,
+    body: Bytes,
+) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
             Ok(principal) => principal,
@@ -3022,7 +3083,10 @@ pub(super) async fn emby_update_person_or_library_image(
             .is_some()
     {
         // A library holds exactly one cover, so the POSTER contract stays stricter than the media
-        // item one; the Web admin uploads covers through this same Emby-compatible route.
+        // item one. This branch only accepts a raw image body whose Content-Type names the image
+        // format (the Web admin uploads through `PUT /api/v1/admin/libraries/{library_id}/cover`,
+        // which Base64-encodes client-side); Base64 text is decoded only on the media item branch.
+        // The 413 below reflects `TooLarge`; other cover validation failures stay 400.
         if mapped_type != Some("POSTER") {
             return StatusCode::NOT_FOUND.into_response();
         }
@@ -3108,7 +3172,13 @@ pub(super) async fn emby_update_person_or_library_image(
         Err(status) => return status.into_response(),
     };
     match images
-        .upload_item_image(&internal_item_id, mapped_type, content_type, &image_bytes)
+        .upload_item_image_with_index(
+            &internal_item_id,
+            mapped_type,
+            target_index,
+            content_type,
+            &image_bytes,
+        )
         .await
     {
         Ok(report) => {
@@ -3130,35 +3200,6 @@ pub(super) async fn emby_update_person_or_library_image(
         }
         Err(error) => emby_item_image_write_error(error),
     }
-}
-
-/// `POST /Items/{item_id}/Images/{image_type}/{image_index}`: the indexed spelling of the image
-/// upload route.
-///
-/// Emby clients append `/0` to the same upload endpoint. The index is validated but cannot select
-/// a write slot: Primary/Logo/... replace their single slot and Backdrop/Fanart append, so the
-/// writer always chooses the slot. Malformed and negative indices are still rejected as 400.
-pub(super) async fn emby_update_person_or_library_image_at_index(
-    headers: HeaderMap,
-    Path((item_id, image_type, image_index)): Path<(String, String, String)>,
-    Query(query): Query<EmbyTokenQuery>,
-    State(state): State<ReadyAppState>,
-    body: Bytes,
-) -> Response {
-    let Ok(image_index) = image_index.trim().parse::<i64>() else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    if image_index < 0 {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    emby_update_person_or_library_image(
-        headers,
-        Path((item_id, image_type)),
-        Query(query),
-        State(state),
-        body,
-    )
-    .await
 }
 
 /// Decodes an Emby image upload body: raw image bytes or a Base64 text body.
