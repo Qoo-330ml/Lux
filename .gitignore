@@ -24,6 +24,10 @@
 *.key
 .DS_Store
 
+# Python bytecode from the repository scripts and tools
+__pycache__/
+*.pyc
+
 # Local tool caches and build artifacts (never part of a commit)
 /.pnpm-store/
 /.pnpm/
