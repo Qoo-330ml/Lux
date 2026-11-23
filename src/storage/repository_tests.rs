@@ -12060,11 +12060,6 @@ async fn catalog_sort_expression_indexes_cover_default_sorting()
             "idx_media_items_library_sortname_sort",
         ),
         (
-            CatalogSort::DateCreated,
-            true,
-            "idx_media_items_library_added_sort",
-        ),
-        (
             CatalogSort::PremiereDate,
             true,
             "idx_media_items_library_premiere_sort",
@@ -12126,6 +12121,50 @@ async fn catalog_sort_expression_indexes_cover_default_sorting()
             "{sort_by:?} still scans media_items: {joined}"
         );
     }
+
+    // DateCreated rolls a series up to its newest available episode, so no plain `added_at` index
+    // can serve it: the expression is a per-row subquery, which SQLite rejects in an index. The
+    // authoritative page therefore sorts this one sort key; the served library page reads the
+    // derived read model, whose page is covered by `idx_catalog_items_recent_sort_added`.
+    let date_filter = CatalogFilterQuery {
+        library_ids: &library_ids,
+        user_id: "index-plan-user",
+        item_types: &item_types,
+        excluded_item_types: &empty,
+        item_ids: None,
+        person_id: None,
+        media_source_ids: None,
+        provider_id_equals: None,
+        years: &empty_years,
+        genre_keys: &[],
+        studio_keys: &[],
+        is_played: None,
+        is_favorite: None,
+        is_resumable: None,
+        min_date_last_saved: None,
+        metadata_pending: false,
+        parent_id_scope: None,
+        content_restrictions: None,
+        sort_by: CatalogSort::DateCreated,
+        descending: true,
+        offset: 0,
+        limit: 24,
+        include_total: true,
+    };
+    let date_plan = database
+        .explain_filtered_catalog_rows(&date_filter, crate::storage::CatalogRowProjection::Full)
+        .await?;
+    let date_joined = date_plan.join("\n");
+    assert!(
+        !date_joined.contains("idx_media_items_library_added_sort"),
+        "DateCreated no longer orders by a plain added_at: {date_joined}"
+    );
+    assert!(
+        date_plan
+            .iter()
+            .any(|line| line.contains("SCAN mi") || line.contains("SEARCH mi")),
+        "DateCreated must read the catalog rows it orders: {date_joined}"
+    );
 
     database.close().await;
     Ok(())
@@ -23841,6 +23880,82 @@ async fn catalog_read_model_shadow_matches_the_legacy_default_list()
     assert_eq!(
         recent_ids,
         vec!["shadow-c".to_owned(), "shadow-a".to_owned()]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_read_model_recent_sort_uses_the_newest_available_episode_of_a_series()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind) VALUES ('recent-series-lib', 'TV', 'SERIES')",
+    )
+    .execute(database.pool())
+    .await?;
+    // The series row itself is the oldest item; its newest available episode is the youngest.
+    for (id, item_type, series_id, added_at, has_source, removed) in [
+        ("rs-series", "SERIES", None, 100_i64, 0_i64, false),
+        ("rs-movie", "MOVIE", None, 300, 1, false),
+        (
+            "rs-episode-new",
+            "EPISODE",
+            Some("rs-series"),
+            500,
+            1,
+            false,
+        ),
+        (
+            "rs-episode-removed",
+            "EPISODE",
+            Some("rs-series"),
+            900,
+            1,
+            true,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, series_id, title, sort_title, identification_status,
+                 has_available_source, added_at, removed_at
+             ) VALUES (?, 'recent-series-lib', ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(item_type)
+        .bind(series_id)
+        .bind(id)
+        .bind(id)
+        .bind(has_source)
+        .bind(added_at)
+        .bind(removed.then_some(1_i64))
+        .execute(database.pool())
+        .await?;
+    }
+    database.rebuild_catalog_items_batch(None, 100).await?;
+
+    let empty_types: Vec<String> = Vec::new();
+    let (ids, _) = database
+        .shadow_catalog_library_page(&ReadModelPageQuery {
+            library_id: "recent-series-lib",
+            item_types: &empty_types,
+            excluded_item_types: &empty_types,
+            sort: ReadModelSort::EffectiveAddedAt,
+            descending: true,
+            offset: 0,
+            limit: 10,
+            include_total: true,
+        })
+        .await?;
+    let position = |item_id: &str| ids.iter().position(|id| id == item_id);
+    assert!(
+        position("rs-series") < position("rs-movie"),
+        "a series updated by a newer episode must outrank a movie added after the series: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"rs-episode-removed".to_owned()),
+        "a removed episode must stay hidden: {ids:?}"
     );
     Ok(())
 }
