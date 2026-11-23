@@ -441,13 +441,24 @@ async fn item_image_upload_accepts_raw_and_base64_bodies() -> Result<(), Box<dyn
     assert_eq!(primary.headers()["content-type"], "image/png");
     assert_eq!(primary.bytes().await?.as_ref(), PNG_1X1);
 
+    // The indexed spelling resolves to a three-segment path extractor, so `/0` must reach the
+    // handler instead of failing route extraction with a 500.
+    let indexed_primary_upload = client
+        .post(format!("{primary_url}/0"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .header("Content-Type", "image/png")
+        .body(PNG_1X1)
+        .send()
+        .await?;
+    assert_eq!(indexed_primary_upload.status(), StatusCode::NO_CONTENT);
+
     // Standard clients may send the image as a Base64 text body with a non-image content type.
     let backdrop_url = format!(
         "{base_url}/emby/Items/{item_id}/Images/Backdrop",
         base_url = fixture.base_url
     );
     let encoded_upload = client
-        .post(&backdrop_url)
+        .post(format!("{backdrop_url}/0"))
         .query(&[("api_key", fixture.key.as_str())])
         .header("Content-Type", "text/plain; charset=utf-8")
         .body(BASE64.encode(JPEG_1X1))
@@ -463,6 +474,22 @@ async fn item_image_upload_accepts_raw_and_base64_bodies() -> Result<(), Box<dyn
     assert_eq!(backdrop.status(), StatusCode::OK);
     assert_eq!(backdrop.headers()["content-type"], "image/jpeg");
     assert_eq!(backdrop.bytes().await?.as_ref(), JPEG_1X1);
+
+    // A malformed or negative index is a client error, never a server error.
+    for image_index in ["abc", "-1"] {
+        let invalid_index = client
+            .post(format!("{primary_url}/{image_index}"))
+            .query(&[("api_key", fixture.key.as_str())])
+            .header("Content-Type", "image/png")
+            .body(PNG_1X1)
+            .send()
+            .await?;
+        assert_eq!(
+            invalid_index.status(),
+            StatusCode::BAD_REQUEST,
+            "{image_index}"
+        );
+    }
 
     // Non-administrators cannot replace item artwork.
     let token = viewer_token(&fixture.base_url, &fixture.database).await?;
@@ -536,6 +563,23 @@ async fn remote_search_accepts_provider_ids_without_a_name()
         .await?;
     assert_eq!(provider_only.status(), StatusCode::CONFLICT);
 
+    // A name plus provider ids stays a name search; the ids only rank the results. Without a
+    // scraper it reports the same configuration gap, never a validation error.
+    let name_and_provider_ids = client
+        .post(&search_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .json(&json!({
+            "ItemId": fixture.public_item_id,
+            "SearchInfo": {
+                "Name": "Admin Media",
+                "ProviderIds": { "Tmdb": "550" },
+                "Year": 2020
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(name_and_provider_ids.status(), StatusCode::CONFLICT);
+
     // A blank name and blank provider ids carry no search terms at all.
     let empty_terms = client
         .post(&search_url)
@@ -579,5 +623,47 @@ async fn current_user_returns_the_authenticated_account() -> Result<(), Box<dyn 
         .send()
         .await?;
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn item_image_upload_body_limit_covers_base64_expansion()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture().await?;
+    let client = test_client();
+    let item_id = fixture.public_item_id.as_str();
+    let primary_url = format!(
+        "{base_url}/emby/Items/{item_id}/Images/Primary",
+        base_url = fixture.base_url
+    );
+
+    // A 4 MiB JPEG is under the 5 MiB decoded limit, but its Base64 text body is larger than the
+    // old route limit. The transport limit must admit it and the writer still accepts the pixels.
+    let mut jpeg = Vec::with_capacity(4 * 1024 * 1024 + 5);
+    jpeg.extend_from_slice(&[0xff, 0xd8, 0xff]);
+    jpeg.resize(4 * 1024 * 1024, 0);
+    jpeg.extend_from_slice(&[0xff, 0xd9]);
+    let encoded = BASE64.encode(&jpeg);
+    assert!(
+        encoded.len() as u64 > luxd::application::images::MAX_MANUAL_ITEM_IMAGE_BYTES,
+        "the encoded body must exceed the decoded route limit"
+    );
+
+    let upload = client
+        .post(&primary_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .body(encoded)
+        .send()
+        .await?;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let served = client
+        .get(&primary_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(served.status(), StatusCode::OK);
+    assert_eq!(served.bytes().await?.as_ref(), jpeg);
     Ok(())
 }

@@ -3038,9 +3038,12 @@ pub(super) async fn emby_update_person_or_library_image(
             Ok(_) => StatusCode::NO_CONTENT.into_response(),
             Err(
                 LibraryCoverError::UnsupportedContentType(_)
-                | LibraryCoverError::InvalidContent { .. }
-                | LibraryCoverError::TooLarge { .. },
+                | LibraryCoverError::InvalidContent { .. },
             ) => StatusCode::BAD_REQUEST.into_response(),
+            // The route admits Base64-expanded bodies, so the decoded cover size is enforced here.
+            Err(LibraryCoverError::TooLarge { .. }) => {
+                StatusCode::PAYLOAD_TOO_LARGE.into_response()
+            }
             Err(LibraryCoverError::LibraryNotFound) => StatusCode::NOT_FOUND.into_response(),
             Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         };
@@ -3127,6 +3130,35 @@ pub(super) async fn emby_update_person_or_library_image(
         }
         Err(error) => emby_item_image_write_error(error),
     }
+}
+
+/// `POST /Items/{item_id}/Images/{image_type}/{image_index}`: the indexed spelling of the image
+/// upload route.
+///
+/// Emby clients append `/0` to the same upload endpoint. The index is validated but cannot select
+/// a write slot: Primary/Logo/... replace their single slot and Backdrop/Fanart append, so the
+/// writer always chooses the slot. Malformed and negative indices are still rejected as 400.
+pub(super) async fn emby_update_person_or_library_image_at_index(
+    headers: HeaderMap,
+    Path((item_id, image_type, image_index)): Path<(String, String, String)>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<ReadyAppState>,
+    body: Bytes,
+) -> Response {
+    let Ok(image_index) = image_index.trim().parse::<i64>() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if image_index < 0 {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    emby_update_person_or_library_image(
+        headers,
+        Path((item_id, image_type)),
+        Query(query),
+        State(state),
+        body,
+    )
+    .await
 }
 
 /// Decodes an Emby image upload body: raw image bytes or a Base64 text body.

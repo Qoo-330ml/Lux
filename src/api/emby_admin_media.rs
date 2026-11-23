@@ -111,13 +111,17 @@ pub(super) async fn emby_remote_search(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let provider_ids = (!provider_ids.is_empty()).then_some(provider_ids);
+    // Only a provider-id-only request is a direct id lookup. When the client sends a name, the
+    // administrator is searching by title (for example after correcting it), so the ids must not
+    // replace the name query; they still rank the returned candidates below.
+    let lookup_provider_ids = direct_provider_ids(search, provider_ids.as_ref());
     let reidentify = state.metadata_reidentify();
     let page = match reidentify
         .search_item_candidates_with_provider_ids(
             &item_id,
             search,
             search_info.year,
-            provider_ids.as_ref(),
+            lookup_provider_ids,
         )
         .await
     {
@@ -137,6 +141,17 @@ pub(super) async fn emby_remote_search(
         .map(remote_search_result_json)
         .collect::<Vec<_>>();
     Json(results).into_response()
+}
+
+/// Provider ids used as a direct-lookup key: only when the request has no usable name.
+fn direct_provider_ids<'a>(
+    search: Option<&str>,
+    provider_ids: Option<&'a BTreeMap<String, String>>,
+) -> Option<&'a BTreeMap<String, String>> {
+    if search.is_some() {
+        return None;
+    }
+    provider_ids
 }
 
 fn provider_id_matches(
@@ -579,6 +594,15 @@ mod tests {
         assert_eq!(stored_image_types("Backdrop"), ["BACKDROP", "FANART"]);
         assert_eq!(stored_image_types("Primary"), ["POSTER"]);
         assert!(stored_image_types("Nope").is_empty());
+    }
+
+    #[test]
+    fn provider_ids_are_a_direct_lookup_only_without_a_name() {
+        let mut ids = BTreeMap::new();
+        ids.insert("Tmdb".to_owned(), "550".to_owned());
+        assert!(direct_provider_ids(Some("Fight Club"), Some(&ids)).is_none());
+        assert_eq!(direct_provider_ids(None, Some(&ids)), Some(&ids));
+        assert!(direct_provider_ids(None, None).is_none());
     }
 
     #[test]
