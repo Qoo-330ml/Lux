@@ -98,13 +98,27 @@ pub(super) async fn emby_remote_search(
         .name
         .as_deref()
         .map(str::trim)
-        .unwrap_or_default();
-    if search.is_empty() {
+        .filter(|name| !name.is_empty());
+    // Provider ids are an alternative search key: a client that already knows the TMDb/IMDb id can
+    // ask for the match directly, without a name. Blank ids are dropped so they cannot turn an
+    // otherwise empty request into a search.
+    let provider_ids = search_info
+        .provider_ids
+        .into_iter()
+        .filter(|(key, value)| !key.trim().is_empty() && !value.trim().is_empty())
+        .collect::<BTreeMap<_, _>>();
+    if search.is_none() && provider_ids.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let provider_ids = (!provider_ids.is_empty()).then_some(provider_ids);
     let reidentify = state.metadata_reidentify();
     let page = match reidentify
-        .search_item_candidates(&item_id, search, search_info.year)
+        .search_item_candidates_with_provider_ids(
+            &item_id,
+            search,
+            search_info.year,
+            provider_ids.as_ref(),
+        )
         .await
     {
         Ok(page) => page,
@@ -116,7 +130,7 @@ pub(super) async fn emby_remote_search(
     let (preferred, rest): (Vec<_>, Vec<_>) = page
         .items
         .iter()
-        .partition(|candidate| provider_id_matches(candidate, &search_info.provider_ids));
+        .partition(|candidate| provider_id_matches(candidate, provider_ids.as_ref()));
     let results = preferred
         .into_iter()
         .chain(rest)
@@ -127,13 +141,15 @@ pub(super) async fn emby_remote_search(
 
 fn provider_id_matches(
     candidate: &crate::application::candidates::MetadataCandidateView,
-    provider_ids: &BTreeMap<String, String>,
+    provider_ids: Option<&BTreeMap<String, String>>,
 ) -> bool {
     let candidate_id = candidate.provider_id.trim();
     !candidate_id.is_empty()
-        && provider_ids.values().any(|value| {
-            let value = value.trim();
-            !value.is_empty() && value.eq_ignore_ascii_case(candidate_id)
+        && provider_ids.is_some_and(|provider_ids| {
+            provider_ids.values().any(|value| {
+                let value = value.trim();
+                !value.is_empty() && value.eq_ignore_ascii_case(candidate_id)
+            })
         })
 }
 
@@ -570,8 +586,9 @@ mod tests {
         let candidate = candidate();
         let mut ids = BTreeMap::new();
         ids.insert("Tmdb".to_owned(), "550".to_owned());
-        assert!(provider_id_matches(&candidate, &ids));
+        assert!(provider_id_matches(&candidate, Some(&ids)));
+        assert!(!provider_id_matches(&candidate, None));
         ids.insert("Tmdb".to_owned(), "551".to_owned());
-        assert!(!provider_id_matches(&candidate, &ids));
+        assert!(!provider_id_matches(&candidate, Some(&ids)));
     }
 }
