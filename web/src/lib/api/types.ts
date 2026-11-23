@@ -307,6 +307,7 @@ export type MediaItem = {
   productionYear?: number | null;
   rating?: number | null;
   ratingSource?: string | null;
+  genres?: string[];
   providerIds?: Record<string, string> | null;
   seasonCount?: number | null;
   episodeCount?: number | null;

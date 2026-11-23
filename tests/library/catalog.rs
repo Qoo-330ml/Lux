@@ -2714,3 +2714,132 @@ async fn lux_item_detail_exposes_local_file_path_only_to_authorized_viewers()
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn home_carousel_includes_genres_from_nfo_cache() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let _admin = setup.complete("Admin", "Admin", "correct password").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let alpha_dir = root.join("Alpha Movie (2020)");
+    let beta_dir = root.join("Beta Movie (2021)");
+    tokio::fs::create_dir_all(&alpha_dir).await?;
+    tokio::fs::create_dir_all(&beta_dir).await?;
+    tokio::fs::write(alpha_dir.join("Alpha.Movie.2020.mkv"), b"alpha").await?;
+    tokio::fs::write(beta_dir.join("Beta.Movie.2021.mkv"), b"beta").await?;
+    tokio::fs::write(
+        alpha_dir.join("Alpha.Movie.2020.nfo"),
+        r#"<movie>
+  <title>Alpha Movie</title>
+  <year>2020</year>
+  <genre>动作</genre>
+  <genre>科幻</genre>
+</movie>"#
+            .as_bytes(),
+    )
+    .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    MetadataEnricher::new(database.clone())
+        .with_nfo_store(LocalNfoMetadataStore::new(database.clone()))
+        .enrich_movie_library(library.id)
+        .await?;
+
+    let alpha_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE title = 'Alpha Movie'")
+            .fetch_one(database.pool())
+            .await?;
+
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let cookies = format!(
+        "lux_session={}; lux_csrf={}",
+        cookie_value(login.headers(), "lux_session"),
+        cookie_value(login.headers(), "lux_csrf")
+    );
+
+    let carousel = client
+        .get(format!("{base_url}/api/v1/home/carousel"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(carousel.status(), reqwest::StatusCode::OK);
+    let carousel_body: Value = carousel.json().await?;
+    let recommended = carousel_body["recommended"]
+        .as_array()
+        .ok_or("recommended must be an array")?;
+    assert_eq!(recommended.len(), 2);
+    let alpha = recommended
+        .iter()
+        .find(|item| item["title"] == "Alpha Movie")
+        .ok_or("Alpha Movie missing from carousel")?;
+    let beta = recommended
+        .iter()
+        .find(|item| item["title"] == "Beta Movie")
+        .ok_or("Beta Movie missing from carousel")?;
+    assert_eq!(alpha["genres"], json!(["动作", "科幻"]));
+    assert_eq!(beta["genres"], json!([]));
+
+    // Malformed cached NFO JSON must degrade gracefully without failing the carousel endpoint.
+    sqlx::query(
+        "UPDATE media_item_nfo_cache
+         SET json = ?, bytes = length(CAST(? AS BLOB)), updated_at = updated_at + 1
+         WHERE item_id = ?",
+    )
+    .bind("{not-valid-json")
+    .bind("{not-valid-json")
+    .bind(&alpha_id)
+    .execute(database.pool())
+    .await?;
+
+    let degraded = client
+        .get(format!("{base_url}/api/v1/home/carousel"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(degraded.status(), reqwest::StatusCode::OK);
+    let degraded_body: Value = degraded.json().await?;
+    let degraded_alpha = degraded_body["recommended"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["title"] == "Alpha Movie"))
+        .ok_or("Alpha Movie missing after malformed cache degradation")?;
+    assert_eq!(degraded_alpha["genres"], json!([]));
+
+    server.abort();
+    Ok(())
+}

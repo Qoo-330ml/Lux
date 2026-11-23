@@ -222,10 +222,40 @@ pub(super) async fn lux_home_carousel(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    match lux_catalog_items_json_for_user(database, &user_id, &recommended).await {
-        Ok(items) => Json(json!({ "recommended": items })).into_response(),
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    let item_ids = recommended
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    let (items_result, nfo_result) = tokio::join!(
+        lux_catalog_items_json_for_user(database, &user_id, &recommended),
+        state.local_nfo().read_items(&item_ids),
+    );
+    let mut items = match items_result {
+        Ok(items) => items,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let nfo_by_id = match nfo_result {
+        Ok(nfo_by_id) => nfo_by_id,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "derived local NFO cache is unavailable for home carousel"
+            );
+            HashMap::new()
+        }
+    };
+    for value in &mut items {
+        if let Value::Object(object) = value {
+            let genres = object
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| nfo_by_id.get(id))
+                .map(|details| details.genres.as_slice())
+                .unwrap_or(&[]);
+            object.insert("genres".to_owned(), json!(genres));
+        }
     }
+    Json(json!({ "recommended": items })).into_response()
 }
 
 pub(super) async fn lux_list_home_library_latest(
