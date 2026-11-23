@@ -2,6 +2,16 @@ import type { ChangelogRelease } from "../types";
 
 export const changelogReleases07: ChangelogRelease[] = [
   {
+    version: "0.7.24",
+    date: "2026-11-23",
+    sections: [
+      { kind: "added", items: [
+        "✨ feat(catalog): 「最近添加」按剧集的最新可播放分集排序 — 剧集新增分集后会回到媒体库列表最前，已移除或没有可用文件的分集不参与；电影、季和分集仍按自身入库时间，Lux 与 Emby 用同一语义。迁移 0252 增加排序列与索引并回填，升级后读模型会自动重建。",
+        "✨ feat(home): 首页轮播条目带上 genres — /api/v1/home/carousel 的每个推荐条目新增 genres 数组，取自本地 NFO；没有 NFO 或读取失败时是空数组，其它字段不变。Web 类型同步，页面暂时还没用。",
+      ] },
+    ],
+  },
+  {
     version: "0.7.23",
     date: "2026-11-18",
     sections: [
