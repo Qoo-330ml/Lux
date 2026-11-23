@@ -503,35 +503,8 @@ pub(super) async fn emby_run_scheduled_task(
 /// Queues one library-wide reconciliation job per enabled library, reusing an active job when the
 /// library already has one.
 async fn queue_all_library_scans(state: &ReadyAppState) -> Result<Vec<Value>, StatusCode> {
-    let database = state.database();
-    let scan_jobs = state.scan_jobs();
-    let library_ids = database
-        .list_enabled_library_ids()
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let mut jobs = Vec::with_capacity(library_ids.len());
-    for library_id in library_ids {
-        let Ok(library_id) = library_id.parse::<crate::domain::ids::LibraryId>() else {
-            continue;
-        };
-        match scan_jobs.create_movie_scan_job(library_id).await {
-            Ok(job) => {
-                let job_id = job.id.clone();
-                jobs.push(scan_job_json(&job));
-                spawn_emby_scan_job(state, job_id);
-            }
-            Err(ScanJobError::AlreadyActive(job_id)) => {
-                match database.find_scan_job(&job_id).await {
-                    Ok(Some(job)) => jobs.push(scan_job_json_from_storage(&job)),
-                    Ok(None) => {}
-                    Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
-                }
-            }
-            Err(ScanJobError::LibraryNotFound) => {}
-            Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
-        }
-    }
-    Ok(jobs)
+    let queued = super::admin::queue_all_library_scans(state).await?;
+    Ok(queued.into_iter().map(|entry| entry.job_json).collect())
 }
 
 /// POST /Items/{itemId}/Refresh: Emby clients use this endpoint for both "scan library files"

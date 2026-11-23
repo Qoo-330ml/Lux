@@ -1588,16 +1588,19 @@ pub(super) async fn auth_update_account_profile(
     State(state): State<ReadyAppState>,
     Json(request): Json<AuthProfilePatch>,
 ) -> Response {
-    let session = match require_web_session_csrf(&headers, &state).await {
-        Ok(session) => session,
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
         Err(response) => return response,
     };
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
     let database = state.database();
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let user_id = session.user.id.to_string();
+    let user_id = user.id.to_string();
     let current_profile = match users.find_admin_profile_by_id(&user_id).await {
         Ok(Some(profile)) => profile,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
@@ -1684,12 +1687,15 @@ pub(super) async fn auth_resend_account_email_change(
     headers: HeaderMap,
     State(state): State<ReadyAppState>,
 ) -> Response {
-    let session = match require_web_session_csrf(&headers, &state).await {
-        Ok(session) => session,
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
         Err(response) => return response,
     };
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
     let database = state.database();
-    let user_id = session.user.id.to_string();
+    let user_id = user.id.to_string();
     let pending = match pending_user_email_change(
         database,
         &user_id,
@@ -1742,10 +1748,13 @@ pub(super) async fn auth_verify_account_email_change(
     State(state): State<ReadyAppState>,
     Json(request): Json<AuthAccountEmailVerificationRequest>,
 ) -> Response {
-    let session = match require_web_session_csrf(&headers, &state).await {
-        Ok(session) => session,
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
         Err(response) => return response,
     };
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
     let database = state.database();
     let Some(config_dir) = state.config_dir.as_deref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -1753,7 +1762,7 @@ pub(super) async fn auth_verify_account_email_change(
     match verify_user_email_change(
         database,
         config_dir,
-        &session.user.id.to_string(),
+        &user.id.to_string(),
         &request.token,
         super::playback::current_unix_timestamp(),
     )
@@ -2321,10 +2330,13 @@ pub(super) async fn auth_update_password(
     State(state): State<ReadyAppState>,
     Json(request): Json<AuthPasswordPatch>,
 ) -> Response {
-    let session = match require_web_session_csrf(&headers, &state).await {
-        Ok(session) => session,
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
         Err(response) => return response,
     };
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
     if request.current_password.is_empty() || request.new_password.is_empty() {
         return api_error(
             &headers,
@@ -2335,15 +2347,24 @@ pub(super) async fn auth_update_password(
         .into_response();
     }
     let auth = state.auth();
-    // Keep the caller's own session usable after the change; every other credential is revoked.
-    let keep_session_token_hash = request_cookie(&headers, "lux_session")
-        .map(|token| crate::auth::sessions::WebAuthService::session_token_hash(&token));
+    // Keep the caller's own session or client token usable after the change; every other credential is revoked.
+    let (keep_session_token_hash, keep_access_token_hash) =
+        if let Some(token) = lux_user_token_from_headers(&headers) {
+            (None, Some(EmbyAuthService::token_hash(&token)))
+        } else {
+            (
+                request_cookie(&headers, "lux_session")
+                    .map(|token| crate::auth::sessions::WebAuthService::session_token_hash(&token)),
+                None,
+            )
+        };
     match auth
         .change_password(
-            &session.user.id,
+            &user.id,
             &request.current_password,
             &request.new_password,
             keep_session_token_hash.as_deref(),
+            keep_access_token_hash.as_deref(),
         )
         .await
     {
@@ -2613,44 +2634,73 @@ pub(super) async fn auth_sessions(
     headers: HeaderMap,
     State(state): State<ReadyAppState>,
 ) -> Response {
-    let auth = state.auth();
-    let Some(session_token) = request_cookie(&headers, "lux_session") else {
-        return api_error(
-            &headers,
-            StatusCode::UNAUTHORIZED,
-            lux::ApiErrorCode::AuthenticationRequired,
-            "需要登录",
-        )
-        .into_response();
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
     };
-    let session =
-        match resolve_web_session_for_request(&headers, &state, auth, &session_token).await {
-            Ok(Some(session)) => session,
-            Ok(None) => {
-                return api_error(
-                    &headers,
-                    StatusCode::UNAUTHORIZED,
-                    lux::ApiErrorCode::AuthenticationRequired,
-                    "需要登录",
-                )
-                .into_response();
-            }
+    let auth = state.auth();
+    let emby_auth = state.emby_auth();
+    let client_token = lux_user_token_from_headers(&headers);
+    let current_web_token = if client_token.is_some() {
+        String::new()
+    } else {
+        request_cookie(&headers, "lux_session").unwrap_or_default()
+    };
+    let web_sessions = match auth.list_sessions(&user.id, &current_web_token).await {
+        Ok(sessions) => sessions,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let current_client_session_id = match client_token.as_deref() {
+        Some(token) => match emby_auth.current_login_session_id(&user.id, token).await {
+            Ok(id) => id,
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
-    match auth.list_sessions(&session.user.id, &session_token).await {
-        Ok(sessions) => Json(json!({
-            "sessions": sessions.iter().map(|session| json!({
+        },
+        None => None,
+    };
+    let (client_sessions, _) = match emby_auth
+        .list_admin_login_sessions(&user.id.to_string(), 100, 0)
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let mut sessions = web_sessions
+        .into_iter()
+        .map(|session| {
+            json!({
                 "id": session.id,
+                "sessionKind": "WEB",
+                "deviceId": Value::Null,
+                "deviceName": Value::Null,
+                "deviceType": Value::Null,
+                "clientName": Value::Null,
+                "clientVersion": Value::Null,
                 "createdAt": session.created_at,
                 "updatedAt": session.updated_at,
                 "expiresAt": session.expires_at,
                 "lastSeenAt": session.last_seen_at,
                 "isCurrent": session.is_current,
-            })).collect::<Vec<_>>()
-        }))
-        .into_response(),
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
+            })
+        })
+        .collect::<Vec<_>>();
+    sessions.extend(client_sessions.into_iter().map(|session| {
+        let is_current = current_client_session_id.as_deref() == Some(session.id.as_str());
+        json!({
+            "id": session.id,
+            "sessionKind": "CLIENT_TOKEN",
+            "deviceId": session.device_id,
+            "deviceName": session.device_name,
+            "deviceType": session.device_type,
+            "clientName": session.client_name,
+            "clientVersion": session.client_version,
+            "createdAt": session.created_at,
+            "updatedAt": session.updated_at,
+            "expiresAt": Value::Null,
+            "lastSeenAt": session.last_seen_at,
+            "isCurrent": is_current,
+        })
+    }));
+    Json(json!({ "sessions": sessions })).into_response()
 }
 
 pub(super) async fn auth_revoke_session(
@@ -2658,76 +2708,63 @@ pub(super) async fn auth_revoke_session(
     Path(session_id): Path<String>,
     State(state): State<ReadyAppState>,
 ) -> Response {
-    let auth = state.auth();
-    let Some(session_token) = request_cookie(&headers, "lux_session") else {
-        return api_error(
-            &headers,
-            StatusCode::UNAUTHORIZED,
-            lux::ApiErrorCode::AuthenticationRequired,
-            "需要登录",
-        )
-        .into_response();
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
     };
-    let session =
-        match resolve_web_session_for_request(&headers, &state, auth, &session_token).await {
-            Ok(Some(session)) => session,
-            Ok(None) => {
-                return api_error(
-                    &headers,
-                    StatusCode::UNAUTHORIZED,
-                    lux::ApiErrorCode::AuthenticationRequired,
-                    "需要登录",
-                )
-                .into_response();
-            }
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
+    let auth = state.auth();
+    let emby_auth = state.emby_auth();
+    if let Some(token) = lux_user_token_from_headers(&headers) {
+        let current_id = match emby_auth.current_login_session_id(&user.id, &token).await {
+            Ok(id) => id,
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         };
-    let Some(csrf_token) = headers
-        .get("x-csrf-token")
-        .and_then(|value| value.to_str().ok())
-    else {
-        return api_error(
-            &headers,
-            StatusCode::FORBIDDEN,
-            lux::ApiErrorCode::CsrfFailed,
-            "CSRF 校验失败",
-        )
-        .into_response();
-    };
-    if !auth.verify_csrf(&session, csrf_token) {
-        return api_error(
-            &headers,
-            StatusCode::FORBIDDEN,
-            lux::ApiErrorCode::CsrfFailed,
-            "CSRF 校验失败",
-        )
-        .into_response();
+        if current_id.as_deref() == Some(session_id.as_str()) {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "不能撤销当前会话，请使用退出登录",
+            )
+            .into_response();
+        }
+    } else if let Some(session_token) = request_cookie(&headers, "lux_session") {
+        let sessions = match auth.list_sessions(&user.id, &session_token).await {
+            Ok(sessions) => sessions,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        if sessions
+            .iter()
+            .any(|entry| entry.id == session_id && entry.is_current)
+        {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "不能撤销当前会话，请使用退出登录",
+            )
+            .into_response();
+        }
     }
-    let sessions = match auth.list_sessions(&session.user.id, &session_token).await {
-        Ok(sessions) => sessions,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    if sessions
-        .iter()
-        .any(|entry| entry.id == session_id && entry.is_current)
-    {
-        return api_error(
-            &headers,
-            StatusCode::BAD_REQUEST,
-            lux::ApiErrorCode::InvalidRequest,
-            "不能撤销当前会话，请使用退出登录",
-        )
-        .into_response();
-    }
-    match auth.revoke_session(&session.user.id, &session_id).await {
+    match auth.revoke_session(&user.id, &session_id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => api_error(
-            &headers,
-            StatusCode::NOT_FOUND,
-            lux::ApiErrorCode::NotFound,
-            "会话不存在",
-        )
-        .into_response(),
+        Ok(false) => match emby_auth
+            .revoke_admin_login_session(&user.id.to_string(), &session_id)
+            .await
+        {
+            Ok(true) => StatusCode::NO_CONTENT.into_response(),
+            Ok(false) => api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "会话不存在",
+            )
+            .into_response(),
+            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        },
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }

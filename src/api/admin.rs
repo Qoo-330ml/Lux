@@ -69,7 +69,7 @@ mod admin_scheduled_tasks;
 mod admin_webhooks;
 pub(super) use admin_emby_migration::emby_migration_error;
 pub(super) use admin_jobs::{
-    AdminJobsQuery, scan_job_json, scan_job_json_from_storage, spawn_library_scan, strm_probe_error,
+    AdminJobsQuery, queue_all_library_scans, scan_job_json, spawn_library_scan, strm_probe_error,
 };
 pub(super) use admin_logs_events::{
     log_authentication_failure, playback_activity_event_type, record_activity_event,

@@ -12,6 +12,7 @@ fn scan_worker_services(
 
 pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new()
+        .route("/api/v1/admin/libraries/scan", post(admin_start_all_scans))
         .route(
             "/api/v1/admin/libraries/{library_id}/scan",
             post(admin_start_scan),
@@ -91,6 +92,100 @@ pub(super) fn api_routes() -> Router<ReadyAppState> {
             get(admin_list_job_events),
         )
         .route("/api/v1/admin/jobs", get(admin_list_jobs))
+}
+
+pub(crate) struct QueuedLibraryScan {
+    pub(crate) job_json: Value,
+    pub(crate) library_id: String,
+    pub(crate) job_id: String,
+    pub(crate) job_type: String,
+    pub(crate) newly_created: bool,
+}
+
+/// Queues one library-wide reconciliation job per enabled library, reusing an active job when the
+/// library already has one.
+pub(crate) async fn queue_all_library_scans(
+    state: &ReadyAppState,
+) -> Result<Vec<QueuedLibraryScan>, StatusCode> {
+    let database = state.database();
+    let scan_jobs = state.scan_jobs();
+    let library_ids = database
+        .list_enabled_library_ids()
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let mut queued = Vec::with_capacity(library_ids.len());
+    for library_id in library_ids {
+        let Ok(library_id) = library_id.parse::<crate::domain::ids::LibraryId>() else {
+            continue;
+        };
+        match crate::application::admin_scan_jobs::start_movie_scan_job(
+            scan_jobs,
+            library_id,
+            scan_worker_services(state),
+        )
+        .await
+        {
+            Ok(job) => queued.push(QueuedLibraryScan {
+                job_json: scan_job_json(&job),
+                library_id: job.library_id.clone(),
+                job_id: job.id.clone(),
+                job_type: job.job_type.clone(),
+                newly_created: true,
+            }),
+            Err(ScanJobError::AlreadyActive(job_id)) => {
+                match database.find_scan_job(&job_id).await {
+                    Ok(Some(job)) => queued.push(QueuedLibraryScan {
+                        job_json: scan_job_json_from_storage(&job),
+                        library_id: job.library_id.clone(),
+                        job_id: job.id.clone(),
+                        job_type: job.job_type.clone(),
+                        newly_created: false,
+                    }),
+                    Ok(None) => {}
+                    Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+                }
+            }
+            Err(ScanJobError::LibraryNotFound) => {}
+            Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+        }
+    }
+    Ok(queued)
+}
+
+pub(crate) async fn admin_start_all_scans(
+    headers: HeaderMap,
+    State(state): State<ReadyAppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let queued = match queue_all_library_scans(&state).await {
+        Ok(queued) => queued,
+        Err(status) => return status.into_response(),
+    };
+    for entry in queued.iter().filter(|entry| entry.newly_created) {
+        record_audit_event(
+            &state,
+            &headers,
+            "SCAN_STARTED",
+            Some("scan_job"),
+            Some(&entry.job_id),
+            &json!({"libraryId": entry.library_id, "jobType": entry.job_type}).to_string(),
+        )
+        .await;
+    }
+    let jobs = queued
+        .into_iter()
+        .map(|entry| entry.job_json)
+        .collect::<Vec<_>>();
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "scope": "ALL",
+            "jobs": jobs,
+        })),
+    )
+        .into_response()
 }
 
 pub(crate) async fn admin_start_scan(

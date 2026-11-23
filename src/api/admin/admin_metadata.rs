@@ -38,8 +38,12 @@ pub(super) fn api_routes() -> Router<ReadyAppState> {
             get(admin_list_item_images),
         )
         .route(
-            "/api/v1/admin/items/{item_id}/images/{image_id}",
-            delete(admin_delete_item_image),
+            "/api/v1/admin/items/{item_id}/images/{image_type}",
+            put(admin_upload_item_image)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    crate::application::images::MAX_MANUAL_ITEM_IMAGE_BYTES as usize,
+                ))
+                .delete(admin_delete_item_image),
         )
         .route(
             "/api/v1/admin/libraries/{library_id}/refresh-local-metadata",
@@ -71,8 +75,11 @@ pub(crate) struct MetadataCandidateQuery {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MetadataCandidateSearchRequest {
-    pub(crate) query: String,
+    #[serde(default)]
+    pub(crate) query: Option<String>,
     pub(crate) year: Option<i32>,
+    #[serde(default)]
+    pub(crate) provider_ids: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -803,8 +810,14 @@ pub(crate) async fn admin_search_item_candidates(
         .into_response();
     }
     let metadata_reidentify = state.metadata_reidentify();
+    let provider_ids = (!request.provider_ids.is_empty()).then_some(&request.provider_ids);
     match metadata_reidentify
-        .search_item_candidates(&item_id, &request.query, request.year)
+        .search_item_candidates_with_provider_ids(
+            &item_id,
+            request.query.as_deref(),
+            request.year,
+            provider_ids,
+        )
         .await
     {
         Ok(page) => {
@@ -875,6 +888,55 @@ pub(crate) async fn admin_list_item_images(
             image_write_error(&headers, error)
         }
     }
+}
+
+pub(crate) async fn admin_upload_item_image(
+    headers: HeaderMap,
+    Path((item_id, image_type)): Path<(String, String)>,
+    State(state): State<ReadyAppState>,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if item_id.parse::<crate::domain::ids::ItemId>().is_err() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体条目 ID 无效",
+        )
+        .into_response();
+    }
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let images = require_service!(state.image_writes);
+    let report = match images
+        .upload_item_image(&item_id, &image_type, content_type, &body)
+        .await
+    {
+        Ok(report) => report,
+        Err(error) => return image_write_error(&headers, error),
+    };
+    let image = match images.list_item_images(&item_id).await {
+        Ok(images) => images.into_iter().find(|image| image.id == report.id),
+        Err(error) => return image_write_error(&headers, error),
+    };
+    let Some(image) = image else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    record_audit_event(
+        &state,
+        &headers,
+        "IMAGE_UPLOADED",
+        Some("item_image"),
+        Some(&image.id),
+        &json!({ "itemId": item_id, "imageType": image.image_type }).to_string(),
+    )
+    .await;
+    Json(json!({ "image": item_image_json(&item_id, &image) })).into_response()
 }
 
 pub(crate) async fn admin_delete_item_image(
@@ -1191,6 +1253,13 @@ pub(crate) fn image_write_error(headers: &HeaderMap, error: ImageWriteError) -> 
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::Internal,
             "该图片正在下载，请稍后重试",
+        )
+        .into_response(),
+        ImageWriteError::TooLarge { .. } => api_error(
+            headers,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            lux::ApiErrorCode::InvalidRequest,
+            "图片不能超过 5 MiB",
         )
         .into_response(),
         _ => api_error(

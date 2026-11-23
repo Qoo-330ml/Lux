@@ -22,15 +22,6 @@ pub(crate) async fn require_admin(
         }
         return Ok(());
     }
-    if users::lux_user_token_from_headers(headers).is_some() {
-        return Err(api_error(
-            headers,
-            StatusCode::FORBIDDEN,
-            lux::ApiErrorCode::PermissionDenied,
-            "客户端令牌不能调用管理员接口",
-        )
-        .into_response());
-    }
     let user = require_web_user(headers, state).await?;
     if !user.can_manage_server {
         return Err(api_error(

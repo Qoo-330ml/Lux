@@ -1187,6 +1187,17 @@ impl MetadataReidentifyService {
         query: &str,
         year: Option<i32>,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
+        self.search_item_candidates_with_provider_ids(item_id, Some(query), year, None)
+            .await
+    }
+
+    pub(crate) async fn search_item_candidates_with_provider_ids(
+        &self,
+        item_id: &str,
+        query: Option<&str>,
+        year: Option<i32>,
+        provider_ids: Option<&std::collections::BTreeMap<String, String>>,
+    ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
         // The search needs the item's type and metadata; read the wide row once and hand it to
         // the candidate search instead of reading kind and metadata separately
         // (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S3).
@@ -1205,15 +1216,43 @@ impl MetadataReidentifyService {
             // why instead of a generic "scraper unavailable".
             Err(error) => return Err(self.scraper_resolution_failure(&error).await),
         };
-        self.search_item_candidates_with_scrapers(item_id, query, year, &scrapers, &current)
-            .await
+        self.search_item_candidates_with_scrapers_and_provider_ids(
+            item_id,
+            query,
+            year,
+            provider_ids,
+            &scrapers,
+            &current,
+        )
+        .await
     }
 
+    #[cfg(test)]
     async fn search_item_candidates_with_scrapers(
         &self,
         item_id: &str,
         query: &str,
         year: Option<i32>,
+        scrapers: &[ResolvedScraper],
+        current: &crate::storage::StoredMediaMetadata,
+    ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
+        self.search_item_candidates_with_scrapers_and_provider_ids(
+            item_id,
+            Some(query),
+            year,
+            None,
+            scrapers,
+            current,
+        )
+        .await
+    }
+
+    async fn search_item_candidates_with_scrapers_and_provider_ids(
+        &self,
+        item_id: &str,
+        query: Option<&str>,
+        year: Option<i32>,
+        provider_ids: Option<&std::collections::BTreeMap<String, String>>,
         scrapers: &[ResolvedScraper],
         current: &crate::storage::StoredMediaMetadata,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
@@ -1246,7 +1285,14 @@ impl MetadataReidentifyService {
         for scraper in candidates {
             match self
                 .candidates
-                .search_and_store_for_current(item_id, query, year, &scraper.provider, current)
+                .search_and_store_for_current_with_provider_ids(
+                    item_id,
+                    query,
+                    year,
+                    provider_ids,
+                    &scraper.provider,
+                    current,
+                )
                 .await
             {
                 Ok(page) if !page.items.is_empty() => {
@@ -4729,6 +4775,56 @@ mod tests {
         assert!(
             matches!(error, super::MetadataCandidateError::ScraperNotConfigured),
             "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_candidate_search_with_provider_ids_skips_text_search()
+    -> Result<(), Box<dyn Error>> {
+        let (_temp_dir, _config, database, item_id) = role_test_fixture().await?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let primary = RoleRecordingAdapter::new("primary", Arc::clone(&calls));
+        let service = super::MetadataReidentifyService::new(
+            database.clone(),
+            super::ScraperProvider::from_adapter(primary.clone()),
+        );
+        let scrapers = vec![super::ResolvedScraper {
+            scraper_id: "primary".to_owned(),
+            role: LibraryScraperRole::Primary,
+            provider: super::ScraperProvider::from_adapter(primary),
+        }];
+        let current = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("fixture movie is missing")?;
+        let provider_ids =
+            std::collections::BTreeMap::from([("Primary".to_owned(), "direct-603".to_owned())]);
+
+        let page = service
+            .search_item_candidates_with_scrapers_and_provider_ids(
+                &item_id,
+                None,
+                None,
+                Some(&provider_ids),
+                &scrapers,
+                &current,
+            )
+            .await?;
+
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].provider_id, "primary-1");
+        let calls = calls
+            .lock()
+            .expect("role scraper call list should not be poisoned")
+            .clone();
+        assert!(
+            calls.iter().any(|call| call == "primary:get"),
+            "expected direct get call, got {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|call| call == "primary:search"),
+            "text search must not run when providerIds matches scraper: {calls:?}"
         );
         Ok(())
     }

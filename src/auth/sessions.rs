@@ -198,6 +198,7 @@ impl WebAuthService {
         current_password: &str,
         new_password: &str,
         keep_session_token_hash: Option<&[u8]>,
+        keep_access_token_hash: Option<&[u8]>,
     ) -> Result<bool, WebAuthError> {
         Ok(self
             .users
@@ -206,6 +207,7 @@ impl WebAuthService {
                 current_password,
                 new_password,
                 keep_session_token_hash,
+                keep_access_token_hash,
             )
             .await?)
     }
@@ -871,6 +873,7 @@ mod principal_tests {
                     &user_id.parse::<crate::domain::ids::UserId>()?,
                     "member password",
                     "changed password",
+                    None,
                     None,
                 )
                 .await?

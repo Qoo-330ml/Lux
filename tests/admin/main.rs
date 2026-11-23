@@ -2,6 +2,7 @@
 mod realtime;
 
 mod admin_api_key;
+mod admin_client_token;
 mod admin_dashboard;
 mod admin_database_diagnostics;
 mod admin_health;

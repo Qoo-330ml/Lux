@@ -43,6 +43,7 @@ use crate::{
 };
 
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+pub const MAX_MANUAL_ITEM_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 const IMAGE_DOWNLOAD_MAX_RETRIES: u32 = 2;
 const IMAGE_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const IMAGE_RETRY_MAX_DELAY: Duration = Duration::from_secs(4);
@@ -1095,6 +1096,69 @@ impl ImageWriteService {
             .await
     }
 
+    pub async fn upload_item_image(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> Result<ImageWriteReport, ImageWriteError> {
+        let image_type = normalize_image_type(image_type)
+            .ok_or_else(|| ImageWriteError::InvalidImageType(image_type.to_owned()))?;
+        let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if size > MAX_MANUAL_ITEM_IMAGE_BYTES {
+            return Err(ImageWriteError::TooLarge {
+                size,
+                max: MAX_MANUAL_ITEM_IMAGE_BYTES,
+            });
+        }
+        let detected = match image::guess_format(bytes).ok() {
+            Some(image::ImageFormat::Jpeg) => ImageFormat::Jpeg,
+            Some(image::ImageFormat::Png) => ImageFormat::Png,
+            Some(image::ImageFormat::WebP) => ImageFormat::Webp,
+            _ => {
+                return Err(ImageWriteError::UnsupportedContentType {
+                    content_type: "invalid".to_owned(),
+                });
+            }
+        };
+        let requested_content_type = content_type
+            .split(';')
+            .next()
+            .map(str::trim)
+            .unwrap_or_default();
+        if !requested_content_type.is_empty()
+            && !requested_content_type.eq_ignore_ascii_case("application/octet-stream")
+            && ImageFormat::from_content_type(requested_content_type) != Some(detected)
+        {
+            return Err(ImageWriteError::UnsupportedContentType {
+                content_type: requested_content_type.to_owned(),
+            });
+        }
+        validate_image_payload(detected, bytes)?;
+
+        let image_index = if image_type == "FANART" {
+            self.next_image_index(item_id, image_type).await?
+        } else {
+            0
+        };
+        let reuse_existing_path = image_type != "FANART";
+        self.store_item_image_bytes(
+            item_id,
+            image_type,
+            image_index,
+            detected,
+            bytes.to_vec(),
+            "MANUAL",
+            None,
+            ImageTargetWrite {
+                reuse_existing_path,
+                attempt: None,
+            },
+        )
+        .await
+    }
+
     /// Downloads, writes and indexes one image.
     ///
     /// `write.attempt` is the claim an attempt-scoped caller already holds: the image row and that
@@ -1186,6 +1250,39 @@ impl ImageWriteService {
         validate_image_payload(format, &body)?;
         drop(_download_permit);
 
+        self.store_item_image_bytes(
+            item_id,
+            image_type,
+            image_index,
+            format,
+            body,
+            source,
+            Some(image_url),
+            ImageTargetWrite {
+                reuse_existing_path,
+                attempt,
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn store_item_image_bytes(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_index: i64,
+        format: ImageFormat,
+        body: Vec<u8>,
+        source: &str,
+        source_url: Option<&str>,
+        write: ImageTargetWrite<'_>,
+    ) -> Result<ImageWriteReport, ImageWriteError> {
+        let ImageTargetWrite {
+            reuse_existing_path,
+            attempt,
+        } = write;
+        let size = u64::try_from(body.len()).unwrap_or(u64::MAX);
         let _image_write_lock = acquire_image_write_lock(item_id).await;
         let (root, directory, movie_stem, episode_stem) = self.writeback_paths(item_id).await?;
         let indexed_images = self.database.list_item_images(item_id).await?;
@@ -1268,7 +1365,7 @@ impl ImageWriteService {
             height: dimensions.map(|(_, height)| height),
             content_tag: &content_tag,
             source,
-            source_url: Some(image_url),
+            source_url,
         };
         let id = match attempt {
             Some(attempt) => self
