@@ -44,6 +44,10 @@ use crate::{
 
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
 pub const MAX_MANUAL_ITEM_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+/// Upper bound for a client-selected multi-image index on a manual upload. Multi-image artwork is
+/// normally capped by [`MAX_IMAGE_VARIANTS`]; this only keeps an arbitrary Emby index from becoming
+/// a file name, so a client can still replace a slot the scanner numbered above the cap.
+pub(crate) const MAX_MANUAL_IMAGE_INDEX: i64 = 100;
 const IMAGE_DOWNLOAD_MAX_RETRIES: u32 = 2;
 const IMAGE_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const IMAGE_RETRY_MAX_DELAY: Duration = Duration::from_secs(4);
@@ -1103,6 +1107,25 @@ impl ImageWriteService {
         content_type: &str,
         bytes: &[u8],
     ) -> Result<ImageWriteReport, ImageWriteError> {
+        self.upload_item_image_with_index(item_id, image_type, None, content_type, bytes)
+            .await
+    }
+
+    /// Uploads manual artwork, optionally replacing one multi-image index.
+    ///
+    /// `target_index = None` keeps the append behavior: fanart takes `max(index) + 1` and every
+    /// single-slot type writes index 0. `Some(index)` writes fanart into that slot in place so an
+    /// Emby client can replace `Backdrop/0` without appending a new image; single-slot types only
+    /// accept index 0, and indices outside `0..=MAX_MANUAL_IMAGE_INDEX` are rejected instead of
+    /// turning into arbitrary file names.
+    pub async fn upload_item_image_with_index(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        target_index: Option<i64>,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> Result<ImageWriteReport, ImageWriteError> {
         let image_type = normalize_image_type(image_type)
             .ok_or_else(|| ImageWriteError::InvalidImageType(image_type.to_owned()))?;
         let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
@@ -1137,12 +1160,32 @@ impl ImageWriteService {
         }
         validate_image_payload(detected, bytes)?;
 
-        let image_index = if image_type == "FANART" {
-            self.next_image_index(item_id, image_type).await?
-        } else {
-            0
+        let (image_index, reuse_existing_path) = match target_index {
+            Some(image_index) => {
+                if !(0..=MAX_MANUAL_IMAGE_INDEX).contains(&image_index) {
+                    return Err(ImageWriteError::InvalidImageType(format!(
+                        "image index {image_index}"
+                    )));
+                }
+                if image_type == "FANART" {
+                    // Replace the requested backdrop slot instead of appending to `max + 1`.
+                    (image_index, true)
+                } else if image_index > 0 {
+                    // Single-slot image types only have index 0.
+                    return Err(ImageWriteError::ItemNotFound);
+                } else {
+                    (0, true)
+                }
+            }
+            None => {
+                let image_index = if image_type == "FANART" {
+                    self.next_image_index(item_id, image_type).await?
+                } else {
+                    0
+                };
+                (image_index, image_type != "FANART")
+            }
         };
-        let reuse_existing_path = image_type != "FANART";
         self.store_item_image_bytes(
             item_id,
             image_type,

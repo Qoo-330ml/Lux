@@ -8,6 +8,13 @@ pub(super) const NORMALIZED_CREDENTIAL_HEADER: &str = "x-lux-internal-emby-crede
 /// Upper bound for the JSON bodies of the Emby administrator media endpoints.
 const EMBY_REMOTE_SEARCH_BODY_BYTES: usize = 64 * 1024;
 
+/// Transport limit for Emby image uploads. Clients may send either the raw image or a Base64 text
+/// body, so the route limit leaves room for the 4/3 encoding expansion plus 76-column CRLF line
+/// breaks; the image services still enforce the decoded 5 MiB item/cover limit (and answer 413
+/// when it is exceeded).
+const EMBY_IMAGE_UPLOAD_BODY_BYTES: usize =
+    crate::application::images::MAX_MANUAL_ITEM_IMAGE_BYTES as usize * 4 / 3 + 256 * 1024;
+
 struct EmbyRouteBuilder {
     router: Router<ReadyAppState>,
     path_templates: Vec<String>,
@@ -106,6 +113,7 @@ pub(super) fn api_routes() -> (Router<ReadyAppState>, Vec<String>) {
                 .post(emby_update_user)
                 .delete(emby_delete_user),
         )
+        .route("/Users/Me", get(emby_current_user))
         .route("/Users/{user_id}/Policy", post(emby_update_user_policy))
         .route("/Users/{user_id}/Password", post(emby_update_user_password))
         .route(
@@ -189,11 +197,19 @@ pub(super) fn api_routes() -> (Router<ReadyAppState>, Vec<String>) {
             get(emby_image)
                 .head(emby_image)
                 .post(emby_update_person_or_library_image)
-                .layer(DefaultBodyLimit::max(MAX_LIBRARY_COVER_BYTES as usize)),
+                .layer(DefaultBodyLimit::max(EMBY_IMAGE_UPLOAD_BODY_BYTES)),
         )
+        // Clients that address an image by index upload and delete through the same path; the
+        // index is validated but cannot select a write slot (Primary replaces, Backdrop appends),
+        // while deletes use it to select the stored row. Keeping the body limit identical to the
+        // unindexed route lets both spellings accept the same payloads.
         .route(
             "/Items/{item_id}/Images/{image_type}/{image_index}",
-            get(emby_image_at_index).head(emby_image_at_index),
+            get(emby_image_at_index)
+                .head(emby_image_at_index)
+                .post(emby_update_person_or_library_image_at_index)
+                .delete(emby_delete_item_image)
+                .layer(DefaultBodyLimit::max(EMBY_IMAGE_UPLOAD_BODY_BYTES)),
         )
         .route(
             "/Videos/{item_id}/{media_source_id}/Subtitles/{stream_index}/Stream",

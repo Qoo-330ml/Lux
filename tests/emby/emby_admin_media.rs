@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use luxd::{
     api::{AppState, app_with_state},
     application::{libraries::LibraryService, scanner::ScanJobService, setup::SetupService},
@@ -12,6 +13,18 @@ use luxd::{
 use reqwest::StatusCode;
 use serde_json::json;
 use tokio::net::TcpListener;
+
+const PNG_1X1: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82,
+];
+
+/// The smallest payload that satisfies the item image validation: JPEG SOI/APP0 magic and the EOI
+/// marker the writer requires.
+const JPEG_1X1: &[u8] = &[0xff, 0xd8, 0xff, 0xd9];
 
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
@@ -83,6 +96,7 @@ struct Fixture {
     base_url: String,
     key: String,
     public_item_id: String,
+    database: Database,
     _server: AbortOnDrop,
     _temp: tempfile::TempDir,
 }
@@ -128,6 +142,7 @@ async fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
         base_url,
         key,
         public_item_id: emby_public_id(&item_id),
+        database,
         _server: server,
         _temp: temp_dir,
     })
@@ -394,5 +409,362 @@ async fn image_delete_maps_type_and_index() -> Result<(), Box<dyn std::error::Er
         .send()
         .await?;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+#[tokio::test]
+async fn item_image_upload_accepts_raw_and_base64_bodies() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = fixture().await?;
+    let client = test_client();
+    let item_id = fixture.public_item_id.as_str();
+    let primary_url = format!(
+        "{base_url}/emby/Items/{item_id}/Images/Primary",
+        base_url = fixture.base_url
+    );
+
+    let raw_upload = client
+        .post(&primary_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .header("Content-Type", "image/png")
+        .body(PNG_1X1)
+        .send()
+        .await?;
+    assert_eq!(raw_upload.status(), StatusCode::NO_CONTENT);
+
+    let primary = client
+        .get(&primary_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(primary.status(), StatusCode::OK);
+    assert_eq!(primary.headers()["content-type"], "image/png");
+    assert_eq!(primary.bytes().await?.as_ref(), PNG_1X1);
+
+    // The indexed spelling resolves to a three-segment path extractor, so `/0` must reach the
+    // handler instead of failing route extraction with a 500.
+    let indexed_primary_upload = client
+        .post(format!("{primary_url}/0"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .header("Content-Type", "image/png")
+        .body(PNG_1X1)
+        .send()
+        .await?;
+    assert_eq!(indexed_primary_upload.status(), StatusCode::NO_CONTENT);
+
+    // Standard clients may send the image as a Base64 text body with a non-image content type.
+    let backdrop_url = format!(
+        "{base_url}/emby/Items/{item_id}/Images/Backdrop",
+        base_url = fixture.base_url
+    );
+    let encoded_upload = client
+        .post(format!("{backdrop_url}/0"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .body(BASE64.encode(JPEG_1X1))
+        .send()
+        .await?;
+    assert_eq!(encoded_upload.status(), StatusCode::NO_CONTENT);
+
+    let backdrop = client
+        .get(&backdrop_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(backdrop.status(), StatusCode::OK);
+    assert_eq!(backdrop.headers()["content-type"], "image/jpeg");
+    assert_eq!(backdrop.bytes().await?.as_ref(), JPEG_1X1);
+
+    // A malformed or negative index is a client error, never a server error.
+    for image_index in ["abc", "-1"] {
+        let invalid_index = client
+            .post(format!("{primary_url}/{image_index}"))
+            .query(&[("api_key", fixture.key.as_str())])
+            .header("Content-Type", "image/png")
+            .body(PNG_1X1)
+            .send()
+            .await?;
+        assert_eq!(
+            invalid_index.status(),
+            StatusCode::BAD_REQUEST,
+            "{image_index}"
+        );
+    }
+
+    // Non-administrators cannot replace item artwork.
+    let token = viewer_token(&fixture.base_url, &fixture.database).await?;
+    let forbidden = client
+        .post(&backdrop_url)
+        .header("X-Emby-Token", token)
+        .header("Content-Type", "image/jpeg")
+        .body(JPEG_1X1)
+        .send()
+        .await?;
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_delete_accepts_the_path_without_the_delete_suffix()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture().await?;
+    let client = test_client();
+    let item_id = fixture.public_item_id.as_str();
+    let primary_url = format!(
+        "{base_url}/emby/Items/{item_id}/Images/Primary",
+        base_url = fixture.base_url
+    );
+    let upload = client
+        .post(&primary_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .header("Content-Type", "image/png")
+        .body(PNG_1X1)
+        .send()
+        .await?;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    // Emby clients also delete through `/Images/{Type}/{Index}` without the legacy `/Delete` suffix.
+    let deleted = client
+        .delete(format!("{primary_url}/0"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+
+    let missing = client
+        .get(&primary_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_search_accepts_provider_ids_without_a_name()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture().await?;
+    let client = test_client();
+    let search_url = format!(
+        "{base_url}/emby/Items/RemoteSearch/Movie",
+        base_url = fixture.base_url
+    );
+
+    // A provider id alone is a valid query. Without a configured scraper the search reports the
+    // configuration gap (409) rather than failing request validation (400).
+    let provider_only = client
+        .post(&search_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .json(&json!({
+            "ItemId": fixture.public_item_id,
+            "SearchInfo": { "ProviderIds": { "Tmdb": "550" } }
+        }))
+        .send()
+        .await?;
+    assert_eq!(provider_only.status(), StatusCode::CONFLICT);
+
+    // A name plus provider ids stays a name search; the ids only rank the results. Without a
+    // scraper it reports the same configuration gap, never a validation error.
+    let name_and_provider_ids = client
+        .post(&search_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .json(&json!({
+            "ItemId": fixture.public_item_id,
+            "SearchInfo": {
+                "Name": "Admin Media",
+                "ProviderIds": { "Tmdb": "550" },
+                "Year": 2020
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(name_and_provider_ids.status(), StatusCode::CONFLICT);
+
+    // A blank name and blank provider ids carry no search terms at all.
+    let empty_terms = client
+        .post(&search_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .json(&json!({
+            "ItemId": fixture.public_item_id,
+            "SearchInfo": { "Name": "   ", "ProviderIds": { "Tmdb": "   ", "": "550" } }
+        }))
+        .send()
+        .await?;
+    assert_eq!(empty_terms.status(), StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+#[tokio::test]
+async fn current_user_returns_the_authenticated_account() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = fixture().await?;
+    let token = viewer_token(&fixture.base_url, &fixture.database).await?;
+    let client = test_client();
+
+    let response = client
+        .get(format!(
+            "{base_url}/emby/Users/Me",
+            base_url = fixture.base_url
+        ))
+        .header("X-Emby-Token", token)
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.json::<serde_json::Value>().await?;
+    assert_eq!(body["Name"], "Viewer");
+    assert!(body["Id"].is_string());
+    assert!(body["Policy"].is_object());
+
+    let anonymous = client
+        .get(format!(
+            "{base_url}/emby/Users/Me",
+            base_url = fixture.base_url
+        ))
+        .send()
+        .await?;
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn item_image_upload_body_limit_covers_base64_expansion()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture().await?;
+    let client = test_client();
+    let item_id = fixture.public_item_id.as_str();
+    let primary_url = format!(
+        "{base_url}/emby/Items/{item_id}/Images/Primary",
+        base_url = fixture.base_url
+    );
+
+    // A 4 MiB JPEG is under the 5 MiB decoded limit, but its Base64 text body is larger than the
+    // old route limit. The transport limit must admit it and the writer still accepts the pixels.
+    let mut jpeg = Vec::with_capacity(4 * 1024 * 1024 + 5);
+    jpeg.extend_from_slice(&[0xff, 0xd8, 0xff]);
+    jpeg.resize(4 * 1024 * 1024, 0);
+    jpeg.extend_from_slice(&[0xff, 0xd9]);
+    let encoded = BASE64.encode(&jpeg);
+    assert!(
+        encoded.len() as u64 > luxd::application::images::MAX_MANUAL_ITEM_IMAGE_BYTES,
+        "the encoded body must exceed the decoded route limit"
+    );
+
+    let upload = client
+        .post(&primary_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .body(encoded)
+        .send()
+        .await?;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let served = client
+        .get(&primary_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(served.status(), StatusCode::OK);
+    assert_eq!(served.bytes().await?.as_ref(), jpeg);
+    Ok(())
+}
+
+#[tokio::test]
+async fn indexed_backdrop_upload_replaces_the_requested_slot()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture().await?;
+    let client = test_client();
+    let item_id = fixture.public_item_id.as_str();
+    let backdrop_url = format!(
+        "{base_url}/emby/Items/{item_id}/Images/Backdrop",
+        base_url = fixture.base_url
+    );
+
+    // No-index backdrop uploads append index 0 and then index 1.
+    for (body, content_type) in [(PNG_1X1, "image/png"), (JPEG_1X1, "image/jpeg")] {
+        let response = client
+            .post(&backdrop_url)
+            .query(&[("api_key", fixture.key.as_str())])
+            .header("Content-Type", content_type)
+            .body(body.to_vec())
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+    let first = client
+        .get(format!("{backdrop_url}/0"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(first.bytes().await?.as_ref(), PNG_1X1);
+    let second = client
+        .get(format!("{backdrop_url}/1"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(second.bytes().await?.as_ref(), JPEG_1X1);
+
+    // Backdrop/0 replaces the first slot in place: index 1 is untouched and no index 2 appears.
+    let mut replacement = PNG_1X1.to_vec();
+    replacement.push(0);
+    let replaced = client
+        .post(format!("{backdrop_url}/0"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .header("Content-Type", "image/png")
+        .body(replacement.clone())
+        .send()
+        .await?;
+    assert_eq!(replaced.status(), StatusCode::NO_CONTENT);
+
+    let first = client
+        .get(format!("{backdrop_url}/0"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(first.bytes().await?.as_ref(), replacement.as_slice());
+    let second = client
+        .get(format!("{backdrop_url}/1"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(second.bytes().await?.as_ref(), JPEG_1X1);
+    let absent = client
+        .get(format!("{backdrop_url}/2"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+
+    // Single-slot types have no index 1, for media items as well as library covers and person ids;
+    // the rule is checked before the target is resolved.
+    let library_id: String = sqlx::query_scalar("SELECT id FROM libraries LIMIT 1")
+        .fetch_one(fixture.database.pool())
+        .await?;
+    for target in [
+        format!(
+            "{base_url}/emby/Items/{item_id}/Images/Primary/1",
+            base_url = fixture.base_url
+        ),
+        format!(
+            "{base_url}/emby/Items/{library_id}/Images/Primary/1",
+            base_url = fixture.base_url
+        ),
+        format!(
+            "{base_url}/emby/Items/104/Images/Primary/1",
+            base_url = fixture.base_url
+        ),
+    ] {
+        let response = client
+            .post(&target)
+            .query(&[("api_key", fixture.key.as_str())])
+            .header("Content-Type", "image/png")
+            .body(PNG_1X1)
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{target}");
+    }
     Ok(())
 }

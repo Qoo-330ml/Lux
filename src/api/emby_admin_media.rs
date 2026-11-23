@@ -94,17 +94,18 @@ pub(super) async fn emby_remote_search(
         return StatusCode::BAD_REQUEST.into_response();
     };
     let search_info = request.search_info.unwrap_or_default();
-    let search = search_info
-        .name
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or_default();
-    if search.is_empty() {
+    let (search, provider_ids, lookup_provider_ids) = resolve_remote_search_input(&search_info);
+    if search.is_none() && provider_ids.is_none() {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let reidentify = state.metadata_reidentify();
     let page = match reidentify
-        .search_item_candidates(&item_id, search, search_info.year)
+        .search_item_candidates_with_provider_ids(
+            &item_id,
+            search,
+            search_info.year,
+            lookup_provider_ids.as_ref(),
+        )
         .await
     {
         Ok(page) => page,
@@ -116,7 +117,7 @@ pub(super) async fn emby_remote_search(
     let (preferred, rest): (Vec<_>, Vec<_>) = page
         .items
         .iter()
-        .partition(|candidate| provider_id_matches(candidate, &search_info.provider_ids));
+        .partition(|candidate| provider_id_matches(candidate, provider_ids.as_ref()));
     let results = preferred
         .into_iter()
         .chain(rest)
@@ -125,15 +126,53 @@ pub(super) async fn emby_remote_search(
     Json(results).into_response()
 }
 
+/// `(search, provider_ids, lookup_provider_ids)` returned by [`resolve_remote_search_input`].
+type ResolvedRemoteSearchInput<'a> = (
+    Option<&'a str>,
+    Option<BTreeMap<String, String>>,
+    Option<BTreeMap<String, String>>,
+);
+
+/// Parsed RemoteSearch terms: `(search, provider_ids, lookup_provider_ids)`.
+///
+/// `search` is the trimmed, non-empty `SearchInfo.Name`; `provider_ids` are the non-blank ids,
+/// which also rank the returned candidates. `lookup_provider_ids` is `Some` only when there is no
+/// usable name: a provider-id-only request performs a direct id lookup, while a name request still
+/// searches by title (for example after the administrator corrects it).
+fn resolve_remote_search_input(
+    search_info: &EmbyRemoteSearchInfo,
+) -> ResolvedRemoteSearchInput<'_> {
+    let search = search_info
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let provider_ids = search_info
+        .provider_ids
+        .iter()
+        .filter(|(key, value)| !key.trim().is_empty() && !value.trim().is_empty())
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let provider_ids = (!provider_ids.is_empty()).then_some(provider_ids);
+    let lookup_provider_ids = if search.is_none() {
+        provider_ids.clone()
+    } else {
+        None
+    };
+    (search, provider_ids, lookup_provider_ids)
+}
+
 fn provider_id_matches(
     candidate: &crate::application::candidates::MetadataCandidateView,
-    provider_ids: &BTreeMap<String, String>,
+    provider_ids: Option<&BTreeMap<String, String>>,
 ) -> bool {
     let candidate_id = candidate.provider_id.trim();
     !candidate_id.is_empty()
-        && provider_ids.values().any(|value| {
-            let value = value.trim();
-            !value.is_empty() && value.eq_ignore_ascii_case(candidate_id)
+        && provider_ids.is_some_and(|provider_ids| {
+            provider_ids.values().any(|value| {
+                let value = value.trim();
+                !value.is_empty() && value.eq_ignore_ascii_case(candidate_id)
+            })
         })
 }
 
@@ -566,12 +605,55 @@ mod tests {
     }
 
     #[test]
+    fn remote_search_input_separates_name_queries_from_id_lookups() {
+        let mut ids = BTreeMap::new();
+        ids.insert("Tmdb".to_owned(), "550".to_owned());
+
+        // A name plus provider ids stays a name search; the ids only rank the candidates.
+        let with_name = EmbyRemoteSearchInfo {
+            name: Some("  Fight Club  ".to_owned()),
+            provider_ids: ids.clone(),
+            ..Default::default()
+        };
+        let (search, provider_ids, lookup_provider_ids) = resolve_remote_search_input(&with_name);
+        assert_eq!(search, Some("Fight Club"));
+        assert_eq!(provider_ids.as_ref(), Some(&ids));
+        assert!(lookup_provider_ids.is_none());
+
+        // Without a name the ids become the direct lookup key.
+        let provider_only = EmbyRemoteSearchInfo {
+            provider_ids: ids.clone(),
+            ..Default::default()
+        };
+        let (search, provider_ids, lookup_provider_ids) =
+            resolve_remote_search_input(&provider_only);
+        assert_eq!(search, None);
+        assert_eq!(provider_ids.as_ref(), Some(&ids));
+        assert_eq!(lookup_provider_ids.as_ref(), Some(&ids));
+
+        // A blank name and blank provider ids carry no search terms; the handler rejects them.
+        let empty = EmbyRemoteSearchInfo {
+            name: Some("   ".to_owned()),
+            provider_ids: BTreeMap::from([
+                ("Tmdb".to_owned(), "   ".to_owned()),
+                (String::new(), "550".to_owned()),
+            ]),
+            ..Default::default()
+        };
+        let (search, provider_ids, lookup_provider_ids) = resolve_remote_search_input(&empty);
+        assert_eq!(search, None);
+        assert!(provider_ids.is_none());
+        assert!(lookup_provider_ids.is_none());
+    }
+
+    #[test]
     fn provider_ids_match_the_stored_candidate() {
         let candidate = candidate();
         let mut ids = BTreeMap::new();
         ids.insert("Tmdb".to_owned(), "550".to_owned());
-        assert!(provider_id_matches(&candidate, &ids));
+        assert!(provider_id_matches(&candidate, Some(&ids)));
+        assert!(!provider_id_matches(&candidate, None));
         ids.insert("Tmdb".to_owned(), "551".to_owned());
-        assert!(!provider_id_matches(&candidate, &ids));
+        assert!(!provider_id_matches(&candidate, Some(&ids)));
     }
 }

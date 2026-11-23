@@ -1242,18 +1242,42 @@ pub(super) async fn emby_user(
         Ok(Some(_) | None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let server_name = current_emby_server_name(&state).await;
-    let ordered_views = emby_ordered_views(&state, &user).await;
-    let configuration = emby_user_configuration(&state, &user, &ordered_views).await;
-    let snapshots = emby_user_access_snapshots(&state, std::slice::from_ref(&user)).await;
-    Json(emby_user_json(
-        &user,
+    Json(emby_user_response_json(&state, &user).await).into_response()
+}
+
+/// GET /Users/Me: the authenticated user, in exactly the shape `GET /Users/{Id}` returns.
+///
+/// Emby clients (and Yamby) resolve the signed-in account through this alias instead of caching
+/// the user id from the login response. Disabled accounts are rejected during token resolution
+/// (401), so the disabled check below is only a defensive fallback.
+pub(super) async fn emby_current_user(
+    headers: HeaderMap,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<ReadyAppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if user.is_disabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Json(emby_user_response_json(&state, &user).await).into_response()
+}
+
+/// Builds the Emby user DTO shared by `/Users/{Id}` and `/Users/Me`.
+async fn emby_user_response_json(state: &ReadyAppState, user: &UserRecord) -> Value {
+    let server_name = current_emby_server_name(state).await;
+    let ordered_views = emby_ordered_views(state, user).await;
+    let configuration = emby_user_configuration(state, user, &ordered_views).await;
+    let snapshots = emby_user_access_snapshots(state, std::slice::from_ref(user)).await;
+    emby_user_json(
+        user,
         &state.server_id,
         &server_name,
         configuration,
         snapshots.get(&user.id.to_string()),
-    ))
-    .into_response()
+    )
 }
 
 #[derive(Deserialize, Default)]
