@@ -3285,6 +3285,9 @@ async fn emby_update_media_item(
     if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
+    if !body.is_object() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     // The body echo of `Id` is optional, but when a client sends one it has to name this item.
     if let Some(requested_id) = emby_body_field(body, "Id", "id").and_then(Value::as_str)
         && emby_internal_id(requested_id) != internal_id

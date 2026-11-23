@@ -68,8 +68,7 @@ Hills 1.11.0 的 `libapp.so` 字符串表；所有响应只按 Emby 公开 DTO �
 
 ### 未实现（本任务范围外）
 
-- `POST /Items/{id}` 对电影/剧集的自由字段编辑仍只处理 `Person`（Yamby/Hills 的“编辑元数据”会 400/404）。
-  这需要一条 Lux 侧的条目元数据编辑用例（锁定字段、NFO 原子写回、低置信度规则），属独立任务。
+- `POST /Items/{id}` 对电影/剧集的自由字段编辑当时尚未实现（只处理 `Person`，已于 2026-11-23 补齐局部元数据编辑：`Name`/`OriginalTitle`/`Overview`/`ProductionYear`/`LockData`/`LockedFields`，含只增不减字段锁、未改动字段 `provenance` 保留、`METADATA_EDITED` 审计与 NFO 写回；未建模字段 `Genres`/`Studios`/`Tags` 等仍忽略）。
 - `POST /System/Restart`、`GET /System/Logs/...`、`GET /System/ActivityLog/Entries`、
   `DELETE /Library/VirtualFolders`：Lux 有等价的 `/api/v1/admin/*`（任务日志、审计、异步删库）但没有 Emby
   形状，且重启与删库是破坏性运维动作，需要单独设计后再补。
@@ -159,8 +158,7 @@ fields, …)`）；复现与回归在项目内起了一次隔离 `luxd`（`LUX_C
   都和 PascalCase 完全一致，两种拼写对同一请求必须返回逐字节相同的响应。
 - 未覆盖：**任意大小写**仍不识别（例如全大写 `PARENTID`）；serde 别名只能枚举拼写，本任务只补客户端实际
   会发的 camelCase。JSON 请求体（`Username`/`Pw`/`Hide` 等）不在本次范围，客户端发的就是 PascalCase。
-- 剩余缺口（未在本任务修改）：`Items/{id}/Refresh` 与 `POST /Items/{id}` 对普通条目返回 404（P3，编辑/
-  刷新入口）。`/Shows/{id}/Episodes` 的季作用域在 LUX-915 核实**本来就生效**，本任务那条「两种拼写都被
+- 剩余缺口（当时未改；注：`POST /Items/{id}` 与 `Items/{id}/Refresh` 后续均已补齐对普通条目的支持）：`Items/{id}/Refresh` 与 `POST /Items/{id}` 对普通条目当时返回 404（编辑/刷新入口）。`/Shows/{id}/Episodes` 的季作用域在 LUX-915 核实**本来就生效**，本任务那条「两种拼写都被
   忽略」的推断是错的，详见上方的 LUX-915 小节。
 - 自动化：`cargo test --locked --test emby query_case::`（7 例）覆盖「16 组 camelCase/PascalCase 响应逐字节
   相等（根路径与 `/emby` 前缀）」、按库/按类型的范围收缩、三页分页覆盖全集、非法分页仍 400、`fields` 投影

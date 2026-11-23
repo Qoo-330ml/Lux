@@ -199,10 +199,10 @@ pub(super) fn api_routes() -> (Router<ReadyAppState>, Vec<String>) {
                 .post(emby_update_person_or_library_image)
                 .layer(DefaultBodyLimit::max(EMBY_IMAGE_UPLOAD_BODY_BYTES)),
         )
-        // Clients that address an image by index upload and delete through the same path; the
-        // index is validated but cannot select a write slot (Primary replaces, Backdrop appends),
-        // while deletes use it to select the stored row. Keeping the body limit identical to the
-        // unindexed route lets both spellings accept the same payloads.
+        // Clients that address an image by index upload and delete through the same path; uploads
+        // replace that Backdrop/Fanart slot in place (single-slot types only accept index 0), and
+        // deletes select that stored row. Keeping the body limit identical to the unindexed route
+        // lets both spellings accept the same payloads.
         .route(
             "/Items/{item_id}/Images/{image_type}/{image_index}",
             get(emby_image_at_index)
