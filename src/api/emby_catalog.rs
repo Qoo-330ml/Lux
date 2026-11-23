@@ -1,4 +1,5 @@
 use super::*;
+use crate::application::metadata::NfoError;
 use crate::application::playback::session::EMBY_DIRECT_STREAM_TICKET_VERSION;
 use std::collections::BTreeSet;
 use tokio::{sync::Semaphore, task::JoinSet};
@@ -2970,10 +2971,20 @@ pub(super) async fn emby_update_item(
             Err(status) => return status.into_response(),
         };
     let internal_id = emby_internal_id(&item_id);
-    if !emby_body_declares_person(&body)
-        && internal_id.parse::<crate::domain::ids::ItemId>().is_ok()
-    {
-        return emby_update_media_item(&auth_principal, &state, &internal_id, &body).await;
+    match emby_item_update_target(&state, &item_id, &internal_id, &body).await {
+        Ok(EmbyItemUpdateTarget::Person) => {}
+        Ok(EmbyItemUpdateTarget::Media(current)) => {
+            return emby_update_media_item(
+                &auth_principal,
+                &headers,
+                &state,
+                &internal_id,
+                &body,
+                current.map(|current| *current),
+            )
+            .await;
+        }
+        Err(status) => return status.into_response(),
     }
     let principal = match emby_access_principal(&auth_principal, None) {
         Ok(principal) => principal,
@@ -3040,12 +3051,77 @@ pub(super) async fn emby_update_item(
 /// Whether the request body explicitly edits a `Person` item.
 ///
 /// Emby clients echo the whole `BaseItemDto` back, so only an exact `Type: "Person"` (either
-/// spelling) routes to the person editor. A body without `Type` never claims to be a person, which
-/// is why the caller also keeps the legacy route for ids that are not media-item uuids.
+/// spelling) routes to the person editor.
 fn emby_body_declares_person(body: &Value) -> bool {
     emby_body_field(body, "Type", "type")
         .and_then(Value::as_str)
         .is_some_and(|item_type| item_type.trim().eq_ignore_ascii_case("Person"))
+}
+
+/// Whether the request body names a media item type (`Movie`, `Series`, `Season`, `Episode`, ...).
+fn emby_body_declares_media_type(body: &Value) -> bool {
+    emby_body_field(body, "Type", "type")
+        .and_then(Value::as_str)
+        .is_some_and(|item_type| normalize_emby_item_type(item_type).is_some())
+}
+
+/// Whether a path id can only be a media item identifier.
+///
+/// Lux exposes an item uuid as a decimal u128, and `Uuid::v7` values convert to integers far above
+/// `u64::MAX`, so a decimal wider than that is always a 128-bit public media id. A hyphenated uuid
+/// is the internal id. Small decimals are the legacy people-catalogue ids (`104`) that
+/// `emby_internal_id` maps onto uuid-shaped strings, and slugs are local person keys.
+fn emby_id_looks_like_media_item(item_id: &str) -> bool {
+    let item_id = item_id.trim();
+    if Uuid::parse_str(item_id).is_ok() {
+        return true;
+    }
+    match item_id.parse::<u128>() {
+        Ok(value) => value > u128::from(u64::MAX),
+        Err(_) => false,
+    }
+}
+
+/// Which Emby editor a `POST /Items/{Id}` request addresses.
+enum EmbyItemUpdateTarget {
+    Person,
+    /// A media item metadata edit. The payload is `None` when the id does not name a stored media
+    /// item: the media editor still runs its permission and body-`Id` checks before answering 404.
+    /// The row is boxed because it is much larger than the `Person` variant.
+    Media(Option<Box<crate::storage::StoredMediaMetadata>>),
+}
+
+/// Splits the single Emby `POST /Items/{Id}` endpoint between the person editor and the media item
+/// editor.
+///
+/// An explicit `Type` decides on its own. Without one the stored media item wins, and only when
+/// the id is not a media item at all does its shape decide: `emby_internal_id` also turns the
+/// people-catalogue id `104` into a valid uuid, and older clients post person bodies without a
+/// `Type`, so a uuid-shaped internal id alone cannot mean "media item". A hyphenated uuid or a
+/// decimal wider than `u64::MAX` can only be a media item, so those still reach the media editor
+/// (and its 403/404 answers), while a small decimal or a slug stays on the person editor.
+async fn emby_item_update_target(
+    state: &ReadyAppState,
+    item_id: &str,
+    internal_id: &str,
+    body: &Value,
+) -> Result<EmbyItemUpdateTarget, StatusCode> {
+    if emby_body_declares_person(body) {
+        return Ok(EmbyItemUpdateTarget::Person);
+    }
+    // Resolved once for both branches: the media editor reuses it instead of querying again.
+    let current = state
+        .database()
+        .find_media_item_metadata(internal_id)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    if current.is_some()
+        || emby_body_declares_media_type(body)
+        || emby_id_looks_like_media_item(item_id)
+    {
+        return Ok(EmbyItemUpdateTarget::Media(current.map(Box::new)));
+    }
+    Ok(EmbyItemUpdateTarget::Person)
 }
 
 /// Reads a field by its PascalCase name with the camelCase spelling as fallback.
@@ -3087,27 +3163,56 @@ fn emby_optional_year_field(
     }
 }
 
-/// Parses an Emby `LockedFields` array into the Lux field locks.
+/// Resolves the lock request of an Emby `BaseItemDto` into the Lux field locks.
+///
+/// Emby's own item DTO always serializes `LockData: false` with `LockedFields: []`, so a client
+/// echoing an unmodified DTO would otherwise wipe every lock an administrator set in Lux. An empty
+/// or missing list therefore keeps the stored locks unless the client explicitly asks for
+/// `LockData: true`, which Emby defines as "lock every editable field". A non-empty list is an
+/// explicit field-level choice and replaces the stored locks.
 ///
 /// Emby's `MetadataFields` enum is longer than the set Lux tracks (`Genres`, `Tags`, `Studios`,
 /// `Cast`, `OfficialRating`, ...). Those members are accepted and dropped: Lux never overwrites
 /// them automatically, so refusing the whole edit over an unmodelled lock would only break stock
 /// clients.
+///
+/// `Ok(None)` means "keep the locks already stored on the item".
 fn emby_locked_metadata_fields(
     body: &Value,
 ) -> Result<Option<BTreeSet<MetadataField>>, StatusCode> {
-    let Some(value) = emby_body_field(body, "LockedFields", "lockedFields") else {
-        return Ok(None);
+    let lock_data = match emby_body_field(body, "LockData", "lockData") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(lock_data)) => Some(*lock_data),
+        Some(_) => return Err(StatusCode::BAD_REQUEST),
     };
-    let Value::Array(entries) = value else {
-        return Err(StatusCode::BAD_REQUEST);
+    let requested = match emby_body_field(body, "LockedFields", "lockedFields") {
+        None => None,
+        Some(Value::Array(entries)) if entries.is_empty() => None,
+        Some(Value::Array(entries)) => Some(
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(emby_locked_metadata_field)
+                .collect::<BTreeSet<_>>(),
+        ),
+        Some(_) => return Err(StatusCode::BAD_REQUEST),
     };
-    let fields = entries
-        .iter()
-        .filter_map(Value::as_str)
-        .filter_map(emby_locked_metadata_field)
-        .collect::<BTreeSet<_>>();
-    Ok(Some(fields))
+    if requested.is_some() {
+        return Ok(requested);
+    }
+    if lock_data == Some(true) {
+        return Ok(Some(
+            [
+                MetadataField::Title,
+                MetadataField::OriginalTitle,
+                MetadataField::Overview,
+                MetadataField::ProductionYear,
+            ]
+            .into_iter()
+            .collect(),
+        ));
+    }
+    Ok(None)
 }
 
 fn emby_locked_metadata_field(name: &str) -> Option<MetadataField> {
@@ -3134,19 +3239,31 @@ fn stored_locked_metadata_fields(raw: Option<&str>) -> BTreeSet<MetadataField> {
 /// Maps a metadata write failure to the bare status code Emby clients expect.
 ///
 /// Emby answers these edits with a status only, so the Lux JSON error body (and its message) is
-/// not reused here: `ItemNotFound` is 404, invalid metadata is 400 and every storage/NFO failure is
-/// retryable 503.
+/// not reused here. The mapping matches `/api/v1/items/{id}/metadata`: a missing item is 404,
+/// invalid metadata is 400, a path outside the library root is 403, an oversized NFO is 413 and an
+/// NFO Lux refuses to parse or rewrite is 422. Only storage, I/O and concurrent-modification
+/// failures stay retryable 503s.
 fn emby_metadata_write_status(error: NfoWriteError) -> StatusCode {
     match error {
         NfoWriteError::ItemNotFound => StatusCode::NOT_FOUND,
         NfoWriteError::InvalidMetadata(_) => StatusCode::BAD_REQUEST,
-        NfoWriteError::Storage(_)
-        | NfoWriteError::Nfo(_)
-        | NfoWriteError::InvalidXml(_)
+        NfoWriteError::PathOutsideRoot(_) | NfoWriteError::SymlinkTarget(_) => {
+            StatusCode::FORBIDDEN
+        }
+        NfoWriteError::Nfo(NfoError::TooLarge) | NfoWriteError::TooLarge(_) => {
+            StatusCode::PAYLOAD_TOO_LARGE
+        }
+        NfoWriteError::Nfo(
+            NfoError::TooManyEvents
+            | NfoError::FieldTooLarge
+            | NfoError::DocTypeNotAllowed
+            | NfoError::Unbalanced
+            | NfoError::Xml(_),
+        )
+        | NfoWriteError::InvalidXml(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        NfoWriteError::Nfo(NfoError::Io(_))
         | NfoWriteError::Io { .. }
-        | NfoWriteError::SymlinkTarget(_)
-        | NfoWriteError::PathOutsideRoot(_)
-        | NfoWriteError::TooLarge(_)
+        | NfoWriteError::Storage(_)
         | NfoWriteError::ConcurrentModification(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
@@ -3155,12 +3272,15 @@ fn emby_metadata_write_status(error: NfoWriteError) -> StatusCode {
 ///
 /// The Emby `BaseItemDto` body is a partial update: a missing key keeps the stored value, while an
 /// explicit `null` clears the optional fields. Unknown keys are ignored, because clients echo
-/// fields Lux does not model.
+/// fields Lux does not model. `current` is the row the caller already resolved for the routing
+/// decision (and is `None` when the id does not name a media item).
 async fn emby_update_media_item(
     auth_principal: &crate::auth::users::AuthenticationPrincipal,
+    headers: &HeaderMap,
     state: &ReadyAppState,
     internal_id: &str,
     body: &Value,
+    current: Option<crate::storage::StoredMediaMetadata>,
 ) -> Response {
     if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
@@ -3171,11 +3291,8 @@ async fn emby_update_media_item(
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let database = state.database();
-    let current = match database.find_media_item_metadata(internal_id).await {
-        Ok(Some(current)) => current,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    let Some(current) = current else {
+        return StatusCode::NOT_FOUND.into_response();
     };
     let title = match emby_body_field(body, "Name", "name") {
         None => current.title.clone(),
@@ -3218,8 +3335,20 @@ async fn emby_update_media_item(
         )
         .await
     {
-        // Emby answers a successful media item edit with 204 No Content.
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => {
+            // Same audit event the Lux metadata endpoint records, tagged with the Emby origin.
+            record_audit_event(
+                state,
+                headers,
+                "METADATA_EDITED",
+                Some("item"),
+                Some(internal_id),
+                r#"{"source":"emby_item_update"}"#,
+            )
+            .await;
+            // Emby answers a successful media item edit with 204 No Content.
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(error) => emby_metadata_write_status(error).into_response(),
     }
 }

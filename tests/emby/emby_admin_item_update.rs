@@ -37,6 +37,7 @@ struct Fixture {
     base_url: String,
     admin_key: String,
     database: Database,
+    admin: UserRecord,
     manager: UserRecord,
     viewer: UserRecord,
     movie_id: String,
@@ -96,7 +97,7 @@ async fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
     };
     let database = Database::connect(&config).await?;
     let setup = SetupService::new(database.clone())?;
-    setup
+    let admin = setup
         .complete("Admin", "Administrator", "correct password")
         .await?;
     let users = UserStore::new(database.clone())?;
@@ -190,6 +191,7 @@ async fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
         base_url: format!("http://{address}"),
         admin_key,
         database,
+        admin,
         manager,
         viewer,
         movie_public_id: emby_public_id(&movie_id),
@@ -704,6 +706,234 @@ async fn sessions_listing_and_stop_honour_server_management_permission()
         .send()
         .await?;
     assert_eq!(own_stop.status(), reqwest::StatusCode::NO_CONTENT);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn echoed_lock_fields_keep_stored_locks_and_lock_data_locks_every_field()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture().await?;
+    let client = test_client();
+    let admin_token = emby_token(
+        &client,
+        &fixture.base_url,
+        "admin",
+        "correct password",
+        "admin-device",
+    )
+    .await?;
+
+    let locked = client
+        .post(format!(
+            "{}/emby/Items/{}",
+            fixture.base_url, fixture.movie_public_id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .json(&json!({
+            "Id": fixture.movie_public_id,
+            "Name": "Locked Movie",
+            "Overview": "Locked overview",
+            "LockedFields": ["Name", "Overview"]
+        }))
+        .send()
+        .await?;
+    assert_eq!(locked.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        stored_item(&fixture.database, &fixture.movie_id)
+            .await?
+            .locked_fields,
+        vec!["title", "overview"]
+    );
+
+    // A stock Emby client echoes the DTO it read back, and Lux's own DTO serializes
+    // `LockData: false` with an empty `LockedFields`. Editing only the year through that echo must
+    // not unlock the fields an administrator locked in Lux.
+    let echoed = client
+        .post(format!(
+            "{}/emby/Items/{}",
+            fixture.base_url, fixture.movie_public_id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .json(&json!({
+            "Id": fixture.movie_public_id,
+            "Type": "Movie",
+            "Name": "Locked Movie",
+            "Overview": "Locked overview",
+            "ProductionYear": 2019,
+            "LockData": false,
+            "LockedFields": [],
+            "Genres": ["Drama"]
+        }))
+        .send()
+        .await?;
+    assert_eq!(echoed.status(), reqwest::StatusCode::NO_CONTENT);
+    let stored = stored_item(&fixture.database, &fixture.movie_id).await?;
+    assert_eq!(stored.production_year, Some(2019));
+    assert_eq!(stored.locked_fields, vec!["title", "overview"]);
+
+    // `LockData: true` is Emby's "lock every editable field".
+    let fully_locked = client
+        .post(format!(
+            "{}/emby/Items/{}",
+            fixture.base_url, fixture.movie_public_id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .json(&json!({
+            "Name": "Fully Locked Movie",
+            "LockData": true,
+            "LockedFields": []
+        }))
+        .send()
+        .await?;
+    assert_eq!(fully_locked.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        stored_item(&fixture.database, &fixture.movie_id)
+            .await?
+            .locked_fields,
+        vec!["title", "originalTitle", "overview", "productionYear"]
+    );
+
+    // Malformed lock payloads are rejected instead of silently ignored.
+    for body in [
+        json!({ "Name": "Bad Lock", "LockData": "yes" }),
+        json!({ "Name": "Bad Lock", "LockedFields": "Name" }),
+    ] {
+        let rejected = client
+            .post(format!(
+                "{}/emby/Items/{}",
+                fixture.base_url, fixture.movie_public_id
+            ))
+            .query(&[("api_key", fixture.admin_key.as_str())])
+            .json(&body)
+            .send()
+            .await?;
+        assert_eq!(
+            rejected.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{body}"
+        );
+    }
+    assert_eq!(
+        stored_item(&fixture.database, &fixture.movie_id)
+            .await?
+            .title,
+        "Fully Locked Movie"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn person_editor_still_handles_ids_without_a_declared_type()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture().await?;
+    let client = test_client();
+    let viewer_token = emby_token(
+        &client,
+        &fixture.base_url,
+        "viewer",
+        "viewer password",
+        "viewer-device",
+    )
+    .await?;
+
+    // Non-administrators always get the media editor's 403, so a 404 proves the request stayed on
+    // the person editor (where the person simply does not exist). Both the legacy numeric
+    // catalogue id and a local slug must keep resolving that way without a `Type`.
+    for person_id in ["104", "local-actor"] {
+        let response = client
+            .post(format!("{}/emby/Items/{person_id}", fixture.base_url))
+            .header("X-Emby-Token", &viewer_token)
+            .json(&json!({ "Name": "Legacy Person", "Id": person_id }))
+            .send()
+            .await?;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "{person_id}"
+        );
+    }
+
+    // A hyphenated uuid, a 128-bit public id and a stored media item still route to the media
+    // editor without a `Type`, so a plain user gets the media 403.
+    let hyphenated_uuid = uuid::Uuid::new_v4().to_string();
+    let public_128_bit_id = (u128::from(u64::MAX) + 7).to_string();
+    for item_id in [
+        hyphenated_uuid.as_str(),
+        public_128_bit_id.as_str(),
+        fixture.movie_public_id.as_str(),
+    ] {
+        let response = client
+            .post(format!("{}/emby/Items/{item_id}", fixture.base_url))
+            .header("X-Emby-Token", &viewer_token)
+            .json(&json!({ "Name": "Media Edit" }))
+            .send()
+            .await?;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::FORBIDDEN,
+            "{item_id}"
+        );
+    }
+
+    // Neither the person attempts nor the rejected media attempts changed the stored movie.
+    assert_eq!(
+        stored_item(&fixture.database, &fixture.movie_id)
+            .await?
+            .title,
+        "Fixture Movie"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn successful_media_edit_records_the_metadata_edited_audit_event()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture().await?;
+    let client = test_client();
+    let admin_token = emby_token(
+        &client,
+        &fixture.base_url,
+        "admin",
+        "correct password",
+        "admin-device",
+    )
+    .await?;
+
+    let updated = client
+        .post(format!(
+            "{}/emby/Items/{}",
+            fixture.base_url, fixture.movie_public_id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .json(&json!({
+            "Name": "Audited Movie",
+            "Overview": "Audited overview"
+        }))
+        .send()
+        .await?;
+    assert_eq!(updated.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let audit = client
+        .get(format!("{}/api/v1/admin/audit", fixture.base_url))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(audit.status(), reqwest::StatusCode::OK);
+    let audit: Value = audit.json().await?;
+    let event = audit["events"]
+        .as_array()
+        .and_then(|events| {
+            events.iter().find(|event| {
+                event["eventType"] == "METADATA_EDITED" && event["targetId"] == fixture.movie_id
+            })
+        })
+        .ok_or("missing METADATA_EDITED audit event for the edited item")?;
+    assert_eq!(event["targetType"], "item");
+    assert_eq!(event["actorUserId"], fixture.admin.id.to_string());
+    assert_eq!(event["metadata"]["source"], "emby_item_update");
 
     Ok(())
 }
