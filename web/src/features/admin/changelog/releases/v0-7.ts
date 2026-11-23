@@ -2,6 +2,23 @@ import type { ChangelogRelease } from "../types";
 
 export const changelogReleases07: ChangelogRelease[] = [
   {
+    version: "0.7.25",
+    date: "2026-11-23",
+    sections: [
+      { kind: "added", items: [
+        "✨ feat(api): 客户端令牌能调管理接口了 — 管理员用用户级客户端令牌就能访问 /api/v1/admin/*、条目图片搜索/选中和元数据编辑，不用再带 Web Cookie 与 CSRF；/api/v1/auth/me 改成返回认证主体，管理入口按 canManageServer 判断。API Key 管理和注册审批这类高敏端点仍然只认 Web session。",
+        "✨ feat(api): 新增头像和会话自助接口 — GET|PUT /api/v1/auth/avatar 读写当前用户头像（只收原始图片，上限 5 MiB，不裁切）；GET /api/v1/auth/sessions 与 DELETE /api/v1/auth/sessions/{id} 同时管 Web 会话和客户端令牌会话，正在用的那个不能自己撤。资料、邮箱验证、账户偏好和改密都支持令牌，改密后只保留当前这个登录。",
+        "✨ feat(api): 新增 POST /api/v1/admin/libraries/scan — 一次给所有已启用媒体库排队扫描，已有任务会复用，返回 202 和任务列表。",
+        "✨ feat(emby): POST /Items/{id} 能编辑电影/剧集元数据了 — 支持名称、原始标题、简介、年份和字段锁，没传的字段保持原值、传 null 清空可选字段，不认识的字段忽略而不是整条拒绝；写回 NFO 并记审计，成功 204。以前这条只认人物，Yamby/Hills 的「编辑元数据」会报错。",
+        "✨ feat(emby): 条目图片能上传和按槽替换 — POST /Items/{id}/Images/{Type} 接受原始图片或 Base64（解码后上限 5 MiB），Backdrop 带索引时替换对应槽位而不是往后追加，单图类型的非零索引返回 404；DELETE 也接受不带 /Delete 的写法。",
+        "✨ feat(emby): 补齐 /Users/Me、纯 ProviderIds 的远程搜索，以及 /Sessions 与停止播放的管理权限（改用 canManageServer，和 Lux 会话页一致）。",
+      ] },
+      { kind: "fixed", items: [
+        "🐛 fix(emby): 图片上传与编辑的评审修正 — 带索引的上传不再因路径段数报错；标准 DTO 回显的 LockData: false、LockedFields: [] 不再清掉管理员设的字段锁（Emby 侧只增不减），未改动字段的来源不会被降级；没带 Type 的人物编辑不再撞上媒体编辑的 403/404。",
+      ] },
+    ],
+  },
+  {
     version: "0.7.24",
     date: "2026-11-23",
     sections: [

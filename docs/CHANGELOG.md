@@ -8,6 +8,58 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 >
 > 发版时两处都要改：本文档，以及应用内「设置 → 更新日志」页面使用的内置列表：新版本条目追加到 `web/src/features/admin/changelog/releases/` 下对应大版本的文件（如 `v0-7.ts`）；新大版本需新增文件，并在 `releases/index.ts` 中按倒序插入（该页面不读取本文件）。
 
+## [0.7.25] - 2026-11-23
+
+这版把用户级客户端令牌扶正成一条完整的登录方式：管理员的令牌能调管理接口，普通用户的令牌能改资料、换头像、管设备。
+Emby 兼容层补上了第三方客户端真正会点的编辑入口——条目元数据编辑、图片上传与按槽替换，以及只给 `ProviderIds` 的
+远程搜索。
+
+### ✨ feat
+
+* **api:** 用户级客户端令牌可以调用管理接口，自助接口全面支持
+
+  `GET /api/v1/auth/me` 改为返回当前认证主体（普通用户回 `user`，共享管理员 API Key 回 `principal`），客户端判断管理入口
+  应以 `canManageServer` 为准。拥有该权限的用户级客户端令牌现在能直接调用 `/api/v1/admin/*`、条目图片搜索与选中、条目
+  元数据 `PATCH`，不再需要 Web Cookie 和 CSRF；`/api/v1/admin/api-key*` 与注册审批等高敏端点仍只接受管理员 Web session。
+
+* **api:** 头像、设备会话与改密的自助接口
+
+  新增 `GET|PUT /api/v1/auth/avatar`：只接受原始图片字节（按 magic bytes 校验，上限 5 MiB，不裁切不缩放），未设置时返回 404。
+  `GET /api/v1/auth/sessions` 与 `DELETE /api/v1/auth/sessions/{sessionId}` 现在同时覆盖 Web 会话与客户端令牌会话，正在使用的
+  那个不能自我撤销（400）。资料、邮箱验证、账户偏好和改密接口都接受客户端令牌；改密后保留发起请求的当前会话或令牌，
+  其余 Web 会话与客户端令牌立即吊销。
+
+* **api:** 新增 `POST /api/v1/admin/libraries/scan`，一次为所有已启用媒体库排队扫描（已有活动任务则复用），成功返回 202
+  与任务列表，并记录 `SCAN_STARTED` 审计。
+
+* **emby:** `POST /Items/{id}` 可以编辑媒体条目元数据
+
+  人物编辑保持原样；电影、剧集、季度、分集走媒体编辑，要求服务器管理权限。接受 `Name`、`OriginalTitle`、`Overview`、
+  `ProductionYear`、`LockData`、`LockedFields`（PascalCase/camelCase 都认），缺失键保留原值、显式 `null` 清空可选字段，
+  未建模字段（`Genres`/`Studios`/`People` 等）忽略而不是整条拒绝。写入复用 Lux 管理端的元数据用例，NFO 写回与
+  400/403/404/413/422/503 映射一致，成功返回 204 并记录 `METADATA_EDITED` 审计。
+
+* **emby:** 条目图片可以上传，也可以按槽位原地替换
+
+  `POST /Items/{itemId}/Images/{Type}` 与带索引写法同时接受原始图片和 Base64 文本（解码后上限 5 MiB，路由层预留 4/3 膨胀
+  与折行余量），媒体条目要求 `canManageServer`；`Backdrop`/`Fanart` 带索引时替换指定槽位而不是追加，单图类型 `index > 0`
+  返回 404。`DELETE /Items/{itemId}/Images/{Type}/{Index}` 增加了不带 `/Delete` 后缀的写法。
+
+* **emby:** 其它兼容补齐
+
+  `GET /Users/Me` 返回当前令牌对应的用户 DTO（未带用户级令牌或账号已禁用返回 401）；`POST /Items/RemoteSearch/{Movie|Series}`
+  在只提供 `ProviderIds` 时走精确 ID 直查，同时给名称与 ID 时仍按名称搜索并把 ID 命中的候选置顶；`GET /Sessions` 与
+  `POST /Sessions/{id}/Playing/Stop` 改用 `canManageServer`，与 Lux 自己的会话页权限一致。
+
+### 🐛 fix
+
+* **emby:** 图片上传与条目编辑的评审修正
+
+  带索引的上传此前会因为路径段数不符直接失败，现在正确解析三段路径并校验索引；标准 DTO 回显的
+  `LockData: false, LockedFields: []` 不再清掉管理员在 Lux 设的字段锁——Emby 侧字段锁只增不减，`LockData: true` 才锁全部
+  四个可编辑字段；未被改动的字段保留原有 `provenance`，不会降级成 `LocalNfo`；请求没带 `Type` 时按内部 ID 区别人物与媒体
+  条目，历史人物编辑不再撞上媒体编辑的 403/404。
+
 ## [0.7.24] - 2026-11-23
 
 这版改的是「最近添加」的排序直觉：剧集不再按第一次入库的时间钉在原地，而是跟着最新一集走；首页轮播接口也顺带
