@@ -3642,6 +3642,30 @@ impl MetadataWriteService {
         item_id: &str,
         request: MetadataWriteRequest,
     ) -> Result<MetadataWriteResult, NfoWriteError> {
+        self.write_item_metadata_with_options(item_id, request, false)
+            .await
+    }
+
+    /// Partial metadata write for editors that echo the whole item back (Emby `POST /Items/{Id}`).
+    ///
+    /// A client that echoes an unchanged field did not edit it, so its stored provenance survives.
+    /// Without this, every save from an Emby client would demote fields it never touched from the
+    /// source that filled them (`ScraperLocalized`, `Fallback`, ...) to `LocalNfo`.
+    pub async fn write_partial_item_metadata(
+        &self,
+        item_id: &str,
+        request: MetadataWriteRequest,
+    ) -> Result<MetadataWriteResult, NfoWriteError> {
+        self.write_item_metadata_with_options(item_id, request, true)
+            .await
+    }
+
+    async fn write_item_metadata_with_options(
+        &self,
+        item_id: &str,
+        request: MetadataWriteRequest,
+        preserve_unchanged_provenance: bool,
+    ) -> Result<MetadataWriteResult, NfoWriteError> {
         let current = self
             .database
             .find_media_item_metadata(item_id)
@@ -3668,18 +3692,20 @@ impl MetadataWriteService {
             ));
         }
 
+        let previous = NfoMetadata {
+            title: Some(current.title),
+            original_title: current.original_title,
+            overview: current.overview,
+            production_year: current
+                .production_year
+                .and_then(|year| i32::try_from(year).ok()),
+        };
         let mut state = MetadataState::from_persisted(
-            NfoMetadata {
-                title: Some(current.title),
-                original_title: current.original_title,
-                overview: current.overview,
-                production_year: current
-                    .production_year
-                    .and_then(|year| i32::try_from(year).ok()),
-            },
+            previous.clone(),
             current.provenance_json.as_deref(),
             current.locked_fields_json.as_deref(),
         );
+        let previous_locked_fields = state.locked_fields.clone();
         state.metadata = NfoMetadata {
             title: Some(std::mem::take(&mut title)),
             original_title: original_title.clone(),
@@ -3693,6 +3719,15 @@ impl MetadataWriteService {
             MetadataField::Overview,
             MetadataField::ProductionYear,
         ] {
+            // A partial write keeps the stored source of a field whose value and lock state did
+            // not change, so an echoed but untouched field is not demoted to `LocalNfo`.
+            let unchanged = preserve_unchanged_provenance
+                && metadata_field_value_unchanged(field, &state.metadata, &previous)
+                && state.locked_fields.contains(&field) == previous_locked_fields.contains(&field)
+                && state.provenance.contains_key(&field);
+            if unchanged {
+                continue;
+            }
             let has_value = match field {
                 MetadataField::Title => state.metadata.title.is_some(),
                 MetadataField::OriginalTitle => state.metadata.original_title.is_some(),
@@ -3734,6 +3769,23 @@ impl MetadataWriteService {
             production_year: state.metadata.production_year,
             locked_fields: state.locked_fields,
         })
+    }
+}
+
+/// Whether `next` carries the same value as `previous` for one editable metadata field.
+///
+/// The caller passes values that already went through the same normalization as a stored item, so
+/// equal values mean the write did not touch the field.
+fn metadata_field_value_unchanged(
+    field: MetadataField,
+    next: &NfoMetadata,
+    previous: &NfoMetadata,
+) -> bool {
+    match field {
+        MetadataField::Title => next.title == previous.title,
+        MetadataField::OriginalTitle => next.original_title == previous.original_title,
+        MetadataField::Overview => next.overview == previous.overview,
+        MetadataField::ProductionYear => next.production_year == previous.production_year,
     }
 }
 

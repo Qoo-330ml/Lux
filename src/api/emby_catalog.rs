@@ -3163,56 +3163,56 @@ fn emby_optional_year_field(
     }
 }
 
-/// Resolves the lock request of an Emby `BaseItemDto` into the Lux field locks.
+/// Resolves the lock request of an Emby `BaseItemDto` on top of the locks already stored on the
+/// item.
 ///
-/// Emby's own item DTO always serializes `LockData: false` with `LockedFields: []`, so a client
-/// echoing an unmodified DTO would otherwise wipe every lock an administrator set in Lux. An empty
-/// or missing list therefore keeps the stored locks unless the client explicitly asks for
-/// `LockData: true`, which Emby defines as "lock every editable field". A non-empty list is an
-/// explicit field-level choice and replaces the stored locks.
+/// Emby's own item DTO always serializes `LockData: false` with `LockedFields: []`, and it never
+/// reports the locks an administrator set in Lux, so an echoed DTO must not be able to unlock
+/// them. Field locks are therefore only ever additive from this endpoint:
+///
+/// - `LockData: true` is Emby's "lock everything" and wins over `LockedFields`, so all four
+///   editable fields are locked whatever field list the client sent.
+/// - Otherwise a `LockedFields` list is unioned with the stored locks: a client that cannot see an
+///   existing `overview` lock must not silently drop it when it saves a `Name`/`ProductionYear`
+///   edit, and the same list never removes a lock either.
+/// - A missing, empty or entirely unmodelled list keeps the stored locks unchanged.
 ///
 /// Emby's `MetadataFields` enum is longer than the set Lux tracks (`Genres`, `Tags`, `Studios`,
 /// `Cast`, `OfficialRating`, ...). Those members are accepted and dropped: Lux never overwrites
 /// them automatically, so refusing the whole edit over an unmodelled lock would only break stock
 /// clients.
-///
-/// `Ok(None)` means "keep the locks already stored on the item".
 fn emby_locked_metadata_fields(
     body: &Value,
-) -> Result<Option<BTreeSet<MetadataField>>, StatusCode> {
+    stored: &BTreeSet<MetadataField>,
+) -> Result<BTreeSet<MetadataField>, StatusCode> {
     let lock_data = match emby_body_field(body, "LockData", "lockData") {
         None | Some(Value::Null) => None,
         Some(Value::Bool(lock_data)) => Some(*lock_data),
         Some(_) => return Err(StatusCode::BAD_REQUEST),
     };
     let requested = match emby_body_field(body, "LockedFields", "lockedFields") {
-        None => None,
-        Some(Value::Array(entries)) if entries.is_empty() => None,
-        Some(Value::Array(entries)) => Some(
-            entries
-                .iter()
-                .filter_map(Value::as_str)
-                .filter_map(emby_locked_metadata_field)
-                .collect::<BTreeSet<_>>(),
-        ),
+        None => BTreeSet::new(),
+        Some(Value::Array(entries)) => entries
+            .iter()
+            .filter_map(Value::as_str)
+            .filter_map(emby_locked_metadata_field)
+            .collect::<BTreeSet<_>>(),
         Some(_) => return Err(StatusCode::BAD_REQUEST),
     };
-    if requested.is_some() {
-        return Ok(requested);
-    }
     if lock_data == Some(true) {
-        return Ok(Some(
-            [
-                MetadataField::Title,
-                MetadataField::OriginalTitle,
-                MetadataField::Overview,
-                MetadataField::ProductionYear,
-            ]
-            .into_iter()
-            .collect(),
-        ));
+        return Ok([
+            MetadataField::Title,
+            MetadataField::OriginalTitle,
+            MetadataField::Overview,
+            MetadataField::ProductionYear,
+        ]
+        .into_iter()
+        .collect());
     }
-    Ok(None)
+    if requested.is_empty() {
+        return Ok(stored.clone());
+    }
+    Ok(stored.union(&requested).copied().collect())
 }
 
 fn emby_locked_metadata_field(name: &str) -> Option<MetadataField> {
@@ -3230,7 +3230,7 @@ fn emby_locked_metadata_field(name: &str) -> Option<MetadataField> {
     }
 }
 
-/// The locks already stored on the item, so an edit that omits `LockedFields` keeps them.
+/// The locks already stored on the item, the base an Emby edit can only extend.
 fn stored_locked_metadata_fields(raw: Option<&str>) -> BTreeSet<MetadataField> {
     raw.and_then(|raw| serde_json::from_str::<BTreeSet<MetadataField>>(raw).ok())
         .unwrap_or_default()
@@ -3316,14 +3316,16 @@ async fn emby_update_media_item(
         Ok(Some(value)) => value,
         Err(status) => return status.into_response(),
     };
-    let locked_fields = match emby_locked_metadata_fields(body) {
-        Ok(Some(fields)) => fields,
-        Ok(None) => stored_locked_metadata_fields(current.locked_fields_json.as_deref()),
+    let locked_fields = match emby_locked_metadata_fields(
+        body,
+        &stored_locked_metadata_fields(current.locked_fields_json.as_deref()),
+    ) {
+        Ok(fields) => fields,
         Err(status) => return status.into_response(),
     };
     let writes = state.metadata_writes();
     match writes
-        .write_item_metadata(
+        .write_partial_item_metadata(
             internal_id,
             MetadataWriteRequest {
                 title,

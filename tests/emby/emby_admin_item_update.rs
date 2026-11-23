@@ -937,3 +937,150 @@ async fn successful_media_edit_records_the_metadata_edited_audit_event()
 
     Ok(())
 }
+
+#[tokio::test]
+async fn lock_data_and_locked_fields_are_additive_to_stored_locks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture().await?;
+    let client = test_client();
+    let admin_token = emby_token(
+        &client,
+        &fixture.base_url,
+        "admin",
+        "correct password",
+        "admin-device",
+    )
+    .await?;
+    let update = |body: Value| {
+        client
+            .post(format!(
+                "{}/emby/Items/{}",
+                fixture.base_url, fixture.movie_public_id
+            ))
+            .header("X-Emby-Token", &admin_token)
+            .json(&body)
+    };
+
+    let locked = update(json!({
+        "Name": "Additive Locks",
+        "LockedFields": ["Name", "Overview"]
+    }))
+    .send()
+    .await?;
+    assert_eq!(locked.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        stored_item(&fixture.database, &fixture.movie_id)
+            .await?
+            .locked_fields,
+        vec!["title", "overview"]
+    );
+
+    // Unmodelled Emby locks (`Genres`) neither add nor remove anything in Lux.
+    let unmodelled = update(json!({
+        "Name": "Additive Locks",
+        "ProductionYear": 2018,
+        "LockData": false,
+        "LockedFields": ["Genres"]
+    }))
+    .send()
+    .await?;
+    assert_eq!(unmodelled.status(), reqwest::StatusCode::NO_CONTENT);
+    let stored = stored_item(&fixture.database, &fixture.movie_id).await?;
+    assert_eq!(stored.production_year, Some(2018));
+    assert_eq!(stored.locked_fields, vec!["title", "overview"]);
+
+    // A modelled lock is additive: the client cannot see the Lux `overview` lock in the Emby DTO,
+    // so adding `productionYear` must not drop it.
+    let added = update(json!({
+        "Name": "Additive Locks",
+        "LockData": false,
+        "LockedFields": ["ProductionYear"]
+    }))
+    .send()
+    .await?;
+    assert_eq!(added.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        stored_item(&fixture.database, &fixture.movie_id)
+            .await?
+            .locked_fields,
+        vec!["title", "overview", "productionYear"]
+    );
+
+    // `LockData: true` locks every editable field no matter what `LockedFields` says.
+    let fully_locked = update(json!({
+        "Name": "Additive Locks",
+        "LockData": true,
+        "LockedFields": ["Genres"]
+    }))
+    .send()
+    .await?;
+    assert_eq!(fully_locked.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        stored_item(&fixture.database, &fixture.movie_id)
+            .await?
+            .locked_fields,
+        vec!["title", "originalTitle", "overview", "productionYear"]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn partial_edit_keeps_unchanged_field_provenance() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture().await?;
+    let client = test_client();
+    let admin_token = emby_token(
+        &client,
+        &fixture.base_url,
+        "admin",
+        "correct password",
+        "admin-device",
+    )
+    .await?;
+
+    // A scraped overview and a fallback title: only the title is edited below.
+    sqlx::query(
+        "UPDATE media_items
+         SET overview = 'Scraped overview',
+             metadata_provenance_json = '{\"title\":\"FALLBACK\",\"overview\":\"SCRAPER_LOCALIZED\"}'
+         WHERE id = ?",
+    )
+    .bind(&fixture.movie_id)
+    .execute(fixture.database.pool())
+    .await?;
+
+    let updated = client
+        .post(format!(
+            "{}/emby/Items/{}",
+            fixture.base_url, fixture.movie_public_id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .json(&json!({
+            "Id": fixture.movie_public_id,
+            "Type": "Movie",
+            "Name": "Renamed By Emby",
+            "Overview": "Scraped overview",
+            "LockData": false,
+            "LockedFields": []
+        }))
+        .send()
+        .await?;
+    assert_eq!(updated.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let stored = stored_item(&fixture.database, &fixture.movie_id).await?;
+    assert_eq!(stored.title, "Renamed By Emby");
+    assert_eq!(stored.overview.as_deref(), Some("Scraped overview"));
+
+    let provenance_json: Option<String> =
+        sqlx::query_scalar("SELECT metadata_provenance_json FROM media_items WHERE id = ?")
+            .bind(&fixture.movie_id)
+            .fetch_one(fixture.database.pool())
+            .await?;
+    let provenance: Value =
+        serde_json::from_str(provenance_json.as_deref().ok_or("missing provenance")?)?;
+    // The untouched overview keeps the source that filled it; only the edited title is demoted.
+    assert_eq!(provenance["overview"], "SCRAPER_LOCALIZED");
+    assert_eq!(provenance["title"], "LOCAL_NFO");
+
+    Ok(())
+}
