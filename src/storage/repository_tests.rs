@@ -4862,6 +4862,87 @@ async fn postgres_notification_deliveries_are_written_in_bounded_batches()
 }
 
 #[tokio::test]
+async fn notification_delivery_queries_use_database_placeholder_adapter()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert!(
+        !include_str!("notifications.rs").contains("sqlx::query"),
+        "all queries in notifications.rs must go through Database::query* so PostgreSQL placeholders are rewritten"
+    );
+
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let destination_id = "adapted-delivery-destination";
+    database
+        .notifications()
+        .create_notification_destination(NewNotificationDestination {
+            id: destination_id,
+            name: "Adapted Delivery",
+            url: "https://example.test/webhook",
+            enabled: true,
+            allow_private_network: false,
+            event_types_json: "[]",
+            payload_format: "LUX",
+            provider_plugin_id: "builtin.webhook",
+            provider_config_json: "{}",
+        })
+        .await?;
+    database
+        .notifications()
+        .insert_notification_event_with_deliveries(
+            NewNotificationEvent {
+                id: "adapted-delivery-event",
+                event_type: "SCAN_COMPLETED",
+                schema_version: 1,
+                occurred_at: 1_800_000_000,
+                dedupe_key: "adapted-delivery-key",
+                payload_json: "{}",
+            },
+            &[destination_id.to_owned()],
+        )
+        .await?;
+
+    database.reset_query_count();
+    let total = database
+        .notifications()
+        .count_notification_deliveries(None, None)
+        .await?;
+    assert_eq!(total, 1);
+    assert_eq!(
+        database.query_count(),
+        1,
+        "count_notification_deliveries must route through Database::query_scalar"
+    );
+
+    let deliveries = database
+        .notifications()
+        .list_notification_deliveries(0, 20, None, None)
+        .await?;
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(database.query_count(), 2);
+
+    let filtered_total = database
+        .notifications()
+        .count_notification_deliveries(Some("PENDING"), Some(destination_id))
+        .await?;
+    assert_eq!(filtered_total, 1);
+    assert_eq!(database.query_count(), 3);
+
+    let filtered_deliveries = database
+        .notifications()
+        .list_notification_deliveries(0, 20, Some("PENDING"), Some(destination_id))
+        .await?;
+    assert_eq!(filtered_deliveries.len(), 1);
+    assert_eq!(database.query_count(), 4);
+
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn progressive_scan_metadata_backfill_is_bounded_recoverable_and_root_scoped() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

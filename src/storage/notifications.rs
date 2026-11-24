@@ -343,17 +343,18 @@ impl NotificationsRepo<'_> {
         status: Option<&str>,
         destination_id: Option<&str>,
     ) -> Result<i64, StorageError> {
-        sqlx::query_scalar(
-            "SELECT COUNT(*) FROM notification_deliveries d
+        self.db
+            .query_scalar(
+                "SELECT COUNT(*) FROM notification_deliveries d
              WHERE (? IS NULL OR d.status = ?) AND (? IS NULL OR d.destination_id = ?)",
-        )
-        .bind(status)
-        .bind(status)
-        .bind(destination_id)
-        .bind(destination_id)
-        .fetch_one(&self.db.pool)
-        .await
-        .map_err(self.db.sqlx_err())
+            )
+            .bind(status)
+            .bind(status)
+            .bind(destination_id)
+            .bind(destination_id)
+            .fetch_one(&self.db.pool)
+            .await
+            .map_err(self.db.sqlx_err())
     }
 
     pub(crate) async fn claim_notification_delivery(
