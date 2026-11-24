@@ -3528,7 +3528,13 @@ impl NfoWriteService {
         &self,
         item_id: &str,
     ) -> Result<Option<LocalNfoProjection>, NfoWriteError> {
-        let target = self.item_nfo_target(item_id).await?;
+        let target = match self.item_nfo_target(item_id).await {
+            Ok(target) => target,
+            // A missing/merged source or a series whose episodes sit directly under the library
+            // root has no sidecar NFO target to read.
+            Err(NfoWriteError::ItemNotFound) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         self.read_item_projection_at_target(&target).await
     }
 
@@ -3563,18 +3569,11 @@ impl NfoWriteService {
         context: &StoredMediaWritebackContext,
         cache: &LocalNfoProjectionCache,
     ) -> Result<(Option<LocalNfoProjection>, bool), NfoWriteError> {
-        let source = context.source.as_ref().ok_or(NfoWriteError::ItemNotFound)?;
-        let target = match self
-            .item_nfo_target_from_source(&context.item_type, season_number, source)
-            .await
-        {
-            Ok(target) => target,
-            // A series whose episodes sit directly under the library root has no per-series
-            // directory for `tvshow.nfo`.
-            Err(NfoWriteError::ItemNotFound) if context.item_type == "SERIES" => {
-                return Ok((None, false));
-            }
-            Err(error) => return Err(error),
+        let Some(target) = self
+            .resolve_writeback_projection_target(season_number, context)
+            .await?
+        else {
+            return Ok((None, false));
         };
         let cell = {
             let mut entries = cache.entries.lock().await;
@@ -3603,20 +3602,31 @@ impl NfoWriteService {
         season_number: Option<i64>,
         context: &crate::storage::StoredMediaWritebackContext,
     ) -> Result<Option<LocalNfoProjection>, NfoWriteError> {
-        let source = context.source.as_ref().ok_or(NfoWriteError::ItemNotFound)?;
-        let target = match self
+        let Some(target) = self
+            .resolve_writeback_projection_target(season_number, context)
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.read_item_projection_at_target(&target).await
+    }
+
+    async fn resolve_writeback_projection_target(
+        &self,
+        season_number: Option<i64>,
+        context: &StoredMediaWritebackContext,
+    ) -> Result<Option<PathBuf>, NfoWriteError> {
+        let Some(source) = context.source.as_ref() else {
+            return Ok(None);
+        };
+        match self
             .item_nfo_target_from_source(&context.item_type, season_number, source)
             .await
         {
-            Ok(target) => target,
-            // A series whose episodes sit directly under the library root has no per-series
-            // directory for `tvshow.nfo`.
-            Err(NfoWriteError::ItemNotFound) if context.item_type == "SERIES" => {
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
-        };
-        self.read_item_projection_at_target(&target).await
+            Ok(target) => Ok(Some(target)),
+            Err(NfoWriteError::ItemNotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     async fn read_item_projection_at_target(
@@ -5575,6 +5585,104 @@ mod tests {
             .read_item_projection_with_writeback_context(None, &root_context)
             .await?;
         assert!(root_uncached.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_item_projection_returns_none_for_root_series_and_missing_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let shows_root = directory.path().join("Shows");
+        let movies_root = directory.path().join("Movies");
+        let movie_dir = movies_root.join("Missing Source (2020)");
+        fs::create_dir_all(&shows_root).await?;
+        fs::create_dir_all(&movie_dir).await?;
+        fs::write(
+            shows_root.join("Stray.S01E01.strm"),
+            b"http://example.invalid/stray\n",
+        )
+        .await?;
+        fs::write(movie_dir.join("Missing.Source.2020.mkv"), b"movie").await?;
+
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let shows_lib = libraries
+            .create_library("Shows", LibraryKind::Series, false)
+            .await?;
+        libraries
+            .add_root(shows_lib.id, shows_root.to_str().ok_or("non-utf8 root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_series_library(shows_lib.id)
+            .await?;
+        let series_id: String = sqlx::query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'SERIES' LIMIT 1",
+        )
+        .bind(shows_lib.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+
+        let movies_lib = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(movies_lib.id, movies_root.to_str().ok_or("non-utf8 root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(movies_lib.id)
+            .await?;
+        let movie_id: String = sqlx::query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' LIMIT 1",
+        )
+        .bind(movies_lib.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE filesystem_entries
+             SET is_missing = 1
+             WHERE id IN (SELECT filesystem_entry_id FROM media_sources WHERE item_id = ?)",
+        )
+        .bind(&movie_id)
+        .execute(database.pool())
+        .await?;
+
+        let writer = NfoWriteService::new(database);
+        assert!(writer.read_item_projection(&series_id).await?.is_none());
+        assert!(writer.read_item_projection(&movie_id).await?.is_none());
+
+        let missing_context = StoredMediaWritebackContext {
+            item_type: "MOVIE".to_owned(),
+            source: None,
+        };
+        let cache = LocalNfoProjectionCache::default();
+        assert!(
+            writer
+                .read_item_projection_with_writeback_context(None, &missing_context)
+                .await?
+                .is_none()
+        );
+        assert_eq!(
+            writer
+                .read_item_projection_with_writeback_context_cached(None, &missing_context, &cache)
+                .await?,
+            (None, false)
+        );
+        assert!(matches!(
+            writer
+                .write_item_series_nfo(&series_id, &super::MovieNfoMetadata::default())
+                .await,
+            Err(NfoWriteError::ItemNotFound)
+        ));
+        assert!(matches!(
+            writer
+                .write_item_nfo(&movie_id, &super::NfoMetadata::default())
+                .await,
+            Err(NfoWriteError::ItemNotFound)
+        ));
         Ok(())
     }
 }
