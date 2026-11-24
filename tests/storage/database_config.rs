@@ -27,7 +27,13 @@ fn postgres_configuration() -> DatabaseConfiguration {
 fn permissions(path: &Path) -> Result<u32, Box<dyn std::error::Error>> {
     use std::os::unix::fs::PermissionsExt;
 
-    Ok(std::fs::metadata(path)?.permissions().mode() & 0o777)
+    Ok(std::fs::metadata(path)?.permissions().mode() & 0o7777)
+}
+
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    // SAFETY: `geteuid` takes no arguments, cannot fail, and only reads process credentials.
+    unsafe { libc::geteuid() == 0 }
 }
 
 #[cfg(unix)]
@@ -223,6 +229,12 @@ async fn world_writable_config_directory_is_tightened_before_writing()
 async fn failed_save_keeps_previous_configuration_and_removes_temporary_files()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::os::unix::fs::PermissionsExt;
+
+    if running_as_root() {
+        // Root bypasses the directory mode, so 0500 cannot provoke a write failure. The
+        // uid-independent rename-failure test and the unit-test injected failures cover cleanup.
+        return Ok(());
+    }
 
     let temp_dir = tempfile::tempdir()?;
     let config = config(&temp_dir.path().join("config"));

@@ -280,15 +280,22 @@ fn write_private_file_atomically(target: &Path, temporary: &Path, bytes: &[u8]) 
         }
         file.write_all(bytes)?;
         #[cfg(test)]
-        maybe_fail_at(AtomicWriteFailure::BeforeSync)?;
+        maybe_fail_at(InjectedFailure::BeforeFileSync)?;
         file.sync_all()?;
         drop(file);
         #[cfg(test)]
-        maybe_fail_at(AtomicWriteFailure::BeforeRename)?;
+        maybe_fail_at(InjectedFailure::BeforeRename)?;
         std::fs::rename(temporary, target)?;
         #[cfg(unix)]
-        if let Some(parent) = target.parent() {
-            std::fs::File::open(parent)?.sync_all()?;
+        if let Some(parent) = target.parent()
+            && let Err(source) = sync_directory(parent)
+        {
+            tracing::warn!(
+                path = %parent.display(),
+                kind = ?source.kind(),
+                "failed to sync the parent directory after writing the database configuration; \
+                 the file was renamed successfully"
+            );
         }
         Ok(())
     })();
@@ -299,9 +306,19 @@ fn write_private_file_atomically(target: &Path, temporary: &Path, bytes: &[u8]) 
     result
 }
 
+#[cfg(unix)]
+fn sync_directory(directory: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    maybe_fail_at(InjectedFailure::BeforeDirectorySync)?;
+    std::fs::File::open(directory)?.sync_all()
+}
+
 /// Creates the configuration directory as owner-only when this process has to create it. Existing
 /// directories keep their host-provided permissions (Docker and NAS mounts commonly arrive as
-/// 0755), except that world-writable directories lose shared write access.
+/// 0755), except that world-writable directories are tightened on a best-effort basis: a host
+/// mount this process cannot chmod must not stop the server from persisting its configuration.
+/// Sticky world-writable directories are left untouched because the sticky bit protects entries
+/// from other users, and system-style shared directories rely on that mode.
 fn prepare_private_config_directory(config_dir: &Path) -> io::Result<()> {
     match std::fs::metadata(config_dir) {
         Ok(metadata) => {
@@ -333,13 +350,36 @@ fn restrict_shared_write_access(config_dir: &Path) -> io::Result<()> {
 
     let permissions = std::fs::metadata(config_dir)?.permissions();
     let mode = permissions.mode();
-    if mode & 0o002 != 0 && mode & 0o1000 == 0 {
-        std::fs::set_permissions(
-            config_dir,
-            std::fs::Permissions::from_mode((mode & 0o7777) & !0o022),
-        )?;
+    if mode & 0o002 == 0 {
+        return Ok(());
+    }
+    if mode & 0o1000 != 0 {
+        tracing::warn!(
+            path = %config_dir.display(),
+            mode = %format!("{:o}", mode & 0o7777),
+            "database configuration directory is sticky and world-writable; keeping its \
+             host-provided permissions"
+        );
+        return Ok(());
+    }
+    if let Err(source) = tighten_directory_permissions(config_dir, (mode & 0o7777) & !0o022) {
+        tracing::warn!(
+            path = %config_dir.display(),
+            kind = ?source.kind(),
+            "failed to tighten a world-writable database configuration directory; continuing \
+             with its host-provided permissions"
+        );
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn tighten_directory_permissions(config_dir: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(test)]
+    maybe_fail_at(InjectedFailure::BeforeDirectoryTightening)?;
+    std::fs::set_permissions(config_dir, std::fs::Permissions::from_mode(mode))
 }
 
 #[cfg(not(unix))]
@@ -349,19 +389,21 @@ fn restrict_shared_write_access(_config_dir: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum AtomicWriteFailure {
-    BeforeSync,
+enum InjectedFailure {
+    BeforeFileSync,
     BeforeRename,
+    BeforeDirectorySync,
+    BeforeDirectoryTightening,
 }
 
 #[cfg(test)]
 thread_local! {
-    static INJECTED_FAILURE: std::cell::Cell<Option<AtomicWriteFailure>> =
+    static INJECTED_FAILURE: std::cell::Cell<Option<InjectedFailure>> =
         const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
-fn maybe_fail_at(point: AtomicWriteFailure) -> io::Result<()> {
+fn maybe_fail_at(point: InjectedFailure) -> io::Result<()> {
     if INJECTED_FAILURE.with(std::cell::Cell::get) == Some(point) {
         return Err(io::Error::other(
             "injected database configuration write failure",
@@ -433,7 +475,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        AtomicWriteFailure, INJECTED_FAILURE, prepare_private_config_directory,
+        INJECTED_FAILURE, InjectedFailure, prepare_private_config_directory,
         write_private_file_atomically,
     };
 
@@ -441,7 +483,7 @@ mod tests {
     fn permissions(path: &Path) -> Result<u32, Box<dyn std::error::Error>> {
         use std::os::unix::fs::PermissionsExt;
 
-        Ok(std::fs::metadata(path)?.permissions().mode() & 0o777)
+        Ok(std::fs::metadata(path)?.permissions().mode() & 0o7777)
     }
 
     #[test]
@@ -476,7 +518,7 @@ mod tests {
     }
 
     fn assert_injected_failure_keeps_previous_file(
-        failure: AtomicWriteFailure,
+        failure: InjectedFailure,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let target = directory.path().join("database.json");
@@ -495,12 +537,68 @@ mod tests {
 
     #[test]
     fn atomic_write_cleans_up_after_a_write_failure() -> Result<(), Box<dyn std::error::Error>> {
-        assert_injected_failure_keeps_previous_file(AtomicWriteFailure::BeforeSync)
+        assert_injected_failure_keeps_previous_file(InjectedFailure::BeforeFileSync)
     }
 
     #[test]
     fn atomic_write_cleans_up_after_a_rename_failure() -> Result<(), Box<dyn std::error::Error>> {
-        assert_injected_failure_keeps_previous_file(AtomicWriteFailure::BeforeRename)
+        assert_injected_failure_keeps_previous_file(InjectedFailure::BeforeRename)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_installs_the_file_when_parent_directory_sync_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let target = directory.path().join("database.json");
+        let temporary = directory.path().join(".database.json.test.tmp");
+        INJECTED_FAILURE.with(|injected| injected.set(Some(InjectedFailure::BeforeDirectorySync)));
+
+        let result = write_private_file_atomically(&target, &temporary, b"replacement");
+        INJECTED_FAILURE.with(|injected| injected.set(None));
+
+        assert!(result.is_ok());
+        assert_eq!(std::fs::read(&target)?, b"replacement");
+        assert!(!temporary.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_directory_tightening_does_not_block_configuration_writes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir()?;
+        let config_dir = directory.path().join("config");
+        std::fs::create_dir(&config_dir)?;
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o777))?;
+        INJECTED_FAILURE
+            .with(|injected| injected.set(Some(InjectedFailure::BeforeDirectoryTightening)));
+
+        let result = prepare_private_config_directory(&config_dir);
+        INJECTED_FAILURE.with(|injected| injected.set(None));
+
+        assert!(result.is_ok());
+        assert_eq!(permissions(&config_dir)?, 0o777);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sticky_world_writable_config_directory_keeps_host_permissions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir()?;
+        let config_dir = directory.path().join("config");
+        std::fs::create_dir(&config_dir)?;
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o1777))?;
+
+        prepare_private_config_directory(&config_dir)?;
+
+        assert_eq!(permissions(&config_dir)?, 0o1777);
+        Ok(())
     }
 
     #[cfg(unix)]
