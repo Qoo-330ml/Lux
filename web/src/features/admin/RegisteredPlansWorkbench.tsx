@@ -52,7 +52,47 @@ function buildCronPresets(allowEmpty: boolean): Array<{ label: string; cron: str
   return presets;
 }
 
-/** Formats a 5-field UTC Cron expression into local-time readable copy. */
+function parseCronInteger(text: string, minimum: number, maximum: number): number | null {
+  if (!/^\d+$/.test(text)) return null;
+  const value = Number(text);
+  if (!Number.isInteger(value) || value < minimum || value > maximum) return null;
+  return value;
+}
+
+function isValidCronField(field: string, minimum: number, maximum: number): boolean {
+  if (!field) return false;
+  for (const item of field.split(",")) {
+    if (!item) return false;
+    const slashIndex = item.indexOf("/");
+    let range = item;
+    let hasStep = false;
+    if (slashIndex !== -1) {
+      if (item.indexOf("/", slashIndex + 1) !== -1) return false;
+      range = item.slice(0, slashIndex);
+      const stepText = item.slice(slashIndex + 1);
+      const step = parseCronInteger(stepText, 1, 255);
+      if (step === null) return false;
+      hasStep = true;
+    }
+    if (range === "*") continue;
+    const dashIndex = range.indexOf("-");
+    if (dashIndex !== -1) {
+      if (range.indexOf("-", dashIndex + 1) !== -1) return false;
+      const start = parseCronInteger(range.slice(0, dashIndex), minimum, maximum);
+      const end = parseCronInteger(range.slice(dashIndex + 1), minimum, maximum);
+      if (start === null || end === null || start > end) return false;
+      continue;
+    }
+    if (hasStep) {
+      if (parseCronInteger(range, minimum, maximum) === null) return false;
+      continue;
+    }
+    if (parseCronInteger(range, minimum, maximum) === null) return false;
+  }
+  return true;
+}
+
+/** Formats a 5-field UTC Cron expression into local-time readable copy and validates field ranges. */
 export function describeCronSchedule(cron?: string | null): CronDescription {
   const trimmed = cron?.trim() ?? "";
   if (!trimmed) {
@@ -73,6 +113,20 @@ export function describeCronSchedule(cron?: string | null): CronDescription {
     };
   }
   const [minute, hour, dayOfMonth, month, dayOfWeek] = parts;
+  if (
+    !isValidCronField(minute, 0, 59)
+    || !isValidCronField(hour, 0, 23)
+    || !isValidCronField(dayOfMonth, 1, 31)
+    || !isValidCronField(month, 1, 12)
+    || !isValidCronField(dayOfWeek, 0, 7)
+  ) {
+    return {
+      human: "Cron 字段格式或数值超出范围（分 0-59、时 0-23、日 1-31、月 1-12、周 0-7）",
+      sub: `当前输入：${trimmed}`,
+      localShort: trimmed,
+      valid: false,
+    };
+  }
   if (minute === "0" && /^\*\/([1-9]\d*)$/.test(hour) && dayOfMonth === "*" && month === "*" && dayOfWeek === "*") {
     const interval = hour.match(/^\*\/(\d+)$/)?.[1] ?? "";
     return {
@@ -85,34 +139,32 @@ export function describeCronSchedule(cron?: string | null): CronDescription {
   if (/^\d{1,2}$/.test(minute) && /^\d{1,2}$/.test(hour) && dayOfMonth === "*" && month === "*") {
     const utcMinute = Number(minute);
     const utcHour = Number(hour);
-    if (utcMinute >= 0 && utcMinute <= 59 && utcHour >= 0 && utcHour <= 23) {
-      const offsetMinutes = new Date().getTimezoneOffset(); // UTC - local in minutes
-      const localTotal = utcHour * 60 + utcMinute - offsetMinutes;
-      const dayShift = Math.floor(localTotal / 1440);
-      const normalizedLocal = ((localTotal % 1440) + 1440) % 1440;
-      const localHour = Math.floor(normalizedLocal / 60);
-      const localMinute = normalizedLocal % 60;
-      const localTime = `${String(localHour).padStart(2, "0")}:${String(localMinute).padStart(2, "0")}`;
-      const utcTime = `${String(utcHour).padStart(2, "0")}:${String(utcMinute).padStart(2, "0")}`;
-      const sameOffset = offsetMinutes === 0;
-      if (dayOfWeek === "*") {
-        return {
-          human: sameOffset ? `每天 ${localTime} (UTC)` : `每天 ${localTime} (本地)`,
-          sub: sameOffset ? trimmed : `UTC ${utcTime} · ${trimmed}`,
-          localShort: `每天 ${localTime}`,
-          valid: true,
-        };
-      }
-      if (/^[0-7]$/.test(dayOfWeek)) {
-        const utcDow = Number(dayOfWeek) === 7 ? 0 : Number(dayOfWeek);
-        const localDow = (((utcDow + dayShift) % 7) + 7) % 7;
-        return {
-          human: sameOffset ? `每${WEEKDAY_LABELS[localDow]} ${localTime} (UTC)` : `每${WEEKDAY_LABELS[localDow]} ${localTime} (本地)`,
-          sub: sameOffset ? trimmed : `UTC 每${WEEKDAY_LABELS[utcDow]} ${utcTime} · ${trimmed}`,
-          localShort: `每${WEEKDAY_LABELS[localDow]} ${localTime}`,
-          valid: true,
-        };
-      }
+    const offsetMinutes = new Date().getTimezoneOffset(); // UTC - local in minutes
+    const localTotal = utcHour * 60 + utcMinute - offsetMinutes;
+    const dayShift = Math.floor(localTotal / 1440);
+    const normalizedLocal = ((localTotal % 1440) + 1440) % 1440;
+    const localHour = Math.floor(normalizedLocal / 60);
+    const localMinute = normalizedLocal % 60;
+    const localTime = `${String(localHour).padStart(2, "0")}:${String(localMinute).padStart(2, "0")}`;
+    const utcTime = `${String(utcHour).padStart(2, "0")}:${String(utcMinute).padStart(2, "0")}`;
+    const sameOffset = offsetMinutes === 0;
+    if (dayOfWeek === "*") {
+      return {
+        human: sameOffset ? `每天 ${localTime} (UTC)` : `每天 ${localTime} (本地)`,
+        sub: sameOffset ? trimmed : `UTC ${utcTime} · ${trimmed}`,
+        localShort: `每天 ${localTime}`,
+        valid: true,
+      };
+    }
+    if (/^[0-7]$/.test(dayOfWeek)) {
+      const utcDow = Number(dayOfWeek) === 7 ? 0 : Number(dayOfWeek);
+      const localDow = (((utcDow + dayShift) % 7) + 7) % 7;
+      return {
+        human: sameOffset ? `每${WEEKDAY_LABELS[localDow]} ${localTime} (UTC)` : `每${WEEKDAY_LABELS[localDow]} ${localTime} (本地)`,
+        sub: sameOffset ? trimmed : `UTC 每${WEEKDAY_LABELS[utcDow]} ${utcTime} · ${trimmed}`,
+        localShort: `每${WEEKDAY_LABELS[localDow]} ${localTime}`,
+        valid: true,
+      };
     }
   }
   return {
@@ -149,6 +201,7 @@ type TaskGroupSummary = {
 export function RegisteredPlansWorkbench({
   plans,
   allPlans,
+  baselinePlans,
   libraries,
   page,
   pageSize,
@@ -163,6 +216,7 @@ export function RegisteredPlansWorkbench({
 }: {
   plans: AdminScheduledTaskPlan[];
   allPlans: AdminScheduledTaskPlan[];
+  baselinePlans: AdminScheduledTaskPlan[];
   libraries: AdminLibrary[];
   page: number;
   pageSize: number;
@@ -178,12 +232,14 @@ export function RegisteredPlansWorkbench({
   const [selectedTaskType, setSelectedTaskType] = useState<string>("");
   const [dialogState, setDialogState] = useState<DialogState | null>(null);
   const [runFeedback, setRunFeedback] = useState<RunFeedback | null>(null);
+  const [emptiedPlanNotice, setEmptiedPlanNotice] = useState<{ id: string; name: string } | null>(null);
   const [assignError, setAssignError] = useState<string>("");
 
   const taskGroups = useMemo<TaskGroupSummary[]>(() => {
     const libraryNameMap = new Map(libraries.map((lib) => [lib.id, lib.name]));
     const visibleByType = new Map<string, AdminScheduledTaskPlan[]>();
     const allByType = new Map<string, AdminScheduledTaskPlan[]>();
+    const baselineByType = new Map<string, AdminScheduledTaskPlan[]>();
 
     for (const plan of plans) {
       const list = visibleByType.get(plan.taskType) ?? [];
@@ -195,10 +251,15 @@ export function RegisteredPlansWorkbench({
       list.push(plan);
       allByType.set(plan.taskType, list);
     }
+    for (const plan of baselinePlans) {
+      const list = baselineByType.get(plan.taskType) ?? [];
+      list.push(plan);
+      baselineByType.set(plan.taskType, list);
+    }
 
     const groups: TaskGroupSummary[] = [];
     for (const [taskType, visiblePlans] of visibleByType.entries()) {
-      const allTaskPlans = allByType.get(taskType) ?? visiblePlans;
+      const allTaskPlans = baselineByType.get(taskType) ?? allByType.get(taskType) ?? visiblePlans;
       const representative = visiblePlans[0] ?? allTaskPlans[0];
       const scopeType = representative?.scopeType === "GLOBAL" ? "GLOBAL" : "LIBRARY";
       const supportedMap = new Map<string, string>();
@@ -221,7 +282,17 @@ export function RegisteredPlansWorkbench({
       });
     }
     return groups;
-  }, [allPlans, libraries, plans, taskLabel]);
+  }, [allPlans, baselinePlans, libraries, plans, taskLabel]);
+
+  const creatableTaskTypeOptions = useMemo(() => {
+    const registeredLibraryTaskTypes = new Set<string>();
+    for (const plan of baselinePlans) {
+      if (plan.scopeType !== "GLOBAL" && (plan.libraries?.length ?? plan.libraryCount ?? 0) > 0) {
+        registeredLibraryTaskTypes.add(plan.taskType);
+      }
+    }
+    return SCHEDULE_TASK_TYPE_OPTIONS.filter(([type]) => registeredLibraryTaskTypes.has(type));
+  }, [baselinePlans]);
 
   const activeGroup = useMemo(() => {
     if (taskGroups.length === 0) return null;
@@ -244,15 +315,26 @@ export function RegisteredPlansWorkbench({
 
   const queryClient = useQueryClient();
   const quickAssign = useMutation({
-    mutationFn: async ({ targetPlanId, libraryId }: { targetPlanId: string; libraryId: string }) => {
-      const targetPlan = allPlans.find((plan) => plan.id === targetPlanId);
+    mutationFn: async ({ targetPlanId, libraryId, taskType }: { targetPlanId: string; libraryId: string; taskType: string }) => {
+      const pool = baselinePlans.length >= allPlans.length ? baselinePlans : allPlans;
+      const targetPlan = pool.find((plan) => plan.id === targetPlanId);
       if (!targetPlan) throw new Error("目标执行计划不存在");
+      const sourcePlan = pool.find((plan) =>
+        plan.taskType === taskType
+        && plan.id !== targetPlanId
+        && (plan.libraries ?? []).some((lib) => lib.id === libraryId),
+      );
       const currentIds = (targetPlan.libraries ?? []).map((lib) => lib.id);
       const nextIds = currentIds.includes(libraryId) ? currentIds : [...currentIds, libraryId];
       await api.updateAdminScheduledTaskPlan(targetPlanId, { libraryIds: nextIds });
+      if (sourcePlan && !sourcePlan.isDefault && (sourcePlan.libraries?.length ?? 0) === 1) {
+        return { id: sourcePlan.id, name: sourcePlan.name || taskGroupLabel(sourcePlan.taskType, taskLabel) };
+      }
+      return null;
     },
-    onSuccess: () => {
+    onSuccess: (emptied) => {
       setAssignError("");
+      setEmptiedPlanNotice(emptied);
       void queryClient.invalidateQueries({ queryKey: ["admin", "scheduled-task-plans"] });
       onRefresh();
     },
@@ -261,16 +343,29 @@ export function RegisteredPlansWorkbench({
     },
   });
 
+  const deleteEmptiedPlan = useMutation({
+    mutationFn: (planId: string) => api.deleteAdminScheduledTaskPlan(planId),
+    onSuccess: () => {
+      setEmptiedPlanNotice(null);
+      void queryClient.invalidateQueries({ queryKey: ["admin", "scheduled-task-plans"] });
+      onRefresh();
+    },
+    onError: (error: Error) => {
+      setAssignError(error.message || "删除空计划失败");
+    },
+  });
+
   const canCreateForActive = Boolean(
     activeGroup
     && activeGroup.scopeType === "LIBRARY"
-    && SCHEDULE_TASK_TYPE_OPTIONS.some(([type]) => type === activeGroup.taskType),
+    && creatableTaskTypeOptions.some(([type]) => type === activeGroup.taskType),
   );
 
   const openTopCreate = () => {
+    if (creatableTaskTypeOptions.length === 0) return;
     const defaultType = canCreateForActive && activeGroup
       ? activeGroup.taskType
-      : SCHEDULE_TASK_TYPE_OPTIONS[0][0];
+      : creatableTaskTypeOptions[0][0];
     setDialogState({
       mode: "create",
       taskType: defaultType,
@@ -298,7 +393,15 @@ export function RegisteredPlansWorkbench({
               placeholder="搜索计划或媒体库"
             />
           </label>
-          <LuxButton tone="primary" size="compact" type="button" onClick={openTopCreate}>
+          <LuxButton
+            tone="primary"
+            size="compact"
+            type="button"
+            aria-label="新建执行计划"
+            disabled={creatableTaskTypeOptions.length === 0}
+            title={creatableTaskTypeOptions.length === 0 ? "暂无已注册媒体库任务可创建自定义计划" : undefined}
+            onClick={openTopCreate}
+          >
             <Plus size={15} />
             新建执行计划
           </LuxButton>
@@ -309,9 +412,14 @@ export function RegisteredPlansWorkbench({
         <div className="lux-operations-empty" role="status">
           <span className="lux-operations-empty-icon"><ClipboardList size={22} /></span>
           <div>
-            <strong>还没有执行计划</strong>
-            <p>系统功能或插件注册后台工作后，执行计划会显示在这里；你也可以点击上方“新建执行计划”。</p>
+            <strong>{search.trim() ? `没有匹配“${search.trim()}”的执行计划` : "还没有执行计划"}</strong>
+            <p>{search.trim() ? "可以修改关键词，或清除筛选查看全部任务。" : "系统功能或插件注册后台工作后，执行计划会显示在这里。"}</p>
           </div>
+          {search.trim() ? (
+            <LuxButton tone="secondary" size="compact" type="button" onClick={() => onSearchChange("")}>
+              清除筛选
+            </LuxButton>
+          ) : null}
         </div>
       ) : (
         <div className="lux-workbench">
@@ -419,6 +527,28 @@ export function RegisteredPlansWorkbench({
                 </div>
               ) : null}
 
+              {emptiedPlanNotice ? (
+                <div className="lux-workbench-empty-plan-notice" role="status">
+                  <span>「{emptiedPlanNotice.name}」已没有关联媒体库，不会执行任何任务，可保留备用或直接删除。</span>
+                  <div className="lux-workbench-run-feedback-actions">
+                    <LuxButton
+                      tone="danger"
+                      size="compact"
+                      type="button"
+                      aria-label={`删除空计划${emptiedPlanNotice.name}`}
+                      disabled={deleteEmptiedPlan.isPending}
+                      onClick={() => deleteEmptiedPlan.mutate(emptiedPlanNotice.id)}
+                    >
+                      <Trash2 size={13} />
+                      {deleteEmptiedPlan.isPending ? "删除中…" : "删除空计划"}
+                    </LuxButton>
+                    <LuxIconButton size="small" type="button" aria-label="关闭空计划提醒" onClick={() => setEmptiedPlanNotice(null)}>
+                      <X size={14} />
+                    </LuxIconButton>
+                  </div>
+                </div>
+              ) : null}
+
               <section className="lux-workbench-block" aria-label="执行计划列表">
                 <div className="lux-workbench-subhead">
                   <h4>{activeGroup.scopeType === "GLOBAL" ? "全局执行配置" : "时间档位 / 执行计划"}</h4>
@@ -492,7 +622,7 @@ export function RegisteredPlansWorkbench({
                                 return;
                               }
                               if (targetPlanId && targetPlanId !== currentPlan?.id) {
-                                quickAssign.mutate({ targetPlanId, libraryId: library.id });
+                                quickAssign.mutate({ targetPlanId, libraryId: library.id, taskType: activeGroup.taskType });
                               }
                             }}
                           />
@@ -522,7 +652,8 @@ export function RegisteredPlansWorkbench({
       {dialogState ? (
         <PlanEditorDialog
           dialogState={dialogState}
-          allPlans={allPlans}
+          allPlans={baselinePlans}
+          creatableTaskTypeOptions={creatableTaskTypeOptions}
           libraries={libraries}
           taskLabel={taskLabel}
           onClose={() => setDialogState(null)}
@@ -596,8 +727,15 @@ function ScheduledTaskPlanRow({
   const globalPlan = plan.scopeType === "GLOBAL";
   const name = plan.name || plan.taskName || plan.taskType;
   const configured = Boolean(plan.schedule);
-  const stateLabel = plan.isEnabled && configured ? "已启用" : configured ? "已停用" : "未配置计划";
   const knownLibraries = (plan.libraries ?? []).length || plan.libraryCount || 0;
+  const hasLibraries = globalPlan || knownLibraries > 0;
+  const stateLabel = !hasLibraries
+    ? "未分配媒体库"
+    : plan.isEnabled && configured
+      ? "已启用"
+      : configured
+        ? "已停用"
+        : "未配置计划";
   const canDelete = !globalPlan && plan.isDefault !== true;
   const cronInfo = describeCronSchedule(plan.schedule);
 
@@ -656,7 +794,10 @@ function ScheduledTaskPlanRow({
   });
 
   const handleDelete = async () => {
-    if (!(await confirm(`删除“${name}”后，${knownLibraries} 个媒体库将回到默认计划，并恢复默认 Cron 和启停状态。确定删除吗？`))) {
+    const prompt = knownLibraries === 0
+      ? `“${name}”当前未关联任何媒体库，确定删除此空计划吗？`
+      : `删除“${name}”后，${knownLibraries} 个媒体库将回到默认计划，并恢复默认 Cron 和启停状态。确定删除吗？`;
+    if (!(await confirm(prompt))) {
       return;
     }
     deletePlan.mutate();
@@ -668,7 +809,7 @@ function ScheduledTaskPlanRow({
       <div className="lux-registered-task-copy">
         <div className="lux-registered-task-heading">
           <strong>{name}</strong>
-          <span className={`lux-registered-task-status ${plan.isEnabled && configured ? "is-enabled" : configured ? "is-disabled" : "is-unconfigured"}`}>
+          <span className={`lux-registered-task-status ${hasLibraries && plan.isEnabled && configured ? "is-enabled" : hasLibraries && configured ? "is-disabled" : "is-unconfigured"}`}>
             {stateLabel}
           </span>
         </div>
@@ -696,8 +837,8 @@ function ScheduledTaskPlanRow({
             className="lux-admin-toggle lux-workbench-row-switch"
             aria-label={`启停${name}`}
             checked={plan.isEnabled}
-            disabled={!configured || toggleEnabled.isPending || deletePlan.isPending}
-            title={configured ? "快速启用或停用此计划" : "请先配置 Cron 执行计划"}
+            disabled={!hasLibraries || !configured || toggleEnabled.isPending || deletePlan.isPending}
+            title={!hasLibraries ? "未分配媒体库，请先分配媒体库" : configured ? "快速启用或停用此计划" : "请先配置 Cron 执行计划"}
             onChange={(event) => toggleEnabled.mutate(event.target.checked)}
           />
         )}
@@ -708,7 +849,8 @@ function ScheduledTaskPlanRow({
           type="button"
           aria-label={`立即执行${name}`}
           onClick={() => runNow.mutate()}
-          disabled={runNow.isPending || deletePlan.isPending}
+          disabled={!hasLibraries || runNow.isPending || deletePlan.isPending}
+          title={!hasLibraries ? "未分配媒体库，无法执行" : undefined}
         >
           <Play size={14} />
           {runNow.isPending ? "执行中…" : "立即执行"}
@@ -747,6 +889,7 @@ function ScheduledTaskPlanRow({
 function PlanEditorDialog({
   dialogState,
   allPlans,
+  creatableTaskTypeOptions,
   libraries,
   taskLabel,
   onClose,
@@ -754,6 +897,7 @@ function PlanEditorDialog({
 }: {
   dialogState: DialogState;
   allPlans: AdminScheduledTaskPlan[];
+  creatableTaskTypeOptions: Array<[string, string]>;
   libraries: AdminLibrary[];
   taskLabel: (taskType: string) => string;
   onClose: () => void;
@@ -860,7 +1004,7 @@ function PlanEditorDialog({
       return;
     }
     if (!cronInfo.valid) {
-      setValidationError("Cron 表达式需包含五段（分 时 日 月 周）。");
+      setValidationError(cronInfo.human);
       return;
     }
     if (!isGlobal) {
@@ -907,7 +1051,7 @@ function PlanEditorDialog({
             <span>任务类型</span>
             <LuxSelect
               value={taskType}
-              options={SCHEDULE_TASK_TYPE_OPTIONS.map(([value, label]) => ({ value, label }))}
+              options={(creatableTaskTypeOptions.length > 0 ? creatableTaskTypeOptions : SCHEDULE_TASK_TYPE_OPTIONS).map(([value, label]) => ({ value, label }))}
               onChange={(nextType) => {
                 setTaskType(nextType);
                 setSelectedIds([]);

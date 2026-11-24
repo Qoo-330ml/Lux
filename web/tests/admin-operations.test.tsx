@@ -382,6 +382,233 @@ describe("AdminOperationsPage", () => {
     });
   });
 
+  it("only offers registered library task types when creating a plan and disables create when none exist", async () => {
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    const plansSpy = vi.spyOn(api, "adminScheduledTaskPlans").mockResolvedValue({
+      plans: [
+        {
+          id: "plan-rec-def",
+          taskType: "RECONCILIATION_SCAN",
+          name: "全量校验媒体库",
+          schedule: "0 3 * * 0",
+          isEnabled: true,
+          sourceType: "SYSTEM",
+          scopeType: "LIBRARY",
+          isDefault: true,
+          libraries: [{ id: "library-1", name: "电影库" }],
+          libraryCount: 1,
+        },
+        {
+          id: "plan-strm",
+          taskType: "STRM_MEDIA_INFO",
+          name: "STRM 扫描",
+          schedule: "0 4 * * *",
+          isEnabled: true,
+          sourceType: "PLUGIN",
+          scopeType: "GLOBAL",
+          isDefault: true,
+          libraries: [],
+          libraryCount: 0,
+        },
+      ],
+      total: 2,
+      page: 1,
+      pageSize: 50,
+    });
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("全量校验媒体库"));
+    });
+
+    const topCreate = container.querySelector<HTMLButtonElement>('button[aria-label="新建执行计划"]');
+    expect(topCreate?.disabled).toBe(false);
+    act(() => topCreate?.click());
+
+    const taskSelect = container.querySelector<HTMLButtonElement>('.lux-dialog button[role="combobox"][aria-label="执行计划任务类型"]');
+    expect(taskSelect).not.toBeNull();
+    await act(async () => taskSelect?.click());
+    expect(document.querySelector('[role="option"][data-value="RECONCILIATION_SCAN"]')).not.toBeNull();
+    expect(document.querySelector('[role="option"][data-value="CHAPTER_DETECTION"]')).toBeNull();
+    act(() => container.querySelector<HTMLButtonElement>('.lux-dialog button[aria-label="关闭"]')?.click());
+
+    // When only global tasks exist, top-level create button is disabled
+    act(() => { root.unmount(); container.remove(); });
+    plansSpy.mockResolvedValue({
+      plans: [{
+        id: "plan-strm",
+        taskType: "STRM_MEDIA_INFO",
+        name: "STRM 扫描",
+        schedule: "0 4 * * *",
+        isEnabled: true,
+        sourceType: "PLUGIN",
+        scopeType: "GLOBAL",
+        isDefault: true,
+        libraries: [],
+        libraryCount: 0,
+      }],
+      total: 1,
+      page: 1,
+      pageSize: 50,
+    });
+    renderPage();
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("STRM 扫描"));
+    });
+    expect(container.querySelector<HTMLButtonElement>('button[aria-label="新建执行计划"]')?.disabled).toBe(true);
+  });
+
+  it("handles emptied custom plans safely and warns after moving out the last library", async () => {
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    vi.spyOn(api, "adminScheduledTaskPlans").mockResolvedValue({
+      plans: [
+        {
+          id: "plan-custom-solo",
+          taskType: "RECONCILIATION_SCAN",
+          name: "独享校验",
+          schedule: "0 18 * * *",
+          isEnabled: true,
+          sourceType: "SYSTEM",
+          scopeType: "LIBRARY",
+          isDefault: false,
+          libraries: [{ id: "lib-movie", name: "电影库" }],
+          libraryCount: 1,
+        },
+        {
+          id: "plan-empty-custom",
+          taskType: "RECONCILIATION_SCAN",
+          name: "已置空计划",
+          schedule: "0 19 * * *",
+          isEnabled: true,
+          sourceType: "SYSTEM",
+          scopeType: "LIBRARY",
+          isDefault: false,
+          libraries: [],
+          libraryCount: 0,
+        },
+        {
+          id: "plan-def",
+          taskType: "RECONCILIATION_SCAN",
+          name: "默认校验",
+          schedule: null,
+          isEnabled: false,
+          sourceType: "SYSTEM",
+          scopeType: "LIBRARY",
+          isDefault: true,
+          libraries: [{ id: "lib-series", name: "剧集库" }],
+          libraryCount: 1,
+        },
+      ],
+      total: 3,
+      page: 1,
+      pageSize: 50,
+    });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({
+      libraries: [{ id: "lib-movie", name: "电影库" }, { id: "lib-series", name: "剧集库" }],
+    });
+    vi.spyOn(api, "updateAdminScheduledTaskPlan").mockResolvedValue({ plan: { id: "plan-def" } });
+    const deletePlan = vi.spyOn(api, "deleteAdminScheduledTaskPlan").mockResolvedValue(undefined);
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("已置空计划"));
+    });
+
+    // Empty custom plan cannot be run or toggled on, and displays clear status
+    expect(container.querySelector<HTMLButtonElement>('button[aria-label="立即执行已置空计划"]')?.disabled).toBe(true);
+    expect(container.querySelector<HTMLInputElement>('input[role="switch"][aria-label="启停已置空计划"]')?.disabled).toBe(true);
+    expect(container.textContent).toContain("未分配媒体库");
+
+    // Moving the last library out of 独享校验 offers 1-click cleanup of the emptied custom plan
+    const movieAssign = container.querySelector<HTMLButtonElement>('button[role="combobox"][aria-label="电影库 所属计划"]');
+    await act(async () => movieAssign?.click());
+    await act(async () => document.querySelector<HTMLButtonElement>('[role="option"][data-value="plan-def"]')?.click());
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("「独享校验」已没有关联媒体库"));
+    });
+    const cleanupBtn = container.querySelector<HTMLButtonElement>('button[aria-label="删除空计划独享校验"]');
+    expect(cleanupBtn).not.toBeNull();
+    await act(async () => cleanupBtn?.click());
+    await act(async () => {
+      await vi.waitFor(() => expect(deletePlan).toHaveBeenCalledWith("plan-custom-solo"));
+    });
+  });
+
+  it("preserves true task library coverage counts while search filters plans and rejects out-of-range cron fields", async () => {
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    vi.spyOn(api, "adminScheduledTaskPlans").mockImplementation(async (_page = 1, _taskType?: string, search?: string) => {
+      const all = [
+        {
+          id: "plan-night",
+          taskType: "RECONCILIATION_SCAN",
+          name: "夜间校验",
+          schedule: "0 18 * * *",
+          isEnabled: true,
+          sourceType: "SYSTEM",
+          scopeType: "LIBRARY",
+          isDefault: false,
+          libraries: [{ id: "lib-1", name: "电影库" }],
+          libraryCount: 1,
+        },
+        {
+          id: "plan-def",
+          taskType: "RECONCILIATION_SCAN",
+          name: "默认校验",
+          schedule: null,
+          isEnabled: false,
+          sourceType: "SYSTEM",
+          scopeType: "LIBRARY",
+          isDefault: true,
+          libraries: [{ id: "lib-2", name: "剧集库" }],
+          libraryCount: 1,
+        },
+      ];
+      const filtered = search ? all.filter((p) => p.name.includes(search)) : all;
+      return { plans: filtered, total: filtered.length, page: 1, pageSize: 50 };
+    });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({
+      libraries: [{ id: "lib-1", name: "电影库" }, { id: "lib-2", name: "剧集库" }],
+    });
+    const updatePlan = vi.spyOn(api, "updateAdminScheduledTaskPlan").mockResolvedValue({ plan: { id: "plan-night" } });
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("默认校验"));
+    });
+
+    const searchInput = container.querySelector<HTMLInputElement>('input[aria-label="搜索执行计划或媒体库"]');
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(searchInput, "夜间");
+      searchInput?.dispatchEvent(new Event("input", { bubbles: true }));
+      await vi.waitFor(() => expect(container.querySelectorAll(".lux-registered-plan-row")).toHaveLength(1));
+    });
+    expect(container.querySelector(".lux-registered-task-list")?.textContent).not.toContain("默认校验");
+    // Coverage in left nav stays 2/2 库 even while search narrowed plans to 1
+    expect(container.querySelector(".lux-workbench-nav")?.textContent).toContain("2/2 库");
+
+    // Out-of-range cron validation blocks submit before API call
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="编辑夜间校验"]')?.click());
+    const cronInput = container.querySelector<HTMLInputElement>('.lux-dialog input[aria-label="Cron 执行计划"]');
+    for (const badCron of ["60 3 * * *", "0 25 * * *", "0 3 * * 8", "*/0 * * * *"]) {
+      act(() => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(cronInput, badCron);
+        cronInput?.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      expect(container.querySelector(".lux-plan-cron-preview.is-invalid")).not.toBeNull();
+    }
+    act(() => container.querySelector<HTMLButtonElement>('.lux-dialog button[type="submit"]')?.click());
+    expect(updatePlan).not.toHaveBeenCalled();
+  });
+
   it("allows deleting custom plans after confirmation while protecting default and global plans", async () => {
     vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
     vi.spyOn(api, "adminScheduledTaskPlans").mockResolvedValue({

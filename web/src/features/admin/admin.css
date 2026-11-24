@@ -2827,6 +2827,19 @@ html[data-lux-theme="light"] .lux-operations-log-details { background: rgba(28,2
   background: color-mix(in srgb, var(--lux-status-warning) 9%, transparent);
 }
 
+.lux-workbench-empty-plan-notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 14px;
+  padding: 10px 13px;
+  border: 1px solid color-mix(in srgb, var(--lux-status-warning) 42%, var(--lux-line-soft));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--lux-status-warning) 8%, transparent);
+  font-size: .74rem;
+}
+
 .lux-workbench-run-feedback-copy {
   display: flex;
   align-items: center;

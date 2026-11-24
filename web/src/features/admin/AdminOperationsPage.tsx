@@ -232,6 +232,13 @@ export function AdminOperationsPage() {
   const taskPlans = useQuery({
     queryKey: queryKeys.adminScheduledTaskPlans(taskPlanPage, "", taskPlanSearch),
     queryFn: () => api.adminScheduledTaskPlans(taskPlanPage, undefined, taskPlanSearch),
+    placeholderData: keepPreviousData,
+    retry: false,
+  });
+  const baseTaskPlans = useQuery({
+    queryKey: queryKeys.adminScheduledTaskPlans(1, "", ""),
+    queryFn: () => api.adminScheduledTaskPlans(1, undefined, ""),
+    enabled: Boolean(taskPlans.data),
     retry: false,
   });
   const libraries = useQuery({
@@ -443,6 +450,7 @@ export function AdminOperationsPage() {
         usingPlans ? <RegisteredPlansWorkbench
           plans={registeredPlans}
           allPlans={allRegisteredPlans}
+          baselinePlans={baseTaskPlans.data?.plans ?? allRegisteredPlans}
           libraries={libraries.data?.libraries ?? []}
           page={taskPlanPage}
           pageSize={taskPlans.data?.pageSize ?? 50}
@@ -450,7 +458,7 @@ export function AdminOperationsPage() {
           search={taskPlanSearch}
           onSearchChange={(value) => { setTaskPlanSearch(value); setTaskPlanPage(1); }}
           onPageChange={setTaskPlanPage}
-          onRefresh={() => { void taskPlans.refetch(); void tasks.refetch(); }}
+          onRefresh={() => { void taskPlans.refetch(); void baseTaskPlans.refetch(); void tasks.refetch(); }}
           onOpenRunsTab={() => setTab("runs")}
           taskLabel={taskLabel}
           pagination={<Pagination page={taskPlanPage} pageSize={taskPlans.data?.pageSize ?? 50} total={registeredPlanTotal} onPageChange={setTaskPlanPage} />}
