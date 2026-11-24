@@ -1722,7 +1722,10 @@ impl PeopleService {
                 .map_err(|source| PeopleError::Serialization(source.to_string()))?;
             self.ensure_person_manifest_restore_pending(options.deferred_restore_pending)
                 .await?;
-            write_atomically(&manifest_path, &bytes).await
+            write_atomically(&manifest_path, &bytes).await?;
+            self.record_person_manifest_path(lux_person_id, &manifest_path)
+                .await;
+            Ok(())
         }
         .await
     }
