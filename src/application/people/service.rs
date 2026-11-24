@@ -631,6 +631,8 @@ pub struct PeopleService {
     rebuild_lock: Arc<AsyncMutex<()>>,
     person_asset_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     relation_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    manifest_dir_index: Arc<AsyncMutex<Option<HashMap<String, PathBuf>>>>,
+    manifest_dir_index_scan_lock: Arc<AsyncMutex<()>>,
     rebuild_coordinator: PersonIndexRebuildCoordinator,
 }
 
@@ -737,6 +739,8 @@ impl PeopleService {
             rebuild_lock: Arc::new(AsyncMutex::new(())),
             person_asset_locks: Arc::new(AsyncMutex::new(HashMap::new())),
             relation_locks: Arc::new(AsyncMutex::new(HashMap::new())),
+            manifest_dir_index: Arc::new(AsyncMutex::new(None)),
+            manifest_dir_index_scan_lock: Arc::new(AsyncMutex::new(())),
             rebuild_coordinator: PersonIndexRebuildCoordinator::default(),
         }
     }
@@ -4496,6 +4500,125 @@ mod tests {
             Some("本地简介".to_owned())
         );
         assert_eq!(saved.metadata_events.len(), 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn find_existing_person_manifest_path_avoids_full_directory_walk_on_direct_and_indexed_hits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct PermissionResetGuard(std::path::PathBuf);
+        impl Drop for PermissionResetGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        let person_dir = lux_person_directory(config.path(), "沈腾", "lux-002286")?;
+        tokio::fs::create_dir_all(&person_dir).await?;
+        let manifest_path = person_dir.join(PERSON_MANIFEST);
+        let manifest = PersonManifest {
+            schema_version: PERSON_MANIFEST_SCHEMA_VERSION,
+            generation: 1,
+            lux_person_id: "lux-002286".to_owned(),
+            display_name: "沈腾".to_owned(),
+            ..PersonManifest::default()
+        };
+        tokio::fs::write(&manifest_path, serde_json::to_vec(&manifest)?).await?;
+
+        let index_path = people_index_path(config.path(), "lux-002286")?;
+        if let Some(parent) = index_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let index = super::StoredPersonIndex {
+            image_path: "people/person/沈/沈腾-lux-002286/folder.jpg".to_owned(),
+            person_key: Some("lux-002286".to_owned()),
+        };
+        tokio::fs::write(&index_path, serde_json::to_vec(&index)?).await?;
+
+        let blocked_bucket = metadata_root(config.path())
+            .join("people")
+            .join("person")
+            .join("X");
+        tokio::fs::create_dir_all(&blocked_bucket).await?;
+        std::fs::set_permissions(&blocked_bucket, std::fs::Permissions::from_mode(0o000))?;
+        let guard = PermissionResetGuard(blocked_bucket.clone());
+
+        let direct = service
+            .find_existing_person_manifest_path("lux-002286", "沈腾")
+            .await?;
+        assert_eq!(direct.as_deref(), Some(manifest_path.as_path()));
+
+        let via_index = service
+            .find_existing_person_manifest_path("lux-002286", "Changed Name")
+            .await?;
+        assert_eq!(via_index.as_deref(), Some(manifest_path.as_path()));
+
+        drop(guard);
+        tokio::fs::remove_dir(&blocked_bucket).await?;
+
+        assert_eq!(
+            service
+                .find_existing_person_manifest_path("lux-999999", "Missing")
+                .await?,
+            None
+        );
+
+        tokio::fs::create_dir_all(&blocked_bucket).await?;
+        std::fs::set_permissions(&blocked_bucket, std::fs::Permissions::from_mode(0o000))?;
+        let _guard2 = PermissionResetGuard(blocked_bucket);
+
+        assert_eq!(
+            service
+                .find_existing_person_manifest_path("lux-888888", "Missing Two")
+                .await?,
+            None
+        );
+
+        service
+            .set_person_field_locks("lux-777777", &["name".to_owned()], "{}")
+            .await?;
+        let created =
+            lux_person_directory(config.path(), "lux-777777", "lux-777777")?.join(PERSON_MANIFEST);
+        assert_eq!(
+            service
+                .find_existing_person_manifest_path("lux-777777", "Different Name")
+                .await?
+                .as_deref(),
+            Some(created.as_path())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_existing_person_manifest_path_finds_legacy_custom_dir_without_lux_suffix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        let custom_dir = metadata_root(config.path())
+            .join("people")
+            .join("person")
+            .join("Z")
+            .join("custom-legacy-dir");
+        tokio::fs::create_dir_all(&custom_dir).await?;
+        let manifest_path = custom_dir.join(PERSON_MANIFEST);
+        let manifest = PersonManifest {
+            schema_version: PERSON_MANIFEST_SCHEMA_VERSION,
+            generation: 1,
+            lux_person_id: "lux-555555".to_owned(),
+            display_name: "Legacy Actor".to_owned(),
+            ..PersonManifest::default()
+        };
+        tokio::fs::write(&manifest_path, serde_json::to_vec(&manifest)?).await?;
+
+        let found = service
+            .find_existing_person_manifest_path("lux-555555", "Custom Name")
+            .await?;
+        assert_eq!(found.as_deref(), Some(manifest_path.as_path()));
         Ok(())
     }
 }
