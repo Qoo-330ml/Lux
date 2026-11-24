@@ -112,12 +112,17 @@ curl -ksS -D "$COOKIE_HEADERS" -o "$WORK_DIR/login.json" \
     -X POST "https://127.0.0.1:$PORT/api/v1/auth/login" \
     -H 'Content-Type: application/json' \
     -d '{"username":"admin","password":"proxy-smoke-test-password"}'
-session_cookie="$(grep -i '^set-cookie: lux_session=' "$COOKIE_HEADERS" \
-    | sed -E 's/^[^:]+: (lux_session=[^;]+).*/\1/I' | tail -n 1)"
+session_cookie_line="$(grep -i '^set-cookie: lux_session=' "$COOKIE_HEADERS" | tail -n 1 || true)"
+session_cookie="$(printf '%s\n' "$session_cookie_line" \
+    | sed -E 's/^[^:]+: (lux_session=[^;]+).*/\1/I')"
 csrf_cookie="$(grep -i '^set-cookie: lux_csrf=' "$COOKIE_HEADERS" \
     | sed -E 's/^[^:]+: (lux_csrf=[^;]+).*/\1/I' | tail -n 1)"
 if [[ -z "$session_cookie" || -z "$csrf_cookie" ]]; then
     echo "login did not return both session cookies" >&2
+    exit 1
+fi
+if ! printf '%s\n' "$session_cookie_line" | grep -qiE '(^|;[[:space:]])Secure([[:space:];]|$)'; then
+    echo "HTTPS proxy login response did not mark lux_session cookie as Secure: $session_cookie_line" >&2
     exit 1
 fi
 csrf_value="${csrf_cookie#lux_csrf=}"

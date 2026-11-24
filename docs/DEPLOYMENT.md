@@ -204,7 +204,7 @@ GPU 转码会占用宿主机 CPU 做解封装/音频编码；只开启 GPU 编�
 
 IP 归属地解析使用内置的 Hiofd 协议字段，不需要额外配置；字段不会写入日志、数据库或 API。Hiofd 不可用时管理员仪表盘仍显示客户端 IP，但归属地为空。
 
-反向代理应向 Lux 传递 `X-Forwarded-For` 和 `X-Forwarded-Proto`；Lux 会优先使用这些头部中的客户端 IP 和协议。这两个头只用于展示与访问诊断：`X-Forwarded-Proto` 不参与认证、授权或 ACL，WebSocket 的同源校验也只比较 `Origin` 与 `Host`，不读取任何转发头。
+反向代理应向 Lux 传递 `X-Forwarded-For` 和 `X-Forwarded-Proto`；Lux 会优先使用这些头部中的客户端 IP 和协议。**注意**：HTTPS 反向代理若漏传 `X-Forwarded-Proto: https`，新签发的会话 Cookie（`lux_session`）将不会带有 `Secure` 属性。这两个头只用于展示与访问诊断：`X-Forwarded-Proto` 不参与认证、授权或 ACL，WebSocket 的同源校验也只比较 `Origin` 与 `Host`，不读取任何转发头。
 
 ## Nginx 反向代理
 
