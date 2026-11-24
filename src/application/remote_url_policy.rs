@@ -332,6 +332,11 @@ pub(crate) async fn resolve_checked_addresses(
 /// kept (order preserved, duplicates collapsed, embedded IPv4 forms unfolded) so the client can
 /// still fall back between them, which keeps dual-stack and dead-peer resilience without ever
 /// touching an unchecked address.
+///
+/// Each candidate is unfolded to the address the connection will really reach **before** `permits`
+/// sees it, so the address a policy approves is always the address that gets pinned. A policy that
+/// only knows the standard library helpers would otherwise approve `::ffff:127.0.0.1`, because
+/// `Ipv6Addr::is_loopback` is false for it, while the pin silently connects to `127.0.0.1`.
 pub(crate) fn checked_addresses(
     candidates: Vec<SocketAddr>,
     permits: impl Fn(IpAddr) -> bool,
@@ -339,12 +344,12 @@ pub(crate) fn checked_addresses(
     if candidates.is_empty() {
         return Err(AddressCheckError::Empty);
     }
-    if candidates.iter().any(|candidate| !permits(candidate.ip())) {
-        return Err(AddressCheckError::Rejected);
-    }
     let mut addresses = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let address = unwrap_embedded_socket_address(candidate);
+        if !permits(address.ip()) {
+            return Err(AddressCheckError::Rejected);
+        }
         if !addresses.contains(&address) {
             addresses.push(address);
         }
@@ -387,8 +392,8 @@ mod tests {
 
     use super::{
         AddressCheckError, LOCAL_HOST_SUFFIXES, OutboundHost, canonical_ip, checked_addresses,
-        domain_matches_any, is_private_or_reserved, resolver_override_hosts,
-        unwrap_embedded_socket_address,
+        domain_matches_any, ipv4_is_documentation, ipv4_is_ietf_protocol_assignment,
+        is_private_or_reserved, resolver_override_hosts, unwrap_embedded_socket_address,
     };
 
     #[test]
@@ -540,5 +545,87 @@ mod tests {
         );
         // Nothing to fall back to when the authority is the root label itself.
         assert_eq!(resolver_override_hosts("."), (".", None));
+    }
+
+    /// Review 9 follow-up: the predicate must judge the address the socket will really reach, not
+    /// the wrapper. A caller that only uses the standard library helpers (`Ipv6Addr::is_loopback`
+    /// is false for `::ffff:127.0.0.1`) must not be able to approve a mapped or compatible
+    /// loopback answer that is then pinned as `127.0.0.1`.
+    #[test]
+    fn checked_answers_judge_the_address_that_gets_pinned() {
+        let mapped_loopback = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001)),
+            80,
+        );
+        let compatible_loopback = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x7f00, 0x0001)),
+            80,
+        );
+        let plain_loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 80);
+        // A policy that knows nothing about embedded forms: the standard library only.
+        let std_only = |address: IpAddr| !address.is_loopback();
+
+        for candidate in [mapped_loopback, compatible_loopback, plain_loopback] {
+            assert!(
+                matches!(
+                    checked_addresses(vec![candidate], std_only),
+                    Err(AddressCheckError::Rejected)
+                ),
+                "{candidate} must be rejected after unfolding"
+            );
+        }
+
+        // The same rule keeps a public mapped address usable, and the pinned set holds the IPv4
+        // form the policy actually approved.
+        let mapped_public = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x5db8, 0xd822)),
+            443,
+        );
+        assert_eq!(
+            checked_addresses(vec![mapped_public], std_only).expect("a public answer is pin-ready"),
+            vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+                443
+            )]
+        );
+    }
+
+    /// Review 9 follow-up: the special-purpose IPv4 blocks must follow the IANA registry exactly.
+    ///
+    /// The former tuple pattern `(192, 0, 0..=255)` pinned the third octet to "any value", so it
+    /// meant `192.0.0.0/16` and also rejected the ordinary public `192.0.1.0/24`. The named
+    /// predicates keep the two real special-purpose blocks - `192.0.0.0/24` (IETF protocol
+    /// assignments) and `192.0.2.0/24` (RFC 5737 TEST-NET-1) - and nothing else.
+    #[test]
+    fn ipv4_special_purpose_blocks_follow_the_iana_registry() {
+        for value in ["192.0.0.1", "192.0.0.9"] {
+            let address: Ipv4Addr = value.parse().expect("address");
+            assert!(
+                ipv4_is_ietf_protocol_assignment(address),
+                "{value} is in 192.0.0.0/24"
+            );
+            assert!(!ipv4_is_documentation(address), "{value} is not a test net");
+            assert!(is_private_or_reserved(IpAddr::V4(address)));
+        }
+        for value in ["192.0.2.1", "192.0.2.254"] {
+            let address: Ipv4Addr = value.parse().expect("address");
+            assert!(ipv4_is_documentation(address), "{value} is in TEST-NET-1");
+            assert!(
+                !ipv4_is_ietf_protocol_assignment(address),
+                "{value} is outside 192.0.0.0/24"
+            );
+            assert!(is_private_or_reserved(IpAddr::V4(address)));
+        }
+        for value in ["192.0.1.5", "192.0.3.5", "192.0.9.9"] {
+            let address: Ipv4Addr = value.parse().expect("address");
+            assert!(
+                !ipv4_is_ietf_protocol_assignment(address) && !ipv4_is_documentation(address),
+                "{value} is ordinary public space"
+            );
+            assert!(
+                !is_private_or_reserved(IpAddr::V4(address)),
+                "{value} must not be caught by a /16-wide pattern"
+            );
+        }
     }
 }
