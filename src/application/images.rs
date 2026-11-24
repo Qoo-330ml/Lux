@@ -294,64 +294,356 @@ impl Default for ImageDownloadConfig {
     }
 }
 
+/// Bound for the pinned client cache. A scrape repeats a handful of image hosts, so their TLS
+/// sessions and pooled connections stay reusable without unbounded growth.
+const PINNED_CLIENT_CACHE_LIMIT: usize = 32;
+
 /// The HTTP client shared by every image download plus the connection policy it was built with.
 ///
 /// A direct download cannot reuse the shared client: the checked DNS answer has to be pinned onto
 /// the client that opens the TCP connection, and `Client` is immutable once built. The policy
 /// fields keep the pinned client identical to the shared one apart from the pin.
 #[derive(Clone)]
-struct ImageHttpClient {
+pub(crate) struct ImageHttpClient {
     client: Client,
     proxy_url: Option<String>,
     timeout: Duration,
     direct_connection_only: bool,
-    /// Whether an explicit or `LUX_PROXY_URL` proxy was configured. An OS-level proxy is invisible
-    /// here; in that deployment the proxy owns the connection and the pin is best effort.
-    proxy_configured: bool,
+    routing: ImageProxyRouting,
+    pinned_clients: Arc<StdMutex<PinnedClientCache>>,
 }
 
 impl ImageHttpClient {
-    fn new(
-        config: &ImageDownloadConfig,
+    pub(crate) fn new(
         proxy_url: Option<String>,
+        timeout: Duration,
+        direct_connection_only: bool,
     ) -> Result<Self, ImageWriteError> {
-        let proxy_configured = image_proxy_configured(proxy_url.as_deref());
-        let client = image_http_builder(
-            proxy_url.as_deref(),
-            config.timeout,
-            config.direct_connection_only,
-        )?
-        .build()
-        .map_err(|error| ImageWriteError::ClientBuild(error.to_string()))?;
+        let routing = ImageProxyRouting::from_environment(proxy_url.as_deref());
+        let client = image_http_builder(proxy_url.as_deref(), timeout, direct_connection_only)?
+            .build()
+            .map_err(|error| ImageWriteError::ClientBuild(error.to_string()))?;
         Ok(Self {
             client,
             proxy_url,
-            timeout: config.timeout,
-            direct_connection_only: config.direct_connection_only,
-            proxy_configured,
+            timeout,
+            direct_connection_only,
+            routing,
+            pinned_clients: Arc::new(StdMutex::new(PinnedClientCache::default())),
         })
     }
 
-    /// Whether this process opens the TCP connection, so a checked address can actually be pinned.
+    /// Checks an image target and returns the client that may fetch it.
     ///
-    /// A configured proxy decides the target address itself; `NO_PROXY` can still route a request
-    /// directly through the proxy client, and the host cannot tell that case apart, which is why
-    /// the checks below never pretend such a request is pinned.
-    fn uses_direct_connection(&self) -> bool {
-        self.direct_connection_only || !self.proxy_configured
+    /// A request that reqwest hands to a proxy is only pre-checked: the proxy resolves and connects
+    /// itself, so a host-side pin would be a lie. Every other request - no proxy configured, a
+    /// `NO_PROXY` match, or `direct_connection_only` - is resolved here, every candidate address is
+    /// validated and the client is pinned to exactly that set.
+    pub(crate) async fn checked_request_client(
+        &self,
+        url: &Url,
+        allow_loopback_http: bool,
+    ) -> Result<Client, ImageWriteError> {
+        self.checked_request_client_with(url, allow_loopback_http, &system_image_host_lookup)
+            .await
     }
 
-    /// Builds the client for one direct download, pinned to the addresses checked for this attempt.
-    fn pinned_client(&self, pinned: PinnedImageHost) -> Result<Client, ImageWriteError> {
-        pinned
-            .pin(image_http_builder(
-                self.proxy_url.as_deref(),
-                self.timeout,
-                self.direct_connection_only,
-            )?)
-            .build()
-            .map_err(|error| ImageWriteError::ClientBuild(error.to_string()))
+    async fn checked_request_client_with(
+        &self,
+        url: &Url,
+        allow_loopback_http: bool,
+        lookup: &ImageHostLookup,
+    ) -> Result<Client, ImageWriteError> {
+        if self.routes_through_proxy(url) {
+            // The final TCP connection and its DNS lookup happen inside the proxy. The pre-check
+            // still rejects private literals and reserved local names, but a public name belongs to
+            // the proxy there.
+            check_proxied_image_host(url, allow_loopback_http)?;
+            return Ok(self.client.clone());
+        }
+        // A proxy exists for this scheme but `NO_PROXY` (or `direct_connection_only`) keeps this
+        // target out of it. The pinned client then disables proxies for itself, so the pin applies
+        // even if reqwest's own matcher ever disagrees with the exclusion check above.
+        let bypass_proxy = !self.direct_connection_only && self.routing.proxy_available(url);
+        let pinned = resolve_and_pin_image_host(url, allow_loopback_http, lookup).await?;
+        self.pinned_client(&pinned, bypass_proxy)
     }
+
+    /// Whether reqwest will let a proxy resolve and open the connection for this URL.
+    fn routes_through_proxy(&self, url: &Url) -> bool {
+        self.routing
+            .routes_through_proxy(url, self.direct_connection_only)
+    }
+
+    /// Returns the client for one checked target, reusing the cached one when the checked address
+    /// set repeats so keep-alive connections and TLS sessions survive across downloads.
+    fn pinned_client(
+        &self,
+        pinned: &PinnedImageHost,
+        bypass_proxy: bool,
+    ) -> Result<Client, ImageWriteError> {
+        let PinnedImageHost::Resolved { host, addresses } = pinned else {
+            // An approved literal cannot resolve anything, so the shared client already connects
+            // only to the checked address.
+            return Ok(self.client.clone());
+        };
+        let mut key_addresses = addresses.clone();
+        key_addresses.sort_unstable();
+        let key = (host.clone(), key_addresses, bypass_proxy);
+        if let Some(client) = self
+            .pinned_clients
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.get(&key))
+        {
+            return Ok(client);
+        }
+        let client = image_http_builder(
+            self.proxy_url.as_deref(),
+            self.timeout,
+            self.direct_connection_only || bypass_proxy,
+        )?
+        .resolve_to_addrs(host, addresses)
+        .build()
+        .map_err(|error| ImageWriteError::ClientBuild(error.to_string()))?;
+        if let Ok(mut cache) = self.pinned_clients.lock() {
+            cache.insert(key, client.clone());
+        }
+        Ok(client)
+    }
+
+    #[cfg(test)]
+    fn cached_pinned_client_count(&self) -> usize {
+        self.pinned_clients
+            .lock()
+            .map(|cache| cache.len())
+            .unwrap_or_default()
+    }
+}
+
+/// A bounded LRU of pinned clients keyed by the host and the exact checked address set.
+#[derive(Default)]
+struct PinnedClientCache {
+    entries: VecDeque<(PinnedClientKey, Client)>,
+}
+
+/// A pinned client only matches a request whose host, checked address set and proxy bypass agree.
+type PinnedClientKey = (String, Vec<SocketAddr>, bool);
+
+impl PinnedClientCache {
+    fn get(&mut self, key: &PinnedClientKey) -> Option<Client> {
+        let index = self.entries.iter().position(|(cached, _)| cached == key)?;
+        let entry = self.entries.remove(index)?;
+        let client = entry.1.clone();
+        self.entries.push_front(entry);
+        Some(client)
+    }
+
+    fn insert(&mut self, key: PinnedClientKey, client: Client) {
+        if let Some(index) = self.entries.iter().position(|(cached, _)| *cached == key) {
+            self.entries.remove(index);
+        }
+        while self.entries.len() >= PINNED_CLIENT_CACHE_LIMIT {
+            self.entries.pop_back();
+        }
+        self.entries.push_front((key, client));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Decides whether an image request is handed to a proxy instead of being connected here.
+///
+/// The decision mirrors reqwest's proxy layer: an explicit proxy first, then the standard proxy
+/// environment variables for the URL scheme, minus the `NO_PROXY` exclusions. Getting this wrong in
+/// the "proxied" direction would skip the pin for a request that actually connects from this
+/// process, so the rules are matched conservatively and covered by tests.
+#[derive(Clone, Debug, Default)]
+struct ImageProxyRouting {
+    /// An explicit proxy URL or `LUX_PROXY_URL`.
+    explicit_proxy: bool,
+    environment: ImageEnvironmentProxy,
+    exclusions: ImageProxyExclusions,
+}
+
+impl ImageProxyRouting {
+    fn from_environment(proxy_url: Option<&str>) -> Self {
+        Self {
+            explicit_proxy: proxy_url.is_some_and(|value| !value.trim().is_empty()),
+            environment: ImageEnvironmentProxy::from_env(),
+            exclusions: ImageProxyExclusions::from_env(),
+        }
+    }
+
+    /// Whether a proxy is configured for this URL's scheme, ignoring `NO_PROXY`.
+    fn proxy_available(&self, url: &Url) -> bool {
+        self.explicit_proxy || self.environment.applies_to(url.scheme())
+    }
+
+    /// Whether reqwest will resolve the target inside a proxy, where this process cannot pin it.
+    fn routes_through_proxy(&self, url: &Url, direct_connection_only: bool) -> bool {
+        // `direct_connection_only` builds the client with `no_proxy()`, which disables every
+        // explicit, environment and system proxy, so the pin is guaranteed to take effect.
+        if direct_connection_only || !self.proxy_available(url) {
+            return false;
+        }
+        // A URL without a host is rejected by the host check; never claim it is proxied.
+        url.host_str()
+            .is_some_and(|host| !self.exclusions.matches(host))
+    }
+}
+
+/// The standard proxy environment variables, per URL scheme, as reqwest reads them.
+#[derive(Clone, Copy, Debug, Default)]
+struct ImageEnvironmentProxy {
+    http: bool,
+    https: bool,
+}
+
+impl ImageEnvironmentProxy {
+    fn from_env() -> Self {
+        // A CGI process ignores proxy environment variables; reqwest's proxy matcher does the same.
+        if std::env::var_os("REQUEST_METHOD").is_some() {
+            return Self::default();
+        }
+        let all_proxy = proxy_environment_url(&["ALL_PROXY", "all_proxy"]).is_some();
+        Self {
+            http: all_proxy || proxy_environment_url(&["HTTP_PROXY", "http_proxy"]).is_some(),
+            https: all_proxy || proxy_environment_url(&["HTTPS_PROXY", "https_proxy"]).is_some(),
+        }
+    }
+
+    fn applies_to(self, scheme: &str) -> bool {
+        match scheme {
+            "http" => self.http,
+            "https" => self.https,
+            // reqwest only proxies http(s) destinations.
+            _ => false,
+        }
+    }
+}
+
+/// The first set proxy variable that names a proxy this process can actually use.
+///
+/// A value without a supported scheme is ignored: reqwest would then connect directly, and the
+/// caller must keep the pinned path instead of handing the host to a proxy that is not there.
+fn proxy_environment_url(names: &[&str]) -> Option<String> {
+    proxy_environment_url_with(names, |name| std::env::var(name).ok())
+}
+
+fn proxy_environment_url_with(
+    names: &[&str],
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    names.iter().find_map(|name| {
+        let value = lookup(name)?;
+        let value = value.trim();
+        let url = Url::parse(value).ok()?;
+        (matches!(
+            url.scheme(),
+            "http" | "https" | "socks4" | "socks4a" | "socks5" | "socks5h"
+        ) && url.host_str().is_some_and(|host| !host.is_empty()))
+        .then(|| value.to_owned())
+    })
+}
+
+/// The `NO_PROXY` exclusions reqwest applies, with the rules of curl's `--noproxy`.
+///
+/// Entries are comma-separated: `*`, an IP address, an IP network, or a domain that also matches
+/// its subdomains. The host is compared exactly, without trailing-dot or IDNA folding, because that
+/// is what reqwest's proxy matcher compares.
+#[derive(Clone, Debug, Default)]
+struct ImageProxyExclusions {
+    raw: Option<String>,
+}
+
+impl ImageProxyExclusions {
+    fn from_env() -> Self {
+        Self {
+            raw: std::env::var("NO_PROXY")
+                .ok()
+                .or_else(|| std::env::var("no_proxy").ok()),
+        }
+    }
+
+    fn matches(&self, host: &str) -> bool {
+        let Some(raw) = self.raw.as_deref() else {
+            return false;
+        };
+        // Brackets are URL syntax, not part of the address the matcher compares.
+        let host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        match host.parse::<IpAddr>() {
+            Ok(address) => raw
+                .split(',')
+                .map(str::trim)
+                .any(|entry| address_entry_excludes(entry, address)),
+            Err(_) => raw
+                .split(',')
+                .map(str::trim)
+                .any(|entry| domain_entry_excludes(entry, host)),
+        }
+    }
+}
+
+fn address_entry_excludes(entry: &str, address: IpAddr) -> bool {
+    let (base, prefix) = match entry.split_once('/') {
+        Some((base, prefix)) => match (base.parse::<IpAddr>(), prefix.parse::<u8>()) {
+            (Ok(base), Ok(prefix)) => (base, Some(prefix)),
+            _ => return false,
+        },
+        None => match entry.parse::<IpAddr>() {
+            Ok(base) => (base, None),
+            Err(_) => return false,
+        },
+    };
+    if base.is_ipv4() != address.is_ipv4() {
+        return false;
+    }
+    let Some(prefix) = prefix else {
+        return base == address;
+    };
+    match (base, address) {
+        (IpAddr::V4(base), IpAddr::V4(address)) => {
+            let mask = u32::MAX
+                .checked_shl(32 - u32::from(prefix.min(32)))
+                .unwrap_or(0);
+            u32::from(base) & mask == u32::from(address) & mask
+        }
+        (IpAddr::V6(base), IpAddr::V6(address)) => {
+            let mask = u128::MAX
+                .checked_shl(128 - u32::from(prefix.min(128)))
+                .unwrap_or(0);
+            u128::from(base) & mask == u128::from(address) & mask
+        }
+        _ => false,
+    }
+}
+
+fn domain_entry_excludes(entry: &str, host: &str) -> bool {
+    if entry == "*" || entry.eq_ignore_ascii_case(host) {
+        return true;
+    }
+    if entry
+        .strip_prefix('.')
+        .is_some_and(|entry| entry.eq_ignore_ascii_case(host))
+    {
+        return true;
+    }
+    let Some(offset) = host.len().checked_sub(entry.len()) else {
+        return false;
+    };
+    if !host.is_char_boundary(offset) || !host[offset..].eq_ignore_ascii_case(entry) {
+        return false;
+    }
+    // A leading-dot entry already carries the label boundary; a plain entry matches only whole
+    // labels, so `images.example` never excludes `notimages.example`.
+    entry.starts_with('.') || (offset > 0 && host.as_bytes()[offset - 1] == b'.')
 }
 
 /// Builds the image HTTP client configuration shared by every download.
@@ -369,25 +661,11 @@ fn image_http_builder(
         // A redirect would bypass the URL checks done before the request.
         .redirect(reqwest::redirect::Policy::none());
     Ok(if direct_connection_only {
+        // Disables every explicit, environment and system proxy so the pin always takes effect.
         builder.no_proxy()
     } else {
         builder
     })
-}
-
-/// Whether the image downloads were given a proxy.
-///
-/// Mirrors `client_builder_from_env_or`: an explicit URL wins, a blank value disables the proxy and
-/// `None` falls back to `LUX_PROXY_URL`.
-fn image_proxy_configured(proxy_url: Option<&str>) -> bool {
-    match proxy_url.map(str::trim) {
-        Some(value) => !value.is_empty(),
-        None => match crate::network::proxy_url_from_env() {
-            Ok(value) => value.is_some(),
-            // An invalid environment proxy already failed the client build above.
-            Err(_) => true,
-        },
-    }
 }
 
 #[derive(Clone)]
@@ -546,7 +824,7 @@ impl ImageWriteService {
                 "image maximum size must be positive".to_owned(),
             ));
         }
-        let http = ImageHttpClient::new(&config, proxy_url)?;
+        let http = ImageHttpClient::new(proxy_url, config.timeout, config.direct_connection_only)?;
         Ok(Self {
             database,
             http,
@@ -1339,14 +1617,17 @@ impl ImageWriteService {
                 "image URL must be an http(s) URL without credentials".to_owned(),
             ));
         }
-        let pinned_host = self.checked_image_host(&url).await?;
+        let request_client = self
+            .http
+            .checked_request_client_with(&url, self.allow_loopback_http, self.host_lookup.as_ref())
+            .await?;
 
         let _download_permit = self
             .download_permits
             .acquire(self.resources.clone(), "image_download_queue")
             .await;
         let download_started = std::time::Instant::now();
-        let response = self.fetch_image(&url, pinned_host).await;
+        let response = self.fetch_image(&url, request_client).await;
         if let Some(resources) = &self.resources {
             resources.record_metadata_stage("image_download", download_started.elapsed());
         }
@@ -1566,46 +1847,19 @@ impl ImageWriteService {
         })
     }
 
-    /// Checks the download target for this attempt.
-    ///
-    /// A direct connection resolves the host, validates every candidate address and returns the
-    /// addresses the request must be pinned to. With a proxy the returned `None` says the proxy owns
-    /// the connection: the pre-check still rejects private literals and reserved local names, but
-    /// the final DNS lookup happens inside the proxy, so a host-side pin would be a lie.
-    async fn checked_image_host(
-        &self,
-        url: &Url,
-    ) -> Result<Option<PinnedImageHost>, ImageWriteError> {
-        if self.http.uses_direct_connection() {
-            resolve_and_pin_image_host(url, self.allow_loopback_http, self.host_lookup.as_ref())
-                .await
-                .map(Some)
-        } else {
-            check_proxied_image_host(url, self.allow_loopback_http).map(|()| None)
-        }
-    }
-
     /// Sends the image request for one checked target.
     ///
-    /// The retry loop below reuses the client built here, so a direct connection keeps the address
-    /// set that was checked for this attempt: a DNS answer that changes between retries never
-    /// reaches the connector and no retry can re-resolve the host unpinned.
+    /// The client was checked and pinned for this attempt and the retry loop below reuses it, so a
+    /// DNS answer that changes between retries never reaches the connector: no retry can re-resolve
+    /// the host unpinned.
     async fn fetch_image(
         &self,
         url: &Url,
-        pinned_host: Option<PinnedImageHost>,
+        client: Client,
     ) -> Result<reqwest::Response, ImageWriteError> {
-        let pinned_client = match pinned_host {
-            Some(pinned) => Some(self.http.pinned_client(pinned)?),
-            None => None,
-        };
-        let http = match &pinned_client {
-            Some(client) => client,
-            None => &self.http.client,
-        };
         let mut retry_count = 0;
         loop {
-            let response = http.get(url.clone()).send().await;
+            let response = client.get(url.clone()).send().await;
             match response {
                 Ok(response)
                     if retry_count < IMAGE_DOWNLOAD_MAX_RETRIES
@@ -3082,6 +3336,7 @@ impl ImageResolutionCache {
     }
 
     #[cfg(test)]
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
     }
@@ -3712,6 +3967,10 @@ fn is_allowed_scraper_image_url(value: &str, allow_loopback_http: bool) -> bool 
 }
 
 /// One address set that a direct image download may connect to, checked once per attempt.
+///
+/// The value is the result of a security check, so dropping it silently would let a caller fetch
+/// the URL through an unpinned client. Callers must pin it onto the request client.
+#[must_use = "a checked image host must pin the request it was checked for"]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PinnedImageHost {
     /// The URL host is an IP literal the policy already approved. The request cannot resolve
@@ -3725,19 +3984,6 @@ pub(crate) enum PinnedImageHost {
         host: String,
         addresses: Vec<SocketAddr>,
     },
-}
-
-impl PinnedImageHost {
-    /// Pins the checked addresses onto the client that opens the TCP connection.
-    ///
-    /// Every checked address is kept, not just the first: the connector still falls back from an
-    /// unreachable AAAA record to the A record, while no unchecked answer can be reached.
-    fn pin(self, builder: ClientBuilder) -> ClientBuilder {
-        match self {
-            Self::IpLiteral => builder,
-            Self::Resolved { host, addresses } => builder.resolve_to_addrs(&host, &addresses),
-        }
-    }
 }
 
 /// A future that resolves one image hostname to every candidate address.
@@ -3876,17 +4122,6 @@ async fn resolve_and_pin_image_host(
     })
 }
 
-/// Checks an image URL host with the system resolver.
-///
-/// Callers that fetch an image through their own client reuse the check; they get the checked
-/// addresses back so they can pin the request the same way the image download does.
-pub(crate) async fn ensure_public_image_host(
-    url: &Url,
-    allow_loopback_http: bool,
-) -> Result<PinnedImageHost, ImageWriteError> {
-    resolve_and_pin_image_host(url, allow_loopback_http, &system_image_host_lookup).await
-}
-
 /// Checks a proxied image target without resolving it.
 ///
 /// With a proxy the final TCP connection and its DNS lookup happen inside the proxy, so a host-side
@@ -3913,16 +4148,18 @@ fn image_download_retry_delay(retry_count: u32) -> Duration {
 mod tests {
     use super::{
         IMAGE_GLOBAL_CONCURRENCY, IMAGE_RESOLUTION_CACHE_CAPACITY, IMAGE_RETRY_BASE_DELAY,
-        IMAGE_RETRY_MAX_DELAY, ImageDownloadConfig, ImageError, ImageFormat, ImageHostLookup,
-        ImageHostLookupFuture, ImagePermitPool, ImageResolutionCache, ImageResolutionKey,
-        ImageService, ImageTargetRequest, ImageWriteError, ImageWriteService, PinnedImageHost,
+        IMAGE_RETRY_MAX_DELAY, ImageDownloadConfig, ImageEnvironmentProxy, ImageError, ImageFormat,
+        ImageHostLookup, ImageHostLookupFuture, ImageHttpClient, ImagePermitPool,
+        ImageProxyExclusions, ImageProxyRouting, ImageResolutionCache, ImageResolutionKey,
+        ImageService, ImageTargetRequest, ImageWriteError, ImageWriteService,
+        PINNED_CLIENT_CACHE_LIMIT, PinnedClientCache, PinnedImageHost,
         background_image_content_tag_and_dimensions_from_bytes, canonical_image_stems,
         check_proxied_image_host, global_image_download_permits, global_image_write_permits,
         image_attempt_failure, image_content_tag_and_dimensions_from_bytes,
         image_download_retry_delay, image_language_matches, image_lookup_stems,
         image_row_write_error, image_target, is_allowed_scraper_image_url, pick_scraper_index,
-        resolve_and_pin_image_host, retryable_image_status, should_suppress_internal_image_write,
-        system_image_host_lookup, write_image_atomically,
+        proxy_environment_url_with, resolve_and_pin_image_host, retryable_image_status,
+        should_suppress_internal_image_write, system_image_host_lookup, write_image_atomically,
     };
     use crate::{
         application::access::MediaAccessService,
@@ -4316,6 +4553,292 @@ mod tests {
         let loopback = Url::parse("http://127.0.0.1:8099/poster.jpg").expect("url");
         check_proxied_image_host(&loopback, true)
             .expect("the loopback opt-in keeps the local stub reachable behind a proxy");
+    }
+
+    /// A client whose proxy routing is fixed for the test, so no environment variable has to be
+    /// touched (tests share one process).
+    fn test_image_http(
+        routing: ImageProxyRouting,
+        direct_connection_only: bool,
+    ) -> ImageHttpClient {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .expect("test image client");
+        ImageHttpClient {
+            client,
+            proxy_url: None,
+            timeout: std::time::Duration::from_secs(5),
+            direct_connection_only,
+            routing,
+            pinned_clients: std::sync::Arc::new(
+                std::sync::Mutex::new(PinnedClientCache::default()),
+            ),
+        }
+    }
+
+    #[test]
+    fn proxy_routing_mirrors_no_proxy_and_scheme_rules() {
+        let routing = ImageProxyRouting {
+            explicit_proxy: true,
+            environment: ImageEnvironmentProxy::default(),
+            exclusions: ImageProxyExclusions {
+                raw: Some("images.example, .internal.example, 10.0.0.0/8".to_owned()),
+            },
+        };
+        let proxied =
+            |url: &str| routing.routes_through_proxy(&Url::parse(url).expect("url"), false);
+        assert!(proxied("https://other.example/poster.jpg"));
+        assert!(!proxied("https://images.example/poster.jpg"));
+        assert!(!proxied("https://cdn.images.example/poster.jpg"));
+        assert!(!proxied("https://host.internal.example/poster.jpg"));
+        assert!(!proxied("http://10.200.0.1/poster.jpg"));
+        // `direct_connection_only` disables every proxy, so the pin always takes effect.
+        assert!(!routing.routes_through_proxy(
+            &Url::parse("https://other.example/poster.jpg").expect("url"),
+            true
+        ));
+
+        // An environment-only proxy is scheme specific.
+        let environment = ImageProxyRouting {
+            explicit_proxy: false,
+            environment: ImageEnvironmentProxy {
+                http: true,
+                https: false,
+            },
+            exclusions: ImageProxyExclusions::default(),
+        };
+        assert!(environment.routes_through_proxy(
+            &Url::parse("http://other.example/poster.jpg").expect("url"),
+            false
+        ));
+        assert!(!environment.routes_through_proxy(
+            &Url::parse("https://other.example/poster.jpg").expect("url"),
+            false
+        ));
+
+        // Without any proxy every request takes the pinned path.
+        let none = ImageProxyRouting::default();
+        assert!(!none.routes_through_proxy(
+            &Url::parse("https://other.example/poster.jpg").expect("url"),
+            false
+        ));
+    }
+
+    #[test]
+    fn no_proxy_exclusions_match_like_curl() {
+        let exclusions = ImageProxyExclusions {
+            raw: Some(
+                "images.example, .suffix.example, 10.0.0.0/8, 192.168.1.0/24, 2001:db8::/32, 127.0.0.1"
+                    .to_owned(),
+            ),
+        };
+        // A plain domain matches its subdomains but not a longer sibling label.
+        assert!(exclusions.matches("images.example"));
+        assert!(exclusions.matches("cdn.images.example"));
+        assert!(exclusions.matches("IMAGES.EXAMPLE"));
+        assert!(!exclusions.matches("notimages.example"));
+        // A leading dot behaves like the plain domain.
+        assert!(exclusions.matches("suffix.example"));
+        assert!(exclusions.matches("host.suffix.example"));
+        // A sibling domain is not excluded.
+        assert!(!exclusions.matches("other.example"));
+        // IP literals use the IP and network entries.
+        assert!(exclusions.matches("10.1.2.3"));
+        assert!(!exclusions.matches("11.0.0.1"));
+        assert!(exclusions.matches("192.168.1.44"));
+        assert!(!exclusions.matches("192.168.2.44"));
+        assert!(exclusions.matches("2001:db8::5"));
+        assert!(exclusions.matches("[2001:db8::5]"));
+        assert!(exclusions.matches("127.0.0.1"));
+        assert!(!exclusions.matches("[::1]"));
+
+        // `*` excludes every domain, matching the curl rule reqwest documents.
+        let any = ImageProxyExclusions {
+            raw: Some("*".to_owned()),
+        };
+        assert!(any.matches("images.example"));
+        assert!(!any.matches("127.0.0.1"));
+    }
+
+    #[test]
+    fn proxy_environment_detection_requires_a_usable_proxy_url() {
+        fn lookup_from<'a>(
+            values: &'a [(&'a str, &'a str)],
+        ) -> impl Fn(&str) -> Option<String> + 'a {
+            move |name: &str| {
+                values
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+            }
+        }
+        let names = ["HTTP_PROXY", "http_proxy"];
+        assert_eq!(
+            proxy_environment_url_with(
+                &names,
+                lookup_from(&[("http_proxy", "http://10.0.0.2:7890")])
+            ),
+            Some("http://10.0.0.2:7890".to_owned()),
+            "the lowercase spelling is read after the uppercase one"
+        );
+        assert_eq!(
+            proxy_environment_url_with(
+                &names,
+                lookup_from(&[
+                    ("HTTP_PROXY", "socks5h://10.0.0.2:1080"),
+                    ("http_proxy", "http://10.0.0.3:7890"),
+                ]),
+            ),
+            Some("socks5h://10.0.0.2:1080".to_owned()),
+            "the first set variable wins"
+        );
+        for unusable in [
+            "   ",
+            "not a proxy",
+            "10.0.0.2:7890",
+            "ftp://10.0.0.2:7890",
+            "http://",
+        ] {
+            assert_eq!(
+                proxy_environment_url_with(&names, lookup_from(&[("HTTP_PROXY", unusable)])),
+                None,
+                "{unusable} must not be treated as a proxy"
+            );
+        }
+
+        assert!(
+            !ImageProxyRouting::from_environment(Some("   ")).explicit_proxy,
+            "a blank explicit proxy is not a proxy"
+        );
+        assert!(
+            ImageProxyRouting::from_environment(Some("http://10.0.0.2:7890")).explicit_proxy,
+            "an explicit proxy always routes through the proxy unless NO_PROXY excludes it"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_image_client_connects_only_to_the_checked_address() {
+        let address = spawn_image_stub("image/png", TEST_PNG_1X1).await;
+        let http = test_image_http(ImageProxyRouting::default(), true);
+        let client = http
+            .pinned_client(
+                &PinnedImageHost::Resolved {
+                    host: "images.example".to_owned(),
+                    addresses: vec![address],
+                },
+                false,
+            )
+            .expect("pinned client");
+
+        // `images.example` cannot resolve, so only the pinned address can answer this request.
+        let url = Url::parse(&format!(
+            "http://images.example:{}/poster.png",
+            address.port()
+        ))
+        .expect("url");
+        let response = client.get(url).send().await.expect("pinned request");
+
+        assert_eq!(response.status().as_u16(), 200);
+    }
+
+    /// A `NO_PROXY` match connects directly from this process, so it must take the resolved and
+    /// pinned path instead of being handed to the proxy.
+    #[tokio::test]
+    async fn no_proxy_targets_take_the_pinned_direct_path() {
+        let address = spawn_image_stub("image/png", TEST_PNG_1X1).await;
+        let http = test_image_http(
+            ImageProxyRouting {
+                explicit_proxy: true,
+                environment: ImageEnvironmentProxy::default(),
+                exclusions: ImageProxyExclusions {
+                    raw: Some("images.example".to_owned()),
+                },
+            },
+            false,
+        );
+        let url = Url::parse(&format!(
+            "http://images.example:{}/poster.png",
+            address.port()
+        ))
+        .expect("url");
+        assert!(
+            !http.routes_through_proxy(&url),
+            "an excluded host must not be handed to the proxy"
+        );
+        let (lookup, calls) = scripted_image_host_lookup(vec![vec![address]]);
+
+        let client = http
+            .checked_request_client_with(&url, true, lookup.as_ref())
+            .await
+            .expect("pinned client");
+        let response = client.get(url).send().await.expect("pinned request");
+
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pinned_clients_are_cached_by_host_and_checked_addresses() {
+        let http = test_image_http(ImageProxyRouting::default(), true);
+        let first = PinnedImageHost::Resolved {
+            host: "images.example".to_owned(),
+            addresses: vec![
+                public_image_address(443),
+                "[2606:4700:4700::1111]:443"
+                    .parse()
+                    .expect("public IPv6 address"),
+            ],
+        };
+        let same_set_other_order = PinnedImageHost::Resolved {
+            host: "images.example".to_owned(),
+            addresses: vec![
+                "[2606:4700:4700::1111]:443"
+                    .parse()
+                    .expect("public IPv6 address"),
+                public_image_address(443),
+            ],
+        };
+        http.pinned_client(&first, false).expect("pinned client");
+        http.pinned_client(&same_set_other_order, false)
+            .expect("the same address set reuses the cached client");
+        assert_eq!(http.cached_pinned_client_count(), 1);
+
+        http.pinned_client(&PinnedImageHost::IpLiteral, false)
+            .expect("an approved literal keeps the shared client");
+        assert_eq!(
+            http.cached_pinned_client_count(),
+            1,
+            "a literal adds nothing to the pin cache"
+        );
+
+        http.pinned_client(
+            &PinnedImageHost::Resolved {
+                host: "cdn.example".to_owned(),
+                addresses: vec![public_image_address(443)],
+            },
+            false,
+        )
+        .expect("a new host gets its own client");
+        assert_eq!(http.cached_pinned_client_count(), 2);
+
+        for index in 0..PINNED_CLIENT_CACHE_LIMIT + 4 {
+            http.pinned_client(
+                &PinnedImageHost::Resolved {
+                    host: format!("host{index}.example"),
+                    addresses: vec![public_image_address(443)],
+                },
+                false,
+            )
+            .expect("bounded pinned client");
+        }
+        assert_eq!(
+            http.cached_pinned_client_count(),
+            PINNED_CLIENT_CACHE_LIMIT,
+            "the pin cache stays bounded"
+        );
     }
 
     #[test]

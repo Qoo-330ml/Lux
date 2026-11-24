@@ -17,7 +17,7 @@ use quick_xml::{
     events::Event,
     reader::Reader,
 };
-use reqwest::{Client, Url, header::CONTENT_TYPE};
+use reqwest::{Url, header::CONTENT_TYPE};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -29,6 +29,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use crate::application::images::ImageHttpClient;
 use crate::application::metadata_paths::{
     MetadataPathError, canonical_person_directory, library_item_directory, lux_person_directory,
     metadata_root, people_directory, people_index_directory, people_index_path,
@@ -626,7 +627,9 @@ pub struct PersonImage {
 #[derive(Clone)]
 pub struct PeopleService {
     config_dir: PathBuf,
-    client: Client,
+    /// The checked image download client for actor profile images. It shares the image writer's
+    /// proxy and timeout policy, and every request is pinned to the addresses checked for it.
+    image_http: Option<ImageHttpClient>,
     database: Option<Database>,
     rebuild_lock: Arc<AsyncMutex<()>>,
     person_asset_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
@@ -720,21 +723,16 @@ impl PeopleService {
     }
 
     fn with_proxy(config_dir: PathBuf, proxy_url: Option<String>) -> Self {
-        let client = match crate::network::client_builder_from_env_or(proxy_url.as_deref()) {
-            Ok(builder) => match builder
-                .timeout(std::time::Duration::from_secs(10))
-                // A redirect would bypass the HTTPS/private-host checks done by the caller.
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-            {
-                Ok(client) => client,
-                Err(_) => Client::new(),
-            },
-            Err(_) => Client::new(),
-        };
+        // Actor profile images download through the image writer's checked client, which pins the
+        // request to the addresses the host check approved. An unusable proxy falls back to a
+        // direct client; a broken TLS backend leaves the download unavailable instead of silently
+        // fetching through an unchecked client.
+        let image_http = ImageHttpClient::new(proxy_url, std::time::Duration::from_secs(10), false)
+            .or_else(|_| ImageHttpClient::new(None, std::time::Duration::from_secs(10), false))
+            .ok();
         Self {
             config_dir,
-            client,
+            image_http,
             database: None,
             rebuild_lock: Arc::new(AsyncMutex::new(())),
             person_asset_locks: Arc::new(AsyncMutex::new(HashMap::new())),

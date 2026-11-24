@@ -1,4 +1,5 @@
 use super::*;
+use crate::application::images::ImageWriteError;
 
 impl PeopleService {
     pub async fn profile_image(&self, person_id: &str) -> Result<Option<PersonImage>, PeopleError> {
@@ -406,15 +407,22 @@ impl PeopleService {
                 "actor profile URL must be a valid HTTPS scraper image URL".to_owned(),
             ));
         }
-        crate::application::images::ensure_public_image_host(&url, false)
+        // The checked client resolves the URL once, validates every candidate address and pins
+        // the request to them, so a DNS answer that changes before the connection cannot redirect
+        // this download into the private network.
+        let image_http = self.image_http.as_ref().ok_or_else(|| {
+            PeopleError::Download("actor profile image client is unavailable".to_owned())
+        })?;
+        let client = image_http
+            .checked_request_client(&url, false)
             .await
-            .map_err(|_| {
-                PeopleError::InvalidUrl(
+            .map_err(|error| match error {
+                ImageWriteError::InvalidUrl(_) => PeopleError::InvalidUrl(
                     "actor profile URL must not resolve to a private address".to_owned(),
-                )
+                ),
+                other => PeopleError::Download(other.to_string()),
             })?;
-        let response = self
-            .client
+        let response = client
             .get(url)
             .send()
             .await
@@ -517,5 +525,46 @@ impl PeopleService {
             let _ = fs::remove_file(&temporary).await;
         }
         result.map(|()| file_name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review #4: the actor profile download used to drop the host check result and then let its
+    /// own client resolve the name again. It now asks the checked image client for the request, so
+    /// an internal target never reaches a connection attempt.
+    #[tokio::test]
+    async fn actor_profile_downloads_reject_private_hosts_before_connecting() {
+        let directory = tempfile::tempdir().expect("temporary people root");
+        let service = PeopleService::new(directory.path().to_owned());
+        let person_dir = directory.path().join("person");
+        tokio::fs::create_dir_all(&person_dir)
+            .await
+            .expect("person directory");
+
+        for image_url in [
+            "https://10.0.0.5/poster.jpg",
+            "https://[::ffff:127.0.0.1]/poster.jpg",
+            "https://localhost./poster.jpg",
+        ] {
+            let error = service
+                .ensure_profile_image("1", "tmdb", Some(image_url), &person_dir, false)
+                .await
+                .expect_err("a private actor profile URL must be rejected");
+            assert!(
+                matches!(error, PeopleError::InvalidUrl(_)),
+                "{image_url} must be rejected: {error:?}"
+            );
+        }
+
+        let mut entries = tokio::fs::read_dir(&person_dir)
+            .await
+            .expect("person files");
+        assert!(
+            entries.next_entry().await.expect("person files").is_none(),
+            "no profile image may be written for a rejected target"
+        );
     }
 }
