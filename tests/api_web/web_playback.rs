@@ -3430,3 +3430,119 @@ fn public_source_id(id: &str) -> String {
         .map(|uuid| uuid.simple().to_string())
         .unwrap_or_else(|_| id.to_owned())
 }
+
+#[tokio::test]
+async fn web_playback_range_rejects_a_forbidden_strm_target_without_leaking_its_body()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The STRM target is a live loopback listener that would answer with a body if it were ever
+    // contacted; the Range proxy must reject the target and never forward anything from it.
+    let forbidden = TcpListener::bind("127.0.0.1:0").await?;
+    let forbidden_address = forbidden.local_addr()?;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(
+        root.join("Forbidden Target Movie 2026.strm"),
+        format!("http://{forbidden_address}/secret.mkv\n"),
+    )
+    .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let (item_id, source_id): (String, String) = sqlx::query_as(
+        "SELECT mi.id, ms.id
+         FROM media_items mi
+         JOIN media_sources ms ON ms.item_id = mi.id
+         WHERE ms.source_kind = 'STRM_URL'
+         LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+
+    let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder().no_proxy().build()?;
+
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let session_cookie = cookie_value(login.headers(), "lux_session").ok_or("missing session")?;
+    let csrf_cookie = cookie_value(login.headers(), "lux_csrf").ok_or("missing csrf")?;
+    let cookies = format!("lux_session={session_cookie}; lux_csrf={csrf_cookie}");
+
+    let create = client
+        .post(format!("{base_url}/api/v1/playback/sessions"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf_cookie)
+        .json(&json!({
+            "itemId": item_id,
+            "sourceId": source_id,
+            "capabilities": {
+                "directPlay": true,
+                "hls": true,
+                "videoCopyToFmp4": true,
+                "audioCopyToFmp4": true,
+                "softwareTranscode": true
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(create.status(), reqwest::StatusCode::OK);
+    let body = create.json::<Value>().await?;
+    assert_eq!(body["plan"]["type"], "DIRECT");
+    let range_url = body["plan"]["rangeUrl"]
+        .as_str()
+        .ok_or("missing STRM range url")?;
+
+    let range = client
+        .get(format!("{base_url}{range_url}"))
+        .header(COOKIE, &cookies)
+        .header("Range", "bytes=0-3")
+        .send()
+        .await?;
+    assert_eq!(range.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let range_body = range.bytes().await?;
+    assert!(
+        range_body.is_empty(),
+        "the forbidden upstream body must not be forwarded: {range_body:?}"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), forbidden.accept())
+            .await
+            .is_err(),
+        "the forbidden STRM target must not receive a connection"
+    );
+
+    server.abort();
+    Ok(())
+}
