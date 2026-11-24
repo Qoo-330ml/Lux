@@ -1043,7 +1043,17 @@ impl ImageWriteService {
         }
 
         let (_, directory, movie_stem, episode_stem) = match writeback_context {
-            Some(context) => self.writeback_paths_for_context(item_id, context).await?,
+            Some(context) => match self.writeback_paths_for_context(item_id, context).await {
+                Ok(paths) => paths,
+                // A series whose episodes sit directly under the library root has no per-series
+                // directory for sidecar images, so skip the directory scan cleanly.
+                Err(ImageWriteError::ItemNotFound)
+                    if context.item_type == "SERIES" && context.source.is_some() =>
+                {
+                    return Ok(found);
+                }
+                Err(error) => return Err(error),
+            },
             None => self.writeback_paths(item_id).await?,
         };
         let paths = read_image_directory_entries(&directory).await?;
@@ -1674,21 +1684,35 @@ impl ImageWriteService {
         if !media_path.starts_with(&root) {
             return Err(ImageWriteError::PathOutsideRoot(media_path));
         }
-        let directory = if item_type == "SERIES" {
-            series_directory(&root, &source.relative_path)
-                .ok_or_else(|| ImageWriteError::PathOutsideRoot(media_path.clone()))?
-        } else {
-            media_path
-                .parent()
-                .ok_or_else(|| ImageWriteError::PathOutsideRoot(media_path.clone()))?
-                .to_owned()
-        };
-        let directory = fs::canonicalize(&directory)
+        let parent_directory = media_path
+            .parent()
+            .ok_or_else(|| ImageWriteError::PathOutsideRoot(media_path.clone()))?
+            .to_owned();
+        let parent_directory = fs::canonicalize(&parent_directory)
             .await
-            .map_err(|error| image_io_error(&directory, error))?;
-        if !directory.starts_with(&root) {
-            return Err(ImageWriteError::PathOutsideRoot(directory));
+            .map_err(|error| image_io_error(&parent_directory, error))?;
+        if !parent_directory.starts_with(&root) {
+            return Err(ImageWriteError::PathOutsideRoot(parent_directory));
         }
+        let directory = if item_type == "SERIES" {
+            if let Some(series_dir) = series_directory(&root, &source.relative_path) {
+                let series_dir = fs::canonicalize(&series_dir)
+                    .await
+                    .map_err(|error| image_io_error(&series_dir, error))?;
+                if !series_dir.starts_with(&root) {
+                    return Err(ImageWriteError::PathOutsideRoot(series_dir));
+                }
+                series_dir
+            } else if parent_directory != root {
+                // `episode_hierarchy` uses the episode's parent folder as the series directory
+                // whenever there is no recognised `Season N` directory, unless it is the root.
+                parent_directory
+            } else {
+                return Err(ImageWriteError::ItemNotFound);
+            }
+        } else {
+            parent_directory
+        };
         let episode_stem = (item_type == "EPISODE").then(|| {
             media_path
                 .file_stem()
@@ -4880,5 +4904,70 @@ mod tests {
                 ))
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn series_without_season_folder_does_not_report_path_outside_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let service = ImageWriteService::new_with_config_dir(database, config.config_dir)?;
+        let root = temp.path().join("Shows");
+        let show_dir = root.join("Flat Show (2025)");
+        tokio::fs::create_dir_all(&show_dir).await?;
+        tokio::fs::write(
+            show_dir.join("Flat.Show.S01E01.strm"),
+            b"http://example.invalid\n",
+        )
+        .await?;
+        tokio::fs::write(show_dir.join("poster.jpg"), b"poster-bytes").await?;
+        tokio::fs::write(root.join("Stray.S01E01.strm"), b"http://example.invalid\n").await?;
+
+        let flat_context = crate::storage::StoredMediaWritebackContext {
+            item_type: "SERIES".to_owned(),
+            source: Some(crate::storage::StoredMediaSourcePath {
+                source_id: "src-flat".to_owned(),
+                item_id: "ep-flat".to_owned(),
+                probe_status: "DONE".to_owned(),
+                root_path: root.to_string_lossy().into_owned(),
+                relative_path: "Flat Show (2025)/Flat.Show.S01E01.strm".to_owned(),
+            }),
+        };
+        let found = service
+            .local_image_types_with_indexed_images_and_context(
+                "series-flat",
+                &["POSTER"],
+                false,
+                &[],
+                &flat_context,
+            )
+            .await?;
+        assert!(found.contains("POSTER"));
+
+        let root_level_context = crate::storage::StoredMediaWritebackContext {
+            item_type: "SERIES".to_owned(),
+            source: Some(crate::storage::StoredMediaSourcePath {
+                source_id: "src-root".to_owned(),
+                item_id: "ep-root".to_owned(),
+                probe_status: "DONE".to_owned(),
+                root_path: root.to_string_lossy().into_owned(),
+                relative_path: "Stray.S01E01.strm".to_owned(),
+            }),
+        };
+        let root_found = service
+            .local_image_types_with_indexed_images_and_context(
+                "series-root",
+                &["POSTER"],
+                false,
+                &[],
+                &root_level_context,
+            )
+            .await?;
+        assert!(root_found.is_empty());
+        Ok(())
     }
 }

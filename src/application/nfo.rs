@@ -3544,9 +3544,18 @@ impl NfoWriteService {
         cache: &LocalNfoProjectionCache,
     ) -> Result<(Option<LocalNfoProjection>, bool), NfoWriteError> {
         let source = context.source.as_ref().ok_or(NfoWriteError::ItemNotFound)?;
-        let target = self
+        let target = match self
             .item_nfo_target_from_source(&context.item_type, season_number, source)
-            .await?;
+            .await
+        {
+            Ok(target) => target,
+            // A series whose episodes sit directly under the library root has no per-series
+            // directory for `tvshow.nfo`.
+            Err(NfoWriteError::ItemNotFound) if context.item_type == "SERIES" => {
+                return Ok((None, false));
+            }
+            Err(error) => return Err(error),
+        };
         let cell = {
             let mut entries = cache.entries.lock().await;
             entries
@@ -3575,9 +3584,18 @@ impl NfoWriteService {
         context: &crate::storage::StoredMediaWritebackContext,
     ) -> Result<Option<LocalNfoProjection>, NfoWriteError> {
         let source = context.source.as_ref().ok_or(NfoWriteError::ItemNotFound)?;
-        let target = self
+        let target = match self
             .item_nfo_target_from_source(&context.item_type, season_number, source)
-            .await?;
+            .await
+        {
+            Ok(target) => target,
+            // A series whose episodes sit directly under the library root has no per-series
+            // directory for `tvshow.nfo`.
+            Err(NfoWriteError::ItemNotFound) if context.item_type == "SERIES" => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         self.read_item_projection_at_target(&target).await
     }
 
@@ -3845,15 +3863,19 @@ impl NfoWriteService {
             "EPISODE" => find_episode_nfo_target(&media_path, &directory).await,
             "VIDEO" => media_path.with_extension("nfo"),
             "SERIES" => {
-                let series_dir = series_directory(&root, &source.relative_path)
-                    .ok_or_else(|| NfoWriteError::PathOutsideRoot(directory.clone()))?;
-                let series_dir = fs::canonicalize(&series_dir)
-                    .await
-                    .map_err(|error| io_error(&series_dir, error))?;
-                if !series_dir.starts_with(&root) {
-                    return Err(NfoWriteError::PathOutsideRoot(series_dir));
+                if let Some(series_dir) = series_directory(&root, &source.relative_path) {
+                    let series_dir = fs::canonicalize(&series_dir)
+                        .await
+                        .map_err(|error| io_error(&series_dir, error))?;
+                    if !series_dir.starts_with(&root) {
+                        return Err(NfoWriteError::PathOutsideRoot(series_dir));
+                    }
+                    series_dir.join("tvshow.nfo")
+                } else if directory != root {
+                    directory.join("tvshow.nfo")
+                } else {
+                    return Err(NfoWriteError::ItemNotFound);
                 }
-                series_dir.join("tvshow.nfo")
             }
             "SEASON" => find_season_nfo_target(&directory, season_number).await,
             _ => return Err(NfoWriteError::ItemNotFound),
@@ -5464,5 +5486,75 @@ mod tests {
             result,
             Err(NfoWriteError::InvalidMetadata(message)) if message == "metadata field is too long"
         ));
+    }
+
+    #[tokio::test]
+    async fn series_without_season_folder_reads_tvshow_nfo_and_skips_root_level_without_path_outside_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let writer = NfoWriteService::new(database);
+        let root = directory.path().join("Shows");
+        let flat_show = root.join("Flat Show (2025)");
+        fs::create_dir_all(&flat_show).await?;
+        fs::write(
+            flat_show.join("Flat.Show.S01E01.strm"),
+            b"http://example.invalid/stream\n",
+        )
+        .await?;
+        fs::write(
+            flat_show.join("tvshow.nfo"),
+            b"<tvshow><title>Flat Show</title></tvshow>",
+        )
+        .await?;
+        fs::write(
+            root.join("Stray.S01E01.strm"),
+            b"http://example.invalid/stream\n",
+        )
+        .await?;
+
+        let root_path = root.to_string_lossy().into_owned();
+        let flat_context = StoredMediaWritebackContext {
+            item_type: "SERIES".to_owned(),
+            source: Some(StoredMediaSourcePath {
+                source_id: "src-flat".to_owned(),
+                item_id: "ep-flat".to_owned(),
+                probe_status: "DONE".to_owned(),
+                root_path: root_path.clone(),
+                relative_path: "Flat Show (2025)/Flat.Show.S01E01.strm".to_owned(),
+            }),
+        };
+        let cache = LocalNfoProjectionCache::default();
+        let (projection, _) = writer
+            .read_item_projection_with_writeback_context_cached(None, &flat_context, &cache)
+            .await?;
+        assert_eq!(
+            projection.and_then(|item| item.metadata.title),
+            Some("Flat Show".to_owned())
+        );
+
+        let root_context = StoredMediaWritebackContext {
+            item_type: "SERIES".to_owned(),
+            source: Some(StoredMediaSourcePath {
+                source_id: "src-root".to_owned(),
+                item_id: "ep-root".to_owned(),
+                probe_status: "DONE".to_owned(),
+                root_path,
+                relative_path: "Stray.S01E01.strm".to_owned(),
+            }),
+        };
+        let (root_cached, _) = writer
+            .read_item_projection_with_writeback_context_cached(None, &root_context, &cache)
+            .await?;
+        assert!(root_cached.is_none());
+        let root_uncached = writer
+            .read_item_projection_with_writeback_context(None, &root_context)
+            .await?;
+        assert!(root_uncached.is_none());
+        Ok(())
     }
 }
