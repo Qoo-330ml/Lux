@@ -3,6 +3,29 @@ use super::*;
 const PERSON_MANIFEST_IDENTITY_BATCH_SIZE: usize = 100;
 const PERSON_MANIFEST_STATE_QUERY_BATCH_SIZE: usize = 100;
 const PERSON_CREDIT_REPLACEMENT_BATCH_SIZE: usize = 16;
+const MAX_SEQUENCE_ALLOCATION_ATTEMPTS: usize = 32;
+const PERSON_ID_SEQUENCE_LOCK_POSTGRES_SQL: &str =
+    "SELECT pg_advisory_xact_lock(7815284569254167667)";
+const ADVANCE_PERSON_ID_SEQUENCE_POSTGRES_SQL: &str = "WITH seq AS (
+    SELECT pg_get_serial_sequence('person_id_sequence', 'id') AS name,
+           GREATEST(?, COALESCE((SELECT MAX(id) FROM person_id_sequence), 1)) AS target
+),
+state AS (
+    SELECT name,
+           target,
+           pg_sequence_last_value(name::regclass) AS last_value
+    FROM seq
+)
+SELECT CASE
+    WHEN state.last_value IS NULL OR state.last_value < state.target
+    THEN setval(state.name::regclass, state.target, true)
+    ELSE state.last_value
+END
+FROM state";
+const ALLOCATE_PERSON_ID_SQLITE_SQL: &str =
+    "INSERT INTO person_id_sequence DEFAULT VALUES RETURNING id";
+const ALLOCATE_PERSON_ID_POSTGRES_SQL: &str =
+    "INSERT INTO person_id_sequence DEFAULT VALUES ON CONFLICT(id) DO NOTHING RETURNING id";
 
 /// The identity a new canonical person is resolved for.
 ///
@@ -802,6 +825,71 @@ impl Database {
         }
     }
 
+    fn is_postgres(&self) -> bool {
+        self.backend == DatabaseBackend::Postgres
+    }
+
+    async fn advance_person_id_sequence_postgres(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        min_target: Option<i64>,
+    ) -> Result<(), StorageError> {
+        let target = min_target.unwrap_or(1).max(1);
+        self.query(PERSON_ID_SEQUENCE_LOCK_POSTGRES_SQL)
+            .execute(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())?;
+        self.query(ADVANCE_PERSON_ID_SEQUENCE_POSTGRES_SQL)
+            .bind(target)
+            .execute(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())?;
+        Ok(())
+    }
+
+    async fn allocate_next_person_id_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+    ) -> Result<String, StorageError> {
+        let mut conflict_attempts = 0;
+        loop {
+            let sequence: Option<i64> = if self.is_postgres() {
+                self.query_scalar(ALLOCATE_PERSON_ID_POSTGRES_SQL)
+                    .fetch_optional(&mut **transaction)
+                    .await
+                    .map_err(self.sqlx_err())?
+            } else {
+                Some(
+                    self.query_scalar(ALLOCATE_PERSON_ID_SQLITE_SQL)
+                        .fetch_one(&mut **transaction)
+                        .await
+                        .map_err(self.sqlx_err())?,
+                )
+            };
+            let Some(sequence) = sequence else {
+                conflict_attempts += 1;
+                if conflict_attempts >= MAX_SEQUENCE_ALLOCATION_ATTEMPTS {
+                    return Err(StorageError::Conflict(format!(
+                        "failed to allocate canonical person id after {MAX_SEQUENCE_ALLOCATION_ATTEMPTS} attempts"
+                    )));
+                }
+                self.advance_person_id_sequence_postgres(transaction, None)
+                    .await?;
+                continue;
+            };
+            let candidate = format!("lux-{sequence:06}");
+            let exists: Option<i64> = self
+                .query_scalar("SELECT 1 FROM people WHERE id = ?")
+                .bind(&candidate)
+                .fetch_optional(&mut **transaction)
+                .await
+                .map_err(self.sqlx_err())?;
+            if exists.is_none() {
+                return Ok(candidate);
+            }
+        }
+    }
+
     /// Resolves one canonical person inside a caller-owned transaction.
     ///
     /// [`CanonicalPersonBatch`] uses this to resolve a whole actor page in one commit; the
@@ -837,23 +925,9 @@ impl Database {
             return stored_canonical_person(person).map_err(self.sqlx_err());
         }
 
-        let person_id = loop {
-            let sequence: i64 = self
-                .query_scalar("INSERT INTO person_id_sequence DEFAULT VALUES RETURNING id")
-                .fetch_one(&mut **transaction)
-                .await
-                .map_err(self.sqlx_err())?;
-            let candidate = format!("lux-{sequence:06}");
-            let exists: Option<i64> = self
-                .query_scalar("SELECT 1 FROM people WHERE id = ?")
-                .bind(&candidate)
-                .fetch_optional(&mut **transaction)
-                .await
-                .map_err(self.sqlx_err())?;
-            if exists.is_none() {
-                break candidate;
-            }
-        };
+        let person_id = self
+            .allocate_next_person_id_in_transaction(transaction)
+            .await?;
         self.query(
             "INSERT INTO people (
                 id, display_name, directory_name, normalized_name, status, created_at, updated_at
@@ -1508,7 +1582,8 @@ impl Database {
         evidence_json: &str,
     ) -> Result<StoredCanonicalPerson, StorageError> {
         let now = current_unix_timestamp();
-        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         let owner = self
             .query_scalar::<String>(
                 "SELECT person_id FROM person_identities
@@ -1529,23 +1604,9 @@ impl Database {
                 "provider identity '{provider}:{provider_id}' belongs to '{owner}'"
             )));
         }
-        let new_person_id = loop {
-            let sequence: i64 = self
-                .query_scalar("INSERT INTO person_id_sequence DEFAULT VALUES RETURNING id")
-                .fetch_one(&mut *transaction)
-                .await
-                .map_err(self.sqlx_err())?;
-            let candidate = format!("lux-{sequence:06}");
-            let exists: Option<i64> = self
-                .query_scalar("SELECT 1 FROM people WHERE id = ?")
-                .bind(&candidate)
-                .fetch_optional(&mut *transaction)
-                .await
-                .map_err(self.sqlx_err())?;
-            if exists.is_none() {
-                break candidate;
-            }
-        };
+        let new_person_id = self
+            .allocate_next_person_id_in_transaction(&mut transaction)
+            .await?;
         self.query(
             "INSERT INTO people (
                 id, display_name, directory_name, normalized_name, status, created_at, updated_at
@@ -2069,6 +2130,7 @@ impl Database {
         if let Some(sequence) = person_id
             .strip_prefix("lux-")
             .and_then(|value| value.parse::<i64>().ok())
+            .filter(|&sequence| sequence > 0)
         {
             self.query(
                 "INSERT INTO person_id_sequence (id) VALUES (?)
@@ -2078,17 +2140,9 @@ impl Database {
             .execute(&mut **transaction)
             .await
             .map_err(self.sqlx_err())?;
-            if self.backend == DatabaseBackend::Postgres {
-                self.query(
-                    "SELECT setval(
-                        pg_get_serial_sequence('person_id_sequence', 'id'),
-                        COALESCE((SELECT MAX(id) FROM person_id_sequence), 1),
-                        true
-                    )",
-                )
-                .execute(&mut **transaction)
-                .await
-                .map_err(self.sqlx_err())?;
+            if self.is_postgres() {
+                self.advance_person_id_sequence_postgres(transaction, Some(sequence))
+                    .await?;
             }
         }
         for chunk in identities.chunks(PERSON_MANIFEST_IDENTITY_BATCH_SIZE) {
@@ -3296,5 +3350,197 @@ fn canonical_provider_priority(provider: &str) -> u8 {
         1
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    async fn connect_test_database(
+        temp_dir: &tempfile::TempDir,
+    ) -> Result<Database, Box<dyn std::error::Error>> {
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        Ok(Database::connect(&config).await?)
+    }
+
+    #[tokio::test]
+    async fn restoring_lower_person_id_after_higher_allocation_keeps_sequence_monotonic()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = connect_test_database(&temp_dir).await?;
+
+        let restored_high = database
+            .restore_canonical_person("lux-000010", "高位演员", &[("tmdb", "high-10")])
+            .await?;
+        assert_eq!(restored_high.id, "lux-000010");
+
+        let allocated_high = database
+            .resolve_or_create_canonical_person(
+                "连续演员甲",
+                "tmdb",
+                "seq-11",
+                "PROVIDER_ID",
+                Some(1.0),
+                r#"{"source":"tmdb"}"#,
+            )
+            .await?;
+        assert_eq!(allocated_high.id, "lux-000011");
+
+        database
+            .attach_canonical_person_identity(
+                &allocated_high.id,
+                "douban",
+                "seq-11-split",
+                "MANUAL_LINK",
+                Some(1.0),
+                r#"{"source":"douban"}"#,
+            )
+            .await?;
+
+        let restored_low = database
+            .restore_canonical_person("lux-000003", "低位演员", &[("tmdb", "low-3")])
+            .await?;
+        assert_eq!(restored_low.id, "lux-000003");
+
+        let created_after_low_restore = database
+            .resolve_or_create_canonical_person(
+                "连续演员乙",
+                "tmdb",
+                "seq-12",
+                "PROVIDER_ID",
+                Some(1.0),
+                r#"{"source":"tmdb"}"#,
+            )
+            .await?;
+        assert_eq!(created_after_low_restore.id, "lux-000012");
+
+        let split_after_low_restore = database
+            .split_canonical_person_identity(
+                &allocated_high.id,
+                "douban",
+                "seq-11-split",
+                "拆分演员",
+                r#"{"reason":"manual split"}"#,
+            )
+            .await?;
+        assert_eq!(split_after_low_restore.id, "lux-000013");
+
+        let sequences: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM person_id_sequence ORDER BY id ASC")
+                .fetch_all(database.pool())
+                .await?;
+        assert_eq!(sequences, vec![3, 10, 11, 12, 13]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn allocating_and_splitting_after_restoring_higher_person_id_skips_occupied_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = connect_test_database(&temp_dir).await?;
+
+        let seed = database
+            .resolve_or_create_canonical_person(
+                "初始演员",
+                "tmdb",
+                "seed-1",
+                "PROVIDER_ID",
+                Some(1.0),
+                r#"{"source":"tmdb"}"#,
+            )
+            .await?;
+        assert_eq!(seed.id, "lux-000001");
+        database
+            .attach_canonical_person_identity(
+                &seed.id,
+                "imdb",
+                "nm-seed-split",
+                "MANUAL_LINK",
+                Some(1.0),
+                r#"{"source":"imdb"}"#,
+            )
+            .await?;
+
+        let restored_high = database
+            .restore_canonical_person("lux-000025", "跳号演员", &[("tmdb", "jump-25")])
+            .await?;
+        assert_eq!(restored_high.id, "lux-000025");
+
+        // Pre-occupy lux-000026 in `people` without a sequence row to verify allocation skips it.
+        sqlx::query(
+            "INSERT INTO people (
+                id, display_name, directory_name, normalized_name, status, created_at, updated_at
+             ) VALUES ('lux-000026', '占位演员', '占位演员', '占位演员', 'ACTIVE', 1, 1)",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let allocated = database
+            .resolve_or_create_canonical_person(
+                "新演员",
+                "tmdb",
+                "after-jump",
+                "PROVIDER_ID",
+                Some(1.0),
+                r#"{"source":"tmdb"}"#,
+            )
+            .await?;
+        assert_eq!(allocated.id, "lux-000027");
+
+        let split = database
+            .split_canonical_person_identity(
+                &seed.id,
+                "imdb",
+                "nm-seed-split",
+                "拆分新演员",
+                r#"{"reason":"manual split"}"#,
+            )
+            .await?;
+        assert_eq!(split.id, "lux-000028");
+        Ok(())
+    }
+
+    #[test]
+    fn postgres_sequence_sql_is_monotonic_and_uses_non_aborting_conflict_clause() {
+        assert_eq!(
+            ADVANCE_PERSON_ID_SEQUENCE_POSTGRES_SQL
+                .matches("pg_sequence_last_value")
+                .count(),
+            1
+        );
+        assert!(ADVANCE_PERSON_ID_SEQUENCE_POSTGRES_SQL.contains("GREATEST"));
+        assert!(
+            ADVANCE_PERSON_ID_SEQUENCE_POSTGRES_SQL
+                .contains("pg_get_serial_sequence('person_id_sequence', 'id')")
+        );
+        assert!(
+            ADVANCE_PERSON_ID_SEQUENCE_POSTGRES_SQL
+                .contains("THEN setval(state.name::regclass, state.target, true)")
+        );
+        assert!(!ADVANCE_PERSON_ID_SEQUENCE_POSTGRES_SQL.contains(
+            "setval(\n                        pg_get_serial_sequence('person_id_sequence', 'id')"
+        ));
+
+        let rewritten = super::adapt_postgres_sql_uncached(ADVANCE_PERSON_ID_SEQUENCE_POSTGRES_SQL);
+        assert!(rewritten.as_str().contains("GREATEST($1,"));
+        assert!(!rewritten.as_str().contains('?'));
+
+        assert!(
+            ALLOCATE_PERSON_ID_POSTGRES_SQL.contains("ON CONFLICT(id) DO NOTHING RETURNING id")
+        );
+        assert!(
+            ALLOCATE_PERSON_ID_POSTGRES_SQL
+                .contains("INSERT INTO person_id_sequence DEFAULT VALUES")
+        );
+        assert!(PERSON_ID_SEQUENCE_LOCK_POSTGRES_SQL.contains("pg_advisory_xact_lock("));
+        assert_eq!(
+            super::adapt_postgres_sql_uncached(PERSON_ID_SEQUENCE_LOCK_POSTGRES_SQL).as_str(),
+            PERSON_ID_SEQUENCE_LOCK_POSTGRES_SQL
+        );
     }
 }

@@ -3374,10 +3374,16 @@ impl MetadataSelectionService {
                 .await?
         };
         let nfo_started = std::time::Instant::now();
-        let nfo_report = match current.item_type.as_str() {
-            "MOVIE" => self.nfo.write_item_movie_nfo(item_id, &movie_nfo).await?,
-            "SERIES" => self.nfo.write_item_series_nfo(item_id, &movie_nfo).await?,
-            _ => self.nfo.write_item_nfo(item_id, &state.metadata).await?,
+        let nfo_report = match match current.item_type.as_str() {
+            "MOVIE" => self.nfo.write_item_movie_nfo(item_id, &movie_nfo).await,
+            "SERIES" => self.nfo.write_item_series_nfo(item_id, &movie_nfo).await,
+            _ => self.nfo.write_item_nfo(item_id, &state.metadata).await,
+        } {
+            Ok(report) => Some(report),
+            // Items without a sidecar NFO directory (such as a root-level series or an item with
+            // no active local source) still persist their database metadata without failing.
+            Err(NfoWriteError::ItemNotFound) => None,
+            Err(error) => return Err(MetadataSelectionError::Nfo(error)),
         };
         self.resources
             .record_metadata_stage("nfo_write", nfo_started.elapsed());
@@ -3407,6 +3413,10 @@ impl MetadataSelectionService {
         }
         let provider_ids_json = serde_json::to_string(&provider_ids)
             .map_err(|error| MetadataSelectionError::InvalidCandidate(error.to_string()))?;
+        let metadata_fingerprint = nfo_report
+            .as_ref()
+            .map(|report| report.fingerprint.as_slice())
+            .unwrap_or_else(|| current.metadata_fingerprint.as_deref().unwrap_or(&[]));
         let update = SelectedMetadataUpdate {
             item_id,
             candidate_id,
@@ -3426,7 +3436,7 @@ impl MetadataSelectionService {
                 && !options.keep_pending)
                 .then_some(options.scraper_id)
                 .flatten(),
-            metadata_fingerprint: &nfo_report.fingerprint,
+            metadata_fingerprint,
             provenance_json: &state.provenance_json(),
             locked_fields_json: &state.locked_fields_json(),
             poster_fallback_required: !has_primary_artwork,
@@ -3439,13 +3449,16 @@ impl MetadataSelectionService {
                     .map_err(|error| MetadataSelectionError::InvalidCandidate(error.to_string()))
             })
             .transpose()?;
+        let content_fingerprint = nfo_report
+            .as_ref()
+            .map(|report| report.content_fingerprint.as_slice());
         let selected = if let Some(nfo_details_json) = nfo_details_json.as_deref() {
             self.database
                 .select_metadata_candidate_with_nfo_cache_and_collection_reference(
                     update,
                     collection_reference.as_ref(),
                     nfo_details_json,
-                    &nfo_report.content_fingerprint,
+                    content_fingerprint,
                 )
                 .await?
         } else {
@@ -3638,6 +3651,12 @@ impl MetadataSelectionService {
             && scraper_allowed("DISC")
             && !screenshot_fallback_types.contains("DISC"))
         .then(|| disc_urls.poster_fallback.clone());
+        if specs.is_empty() && poster_disc_fallback.is_none() {
+            return Ok(Vec::new());
+        }
+        if !self.images.has_local_writeback_directory(item_id).await? {
+            return Ok(Vec::new());
+        }
         let item_permits = Arc::new(Semaphore::new(IMAGE_ITEM_CONCURRENCY));
         let mut tasks = JoinSet::new();
         for (index, (image_type, urls, image_index)) in specs.into_iter().enumerate() {
@@ -7555,6 +7574,231 @@ mod tests {
             .local_metadata_completeness_plans(&plan_inputs)
             .await?;
         assert_eq!(plans.len(), item_ids.len());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fill_missing_plan_and_selection_succeed_for_root_series_and_missing_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{libraries::LibraryService, scanner::LibraryScanner},
+            config::Config,
+            library::LibraryKind,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let shows_root = directory.path().join("Shows");
+        let movies_root = directory.path().join("Movies");
+        let movie_dir = movies_root.join("Missing Source (2020)");
+        tokio::fs::create_dir_all(&shows_root).await?;
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(
+            shows_root.join("Stray.S01E01.strm"),
+            "http://example.invalid/1\n",
+        )
+        .await?;
+        tokio::fs::write(movie_dir.join("Missing.Source.2020.mkv"), b"movie").await?;
+
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let shows_lib = libraries
+            .create_library("Shows", LibraryKind::Series, false)
+            .await?;
+        libraries
+            .add_root(
+                shows_lib.id,
+                shows_root.to_str().ok_or("non-utf8 media root")?,
+            )
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_series_library(shows_lib.id)
+            .await?;
+        let series_id: String = sqlx::query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'SERIES' LIMIT 1",
+        )
+        .bind(shows_lib.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+
+        let movies_lib = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(
+                movies_lib.id,
+                movies_root.to_str().ok_or("non-utf8 media root")?,
+            )
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(movies_lib.id)
+            .await?;
+        let movie_id: String = sqlx::query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' LIMIT 1",
+        )
+        .bind(movies_lib.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE filesystem_entries
+             SET is_missing = 1
+             WHERE id IN (SELECT filesystem_entry_id FROM media_sources WHERE item_id = ?)",
+        )
+        .bind(&movie_id)
+        .execute(database.pool())
+        .await?;
+
+        let service = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new_with_config_dir(database.clone(), config.config_dir.clone())?,
+            config.config_dir,
+        );
+        let series_current = database
+            .find_media_item_metadata(&series_id)
+            .await?
+            .ok_or("root series metadata missing")?;
+        let movie_current = database
+            .find_media_item_metadata(&movie_id)
+            .await?
+            .ok_or("missing-source movie metadata missing")?;
+
+        let series_plan = service
+            .fill_missing_request_plan_for_current(&series_id, &series_current, None)
+            .await?;
+        assert!(series_plan.requestable.needs_metadata);
+        let movie_plan = service
+            .fill_missing_request_plan_for_current(&movie_id, &movie_current, None)
+            .await?;
+        assert!(movie_plan.requestable.needs_metadata);
+
+        let candidate_id = uuid::Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO metadata_candidates (
+                 id, item_id, provider, provider_id, candidate_json, score, status
+             ) VALUES (?, ?, 'tmdb', '999', ?, 100.0, 'PENDING')",
+        )
+        .bind(&candidate_id)
+        .bind(&series_id)
+        .bind(
+            json!({
+                "title": "Stray",
+                "overview": "Root-level series overview",
+                "productionYear": 2025,
+                "posterUrl": "https://example.invalid/poster.jpg",
+                "genres": ["Drama"]
+            })
+            .to_string(),
+        )
+        .execute(database.pool())
+        .await?;
+
+        let report = service
+            .select(
+                &series_id,
+                &candidate_id,
+                MetadataSelectionMode::FillMissing,
+            )
+            .await?;
+        assert_eq!(report.status, "ONLINE_CONFIRMED");
+        assert!(report.image_types.is_empty());
+
+        let updated = database
+            .find_media_item_metadata(&series_id)
+            .await?
+            .ok_or("updated root series metadata missing")?;
+        assert_eq!(updated.identification_status, "ONLINE_CONFIRMED");
+        assert_eq!(
+            updated.overview.as_deref(),
+            Some("Root-level series overview")
+        );
+        assert!(updated.nfo_metadata_json.is_some());
+        let item_nfo_fingerprint: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT nfo_metadata_fingerprint FROM media_items WHERE id = ?")
+                .bind(&series_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert!(item_nfo_fingerprint.is_none());
+        let cache_nfo_fingerprint: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT fingerprint FROM media_item_nfo_cache WHERE item_id = ?")
+                .bind(&series_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert!(cache_nfo_fingerprint.is_none());
+
+        // Updating only the fingerprint on an identical cached NFO JSON snapshot must refresh
+        // `media_item_nfo_cache.fingerprint` instead of leaving NULL/stale bytes behind.
+        let new_cache_fingerprint = vec![9_u8; 32];
+        database
+            .update_media_item_nfo_metadata(
+                &series_id,
+                updated.nfo_metadata_json.as_deref(),
+                Some(&new_cache_fingerprint),
+            )
+            .await?;
+        let updated_cache_fingerprint: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT fingerprint FROM media_item_nfo_cache WHERE item_id = ?")
+                .bind(&series_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(
+            updated_cache_fingerprint.as_deref(),
+            Some(new_cache_fingerprint.as_slice())
+        );
+
+        // Selecting metadata when the local media source is missing (`nfo_report == None`)
+        // preserves an existing non-null `media_items.nfo_metadata_fingerprint` via `COALESCE`.
+        let preserved_fingerprint = vec![7_u8; 32];
+        sqlx::query("UPDATE media_items SET nfo_metadata_fingerprint = ? WHERE id = ?")
+            .bind(&preserved_fingerprint)
+            .bind(&movie_id)
+            .execute(database.pool())
+            .await?;
+        let movie_candidate_id = uuid::Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO metadata_candidates (
+                 id, item_id, provider, provider_id, candidate_json, score, status
+             ) VALUES (?, ?, 'tmdb', '998', ?, 100.0, 'PENDING')",
+        )
+        .bind(&movie_candidate_id)
+        .bind(&movie_id)
+        .bind(
+            json!({
+                "title": "Missing Source",
+                "overview": "Missing-source movie overview",
+                "productionYear": 2020,
+                "genres": ["Action"]
+            })
+            .to_string(),
+        )
+        .execute(database.pool())
+        .await?;
+        let movie_report = service
+            .select(
+                &movie_id,
+                &movie_candidate_id,
+                MetadataSelectionMode::FillMissing,
+            )
+            .await?;
+        assert_eq!(movie_report.status, "ONLINE_CONFIRMED");
+        let movie_nfo_fingerprint: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT nfo_metadata_fingerprint FROM media_items WHERE id = ?")
+                .bind(&movie_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(
+            movie_nfo_fingerprint.as_deref(),
+            Some(preserved_fingerprint.as_slice())
+        );
+        let movie_cache_fingerprint: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT fingerprint FROM media_item_nfo_cache WHERE item_id = ?")
+                .bind(&movie_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert!(movie_cache_fingerprint.is_none());
+        database.close().await;
         Ok(())
     }
 }

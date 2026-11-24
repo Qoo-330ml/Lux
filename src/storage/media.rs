@@ -165,6 +165,7 @@ struct MediaMetadataRow {
     series_provider_ids_json: Option<String>,
     series_metadata_scraper_id: Option<String>,
     scraper_id: Option<String>,
+    is_active: i64,
 }
 
 fn stored_media_metadata(row: MediaMetadataRow) -> StoredMediaMetadata {
@@ -201,6 +202,7 @@ fn stored_media_metadata(row: MediaMetadataRow) -> StoredMediaMetadata {
         series_provider_ids_json,
         series_metadata_scraper_id,
         scraper_id,
+        is_active: _,
     } = row;
     let series_scraper_id = series_metadata_scraper_id.or_else(|| scraper_id.clone());
     let series_provider =
@@ -3364,11 +3366,54 @@ impl Database {
         Ok(metadata.remove(item_id))
     }
 
+    pub(crate) async fn find_media_item_metadata_with_active_state(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<(StoredMediaMetadata, bool)>, StorageError> {
+        let mut rows = self
+            .list_media_item_metadata_rows_by_ids(&[item_id.to_owned()])
+            .await?;
+        let Some(row) = rows.pop() else {
+            return Ok(None);
+        };
+        let is_active = row.is_active != 0;
+        Ok(Some((stored_media_metadata(row), is_active)))
+    }
+
     pub(crate) async fn list_media_item_metadata_by_ids(
         &self,
         item_ids: &[String],
     ) -> Result<HashMap<String, StoredMediaMetadata>, StorageError> {
-        let mut metadata = HashMap::with_capacity(item_ids.len());
+        let rows = self.list_media_item_metadata_rows_by_ids(item_ids).await?;
+        let mut metadata = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let item_id = row.item_id.clone();
+            metadata.insert(item_id, stored_media_metadata(row));
+        }
+        Ok(metadata)
+    }
+
+    pub(crate) async fn list_active_media_item_metadata_by_ids(
+        &self,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, StoredMediaMetadata>, StorageError> {
+        let rows = self.list_media_item_metadata_rows_by_ids(item_ids).await?;
+        let mut metadata = HashMap::with_capacity(rows.len());
+        for row in rows {
+            if row.is_active == 0 {
+                continue;
+            }
+            let item_id = row.item_id.clone();
+            metadata.insert(item_id, stored_media_metadata(row));
+        }
+        Ok(metadata)
+    }
+
+    async fn list_media_item_metadata_rows_by_ids(
+        &self,
+        item_ids: &[String],
+    ) -> Result<Vec<MediaMetadataRow>, StorageError> {
+        let mut metadata_rows = Vec::with_capacity(item_ids.len());
         for chunk in item_ids.chunks(500) {
             if chunk.is_empty() {
                 continue;
@@ -3393,7 +3438,9 @@ impl Database {
                         series.production_year AS series_production_year,
                         series.provider_ids_json AS series_provider_ids_json,
                         series.metadata_scraper_id AS series_metadata_scraper_id,
-                        libraries.scraper_id AS scraper_id
+                        libraries.scraper_id AS scraper_id,
+                        CAST(CASE WHEN mi.removed_at IS NULL AND mi.merged_into_item_id IS NULL
+                             THEN 1 ELSE 0 END AS BIGINT) AS is_active
                  FROM media_items mi
                  LEFT JOIN media_item_nfo_cache cache ON cache.item_id = mi.id
                  LEFT JOIN collection_item_references collection_reference
@@ -3410,12 +3457,9 @@ impl Database {
                 .fetch_all(&self.pool)
                 .await
                 .map_err(self.sqlx_err())?;
-            for row in rows {
-                let item_id = row.item_id.clone();
-                metadata.insert(item_id, stored_media_metadata(row));
-            }
+            metadata_rows.extend(rows);
         }
-        Ok(metadata)
+        Ok(metadata_rows)
     }
 
     pub(crate) async fn list_active_media_item_metadata_with_libraries(
@@ -3448,7 +3492,8 @@ impl Database {
                         series.production_year AS series_production_year,
                         series.provider_ids_json AS series_provider_ids_json,
                         series.metadata_scraper_id AS series_metadata_scraper_id,
-                        libraries.scraper_id AS scraper_id
+                        libraries.scraper_id AS scraper_id,
+                        CAST(1 AS BIGINT) AS is_active
                  FROM media_items mi
                  LEFT JOIN media_item_nfo_cache cache ON cache.item_id = mi.id
                  JOIN libraries
@@ -3456,7 +3501,9 @@ impl Database {
                  LEFT JOIN collection_item_references collection_reference
                    ON collection_reference.item_id = mi.id
                  LEFT JOIN media_items series ON series.id = mi.series_id
-                 WHERE mi.id IN ({placeholders}) AND mi.removed_at IS NULL"
+                 WHERE mi.id IN ({placeholders})
+                   AND mi.removed_at IS NULL
+                   AND mi.merged_into_item_id IS NULL"
             );
             let mut statement = self.query_as::<MediaMetadataRow>(sqlx::AssertSqlSafe(query));
             for item_id in chunk {
@@ -3482,7 +3529,7 @@ impl Database {
         let item_type = self
             .query_scalar::<String>(
                 "SELECT item_type FROM media_items
-             WHERE id = ? AND removed_at IS NULL",
+             WHERE id = ? AND removed_at IS NULL AND merged_into_item_id IS NULL",
             )
             .bind(item_id)
             .fetch_optional(&self.pool)
@@ -3494,17 +3541,19 @@ impl Database {
         let query = match item_type.as_str() {
             "SERIES" => {
                 "SELECT id FROM media_items
-                 WHERE removed_at IS NULL AND (id = ? OR series_id = ?)
+                 WHERE removed_at IS NULL AND merged_into_item_id IS NULL AND (id = ? OR series_id = ?)
                  ORDER BY CASE item_type WHEN 'SERIES' THEN 0 WHEN 'SEASON' THEN 1 ELSE 2 END,
                           season_number, episode_number, id"
             }
             "SEASON" => {
                 "SELECT id FROM media_items
-                 WHERE removed_at IS NULL AND (id = ? OR parent_id = ?)
+                 WHERE removed_at IS NULL AND merged_into_item_id IS NULL AND (id = ? OR parent_id = ?)
                  ORDER BY CASE item_type WHEN 'SEASON' THEN 0 ELSE 1 END,
                           episode_number, id"
             }
-            _ => "SELECT id FROM media_items WHERE id = ? AND removed_at IS NULL",
+            _ => {
+                "SELECT id FROM media_items WHERE id = ? AND removed_at IS NULL AND merged_into_item_id IS NULL"
+            }
         };
         let mut query = self.query_scalar::<String>(query).bind(item_id);
         if matches!(item_type.as_str(), "SERIES" | "SEASON") {

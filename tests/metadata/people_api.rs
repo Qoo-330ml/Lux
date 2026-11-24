@@ -3246,3 +3246,124 @@ async fn startup_backfill_reparses_pre_upgrade_dual_nfos_and_merges_existing_peo
     assert_eq!(converged_person, tmdb_person_id);
     Ok(())
 }
+
+#[tokio::test]
+async fn restoring_person_manifests_and_splitting_identity_keeps_lux_person_ids_monotonic()
+-> Result<(), Box<dyn std::error::Error>> {
+    use sha2::{Digest, Sha256};
+
+    fn signed_person_manifest_json(
+        lux_id: &str,
+        name: &str,
+        provider: &str,
+        provider_id: &str,
+    ) -> Result<String, serde_json::Error> {
+        let render = |checksum: &str| -> Result<String, serde_json::Error> {
+            Ok(format!(
+                "{{\"schemaVersion\":3,\"generation\":1,\"luxPersonId\":{},\"displayName\":{},\"identities\":[{{\"provider\":{},\"id\":{}}}],\"checksum\":{}}}",
+                serde_json::to_string(lux_id)?,
+                serde_json::to_string(name)?,
+                serde_json::to_string(provider)?,
+                serde_json::to_string(provider_id)?,
+                serde_json::to_string(checksum)?,
+            ))
+        };
+        let unsigned = render("")?;
+        let checksum: String = Sha256::digest(unsigned.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        render(&checksum)
+    }
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, title, sort_title, identification_status, has_available_source
+         ) VALUES ('movie-seq-1', ?, 'MOVIE', 'Sequence Movie', 'sequence movie', 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let people = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+
+    for (lux_id, name, provider, provider_id) in [
+        ("lux-000015", "高位演员", "tmdb", "1500"),
+        ("lux-000002", "低位演员", "tmdb", "200"),
+    ] {
+        let person_dir = lux_person_directory(&config.config_dir, name, lux_id)?;
+        tokio::fs::create_dir_all(&person_dir).await?;
+        let manifest_json = signed_person_manifest_json(lux_id, name, provider, provider_id)?;
+        tokio::fs::write(person_dir.join("person.json"), manifest_json).await?;
+    }
+
+    sqlx::query(
+        "INSERT INTO person_manifest_restore_state (id, status, schema_version, updated_at)
+         VALUES (1, 'PENDING', 3, 1)
+         ON CONFLICT(id) DO UPDATE SET status = 'PENDING', schema_version = 3",
+    )
+    .execute(database.pool())
+    .await?;
+    people.rebuild_person_credit_index().await?;
+
+    let restored_high: String = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities WHERE provider = 'tmdb' AND provider_id = '1500'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let restored_low: String = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities WHERE provider = 'tmdb' AND provider_id = '200'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(restored_high, "lux-000015");
+    assert_eq!(restored_low, "lux-000002");
+
+    people
+        .persist_item_actors(
+            "movie-seq-1",
+            "tmdb",
+            &[ActorCredit {
+                id: "1600".to_owned(),
+                provider: Some("tmdb".to_owned()),
+                identities: vec![luxd::application::people::PersonIdentity {
+                    provider: "imdb".to_owned(),
+                    id: "nm1600".to_owned(),
+                }],
+                name: "新演员".to_owned(),
+                character: Some("主角".to_owned()),
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+
+    let created_id: String = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities WHERE provider = 'tmdb' AND provider_id = '1600'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(created_id, "lux-000016");
+
+    let split_id = people
+        .split_person_identity(
+            &created_id,
+            "imdb",
+            "nm1600",
+            "拆分演员",
+            r#"{"reason":"manual split"}"#,
+        )
+        .await?;
+    assert_eq!(split_id, "lux-000017");
+    Ok(())
+}

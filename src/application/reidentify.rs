@@ -795,6 +795,7 @@ impl MetadataJobOwnerGuard {
 enum RefreshItemOutcome {
     Confirmed(i64),
     NeedsReview(i64),
+    SkippedInactive(i64),
 }
 
 struct RefreshItemOptions<'a> {
@@ -1428,7 +1429,7 @@ impl MetadataReidentifyService {
         }
         let metadata_by_item = self
             .database
-            .list_media_item_metadata_by_ids(&unique_ids)
+            .list_active_media_item_metadata_by_ids(&unique_ids)
             .await?;
         for item_id in &unique_ids {
             let Some(item) = metadata_by_item.get(item_id) else {
@@ -1834,8 +1835,16 @@ impl MetadataReidentifyService {
     ) {
         let item_started = Instant::now();
         let mut item_title = None;
-        let result = match self.database.find_media_item_metadata(item_id).await {
-            Ok(Some(item)) => {
+        let result = match self
+            .database
+            .find_media_item_metadata_with_active_state(item_id)
+            .await
+        {
+            Ok(Some((item, false))) => {
+                item_title = Some(bounded_display_text(&item.title));
+                Ok(RefreshItemOutcome::SkippedInactive(0))
+            }
+            Ok(Some((item, true))) => {
                 item_title = Some(bounded_display_text(&item.title));
                 if !matches!(
                     item.item_type.as_str(),
@@ -1930,12 +1939,16 @@ impl MetadataReidentifyService {
         }
         match result {
             Ok(outcome) => {
-                let (candidate_count, issue) = match outcome {
-                    RefreshItemOutcome::Confirmed(candidate_count) => (candidate_count, None),
+                let (candidate_count, issue, emit_webhook) = match outcome {
+                    RefreshItemOutcome::Confirmed(candidate_count) => (candidate_count, None, true),
                     RefreshItemOutcome::NeedsReview(candidate_count) => (
                         candidate_count,
                         Some(MetadataReidentifyError::LowConfidence),
+                        true,
                     ),
+                    RefreshItemOutcome::SkippedInactive(candidate_count) => {
+                        (candidate_count, None, false)
+                    }
                 };
                 let recorded = self
                     .database
@@ -1966,7 +1979,7 @@ impl MetadataReidentifyService {
                     }
                 }
                 self.publish_job_progress(job_id);
-                if !matches!(mode, MetadataRefreshMode::Reidentify) {
+                if emit_webhook && !matches!(mode, MetadataRefreshMode::Reidentify) {
                     let (item_title, library_name) = if self.webhooks.is_some() {
                         let library_name = match job_library_name {
                             Some(library_name) => library_name,
@@ -2328,6 +2341,13 @@ impl MetadataReidentifyService {
                         selected_scraper_id = Some(scraper.scraper_id.clone());
                         break;
                     }
+                    Ok(RefreshItemOutcome::SkippedInactive(count)) => {
+                        return Ok(if candidate_count > 0 {
+                            RefreshItemOutcome::Confirmed(candidate_count.saturating_add(count))
+                        } else {
+                            RefreshItemOutcome::SkippedInactive(0)
+                        });
+                    }
                     Ok(RefreshItemOutcome::NeedsReview(count)) => {
                         log_metadata_scraper_attempt_issue(
                             job_id,
@@ -2385,13 +2405,25 @@ impl MetadataReidentifyService {
                 }) {
                     let current = match reusable_snapshot.take() {
                         Some(current) => current,
-                        None => self
+                        None => match self
                             .database
-                            .find_media_item_metadata(item_id)
+                            .find_media_item_metadata_with_active_state(item_id)
                             .await?
-                            .ok_or_else(|| {
-                                MetadataReidentifyError::ItemNotFound(item_id.to_owned())
-                            })?,
+                        {
+                            Some((current, true)) => current,
+                            Some((_, false)) => {
+                                return Ok(if candidate_count > 0 {
+                                    RefreshItemOutcome::Confirmed(candidate_count)
+                                } else {
+                                    RefreshItemOutcome::SkippedInactive(0)
+                                });
+                            }
+                            None => {
+                                return Err(MetadataReidentifyError::ItemNotFound(
+                                    item_id.to_owned(),
+                                ));
+                            }
+                        },
                     };
                     let fallback_plan = selection
                         .fallback_request_plan_for_current(item_id, &current)
@@ -2429,6 +2461,13 @@ impl MetadataReidentifyService {
                             RefreshItemOutcome::Confirmed(count)
                             | RefreshItemOutcome::NeedsReview(count),
                         ) => candidate_count = candidate_count.saturating_add(count),
+                        Ok(RefreshItemOutcome::SkippedInactive(count)) => {
+                            return Ok(if candidate_count > 0 {
+                                RefreshItemOutcome::Confirmed(candidate_count.saturating_add(count))
+                            } else {
+                                RefreshItemOutcome::SkippedInactive(0)
+                            });
+                        }
                         Err(error) if recoverable_scraper_attempt(&error) => {
                             log_metadata_scraper_attempt_issue(
                                 job_id,
@@ -2488,6 +2527,7 @@ impl MetadataReidentifyService {
                         RefreshItemOutcome::Confirmed(count)
                         | RefreshItemOutcome::NeedsReview(count),
                     ) => candidate_count = candidate_count.saturating_add(count),
+                    Ok(RefreshItemOutcome::SkippedInactive(_)) => {}
                     Err(error) if recoverable_scraper_attempt(&error) => {
                         log_metadata_scraper_attempt_issue(
                             job_id,
@@ -5069,6 +5109,9 @@ mod tests {
             match outcome {
                 super::RefreshItemOutcome::Confirmed(count) => format!("confirmed {count}"),
                 super::RefreshItemOutcome::NeedsReview(count) => format!("review {count}"),
+                super::RefreshItemOutcome::SkippedInactive(count) => {
+                    format!("skipped inactive {count}")
+                }
             }
         );
         let calls = calls
@@ -6403,5 +6446,177 @@ mod tests {
         assert_eq!(log_events.len(), 2);
         assert!(log_events[0]["fields"].get("upstream_status").is_none());
         assert_eq!(log_events[1]["fields"]["upstream_status"], 502);
+    }
+
+    #[tokio::test]
+    async fn library_refresh_job_and_active_metadata_query_exclude_merged_items()
+    -> Result<(), Box<dyn Error>> {
+        let (_temp_dir, _config, database, item_ids) = two_movie_fixture().await?;
+        let library_id = fixture_library_id(&database, &item_ids[0]).await?;
+        sqlx::query("UPDATE media_items SET merged_into_item_id = ? WHERE id = ?")
+            .bind(&item_ids[0])
+            .bind(&item_ids[1])
+            .execute(database.pool())
+            .await?;
+
+        let active = database
+            .list_active_media_item_metadata_with_libraries(&item_ids)
+            .await?;
+        assert_eq!(active.len(), 1);
+        assert!(active.contains_key(&item_ids[0]));
+        assert!(!active.contains_key(&item_ids[1]));
+
+        let service = super::MetadataReidentifyService::new(
+            database.clone(),
+            super::ScraperProvider::unconfigured(),
+        );
+        let job = service
+            .create_library_refresh_job(&library_id, MetadataRefreshMode::FillMissing)
+            .await?;
+        assert_eq!(job.total_count, 1);
+        assert_eq!(job.items.len(), 1);
+        assert_eq!(job.items[0].item_id, item_ids[0]);
+        assert!(
+            database
+                .list_metadata_refresh_item_ids(&item_ids[1])
+                .await?
+                .is_empty()
+        );
+        assert!(matches!(
+            service
+                .create_fill_missing_job(vec![item_ids[1].clone()])
+                .await,
+            Err(super::MetadataReidentifyError::ItemNotFound(id)) if id == item_ids[1]
+        ));
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fill_missing_skips_items_merged_or_removed_while_queued() -> Result<(), Box<dyn Error>>
+    {
+        let (_temp_dir, config, database, item_ids) = two_movie_fixture().await?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let scraper = RoleRecordingAdapter::new("tmdb", Arc::clone(&calls));
+        let selection = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new(database.clone())?,
+            config.config_dir.clone(),
+        );
+        let service = super::MetadataReidentifyService::with_selection(
+            database.clone(),
+            super::ScraperProvider::from_adapter(scraper.clone()),
+            Some(selection.clone()),
+        );
+        let job = service.create_fill_missing_job(item_ids.clone()).await?;
+
+        // Simulate one item being merged away (sources moved) and one being soft-deleted while
+        // the job sits in the queue.
+        sqlx::query("DELETE FROM media_sources WHERE item_id IN (?, ?)")
+            .bind(&item_ids[0])
+            .bind(&item_ids[1])
+            .execute(database.pool())
+            .await?;
+        sqlx::query("UPDATE media_items SET merged_into_item_id = ? WHERE id = ?")
+            .bind(&item_ids[1])
+            .bind(&item_ids[0])
+            .execute(database.pool())
+            .await?;
+        sqlx::query("UPDATE media_items SET removed_at = 1 WHERE id = ?")
+            .bind(&item_ids[1])
+            .execute(database.pool())
+            .await?;
+
+        service.run(&job.id).await;
+
+        let finished = service.get_job(&job.id).await?;
+        assert_eq!(finished.status, "COMPLETED");
+        assert_eq!(finished.total_count, 2);
+        assert_eq!(finished.processed_count, 2);
+        assert!(finished.error.is_none());
+        assert_eq!(
+            metadata_job_item_rows(&database, &job.id).await?,
+            vec![
+                ("COMPLETED".to_owned(), 0_i64, None),
+                ("COMPLETED".to_owned(), 0_i64, None),
+            ]
+        );
+        for inactive_id in [&item_ids[0], &item_ids[1]] {
+            assert!(matches!(
+                service
+                    .create_fill_missing_job(vec![inactive_id.clone()])
+                    .await,
+                Err(super::MetadataReidentifyError::ItemNotFound(id)) if &id == inactive_id
+            ));
+        }
+        assert!(
+            calls
+                .lock()
+                .expect("scraper call list should not be poisoned")
+                .is_empty()
+        );
+
+        // Truly missing rows still report ItemNotFound rather than being silently skipped.
+        assert!(
+            database
+                .find_media_item_metadata_with_active_state("truly-missing-item")
+                .await?
+                .is_none()
+        );
+        assert!(matches!(
+            service
+                .create_fill_missing_job(vec!["truly-missing-item".to_owned()])
+                .await,
+            Err(super::MetadataReidentifyError::ItemNotFound(id)) if id == "truly-missing-item"
+        ));
+
+        // A root-level series still completes FILL_MISSING without IMAGE_ITEM_NOT_FOUND or
+        // NFO_WRITE_FAILED even though it has no dedicated per-series folder.
+        let shows_root = _temp_dir.path().join("Shows");
+        tokio::fs::create_dir_all(&shows_root).await?;
+        tokio::fs::write(
+            shows_root.join("Example.Movie.S01E01.strm"),
+            b"http://example.invalid/stray\n",
+        )
+        .await?;
+        let shows_lib = LibraryService::new(database.clone())
+            .create_library("Shows", LibraryKind::Series, false)
+            .await?;
+        LibraryService::new(database.clone())
+            .add_root(shows_lib.id, shows_root.to_str().ok_or("non-utf8 root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_series_library(shows_lib.id)
+            .await?;
+        let series_id: String = sqlx::query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'SERIES' LIMIT 1",
+        )
+        .bind(shows_lib.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE media_items SET title = 'Example Movie', production_year = 2020 WHERE id = ?",
+        )
+        .bind(&series_id)
+        .execute(database.pool())
+        .await?;
+        let series_job = service
+            .create_fill_missing_job(vec![series_id.clone()])
+            .await?;
+        service.run(&series_job.id).await;
+        let series_finished = service.get_job(&series_job.id).await?;
+        assert_eq!(series_finished.status, "COMPLETED");
+        assert!(series_finished.error.is_none());
+        assert_eq!(
+            metadata_job_item_rows(&database, &series_job.id).await?,
+            vec![("COMPLETED".to_owned(), 1_i64, None)]
+        );
+        let series_updated = database
+            .find_media_item_metadata(&series_id)
+            .await?
+            .ok_or("root series should remain readable")?;
+        assert_eq!(series_updated.identification_status, "ONLINE_CONFIRMED");
+        database.close().await;
+        Ok(())
     }
 }

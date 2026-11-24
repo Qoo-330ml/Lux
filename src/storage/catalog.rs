@@ -9800,13 +9800,16 @@ impl Database {
         json: &str,
         fingerprint: Option<&[u8]>,
     ) -> Result<bool, StorageError> {
-        let previous: Option<String> = self
-            .query_scalar("SELECT json FROM media_item_nfo_cache WHERE item_id = ?")
+        let previous: Option<(String, Option<Vec<u8>>)> = self
+            .query_as("SELECT json, fingerprint FROM media_item_nfo_cache WHERE item_id = ?")
             .bind(item_id)
             .fetch_optional(&mut **transaction)
             .await
             .map_err(self.sqlx_err())?;
-        if previous.as_deref() == Some(json) {
+        let json_changed = previous.as_ref().map(|(prev_json, _)| prev_json.as_str()) != Some(json);
+        let fingerprint_changed =
+            previous.as_ref().map(|(_, prev_fp)| prev_fp.as_deref()) != Some(fingerprint);
+        if !json_changed && !fingerprint_changed {
             return Ok(false);
         }
         let (byte_length, now) = match self.backend() {
@@ -9830,7 +9833,7 @@ impl Database {
             .execute(&mut **transaction)
             .await
             .map_err(self.sqlx_err())?;
-        Ok(true)
+        Ok(json_changed)
     }
 
     async fn update_media_item_nfo_metadata_in_transaction(
