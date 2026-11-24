@@ -224,6 +224,55 @@ async fn login_me_logout_and_csrf_are_session_backed() -> Result<(), Box<dyn std
     Ok(())
 }
 
+/// A reverse proxy terminates TLS and forwards the original scheme, so the session cookie must be
+/// marked `Secure` whenever the request reports HTTPS. The cookie stays unmarked on plain HTTP,
+/// which the login above already pins.
+#[tokio::test]
+async fn https_forwarded_login_marks_the_session_cookie_secure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = test_config(&temp_dir)?;
+    let (base_url, server) = test_server(config).await?;
+    let client = test_client();
+
+    let setup = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(
+            &json!({ "username": "Admin", "displayName": "Admin", "password": "correct password" }),
+        )
+        .send()
+        .await?;
+    assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
+
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .header("x-forwarded-proto", "https")
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let session_set_cookie = login
+        .headers()
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with("lux_session="))
+        .ok_or("missing session set-cookie")?;
+    assert!(session_set_cookie.contains("Secure"));
+    assert!(session_set_cookie.contains("HttpOnly"));
+    let csrf_set_cookie = login
+        .headers()
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with("lux_csrf="))
+        .ok_or("missing csrf set-cookie")?;
+    assert!(csrf_set_cookie.contains("Secure"));
+
+    server.abort();
+    Ok(())
+}
+
 #[tokio::test]
 async fn expired_web_sessions_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

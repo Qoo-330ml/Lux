@@ -95,13 +95,28 @@ pub fn apply_proxy(
 pub struct RemoteAccessPolicy;
 
 impl RemoteAccessPolicy {
-    pub fn is_remote(&self, _peer: Option<&str>, _forwarded_for: Option<&str>) -> bool {
-        false
+    /// Whether a request is a remote request, given the address the trusted access-IP resolver
+    /// produced for it.
+    ///
+    /// `client_ip` must already be the resolver's answer: the connection peer from the server
+    /// middleware, with the forwarded chain applied only when that peer is an explicitly trusted
+    /// proxy. Raw `X-Forwarded-For` values never reach this decision, so callers must not parse a
+    /// forwarded header themselves and pass the result here.
+    ///
+    /// `None` means the process served the request without a network peer (in-process handler
+    /// tests); the TCP server always attaches `x-lux-peer-ip`, so an absent address is local.
+    pub fn is_remote_address(&self, client_ip: Option<IpAddr>) -> bool {
+        client_ip.is_some_and(|address| self.is_remote_ip(address))
     }
 
-    pub fn client_ip(&self, peer: Option<&str>, forwarded_for: Option<&str>) -> Option<IpAddr> {
-        let peer = peer.and_then(|value| value.parse::<IpAddr>().ok())?;
-        Some(forwarded_for.and_then(first_forwarded_ip).unwrap_or(peer))
+    /// Whether one resolved client address lies outside the local network.
+    ///
+    /// The local set matches [`crate::application::user_access_rules::is_private_or_loopback`]:
+    /// loopback, RFC 1918, IPv4 link-local, IPv6 unique-local and link-local, and the IPv4-mapped
+    /// forms of those. Everything else - including public addresses and the Tailscale/CGNAT
+    /// `100.64.0.0/10` range - is remote.
+    pub fn is_remote_ip(&self, client_ip: IpAddr) -> bool {
+        !crate::application::user_access_rules::is_private_or_loopback(client_ip)
     }
 
     pub fn reported_client_ip(

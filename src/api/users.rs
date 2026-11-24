@@ -1063,11 +1063,9 @@ pub(super) async fn auth_login(
         .into_response();
     };
     state.login_rate_limiter.record_success(&login_key).await;
-    if state.remote_access.is_remote(
-        header_str(&headers, "x-lux-peer-ip"),
-        header_str(&headers, "x-forwarded-for"),
-    ) && !session.user.can_remote_access
-    {
+    // The account is checked against the address the login itself was judged with, so the policy
+    // decision and the access rules cannot disagree about which client this is.
+    if state.remote_access.is_remote_address(client_ip) && !session.user.can_remote_access {
         let _ = auth.logout(&session.session_token).await;
         return api_error(
             &headers,
@@ -1508,11 +1506,19 @@ pub(super) async fn auth_me(headers: HeaderMap, State(state): State<ReadyAppStat
         let service = state.admin_api_key();
         match service.resolve_principal(&candidate).await {
             Ok(Some(principal)) => {
-                if state.remote_access.is_remote(
-                    header_str(&headers, "x-lux-peer-ip"),
-                    header_str(&headers, "x-forwarded-for"),
-                ) && !principal.can_remote_access()
-                {
+                let remote = match super::request_is_remote(&headers, &state).await {
+                    Ok(remote) => remote,
+                    Err(_) => {
+                        return api_error(
+                            &headers,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            lux::ApiErrorCode::DatabaseUnavailable,
+                            "认证暂时不可用",
+                        )
+                        .into_response();
+                    }
+                };
+                if remote && !principal.can_remote_access() {
                     return api_error(
                         &headers,
                         StatusCode::FORBIDDEN,
@@ -1940,16 +1946,60 @@ pub(super) async fn redeem_device_pairing(
         .redeem(&pairing_id, request.secret.trim(), &device)
         .await
     {
-        Ok(redemption) => (
-            StatusCode::OK,
-            [("Cache-Control", "no-store")],
-            Json(json!({
-                "accessToken": redemption.access_token,
-                "userId": redemption.user_id,
-                "serverId": state.server_id,
-            })),
-        )
-            .into_response(),
+        Ok(redemption) => {
+            // Redemption mints a client token, so it is a login entry point of its own: a remote
+            // request may not hand a device a credential for an account whose remote access is
+            // withdrawn. `Ok(false)` is the policy refusal; `Err(())` means the answer could not
+            // be established, which fails closed.
+            let policy = match super::request_is_remote(&headers, &state).await {
+                Ok(false) => Ok(true),
+                Ok(true) => match UserStore::new(state.database().clone()) {
+                    // An account that no longer exists cannot use the token either.
+                    Ok(users) => users
+                        .find_by_id(&redemption.user_id)
+                        .await
+                        .map(|user| user.is_some_and(|user| user.can_remote_access))
+                        .map_err(|_| ()),
+                    Err(_) => Err(()),
+                },
+                Err(_) => Err(()),
+            };
+            match policy {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = state.emby_auth().logout(&redemption.access_token).await;
+                    return api_error(
+                        &headers,
+                        StatusCode::FORBIDDEN,
+                        lux::ApiErrorCode::PermissionDenied,
+                        "当前账户不允许远程访问",
+                    )
+                    .into_response();
+                }
+                Err(()) => {
+                    // Revoke before answering so the pairing cannot be replayed into a token the
+                    // caller never learns the fate of.
+                    let _ = state.emby_auth().logout(&redemption.access_token).await;
+                    return api_error(
+                        &headers,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        lux::ApiErrorCode::DatabaseUnavailable,
+                        "设备配对暂时不可用",
+                    )
+                    .into_response();
+                }
+            }
+            (
+                StatusCode::OK,
+                [("Cache-Control", "no-store")],
+                Json(json!({
+                    "accessToken": redemption.access_token,
+                    "userId": redemption.user_id,
+                    "serverId": state.server_id,
+                })),
+            )
+                .into_response()
+        }
         Err(error) => device_pairing_error(&headers, error),
     }
 }
@@ -1990,11 +2040,19 @@ async fn require_web_session_csrf(
             .into_response());
         }
     };
-    if state.remote_access.is_remote(
-        header_str(headers, "x-lux-peer-ip"),
-        header_str(headers, "x-forwarded-for"),
-    ) && !session.user.can_remote_access
-    {
+    let remote = match super::request_is_remote(headers, state).await {
+        Ok(remote) => remote,
+        Err(_) => {
+            return Err(api_error(
+                headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "认证暂时不可用",
+            )
+            .into_response());
+        }
+    };
+    if remote && !session.user.can_remote_access {
         return Err(api_error(
             headers,
             StatusCode::FORBIDDEN,
@@ -2961,11 +3019,19 @@ async fn require_web_principal_observing_device(
 ) -> Result<crate::auth::users::AuthenticationPrincipal, Response> {
     if has_client_token(headers) {
         if let Some(principal) = resolve_shared_admin_api_key(headers, state).await? {
-            if state.remote_access.is_remote(
-                header_str(headers, "x-lux-peer-ip"),
-                header_str(headers, "x-forwarded-for"),
-            ) && !principal.can_remote_access()
-            {
+            let remote = match super::request_is_remote(headers, state).await {
+                Ok(remote) => remote,
+                Err(_) => {
+                    return Err(api_error(
+                        headers,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        lux::ApiErrorCode::DatabaseUnavailable,
+                        "认证暂时不可用",
+                    )
+                    .into_response());
+                }
+            };
+            if remote && !principal.can_remote_access() {
                 return Err(api_error(
                     headers,
                     StatusCode::FORBIDDEN,
@@ -3000,11 +3066,7 @@ async fn require_web_principal_observing_device(
         };
         return match auth.resolve_token_with_ip(&token, client_ip).await {
             Ok(Some(user)) => {
-                if state.remote_access.is_remote(
-                    header_str(headers, "x-lux-peer-ip"),
-                    header_str(headers, "x-forwarded-for"),
-                ) && !user.can_remote_access
-                {
+                if state.remote_access.is_remote_address(client_ip) && !user.can_remote_access {
                     Err(api_error(
                         headers,
                         StatusCode::FORBIDDEN,
@@ -3065,11 +3127,7 @@ async fn require_web_principal_observing_device(
     };
     match auth.resolve_principal(&session_token, client_ip).await {
         Ok(crate::auth::sessions::PrincipalResolution::Session(session)) => {
-            if state.remote_access.is_remote(
-                header_str(headers, "x-lux-peer-ip"),
-                header_str(headers, "x-forwarded-for"),
-            ) && !session.user.can_remote_access
-            {
+            if state.remote_access.is_remote_address(client_ip) && !session.user.can_remote_access {
                 return Err(api_error(
                     headers,
                     StatusCode::FORBIDDEN,
