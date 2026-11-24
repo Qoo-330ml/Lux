@@ -904,7 +904,27 @@ pub(super) async fn auth_login(
 ) -> Response {
     let auth = state.auth().clone();
 
-    let login_key = login_attempt_key(&headers, &request.username);
+    // Resolve the account before spending a rate-limit reservation: an attacker who spells
+    // `Ädmin`, `ädmin` or reaches the account through another route must land in one bucket.
+    // An unknown or unusable name keeps a normalized name bucket, and a storage fault is answered
+    // with 503 before anything is reserved.
+    let login_identity = match auth.find_user_id_by_username(&request.username).await {
+        Ok(Some(user_id)) => login_attempt_identity_for_user(&user_id),
+        Ok(None) => login_attempt_identity_for_unknown_name(&request.username),
+        Err(crate::auth::sessions::WebAuthError::UserStore(
+            crate::auth::users::UserStoreError::InvalidUsername,
+        )) => login_attempt_identity_for_unknown_name(&request.username),
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "登录暂时不可用",
+            )
+            .into_response();
+        }
+    };
+    let login_key = login_attempt_key(&headers, &login_identity);
     let login_device_id = web_login_device_id(&headers);
     if !state.login_rate_limiter.try_acquire(&login_key).await {
         return api_error(
@@ -940,8 +960,9 @@ pub(super) async fn auth_login(
     {
         Ok(session) => session,
         Err(crate::auth::sessions::WebAuthError::AccessDenied) => {
-            // Neither branch compared the password: an access rule or a storage fault is not a
-            // credential failure, so the reservation goes back to the window.
+            // The password matched and a device, client or IP rule then refused the session.
+            // That is not a failed credential, so the reservation goes back to the window
+            // instead of counting against the account.
             state.login_rate_limiter.release_attempt(&login_key).await;
             return api_error(
                 &headers,
@@ -952,6 +973,8 @@ pub(super) async fn auth_login(
             .into_response();
         }
         Err(_) => {
+            // A storage or rule-evaluation fault is not a failed password either; release the
+            // reservation so a broken backend cannot lock the account out.
             state.login_rate_limiter.release_attempt(&login_key).await;
             return api_error(
                 &headers,

@@ -935,15 +935,18 @@ async fn failed_emby_logins_are_indexed_only_for_known_users_and_not_rate_limite
     .await?;
     assert_eq!(
         failed_events.len(),
-        7,
-        "the sixth known-user attempt is rate limited"
+        6,
+        "the sixth attempt is refused before the password check and is not audited, and the \
+         display-name spelling shares the account's budget"
     );
     assert_eq!(
         failed_events
             .iter()
             .filter(|event| event.1 == known_user.id.to_string())
             .count(),
-        6
+        5,
+        "five audited password failures: the sixth attempt and the display-name attempt are \
+         refused by the limiter before any credential check"
     );
     assert_eq!(
         failed_events
@@ -977,7 +980,7 @@ async fn failed_emby_logins_are_indexed_only_for_known_users_and_not_rate_limite
             .iter()
             .filter(|event| event["eventType"] == "AUTH_LOGIN_FAILED")
             .count(),
-        7
+        6
     );
 
     server.abort();

@@ -178,6 +178,19 @@ impl EmbyAuthService {
         &self,
         username: &str,
     ) -> Result<Option<String>, EmbyAuthError> {
+        self.login_target_user_id(username).await
+    }
+
+    /// The account an `AuthenticateByName` login targets.
+    ///
+    /// It resolves exactly like the password check itself (normalized username first, then a
+    /// single exact display-name match), so the login rate limiter can key the attempt on the
+    /// account instead of the submitted string: the username, its display name and the
+    /// `/Users/{id}/Authenticate` route would otherwise hand one account three failure budgets.
+    pub async fn login_target_user_id(
+        &self,
+        username: &str,
+    ) -> Result<Option<String>, EmbyAuthError> {
         Ok(self
             .users
             .find_emby_authentication_target_id(username)
@@ -217,13 +230,16 @@ impl EmbyAuthService {
             .user_access_blacklist_matches(&user.id.to_string(), device)
             .await?
         {
-            return Ok(None);
+            // The password already matched; only the session is refused. Reporting this as a
+            // missing credential would count it as a failed password and emit the brute-force
+            // audit event for a user who authenticated correctly.
+            return Err(EmbyAuthError::AccessDenied);
         }
         if self
             .is_user_ip_blacklisted(&user.id.to_string(), client_ip)
             .await?
         {
-            return Ok(None);
+            return Err(EmbyAuthError::AccessDenied);
         }
         let token = generate_token()?;
         let token_id = UserId::new().to_string();
@@ -732,6 +748,12 @@ fn principal_cache_key(token_hash: &[u8], allow_playback_scope: bool) -> Vec<u8>
 
 #[derive(Debug)]
 pub enum EmbyAuthError {
+    /// The password was verified but a device, client or IP access rule refused the session.
+    ///
+    /// This is deliberately not `Ok(None)`: the caller must be able to tell a rejected
+    /// credential from a rejected session, because only the former counts as a failed password
+    /// attempt and is audited as one.
+    AccessDenied,
     AccessRulesUnavailable,
     InvalidUserId(String),
     Password(PasswordError),
@@ -761,6 +783,7 @@ impl From<UserStoreError> for EmbyAuthError {
 impl std::fmt::Display for EmbyAuthError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::AccessDenied => formatter.write_str("session denied by user access rules"),
             Self::AccessRulesUnavailable => formatter.write_str("access rules are unavailable"),
             Self::InvalidUserId(error) => write!(formatter, "stored user ID is invalid: {error}"),
             Self::Password(error) => error.fmt(formatter),
@@ -777,9 +800,10 @@ impl std::error::Error for EmbyAuthError {
             Self::Password(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::UserStore(error) => Some(error),
-            Self::AccessRulesUnavailable | Self::InvalidUserId(_) | Self::TokenGeneration(_) => {
-                None
-            }
+            Self::AccessDenied
+            | Self::AccessRulesUnavailable
+            | Self::InvalidUserId(_)
+            | Self::TokenGeneration(_) => None,
         }
     }
 }

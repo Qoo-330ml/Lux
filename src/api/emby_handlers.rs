@@ -2332,7 +2332,19 @@ pub(super) async fn emby_authenticate(
         Err(status) => return status.into_response(),
     };
     let auth = state.emby_auth().clone();
-    let login_key = login_attempt_key(&headers, &request.username);
+    // Resolve the account with the same rule the password check uses (normalized username, then
+    // one exact display-name match) so the username, its display name and this account's id route
+    // all share one failure budget. Unresolvable names keep a normalized name bucket, and a
+    // storage fault is answered with 503 before any reservation is taken.
+    let login_identity = match auth.login_target_user_id(&request.username).await {
+        Ok(Some(user_id)) => login_attempt_identity_for_user(&user_id),
+        Ok(None) => login_attempt_identity_for_unknown_name(&request.username),
+        Err(crate::auth::emby::EmbyAuthError::UserStore(
+            crate::auth::users::UserStoreError::InvalidUsername,
+        )) => login_attempt_identity_for_unknown_name(&request.username),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let login_key = login_attempt_key(&headers, &login_identity);
     if !state.login_rate_limiter.try_acquire(&login_key).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -2351,6 +2363,13 @@ pub(super) async fn emby_authenticate(
     {
         Ok(Some(result)) => {
             emby_authentication_success_response(&headers, &state, &auth, &login_key, result).await
+        }
+        Err(crate::auth::emby::EmbyAuthError::AccessDenied) => {
+            // The password matched; a device, client or IP rule refused the session. Release the
+            // reservation and emit no failed-credential event: a blacklisted client retrying must
+            // not exhaust the account's password budget or raise brute-force alerts.
+            state.login_rate_limiter.release_attempt(&login_key).await;
+            StatusCode::UNAUTHORIZED.into_response()
         }
         Ok(None) => {
             // The reservation taken by `try_acquire` already counts this credential failure.
@@ -2375,11 +2394,14 @@ pub(super) async fn emby_authenticate(
             StatusCode::UNAUTHORIZED.into_response()
         }
         Err(crate::auth::emby::EmbyAuthError::AccessRulesUnavailable) => {
+            // Rule evaluation itself failed; the password may already have matched, so this is
+            // not a failed credential either.
             state.login_rate_limiter.release_attempt(&login_key).await;
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
         Err(_) => {
-            // A storage or rule-evaluation fault never compared the password.
+            // A storage or rule-evaluation fault is not a failed password: release the
+            // reservation so a broken backend cannot lock the account out.
             state.login_rate_limiter.release_attempt(&login_key).await;
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
@@ -2397,7 +2419,14 @@ pub(super) async fn emby_authenticate_user_id(
         Err(status) => return status.into_response(),
     };
     let auth = state.emby_auth().clone();
-    let login_key = login_attempt_key(&headers, &user_id);
+    // This route authenticates the same account as `/Users/AuthenticateByName`, so it must key the
+    // attempt on the resolved account as well; only ids that match no row keep their own bucket.
+    let login_identity = match auth.user_by_id(&user_id).await {
+        Ok(Some(user)) => login_attempt_identity_for_user(&user.id.to_string()),
+        Ok(None) => login_attempt_identity_for_unknown_id(&user_id),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let login_key = login_attempt_key(&headers, &login_identity);
     if !state.login_rate_limiter.try_acquire(&login_key).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -2415,6 +2444,13 @@ pub(super) async fn emby_authenticate_user_id(
     {
         Ok(Some(result)) => {
             emby_authentication_success_response(&headers, &state, &auth, &login_key, result).await
+        }
+        Err(crate::auth::emby::EmbyAuthError::AccessDenied) => {
+            // The password matched; a device, client or IP rule refused the session. Release the
+            // reservation and emit no failed-credential event: a blacklisted client retrying must
+            // not exhaust the account's password budget or raise brute-force alerts.
+            state.login_rate_limiter.release_attempt(&login_key).await;
+            StatusCode::UNAUTHORIZED.into_response()
         }
         Ok(None) => {
             // The reservation taken by `try_acquire` already counts this credential failure.
@@ -2438,6 +2474,7 @@ pub(super) async fn emby_authenticate_user_id(
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
         Err(_) => {
+            // Storage or rule-evaluation fault: release, never count it as a bad password.
             state.login_rate_limiter.release_attempt(&login_key).await;
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
