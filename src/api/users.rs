@@ -906,7 +906,7 @@ pub(super) async fn auth_login(
 
     let login_key = login_attempt_key(&headers, &request.username);
     let login_device_id = web_login_device_id(&headers);
-    if !state.login_rate_limiter.is_allowed(&login_key).await {
+    if !state.login_rate_limiter.try_acquire(&login_key).await {
         return api_error(
             &headers,
             StatusCode::UNAUTHORIZED,
@@ -918,6 +918,8 @@ pub(super) async fn auth_login(
     let client_ip = match super::request_access_ip(&headers, &state).await {
         Ok(client_ip) => client_ip,
         Err(_) => {
+            // The credentials were never checked, so this attempt must not stay counted.
+            state.login_rate_limiter.release_attempt(&login_key).await;
             return api_error(
                 &headers,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -938,6 +940,9 @@ pub(super) async fn auth_login(
     {
         Ok(session) => session,
         Err(crate::auth::sessions::WebAuthError::AccessDenied) => {
+            // Neither branch compared the password: an access rule or a storage fault is not a
+            // credential failure, so the reservation goes back to the window.
+            state.login_rate_limiter.release_attempt(&login_key).await;
             return api_error(
                 &headers,
                 StatusCode::FORBIDDEN,
@@ -947,6 +952,7 @@ pub(super) async fn auth_login(
             .into_response();
         }
         Err(_) => {
+            state.login_rate_limiter.release_attempt(&login_key).await;
             return api_error(
                 &headers,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -975,6 +981,7 @@ pub(super) async fn auth_login(
             {
                 Ok(reauthenticated) => session = reauthenticated,
                 Err(crate::auth::sessions::WebAuthError::AccessDenied) => {
+                    state.login_rate_limiter.release_attempt(&login_key).await;
                     return api_error(
                         &headers,
                         StatusCode::FORBIDDEN,
@@ -984,6 +991,7 @@ pub(super) async fn auth_login(
                     .into_response();
                 }
                 Err(_) => {
+                    state.login_rate_limiter.release_attempt(&login_key).await;
                     return api_error(
                         &headers,
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -998,7 +1006,8 @@ pub(super) async fn auth_login(
         }
     }
     let Some(session) = session else {
-        state.login_rate_limiter.record_failure(&login_key).await;
+        // Credential failure: the reservation taken by `try_acquire` is the failure count, so it
+        // is kept and nothing is incremented a second time.
         // §18.3: every failed credential check emits the parseable event, including an unknown
         // username - guessing usernames is exactly what the ban list is for. This also covers a
         // failed migration-backend call: the response below is already 401 INVALID_CREDENTIALS,
