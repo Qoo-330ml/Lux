@@ -2,6 +2,17 @@ import type { ChangelogRelease } from "../types";
 
 export const changelogReleases07: ChangelogRelease[] = [
   {
+    version: "0.7.29",
+    date: "2026-11-24",
+    sections: [
+      { kind: "fixed", items: [
+        "🐛 fix(people): 旧版人物关系快照不再被误隔离 — LUX-FP-1 时代的 32 字节快照遇到容器/FUSE 挂载的设备号漂移时，会被当成过期把好好的 people.json 挪进隔离区；现在回退到精确尺寸、纳秒修改时间、片名与年份一起校验。",
+        "🐛 fix(people): 被误隔离的快照会自动搬回来 — 升级后首启跑一次恢复，把当初被误隔离、且仍能匹配在库媒体的旧快照迁回原位并重建人物索引（索引 schema 升到 4）。",
+        "🐛 fix(metadata): 存量的双 NFO 会重新读一遍 — 本地元数据队列和手动刷新之前没拿到 PeopleService，双 NFO 的演员合并在批处理里跑不到，并发写同一演员时重定向也会指错；已修好并把本地 NFO 缓存与人物关系升到 2/5，启动后重排一次本地元数据回填，已有的 <片名>.nfo + movie.nfo 会重新读取、碰撞演员自动收敛。升级首启会多一次回填耗时。",
+      ] },
+    ],
+  },
+  {
     version: "0.7.28",
     date: "2026-11-24",
     sections: [
