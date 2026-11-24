@@ -2,6 +2,18 @@ import type { ChangelogRelease } from "../types";
 
 export const changelogReleases07: ChangelogRelease[] = [
   {
+    version: "0.7.27",
+    date: "2026-11-24",
+    sections: [
+      { kind: "added", items: [
+        "✨ feat(nfo): 演员的多个外部 ID 不再互相覆盖 — <actor> 里同时写了 tmdbid、imdbid、doubanid 时以前只留最后一个，现在全部保留并写回；同目录的 <片名>.nfo 与 movie.nfo 在确认是同一部影片时会互补补齐条目和演员的 ID，不是同一部就不合。",
+        "✨ feat(people): 同一演员的多个身份会自动收敛 — 之前同一个演员分别按 tmdb、imdb、豆瓣建成几个人物的，入库和人物重建时会自动选一条主记录合并，参演关系、收藏和头像都并过去，源人物标记为已合并，重启也不会被恢复。",
+        "✨ feat(people): 没有外部 ID 的本地演员按姓名合并 — 以前按「姓名 + 角色」生成本地 ID，同一个演员在不同片演不同角色会分裂成几条；现在只按规范化姓名，重建时会把旧收藏和已上传头像迁到新 ID，搜索里同一个人只剩一条。升级后首次启动会重建一次人物索引（schema 2→3），大库会有重建耗时，期间人物搜索可能暂时不全。",
+        "✨ feat(api): 新增 POST /api/v1/admin/people/merge — 管理员可以手动把源人物并进目标人物，返回合并结果并记录审计；自合并或已合并返回 409，人物不存在返回 404。",
+      ] },
+    ],
+  },
+  {
     version: "0.7.26",
     date: "2026-11-24",
     sections: [
