@@ -477,4 +477,119 @@ describe("AdminNotificationsPage", () => {
       }),
     );
   });
+
+  it("renders scheme A summary stats, filters destinations by status and search, and toggles enabled state via switch", async () => {
+    vi.mocked(api.adminWebhookDestinations).mockResolvedValueOnce({
+      destinations: [{
+        id: "destination-1",
+        name: "本地接收器",
+        url: "http://127.0.0.1:8787/hooks",
+        payloadFormat: "LUX",
+        providerPluginId: "org.lux.webhook",
+        providerConfig: { url: "http://127.0.0.1:8787/hooks" },
+        enabled: true,
+        allowPrivateNetwork: true,
+        eventTypes: ["MEDIA_ADDED", "SCAN_COMPLETED", "SCAN_FAILED", "JOB_FAILED"],
+        secretConfigured: true,
+        createdAt: 1_700_000_000,
+        updatedAt: 1_700_000_100,
+      }, {
+        id: "destination-2",
+        name: "备用审计钩子",
+        url: "https://audit.example.com/hooks",
+        payloadFormat: "LUX",
+        providerPluginId: "org.lux.webhook",
+        providerConfig: { url: "https://audit.example.com/hooks" },
+        enabled: false,
+        allowPrivateNetwork: false,
+        eventTypes: [],
+        secretConfigured: false,
+        createdAt: 1_700_000_000,
+        updatedAt: 1_700_000_100,
+      }],
+      page: 1,
+      pageSize: 50,
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root.render(createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(MemoryRouter, null, createElement(AdminNotificationsPage)),
+      ));
+    });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+
+    expect(container.querySelector(".lux-notification-stats")?.textContent).toContain("1 / 2");
+    expect(container.querySelectorAll(".lux-notification-destination")).toHaveLength(2);
+    expect(container.textContent).toContain("全部事件");
+    expect(container.textContent).toContain("+1");
+
+    const disabledFilter = [...container.querySelectorAll<HTMLButtonElement>(".lux-notification-filter-pills button")]
+      .find((button) => button.dataset.filter === "disabled");
+    expect(disabledFilter).toBeTruthy();
+    await act(async () => { disabledFilter!.click(); });
+    expect(container.querySelectorAll(".lux-notification-destination")).toHaveLength(1);
+    expect(container.textContent).toContain("备用审计钩子");
+
+    const allFilter = [...container.querySelectorAll<HTMLButtonElement>(".lux-notification-filter-pills button")]
+      .find((button) => button.dataset.filter === "all");
+    await act(async () => { allFilter!.click(); });
+
+    const searchInput = container.querySelector<HTMLInputElement>('input[aria-label="筛选通知目标"]');
+    expect(searchInput).toBeTruthy();
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(searchInput, "audit.example.com");
+      searchInput!.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(container.querySelectorAll(".lux-notification-destination")).toHaveLength(1);
+    expect(container.textContent).toContain("备用审计钩子");
+
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(searchInput, "");
+      searchInput!.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    const toggleSwitch = container.querySelector<HTMLInputElement>('input[aria-label="停用 本地接收器"]');
+    expect(toggleSwitch).toBeTruthy();
+    await act(async () => { toggleSwitch!.click(); });
+    expect(api.updateAdminWebhookDestination).toHaveBeenCalledWith("destination-1", { enabled: false });
+  });
+
+  it("opens edit modal outside the row and exposes rotate/delete inside overflow menu", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root.render(createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(MemoryRouter, null, createElement(AdminNotificationsPage)),
+      ));
+    });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+
+    const editButton = [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("编辑"));
+    await act(async () => { editButton!.click(); });
+
+    const editDialog = container.querySelector('[role="dialog"][aria-labelledby="notification-edit-title"]');
+    expect(editDialog).toBeTruthy();
+    expect(editDialog?.querySelector(".lux-notification-edit-form")).toBeTruthy();
+    expect(container.querySelector(".lux-notification-destination .lux-notification-edit-form")).toBeNull();
+
+    await act(async () => {
+      (container.querySelector('button[aria-label="关闭编辑通知"]') as HTMLButtonElement).click();
+    });
+    expect(container.querySelector('[role="dialog"][aria-labelledby="notification-edit-title"]')).toBeNull();
+
+    const moreButton = container.querySelector<HTMLButtonElement>('button[aria-label="更多操作：本地接收器"]');
+    expect(moreButton).toBeTruthy();
+    await act(async () => { moreButton!.click(); });
+
+    const menu = container.querySelector('[role="menu"]');
+    expect(menu).toBeTruthy();
+    const rotateItem = [...menu!.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+      .find((item) => item.textContent?.includes("轮换 Secret"));
+    expect(rotateItem).toBeTruthy();
+    await act(async () => { rotateItem!.click(); });
+    expect(api.rotateAdminWebhookSecret).toHaveBeenCalledWith("destination-1", undefined);
+  });
 });

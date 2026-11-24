@@ -97,6 +97,11 @@ describe("AdminOperationsPage", () => {
     await act(async () => {
       await vi.waitFor(() => expect(runPlan).toHaveBeenCalledWith("plan-night"));
     });
+    expect(container.textContent).toContain("已将「夜间校验」加入执行队列");
+    const goRunsBtn = container.querySelector<HTMLButtonElement>('button[aria-label="前往运行记录"]');
+    expect(goRunsBtn).not.toBeNull();
+    act(() => goRunsBtn?.click());
+    expect(container.querySelector('#runs-title')).not.toBeNull();
   });
 
   it("does not show an empty default library plan as a duplicate executable task", async () => {
@@ -147,21 +152,35 @@ describe("AdminOperationsPage", () => {
     expect(container.querySelector(".lux-operations-summary .lux-operations-stat strong")?.textContent).toBe("1");
   });
 
-  it("edits a plan cron with a tag-style dropdown that hides selected libraries", async () => {
+  it("edits a plan name, cron, and multi-select libraries in the workbench dialog", async () => {
     vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
     vi.spyOn(api, "adminScheduledTaskPlans").mockResolvedValue({
-      plans: [{
-        id: "plan-night",
-        taskType: "RECONCILIATION_SCAN",
-        name: "夜间校验",
-        schedule: "0 2 * * *",
-        isEnabled: true,
-        sourceType: "SYSTEM",
-        scopeType: "LIBRARY",
-        libraries: [{ id: "library-1", name: "电影库" }],
-        libraryCount: 1,
-      }],
-      total: 1,
+      plans: [
+        {
+          id: "plan-night",
+          taskType: "RECONCILIATION_SCAN",
+          name: "夜间校验",
+          schedule: "0 2 * * *",
+          isEnabled: true,
+          sourceType: "SYSTEM",
+          scopeType: "LIBRARY",
+          libraries: [{ id: "library-1", name: "电影库" }],
+          libraryCount: 1,
+        },
+        {
+          id: "plan-default",
+          taskType: "RECONCILIATION_SCAN",
+          name: "默认校验",
+          schedule: null,
+          isEnabled: false,
+          sourceType: "SYSTEM",
+          scopeType: "LIBRARY",
+          isDefault: true,
+          libraries: [{ id: "library-2", name: "剧集库" }],
+          libraryCount: 1,
+        },
+      ],
+      total: 2,
       page: 1,
       pageSize: 50,
     });
@@ -181,31 +200,184 @@ describe("AdminOperationsPage", () => {
       await vi.waitFor(() => expect(container.textContent).toContain("夜间校验"));
     });
     act(() => container.querySelector<HTMLButtonElement>('button[aria-label="编辑夜间校验"]')?.click());
-    expect(container.querySelector('input[aria-label="搜索媒体库"]')).toBeNull();
-    expect(container.querySelector('button[aria-label="移除媒体库 电影库"]')).not.toBeNull();
 
-    const librarySelect = container.querySelector<HTMLButtonElement>('button[role="combobox"][aria-label="选择目标媒体库"]');
-    expect(librarySelect).not.toBeNull();
-    await act(async () => librarySelect?.click());
-    expect(document.querySelector('[role="option"][data-value="library-1"]')).toBeNull();
-    const secondLibrary = document.querySelector<HTMLButtonElement>('[role="option"][data-value="library-2"]');
-    expect(secondLibrary).not.toBeNull();
-    await act(async () => secondLibrary?.click());
-    expect(container.querySelector('button[aria-label="移除媒体库 剧集库"]')).not.toBeNull();
+    const dialog = container.querySelector<HTMLElement>('.lux-dialog[role="dialog"]');
+    expect(dialog).not.toBeNull();
+    const nameInput = dialog?.querySelector<HTMLInputElement>('input[aria-label="计划名称"]');
+    expect(nameInput).not.toBeNull();
+    act(() => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(nameInput, "剧集深夜校验");
+      nameInput?.dispatchEvent(new Event("input", { bubbles: true }));
+    });
 
-    await act(async () => librarySelect?.click());
-    expect(document.querySelector('[role="option"][data-value="library-2"]')).toBeNull();
-    const removeFirstLibrary = container.querySelector<HTMLButtonElement>('button[aria-label="移除媒体库 电影库"]');
-    expect(removeFirstLibrary).not.toBeNull();
-    act(() => removeFirstLibrary?.click());
-    expect(container.querySelector('button[aria-label="移除媒体库 电影库"]')).toBeNull();
+    const movieCheckbox = dialog?.querySelector<HTMLInputElement>('input[type="checkbox"][data-library-id="library-1"]');
+    const seriesCheckbox = dialog?.querySelector<HTMLInputElement>('input[type="checkbox"][data-library-id="library-2"]');
+    expect(movieCheckbox?.checked).toBe(true);
+    expect(seriesCheckbox?.checked).toBe(false);
+    act(() => {
+      movieCheckbox?.click();
+      seriesCheckbox?.click();
+    });
+
     await act(async () => {
-      container.querySelector<HTMLButtonElement>(".lux-registered-plan-editor button[type='submit']")?.click();
+      dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.click();
       await vi.waitFor(() => expect(updatePlan).toHaveBeenCalledWith("plan-night", {
-        name: "夜间校验",
+        name: "剧集深夜校验",
         schedule: "0 2 * * *",
         isEnabled: true,
         libraryIds: ["library-2"],
+      }));
+    });
+  });
+
+  it("switches tasks in the master-detail workbench, isolates unsupported libraries, and quick-assigns a library", async () => {
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    vi.spyOn(api, "adminScheduledTaskPlans").mockResolvedValue({
+      plans: [
+        {
+          id: "plan-rec-night",
+          taskType: "RECONCILIATION_SCAN",
+          name: "剧集每日校验",
+          schedule: "0 18 * * *",
+          isEnabled: true,
+          sourceType: "SYSTEM",
+          scopeType: "LIBRARY",
+          isDefault: false,
+          libraries: [{ id: "lib-series", name: "剧集库" }],
+          libraryCount: 1,
+        },
+        {
+          id: "plan-rec-def",
+          taskType: "RECONCILIATION_SCAN",
+          name: "默认校验",
+          schedule: null,
+          isEnabled: false,
+          sourceType: "SYSTEM",
+          scopeType: "LIBRARY",
+          isDefault: true,
+          libraries: [{ id: "lib-movie", name: "电影库" }, { id: "lib-doc", name: "纪录片" }],
+          libraryCount: 2,
+        },
+        {
+          id: "plan-chapter-def",
+          taskType: "CHAPTER_DETECTION",
+          name: "片头片尾默认计划",
+          schedule: "0 19 * * *",
+          isEnabled: true,
+          sourceType: "PLUGIN",
+          pluginId: "org.lux.chapter",
+          scopeType: "LIBRARY",
+          isDefault: true,
+          libraries: [{ id: "lib-series", name: "剧集库" }],
+          libraryCount: 1,
+        },
+      ],
+      total: 3,
+      page: 1,
+      pageSize: 50,
+    });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({
+      libraries: [
+        { id: "lib-movie", name: "电影库" },
+        { id: "lib-series", name: "剧集库" },
+        { id: "lib-doc", name: "纪录片" },
+      ],
+    });
+    const updatePlan = vi.spyOn(api, "updateAdminScheduledTaskPlan").mockResolvedValue({
+      plan: { id: "plan-rec-night" },
+    });
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("剧集每日校验"));
+    });
+
+    const nav = container.querySelector<HTMLElement>(".lux-workbench-nav");
+    expect(nav).not.toBeNull();
+    expect(nav?.textContent).toContain("3/3 库");
+    expect(nav?.textContent).toContain("1/3 库");
+
+    // Quick-assign 电影库 from default plan into 剧集每日校验
+    const movieAssign = container.querySelector<HTMLButtonElement>('button[role="combobox"][aria-label="电影库 所属计划"]');
+    expect(movieAssign).not.toBeNull();
+    await act(async () => movieAssign?.click());
+    const nightOption = document.querySelector<HTMLButtonElement>('[role="option"][data-value="plan-rec-night"]');
+    expect(nightOption).not.toBeNull();
+    await act(async () => nightOption?.click());
+    await act(async () => {
+      await vi.waitFor(() => expect(updatePlan).toHaveBeenCalledWith("plan-rec-night", {
+        libraryIds: ["lib-series", "lib-movie"],
+      }));
+    });
+
+    // Switch to 片头片尾检测 in left nav and verify unsupported libraries are isolated
+    const chapterNavBtn = container.querySelector<HTMLButtonElement>('button[data-workbench-task="CHAPTER_DETECTION"]');
+    expect(chapterNavBtn).not.toBeNull();
+    act(() => chapterNavBtn?.click());
+    expect(container.querySelector(".lux-workbench-detail")?.textContent).toContain("片头片尾默认计划");
+    expect(container.querySelector(".lux-workbench-unsupported")?.textContent).toContain("另有 2 个媒体库未接入");
+    expect(container.querySelector(".lux-workbench-unsupported")?.textContent).toContain("电影库");
+  });
+
+  it("toggles plan enabled state directly on the row and allows clearing a library plan schedule", async () => {
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    vi.spyOn(api, "adminScheduledTaskPlans").mockResolvedValue({
+      plans: [
+        {
+          id: "plan-night",
+          taskType: "RECONCILIATION_SCAN",
+          name: "夜间校验",
+          schedule: "0 18 * * *",
+          isEnabled: true,
+          sourceType: "SYSTEM",
+          scopeType: "LIBRARY",
+          isDefault: false,
+          libraries: [{ id: "library-1", name: "电影库" }],
+          libraryCount: 1,
+        },
+      ],
+      total: 1,
+      page: 1,
+      pageSize: 50,
+    });
+    const updatePlan = vi.spyOn(api, "updateAdminScheduledTaskPlan").mockResolvedValue({
+      plan: { id: "plan-night" },
+    });
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [{ id: "library-1", name: "电影库" }] });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("夜间校验"));
+    });
+
+    const quickSwitch = container.querySelector<HTMLInputElement>('input[role="switch"][aria-label="启停夜间校验"]');
+    expect(quickSwitch?.checked).toBe(true);
+    await act(async () => quickSwitch?.click());
+    await act(async () => {
+      await vi.waitFor(() => expect(updatePlan).toHaveBeenCalledWith("plan-night", { isEnabled: false }));
+    });
+
+    // Open edit dialog and clear Cron schedule (must not be blocked by required={!globalPlan})
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="编辑夜间校验"]')?.click());
+    const cronInput = container.querySelector<HTMLInputElement>('.lux-dialog input[aria-label="Cron 执行计划"]');
+    expect(cronInput?.required).toBe(false);
+    act(() => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(cronInput, "");
+      cronInput?.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('.lux-dialog button[type="submit"]')?.click();
+      await vi.waitFor(() => expect(updatePlan).toHaveBeenCalledWith("plan-night", {
+        name: "夜间校验",
+        schedule: null,
+        isEnabled: false,
+        libraryIds: ["library-1"],
       }));
     });
   });
@@ -266,6 +438,11 @@ describe("AdminOperationsPage", () => {
     expect(container.querySelector('button[aria-label="删除默认校验"]')).toBeNull();
     expect(container.querySelector('button[aria-label="删除STRM 信息"]')).toBeNull();
 
+    act(() => container.querySelector<HTMLButtonElement>('button[data-workbench-task="STRM_MEDIA_INFO"]')?.click());
+    expect(container.textContent).toContain("STRM 信息");
+    expect(container.querySelector('button[aria-label="删除STRM 信息"]')).toBeNull();
+
+    act(() => container.querySelector<HTMLButtonElement>('button[data-workbench-task="RECONCILIATION_SCAN"]')?.click());
     act(() => container.querySelector<HTMLButtonElement>('button[aria-label="删除夜间校验"]')?.click());
     await act(async () => {
       await vi.waitFor(() => expect(deletePlan).toHaveBeenCalledWith("plan-custom"));
@@ -478,13 +655,15 @@ describe("AdminOperationsPage", () => {
     });
     act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(2)')?.click());
 
-    expect(container.textContent).toContain("部分条目处理失败");
-    expect(container.textContent).toContain("失败原因");
+    expect(container.textContent).not.toContain("部分条目处理失败");
+    expect(container.textContent).not.toContain("失败原因");
 
     await act(async () => {
       container.querySelector<HTMLButtonElement>('button[aria-label="查看元数据仅补全问题详情"]')?.click();
       await vi.waitFor(() => expect(getJob).toHaveBeenCalledWith("metadata-job-failed"));
     });
+    expect(container.textContent).toContain("失败原因");
+    expect(container.textContent).toContain("部分条目处理失败");
     expect(container.textContent).toContain("问题条目 4 个");
     expect(container.textContent).toContain("图片下载或写回失败");
     expect(container.textContent).toContain("TMDb 服务暂时不可用");
@@ -582,8 +761,10 @@ describe("AdminOperationsPage", () => {
     });
     expect(container.querySelector("h1")?.textContent).not.toBe("任务数据加载失败");
     expect(container.textContent).toContain("元数据仅补全");
-    expect(container.textContent).toContain("部分条目处理失败");
     expect(container.textContent).toContain("索引已完成，后处理未完成");
+    expect(container.textContent).not.toContain("部分条目处理失败");
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="查看元数据仅补全问题详情"]')?.click());
+    expect(container.textContent).toContain("部分条目处理失败");
     expect(scanJobs).toHaveBeenCalledWith(undefined, { hasPostprocessingIssues: true });
   });
 
@@ -1400,6 +1581,71 @@ describe("AdminOperationsPage", () => {
       expect(vi.mocked(api.adminLibraries).mock.calls.length).toBeGreaterThan(adminLibraryCallsBeforeRun);
     });
     expect(container.querySelector<HTMLButtonElement>('button[aria-label="编辑自动生成媒体库封面"]')).not.toBeNull();
+  });
+
+  it("renders scheme A compact runs table with on-demand error details behind the details button", async () => {
+    vi.spyOn(api, "adminJobs").mockResolvedValue({
+      jobs: [
+        {
+          id: "run-active",
+          libraryId: "library-1",
+          jobType: "INCREMENTAL_SCAN",
+          status: "RUNNING",
+          processedCount: 2,
+          totalCount: 10,
+          discoveryCompleted: true,
+          currentItem: "Movies/Dune.mkv",
+          createdAt: 1_700_000_300,
+        },
+        {
+          id: "run-completed",
+          libraryId: "library-1",
+          jobType: "RECONCILE_LIBRARY",
+          status: "COMPLETED",
+          processedMediaCount: 12,
+          startedAt: 1_700_000_000,
+          finishedAt: 1_700_000_045,
+          createdAt: 1_700_000_200,
+        },
+        {
+          id: "run-failed",
+          libraryId: "library-1",
+          jobType: "INCREMENTAL_SCAN",
+          status: "FAILED",
+          error: "WORKER_FAILED",
+          createdAt: 1_700_000_100,
+        },
+      ],
+    });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("已注册任务"));
+    });
+    act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(2)')?.click());
+
+    expect(container.querySelector(".lux-operations-runs-note")).not.toBeNull();
+    expect(container.querySelector("table.lux-runs-table")).not.toBeNull();
+    const rows = [...container.querySelectorAll<HTMLElement>(".lux-admin-job-row")];
+    expect(rows).toHaveLength(3);
+
+    expect(rows[0].querySelector(".lux-job-icon.is-active")).not.toBeNull();
+    expect(rows[0].querySelector(".lux-admin-job-library")?.textContent).toContain("电影库");
+    expect(rows[0].querySelector(".lux-admin-job-progress-pct")?.textContent).toBe("20%");
+
+    expect(rows[1].querySelector(".lux-job-icon.is-completed")).not.toBeNull();
+    expect(rows[1].textContent).toContain("总耗时：45 秒");
+
+    expect(rows[2].querySelector(".lux-job-icon.is-failed")).not.toBeNull();
+    expect(container.textContent).not.toContain("失败原因");
+
+    const detailsToggle = rows[2].querySelector<HTMLButtonElement>('button[aria-label="查看实时增量扫描问题详情"]');
+    expect(detailsToggle).not.toBeNull();
+    await act(async () => { detailsToggle!.click(); });
+    expect(container.querySelector(".lux-admin-job-detail-row")?.textContent).toContain("失败原因");
   });
 
   function renderPage() {

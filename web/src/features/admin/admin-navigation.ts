@@ -82,6 +82,10 @@ export function prefetchAdminPage(queryClient: QueryClient, to: string): void {
       break;
     case "/admin/jobs":
       void queryClient.prefetchQuery({
+        queryKey: queryKeys.adminScheduledTaskPlans(1, "", ""),
+        queryFn: () => api.adminScheduledTaskPlans(1, undefined, ""),
+      });
+      void queryClient.prefetchQuery({
         queryKey: queryKeys.adminScheduledTasks(1),
         queryFn: () => api.adminScheduledTasks(1),
       });

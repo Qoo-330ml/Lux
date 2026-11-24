@@ -5,20 +5,22 @@ import {
   ChevronDown,
   CheckCircle2,
   ClipboardList,
+  Clock,
+  Database,
   Download,
   FileClock,
   Inbox,
+  Info,
+  Layers,
   Pencil,
   Play,
-  Plus,
   RefreshCw,
   RotateCcw,
   Save,
   StopCircle,
-  Trash2,
   X,
 } from "lucide-react";
-import { useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { Fragment, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { LuxSelect } from "../../components/LuxSelect";
 import { api } from "../../lib/api/client";
@@ -36,8 +38,9 @@ import type {
   AdminStrmProbeJob,
 } from "../../lib/api/types";
 import { formatAdminDate } from "./date";
+import { RegisteredPlansWorkbench } from "./RegisteredPlansWorkbench";
 import { useAdminRealtimeConnectionState } from "./useAdminEvents";
-import { LuxButton, LuxIconButton, LuxSwitch, LuxTextField, useLuxConfirm } from "../../components/ui";
+import { LuxButton, LuxIconButton, LuxSwitch, LuxTextField } from "../../components/ui";
 
 type OperationsTab = "registered" | "runs" | "logs";
 type OperationsJob =
@@ -222,7 +225,6 @@ export function AdminOperationsPage() {
   const [taskPage, setTaskPage] = useState(1);
   const [taskPlanPage, setTaskPlanPage] = useState(1);
   const [taskPlanSearch, setTaskPlanSearch] = useState("");
-  const [creatingPlan, setCreatingPlan] = useState(false);
   const tasks = useQuery({
     queryKey: queryKeys.adminScheduledTasks(taskPage),
     queryFn: () => api.adminScheduledTasks(taskPage),
@@ -373,7 +375,8 @@ export function AdminOperationsPage() {
   }, [logLevel, logSearch, logs.data?.events]);
 
   const usingPlans = Boolean(taskPlans.data);
-  if (!usingPlans && tasks.error && !tasks.data) return <AdminOperationsState label={tasks.error.message || "注册任务加载失败"} error />;
+  if (!usingPlans && taskPlans.isLoading && tasks.isLoading) return <AdminOperationsState label="正在读取注册任务…" />;
+  if (!usingPlans && !taskPlans.isLoading && tasks.error && !tasks.data) return <AdminOperationsState label={tasks.error.message || "注册任务加载失败"} error />;
   if (!usingPlans && tasks.isLoading) return <AdminOperationsState label="正在读取注册任务…" />;
 
   const runningCount = jobItems.filter(isActiveJob).length;
@@ -437,8 +440,9 @@ export function AdminOperationsPage() {
       </nav>
 
       {tab === "registered" ? (
-        usingPlans ? <RegisteredPlansSection
+        usingPlans ? <RegisteredPlansWorkbench
           plans={registeredPlans}
+          allPlans={allRegisteredPlans}
           libraries={libraries.data?.libraries ?? []}
           page={taskPlanPage}
           pageSize={taskPlans.data?.pageSize ?? 50}
@@ -446,9 +450,10 @@ export function AdminOperationsPage() {
           search={taskPlanSearch}
           onSearchChange={(value) => { setTaskPlanSearch(value); setTaskPlanPage(1); }}
           onPageChange={setTaskPlanPage}
-          creating={creatingPlan}
-          onCreatingChange={setCreatingPlan}
           onRefresh={() => { void taskPlans.refetch(); void tasks.refetch(); }}
+          onOpenRunsTab={() => setTab("runs")}
+          taskLabel={taskLabel}
+          pagination={<Pagination page={taskPlanPage} pageSize={taskPlans.data?.pageSize ?? 50} total={registeredPlanTotal} onPageChange={setTaskPlanPage} />}
         /> : <RegisteredTasksSection
           tasks={registeredTasks}
           page={taskPage}
@@ -518,245 +523,9 @@ function RegisteredTasksSection({
   );
 }
 
-function RegisteredPlansSection({
-  plans,
-  libraries,
-  page,
-  pageSize,
-  total,
-  search,
-  onSearchChange,
-  onPageChange,
-  creating,
-  onCreatingChange,
-  onRefresh,
-}: {
-  plans: AdminScheduledTaskPlan[];
-  libraries: AdminLibrary[];
-  page: number;
-  pageSize: number;
-  total: number;
-  search: string;
-  onSearchChange: (value: string) => void;
-  onPageChange: (page: number) => void;
-  creating: boolean;
-  onCreatingChange: (creating: boolean) => void;
-  onRefresh: () => void;
-}) {
-  const groupedPlans = new Map<string, AdminScheduledTaskPlan[]>();
-  for (const plan of plans) {
-    const group = groupedPlans.get(plan.taskType) ?? [];
-    group.push(plan);
-    groupedPlans.set(plan.taskType, group);
-  }
-  return (
-    <section className="lux-admin-panel lux-operations-section" aria-labelledby="registered-plans-title">
-      <div className="lux-operations-section-heading lux-registered-plans-heading">
-        <div>
-          <span className="lux-eyebrow">任务注册</span>
-          <h2 id="registered-plans-title">已注册任务</h2>
-          <p>按任务类型聚合配置；每个执行计划拥有独立时间和媒体库范围，触发后仍按媒体库排队运行。</p>
-        </div>
-        <div className="lux-registered-plans-tools">
-          <label className="lux-registered-plans-search">
-            <span className="lux-sr-only">搜索执行计划或媒体库</span>
-            <LuxTextField aria-label="搜索执行计划或媒体库" type="search" value={search} onChange={(event) => onSearchChange(event.target.value)} placeholder="搜索计划或媒体库" />
-          </label>
-          <LuxButton tone="primary" size="compact" type="button" onClick={() => onCreatingChange(!creating)}>
-            {creating ? <X size={15} /> : <Plus size={15} />}
-            {creating ? "取消新建" : "新建执行计划"}
-          </LuxButton>
-        </div>
-      </div>
-      {creating ? <ScheduledTaskPlanEditor libraries={libraries} onSaved={() => { onCreatingChange(false); onRefresh(); }} onCancel={() => onCreatingChange(false)} /> : null}
-      {plans.length === 0 ? <RegisteredPlansEmpty creating={creating} /> : <div className="lux-registered-plan-groups">
-        {[...groupedPlans.entries()].map(([taskType, taskPlans]) => (
-          <section className="lux-registered-plan-group" key={taskType} aria-labelledby={`plan-group-${taskType}`}>
-            <div className="lux-registered-plan-group-heading">
-              <div><h3 id={`plan-group-${taskType}`}>{taskGroupLabel(taskType)}</h3><code>{taskType}</code></div>
-              <span>{taskPlans.length} 个执行计划</span>
-            </div>
-            <div className="lux-registered-task-list">
-              {taskPlans.map((plan) => <ScheduledTaskPlanRow
-                key={plan.id}
-                plan={plan}
-                libraries={libraries}
-                onSaved={onRefresh}
-                onDeleted={() => {
-                  const remainingTotal = Math.max(0, total - 1);
-                  const lastAvailablePage = Math.max(1, Math.ceil(remainingTotal / pageSize));
-                  onPageChange(Math.min(page, lastAvailablePage));
-                  onRefresh();
-                }}
-              />)}
-            </div>
-          </section>
-        ))}
-      </div>}
-      {plans.length > 0 && total > pageSize ? <Pagination page={page} pageSize={pageSize} total={total} onPageChange={onPageChange} /> : null}
-    </section>
-  );
-}
-
-function RegisteredPlansEmpty({ creating }: { creating: boolean }) {
-  return <div className="lux-operations-empty" role="status"><span className="lux-operations-empty-icon"><Inbox size={22} /></span><div><strong>{creating ? "请选择任务类型和媒体库" : "还没有执行计划"}</strong><p>{creating ? "新建计划后，同一任务类型下的多个媒体库可以共用时间，也可以继续拆成不同时间的计划。" : "系统功能或插件注册后台工作后，执行计划会显示在这里。"}</p></div></div>;
-}
-
-function ScheduledTaskPlanRow({ plan, libraries, onSaved, onDeleted }: { plan: AdminScheduledTaskPlan; libraries: AdminLibrary[]; onSaved: () => void; onDeleted: () => void }) {
-  const confirm = useLuxConfirm();
-  const queryClient = useQueryClient();
-  const [editing, setEditing] = useState(false);
-  const [schedule, setSchedule] = useState(plan.schedule ?? "");
-  const [enabled, setEnabled] = useState(plan.isEnabled);
-  const [libraryIds, setLibraryIds] = useState((plan.libraries ?? []).map((library) => library.id));
-  const globalPlan = plan.scopeType === "GLOBAL";
-  const update = useMutation({
-    mutationFn: async () => {
-      if (globalPlan) {
-        await api.updateAdminScheduledTask({
-          ownerType: "GLOBAL",
-          ownerId: "global",
-          taskType: plan.taskType,
-          schedule: schedule.trim() || null,
-          isEnabled: undefined,
-        });
-        return;
-      }
-      await api.updateAdminScheduledTaskPlan(plan.id, {
-        name: plan.name,
-        schedule: schedule.trim() || null,
-        isEnabled: enabled,
-        libraryIds,
-      });
-    },
-    onSuccess: () => { setEditing(false); onSaved(); },
-  });
-  const runNow = useMutation({
-    mutationFn: () => globalPlan ? api.runAdminScheduledTask({ ownerType: "GLOBAL", ownerId: "global", taskType: plan.taskType }) : api.runAdminScheduledTaskPlan(plan.id),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: queryKeys.adminJobs() });
-      void queryClient.invalidateQueries({ queryKey: ["admin", "metadata-jobs"] });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.adminStrmProbeJobs() });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.adminChapterDetectionJobs() });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.adminDanmakuMatchJobs() });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraryCoverJobs() });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.adminTaskActivity });
-      onSaved();
-    },
-  });
-  const name = plan.name || plan.taskName || taskLabel(plan.taskType);
-  const configured = Boolean(plan.schedule);
-  const stateLabel = plan.isEnabled && configured ? "已启用" : configured ? "已停用" : "未配置计划";
-  const knownLibraries = (plan.libraries ?? []).length || plan.libraryCount || 0;
-  const canDelete = !globalPlan && plan.isDefault !== true;
-  const deletePlan = useMutation({
-    mutationFn: () => api.deleteAdminScheduledTaskPlan(plan.id),
-    onSuccess: onDeleted,
-  });
-  const handleDelete = async () => {
-    if (!(await confirm(`删除“${name}”后，${knownLibraries} 个媒体库将回到默认计划，并恢复默认 Cron 和启停状态。确定删除吗？`))) {
-      return;
-    }
-    deletePlan.mutate();
-  };
-  const beginEditing = () => {
-    setSchedule(plan.schedule ?? "");
-    setEnabled(plan.isEnabled);
-    setLibraryIds((plan.libraries ?? []).map((library) => library.id));
-    setEditing(true);
-  };
-  return (
-    <article className={`lux-registered-task-row lux-registered-plan-row${editing ? " is-editing" : ""}`}>
-      <div className="lux-registered-task-icon"><ClipboardList size={18} /></div>
-      <div className="lux-registered-task-copy">
-        <div className="lux-registered-task-heading"><strong>{name}</strong><span className={`lux-registered-task-status ${plan.isEnabled && configured ? "is-enabled" : configured ? "is-disabled" : "is-unconfigured"}`}>{stateLabel}</span></div>
-        <p>{plan.description || "由后台注册的任务。"}</p>
-        <div className="lux-registered-task-meta"><span>{globalPlan ? "全局插件计划" : `${knownLibraries} 个媒体库`}</span><span>{plan.isDefault ? "默认计划" : "自定义计划"}</span>{plan.sourceType === "PLUGIN" ? <span>插件注册{plan.pluginId ? ` · ${plan.pluginId}` : ""}</span> : <span>系统注册</span>}</div>
-        {globalPlan ? null : <div className="lux-registered-plan-libraries">{(plan.libraries ?? []).map((library) => <span key={library.id}>{library.name}</span>)}</div>}
-        {editing ? <form className="lux-registered-task-editor lux-registered-plan-editor" onSubmit={(event) => { event.preventDefault(); update.mutate(); }}>
-          <label htmlFor={`plan-schedule-${plan.id}`}>Cron 执行计划<LuxTextField id={`plan-schedule-${plan.id}`} value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder="例如 0 3 * * *" maxLength={128} required={!globalPlan} /></label>
-          {globalPlan ? null : <><LuxSwitch className="lux-admin-toggle" id={`plan-enabled-${plan.id}`} checked={enabled} onChange={(event) => setEnabled(event.target.checked)} label="启用此计划" /><PlanLibraryPicker libraries={libraries} selectedIds={libraryIds} onChange={setLibraryIds} /></>}
-          <div className="lux-registered-task-editor-actions"><LuxButton tone="secondary" type="submit" disabled={update.isPending}><Save size={15} />{update.isPending ? "保存中…" : "保存"}</LuxButton><LuxIconButton className="lux-icon-button-small" type="button" aria-label="取消编辑执行计划" onClick={() => setEditing(false)}><X size={16} /></LuxIconButton></div>
-          <small className="lux-registered-task-editor-help">标准五段式：分 时 日 月 周，按 UTC 执行。全量校验触发后按媒体库进入全局扫描队列，同一时刻只执行一个全量扫描。</small>
-          {update.error ? <p className="lux-error-copy" role="alert">{update.error.message}</p> : null}
-        </form> : <span className="lux-registered-task-schedule">{plan.schedule || "尚未配置执行计划"}</span>}
-      </div>
-      {!editing ? <div className="lux-registered-task-actions"><LuxButton tone="secondary" size="compact" className="lux-registered-task-run" type="button" aria-label={`立即执行${name}`} onClick={() => runNow.mutate()} disabled={runNow.isPending || deletePlan.isPending}><Play size={14} />{runNow.isPending ? "执行中…" : "立即执行"}</LuxButton><LuxIconButton className="lux-icon-button-small lux-registered-task-edit" type="button" aria-label={`编辑${name}`} onClick={beginEditing} disabled={deletePlan.isPending}><Pencil size={15} /></LuxIconButton>{canDelete ? <LuxIconButton danger className="lux-icon-button-small" type="button" aria-label={`删除${name}`} onClick={handleDelete} disabled={deletePlan.isPending} title="删除执行计划"><Trash2 size={15} /></LuxIconButton> : null}</div> : null}
-      {runNow.error ? <p className="lux-error-copy lux-registered-task-error" role="alert">{runNow.error.message}</p> : null}
-      {deletePlan.error ? <p className="lux-error-copy lux-registered-task-error" role="alert">{deletePlan.error.message}</p> : null}
-    </article>
-  );
-}
-
-function ScheduledTaskPlanEditor({ libraries, onSaved, onCancel }: { libraries: AdminLibrary[]; onSaved: () => void; onCancel: () => void }) {
-  const [taskType, setTaskType] = useState("RECONCILIATION_SCAN");
-  const [name, setName] = useState("");
-  const [schedule, setSchedule] = useState("");
-  const [enabled, setEnabled] = useState(true);
-  const [libraryIds, setLibraryIds] = useState<string[]>([]);
-  const create = useMutation({
-    mutationFn: () => api.createAdminScheduledTaskPlan({ taskType, name: name.trim(), schedule: schedule.trim() || null, isEnabled: enabled, libraryIds }),
-    onSuccess: onSaved,
-  });
-  return <form className="lux-registered-plan-create" onSubmit={(event) => { event.preventDefault(); create.mutate(); }}>
-    <div className="lux-registered-plan-create-grid">
-      <label>任务类型<LuxSelect value={taskType} options={SCHEDULE_TASK_TYPE_OPTIONS.map(([value, label]) => ({ value, label }))} onChange={setTaskType} aria-label="执行计划任务类型" /></label>
-      <label>计划名称<LuxTextField value={name} onChange={(event) => setName(event.target.value)} maxLength={128} placeholder="例如 夜间校验" required /></label>
-      <label> Cron 执行计划<LuxTextField value={schedule} onChange={(event) => setSchedule(event.target.value)} maxLength={128} placeholder="例如 0 3 * * *" /></label>
-      <LuxSwitch className="lux-admin-toggle lux-registered-plan-enabled" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} label="创建后启用" />
-    </div>
-    <PlanLibraryPicker libraries={libraries} selectedIds={libraryIds} onChange={setLibraryIds} />
-    {create.error ? <p className="lux-error-copy" role="alert">{create.error.message}</p> : null}
-    <div className="lux-registered-plan-create-actions"><LuxButton tone="primary" type="submit" disabled={create.isPending}>{create.isPending ? "创建中…" : "创建执行计划"}</LuxButton><LuxButton tone="secondary" type="button" onClick={onCancel}>取消</LuxButton></div>
-  </form>;
-}
-
-const SCHEDULE_TASK_TYPE_OPTIONS: Array<[string, string]> = [
-  ["RECONCILIATION_SCAN", "全量校验媒体库"],
-  ["METADATA_PARSE", "元数据刮削"],
-  ["CHAPTER_DETECTION", "片头片尾检测"],
-  ["AUTO_LIBRARY_COVER", "自动生成媒体库封面"],
-];
-
-function taskGroupLabel(taskType: string) {
-  return SCHEDULE_TASK_TYPE_OPTIONS.find(([value]) => value === taskType)?.[1] ?? taskLabel(taskType);
-}
-
 function isEmptyDefaultLibraryPlan(plan: AdminScheduledTaskPlan) {
   const libraryCount = plan.libraries?.length ?? plan.libraryCount ?? 0;
   return plan.scopeType === "LIBRARY" && plan.isDefault === true && libraryCount === 0;
-}
-
-function PlanLibraryPicker({ libraries, selectedIds, onChange }: { libraries: AdminLibrary[]; selectedIds: string[]; onChange: (ids: string[]) => void }) {
-  const selectedLibraryIds = new Set(selectedIds);
-  const selectedLibraries = selectedIds
-    .map((libraryId) => libraries.find((library) => library.id === libraryId))
-    .filter((library): library is AdminLibrary => Boolean(library));
-  const availableLibraries = libraries.filter((library) => !selectedLibraryIds.has(library.id));
-  const addLibrary = (libraryId: string) => {
-    if (!selectedLibraryIds.has(libraryId)) onChange([...selectedIds, libraryId]);
-  };
-  const removeLibrary = (libraryId: string) => onChange(selectedIds.filter((id) => id !== libraryId));
-  return <fieldset className="lux-registered-plan-library-picker">
-    <legend>目标媒体库（已选 {selectedIds.length} 个）</legend>
-    <div className="lux-registered-plan-library-field">
-      <div className="lux-registered-plan-library-tags" aria-live="polite">
-        {selectedLibraries.length === 0 ? <span className="lux-registered-plan-library-placeholder">暂未选择媒体库</span> : selectedLibraries.map((library) => <span className="lux-registered-plan-library-tag" key={library.id}>
-          <span>{library.name}</span>
-          <button type="button" aria-label={`移除媒体库 ${library.name}`} onClick={() => removeLibrary(library.id)}><X size={12} aria-hidden="true" /></button>
-        </span>)}
-      </div>
-      <LuxSelect
-        className="lux-registered-plan-library-select"
-        value=""
-        options={availableLibraries.map((library) => ({ value: library.id, label: library.name }))}
-        onChange={addLibrary}
-        placeholder={availableLibraries.length ? "选择媒体库" : "已选全部媒体库"}
-        disabled={availableLibraries.length === 0}
-        aria-label="选择目标媒体库"
-      />
-    </div>
-  </fieldset>;
 }
 
 function RegisteredTasksEmpty() {
@@ -853,7 +622,75 @@ function RunsSection({
   onRetry: (job: OperationsJob) => void;
   busy: boolean;
 }) {
-  return <section className="lux-admin-panel lux-operations-section" aria-labelledby="runs-title"><div className="lux-operations-section-heading"><div><span className="lux-eyebrow">执行历史</span><h2 id="runs-title">运行记录</h2><p>查看后台任务进度；有问题、失败或取消的任务可以从这里重试。</p></div><LuxSelect className="lux-admin-filter-select" value={status} options={[{ value: "", label: "全部状态" }, { value: "PENDING", label: "等待中" }, { value: "RUNNING", label: "运行中" }, { value: "COMPLETED_WITH_ISSUES", label: "已完成，有问题" }, { value: "DEFERRED", label: "已延后" }, { value: "FAILED", label: "失败" }, { value: "COMPLETED", label: "已完成" }, { value: "CANCELLED", label: "已取消" }]} onChange={onStatusChange} aria-label="运行记录状态" /></div><p className="lux-admin-muted">整库元数据操作会调用所属媒体库的注册刮削任务，低匹配项可从对应媒体库的“待确认”筛选处理。</p><div className="lux-admin-job-list">{jobs.length === 0 ? <div className="lux-operations-empty" role="status"><span className="lux-operations-empty-icon"><Inbox size={22} /></span><div><strong>暂无运行记录</strong><p>手动或计划任务开始执行后，状态会显示在这里。</p></div></div> : jobs.map((job) => <JobRow key={`${job.kind}-${job.id}`} job={job} libraryNames={libraryNames} libraryKinds={libraryKinds} onCancel={() => onCancel(job)} onRetry={() => onRetry(job)} busy={busy} />)}</div></section>;
+  return (
+    <section className="lux-admin-panel lux-operations-section" aria-labelledby="runs-title">
+      <div className="lux-operations-section-heading">
+        <div>
+          <span className="lux-eyebrow">执行历史</span>
+          <h2 id="runs-title">运行记录</h2>
+          <p>查看后台任务进度；有问题、失败或取消的任务可以从这里重试。</p>
+        </div>
+        <LuxSelect
+          className="lux-admin-filter-select"
+          value={status}
+          options={[
+            { value: "", label: "全部状态" },
+            { value: "PENDING", label: "等待中" },
+            { value: "RUNNING", label: "运行中" },
+            { value: "COMPLETED_WITH_ISSUES", label: "已完成，有问题" },
+            { value: "DEFERRED", label: "已延后" },
+            { value: "FAILED", label: "失败" },
+            { value: "COMPLETED", label: "已完成" },
+            { value: "CANCELLED", label: "已取消" },
+          ]}
+          onChange={onStatusChange}
+          aria-label="运行记录状态"
+        />
+      </div>
+      <div className="lux-operations-runs-note">
+        <Info size={14} aria-hidden="true" />
+        <span>整库元数据操作会调用所属媒体库的注册刮削任务，低匹配项可从对应媒体库的“待确认”筛选处理。</span>
+      </div>
+      <div className="lux-admin-job-list">
+        {jobs.length === 0 ? (
+          <div className="lux-operations-empty" role="status">
+            <span className="lux-operations-empty-icon"><Inbox size={22} /></span>
+            <div>
+              <strong>暂无运行记录</strong>
+              <p>手动或计划任务开始执行后，状态会显示在这里。</p>
+            </div>
+          </div>
+        ) : (
+          <div className="lux-runs-table-wrap" role="region" aria-labelledby="runs-title" tabIndex={0}>
+            <table className="lux-runs-table">
+              <thead>
+                <tr>
+                  <th scope="col">任务</th>
+                  <th scope="col">状态</th>
+                  <th scope="col">进度 / 规模</th>
+                  <th scope="col">耗时 · 完成时间</th>
+                  <th scope="col"><span className="lux-visually-hidden">操作</span></th>
+                </tr>
+              </thead>
+              <tbody>
+                {jobs.map((job) => (
+                  <JobRow
+                    key={`${job.kind}-${job.id}`}
+                    job={job}
+                    libraryNames={libraryNames}
+                    libraryKinds={libraryKinds}
+                    onCancel={() => onCancel(job)}
+                    onRetry={() => onRetry(job)}
+                    busy={busy}
+                  />
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </section>
+  );
 }
 
 function LogsSection({
@@ -1086,37 +923,234 @@ function JobRow({ job, libraryNames, libraryKinds, onCancel, onRetry, busy }: { 
   const issueItems = details.data?.job.items?.filter((item) => Boolean(item.error)) ?? [];
   const jobLabel = formatJobType(job.jobType);
   const duration = formatJobDuration(job);
-  return <article className="lux-admin-job-row">
-    <div className={`lux-job-icon${active ? " is-active" : ""}`}>{postprocessingIssues || job.status === "FAILED" || job.status === "COMPLETED_WITH_ISSUES" ? <AlertTriangle size={17} /> : job.status === "COMPLETED" && !postprocessing ? <CheckCircle2 size={17} /> : <FileClock size={17} />}</div>
-    <div className="lux-admin-job-main">
-      <div className="lux-admin-job-heading"><strong>{jobLabel}</strong><span className={`lux-job-status ${postprocessing ? "status-postprocessing" : postprocessingIssues ? "status-completed-with-issues" : `status-${job.status.toLowerCase().replaceAll("_", "-")}`}`}>{postprocessing ? "后处理进行中" : postprocessingIssues ? "已完成，有问题" : formatJobStatus(job.status)}</span></div>
-      <div className="lux-admin-job-meta"><span className="lux-admin-job-context">{cancelling ? "正在停止…" : postprocessing ? "索引已完成，后处理进行中" : postprocessingIssues ? "索引已完成，后处理未完成" : discovering ? "正在发现目录" : jobContext}{libraryLabel ? ` · 媒体库：${libraryLabel}` : ""}</span><span className="lux-admin-job-count">{countLabel}</span></div>
-      {currentItem ? <span className="lux-admin-job-current-item">当前：{currentItem}</span> : null}
-      {error ? <div className="lux-admin-job-error" role="alert"><strong>失败原因</strong><span>{error}</span></div> : null}
-      {detailsOpen && postprocessingIssues ? <div className="lux-admin-job-details">
-        {scanIssueEvents.isPending ? <p role="status">正在读取原因记录…</p> : <>
-          {scanIssueEvents.data?.unavailable ? <p>原因记录读取失败。</p> : !scanIssueCodes.length ? <p>未找到详细原因记录。</p> : null}
-          {scanIssueCodes.length ? <ul>{scanIssueCodes.map((code) => <li key={code}><code>{code}</code><span>{formatJobError(code)}</span></li>)}</ul> : null}
-          <p>未完成目标已保留，日志缺失不影响重试。</p>
-        </>}
-      </div> : null}
-      {detailsOpen && job.kind === "metadata" ? <div className="lux-admin-job-details">
-        {details.isPending ? <p role="status">正在读取失败详情…</p> : null}
-        {details.error ? <p role="alert">详情读取失败，请稍后重试。</p> : null}
-        {details.data ? <><strong>问题条目 {issueItems.length} 个</strong>{issueItems.length ? <ul>{issueItems.map((item) => <li key={item.itemId}><code>{item.itemId}</code><span>{metadataItemIssueText(item.error, item.candidateCount)}</span></li>)}</ul> : <p>没有记录逐条问题。</p>}</> : null}
-      </div> : null}
-      <time className="lux-admin-job-finished-at">完成时间：{active || job.finishedAt == null ? "未完成" : formatAdminDate(job.finishedAt)}</time>
-      {duration ? <span className="lux-admin-job-duration">{duration}</span> : null}
-      {active && (fullLibraryScan || postprocessing || progress !== null || discovering) ? <div className={`lux-job-progress${fullLibraryScan || postprocessing || (discovering && progress === null) ? " is-indeterminate" : ""}`}><span style={fullLibraryScan || postprocessing || progress === null ? undefined : { width: `${progress}%` }} /></div> : null}
-      {pendingCount > 0 ? pendingHref ? <Link className="lux-admin-job-attention" to={pendingHref}>低匹配 {pendingCount} 项 · 去处理</Link> : <span className="lux-admin-job-attention">低匹配 {pendingCount} 项</span> : null}
-    </div>
-    <div className="lux-admin-job-actions">
-      {postprocessingIssues ? <button className="lux-admin-job-details-toggle" type="button" aria-expanded={detailsOpen} aria-label={`${detailsOpen ? "收起" : "查看"}扫描后处理原因`} onClick={() => setDetailsOpen((open) => !open)}>{detailsOpen ? "收起原因" : "查看原因"}<ChevronDown size={14} /></button> : null}
-      {job.kind === "metadata" ? <button className="lux-admin-job-details-toggle" type="button" aria-expanded={detailsOpen} aria-label={`${detailsOpen ? "收起" : "查看"}${jobLabel}问题详情`} onClick={() => setDetailsOpen((open) => !open)}>详情<ChevronDown size={14} /></button> : null}
-      {cancellable && job.kind !== "cover" ? <LuxIconButton className="lux-icon-button-small" type="button" aria-label={cancelling ? "正在取消任务" : "取消任务"} onClick={onCancel} disabled={busy || cancelling}><StopCircle size={15} /></LuxIconButton> : null}
-      {retryable ? <LuxIconButton className="lux-icon-button-small" type="button" aria-label="重试任务" onClick={() => { setDetailsOpen(false); onRetry(); }} disabled={busy}><RotateCcw size={15} /></LuxIconButton> : null}
-    </div>
-  </article>;
+  const isWarningTone = postprocessingIssues || job.status === "COMPLETED_WITH_ISSUES" || job.status === "DEFERRED";
+  const isFailedTone = job.status === "FAILED";
+  const isCompletedTone = job.status === "COMPLETED" && !postprocessing && !postprocessingIssues;
+  const iconToneClass = active
+    ? " is-active"
+    : isWarningTone
+      ? " is-warn"
+      : isFailedTone
+        ? " is-failed"
+        : isCompletedTone
+          ? " is-completed"
+          : "";
+  const statusClass = postprocessing
+    ? "status-postprocessing"
+    : postprocessingIssues
+      ? "status-completed-with-issues"
+      : `status-${job.status.toLowerCase().replaceAll("_", "-")}`;
+  const statusText = postprocessing ? "后处理进行中" : postprocessingIssues ? "已完成，有问题" : formatJobStatus(job.status);
+  const contextText = cancelling
+    ? "正在停止…"
+    : postprocessing
+      ? "索引已完成，后处理进行中"
+      : postprocessingIssues
+        ? "索引已完成，后处理未完成"
+        : discovering
+          ? "正在发现目录"
+          : jobContext;
+  const showProgress = active && (fullLibraryScan || postprocessing || progress !== null || discovering);
+  const indeterminate = fullLibraryScan || postprocessing || (discovering && progress === null);
+  const hasDetailsButton = postprocessingIssues || job.kind === "metadata" || Boolean(error) || needsScanErrorCode;
+  const detailsAriaLabel = postprocessingIssues
+    ? `${detailsOpen ? "收起" : "查看"}扫描后处理原因`
+    : `${detailsOpen ? "收起" : "查看"}${jobLabel}问题详情`;
+  const detailsText = detailsOpen ? (postprocessingIssues ? "收起原因" : "收起") : (postprocessingIssues ? "查看原因" : "详情");
+
+  return (
+    <Fragment>
+      <tr className={`lux-admin-job-row${detailsOpen ? " is-expanded" : ""}`}>
+        <td className="lux-runs-col-task">
+          <div className="lux-runs-task-cell">
+            <div className={`lux-job-icon${iconToneClass}`}>
+              {isWarningTone || isFailedTone ? (
+                <AlertTriangle size={16} />
+              ) : isCompletedTone ? (
+                <CheckCircle2 size={16} />
+              ) : (
+                <FileClock size={16} />
+              )}
+            </div>
+            <div className="lux-runs-task-copy">
+              <div className="lux-admin-job-heading">
+                <strong>{jobLabel}</strong>
+                {pendingCount > 0 ? (
+                  pendingHref ? (
+                    <Link className="lux-admin-job-attention" to={pendingHref}>低匹配 {pendingCount} 项 · 去处理</Link>
+                  ) : (
+                    <span className="lux-admin-job-attention">低匹配 {pendingCount} 项</span>
+                  )
+                ) : null}
+              </div>
+              <div className="lux-admin-job-meta">
+                <span className="lux-admin-job-context">{contextText}</span>
+                {libraryLabel ? (
+                  <>
+                    <span className="lux-admin-job-meta-sep" aria-hidden="true"> · </span>
+                    <span className="lux-admin-job-library">
+                      <Database size={11} aria-hidden="true" />
+                      媒体库：{libraryLabel}
+                    </span>
+                  </>
+                ) : null}
+              </div>
+              {currentItem ? (
+                <div className="lux-admin-job-current-item" title={currentItem}>
+                  <span>当前：</span>
+                  <code>{currentItem}</code>
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </td>
+        <td className="lux-runs-col-status">
+          <span className={`lux-job-status ${statusClass}`}>{statusText}</span>
+        </td>
+        <td className="lux-runs-col-progress">
+          {showProgress ? (
+            <div className="lux-runs-progress-cell">
+              <div className="lux-admin-job-progress-wrap">
+                <div
+                  className={`lux-job-progress${indeterminate ? " is-indeterminate" : ""}`}
+                  role="progressbar"
+                  aria-label={`${jobLabel}进度`}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={indeterminate || progress === null ? undefined : progress}
+                >
+                  <span style={indeterminate || progress === null ? undefined : { width: `${progress}%` }} />
+                </div>
+                {!indeterminate && progress !== null ? <span className="lux-admin-job-progress-pct">{progress}%</span> : null}
+              </div>
+              <span className="lux-admin-job-count">
+                <Layers size={11} aria-hidden="true" />
+                {countLabel}
+              </span>
+            </div>
+          ) : (
+            <span className="lux-admin-job-count">
+              <Layers size={12} aria-hidden="true" />
+              {countLabel}
+            </span>
+          )}
+        </td>
+        <td className="lux-runs-col-time">
+          <div className="lux-runs-time-cell">
+            {duration ? <span className="lux-admin-job-duration">{duration}</span> : null}
+            <time className="lux-admin-job-finished-at">
+              <Clock size={11} aria-hidden="true" />
+              完成时间：{active || job.finishedAt == null ? "未完成" : formatAdminDate(job.finishedAt)}
+            </time>
+          </div>
+        </td>
+        <td className="lux-runs-col-actions">
+          <div className="lux-admin-job-actions">
+            {hasDetailsButton ? (
+              <button
+                className="lux-admin-job-details-toggle"
+                type="button"
+                aria-expanded={detailsOpen}
+                aria-label={detailsAriaLabel}
+                onClick={() => setDetailsOpen((open) => !open)}
+              >
+                {detailsText}
+                <ChevronDown size={14} />
+              </button>
+            ) : null}
+            {cancellable && job.kind !== "cover" ? (
+              <LuxIconButton
+                className="lux-icon-button-small"
+                type="button"
+                aria-label={cancelling ? "正在取消任务" : "取消任务"}
+                onClick={onCancel}
+                disabled={busy || cancelling}
+              >
+                <StopCircle size={15} />
+              </LuxIconButton>
+            ) : null}
+            {retryable ? (
+              <LuxIconButton
+                className="lux-icon-button-small"
+                type="button"
+                aria-label="重试任务"
+                onClick={() => {
+                  setDetailsOpen(false);
+                  onRetry();
+                }}
+                disabled={busy}
+              >
+                <RotateCcw size={15} />
+              </LuxIconButton>
+            ) : null}
+          </div>
+        </td>
+      </tr>
+      {detailsOpen && hasDetailsButton ? (
+        <tr className="lux-admin-job-detail-row">
+          <td colSpan={5}>
+            <div className="lux-runs-detail-panel">
+              {error ? (
+                <div className="lux-admin-job-error" role="alert">
+                  <strong>失败原因</strong>
+                  <span>{error}</span>
+                </div>
+              ) : null}
+              {postprocessingIssues ? (
+                <div className="lux-admin-job-details">
+                  {scanIssueEvents.isPending ? (
+                    <p role="status">正在读取原因记录…</p>
+                  ) : (
+                    <>
+                      {scanIssueEvents.data?.unavailable ? (
+                        <p>原因记录读取失败。</p>
+                      ) : !scanIssueCodes.length ? (
+                        <p>未找到详细原因记录。</p>
+                      ) : null}
+                      {scanIssueCodes.length ? (
+                        <ul>
+                          {scanIssueCodes.map((code) => (
+                            <li key={code}>
+                              <code>{code}</code>
+                              <span>{formatJobError(code)}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : null}
+                      <p>未完成目标已保留，日志缺失不影响重试。</p>
+                    </>
+                  )}
+                </div>
+              ) : null}
+              {job.kind === "metadata" ? (
+                <div className="lux-admin-job-details">
+                  {details.isPending ? <p role="status">正在读取失败详情…</p> : null}
+                  {details.error ? <p role="alert">详情读取失败，请稍后重试。</p> : null}
+                  {details.data ? (
+                    <>
+                      <strong>问题条目 {issueItems.length} 个</strong>
+                      {issueItems.length ? (
+                        <ul>
+                          {issueItems.map((item) => (
+                            <li key={item.itemId}>
+                              <code>{item.itemId}</code>
+                              <span>{metadataItemIssueText(item.error, item.candidateCount)}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p>没有记录逐条问题。</p>
+                      )}
+                    </>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+          </td>
+        </tr>
+      ) : null}
+    </Fragment>
+  );
 }
 
 function isFullLibraryScan(job: OperationsJob): job is Extract<OperationsJob, { kind: "scan" }> {

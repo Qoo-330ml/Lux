@@ -1772,9 +1772,9 @@ html[data-lux-theme="light"] .lux-library-cover-preview { background: #e7e6e3; }
 
 
 
-.lux-admin-job-list, .lux-admin-log-list { display: grid; gap: 7px; }
+.lux-admin-log-list { display: grid; gap: 7px; }
 
-.lux-admin-job-row, .lux-admin-log-row { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; align-items: center; gap: 11px; padding: 12px; border: 1px solid var(--lux-line-soft); border-radius: 9px; background: rgba(255,255,255,.025); }
+.lux-admin-log-row { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; align-items: center; gap: 11px; padding: 12px; border: 1px solid var(--lux-line-soft); border-radius: 9px; background: rgba(255,255,255,.025); }
 
 .lux-job-icon, .lux-admin-log-icon { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 8px; color: var(--lux-subtle); background: rgba(255,255,255,.07); }
 
@@ -1909,8 +1909,8 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-admin-permission-toggle { min-height: var(--lux-button-height-touch); }
   .lux-admin-filter-select .lux-select-trigger { min-height: var(--lux-button-height-touch); }
   .lux-admin-password-row { align-items: stretch; flex-direction: column; }
-  .lux-admin-job-row, .lux-admin-log-row { grid-template-columns: 30px minmax(0, 1fr); }
-  .lux-admin-job-actions, .lux-admin-log-row time { grid-column: 2; }
+  .lux-admin-log-row { grid-template-columns: 30px minmax(0, 1fr); }
+  .lux-admin-log-row time { grid-column: 2; }
   .lux-admin-job-actions { flex-wrap: wrap; }
   .lux-admin-job-details li { grid-template-columns: 1fr; gap: 3px; }
 }
@@ -2153,7 +2153,6 @@ html[data-lux-theme="light"] .lux-admin-plugin-dialog-form input:focus { border-
 html[data-lux-theme="light"] .lux-admin-library-card,
 html[data-lux-theme="light"] .lux-admin-subpanel,
 html[data-lux-theme="light"] .lux-admin-user-row,
-html[data-lux-theme="light"] .lux-admin-job-row,
 html[data-lux-theme="light"] .lux-admin-log-row { background: rgba(255,255,255,.88); }
 
 html[data-lux-theme="light"] .lux-admin-library-heading h2,
@@ -2337,14 +2336,57 @@ html[data-lux-theme="light"] .lux-admin-library-page .lux-library-dialog select 
 
 .lux-operations-section-heading h2 { margin: 4px 0 4px; font-size: 1.05rem; }
 
-/* Run cards: a status rail on the left replaces the boxed icon-first row. */
-.lux-admin-job-list { gap: 10px; }
+/* Scheme A: compact execution table with status rail, inline progress, and on-demand detail rows. */
+.lux-operations-runs-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding: 9px 13px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, .025);
+  color: var(--lux-muted);
+  font-size: .74rem;
+  line-height: 1.45;
+}
 
-.lux-admin-job-row { --job-rail: var(--lux-line); position: relative; grid-template-columns: 34px minmax(0, 1fr) auto; align-items: start; gap: 14px; padding: 14px 16px 14px 18px; overflow: hidden; border-radius: 12px; }
+.lux-operations-runs-note svg { flex: 0 0 auto; color: var(--lux-subtle); }
 
-.lux-admin-job-row::before { position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--job-rail); content: ""; }
+.lux-admin-job-list { display: block; }
 
-.lux-admin-job-row:has(.status-running, .status-pending, .status-queued, .status-postprocessing) { --job-rail: var(--lux-accent); }
+.lux-runs-table-wrap {
+  container-type: inline-size;
+  overflow: auto;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, .018);
+}
+
+.lux-runs-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: .78rem;
+}
+
+.lux-runs-table thead th {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: 1;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--lux-line-soft);
+  background: rgba(18, 18, 22, .94);
+  color: var(--lux-subtle);
+  font-size: .68rem;
+  font-weight: 550;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.lux-admin-job-row { --job-rail: var(--lux-line); }
+
+.lux-admin-job-row:has(.status-running, .status-pending, .status-queued, .status-postprocessing) { --job-rail: var(--lux-status-active); }
 
 .lux-admin-job-row:has(.status-completed) { --job-rail: var(--lux-status-success); }
 
@@ -2352,15 +2394,225 @@ html[data-lux-theme="light"] .lux-admin-library-page .lux-library-dialog select 
 
 .lux-admin-job-row:has(.status-completed-with-issues, .status-deferred) { --job-rail: var(--lux-status-warning); }
 
-.lux-admin-job-heading { flex-wrap: wrap; }
+.lux-admin-job-row td {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--lux-line-soft);
+  vertical-align: middle;
+  transition: background .16s ease;
+}
 
-.lux-admin-job-heading strong { font-size: .86rem; }
+.lux-admin-job-row td:first-child {
+  padding-left: 16px;
+  box-shadow: inset 3px 0 0 var(--job-rail);
+}
 
-.lux-admin-job-main > .lux-admin-job-meta { margin-top: 6px; }
+.lux-runs-table tbody tr:last-child td { border-bottom: 0; }
 
-.lux-admin-job-finished-at, .lux-admin-job-duration { display: inline-block; margin: 6px 12px 0 0; }
+.lux-admin-job-row:hover td { background: rgba(255, 255, 255, .03); }
 
-.lux-admin-job-actions { align-self: center; }
+.lux-admin-job-row.is-expanded td { border-bottom-color: transparent; background: rgba(255, 255, 255, .025); }
+
+.lux-runs-task-cell {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  min-width: 0;
+}
+
+.lux-runs-task-copy { min-width: 0; display: grid; gap: 3px; }
+
+.lux-runs-task-cell .lux-job-icon {
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  margin-top: 1px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, .045);
+  color: var(--lux-muted);
+}
+
+.lux-runs-task-cell .lux-job-icon.is-active {
+  border-color: color-mix(in srgb, var(--lux-status-active) 34%, transparent);
+  background: color-mix(in srgb, var(--lux-status-active) 12%, transparent);
+  color: var(--lux-status-active);
+}
+
+.lux-runs-task-cell .lux-job-icon.is-completed {
+  border-color: color-mix(in srgb, var(--lux-status-success) 32%, transparent);
+  background: color-mix(in srgb, var(--lux-status-success) 10%, transparent);
+  color: var(--lux-status-success);
+}
+
+.lux-runs-task-cell .lux-job-icon.is-warn {
+  border-color: color-mix(in srgb, var(--lux-status-warning) 34%, transparent);
+  background: color-mix(in srgb, var(--lux-status-warning) 11%, transparent);
+  color: var(--lux-status-warning);
+}
+
+.lux-runs-task-cell .lux-job-icon.is-failed {
+  border-color: color-mix(in srgb, var(--lux-status-danger) 34%, transparent);
+  background: color-mix(in srgb, var(--lux-status-danger) 11%, transparent);
+  color: var(--lux-status-danger);
+}
+
+.lux-admin-job-heading { flex-wrap: wrap; align-items: center; gap: 8px; }
+
+.lux-admin-job-heading strong { font-size: .84rem; font-weight: 600; letter-spacing: -.01em; }
+
+.lux-admin-job-heading .lux-admin-job-attention { margin-top: 0; font-size: .68rem; }
+
+.lux-admin-job-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  color: var(--lux-subtle);
+  font-size: .71rem;
+}
+
+.lux-admin-job-meta .lux-admin-job-context { flex: 0 1 auto; }
+
+.lux-admin-job-meta-sep { color: var(--lux-subtle); }
+
+.lux-admin-job-library {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, .04);
+  color: var(--lux-muted);
+  font-size: .67rem;
+}
+
+.lux-admin-job-current-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  max-width: min(360px, 100%);
+  margin-top: 3px;
+  padding: 3px 8px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, .24);
+  font-size: .68rem;
+}
+
+.lux-admin-job-current-item span { flex: 0 0 auto; color: var(--lux-subtle); }
+
+.lux-admin-job-current-item code {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--lux-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lux-runs-col-status { white-space: nowrap; }
+
+.lux-runs-col-progress { min-width: 165px; }
+
+.lux-runs-progress-cell { display: grid; gap: 5px; }
+
+.lux-admin-job-progress-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 0;
+}
+
+.lux-admin-job-progress-wrap .lux-job-progress {
+  flex: 1 1 auto;
+  height: 5px;
+  margin-top: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .1);
+}
+
+.lux-admin-job-progress-wrap .lux-job-progress span {
+  border-radius: 999px;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--lux-status-active) 70%, var(--lux-accent)), var(--lux-accent));
+  transition: width .28s var(--lux-ease);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lux-job-progress.is-indeterminate span { animation-duration: 10s; }
+}
+
+.lux-admin-job-progress-pct {
+  flex: 0 0 auto;
+  color: var(--lux-text);
+  font-size: .71rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.lux-runs-table .lux-admin-job-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--lux-muted);
+  font-size: .72rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.lux-runs-time-cell { display: grid; gap: 3px; white-space: nowrap; }
+
+.lux-runs-time-cell .lux-admin-job-duration { margin: 0; color: var(--lux-text); font-size: .73rem; }
+
+.lux-runs-time-cell .lux-admin-job-finished-at {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  color: var(--lux-subtle);
+  font-size: .68rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.lux-runs-col-actions { width: 1%; white-space: nowrap; text-align: right; }
+
+.lux-runs-col-actions .lux-admin-job-actions { justify-content: flex-end; }
+
+.lux-admin-job-detail-row td {
+  padding: 0 14px 14px 58px;
+  border-bottom: 1px solid var(--lux-line-soft);
+  box-shadow: inset 3px 0 0 var(--job-rail);
+  background: rgba(0, 0, 0, .18);
+}
+
+.lux-runs-detail-panel { display: grid; gap: 8px; }
+
+.lux-runs-detail-panel .lux-admin-job-error { margin-top: 0; }
+
+.lux-runs-detail-panel .lux-admin-job-details { margin-top: 0; }
+
+@container (width < 720px) {
+  .lux-runs-table thead { display: none; }
+  .lux-runs-table, .lux-runs-table tbody, .lux-runs-table tr, .lux-runs-table td { display: block; width: 100%; }
+  .lux-admin-job-row { padding: 12px 14px; border-bottom: 1px solid var(--lux-line-soft); box-shadow: inset 3px 0 0 var(--job-rail); }
+  .lux-admin-job-row td { padding: 4px 0; border-bottom: 0; box-shadow: none; }
+  .lux-admin-job-row td:first-child { padding-left: 0; box-shadow: none; }
+  .lux-runs-col-status, .lux-runs-col-progress, .lux-runs-col-time, .lux-runs-col-actions { padding-left: 43px !important; }
+  .lux-runs-col-actions { text-align: left; }
+  .lux-runs-col-actions .lux-admin-job-actions { justify-content: flex-start; padding-top: 4px; }
+  .lux-admin-job-detail-row td { padding: 4px 14px 14px; }
+}
+
+html[data-lux-theme="light"] .lux-operations-runs-note { background: rgba(28, 28, 34, .035); }
+html[data-lux-theme="light"] .lux-runs-table-wrap { background: rgba(255, 255, 255, .86); }
+html[data-lux-theme="light"] .lux-runs-table thead th { background: rgba(244, 243, 241, .96); }
+html[data-lux-theme="light"] .lux-admin-job-row:hover td { background: rgba(28, 28, 34, .03); }
+html[data-lux-theme="light"] .lux-admin-job-row.is-expanded td { background: rgba(28, 28, 34, .025); }
+html[data-lux-theme="light"] .lux-runs-task-cell .lux-job-icon:not(.is-active):not(.is-completed):not(.is-warn):not(.is-failed) { background: rgba(28, 28, 34, .045); }
+html[data-lux-theme="light"] .lux-admin-job-library { background: rgba(28, 28, 34, .045); }
+html[data-lux-theme="light"] .lux-admin-job-current-item { background: rgba(28, 28, 34, .04); }
+html[data-lux-theme="light"] .lux-admin-job-progress-wrap .lux-job-progress { background: rgba(28, 28, 34, .1); }
+html[data-lux-theme="light"] .lux-admin-job-detail-row td { background: rgba(28, 28, 34, .035); }
 
 /* Logs: terminal-style console with fixed columns. */
 .lux-operations-log-toolbar { padding: 8px; border: 1px solid var(--lux-line-soft); border-radius: 12px 12px 0 0; background: rgba(255,255,255,.03); margin-bottom: 0; }
@@ -2413,8 +2665,6 @@ html[data-lux-theme="light"] .lux-operations-log-row:hover { background: rgba(28
   .lux-operations-log-toolbar { flex-wrap: wrap; }
   .lux-operations-log-row { grid-template-columns: 48px minmax(0, 1fr) auto; }
   .lux-operations-log-row time { grid-column: 2; padding-top: 0; }
-  .lux-admin-job-row { grid-template-columns: 34px minmax(0, 1fr); }
-  .lux-admin-job-actions { grid-column: 2; align-self: start; }
 }
 
 /* System log details: label/value rows instead of raw JSON. */
@@ -2427,6 +2677,441 @@ html[data-lux-theme="light"] .lux-operations-log-row:hover { background: rgba(28
 .lux-operations-log-details li strong { min-width: 0; color: var(--lux-text); font-weight: 500; overflow-wrap: anywhere; }
 
 html[data-lux-theme="light"] .lux-operations-log-details { background: rgba(28,28,34,.04); }
+
+/* Scheme A Master-Detail Workbench for Registered Plans */
+.lux-workbench {
+  display: grid;
+  grid-template-columns: 268px minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.lux-workbench-nav {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, .02);
+}
+
+.lux-workbench-nav-section {
+  display: grid;
+  gap: 4px;
+}
+
+.lux-workbench-nav-label {
+  padding: 4px 10px;
+  color: var(--lux-subtle);
+  font-size: .66rem;
+  font-weight: 600;
+  letter-spacing: .04em;
+}
+
+.lux-workbench-task-item {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  padding: 10px 11px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  color: var(--lux-text);
+  background: transparent;
+  text-align: left;
+  transition: background .16s ease, border-color .16s ease;
+}
+
+.lux-workbench-task-item:hover {
+  background: rgba(255, 255, 255, .055);
+}
+
+.lux-workbench-task-item.is-selected {
+  border-color: color-mix(in srgb, var(--lux-accent) 44%, var(--lux-line-soft));
+  background: color-mix(in srgb, var(--lux-accent) 10%, transparent);
+}
+
+.lux-workbench-task-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.lux-workbench-task-top strong {
+  font-size: .8rem;
+  font-weight: 650;
+}
+
+.lux-workbench-task-scope {
+  flex: 0 0 auto;
+  color: var(--lux-subtle);
+  font-size: .66rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.lux-workbench-task-sub {
+  color: var(--lux-muted);
+  font-size: .68rem;
+}
+
+.lux-workbench-detail {
+  display: grid;
+  gap: 18px;
+  min-width: 0;
+  padding: 18px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, .02);
+}
+
+.lux-workbench-detail-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--lux-line-soft);
+}
+
+.lux-workbench-detail-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 5px;
+}
+
+.lux-workbench-detail-title h3 {
+  margin: 0;
+  color: #fff;
+  font-size: 1.02rem;
+  letter-spacing: -.02em;
+}
+
+.lux-workbench-detail-title code {
+  color: var(--lux-subtle);
+  font: .66rem ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.lux-workbench-scope-badge {
+  padding: 3px 8px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 999px;
+  color: var(--lux-muted);
+  background: rgba(255, 255, 255, .04);
+  font-size: .65rem;
+}
+
+.lux-workbench-detail-head p {
+  margin: 0;
+  color: var(--lux-muted);
+  font-size: .74rem;
+  line-height: 1.5;
+}
+
+.lux-workbench-run-feedback {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 14px;
+  padding: 10px 13px;
+  border: 1px solid color-mix(in srgb, var(--lux-status-success) 38%, var(--lux-line-soft));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--lux-status-success) 9%, transparent);
+}
+
+.lux-workbench-run-feedback.is-warn {
+  border-color: color-mix(in srgb, var(--lux-status-warning) 44%, var(--lux-line-soft));
+  background: color-mix(in srgb, var(--lux-status-warning) 9%, transparent);
+}
+
+.lux-workbench-run-feedback-copy {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--lux-text);
+  font-size: .75rem;
+}
+
+.lux-workbench-run-feedback-copy svg {
+  flex: 0 0 auto;
+  color: var(--lux-status-success);
+}
+
+.lux-workbench-run-feedback.is-warn .lux-workbench-run-feedback-copy svg {
+  color: var(--lux-status-warning);
+}
+
+.lux-workbench-run-feedback-copy small {
+  display: block;
+  margin-top: 2px;
+  color: var(--lux-muted);
+  font-size: .68rem;
+}
+
+.lux-workbench-run-feedback-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.lux-workbench-block {
+  display: grid;
+  gap: 10px;
+}
+
+.lux-workbench-subhead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.lux-workbench-subhead h4 {
+  margin: 0;
+  color: var(--lux-text);
+  font-size: .8rem;
+  font-weight: 650;
+}
+
+.lux-workbench-subhead span {
+  color: var(--lux-subtle);
+  font-size: .68rem;
+}
+
+.lux-workbench-cron-readout {
+  display: grid;
+  gap: 2px;
+  margin-top: 10px;
+}
+
+.lux-workbench-cron-readout strong {
+  color: var(--lux-text);
+  font-size: .76rem;
+  font-weight: 600;
+}
+
+.lux-workbench-cron-readout small {
+  color: var(--lux-subtle);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .66rem;
+}
+
+.lux-workbench-row-switch {
+  margin-right: 4px;
+}
+
+.lux-workbench-alloc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 9px;
+}
+
+.lux-workbench-alloc-card {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, .025);
+}
+
+.lux-workbench-alloc-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.lux-workbench-alloc-top strong {
+  overflow: hidden;
+  color: var(--lux-text);
+  font-size: .76rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lux-workbench-alloc-select .lux-select-trigger {
+  min-height: 34px;
+  font-size: .71rem;
+}
+
+.lux-workbench-unsupported {
+  padding: 10px 12px;
+  border: 1px dashed var(--lux-line-soft);
+  border-radius: 9px;
+  color: var(--lux-subtle);
+  font-size: .72rem;
+}
+
+.lux-workbench-unsupported summary {
+  color: var(--lux-muted);
+  font-weight: 550;
+  cursor: pointer;
+}
+
+.lux-workbench-unsupported p {
+  margin: 8px 0 0;
+  line-height: 1.5;
+}
+
+/* Plan editor dialog */
+.lux-plan-dialog-form {
+  display: grid;
+  gap: 14px;
+}
+
+.lux-plan-dialog-field {
+  display: grid;
+  gap: 6px;
+  color: var(--lux-muted);
+  font-size: .74rem;
+}
+
+.lux-plan-dialog-field > span {
+  font-weight: 600;
+}
+
+.lux-plan-preset-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.lux-plan-preset-chip {
+  padding: 5px 10px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 999px;
+  color: var(--lux-muted);
+  background: rgba(255, 255, 255, .03);
+  font-size: .7rem;
+  transition: border-color .16s ease, color .16s ease, background .16s ease;
+}
+
+.lux-plan-preset-chip:hover {
+  border-color: var(--lux-line);
+  color: var(--lux-text);
+}
+
+.lux-plan-preset-chip.is-active {
+  border-color: color-mix(in srgb, var(--lux-accent) 60%, transparent);
+  color: var(--lux-text);
+  background: color-mix(in srgb, var(--lux-accent) 14%, transparent);
+}
+
+.lux-plan-cron-preview {
+  display: grid;
+  gap: 2px;
+  padding: 10px 12px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .03);
+}
+
+.lux-plan-cron-preview strong {
+  color: var(--lux-status-info);
+  font-size: .76rem;
+}
+
+.lux-plan-cron-preview.is-invalid strong {
+  color: var(--lux-status-danger);
+}
+
+.lux-plan-cron-preview small {
+  color: var(--lux-subtle);
+  font-size: .68rem;
+}
+
+.lux-plan-checklist-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.lux-plan-checklist {
+  display: grid;
+  gap: 6px;
+  max-height: 220px;
+  padding: 8px;
+  overflow-y: auto;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, .02);
+}
+
+.lux-plan-check-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .03);
+}
+
+.lux-plan-check-row.is-locked {
+  opacity: .72;
+}
+
+.lux-plan-check-origin {
+  color: var(--lux-subtle);
+  font-size: .68rem;
+  text-align: right;
+}
+
+.lux-plan-check-origin.is-move {
+  color: var(--lux-status-warning);
+}
+
+.lux-plan-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 6px;
+}
+
+html[data-lux-theme="light"] .lux-workbench-nav,
+html[data-lux-theme="light"] .lux-workbench-detail {
+  background: rgba(255, 255, 255, .68);
+}
+
+html[data-lux-theme="light"] .lux-workbench-task-item:hover {
+  background: rgba(28, 28, 34, .05);
+}
+
+html[data-lux-theme="light"] .lux-workbench-detail-title h3 {
+  color: var(--lux-text);
+}
+
+html[data-lux-theme="light"] .lux-workbench-alloc-card,
+html[data-lux-theme="light"] .lux-plan-cron-preview,
+html[data-lux-theme="light"] .lux-plan-checklist,
+html[data-lux-theme="light"] .lux-plan-check-row,
+html[data-lux-theme="light"] .lux-plan-preset-chip,
+html[data-lux-theme="light"] .lux-workbench-scope-badge {
+  background: rgba(28, 28, 34, .035);
+}
+
+@media (max-width: 900px) {
+  .lux-workbench {
+    grid-template-columns: 1fr;
+  }
+  .lux-registered-plan-row:not(.is-editing) .lux-registered-task-heading {
+    padding-right: 0;
+  }
+  .lux-registered-plan-row .lux-registered-task-actions {
+    position: static;
+    grid-column: 1 / -1;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    padding-top: 4px;
+  }
+}
 
 /* Phone admin shell: bottom tab bar + "more" sheet replace the sidebar navigation. */
 .lux-admin-tabbar,

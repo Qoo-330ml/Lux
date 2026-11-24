@@ -27,7 +27,7 @@ describe("admin navigation preloading", () => {
     ["/admin/plugins", [queryKeys.adminPlugins]],
     ["/admin/notifications", [queryKeys.adminWebhookDestinations]],
     ["/admin/users", [queryKeys.adminUsers]],
-    ["/admin/jobs", [queryKeys.adminScheduledTasks(1)]],
+    ["/admin/jobs", [queryKeys.adminScheduledTaskPlans(1, "", ""), queryKeys.adminScheduledTasks(1)]],
     ["/admin/settings", [queryKeys.adminSettings]],
     ["/admin/changelog", []],
   ] as const)("prefetches the main data for %s", (to, expectedKeys) => {
