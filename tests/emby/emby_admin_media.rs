@@ -1,0 +1,770 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use luxd::{
+    api::{AppState, app_with_state},
+    application::{libraries::LibraryService, scanner::ScanJobService, setup::SetupService},
+    auth::{
+        admin_api_key::AdminApiKeyService, emby::EmbyAuthService, sessions::WebAuthService,
+        users::UserStore,
+    },
+    config::Config,
+    library::LibraryKind,
+    storage::Database,
+};
+use reqwest::StatusCode;
+use serde_json::json;
+use tokio::net::TcpListener;
+
+const PNG_1X1: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82,
+];
+
+/// The smallest payload that satisfies the item image validation: JPEG SOI/APP0 magic and the EOI
+/// marker the writer requires.
+const JPEG_1X1: &[u8] = &[0xff, 0xd8, 0xff, 0xd9];
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn start_server(
+    config: Config,
+    database: Database,
+    setup: SetupService,
+) -> Result<(String, AbortOnDrop), Box<dyn std::error::Error>> {
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database)?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Ok((format!("http://{address}"), AbortOnDrop(task)))
+}
+
+fn emby_public_id(id: &str) -> String {
+    uuid::Uuid::parse_str(id)
+        .map(|uuid| uuid.as_u128().to_string())
+        .unwrap_or_else(|_| id.to_owned())
+}
+
+fn test_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client")
+}
+
+async fn wait_for_local_metadata_batches(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let pending = pending_local_metadata_batches(database).await?;
+            if pending == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        Ok::<(), sqlx::Error>(())
+    })
+    .await??;
+    Ok(())
+}
+
+async fn pending_local_metadata_batches(database: &Database) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_local_metadata_batches WHERE status IN ('PENDING', 'RUNNING')",
+    )
+    .fetch_one(database.pool())
+    .await
+}
+
+struct Fixture {
+    base_url: String,
+    key: String,
+    public_item_id: String,
+    database: Database,
+    _server: AbortOnDrop,
+    _temp: tempfile::TempDir,
+}
+
+async fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(
+        root.join("Admin.Media.2020.strm"),
+        "https://example.invalid/admin-media",
+    )
+    .await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+    wait_for_local_metadata_batches(&database).await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE'")
+            .fetch_one(database.pool())
+            .await?;
+    let key = AdminApiKeyService::new(config.config_dir.clone(), database.clone())
+        .rotate()
+        .await?;
+    let (base_url, server) = start_server(config, database.clone(), setup).await?;
+    Ok(Fixture {
+        base_url,
+        key,
+        public_item_id: emby_public_id(&item_id),
+        database,
+        _server: server,
+        _temp: temp_dir,
+    })
+}
+
+async fn viewer_token(
+    base_url: &str,
+    database: &Database,
+) -> Result<String, Box<dyn std::error::Error>> {
+    UserStore::new(database.clone())?
+        .create_user("Viewer", "Viewer", "viewer password", false)
+        .await?;
+    let response = test_client()
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .json(&json!({ "Username": "Viewer", "Pw": "viewer password" }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.json::<serde_json::Value>().await?;
+    Ok(body["AccessToken"]
+        .as_str()
+        .ok_or("missing viewer token")?
+        .to_owned())
+}
+
+#[tokio::test]
+async fn remote_search_validates_the_client_and_the_item() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = fixture().await?;
+    let client = test_client();
+    let search_body = json!({
+        "ItemId": fixture.public_item_id,
+        "SearchInfo": {
+            "ProviderIds": { "Tmdb": "550" },
+            "Name": "Admin Media",
+            "Year": 2020
+        }
+    });
+
+    // The library has no scraper configured, so the search reports the configuration gap (409)
+    // instead of an empty list that looks like "no results".
+    let response = client
+        .post(format!(
+            "{base_url}/emby/Items/RemoteSearch/Movie",
+            base_url = fixture.base_url
+        ))
+        .query(&[("api_key", fixture.key.as_str())])
+        .json(&search_body)
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let unknown_item = client
+        .post(format!(
+            "{base_url}/emby/Items/RemoteSearch/Movie",
+            base_url = fixture.base_url
+        ))
+        .query(&[("api_key", fixture.key.as_str())])
+        .json(&json!({
+            "ItemId": emby_public_id(&uuid::Uuid::now_v7().to_string()),
+            "SearchInfo": { "Name": "Admin Media" }
+        }))
+        .send()
+        .await?;
+    assert_eq!(unknown_item.status(), StatusCode::NOT_FOUND);
+
+    let blank_name = client
+        .post(format!(
+            "{base_url}/emby/Items/RemoteSearch/Movie",
+            base_url = fixture.base_url
+        ))
+        .query(&[("api_key", fixture.key.as_str())])
+        .json(&json!({
+            "ItemId": fixture.public_item_id,
+            "SearchInfo": { "Name": "   " }
+        }))
+        .send()
+        .await?;
+    assert_eq!(blank_name.status(), StatusCode::BAD_REQUEST);
+
+    let wrong_type = client
+        .post(format!(
+            "{base_url}/emby/Items/RemoteSearch/Person",
+            base_url = fixture.base_url
+        ))
+        .query(&[("api_key", fixture.key.as_str())])
+        .json(&search_body)
+        .send()
+        .await?;
+    assert_eq!(wrong_type.status(), StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_search_rejects_non_administrators() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
+    let (base_url, _server) = start_server(config, database.clone(), setup).await?;
+    let token = viewer_token(&base_url, &database).await?;
+    let client = test_client();
+
+    for path in [
+        "/emby/Items/RemoteSearch/Movie",
+        "/emby/Items/RemoteSearch/Apply/any",
+    ] {
+        let response = client
+            .post(format!("{base_url}{path}"))
+            .header("X-Emby-Token", &token)
+            .json(&json!({ "ItemId": "1", "SearchInfo": { "Name": "x" } }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+    let images = client
+        .get(format!("{base_url}/emby/Items/1/RemoteImages"))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(images.status(), StatusCode::FORBIDDEN);
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_search_apply_rejects_unknown_candidates() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = fixture().await?;
+    let client = test_client();
+
+    let unknown_candidate = client
+        .post(format!(
+            "{base_url}/emby/Items/RemoteSearch/Apply/{item_id}",
+            base_url = fixture.base_url,
+            item_id = fixture.public_item_id
+        ))
+        .query(&[("api_key", fixture.key.as_str())])
+        .json(&json!({ "Id": "not-a-candidate", "ProviderIds": { "Tmdb": "999999" } }))
+        .send()
+        .await?;
+    assert_eq!(unknown_candidate.status(), StatusCode::NOT_FOUND);
+
+    let unknown_item = client
+        .post(format!(
+            "{base_url}/emby/Items/RemoteSearch/Apply/{item_id}",
+            base_url = fixture.base_url,
+            item_id = emby_public_id(&uuid::Uuid::now_v7().to_string())
+        ))
+        .query(&[("api_key", fixture.key.as_str())])
+        .json(&json!({ "Id": "x" }))
+        .send()
+        .await?;
+    assert_eq!(unknown_item.status(), StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_images_validate_type_and_item() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture().await?;
+    let client = test_client();
+
+    let invalid_type = client
+        .get(format!(
+            "{base_url}/emby/Items/{item_id}/RemoteImages?Type=Nope",
+            base_url = fixture.base_url,
+            item_id = fixture.public_item_id
+        ))
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(invalid_type.status(), StatusCode::BAD_REQUEST);
+
+    // The item has no provider id yet, and the library has no scraper: both are reported as a
+    // conflict, never as an empty image list.
+    let unresolved = client
+        .get(format!(
+            "{base_url}/emby/Items/{item_id}/RemoteImages?Type=Primary",
+            base_url = fixture.base_url,
+            item_id = fixture.public_item_id
+        ))
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    let status = unresolved.status();
+    assert!(
+        status == StatusCode::CONFLICT || status == StatusCode::SERVICE_UNAVAILABLE,
+        "unexpected status {status}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_image_download_validates_the_body() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture().await?;
+    let client = test_client();
+
+    let missing_url = client
+        .post(format!(
+            "{base_url}/emby/Items/{item_id}/RemoteImages/Download",
+            base_url = fixture.base_url,
+            item_id = fixture.public_item_id
+        ))
+        .query(&[("api_key", fixture.key.as_str())])
+        .json(&json!({ "Type": "Primary" }))
+        .send()
+        .await?;
+    assert_eq!(missing_url.status(), StatusCode::BAD_REQUEST);
+
+    let invalid_type = client
+        .post(format!(
+            "{base_url}/emby/Items/{item_id}/RemoteImages/Download",
+            base_url = fixture.base_url,
+            item_id = fixture.public_item_id
+        ))
+        .query(&[("api_key", fixture.key.as_str())])
+        .json(&json!({ "Type": "Nope", "ImageUrl": "https://img.example/x.jpg" }))
+        .send()
+        .await?;
+    assert_eq!(invalid_type.status(), StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_delete_maps_type_and_index() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture().await?;
+    let client = test_client();
+
+    let invalid_index = client
+        .delete(format!(
+            "{base_url}/emby/Items/{item_id}/Images/Primary/abc/Delete",
+            base_url = fixture.base_url,
+            item_id = fixture.public_item_id
+        ))
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(invalid_index.status(), StatusCode::BAD_REQUEST);
+
+    let invalid_type = client
+        .delete(format!(
+            "{base_url}/emby/Items/{item_id}/Images/Nope/0/Delete",
+            base_url = fixture.base_url,
+            item_id = fixture.public_item_id
+        ))
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(invalid_type.status(), StatusCode::BAD_REQUEST);
+
+    // A scanned STRM item has no stored images, so the delete is a clean 404.
+    let missing = client
+        .delete(format!(
+            "{base_url}/emby/Items/{item_id}/Images/Primary/0/Delete",
+            base_url = fixture.base_url,
+            item_id = fixture.public_item_id
+        ))
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+#[tokio::test]
+async fn item_image_upload_accepts_raw_and_base64_bodies() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = fixture().await?;
+    let client = test_client();
+    let item_id = fixture.public_item_id.as_str();
+    let primary_url = format!(
+        "{base_url}/emby/Items/{item_id}/Images/Primary",
+        base_url = fixture.base_url
+    );
+
+    let raw_upload = client
+        .post(&primary_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .header("Content-Type", "image/png")
+        .body(PNG_1X1)
+        .send()
+        .await?;
+    assert_eq!(raw_upload.status(), StatusCode::NO_CONTENT);
+
+    let primary = client
+        .get(&primary_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(primary.status(), StatusCode::OK);
+    assert_eq!(primary.headers()["content-type"], "image/png");
+    assert_eq!(primary.bytes().await?.as_ref(), PNG_1X1);
+
+    // The indexed spelling resolves to a three-segment path extractor, so `/0` must reach the
+    // handler instead of failing route extraction with a 500.
+    let indexed_primary_upload = client
+        .post(format!("{primary_url}/0"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .header("Content-Type", "image/png")
+        .body(PNG_1X1)
+        .send()
+        .await?;
+    assert_eq!(indexed_primary_upload.status(), StatusCode::NO_CONTENT);
+
+    // Standard clients may send the image as a Base64 text body with a non-image content type.
+    let backdrop_url = format!(
+        "{base_url}/emby/Items/{item_id}/Images/Backdrop",
+        base_url = fixture.base_url
+    );
+    let encoded_upload = client
+        .post(format!("{backdrop_url}/0"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .body(BASE64.encode(JPEG_1X1))
+        .send()
+        .await?;
+    assert_eq!(encoded_upload.status(), StatusCode::NO_CONTENT);
+
+    let backdrop = client
+        .get(&backdrop_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(backdrop.status(), StatusCode::OK);
+    assert_eq!(backdrop.headers()["content-type"], "image/jpeg");
+    assert_eq!(backdrop.bytes().await?.as_ref(), JPEG_1X1);
+
+    // A malformed or negative index is a client error, never a server error.
+    for image_index in ["abc", "-1"] {
+        let invalid_index = client
+            .post(format!("{primary_url}/{image_index}"))
+            .query(&[("api_key", fixture.key.as_str())])
+            .header("Content-Type", "image/png")
+            .body(PNG_1X1)
+            .send()
+            .await?;
+        assert_eq!(
+            invalid_index.status(),
+            StatusCode::BAD_REQUEST,
+            "{image_index}"
+        );
+    }
+
+    // Non-administrators cannot replace item artwork.
+    let token = viewer_token(&fixture.base_url, &fixture.database).await?;
+    let forbidden = client
+        .post(&backdrop_url)
+        .header("X-Emby-Token", token)
+        .header("Content-Type", "image/jpeg")
+        .body(JPEG_1X1)
+        .send()
+        .await?;
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_delete_accepts_the_path_without_the_delete_suffix()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture().await?;
+    let client = test_client();
+    let item_id = fixture.public_item_id.as_str();
+    let primary_url = format!(
+        "{base_url}/emby/Items/{item_id}/Images/Primary",
+        base_url = fixture.base_url
+    );
+    let upload = client
+        .post(&primary_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .header("Content-Type", "image/png")
+        .body(PNG_1X1)
+        .send()
+        .await?;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    // Emby clients also delete through `/Images/{Type}/{Index}` without the legacy `/Delete` suffix.
+    let deleted = client
+        .delete(format!("{primary_url}/0"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+
+    let missing = client
+        .get(&primary_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_search_accepts_provider_ids_without_a_name()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture().await?;
+    let client = test_client();
+    let search_url = format!(
+        "{base_url}/emby/Items/RemoteSearch/Movie",
+        base_url = fixture.base_url
+    );
+
+    // A provider id alone is a valid query. Without a configured scraper the search reports the
+    // configuration gap (409) rather than failing request validation (400).
+    let provider_only = client
+        .post(&search_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .json(&json!({
+            "ItemId": fixture.public_item_id,
+            "SearchInfo": { "ProviderIds": { "Tmdb": "550" } }
+        }))
+        .send()
+        .await?;
+    assert_eq!(provider_only.status(), StatusCode::CONFLICT);
+
+    // A name plus provider ids stays a name search; the ids only rank the results. Without a
+    // scraper it reports the same configuration gap, never a validation error.
+    let name_and_provider_ids = client
+        .post(&search_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .json(&json!({
+            "ItemId": fixture.public_item_id,
+            "SearchInfo": {
+                "Name": "Admin Media",
+                "ProviderIds": { "Tmdb": "550" },
+                "Year": 2020
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(name_and_provider_ids.status(), StatusCode::CONFLICT);
+
+    // A blank name and blank provider ids carry no search terms at all.
+    let empty_terms = client
+        .post(&search_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .json(&json!({
+            "ItemId": fixture.public_item_id,
+            "SearchInfo": { "Name": "   ", "ProviderIds": { "Tmdb": "   ", "": "550" } }
+        }))
+        .send()
+        .await?;
+    assert_eq!(empty_terms.status(), StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+#[tokio::test]
+async fn current_user_returns_the_authenticated_account() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = fixture().await?;
+    let token = viewer_token(&fixture.base_url, &fixture.database).await?;
+    let client = test_client();
+
+    let response = client
+        .get(format!(
+            "{base_url}/emby/Users/Me",
+            base_url = fixture.base_url
+        ))
+        .header("X-Emby-Token", token)
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.json::<serde_json::Value>().await?;
+    assert_eq!(body["Name"], "Viewer");
+    assert!(body["Id"].is_string());
+    assert!(body["Policy"].is_object());
+
+    let anonymous = client
+        .get(format!(
+            "{base_url}/emby/Users/Me",
+            base_url = fixture.base_url
+        ))
+        .send()
+        .await?;
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn item_image_upload_body_limit_covers_base64_expansion()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture().await?;
+    let client = test_client();
+    let item_id = fixture.public_item_id.as_str();
+    let primary_url = format!(
+        "{base_url}/emby/Items/{item_id}/Images/Primary",
+        base_url = fixture.base_url
+    );
+
+    // A 4 MiB JPEG is under the 5 MiB decoded limit, but its Base64 text body is larger than the
+    // old route limit. The transport limit must admit it and the writer still accepts the pixels.
+    let mut jpeg = Vec::with_capacity(4 * 1024 * 1024 + 5);
+    jpeg.extend_from_slice(&[0xff, 0xd8, 0xff]);
+    jpeg.resize(4 * 1024 * 1024, 0);
+    jpeg.extend_from_slice(&[0xff, 0xd9]);
+    let encoded = BASE64.encode(&jpeg);
+    assert!(
+        encoded.len() as u64 > luxd::application::images::MAX_MANUAL_ITEM_IMAGE_BYTES,
+        "the encoded body must exceed the decoded route limit"
+    );
+
+    let upload = client
+        .post(&primary_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .body(encoded)
+        .send()
+        .await?;
+    assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+
+    let served = client
+        .get(&primary_url)
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(served.status(), StatusCode::OK);
+    assert_eq!(served.bytes().await?.as_ref(), jpeg);
+    Ok(())
+}
+
+#[tokio::test]
+async fn indexed_backdrop_upload_replaces_the_requested_slot()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture().await?;
+    let client = test_client();
+    let item_id = fixture.public_item_id.as_str();
+    let backdrop_url = format!(
+        "{base_url}/emby/Items/{item_id}/Images/Backdrop",
+        base_url = fixture.base_url
+    );
+
+    // No-index backdrop uploads append index 0 and then index 1.
+    for (body, content_type) in [(PNG_1X1, "image/png"), (JPEG_1X1, "image/jpeg")] {
+        let response = client
+            .post(&backdrop_url)
+            .query(&[("api_key", fixture.key.as_str())])
+            .header("Content-Type", content_type)
+            .body(body.to_vec())
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+    let first = client
+        .get(format!("{backdrop_url}/0"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(first.bytes().await?.as_ref(), PNG_1X1);
+    let second = client
+        .get(format!("{backdrop_url}/1"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(second.bytes().await?.as_ref(), JPEG_1X1);
+
+    // Backdrop/0 replaces the first slot in place: index 1 is untouched and no index 2 appears.
+    let mut replacement = PNG_1X1.to_vec();
+    replacement.push(0);
+    let replaced = client
+        .post(format!("{backdrop_url}/0"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .header("Content-Type", "image/png")
+        .body(replacement.clone())
+        .send()
+        .await?;
+    assert_eq!(replaced.status(), StatusCode::NO_CONTENT);
+
+    let first = client
+        .get(format!("{backdrop_url}/0"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(first.bytes().await?.as_ref(), replacement.as_slice());
+    let second = client
+        .get(format!("{backdrop_url}/1"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(second.bytes().await?.as_ref(), JPEG_1X1);
+    let absent = client
+        .get(format!("{backdrop_url}/2"))
+        .query(&[("api_key", fixture.key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+
+    // Single-slot types have no index 1, for media items as well as library covers and person ids;
+    // the rule is checked before the target is resolved.
+    let library_id: String = sqlx::query_scalar("SELECT id FROM libraries LIMIT 1")
+        .fetch_one(fixture.database.pool())
+        .await?;
+    for target in [
+        format!(
+            "{base_url}/emby/Items/{item_id}/Images/Primary/1",
+            base_url = fixture.base_url
+        ),
+        format!(
+            "{base_url}/emby/Items/{library_id}/Images/Primary/1",
+            base_url = fixture.base_url
+        ),
+        format!(
+            "{base_url}/emby/Items/104/Images/Primary/1",
+            base_url = fixture.base_url
+        ),
+    ] {
+        let response = client
+            .post(&target)
+            .query(&[("api_key", fixture.key.as_str())])
+            .header("Content-Type", "image/png")
+            .body(PNG_1X1)
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{target}");
+    }
+    Ok(())
+}

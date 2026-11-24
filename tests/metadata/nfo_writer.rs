@@ -1309,3 +1309,118 @@ fn local_nfo_parser_ignores_user_ratings_and_incomplete_containers()
     assert_eq!(value_only.rating, None);
     Ok(())
 }
+
+#[test]
+fn movie_nfo_parser_preserves_multiple_actor_provider_ids_and_writes_them_back()
+-> Result<(), Box<dyn std::error::Error>> {
+    use luxd::application::nfo::rewrite_movie_nfo;
+
+    let nfo = r#"<movie>
+  <title>飞驰人生2</title>
+  <actor>
+    <name>沈腾</name>
+    <role>Zhang Chi</role>
+    <type>Actor</type>
+    <imdbid>nm7613067</imdbid>
+    <doubanid>1325700</doubanid>
+    <tmdbid>1519026</tmdbid>
+    <order>0</order>
+  </actor>
+</movie>"#;
+    let actors = parse_movie_nfo_actors(nfo.as_bytes())?;
+    assert_eq!(actors.len(), 1);
+    assert_eq!(actors[0].id, "1519026");
+    assert_eq!(actors[0].provider.as_deref(), Some("tmdb"));
+    let pairs = actors[0]
+        .identities
+        .iter()
+        .map(|identity| (identity.provider.as_str(), identity.id.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pairs,
+        vec![
+            ("douban", "1325700"),
+            ("imdb", "nm7613067"),
+            ("tmdb", "1519026"),
+        ]
+    );
+
+    let merged_xml = rewrite_movie_nfo(
+        b"<movie><title>old</title></movie>",
+        &MovieNfoMetadata {
+            base: NfoMetadata {
+                title: Some("飞驰人生2".to_owned()),
+                ..NfoMetadata::default()
+            },
+            actors,
+            ..MovieNfoMetadata::default()
+        },
+    )?;
+    let merged_text = String::from_utf8(merged_xml)?;
+    assert!(merged_text.contains("<tmdbid>1519026</tmdbid>"));
+    assert!(merged_text.contains("<imdbid>nm7613067</imdbid>"));
+    assert!(merged_text.contains("<doubanid>1325700</doubanid>"));
+    Ok(())
+}
+
+#[test]
+fn complementary_movie_nfo_merge_supplements_actor_ids_only_for_same_film()
+-> Result<(), Box<dyn std::error::Error>> {
+    use luxd::application::nfo::merge_complementary_movie_nfo_projections;
+
+    let per_file = parse_local_nfo_projection(
+        r#"<movie>
+  <title>飞驰人生2</title>
+  <year>2024</year>
+  <tmdbid>1212266</tmdbid>
+  <actor><name>沈腾</name><role>Zhang Chi</role></actor>
+  <actor><name>尹正</name><role>Sun Yuqiang</role><tmdbid>1519030</tmdbid></actor>
+</movie>"#
+            .as_bytes(),
+    )?;
+    let folder_same = parse_local_nfo_projection(
+        r#"<movie>
+  <title>飞驰人生2</title>
+  <year>2024</year>
+  <tmdbid>1212266</tmdbid>
+  <imdbid>tt30872721</imdbid>
+  <actor><name>沈腾</name><role>Zhang Chi</role><tmdbid>1519026</tmdbid><imdbid>nm7613067</imdbid></actor>
+  <actor><name>尹正</name><role>Sun Yuqiang</role><imdbid>nm7613069</imdbid></actor>
+</movie>"#
+            .as_bytes(),
+    )?;
+    let folder_wrong = parse_local_nfo_projection(
+        r#"<movie>
+  <title>别的电影</title>
+  <year>2024</year>
+  <tmdbid>999999</tmdbid>
+  <actor><name>沈腾</name><role>Zhang Chi</role><tmdbid>888888</tmdbid></actor>
+</movie>"#
+            .as_bytes(),
+    )?;
+
+    let mut merged = per_file.clone();
+    assert!(merge_complementary_movie_nfo_projections(
+        &mut merged,
+        &folder_same
+    ));
+    assert_eq!(
+        merged.details.provider_ids.get("imdb").map(String::as_str),
+        Some("tt30872721")
+    );
+    assert_eq!(merged.actors[0].id, "1519026");
+    assert_eq!(merged.actors[0].provider.as_deref(), Some("tmdb"));
+    assert_eq!(merged.actors[0].identities.len(), 2);
+    assert_eq!(merged.actors[1].id, "1519030");
+    assert_eq!(merged.actors[1].identities.len(), 2);
+
+    let mut untouched = per_file;
+    assert!(!merge_complementary_movie_nfo_projections(
+        &mut untouched,
+        &folder_wrong
+    ));
+    assert!(untouched.actors[0].id.is_empty());
+    assert!(untouched.actors[0].identities.is_empty());
+    assert!(!untouched.details.provider_ids.contains_key("imdb"));
+    Ok(())
+}

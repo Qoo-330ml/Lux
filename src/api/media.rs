@@ -4,6 +4,7 @@ use crate::application::image_variants::{
     OriginalImageReason, source_pixel_dimensions,
 };
 use crate::application::playback::session::EMBY_DIRECT_STREAM_TICKET_VERSION;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 const LUX_SEARCH_ITEM_TYPES: [&str; 3] = ["MOVIE", "SERIES", "VIDEO"];
 const MAX_HOME_LATEST_LIBRARY_IDS: usize = 100;
@@ -222,10 +223,40 @@ pub(super) async fn lux_home_carousel(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    match lux_catalog_items_json_for_user(database, &user_id, &recommended).await {
-        Ok(items) => Json(json!({ "recommended": items })).into_response(),
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    let item_ids = recommended
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    let (items_result, nfo_result) = tokio::join!(
+        lux_catalog_items_json_for_user(database, &user_id, &recommended),
+        state.local_nfo().read_items(&item_ids),
+    );
+    let mut items = match items_result {
+        Ok(items) => items,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let nfo_by_id = match nfo_result {
+        Ok(nfo_by_id) => nfo_by_id,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "derived local NFO cache is unavailable for home carousel"
+            );
+            HashMap::new()
+        }
+    };
+    for value in &mut items {
+        if let Value::Object(object) = value {
+            let genres = object
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| nfo_by_id.get(id))
+                .map(|details| details.genres.as_slice())
+                .unwrap_or(&[]);
+            object.insert("genres".to_owned(), json!(genres));
+        }
     }
+    Json(json!({ "recommended": items })).into_response()
 }
 
 pub(super) async fn lux_list_home_library_latest(
@@ -2341,8 +2372,15 @@ pub(super) async fn lux_search_item_images(
         )
         .await
     {
-        Ok(images) => Json(json!({
-            "images": images.iter().map(image_candidate_json).collect::<Vec<_>>()
+        Ok(outcome) => Json(json!({
+            "images": outcome.images.iter().map(image_candidate_json).collect::<Vec<_>>(),
+            // An empty list is ambiguous without these: the scraper may have returned logos in
+            // other languages that the language filter removed, or the source may not provide
+            // this image type at all.
+            "availableLanguages": outcome.available_languages,
+            "filteredByLanguage": outcome.filtered_by_language,
+            "availableImageTypes": outcome.available_image_types,
+            "source": outcome.source,
         }))
         .into_response(),
         Err(error) => image_candidate_error(&headers, error),
@@ -2962,6 +3000,67 @@ pub(super) async fn emby_update_person_or_library_image(
     State(state): State<ReadyAppState>,
     body: Bytes,
 ) -> Response {
+    update_emby_person_or_library_image(headers, item_id, image_type, None, query, state, body)
+        .await
+}
+
+/// `POST /Items/{item_id}/Images/{image_type}/{image_index}`: the indexed spelling of the image
+/// upload route.
+///
+/// Emby clients append `/0` to the same upload endpoint. The index is validated before the shared
+/// handler runs: single-slot types only have index 0 (so `Primary/1` is a missing image, 404),
+/// while fanart accepts `0..=MAX_MANUAL_IMAGE_INDEX` and replaces that slot in place instead of
+/// appending. Malformed and negative indices are rejected as 400.
+pub(super) async fn emby_update_person_or_library_image_at_index(
+    headers: HeaderMap,
+    Path((item_id, image_type, image_index)): Path<(String, String, String)>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<ReadyAppState>,
+    body: Bytes,
+) -> Response {
+    let Ok(image_index) = image_index.trim().parse::<i64>() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if let Err(status) = validate_emby_image_upload_index(&image_type, image_index) {
+        return status.into_response();
+    }
+    update_emby_person_or_library_image(
+        headers,
+        item_id,
+        image_type,
+        Some(image_index),
+        query,
+        state,
+        body,
+    )
+    .await
+}
+
+fn validate_emby_image_upload_index(image_type: &str, image_index: i64) -> Result<(), StatusCode> {
+    if image_index < 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    match normalize_image_type(image_type) {
+        Some("FANART") if image_index > crate::application::images::MAX_MANUAL_IMAGE_INDEX => {
+            Err(StatusCode::BAD_REQUEST)
+        }
+        Some("FANART") => Ok(()),
+        // Every other image type has a single slot at index 0, so an out-of-range index names no
+        // image; GET on the same path answers the same way.
+        _ if image_index > 0 => Err(StatusCode::NOT_FOUND),
+        _ => Ok(()),
+    }
+}
+
+async fn update_emby_person_or_library_image(
+    headers: HeaderMap,
+    item_id: String,
+    image_type: String,
+    target_index: Option<i64>,
+    query: EmbyTokenQuery,
+    state: ReadyAppState,
+    body: Bytes,
+) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
             Ok(principal) => principal,
@@ -2971,19 +3070,26 @@ pub(super) async fn emby_update_person_or_library_image(
         Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
-    if normalize_image_type(&image_type) != Some("POSTER") {
-        return StatusCode::NOT_FOUND.into_response();
-    }
+    let image_type = image_type.trim();
+    let mapped_type = normalize_image_type(image_type);
     let internal_item_id = emby_internal_id(&item_id);
     if let Ok(library_id) = internal_item_id.parse::<crate::domain::ids::LibraryId>()
-        && let Some(database) = Some(state.database())
-        && database
+        && state
+            .database()
             .find_library(&library_id.to_string())
             .await
             .ok()
             .flatten()
             .is_some()
     {
+        // A library holds exactly one cover, so the POSTER contract stays stricter than the media
+        // item one. This branch only accepts a raw image body whose Content-Type names the image
+        // format (the Web admin uploads through `PUT /api/v1/admin/libraries/{library_id}/cover`,
+        // which Base64-encodes client-side); Base64 text is decoded only on the media item branch.
+        // The 413 below reflects `TooLarge`; other cover validation failures stay 400.
+        if mapped_type != Some("POSTER") {
+            return StatusCode::NOT_FOUND.into_response();
+        }
         if !auth_principal.can_manage_server() {
             return StatusCode::FORBIDDEN.into_response();
         }
@@ -2996,9 +3102,12 @@ pub(super) async fn emby_update_person_or_library_image(
             Ok(_) => StatusCode::NO_CONTENT.into_response(),
             Err(
                 LibraryCoverError::UnsupportedContentType(_)
-                | LibraryCoverError::InvalidContent { .. }
-                | LibraryCoverError::TooLarge { .. },
+                | LibraryCoverError::InvalidContent { .. },
             ) => StatusCode::BAD_REQUEST.into_response(),
+            // The route admits Base64-expanded bodies, so the decoded cover size is enforced here.
+            Err(LibraryCoverError::TooLarge { .. }) => {
+                StatusCode::PAYLOAD_TOO_LARGE.into_response()
+            }
             Err(LibraryCoverError::LibraryNotFound) => StatusCode::NOT_FOUND.into_response(),
             Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         };
@@ -3009,32 +3118,139 @@ pub(super) async fn emby_update_person_or_library_image(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let people = state.people();
-    let person = match people.find_person(&library_ids, "Actor", &item_id).await {
-        Ok(Some(person)) => person,
-        Ok(None) | Err(PeopleError::InvalidComponent(_)) => {
-            return StatusCode::NOT_FOUND.into_response();
+    // Actor portraits are POSTER-only; other image types fall through to the media item branch
+    // (or 404 when the id is not an item) instead of hijacking a person record.
+    let person = if mapped_type == Some("POSTER") {
+        match people.find_person(&library_ids, "Actor", &item_id).await {
+            Ok(person) => person,
+            Err(PeopleError::InvalidComponent(_)) => None,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         }
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    } else {
+        None
     };
-    let content_type = headers
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok());
-    match people
-        .update_person_image(
-            &item_id,
-            &person.name,
-            person.provider.as_deref(),
+    if let Some(person) = person {
+        let content_type = headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        return match people
+            .update_person_image(
+                &item_id,
+                &person.name,
+                person.provider.as_deref(),
+                content_type,
+                &body,
+            )
+            .await
+        {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(PeopleError::InvalidComponent(_) | PeopleError::InvalidImage(_)) => {
+                StatusCode::BAD_REQUEST.into_response()
+            }
+            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+    }
+    // Not a library cover and not a known person: treat the id as a media item so Emby clients can
+    // replace Primary/Backdrop/Logo/... artwork with a local file, raw bytes or Base64 text.
+    if internal_item_id
+        .parse::<crate::domain::ids::ItemId>()
+        .is_err()
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !auth_principal.can_manage_server() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(mapped_type) = mapped_type else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(images) = state.image_writes() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let (content_type, image_bytes) = match decode_emby_item_image_body(&body) {
+        Ok(value) => value,
+        Err(status) => return status.into_response(),
+    };
+    match images
+        .upload_item_image_with_index(
+            &internal_item_id,
+            mapped_type,
+            target_index,
             content_type,
-            &body,
+            &image_bytes,
         )
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(PeopleError::InvalidComponent(_) | PeopleError::InvalidImage(_)) => {
-            StatusCode::BAD_REQUEST.into_response()
+        Ok(report) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "IMAGE_UPLOADED",
+                Some("item_image"),
+                Some(&report.id),
+                &json!({
+                    "itemId": internal_item_id,
+                    "imageType": report.image_type,
+                    "source": "emby_item_image_upload",
+                })
+                .to_string(),
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
         }
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => emby_item_image_write_error(error),
     }
+}
+
+/// Decodes an Emby image upload body: raw image bytes or a Base64 text body.
+///
+/// Official clients use both spellings for `POST /Items/{Id}/Images/{Type}`. The returned content
+/// type is detected from the pixels rather than trusted from the request, so a Base64 body sent
+/// with `Content-Type: text/plain` (or a stale image type) still maps to the stored format.
+fn decode_emby_item_image_body(body: &Bytes) -> Result<(&'static str, Vec<u8>), StatusCode> {
+    if let Some(content_type) = emby_image_content_type(body) {
+        return Ok((content_type, body.to_vec()));
+    }
+    let compact = body
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    let decoded = BASE64
+        .decode(compact)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let content_type = emby_image_content_type(&decoded).ok_or(StatusCode::BAD_REQUEST)?;
+    Ok((content_type, decoded))
+}
+
+fn emby_image_content_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// Emby status codes for a failed item image write: the same mapping the remote image download
+/// and image delete endpoints use, without leaking Lux error DTOs into the Emby protocol.
+fn emby_item_image_write_error(error: ImageWriteError) -> Response {
+    let status = match error {
+        ImageWriteError::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+        ImageWriteError::ItemNotFound => StatusCode::NOT_FOUND,
+        ImageWriteError::InvalidImageType(_)
+        | ImageWriteError::InvalidUrl(_)
+        | ImageWriteError::UnsupportedContentType { .. }
+        | ImageWriteError::InvalidContent { .. } => StatusCode::BAD_REQUEST,
+        ImageWriteError::InvalidConfiguration(_) | ImageWriteError::ConcurrentModification(_) => {
+            StatusCode::CONFLICT
+        }
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    status.into_response()
 }
 
 pub(super) async fn emby_subtitle_with_source(

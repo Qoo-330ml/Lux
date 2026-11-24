@@ -274,8 +274,8 @@ async fn emby_scheduled_tasks_reports_library_scan_state() -> Result<(), Box<dyn
     let tasks = serde_json::from_str::<Vec<serde_json::Value>>(&response_body)?;
     let refresh_task = tasks
         .iter()
-        .find(|task| task["Key"] == "RefreshMediaLibrary")
-        .ok_or("missing RefreshMediaLibrary task")?;
+        .find(|task| task["Key"] == "RefreshLibrary")
+        .ok_or("missing RefreshLibrary scan task")?;
     assert_eq!(refresh_task["State"], "Running");
     assert_eq!(refresh_task["IsHidden"], false);
     assert_eq!(scan.status, "PENDING");

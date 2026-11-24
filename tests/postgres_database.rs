@@ -5234,3 +5234,59 @@ async fn a_marker_left_by_the_setup_placeholder_does_not_block_a_fresh_postgres_
     drop_postgres_test_database(&database_name).await?;
     result
 }
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_notification_deliveries_can_be_counted_and_listed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let result = async {
+        let database = Database::connect_with_configuration(&config, &connection).await?;
+        let webhooks = WebhookService::new(database.clone(), config.config_dir.clone())?;
+        let (destination, _) = webhooks
+            .create_destination(
+                "PostgreSQL deliveries",
+                "https://example.com/lux-hook",
+                true,
+                false,
+                &["SCAN_COMPLETED".to_owned()],
+                None,
+            )
+            .await?;
+        webhooks
+            .publish(
+                luxd::application::webhooks::WebhookEventType::ScanCompleted,
+                "postgres:deliveries:test",
+                1_700_000_000,
+                json!({ "libraryId": "library-1" }),
+            )
+            .await?;
+
+        let (all_deliveries, total) = webhooks.list_deliveries(0, 20, None, None).await?;
+        assert_eq!(total, 1);
+        assert_eq!(all_deliveries.len(), 1);
+
+        let (filtered_deliveries, filtered_total) = webhooks
+            .list_deliveries(0, 20, Some("PENDING"), Some(&destination.id))
+            .await?;
+        assert_eq!(filtered_total, 1);
+        assert_eq!(filtered_deliveries.len(), 1);
+
+        let (missing_deliveries, missing_total) = webhooks
+            .list_deliveries(0, 20, Some("FAILED"), None)
+            .await?;
+        assert_eq!(missing_total, 0);
+        assert!(missing_deliveries.is_empty());
+
+        database.close().await;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    drop_postgres_test_database(&database_name).await?;
+    result
+}

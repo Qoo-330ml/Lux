@@ -1,5 +1,9 @@
-.lux-notifications-page { display: grid; gap: 18px; }
+.lux-notifications-page { display: grid; grid-template-columns: minmax(0, 1fr); align-items: start; gap: 16px; }
+.lux-notifications-page > * { min-width: 0; }
 .lux-notifications-heading { margin-bottom: 0; }
+.lux-notifications-panel { display: grid; gap: 16px; padding-inline: 0; }
+
+/* 表单与弹窗通用样式 */
 .lux-notification-form, .lux-notification-edit-form { display: grid; gap: 16px; }
 .lux-notification-section { display: grid; gap: 10px; min-width: 0; padding: 0 0 16px; border: 0; border-bottom: 1px solid var(--lux-line-soft); }
 .lux-notification-section legend { margin-bottom: 2px; color: var(--lux-text); font-size: .86rem; font-weight: 600; }
@@ -20,22 +24,274 @@
 .lux-notification-provider-empty { display: flex; align-items: center; gap: 10px; color: var(--lux-muted); font-size: .8rem; }
 .lux-notification-provider-empty p { margin: 0; }
 .lux-notification-provider-empty a { color: var(--lux-accent); }
-.lux-notification-destination-list, .lux-notification-delivery-list { display: grid; gap: 10px; }
-.lux-notification-destination { display: grid; gap: 14px; padding: 16px 0; border-top: 1px solid var(--lux-line-soft); }
-.lux-notification-destination-summary { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: 12px; }
-.lux-notification-destination-icon { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid var(--lux-line-soft); border-radius: 9px; color: var(--lux-accent); }
-.lux-notification-destination h3 { margin: 0 0 4px; color: var(--lux-text); font-size: .95rem; }
-.lux-notification-destination p, .lux-notification-destination small { display: block; max-width: 100%; margin: 0; overflow: hidden; color: var(--lux-muted); font-size: .76rem; text-overflow: ellipsis; white-space: nowrap; }
-.lux-notification-destination small { margin-top: 5px; color: var(--lux-subtle); }
-.lux-notification-destination-actions { display: flex; flex-wrap: wrap; gap: 8px; }
-.lux-notification-edit-form { padding-top: 4px; }
-.lux-notification-result { margin: 0; color: var(--lux-accent); font-size: .78rem; }
-.lux-notification-delivery { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid var(--lux-line-soft); }
-.lux-notification-delivery > div { display: grid; gap: 3px; min-width: 0; }
-.lux-notification-delivery strong { color: var(--lux-text); font-size: .84rem; }
-.lux-notification-delivery span, .lux-notification-delivery small { color: var(--lux-muted); font-size: .74rem; }
-.lux-notification-delivery-content { margin: 2px 0 1px; overflow-wrap: anywhere; color: var(--lux-text); font-size: .82rem; line-height: 1.5; white-space: pre-wrap; }
-.lux-notification-delivery small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lux-notification-edit-toggles { display: grid; gap: 10px; }
+.lux-notification-edit-footer { display: flex; justify-content: flex-end; gap: 10px; padding-top: 6px; }
+
+/* 顶部视图切换 */
+.lux-notification-tabs { display: flex; gap: 22px; border-bottom: 1px solid var(--lux-line-soft); }
+.lux-notification-tabs button { display: inline-flex; align-items: center; gap: 8px; margin-bottom: -1px; padding: 8px 0; border: 0; border-bottom: 2px solid transparent; color: var(--lux-muted); background: none; font: inherit; font-size: .86rem; cursor: pointer; }
+.lux-notification-tabs button.is-active { border-bottom-color: var(--lux-text); color: var(--lux-text); }
+.lux-notification-tabpanel { display: grid; gap: 16px; }
+
+/* 方案 A：概览条 + 筛选工具栏 */
+.lux-notification-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, .02);
+  overflow: hidden;
+}
+.lux-notification-stat {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 13px 18px;
+}
+.lux-notification-stat + .lux-notification-stat { border-left: 1px solid var(--lux-line-soft); }
+.lux-notification-stat span { color: var(--lux-muted); font-size: .74rem; }
+.lux-notification-stat strong { color: var(--lux-text); font-size: 1.2rem; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: -.03em; }
+.lux-notification-stat strong.is-ok { color: var(--lux-status-success); }
+
+.lux-notification-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 14px;
+}
+.lux-notification-filter-pills { display: flex; flex-wrap: wrap; gap: 4px; }
+.lux-notification-filter-pills button {
+  padding: 6px 12px;
+  border: 0;
+  border-radius: 99px;
+  color: var(--lux-muted);
+  background: none;
+  font: inherit;
+  font-size: .76rem;
+  cursor: pointer;
+  transition: color .18s ease, background .18s ease;
+}
+.lux-notification-filter-pills button:hover { color: var(--lux-text); background: rgba(255, 255, 255, .06); }
+.lux-notification-filter-pills button.is-active { color: var(--lux-bg); background: var(--lux-text); font-weight: 600; }
+
+.lux-notifications-panel-actions { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
+.lux-notifications-panel-actions .lux-button { flex: 0 0 auto; }
+.lux-notification-search {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 220px;
+  height: var(--lux-button-height-compact);
+  padding: 0 11px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 9px;
+  color: var(--lux-subtle);
+  background: rgba(255, 255, 255, .035);
+  transition: border-color .18s ease, background .18s ease;
+}
+.lux-notification-search:focus-within {
+  border-color: color-mix(in srgb, var(--lux-accent) 55%, var(--lux-line));
+  color: var(--lux-text);
+  background: rgba(255, 255, 255, .055);
+}
+.lux-notification-search input {
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--lux-text);
+  font-size: .75rem;
+}
+.lux-notification-search input::placeholder { color: var(--lux-subtle); }
+
+/* 方案 A：精密列表流 */
+.lux-notification-destination-list {
+  display: grid;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, .02);
+}
+.lux-notification-destination {
+  display: grid;
+  grid-template-columns: minmax(240px, 1.35fr) minmax(180px, 1fr) auto;
+  align-items: center;
+  gap: 10px 18px;
+  padding: 15px 18px;
+  transition: background .16s ease, opacity .16s ease;
+}
+.lux-notification-destination + .lux-notification-destination { border-top: 1px solid var(--lux-line-soft); }
+.lux-notification-destination:first-child { border-radius: 14px 14px 0 0; }
+.lux-notification-destination:last-child { border-radius: 0 0 14px 14px; }
+.lux-notification-destination:only-child { border-radius: 14px; }
+.lux-notification-destination:hover { background: rgba(255, 255, 255, .032); }
+.lux-notification-destination.is-disabled { opacity: .68; }
+
+.lux-notification-destination-summary {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  min-width: 0;
+}
+.lux-notification-destination-icon {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 38px;
+  height: 38px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, .04);
+  color: var(--lux-accent);
+}
+.lux-notification-status-dot {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 9px;
+  height: 9px;
+  border: 2px solid var(--lux-bg);
+  border-radius: 50%;
+  background: var(--lux-status-success);
+}
+.lux-notification-destination.is-disabled .lux-notification-status-dot { background: var(--lux-subtle); }
+
+.lux-notification-destination-identity { min-width: 0; display: grid; gap: 4px; }
+.lux-notification-destination-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.lux-notification-destination h3 {
+  margin: 0;
+  overflow: hidden;
+  color: var(--lux-text);
+  font-size: .88rem;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lux-notification-provider-tag {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, .07);
+  color: var(--lux-muted);
+  font-size: .66rem;
+  font-weight: 550;
+}
+.lux-notification-destination-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--lux-subtle);
+  font-size: .72rem;
+}
+.lux-notification-endpoint {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--lux-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .72rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lux-notification-meta-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+.lux-notification-meta-flag::before { content: "·"; margin-right: 4px; color: var(--lux-subtle); }
+
+.lux-notification-event-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.lux-notification-event-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border: 1px solid var(--lux-line-soft);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, .04);
+  color: var(--lux-muted);
+  font-size: .7rem;
+  white-space: nowrap;
+}
+.lux-notification-event-chip.is-all {
+  border-color: color-mix(in srgb, var(--lux-accent) 30%, transparent);
+  background: color-mix(in srgb, var(--lux-accent) 10%, transparent);
+  color: var(--lux-text);
+}
+.lux-notification-event-chip.is-more { color: var(--lux-subtle); }
+
+.lux-notification-destination-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-self: end;
+}
+.lux-notification-actions-sep {
+  width: 1px;
+  height: 18px;
+  margin-inline: 2px;
+  background: var(--lux-line-soft);
+}
+.lux-notification-menu-wrap { position: relative; display: inline-flex; }
+.lux-notification-menu {
+  position: absolute;
+  z-index: 25;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 156px;
+  padding: 5px;
+  border: 1px solid var(--lux-line);
+  border-radius: 11px;
+  background: var(--lux-surface-strong);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, .48);
+}
+.lux-notification-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 7px;
+  color: var(--lux-text);
+  background: transparent;
+  font: inherit;
+  font-size: .76rem;
+  text-align: left;
+  cursor: pointer;
+}
+.lux-notification-menu button:hover:not(:disabled) { background: rgba(255, 255, 255, .08); }
+.lux-notification-menu button.is-danger { color: var(--lux-danger); }
+.lux-notification-menu-divider { height: 1px; margin: 4px; background: var(--lux-line-soft); }
+
+.lux-notification-row-feedback { grid-column: 1 / -1; padding-left: 51px; }
+.lux-notification-result { margin: 0; color: var(--lux-accent); font-size: .76rem; }
+.lux-notification-empty-filter {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 36px 20px;
+  border: 1px dashed var(--lux-line-soft);
+  border-radius: 14px;
+  color: var(--lux-muted);
+  font-size: .82rem;
+}
+.lux-notification-empty-filter p { margin: 0; }
+
+/* 状态页与弹窗 */
 .lux-admin-state { display: grid; place-items: center; gap: 10px; min-height: 240px; color: var(--lux-muted); text-align: center; }
 .lux-admin-state p { margin: 0; }
 .lux-notification-secret-backdrop { position: fixed; z-index: 20; inset: 0; display: grid; place-items: center; padding: max(20px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) max(20px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left)); overflow-y: auto; background: rgba(0,0,0,.62); }
@@ -48,34 +304,10 @@
 .lux-notification-dialog-heading h2 { margin: 9px 0 0; color: var(--lux-text); font-size: 1.25rem; }
 .lux-notification-dialog-heading p { margin: 8px 0 0; color: var(--lux-muted); font-size: .75rem; line-height: 1.55; }
 .lux-notification-dialog-close { min-width: 36px; width: 36px; height: 36px; }
-@media (max-width: 720px) { .lux-notification-target-grid, .lux-notification-config-grid { grid-template-columns: 1fr; } .lux-notification-destination-summary { grid-template-columns: auto minmax(0, 1fr); } .lux-notification-destination-summary > .lux-user-badge { grid-column: 2; justify-self: start; } .lux-notification-delivery { grid-template-columns: minmax(0, 1fr) auto; } .lux-notification-delivery > .lux-icon-button { grid-column: 2; grid-row: 1; } .lux-notifications-panel-actions { flex-wrap: wrap; justify-content: flex-end; } .lux-notification-dialog { padding: 20px; } .lux-notification-dialog-close { min-width: var(--lux-button-height-touch); width: var(--lux-button-height-touch); height: var(--lux-button-height-touch); } .lux-notification-destination-actions .lux-button { min-height: var(--lux-button-height-touch); } .lux-notification-destination-actions .lux-icon-button { min-height: var(--lux-button-height-touch); } }
-html[data-lux-theme="light"] .lux-notification-form input:not([type="checkbox"]):not([type="radio"]), html[data-lux-theme="light"] .lux-notification-edit-form input:not([type="checkbox"]):not([type="radio"]) { color: var(--lux-text); background: rgba(28,28,34,.04); }
-html[data-lux-theme="light"] .lux-notification-form select, html[data-lux-theme="light"] .lux-notification-form textarea, html[data-lux-theme="light"] .lux-notification-edit-form select, html[data-lux-theme="light"] .lux-notification-edit-form textarea { color: var(--lux-text); background: rgba(28,28,34,.04); }
 
-/* Redesign: tabbed workspace — destinations as cards, deliveries as a paged table. */
-.lux-notifications-page { grid-template-columns: minmax(0, 1fr); align-items: start; gap: 16px; }
-.lux-notifications-page > * { min-width: 0; }
+/* 投递记录表格 */
 .lux-notifications-page .lux-admin-panel-heading { margin-bottom: 14px; }
 .lux-notifications-page .lux-admin-panel-heading h2 { font-size: 1.02rem; }
-.lux-notifications-panel-actions { display: flex; align-items: center; gap: 12px; flex: 0 0 auto; }
-.lux-notifications-panel-actions .lux-button { flex: 0 0 auto; }
-
-.lux-notification-tabs { display: flex; gap: 22px; border-bottom: 1px solid var(--lux-line-soft); }
-.lux-notification-tabs button { display: inline-flex; align-items: center; gap: 8px; margin-bottom: -1px; padding: 8px 0; border: 0; border-bottom: 2px solid transparent; color: var(--lux-muted); background: none; font: inherit; font-size: .86rem; cursor: pointer; }
-.lux-notification-tabs button.is-active { border-bottom-color: var(--lux-text); color: var(--lux-text); }
-.lux-notification-tabpanel { display: grid; gap: 16px; }
-
-.lux-notification-destination-list { grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
-.lux-notification-destination { position: relative; gap: 12px; padding: 14px 14px 14px 17px; overflow: hidden; border: 1px solid var(--lux-line-soft); border-radius: 12px; background: rgba(255,255,255,.03); transition: border-color .2s ease, background .2s ease; }
-.lux-notification-destination::before { position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--lux-status-success); content: ""; }
-.lux-notification-destination.is-disabled::before { background: var(--lux-line); }
-.lux-notification-destination.is-disabled { opacity: .8; }
-.lux-notification-destination:hover { border-color: var(--lux-line); background: rgba(255,255,255,.05); }
-.lux-notification-destination-summary { grid-template-columns: auto minmax(0, 1fr); }
-.lux-notification-destination-summary > .lux-user-badge { grid-column: 2; justify-self: start; }
-.lux-notification-destination-actions { padding-top: 10px; border-top: 1px solid var(--lux-line-soft); }
-
-/* Delivery table: fixed page size, single-line rows, filters above, pager below. */
 .lux-notification-delivery-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; margin-bottom: 12px; }
 .lux-notification-status-filter { display: flex; gap: 4px; }
 .lux-notification-status-filter button { padding: 5px 12px; border: 0; border-radius: 99px; color: var(--lux-muted); background: none; font: inherit; font-size: .76rem; cursor: pointer; }
@@ -92,5 +324,44 @@ html[data-lux-theme="light"] .lux-notification-form select, html[data-lux-theme=
 .lux-notification-pagination { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; color: var(--lux-subtle); font-size: .74rem; }
 .lux-notification-pagination div { display: flex; gap: 6px; }
 
-html[data-lux-theme="light"] .lux-notification-destination { background: rgba(255,255,255,.7); }
+@media (max-width: 960px) {
+  .lux-notification-destination {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+  .lux-notification-event-chips { padding-left: 51px; }
+  .lux-notification-destination-actions {
+    justify-self: stretch;
+    justify-content: flex-end;
+    padding-top: 10px;
+    border-top: 1px solid var(--lux-line-soft);
+  }
+  .lux-notification-destination-actions .lux-choice { margin-right: auto; }
+}
+
+@media (max-width: 720px) {
+  .lux-notification-stats { grid-template-columns: 1fr; }
+  .lux-notification-stat + .lux-notification-stat { border-left: 0; border-top: 1px solid var(--lux-line-soft); }
+  .lux-notification-target-grid, .lux-notification-config-grid { grid-template-columns: 1fr; }
+  .lux-notifications-panel-actions { width: 100%; flex-wrap: wrap; justify-content: space-between; }
+  .lux-notification-search { flex: 1 1 180px; min-width: 0; height: var(--lux-button-height-touch); }
+  .lux-notification-event-chips, .lux-notification-row-feedback { padding-left: 0; }
+  .lux-notification-dialog { padding: 20px; }
+  .lux-notification-dialog-close { min-width: var(--lux-button-height-touch); width: var(--lux-button-height-touch); height: var(--lux-button-height-touch); }
+  .lux-notification-destination-actions .lux-button { min-height: var(--lux-button-height-touch); }
+  .lux-notification-destination-actions .lux-icon-button { min-height: var(--lux-button-height-touch); min-width: var(--lux-button-height-touch); }
+}
+
+/* 浅色主题适配 */
+html[data-lux-theme="light"] .lux-notification-form input:not([type="checkbox"]):not([type="radio"]), html[data-lux-theme="light"] .lux-notification-edit-form input:not([type="checkbox"]):not([type="radio"]) { color: var(--lux-text); background: rgba(28,28,34,.04); }
+html[data-lux-theme="light"] .lux-notification-form select, html[data-lux-theme="light"] .lux-notification-form textarea, html[data-lux-theme="light"] .lux-notification-edit-form select, html[data-lux-theme="light"] .lux-notification-edit-form textarea { color: var(--lux-text); background: rgba(28,28,34,.04); }
+html[data-lux-theme="light"] .lux-notification-stats,
+html[data-lux-theme="light"] .lux-notification-destination-list { background: rgba(255, 255, 255, .74); }
+html[data-lux-theme="light"] .lux-notification-destination:hover { background: rgba(28, 28, 34, .03); }
+html[data-lux-theme="light"] .lux-notification-destination-icon { background: rgba(28, 28, 34, .04); }
+html[data-lux-theme="light"] .lux-notification-provider-tag,
+html[data-lux-theme="light"] .lux-notification-event-chip { background: rgba(28, 28, 34, .05); }
+html[data-lux-theme="light"] .lux-notification-search { background: rgba(28, 28, 34, .035); }
+html[data-lux-theme="light"] .lux-notification-menu { box-shadow: 0 18px 48px rgba(30, 30, 38, .18); }
+html[data-lux-theme="light"] .lux-notification-menu button:hover:not(:disabled) { background: rgba(28, 28, 34, .06); }
 html[data-lux-theme="light"] .lux-notification-delivery-table tbody tr:hover td { background: rgba(28,28,34,.045); }

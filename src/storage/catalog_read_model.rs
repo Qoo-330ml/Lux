@@ -642,7 +642,7 @@ impl Database {
         } = *page;
         let order = match sort {
             ReadModelSort::SortTitle => "sort_title",
-            ReadModelSort::EffectiveAddedAt => "effective_added_at",
+            ReadModelSort::EffectiveAddedAt => "recent_added_at",
             ReadModelSort::Rating => "rating",
             ReadModelSort::ProductionYear => "production_year",
         };
@@ -1254,8 +1254,8 @@ const CATALOG_ITEM_UPSERT_SELECT: &str = "INSERT INTO catalog_items (
                      removed_at, merged_into, has_available_source, default_source_id,
                      poster_tag, backdrop_tag, thumb_tag, logo_tag, season_count,
                      episode_count, latest_child_added_at, latest_episode_added_at,
-                     latest_added_at, restriction_code, metadata_state, nfo_fingerprint,
-                     applied_seq
+                     latest_added_at, recent_added_at, latest_episode_added_at_sort,
+                     restriction_code, metadata_state, nfo_fingerprint, applied_seq
                  )
                  SELECT
                      mi.id, mi.library_id, mi.item_type, mi.parent_id, mi.series_id,
@@ -1297,6 +1297,25 @@ const CATALOG_ITEM_UPSERT_SELECT: &str = "INSERT INTO catalog_items (
                             AND (child.series_id = mi.id OR child.parent_id = mi.id)),
                          mi.added_at)
                      ELSE mi.added_at END,
+                     CASE WHEN mi.item_type = 'SERIES' THEN COALESCE(
+                         (SELECT MAX(recent_episode.added_at)
+                          FROM media_items recent_episode
+                          WHERE recent_episode.item_type = 'EPISODE'
+                            AND recent_episode.removed_at IS NULL
+                            AND recent_episode.has_available_source = 1
+                            AND recent_episode.merged_into_item_id IS NULL
+                            AND (recent_episode.series_id = mi.id
+                                 OR recent_episode.parent_id = mi.id)),
+                         mi.added_at)
+                     ELSE mi.added_at END,
+                     (SELECT MAX(sort_episode.added_at)
+                      FROM media_items sort_episode
+                      WHERE sort_episode.item_type = 'EPISODE'
+                        AND sort_episode.removed_at IS NULL
+                        AND sort_episode.has_available_source = 1
+                        AND sort_episode.merged_into_item_id IS NULL
+                        AND (sort_episode.series_id = mi.id
+                             OR sort_episode.parent_id = mi.id)),
                      (SELECT cri.certification_code FROM media_content_restriction_index cri
                        WHERE cri.item_id = mi.id LIMIT 1),
                      mi.identification_status, mi.nfo_metadata_fingerprint, 0
@@ -1332,6 +1351,8 @@ const CATALOG_ITEM_UPSERT_CONFLICT: &str = " ON CONFLICT(item_id) DO UPDATE SET
                      latest_child_added_at = excluded.latest_child_added_at,
                      latest_episode_added_at = excluded.latest_episode_added_at,
                      latest_added_at = excluded.latest_added_at,
+                     recent_added_at = excluded.recent_added_at,
+                     latest_episode_added_at_sort = excluded.latest_episode_added_at_sort,
                      restriction_code = excluded.restriction_code,
                      metadata_state = excluded.metadata_state,
                      nfo_fingerprint = excluded.nfo_fingerprint,

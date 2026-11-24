@@ -25,9 +25,9 @@ use crate::{
         },
         people::{ActorCredit, LocalActorRelationPageCache, PeopleError},
         scraper::{
-            ScraperError, ScraperGetRequest, ScraperImageRequest, ScraperItemType, ScraperMetadata,
-            ScraperProvider, ScraperSearchResponse, ScraperSearchResult, provider_id_for_key,
-            provider_key_from_plugin_id,
+            ScraperError, ScraperFailureCause, ScraperGetRequest, ScraperImageRequest,
+            ScraperItemType, ScraperMetadata, ScraperProvider, ScraperSearchResponse,
+            ScraperSearchResult, provider_id_for_key, provider_key_from_plugin_id,
         },
         thumbnail_policy::ThumbnailScrapingMode,
     },
@@ -594,6 +594,7 @@ impl MetadataCandidateService {
                 mode: CandidateSearchMode::Manual,
                 plan: MetadataRequestPlan::full(),
                 current: None,
+                explicit_provider_ids: None,
             },
         )
         .await
@@ -620,6 +621,7 @@ impl MetadataCandidateService {
     ///
     /// `docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S3: the manual entry point already read
     /// the item (to reject `VIDEO` items), so the search must not read it a second time.
+    #[cfg(test)]
     pub(crate) async fn search_and_store_for_current(
         &self,
         item_id: &str,
@@ -628,15 +630,36 @@ impl MetadataCandidateService {
         scraper: &ScraperProvider,
         current: &StoredMediaMetadata,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
+        self.search_and_store_for_current_with_provider_ids(
+            item_id,
+            Some(query),
+            year,
+            None,
+            scraper,
+            current,
+        )
+        .await
+    }
+
+    pub(crate) async fn search_and_store_for_current_with_provider_ids(
+        &self,
+        item_id: &str,
+        query: Option<&str>,
+        year: Option<i32>,
+        explicit_provider_ids: Option<&BTreeMap<String, String>>,
+        scraper: &ScraperProvider,
+        current: &StoredMediaMetadata,
+    ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
         self.search_and_store_with_mode(
             item_id,
-            query,
+            query.unwrap_or_default(),
             year,
             scraper,
             CandidateSearchOptions {
                 mode: CandidateSearchMode::Manual,
                 plan: MetadataRequestPlan::full(),
                 current: Some(current),
+                explicit_provider_ids,
             },
         )
         .await
@@ -659,6 +682,7 @@ impl MetadataCandidateService {
                 mode: CandidateSearchMode::AutomaticReuse,
                 plan,
                 current: None,
+                explicit_provider_ids: None,
             },
         )
         .await
@@ -682,6 +706,7 @@ impl MetadataCandidateService {
                 mode: CandidateSearchMode::AutomaticReuse,
                 plan,
                 current: Some(current),
+                explicit_provider_ids: None,
             },
         )
         .await
@@ -704,6 +729,7 @@ impl MetadataCandidateService {
                 mode: CandidateSearchMode::AutomaticFresh,
                 plan: MetadataRequestPlan::full(),
                 current: Some(current),
+                explicit_provider_ids: None,
             },
         )
         .await
@@ -721,6 +747,7 @@ impl MetadataCandidateService {
             mode,
             plan,
             current,
+            explicit_provider_ids,
         } = options;
         let automatic_match = matches!(
             mode,
@@ -768,13 +795,22 @@ impl MetadataCandidateService {
             }
             _ => return Err(MetadataCandidateError::InvalidSearch),
         };
+        let explicit_direct_id = explicit_provider_ids
+            .and_then(|ids| provider_id_for_key(ids, scraper.provider_key()))
+            .map(str::trim)
+            .filter(|value| {
+                !value.is_empty()
+                    && value.chars().count() <= 128
+                    && !value.chars().any(char::is_control)
+            })
+            .map(str::to_owned);
         let parsed = parse_media_name(query, kind);
         let query = parsed
             .as_ref()
             .map(|value| value.title.as_str())
             .unwrap_or_else(|| query.trim());
         let year = year.or_else(|| parsed.as_ref().and_then(|value| value.production_year));
-        if query.is_empty() || query.chars().count() > 128 {
+        if explicit_direct_id.is_none() && (query.is_empty() || query.chars().count() > 128) {
             return Err(MetadataCandidateError::InvalidSearch);
         }
         if year.is_some_and(|value| !(1800..=2200).contains(&value)) {
@@ -787,15 +823,17 @@ impl MetadataCandidateService {
             MediaKind::Episode => return Err(MetadataCandidateError::InvalidSearch),
         };
         self.ensure_candidate_item_available(item_id, plan).await?;
-        let direct_provider_id = selected_scraper_provider_id(current, scraper).filter(|_| {
-            if plan != MetadataRequestPlan::full() {
-                return true;
-            }
-            let same_title = crate::application::media_matching::normalize_title(query)
-                == crate::application::media_matching::normalize_title(&current.title);
-            let same_year =
-                year.is_none_or(|year| current.production_year == Some(i64::from(year)));
-            same_title && same_year
+        let direct_provider_id = explicit_direct_id.or_else(|| {
+            selected_scraper_provider_id(current, scraper).filter(|_| {
+                if plan != MetadataRequestPlan::full() {
+                    return true;
+                }
+                let same_title = crate::application::media_matching::normalize_title(query)
+                    == crate::application::media_matching::normalize_title(&current.title);
+                let same_year =
+                    year.is_none_or(|year| current.production_year == Some(i64::from(year)));
+                same_title && same_year
+            })
         });
         let (response, direct_details) = if let Some(provider_id) = direct_provider_id.as_deref() {
             let details = if plan.needs_metadata || plan == MetadataRequestPlan::full() {
@@ -1940,6 +1978,7 @@ struct CandidateSearchOptions<'a> {
     mode: CandidateSearchMode,
     plan: MetadataRequestPlan,
     current: Option<&'a StoredMediaMetadata>,
+    explicit_provider_ids: Option<&'a BTreeMap<String, String>>,
 }
 
 struct CandidateSearchContext<'a> {
@@ -2274,12 +2313,31 @@ pub struct MetadataFieldDiff {
     pub provenance: Option<String>,
 }
 
+/// One configured scraper that could not answer a candidate search.
+#[derive(Debug)]
+pub struct ScraperAttemptFailure {
+    /// The configured scraper id (the plugin id when the plugin store resolved it).
+    pub scraper_id: String,
+    /// The plugin's display name when the host knows it, so the administrator can act on the right
+    /// plugin instead of reading a raw id.
+    pub label: Option<String>,
+    pub cause: ScraperFailureCause,
+}
+
 #[derive(Debug)]
 pub enum MetadataCandidateError {
     ItemNotFound,
     InvalidSearch,
     InvalidCandidateJson(String),
+    /// A single scraper call failed before the caller aggregated per-source failures.
     Scraper(crate::application::scraper::ScraperError),
+    /// Every configured scraper failed; each entry names the source and the stable cause.
+    ScraperFailed(Vec<ScraperAttemptFailure>),
+    /// The item has no usable online scraper: none is configured for the library, or the library
+    /// fell back to the host's unconfigured placeholder.
+    ScraperNotConfigured,
+    /// Home video items never have an online metadata source.
+    VideoItemUnsupported,
     Storage(StorageError),
 }
 
@@ -2292,6 +2350,24 @@ impl fmt::Display for MetadataCandidateError {
                 write!(formatter, "candidate JSON is invalid: {error}")
             }
             Self::Scraper(error) => error.fmt(formatter),
+            Self::ScraperFailed(failures) => {
+                formatter.write_str("every configured scraper failed")?;
+                for failure in failures {
+                    let source = failure
+                        .label
+                        .as_deref()
+                        .filter(|label| !label.trim().is_empty())
+                        .unwrap_or(&failure.scraper_id);
+                    write!(formatter, " [{source}: {}]", failure.cause)?;
+                }
+                Ok(())
+            }
+            Self::ScraperNotConfigured => {
+                formatter.write_str("no usable metadata scraper is configured for the item")
+            }
+            Self::VideoItemUnsupported => {
+                formatter.write_str("home video items have no online metadata source")
+            }
             Self::Storage(error) => error.fmt(formatter),
         }
     }

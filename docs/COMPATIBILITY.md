@@ -1,5 +1,170 @@
 # Lux 客户端兼容性矩阵
 
+## LUX-916/LUX-917 Emby 管理员端点（2026-11-18）
+
+分级：**请求形态来自静态反编译 + 服务端合同由自动化测试固定；未在 Yamby/Hills 真机复测**。请求形态来自
+Yamby 2.1.0.11（`ScheduledTasksInfo.m4370()`、`gb/C2482.java`、`ic/C3003.java`、`dd/C1544.java`）与
+Hills 1.11.0 的 `libapp.so` 字符串表；所有响应只按 Emby 公开 DTO 形状实现，不代表任一客户端的管理菜单已经
+在真机上跑通。
+
+背景：两家客户端都没有自带刮削器，管理员登录后只是替用户点服务器上的管理端点。Yamby 的“扫描/刷新元数据/
+识别/编辑图片/任务面板”分别落在 `POST /Items/{id}/Refresh`、`POST /Items/RemoteSearch/*`、
+`GET /Items/{id}/RemoteImages`、`GET+POST /ScheduledTasks*` 上。此前 Lux 只实现了其中一部分，且两处语义
+不成立：普通条目的 `/Items/{id}/Refresh` 返回 404，`MetadataRefreshMode` 被丢弃。
+
+### 任务与扫描
+
+- `GET /ScheduledTasks`（含 `/emby` 前缀）返回的单个任务 `Key` 由 `RefreshMediaLibrary` 改为
+  **`RefreshLibrary`**。依据：Yamby 的 `ScheduledTasksInfo.m4370()` 用 `Collection.contains` 精确比对
+  `markers`/`RefreshLibrary`/`RefreshChapterImages`/`RestartPlugins` 四个键，其余键一律丢弃；旧键名会让
+  管理员的任务面板为空列表。`Id` 保持 `lux-refresh-media-library`（客户端只把它当作不透明句柄）。
+- 新增 `POST /ScheduledTasks/Running/{taskId}`：管理员 token/API key 启动唯一的扫描任务，行为与
+  `POST /Library/Refresh` 相同（为每个启用库排队或复用全库校验任务），成功返回 **204**（与 Emby 一致，
+  不返回 Lux 的 202 body）；未知任务 404；普通用户 403；服务未就绪 503。任务 id 接受 `lux-refresh-media-library`
+  或 `RefreshLibrary`，大小写不敏感。
+
+### 条目刷新与删除
+
+- `POST /Items/{id}/Refresh` 现在按客户端意图分流（`Recursive=false` 仍为 422）：
+  - `MetadataRefreshMode=FullRefresh` 或 `ImageRefreshMode=FullRefresh` 或 `ReplaceAllMetadata=true` /
+    `ReplaceAllImages=true` → 入队条目元数据刷新（`FULL_REFRESH`），返回 202 与
+    `scope: "ITEM_METADATA"`，不在请求内扫描或调用刮削器；条目不存在 404，视频/家庭视频条目 422。
+  - 其余（含 Yamby 的“扫描”`MetadataRefreshMode=Default`）→ 文件系统扫描：已登记 `FOLDER` 返回
+    `scope: "FOLDER"`（既有行为不变），普通条目按媒体源所在文件夹返回 `scope: "ITEM_FOLDER"`，媒体库 id
+    返回 `scope: "LIBRARY_ROOT"`。三者都只入队增量扫描，不做在线刮削。
+  - 有意忽略 Hills 字符串表里的 `RefreshMetadataMode=FullRefresh`：该名不是 Emby 参数，且抓包无法证明它
+    属于“刷新元数据”还是“扫描媒体库”，按它分流会把扫描静默升级成刮削。
+- `DELETE /Items/{id}/Delete` 与既有 `DELETE /Items/{id}` 等价（Yamby 用带 `/Delete` 后缀的写法）。同时修正
+  一个既有缺陷：删除处理器此前把 DTO 的公共 id（十进制 u128）直接交给删除服务，导致合法请求返回
+  `400`；现在条目 id 与 `MediaSourceId`（STRM 的 32 位十六进制）都会先还原成内部标识。成功 204，未知条目
+  404，非管理员 403。
+
+### 识别（RemoteSearch）
+
+- `POST /Items/RemoteSearch/{Movie|Series}`：管理员请求体按 Emby `RemoteSearchQuery` 解析（PascalCase，
+  兼容 camelCase），`ItemId` + `SearchInfo.Name/Year/ProviderIds` 驱动现有的候选搜索服务，返回
+  `RemoteSearchResult[]`：`Id`（Lux 候选行 id，供 Apply 回传）、`Name`、`OriginalTitle`、`Overview`、
+  `ProductionYear`、`PremiereDate`、`ImageUrl`、`ProviderIds`、`SearchProviderName`、`SearchProviderId`。
+  请求带 `ProviderIds` 时，provider id 匹配的候选排在最前。
+  - 错误：未知条目 404；空标题或非法类型 400；`VIDEO`/家庭视频条目 422；库没有可用刮削器 409；刮削器全部
+    失败 503。空列表只表示“搜到了但没有候选”，配置问题绝不伪装成空结果。
+- `POST /Items/RemoteSearch/Apply/{ItemId}`：客户端回传的 `RemoteSearchResult` 先按 `Id`，再按
+  `ProviderIds` 的值匹配该条目的 pending 候选；候选已过期时用 body 里的 `Name`/`ProductionYear` 重新搜一次
+  并选中首个候选；仍无匹配则 404。选中走与 Lux 管理 API 相同的用例（NFO/图片写回、锁定字段、低置信度
+  规则完全一致），成功 **204**。
+
+### 远程图片
+
+- `GET /Items/{id}/RemoteImages`：`Type` 接受 Emby 的 Primary/Backdrop/Logo/Thumb/Banner/Disc/Art（大小写
+  不敏感，映射到 Lux 的 POSTER/BACKDROP/LOGO/THUMB/BANNER/DISC/ART），返回
+  `{Images: [{Url, Type, Language, ProviderName, Width, Height, ImageIndex}], TotalRecordCount}`；
+  `StartIndex`/`Limit` 在服务端限幅（默认 100，上限 1000）。非法类型 400；条目不存在 404；条目尚未完成
+  元数据匹配或库没有刮削器时沿用图片搜索服务的 409。`IncludeAllLanguages` 被忽略：Lux 的图片语言来自
+  媒体库策略，客户端提示不改变结果。
+- `POST /Items/{id}/RemoteImages/Download`：body `{Type, ImageUrl}`（`Url` 亦可），写入该条目并返回 204；
+  缺 URL 或非法类型 400。
+- `DELETE /Items/{id}/Images/{Type}/{Index}/Delete`：按类型与序号定位已存储图片并删除，返回 204；类型无法
+  映射或序号非数字 400；没有对应图片 404。
+
+### 未实现（本任务范围外）
+
+- `POST /Items/{id}` 对电影/剧集的自由字段编辑当时尚未实现（只处理 `Person`，已于 2026-11-23 补齐局部元数据编辑：`Name`/`OriginalTitle`/`Overview`/`ProductionYear`/`LockData`/`LockedFields`，含只增不减字段锁、未改动字段 `provenance` 保留、`METADATA_EDITED` 审计与 NFO 写回；未建模字段 `Genres`/`Studios`/`Tags` 等仍忽略）。
+- `POST /System/Restart`、`GET /System/Logs/...`、`GET /System/ActivityLog/Entries`、
+  `DELETE /Library/VirtualFolders`：Lux 有等价的 `/api/v1/admin/*`（任务日志、审计、异步删库）但没有 Emby
+  形状，且重启与删库是破坏性运维动作，需要单独设计后再补。
+
+自动化：`cargo test --locked --test emby emby_admin_tasks::` 5/5、
+`cargo test --locked --test emby emby_admin_media::` 6/6、`cargo test --locked --lib emby_admin_media` 3/3，
+整组 `cargo test --locked --test emby` 111/111；`cargo fmt --all -- --check` 与
+`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。
+
+## 网易爆米花演员署名与背景图（2026-11-16）
+
+分级：**静态确认 + 隔离实例回归**。客户端侧证据来自 iOS 2.15.14 的 `MediaServerAPI` 导出符号，
+以及 macOS 2.9.0 未加密构建的反汇编（两者 DTO 属性逐字段一致）；本机以真实条目对照线上 Lux 响应，
+**未**在 iOS 真机复测。
+
+爆米花详情页的 `backdropImageTag` 与 `primaryImageTag` 都是计算属性，读的是 `imageTags["Backdrop"]`
+和 `imageTags["Primary"]`（`MediaItemDetailResult` 0x37c70 / `MediaResumeItem` 0x3335c），
+不是 JSON 顶层的 `PrimaryImageTag` / `BackdropImageTag`。据此修两处 DTO：
+
+- 条目内 `People[].Type` 由 `Person` 改为 `Actor`。Emby 的 `BaseItemPerson.Type` 是条目里的**署名类型**，
+  不是人物条目类型；`/Persons` 列表、`/Persons/{id}` 和 `/Users/{id}/Items/{personId}` 仍返回 `Person`，
+  NFO crew 仍为 `Director` / `Writer`。此前所有演员都是 `Person`，只认 `Actor`/`Director` 的客户端
+  因此拿不到演员区块。
+- `ImageTags` 增加 `Backdrop`，取第一张背景图的 tag；`BackdropImageTags` 保持原样（全部背景图）。
+  之前只有 `BackdropImageTags`，客户端拼不出带 `tag=` 的背景图 URL，详情页与继续观看的背景条为空。
+  `/Items/{id}/Similar` 的 `EnableImageTypes` / `ImageTypeLimit` 过滤仍会移除或清空该键。
+
+未修（缺数据面，不是 DTO 投影问题）：
+
+- `ProductionLocations`：条目级没有存储制作地区（只有人物 DTO 有），要补得改刮削与 schema。
+- `Chapters`（片头/片尾标记）：依赖章节检测插件产出 `INTRO_START`/`INTRO_END`；没有检测结果时为空。
+- 详情接口的 `MediaSources[].MediaStreams`：首次播放前未探测媒体信息时为空，属既有的“按需探测”设计；
+  播放过一次后同一请求会带上流信息。
+
+自动化：`cargo test --locked --test library catalog::` 6/6、`cargo test --locked --test metadata people_api::`
+10/10、`cargo test --locked --lib emby_catalog` 48/48；`cargo fmt --all -- --check` 与
+`cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。
+
+## LUX-915 `Shows/{seriesId}/Episodes` 的季作用域（2026-11-16）
+
+分级：**隔离实例核实 + 回归固定**。在自建「两季各两集」的剧上逐条核对；**未**在真机 APK 上复测。
+
+这条复核纠正了 LUX-914 记录里的一句错误推断。上一轮实测到的「`SeasonId=deadbeef` 仍返回 2 集」不是季
+过滤失效，而是 `emby_show_episodes` 的既有 VidHub 兼容分支：季 id 解析不到时
+（`Err(CatalogError::LibraryNotFound) if season_id.is_some()`）去掉季选择器重取整剧，理由是「库重扫后
+客户端可能留着旧选择器，不该把页面清空」。季过滤本身一直在（`mi.parent_id = ?`），真正缺的只有 camelCase
+别名，已由 LUX-914 补上。
+
+- 合法季 id：`SeasonId` 与 `seasonId` 都把结果缩到该季，`TotalRecordCount` 是该季的集数，分页在季内生效。
+- 空/占位值：`SeasonId=`、`seasonId=`、`null`、`undefined` 都按「没选季」返回整剧（与既有行为一致）。
+- 失效或跨剧的季 id：维持 VidHub 兼容回退——返回本剧全集，不 404，也不会把另一个季的集带进来。
+- 根路径与 `/emby` 前缀行为一致。
+- 自动化：`cargo test --locked --test emby emby_season_scope::`（8 例）固定上述六种情形，其中
+  `stale_season_id_falls_back_to_the_whole_show` 明确把兼容回退写成合同，避免以后被当成 bug 改掉。
+- 未验证：Entryway 真机上传的 `seasonId` 到底是季条目 id 还是季号。静态看它是 `px5.K` 的 `str2`
+  位置参数（来自季列表对象）；若某些路径传的是季号，Lux 会走回退分支返回整剧，客户端需自行按条目的
+  `SeasonId` 过滤。
+
+## LUX-914 Emby 查询参数大小写（2026-11-16）
+
+分级：**请求形态静态确认 + 隔离实例复现**。请求形态来自 Entryway 1.0.18 反编译的 Emby 适配层
+（`02-反编译/entryway-phone/1.0.18/jadx/sources/defpackage/zy5.java` 的 31 个 `@jx7` 参数名，浏览入口是
+`defpackage/px5.java` 的 `zy5.c0(userId, parentId, …, includeItemTypes, recursive, …, limit, startIndex,
+fields, …)`）；复现与回归在项目内起了一次隔离 `luxd`（`LUX_CONFIG_DIR` 指向 `.tmp/`，自建电影/剧集夹具），
+**尚未**在 Entryway 真机 APK 上复测。
+
+标准 Emby 服务端是 ASP.NET，查询字符串绑定不区分大小写；Lux 的 Emby 适配层用 serde `rename` 逐字段命名，
+因此只接受那一种拼写，其余拼写被**静默丢弃**（既不 400 也不生效）。Hills/Yamby 发 PascalCase，所以此前
+没有暴露；Entryway 发 camelCase，于是 `/Users/{userId}/Items` 的 `parentId`、`includeItemTypes`、`limit`、
+`startIndex`、`fields` 全部失效：媒体库页退化成「全服所有库混在一起、电影格里混进剧集、翻页无效」，
+而且响应仍是 200，客户端无从判断。
+
+- 范围（只加 camelCase 别名，不改既有拼写，不改路由）：
+  - `EmbyItemsQuery`（`src/api/emby_catalog.rs`）：`parentId`、`ids`、`includeItemTypes`、`excludeItemTypes`、
+    `seasonId`、`startIndex`、`limit`、`isPlayed`、`isFavorite`、`years`、`genres`、`studios`、`fields`、
+    `groupItems`、`enableTotalRecordCount`、`recursive`。该结构体是 `/Items`、`/Users/{id}/Items` 及
+    `Resume`/`Latest`/`NextUp`、`/Shows/{id}/Episodes`、`/Shows/{id}/Seasons`、`/Items/{id}/Children` 共用的
+    查询类型，因此这一处改动覆盖上述全部列表端点。
+  - `EmbySimilarQuery`（`src/api/emby_similar.rs`）：`fields`、`limit`、`imageTypeLimit`、`enableImageTypes`。
+    Entryway 的 `Items/{id}/Similar` 带 `limit`/`fields`；此前 `limit` 被忽略，`limit=-1` 不再是 400。
+  - `EmbyTokenQuery`（`src/api/emby_handlers.rs`）：`fields`，用于 `GET /Items/{id}` 与
+    `GET /Users/{userId}/Items/{id}` 的详情投影（此前 camelCase 的 `fields` 退化成「不带 Fields」）。
+  - `ResumeVisibilityQuery`（`src/api/emby_resume_visibility.rs`）：`hide`；此前只认 `Hide=`，小写 `hide=`
+    被当成「没给」，直接 400。
+- 语义不变：别名只影响「能不能读到这个值」。校验规则、默认值、上限与错误码逐端点保持原样——`limit=0`
+  的计数语义、`limit>1000`/`startIndex=-1`/`startIndex=abc` 的 400、空 `Limit=`（LUX-888）按「未提供」处理
+  都和 PascalCase 完全一致，两种拼写对同一请求必须返回逐字节相同的响应。
+- 未覆盖：**任意大小写**仍不识别（例如全大写 `PARENTID`）；serde 别名只能枚举拼写，本任务只补客户端实际
+  会发的 camelCase。JSON 请求体（`Username`/`Pw`/`Hide` 等）不在本次范围，客户端发的就是 PascalCase。
+- 剩余缺口（当时未改；注：`POST /Items/{id}` 与 `Items/{id}/Refresh` 后续均已补齐对普通条目的支持）：`Items/{id}/Refresh` 与 `POST /Items/{id}` 对普通条目当时返回 404（编辑/刷新入口）。`/Shows/{id}/Episodes` 的季作用域在 LUX-915 核实**本来就生效**，本任务那条「两种拼写都被
+  忽略」的推断是错的，详见上方的 LUX-915 小节。
+- 自动化：`cargo test --locked --test emby query_case::`（7 例）覆盖「16 组 camelCase/PascalCase 响应逐字节
+  相等（根路径与 `/emby` 前缀）」、按库/按类型的范围收缩、三页分页覆盖全集、非法分页仍 400、`fields` 投影
+  生效、详情投影等价、`Similar` 的 `limit`/`fields`、`hide=` 隐藏。整组 `cargo test --locked --test emby`
+  为 92 passed、0 failed。
+
 ## LUX-897 SSE 端点删除（2026-11-06）
 
 分级：**服务端 404 由自动化测试固定；未在真实第三方客户端上复测**。
@@ -764,11 +929,11 @@ Emby 兼容层提供 `DELETE /Items/{itemId}`。拥有服务器管理权限的 E
 
 ## Emby 增量同步状态兼容合同
 
-Lux 兼容 `GET /ScheduledTasks` 和 `/emby/ScheduledTasks`，返回标准的 `RefreshMediaLibrary` 任务项。
+Lux 兼容 `GET /ScheduledTasks` 和 `/emby/ScheduledTasks`，返回标准的 `RefreshLibrary` 任务项（LUX-916 由 `RefreshMediaLibrary` 更名，原因见上）。
 排队或运行中的非 `INCREMENTAL_SCAN` 任务报告为 `Running`，没有全库扫描任务时报告为 `Idle`；增量扫描本身不会
 阻塞该全库状态判断。该接口只提供状态观察，不会因为查询而启动扫描。
 
-自动化回归覆盖 `/emby/ScheduledTasks` 的管理员 API Key 调用、`RefreshMediaLibrary` 任务形状和排队全库扫描的
+自动化回归覆盖 `/emby/ScheduledTasks` 的管理员 API Key 调用、`RefreshLibrary` 任务形状和排队全库扫描的
 `Running` 状态；这证明 Lux 服务端协议，不代表 Nextfind 已在 FNOS 部署实例上重新验证。
 
 ## Qmby 使用的 Emby 接口补齐（2026-09-23）
@@ -1947,7 +2112,7 @@ Lux 当时返回 404 空响应，客户端页面不报错、推荐区整块缺�
 - 只实现 `Sessions` 与 `ScheduledTasksInfo` 两类推送；`ForceKeepAlive`、`UserDataChanged`、
   `LibraryChanged` 等其它 Emby WebSocket 消息一律不推送（客户端对这些类型本就忽略）。
 - `Sessions` 的条目来自 Lux 现有的 `GET /Sessions` 投影（`NowPlayingItem`/`PlayState` 完整），没有为了
-  WebSocket 增加额外字段；`ScheduledTasksInfo` 复用 `GET /ScheduledTasks` 的单一 `RefreshMediaLibrary`
+  WebSocket 增加额外字段；`ScheduledTasksInfo` 复用 `GET /ScheduledTasks` 的单一 `RefreshLibrary`
   任务项。
 - 推送是"按客户端要求的间隔轮询现有应用服务"，不是事件驱动；两个客户端请求的 1.5 s / 1 s 间隔都在
   钳制范围内，因此行为与 Emby 原生推送在观感上一致，但延迟上限由间隔决定。

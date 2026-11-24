@@ -217,4 +217,61 @@ describe("media editors", () => {
       isForced: false,
     });
   });
+
+  it("explains why image search came back empty instead of repeating the pre-search hint", async () => {
+    vi.spyOn(api, "itemImages").mockResolvedValue({ images: [] });
+    const search = vi.spyOn(api, "searchItemImages").mockResolvedValue({
+      images: [],
+      availableLanguages: ["en", "ko"],
+      filteredByLanguage: 2,
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      root.render(<MediaImageEditor item={{ id: "item-1", title: "示例剧集" }} onClose={() => undefined} />);
+    });
+    await act(async () => await Promise.resolve());
+
+    const logoTab = [...container.querySelectorAll<HTMLButtonElement>(".lux-image-type-tabs [role=tab]")]
+      .find((button) => button.textContent?.includes("徽标"));
+    await act(async () => logoTab?.click());
+    await act(async () => container.querySelector<HTMLButtonElement>(".lux-image-editor-toolbar .lux-button")?.click());
+
+    expect(search).toHaveBeenLastCalledWith("item-1", { imageType: "LOGO", language: "zh-CN", source: "" });
+    const state = container.querySelector<HTMLElement>(".lux-image-result-state[role=status]")?.textContent ?? "";
+    expect(state).toContain("没有「简体中文」的徽标");
+    expect(state).toContain("en / ko");
+    expect(state).not.toContain("选择语言和来源后搜索");
+  });
+
+  it("names a source that only returns posters instead of leaving the logo search unexplained", async () => {
+    vi.spyOn(api, "itemImages").mockResolvedValue({ images: [] });
+    vi.spyOn(api, "searchItemImages").mockResolvedValue({
+      images: [],
+      availableLanguages: [],
+      filteredByLanguage: 0,
+      availableImageTypes: ["POSTER"],
+      source: "豆瓣元数据插件",
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      root.render(<MediaImageEditor item={{ id: "item-1", title: "黑暗荣耀" }} onClose={() => undefined} />);
+    });
+    await act(async () => await Promise.resolve());
+
+    const logoTab = [...container.querySelectorAll<HTMLButtonElement>(".lux-image-type-tabs [role=tab]")]
+      .find((button) => button.textContent?.includes("徽标"));
+    await act(async () => logoTab?.click());
+    await act(async () => container.querySelector<HTMLButtonElement>(".lux-image-editor-toolbar .lux-button")?.click());
+
+    const state = container.querySelector<HTMLElement>(".lux-image-result-state[role=status]")?.textContent ?? "";
+    expect(state).toContain("「豆瓣元数据插件」没有返回这个条目的徽标");
+    expect(state).toContain("返回了海报");
+    expect(state).toContain("换一个提供徽标的刮削器");
+  });
 });

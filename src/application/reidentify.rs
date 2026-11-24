@@ -24,11 +24,13 @@ use crate::{
             FillMissingRequestPlan, ImageSelectionPolicy, MetadataAttemptHistory,
             MetadataCandidateError, MetadataCandidatePage, MetadataCandidateService,
             MetadataCandidateView, MetadataRequestPlan, MetadataSelectionError,
-            MetadataSelectionMode, MetadataSelectionService, SelectionInputs,
-            has_selected_provider_id,
+            MetadataSelectionMode, MetadataSelectionService, ScraperAttemptFailure,
+            SelectionInputs, has_selected_provider_id,
         },
         notification_template::bounded_display_text,
-        scraper::{ResolvedScraper, ScraperError, ScraperProvider, ScraperResolver},
+        scraper::{
+            ResolvedScraper, ScraperError, ScraperFailureCause, ScraperProvider, ScraperResolver,
+        },
         thumbnail_policy::thumbnail_scraper_retry_at,
         webhooks::{WebhookEventType, WebhookService},
     },
@@ -1185,6 +1187,17 @@ impl MetadataReidentifyService {
         query: &str,
         year: Option<i32>,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
+        self.search_item_candidates_with_provider_ids(item_id, Some(query), year, None)
+            .await
+    }
+
+    pub(crate) async fn search_item_candidates_with_provider_ids(
+        &self,
+        item_id: &str,
+        query: Option<&str>,
+        year: Option<i32>,
+        provider_ids: Option<&std::collections::BTreeMap<String, String>>,
+    ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
         // The search needs the item's type and metadata; read the wide row once and hand it to
         // the candidate search instead of reading kind and metadata separately
         // (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S3).
@@ -1195,19 +1208,26 @@ impl MetadataReidentifyService {
             .map_err(MetadataCandidateError::Storage)?
             .ok_or(MetadataCandidateError::ItemNotFound)?;
         if current.item_type == "VIDEO" {
-            return Err(MetadataCandidateError::Scraper(
-                ScraperError::UnsupportedCapability("metadata.search".to_owned()),
-            ));
+            return Err(MetadataCandidateError::VideoItemUnsupported);
         }
-        let scrapers = self
-            .providers_for_item(item_id, false, None)
-            .await
-            .map_err(MetadataCandidateError::Scraper)?
-            .unwrap_or_default();
-        self.search_item_candidates_with_scrapers(item_id, query, year, &scrapers, &current)
-            .await
+        let scrapers = match self.providers_for_item(item_id, false, None).await {
+            Ok(scrapers) => scrapers.unwrap_or_default(),
+            // The configured scrapers exist but none of them can be used. Report which plugin and
+            // why instead of a generic "scraper unavailable".
+            Err(error) => return Err(self.scraper_resolution_failure(&error).await),
+        };
+        self.search_item_candidates_with_scrapers_and_provider_ids(
+            item_id,
+            query,
+            year,
+            provider_ids,
+            &scrapers,
+            &current,
+        )
+        .await
     }
 
+    #[cfg(test)]
     async fn search_item_candidates_with_scrapers(
         &self,
         item_id: &str,
@@ -1216,23 +1236,63 @@ impl MetadataReidentifyService {
         scrapers: &[ResolvedScraper],
         current: &crate::storage::StoredMediaMetadata,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
-        let mut last_page = None;
-        let mut last_scraper_error = None;
-        let mut last_attempt_failed = false;
-        let mut attempted = false;
+        self.search_item_candidates_with_scrapers_and_provider_ids(
+            item_id,
+            Some(query),
+            year,
+            None,
+            scrapers,
+            current,
+        )
+        .await
+    }
 
-        for scraper in scrapers.iter().filter(|scraper| {
-            matches!(
-                scraper.role,
-                crate::library::LibraryScraperRole::Primary
-                    | crate::library::LibraryScraperRole::Backup
-                    | crate::library::LibraryScraperRole::Both
-            )
-        }) {
-            attempted = true;
+    async fn search_item_candidates_with_scrapers_and_provider_ids(
+        &self,
+        item_id: &str,
+        query: Option<&str>,
+        year: Option<i32>,
+        provider_ids: Option<&std::collections::BTreeMap<String, String>>,
+        scrapers: &[ResolvedScraper],
+        current: &crate::storage::StoredMediaMetadata,
+    ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
+        let candidates = scrapers
+            .iter()
+            .filter(|scraper| {
+                matches!(
+                    scraper.role,
+                    crate::library::LibraryScraperRole::Primary
+                        | crate::library::LibraryScraperRole::Backup
+                        | crate::library::LibraryScraperRole::Both
+                )
+            })
+            .collect::<Vec<_>>();
+        // An empty role set and the host's unconfigured placeholder (no plugin id, no provider
+        // key) both mean the library has no online scraper at all.
+        if candidates.is_empty()
+            || candidates.iter().all(|scraper| {
+                scraper.provider.plugin_id().is_none()
+                    && scraper.provider.provider_key().trim().is_empty()
+            })
+        {
+            return Err(MetadataCandidateError::ScraperNotConfigured);
+        }
+
+        let mut last_page = None;
+        let mut failures = Vec::new();
+        let mut last_attempt_failed = false;
+
+        for scraper in candidates {
             match self
                 .candidates
-                .search_and_store_for_current(item_id, query, year, &scraper.provider, current)
+                .search_and_store_for_current_with_provider_ids(
+                    item_id,
+                    query,
+                    year,
+                    provider_ids,
+                    &scraper.provider,
+                    current,
+                )
                 .await
             {
                 Ok(page) if !page.items.is_empty() => {
@@ -1246,39 +1306,75 @@ impl MetadataReidentifyService {
                     last_attempt_failed = false;
                 }
                 Err(MetadataCandidateError::Scraper(error)) => {
+                    let cause = ScraperFailureCause::from_error(&error);
                     tracing::warn!(
                         item_id,
                         scraper_id = %scraper.scraper_id,
+                        failure_reason = cause.as_str(),
                         "metadata candidate scraper failed; trying the next configured scraper"
                     );
-                    last_scraper_error = Some(error);
+                    let label = self.scraper_label(scraper).await;
+                    failures.push(ScraperAttemptFailure {
+                        scraper_id: scraper.scraper_id.clone(),
+                        label,
+                        cause,
+                    });
                     last_attempt_failed = true;
                 }
                 Err(error) => return Err(error),
             }
         }
 
-        if !attempted {
-            return Err(MetadataCandidateError::Scraper(
-                ScraperError::UnsupportedCapability("metadata.search".to_owned()),
-            ));
-        }
         if last_attempt_failed {
             if let Some(page) = last_page.filter(|page| !page.items.is_empty()) {
                 return Ok(page);
             }
-            if let Some(error) = last_scraper_error {
-                return Err(MetadataCandidateError::Scraper(error));
+            if failures.is_empty() {
+                return Err(MetadataCandidateError::ScraperNotConfigured);
             }
-            return Err(MetadataCandidateError::Scraper(
-                ScraperError::UnsupportedCapability("metadata.search".to_owned()),
-            ));
+            return Err(MetadataCandidateError::ScraperFailed(failures));
         }
-        last_page.ok_or_else(|| {
-            MetadataCandidateError::Scraper(ScraperError::UnsupportedCapability(
-                "metadata.search".to_owned(),
-            ))
-        })
+        last_page.ok_or(MetadataCandidateError::ScraperNotConfigured)
+    }
+
+    /// The configured scraper id the host could not resolve, when the error names one.
+    async fn scraper_resolution_failure(&self, error: &ScraperError) -> MetadataCandidateError {
+        let cause = ScraperFailureCause::from_error(error);
+        let scraper_id = match error {
+            ScraperError::Plugin(
+                crate::application::plugins::PluginServiceError::UnknownPlugin(scraper_id)
+                | crate::application::plugins::PluginServiceError::Unavailable(scraper_id),
+            ) => scraper_id.trim().to_owned(),
+            ScraperError::Plugin(crate::application::plugins::PluginServiceError::Runtime(
+                crate::application::plugin_runtime::PluginRuntimeError::UnknownPlugin(scraper_id),
+            )) => scraper_id.trim().to_owned(),
+            _ => String::new(),
+        };
+        let label = self.scraper_label_for_id(&scraper_id).await;
+        MetadataCandidateError::ScraperFailed(vec![ScraperAttemptFailure {
+            scraper_id,
+            label,
+            cause,
+        }])
+    }
+
+    /// The display name for a resolved scraper: the plugin manifest name when the resolver knows
+    /// the plugin, otherwise the provider key (for example `tmdb`).
+    async fn scraper_label(&self, scraper: &ResolvedScraper) -> Option<String> {
+        if let Some(label) = self.scraper_label_for_id(&scraper.scraper_id).await {
+            return Some(label);
+        }
+        let provider_key = scraper.provider.provider_key().trim();
+        (!provider_key.is_empty()).then(|| provider_key.to_owned())
+    }
+
+    async fn scraper_label_for_id(&self, scraper_id: &str) -> Option<String> {
+        let scraper_id = scraper_id.trim();
+        if scraper_id.is_empty() {
+            return None;
+        }
+        let resolver = self.resolver.as_ref()?;
+        resolver.scraper_display_name(scraper_id).await
     }
 
     pub async fn enqueue_selected_actor_enrichment(
@@ -2914,7 +3010,12 @@ impl MetadataReidentifyError {
             Self::Candidate(MetadataCandidateError::InvalidSearch) => "INVALID_SEARCH",
             Self::Candidate(MetadataCandidateError::ItemNotFound) => "ITEM_NOT_FOUND",
             Self::Candidate(MetadataCandidateError::InvalidCandidateJson(_)) => "CANDIDATE_ERROR",
-            Self::Candidate(MetadataCandidateError::Scraper(_)) => "SCRAPER_UNAVAILABLE",
+            Self::Candidate(MetadataCandidateError::Scraper(_))
+            | Self::Candidate(MetadataCandidateError::ScraperFailed(_))
+            | Self::Candidate(MetadataCandidateError::ScraperNotConfigured)
+            | Self::Candidate(MetadataCandidateError::VideoItemUnsupported) => {
+                "SCRAPER_UNAVAILABLE"
+            }
             Self::Candidate(MetadataCandidateError::Storage(_)) => "STORAGE_ERROR",
             Self::Scraper(_) => "SCRAPER_UNAVAILABLE",
             Self::Selection(MetadataSelectionError::Nfo(_)) => "METADATA_NFO_WRITE_FAILED",
@@ -3007,8 +3108,23 @@ fn metadata_reidentify_issue_diagnostic(
         MetadataReidentifyError::LowConfidence => ("MATCH", "NO_CONFIRMED_CANDIDATE", None),
         MetadataReidentifyError::NoCandidate => ("MATCH", "NO_CANDIDATE", None),
         MetadataReidentifyError::Scraper(error)
-        | MetadataReidentifyError::Candidate(MetadataCandidateError::Scraper(error)) => {
-            ("SCRAPER", scraper_failure_reason(error), None)
+        | MetadataReidentifyError::Candidate(MetadataCandidateError::Scraper(error)) => (
+            "SCRAPER",
+            ScraperFailureCause::from_error(error).as_str(),
+            None,
+        ),
+        MetadataReidentifyError::Candidate(MetadataCandidateError::ScraperFailed(failures)) => (
+            "SCRAPER",
+            failures
+                .first()
+                .map_or("SCRAPER_UNAVAILABLE", |failure| failure.cause.as_str()),
+            None,
+        ),
+        MetadataReidentifyError::Candidate(MetadataCandidateError::ScraperNotConfigured) => {
+            ("SCRAPER", "NO_SCRAPER_CONFIGURED", None)
+        }
+        MetadataReidentifyError::Candidate(MetadataCandidateError::VideoItemUnsupported) => {
+            ("SCRAPER", "VIDEO_ITEM_UNSUPPORTED", None)
         }
         MetadataReidentifyError::Candidate(MetadataCandidateError::InvalidCandidateJson(_)) => {
             ("SCRAPER_RESPONSE", "INVALID_CANDIDATE_RESPONSE", None)
@@ -3053,40 +3169,6 @@ fn metadata_reidentify_issue_diagnostic(
         stage: diagnostic.0,
         reason_code: diagnostic.1,
         upstream_status: diagnostic.2,
-    }
-}
-
-fn scraper_failure_reason(error: &ScraperError) -> &'static str {
-    use crate::application::{plugin_runtime::PluginRuntimeError, plugins::PluginServiceError};
-
-    match error {
-        ScraperError::UnsupportedCapability(_) => "UNSUPPORTED_CAPABILITY",
-        ScraperError::Storage(_) => "STORAGE_ERROR",
-        ScraperError::Provider(_) => "PROVIDER_ERROR",
-        ScraperError::InvalidResponse(_) => "SCRAPER_INVALID_RESPONSE",
-        ScraperError::Plugin(error) => match error {
-            PluginServiceError::UnknownPlugin(_) => "PLUGIN_UNKNOWN",
-            PluginServiceError::Unavailable(_) => "PLUGIN_UNAVAILABLE",
-            PluginServiceError::Unsupported(_) => "PLUGIN_UNSUPPORTED",
-            PluginServiceError::InvalidRequest(_) => "PLUGIN_INVALID_REQUEST",
-            PluginServiceError::InvalidConfig => "PLUGIN_CONFIG_INVALID",
-            PluginServiceError::NoUpdate => "PLUGIN_NOT_READY",
-            PluginServiceError::InvalidResponse => "PLUGIN_INVALID_RESPONSE",
-            PluginServiceError::ImageAsset(_) => "PLUGIN_ASSET_FAILED",
-            PluginServiceError::ConfigIo(_) => "PLUGIN_CONFIG_IO_FAILED",
-            PluginServiceError::Runtime(error) => match error {
-                PluginRuntimeError::UnknownPlugin(_) => "PLUGIN_UNKNOWN",
-                PluginRuntimeError::Io(_) => "PLUGIN_IO_FAILED",
-                PluginRuntimeError::Json(_) | PluginRuntimeError::Protocol(_) => {
-                    "PLUGIN_PROTOCOL_FAILED"
-                }
-                PluginRuntimeError::Plugin { .. } => "PLUGIN_REPORTED_ERROR",
-                PluginRuntimeError::Timeout => "PLUGIN_TIMEOUT",
-                PluginRuntimeError::Exited => "PLUGIN_EXITED",
-            },
-            PluginServiceError::Store(_) => "PLUGIN_STORE_FAILED",
-            PluginServiceError::Storage(_) => "STORAGE_ERROR",
-        },
     }
 }
 
@@ -4672,6 +4754,156 @@ mod tests {
             calls[..first_backup_call]
                 .iter()
                 .all(|call| call.starts_with("primary:"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_candidate_search_reports_missing_scraper_configuration()
+    -> Result<(), Box<dyn Error>> {
+        let (_temp_dir, _config, database, item_id) = role_test_fixture().await?;
+        let service = super::MetadataReidentifyService::new(
+            database.clone(),
+            super::ScraperProvider::unconfigured(),
+        );
+
+        let error = service
+            .search_item_candidates(&item_id, "Example Movie", Some(2020))
+            .await
+            .expect_err("a library without an online scraper cannot search candidates");
+
+        assert!(
+            matches!(error, super::MetadataCandidateError::ScraperNotConfigured),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_candidate_search_with_provider_ids_skips_text_search()
+    -> Result<(), Box<dyn Error>> {
+        let (_temp_dir, _config, database, item_id) = role_test_fixture().await?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let primary = RoleRecordingAdapter::new("primary", Arc::clone(&calls));
+        let service = super::MetadataReidentifyService::new(
+            database.clone(),
+            super::ScraperProvider::from_adapter(primary.clone()),
+        );
+        let scrapers = vec![super::ResolvedScraper {
+            scraper_id: "primary".to_owned(),
+            role: LibraryScraperRole::Primary,
+            provider: super::ScraperProvider::from_adapter(primary),
+        }];
+        let current = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("fixture movie is missing")?;
+        let provider_ids =
+            std::collections::BTreeMap::from([("Primary".to_owned(), "direct-603".to_owned())]);
+
+        let page = service
+            .search_item_candidates_with_scrapers_and_provider_ids(
+                &item_id,
+                None,
+                None,
+                Some(&provider_ids),
+                &scrapers,
+                &current,
+            )
+            .await?;
+
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].provider_id, "primary-1");
+        let calls = calls
+            .lock()
+            .expect("role scraper call list should not be poisoned")
+            .clone();
+        assert!(
+            calls.iter().any(|call| call == "primary:get"),
+            "expected direct get call, got {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|call| call == "primary:search"),
+            "text search must not run when providerIds matches scraper: {calls:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_candidate_search_reports_each_failed_scraper() -> Result<(), Box<dyn Error>> {
+        let (_temp_dir, _config, database, item_id) = role_test_fixture().await?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let primary = RoleRecordingAdapter::with_search_failure("primary", Arc::clone(&calls));
+        let backup = RoleRecordingAdapter::with_search_failure("backup", Arc::clone(&calls));
+        let service = super::MetadataReidentifyService::new(
+            database.clone(),
+            super::ScraperProvider::from_adapter(primary.clone()),
+        );
+        let scrapers = vec![
+            super::ResolvedScraper {
+                scraper_id: "primary".to_owned(),
+                role: LibraryScraperRole::Primary,
+                provider: super::ScraperProvider::from_adapter(primary),
+            },
+            super::ResolvedScraper {
+                scraper_id: "backup".to_owned(),
+                role: LibraryScraperRole::Backup,
+                provider: super::ScraperProvider::from_adapter(backup),
+            },
+        ];
+
+        let current = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("item metadata missing")?;
+        let error = service
+            .search_item_candidates_with_scrapers(
+                &item_id,
+                "Example Movie",
+                Some(2020),
+                &scrapers,
+                &current,
+            )
+            .await
+            .expect_err("every configured scraper failed, so the search cannot succeed");
+
+        let super::MetadataCandidateError::ScraperFailed(failures) = error else {
+            return Err(format!("unexpected error: {error}").into());
+        };
+        assert_eq!(failures.len(), 2);
+        assert_eq!(failures[0].scraper_id, "primary");
+        assert_eq!(
+            failures[0].cause,
+            super::ScraperFailureCause::ProviderFailed
+        );
+        assert_eq!(failures[1].scraper_id, "backup");
+        assert_eq!(
+            failures[1].cause,
+            super::ScraperFailureCause::ProviderFailed
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_candidate_search_rejects_home_video_items() -> Result<(), Box<dyn Error>> {
+        let (_temp_dir, _config, database, item_id) = role_test_fixture().await?;
+        sqlx::query("UPDATE media_items SET item_type = 'VIDEO' WHERE id = ?")
+            .bind(&item_id)
+            .execute(database.pool())
+            .await?;
+        let service = super::MetadataReidentifyService::new(
+            database.clone(),
+            super::ScraperProvider::unconfigured(),
+        );
+
+        let error = service
+            .search_item_candidates(&item_id, "Example Movie", None)
+            .await
+            .expect_err("home video items have no online metadata source");
+
+        assert!(
+            matches!(error, super::MetadataCandidateError::VideoItemUnsupported),
+            "unexpected error: {error}"
         );
         Ok(())
     }

@@ -188,38 +188,76 @@ impl Database {
         page_size: i64,
         offset: i64,
     ) -> Result<(Vec<StoredPlaybackSession>, i64), StorageError> {
+        self.list_current_playback_sessions_page(Some(user_id), page_size, offset)
+            .await
+    }
+
+    pub(crate) async fn list_current_playback_sessions_page(
+        &self,
+        user_id: Option<&str>,
+        page_size: i64,
+        offset: i64,
+    ) -> Result<(Vec<StoredPlaybackSession>, i64), StorageError> {
         let page_size = page_size.clamp(1, 100);
         let offset = offset.max(0);
-        let total_count: i64 = self
-            .query_scalar(
-                "SELECT COUNT(*) FROM playback_sessions
-                 WHERE user_id = ?
-                   AND state != 'STOPPED'
-                   AND last_event_at > unixepoch() - ?",
-            )
-            .bind(user_id)
-            .bind(PLAYBACK_SESSION_STALE_AFTER_SECONDS)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(self.sqlx_err())?;
-        let sessions = self
-            .query(
+        let total_count: i64 = match user_id {
+            Some(user_id) => self
+                .query_scalar(
+                    "SELECT COUNT(*) FROM playback_sessions
+                     WHERE user_id = ?
+                       AND state != 'STOPPED'
+                       AND last_event_at > unixepoch() - ?",
+                )
+                .bind(user_id)
+                .bind(PLAYBACK_SESSION_STALE_AFTER_SECONDS)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?,
+            None => self
+                .query_scalar(
+                    "SELECT COUNT(*) FROM playback_sessions
+                     WHERE state != 'STOPPED'
+                       AND last_event_at > unixepoch() - ?",
+                )
+                .bind(PLAYBACK_SESSION_STALE_AFTER_SECONDS)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?,
+        };
+        let mut statement = match user_id {
+            Some(user_id) => self
+                .query(
+                    "SELECT id, user_id, item_id, media_source_id, play_session_id,
+                            device_id, client, device_name, client_version, device_type,
+                            remote_ip, state,
+                            position_ticks, duration_ticks, is_paused, started_at,
+                            last_event_at
+                     FROM playback_sessions
+                     WHERE user_id = ?
+                       AND state != 'STOPPED'
+                       AND last_event_at > unixepoch() - ?
+                     ORDER BY last_event_at DESC, id ASC
+                     LIMIT ? OFFSET ?",
+                )
+                .bind(user_id),
+            None => self.query(
                 "SELECT id, user_id, item_id, media_source_id, play_session_id,
                         device_id, client, device_name, client_version, device_type,
                         remote_ip, state,
                         position_ticks, duration_ticks, is_paused, started_at,
                         last_event_at
                  FROM playback_sessions
-                 WHERE user_id = ?
-                   AND state != 'STOPPED'
+                 WHERE state != 'STOPPED'
                    AND last_event_at > unixepoch() - ?
                  ORDER BY last_event_at DESC, id ASC
                  LIMIT ? OFFSET ?",
-            )
-            .bind(user_id)
+            ),
+        };
+        statement = statement
             .bind(PLAYBACK_SESSION_STALE_AFTER_SECONDS)
             .bind(page_size)
-            .bind(offset)
+            .bind(offset);
+        let sessions = statement
             .fetch_all(&self.pool)
             .await
             .map_err(self.sqlx_err())?

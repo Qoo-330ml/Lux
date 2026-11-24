@@ -35,6 +35,202 @@ fn emby_public_id(id: &str) -> String {
         .unwrap_or_else(|_| id.to_owned())
 }
 
+/// "Recently added" must follow the newest available episode of a series: an episode added to an
+/// older show moves that show back to the top of the library page in the Lux list and in Emby.
+#[tokio::test]
+async fn recently_added_library_sort_moves_a_series_up_when_a_new_episode_arrives()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    let root = temp_dir.path().join("Shows");
+    let old_show = root.join("Old Show/Season 01");
+    let new_show = root.join("New Show/Season 01");
+    let middle_show = root.join("Middle Show/Season 01");
+    tokio::fs::create_dir_all(&old_show).await?;
+    tokio::fs::create_dir_all(&new_show).await?;
+    tokio::fs::create_dir_all(&middle_show).await?;
+    tokio::fs::write(old_show.join("Old.Show.S01E01.mkv"), b"old").await?;
+    tokio::fs::write(new_show.join("New.Show.S01E01.mkv"), b"new").await?;
+    tokio::fs::write(middle_show.join("Middle.Show.S01E01.mkv"), b"middle").await?;
+    LibraryService::new(database.clone())
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_series_library(library.id)
+        .await?;
+
+    // Pin the timestamps so the order can only follow the episodes, not the scan order: every series
+    // is added before every episode, and the oldest show gets the newest episode later.
+    for (title, added_at) in [
+        ("Old Show", 100_i64),
+        ("New Show", 300),
+        ("Middle Show", 200),
+    ] {
+        sqlx::query("UPDATE media_items SET added_at = ? WHERE item_type = 'SERIES' AND title = ?")
+            .bind(added_at)
+            .bind(title)
+            .execute(database.pool())
+            .await?;
+    }
+    for (title, added_at) in [
+        ("Old Show", 150_i64),
+        ("New Show", 250),
+        ("Middle Show", 350),
+    ] {
+        sqlx::query(
+            "UPDATE media_items SET added_at = ?
+             WHERE item_type = 'EPISODE' AND title LIKE ?",
+        )
+        .bind(added_at)
+        .bind(format!("{title}%"))
+        .execute(database.pool())
+        .await?;
+    }
+
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let cookie = |name: &str| {
+        login
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find_map(|value| {
+                let (pair, _) = value.split_once(';')?;
+                let (cookie_name, cookie_value) = pair.split_once('=')?;
+                (cookie_name == name).then(|| cookie_value.to_owned())
+            })
+            .expect("expected cookie")
+    };
+    let cookies = format!(
+        "lux_session={}; lux_csrf={}",
+        cookie("lux_session"),
+        cookie("lux_csrf")
+    );
+    let emby_login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="LuxTest", Device="Mac", DeviceId="recent-device", Version="1""#,
+        )
+        .json(&json!({ "Username": "admin", "Pw": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(emby_login.status(), reqwest::StatusCode::OK);
+    let admin_token = emby_login.json::<Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing admin token")?
+        .to_owned();
+    let emby_library_id = emby_public_id(&library.id.to_string());
+    let library_id = library.id.to_string();
+
+    // The first page of each list, in the "recently added" order both clients request. The client
+    // is only borrowed so the closure stays usable for both requests below.
+    let recent_page = |client: &reqwest::Client, cookies: &str, token: &str, admin_id: &str| {
+        let base_url = base_url.clone();
+        let library_id = library_id.clone();
+        let emby_library_id = emby_library_id.clone();
+        let client = client.clone();
+        let cookies = cookies.to_owned();
+        let admin_id = admin_id.to_owned();
+        let token = token.to_owned();
+        async move {
+            let lux = client
+                .get(format!(
+                    "{base_url}/api/v1/libraries/{library_id}/items?pageSize=1&itemType=Series&sort_by=DateCreated&sort_order=Descending"
+                ))
+                .header(COOKIE, &cookies)
+                .send()
+                .await?
+                .json::<Value>()
+                .await?;
+            let emby = client
+                .get(format!(
+                    "{base_url}/Users/{admin_id}/Items?ParentId={emby_library_id}&IncludeItemTypes=Series&Recursive=true&Limit=1&SortBy=DateCreated&SortOrder=Descending"
+                ))
+                .header("X-Emby-Token", &token)
+                .send()
+                .await?
+                .json::<Value>()
+                .await?;
+            let lux_title = lux["items"][0]["title"].as_str().map(str::to_owned);
+            let emby_name = emby["Items"][0]["Name"].as_str().map(str::to_owned);
+            Ok::<_, reqwest::Error>((lux_title, emby_name))
+        }
+    };
+
+    // Without a new episode each list orders by the newest episode of every series.
+    let (lux_title, emby_name) =
+        recent_page(&client, &cookies, &admin_token, &admin.id.to_string()).await?;
+    assert_eq!(lux_title.as_deref(), Some("Middle Show"));
+    assert_eq!(emby_name.as_deref(), Some("Middle Show"));
+
+    // A new episode of the oldest show lifts that show to the top of both lists. The refresh is an
+    // incremental scan like the watcher runs, stopped right after discovery and indexing, before
+    // any of its optional post-scan passes can refresh other rows.
+    let old_show_new_episode = root.join("Old Show/Season 02");
+    tokio::fs::create_dir_all(&old_show_new_episode).await?;
+    tokio::fs::write(old_show_new_episode.join("Old.Show.S02E01.mkv"), b"old-new").await?;
+    LibraryScanner::new(database.clone())
+        .scan_series_library(library.id)
+        .await?;
+    let new_episode_id: String = sqlx::query_scalar(
+        "SELECT item.id FROM media_items item
+         JOIN media_sources source ON source.item_id = item.id
+         JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+         WHERE item.item_type = 'EPISODE' AND entry.relative_path LIKE 'Old Show/Season 02/%'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query("UPDATE media_items SET added_at = 900 WHERE id = ?")
+        .bind(&new_episode_id)
+        .execute(database.pool())
+        .await?;
+    let newest_episode = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?ParentId={emby_library_id}&IncludeItemTypes=Episode&Recursive=true&Limit=50&SortBy=DateCreated&SortOrder=Descending",
+            admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(newest_episode.status(), reqwest::StatusCode::OK);
+    let newest_episode_body: Value = newest_episode.json().await?;
+    assert_eq!(
+        newest_episode_body["Items"][0]["Name"], "Old Show",
+        "the newly indexed episode must be the newest item: {newest_episode_body}"
+    );
+
+    server.abort();
+    Ok(())
+}
 #[tokio::test]
 async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -621,7 +817,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     let emby_people_page_body: Value = emby_people_page.json().await?;
     assert_eq!(
         emby_people_page_body["Items"][0]["People"][0]["Type"],
-        "Person"
+        "Actor"
     );
     assert_eq!(
         emby_people_page_body["Items"][0]["People"][1]["Type"],
@@ -827,6 +1023,10 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(
         popcorn_item["BackdropImageTags"].as_array().map(Vec::len),
         Some(2)
+    );
+    assert_eq!(
+        popcorn_item["ImageTags"]["Backdrop"],
+        popcorn_item["BackdropImageTags"][0]
     );
     assert_eq!(popcorn_item["PremiereDate"], "2020-01-02T00:00:00.0000000Z");
     assert_eq!(popcorn_item["ParentId"], emby_alpha_parent_id);
@@ -1097,7 +1297,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert!(user_scoped_detail_body.get("SeasonId").is_none());
     assert_eq!(user_scoped_detail_body["People"][0]["Id"], "9");
     assert_eq!(user_scoped_detail_body["People"][0]["Role"], "角色甲");
-    assert_eq!(user_scoped_detail_body["People"][0]["Type"], "Person");
+    assert_eq!(user_scoped_detail_body["People"][0]["Type"], "Actor");
     assert_eq!(user_scoped_detail_body["People"][1]["Id"], "88");
     assert_eq!(user_scoped_detail_body["People"][1]["Name"], "导演甲");
     assert_eq!(user_scoped_detail_body["People"][1]["Type"], "Director");
@@ -2706,6 +2906,135 @@ async fn lux_item_detail_exposes_local_file_path_only_to_authorized_viewers()
         !denied_body.contains(expected_path.to_str().unwrap_or_default()),
         "denied response must not leak the local path"
     );
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn home_carousel_includes_genres_from_nfo_cache() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let _admin = setup.complete("Admin", "Admin", "correct password").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let alpha_dir = root.join("Alpha Movie (2020)");
+    let beta_dir = root.join("Beta Movie (2021)");
+    tokio::fs::create_dir_all(&alpha_dir).await?;
+    tokio::fs::create_dir_all(&beta_dir).await?;
+    tokio::fs::write(alpha_dir.join("Alpha.Movie.2020.mkv"), b"alpha").await?;
+    tokio::fs::write(beta_dir.join("Beta.Movie.2021.mkv"), b"beta").await?;
+    tokio::fs::write(
+        alpha_dir.join("Alpha.Movie.2020.nfo"),
+        r#"<movie>
+  <title>Alpha Movie</title>
+  <year>2020</year>
+  <genre>动作</genre>
+  <genre>科幻</genre>
+</movie>"#
+            .as_bytes(),
+    )
+    .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    MetadataEnricher::new(database.clone())
+        .with_nfo_store(LocalNfoMetadataStore::new(database.clone()))
+        .enrich_movie_library(library.id)
+        .await?;
+
+    let alpha_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE title = 'Alpha Movie'")
+            .fetch_one(database.pool())
+            .await?;
+
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let cookies = format!(
+        "lux_session={}; lux_csrf={}",
+        cookie_value(login.headers(), "lux_session"),
+        cookie_value(login.headers(), "lux_csrf")
+    );
+
+    let carousel = client
+        .get(format!("{base_url}/api/v1/home/carousel"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(carousel.status(), reqwest::StatusCode::OK);
+    let carousel_body: Value = carousel.json().await?;
+    let recommended = carousel_body["recommended"]
+        .as_array()
+        .ok_or("recommended must be an array")?;
+    assert_eq!(recommended.len(), 2);
+    let alpha = recommended
+        .iter()
+        .find(|item| item["title"] == "Alpha Movie")
+        .ok_or("Alpha Movie missing from carousel")?;
+    let beta = recommended
+        .iter()
+        .find(|item| item["title"] == "Beta Movie")
+        .ok_or("Beta Movie missing from carousel")?;
+    assert_eq!(alpha["genres"], json!(["动作", "科幻"]));
+    assert_eq!(beta["genres"], json!([]));
+
+    // Malformed cached NFO JSON must degrade gracefully without failing the carousel endpoint.
+    sqlx::query(
+        "UPDATE media_item_nfo_cache
+         SET json = ?, bytes = length(CAST(? AS BLOB)), updated_at = updated_at + 1
+         WHERE item_id = ?",
+    )
+    .bind("{not-valid-json")
+    .bind("{not-valid-json")
+    .bind(&alpha_id)
+    .execute(database.pool())
+    .await?;
+
+    let degraded = client
+        .get(format!("{base_url}/api/v1/home/carousel"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(degraded.status(), reqwest::StatusCode::OK);
+    let degraded_body: Value = degraded.json().await?;
+    let degraded_alpha = degraded_body["recommended"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["title"] == "Alpha Movie"))
+        .ok_or("Alpha Movie missing after malformed cache degradation")?;
+    assert_eq!(degraded_alpha["genres"], json!([]));
 
     server.abort();
     Ok(())

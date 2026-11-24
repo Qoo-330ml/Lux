@@ -533,7 +533,7 @@ pub(super) fn actor_id_from_stored_actor(actor: &StoredActor) -> String {
                 })
                 .map(|identity| identity.id.clone())
         })
-        .unwrap_or_else(|| local_actor_id(&actor.name, actor.character.as_deref()))
+        .unwrap_or_else(|| local_actor_id(&actor.name))
 }
 
 pub(super) fn actor_id_is_name_derived(actor: &StoredActor) -> bool {
@@ -1081,7 +1081,19 @@ pub(super) fn person_key_for_identities(identities: &[PersonIdentity]) -> Option
     Some(format!("person-{encoded}"))
 }
 
-pub(super) fn local_actor_id(name: &str, character: Option<&str>) -> String {
+pub(super) fn local_actor_id(name: &str) -> String {
+    let normalized = normalize_person_match_text(name);
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    format!("local-{encoded}")
+}
+
+pub(super) fn legacy_local_actor_id(name: &str, character: Option<&str>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(name.trim().as_bytes());
     hasher.update([0]);

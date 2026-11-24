@@ -347,6 +347,21 @@ impl EmbyAuthService {
             .await?)
     }
 
+    pub(crate) fn token_hash(token: &str) -> Vec<u8> {
+        hash_token(token)
+    }
+
+    pub async fn current_login_session_id(
+        &self,
+        user_id: &UserId,
+        token: &str,
+    ) -> Result<Option<String>, EmbyAuthError> {
+        Ok(self
+            .database
+            .find_active_access_token_session_id(&user_id.to_string(), &hash_token(token))
+            .await?)
+    }
+
     pub async fn verify_token(&self, token: &str) -> Result<bool, EmbyAuthError> {
         Ok(self
             .database

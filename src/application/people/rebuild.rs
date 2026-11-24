@@ -497,19 +497,137 @@ impl PeopleService {
                             .iter()
                             .map(|identity| (identity.provider.clone(), identity.id.clone())),
                     );
+                    if actor.identities.is_empty()
+                        && let (Some(provider), Some(id)) = (
+                            actor_provider_from_stored_actor(actor),
+                            actor.id.as_deref().filter(|id| is_valid_person_id(id)),
+                        )
+                        && !id.starts_with("local-")
+                    {
+                        identities.insert((provider, id.to_owned()));
+                    }
                 }
                 pending.push((item_id.clone(), relation, relation_checksum));
                 processed_count += 1;
                 cursor_id = Some(item_id.clone());
             }
 
-            let identity_lookup = database
+            let mut identity_lookup = database
                 .find_canonical_people_by_identities(&identities.into_iter().collect::<Vec<_>>())
                 .await
                 .map_err(|error| PeopleError::Storage(error.to_string()))?
                 .into_iter()
                 .map(|(provider, provider_id, person_id)| ((provider, provider_id), person_id))
                 .collect::<BTreeMap<_, _>>();
+            let mut merged_people = Vec::new();
+            for (item_id, relation, _) in &pending {
+                for actor in &relation.actors {
+                    let effective_identities = if !actor.identities.is_empty() {
+                        actor
+                            .identities
+                            .iter()
+                            .map(|identity| (identity.provider.clone(), identity.id.clone()))
+                            .collect::<Vec<_>>()
+                    } else if let (Some(provider), Some(id)) = (
+                        actor_provider_from_stored_actor(actor),
+                        actor.id.as_deref().filter(|id| is_valid_person_id(id)),
+                    ) && !id.starts_with("local-")
+                    {
+                        vec![(provider, id.to_owned())]
+                    } else {
+                        Vec::new()
+                    };
+                    let mut distinct_person_ids = Vec::new();
+                    let mut seen_person_ids = HashSet::new();
+                    for pair in &effective_identities {
+                        if let Some(person_id) = identity_lookup.get(pair)
+                            && seen_person_ids.insert(person_id.clone())
+                        {
+                            distinct_person_ids.push(person_id.clone());
+                        }
+                    }
+                    if distinct_person_ids.len() <= 1 {
+                        continue;
+                    }
+                    let target_person_id = database
+                        .choose_preferred_canonical_person(&distinct_person_ids)
+                        .await
+                        .map_err(|error| PeopleError::Storage(error.to_string()))?;
+                    let evidence_json = serde_json::json!({
+                        "method": "rebuild-multi-identity-collision",
+                        "itemId": item_id,
+                        "actor": actor.name,
+                        "identities": effective_identities
+                            .iter()
+                            .map(|(provider, id)| format!("{provider}:{id}"))
+                            .collect::<Vec<_>>(),
+                    })
+                    .to_string();
+                    for source_person_id in &distinct_person_ids {
+                        if source_person_id == &target_person_id {
+                            continue;
+                        }
+                        let merged = database
+                            .merge_canonical_person(
+                                source_person_id,
+                                &target_person_id,
+                                "REBUILD_AUTO_MERGE",
+                                Some(1.0),
+                                &evidence_json,
+                            )
+                            .await
+                            .map_err(|error| PeopleError::Storage(error.to_string()))?;
+                        for mapped_person_id in identity_lookup.values_mut() {
+                            if *mapped_person_id == merged.source_person_id {
+                                *mapped_person_id = merged.target_person_id.clone();
+                            }
+                        }
+                        merged_people.push((merged, evidence_json.clone()));
+                    }
+                }
+            }
+            for (merged, evidence_json) in &merged_people {
+                self.sync_merged_canonical_person_artifacts(
+                    merged,
+                    "REBUILD_AUTO_MERGE",
+                    evidence_json,
+                )
+                .await?;
+            }
+            let mut local_id_migrations = Vec::new();
+            let mut seen_local_migrations = HashSet::new();
+            for (_, relation, _) in &pending {
+                for actor in relation.actors.iter().take(MAX_ACTORS) {
+                    if actor.name.trim().is_empty() || !actor_id_is_name_derived(actor) {
+                        continue;
+                    }
+                    let old_local_id =
+                        legacy_local_actor_id(&actor.name, actor.character.as_deref());
+                    let new_local_id = local_actor_id(&actor.name);
+                    if old_local_id != new_local_id
+                        && seen_local_migrations
+                            .insert((old_local_id.clone(), new_local_id.clone()))
+                    {
+                        local_id_migrations.push((
+                            old_local_id,
+                            new_local_id,
+                            actor.name.trim().to_owned(),
+                        ));
+                    }
+                }
+            }
+            if !local_id_migrations.is_empty() {
+                let favorite_pairs = local_id_migrations
+                    .iter()
+                    .map(|(old_id, new_id, _)| (old_id.clone(), new_id.clone()))
+                    .collect::<Vec<_>>();
+                database
+                    .migrate_person_favorite_ids(&favorite_pairs)
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?;
+                self.migrate_legacy_local_actor_assets(&local_id_migrations)
+                    .await?;
+            }
             let credit_replacements = pending
                 .into_iter()
                 .map(|(item_id, relation, relation_checksum)| {
@@ -929,13 +1047,26 @@ impl PeopleService {
                 continue;
             }
             let mut actor = actor.clone();
-            if !actor.identities.is_empty() {
+            let effective_identities: Vec<(String, String)> = if !actor.identities.is_empty() {
+                actor
+                    .identities
+                    .iter()
+                    .map(|identity| (identity.provider.clone(), identity.id.clone()))
+                    .collect()
+            } else if let (Some(provider), Some(id)) = (
+                actor_provider_from_stored_actor(&actor),
+                actor.id.as_deref().filter(|id| is_valid_person_id(id)),
+            ) && !id.starts_with("local-")
+            {
+                vec![(provider, id.to_owned())]
+            } else {
+                Vec::new()
+            };
+            if !effective_identities.is_empty() {
                 let mut mapped_person_id = None;
                 let mut conflicting = false;
-                for identity in &actor.identities {
-                    let Some(mapped) =
-                        lookup.get(&(identity.provider.clone(), identity.id.clone()))
-                    else {
+                for (provider, id) in &effective_identities {
+                    let Some(mapped) = lookup.get(&(provider.clone(), id.clone())) else {
                         continue;
                     };
                     if mapped_person_id
@@ -1026,16 +1157,26 @@ async fn restore_person_manifest_batch(
         }
         checked_person_ids.insert(manifest.lux_person_id.clone());
 
-        let identities = manifest
-            .identities
-            .iter()
-            .map(|identity| (identity.provider.as_str(), identity.id.as_str()))
-            .collect::<Vec<_>>();
+        let status = if manifest.merged_into_person_id.is_some() {
+            "MERGED"
+        } else {
+            "ACTIVE"
+        };
+        let identities = if status == "MERGED" {
+            Vec::new()
+        } else {
+            manifest
+                .identities
+                .iter()
+                .map(|identity| (identity.provider.as_str(), identity.id.as_str()))
+                .collect::<Vec<_>>()
+        };
         match database
-            .restore_canonical_person_if_manifest_changed(
+            .restore_canonical_person_with_status_if_manifest_changed(
                 &manifest.lux_person_id,
                 &manifest.display_name,
                 &identities,
+                status,
                 &manifest.checksum,
                 schema_version,
             )
@@ -1052,5 +1193,170 @@ async fn restore_person_manifest_batch(
                 );
             }
         }
+    }
+}
+
+impl PeopleService {
+    async fn migrate_legacy_local_actor_assets(
+        &self,
+        migrations: &[(String, String, String)],
+    ) -> Result<(), PeopleError> {
+        let index_dir = people_index_directory(&self.config_dir);
+        let index_exists = safe_metadata(&index_dir)
+            .await?
+            .is_some_and(|metadata| metadata.is_dir());
+        let legacy_profiles_dir = self.legacy_people_dir().join(LEGACY_PROFILES_DIR);
+        let legacy_profiles_exists = safe_metadata(&legacy_profiles_dir)
+            .await?
+            .is_some_and(|metadata| metadata.is_dir());
+        let metadata_dir = metadata_root(&self.config_dir);
+
+        for (old_id, new_id, actor_name) in migrations {
+            if !is_valid_person_id(old_id) || !is_valid_person_id(new_id) {
+                continue;
+            }
+            let mut migrated_any_index = false;
+            if index_exists {
+                let providers: [Option<&str>; 6] = [
+                    None,
+                    Some("tmdb"),
+                    Some("local"),
+                    Some("nfo"),
+                    Some("douban"),
+                    Some("imdb"),
+                ];
+                for provider in providers {
+                    let old_index_path = match provider {
+                        Some(provider) => {
+                            people_index_path_for_provider(&self.config_dir, provider, old_id)?
+                        }
+                        None => people_index_path(&self.config_dir, old_id)?,
+                    };
+                    let Some(bytes) = read_people_file(&old_index_path).await? else {
+                        continue;
+                    };
+                    let Ok(index) = serde_json::from_slice::<StoredPersonIndex>(&bytes) else {
+                        continue;
+                    };
+                    let relative = Path::new(&index.image_path);
+                    if relative.is_absolute()
+                        || relative
+                            .components()
+                            .any(|component| !matches!(component, Component::Normal(_)))
+                    {
+                        continue;
+                    }
+                    let target_image = metadata_dir.join(relative);
+                    if !target_image.starts_with(&metadata_dir)
+                        || safe_metadata(&target_image)
+                            .await?
+                            .is_none_or(|metadata| !metadata.is_file())
+                    {
+                        continue;
+                    }
+                    let new_index_path = match provider {
+                        Some(provider) => {
+                            people_index_path_for_provider(&self.config_dir, provider, new_id)?
+                        }
+                        None => people_index_path(&self.config_dir, new_id)?,
+                    };
+                    if safe_metadata(&new_index_path).await?.is_none() {
+                        write_atomically_if_changed(&new_index_path, &bytes).await?;
+                        restrict_permissions(&new_index_path, false).await?;
+                    }
+                    migrated_any_index = true;
+                }
+            }
+
+            if !migrated_any_index {
+                let mut found_image_path = None;
+                if is_valid_person_lookup(actor_name) {
+                    'outer: for provider in ["tmdb", "local", "nfo"] {
+                        let Ok(old_dir) =
+                            people_directory(&self.config_dir, actor_name, provider, old_id)
+                        else {
+                            continue;
+                        };
+                        for ext in PROFILE_EXTENSIONS {
+                            let candidate = old_dir.join(format!("{PERSON_IMAGE}.{ext}"));
+                            if safe_metadata(&candidate)
+                                .await?
+                                .is_some_and(|metadata| metadata.is_file())
+                            {
+                                found_image_path = Some((candidate, None));
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+                if found_image_path.is_none() && legacy_profiles_exists {
+                    for ext in PROFILE_EXTENSIONS {
+                        let candidate = legacy_profiles_dir.join(format!("{old_id}.{ext}"));
+                        if safe_metadata(&candidate)
+                            .await?
+                            .is_some_and(|metadata| metadata.is_file())
+                        {
+                            found_image_path = Some((candidate, Some(ext)));
+                            break;
+                        }
+                    }
+                }
+                if let Some((source_image, legacy_ext)) = found_image_path {
+                    let stored_image_path = if let Some(ext) = legacy_ext {
+                        let person_key = person_key_for_identities(&[PersonIdentity {
+                            provider: "tmdb".to_owned(),
+                            id: new_id.clone(),
+                        }])
+                        .ok_or_else(|| PeopleError::InvalidComponent(new_id.clone()))?;
+                        let asset_dir = canonical_person_directory(&self.config_dir, &person_key)?;
+                        create_private_dir(&asset_dir).await?;
+                        let dest = asset_dir.join(format!("{PERSON_IMAGE}.{ext}"));
+                        let image_bytes =
+                            fs::read(&source_image)
+                                .await
+                                .map_err(|source| PeopleError::Io {
+                                    path: source_image,
+                                    source,
+                                })?;
+                        write_atomically_if_changed(&dest, &image_bytes).await?;
+                        restrict_permissions(&dest, false).await?;
+                        dest
+                    } else {
+                        source_image
+                    };
+                    if let Ok(relative) = stored_image_path.strip_prefix(&metadata_dir) {
+                        let relative_parts = relative
+                            .components()
+                            .filter_map(|component| match component {
+                                Component::Normal(segment) => {
+                                    Some(segment.to_string_lossy().into_owned())
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        if !relative_parts.is_empty() {
+                            let index = StoredPersonIndex {
+                                image_path: relative_parts.join("/"),
+                                person_key: None,
+                            };
+                            let index_bytes = serde_json::to_vec_pretty(&index)
+                                .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+                            create_private_dir(&index_dir).await?;
+                            for target_path in [
+                                people_index_path(&self.config_dir, new_id)?,
+                                people_index_path_for_provider(&self.config_dir, "tmdb", new_id)?,
+                            ] {
+                                if safe_metadata(&target_path).await?.is_none() {
+                                    write_atomically_if_changed(&target_path, &index_bytes).await?;
+                                    restrict_permissions(&target_path, false).await?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }

@@ -776,6 +776,306 @@ impl PeopleService {
         Ok(split.id)
     }
 
+    pub async fn merge_canonical_people(
+        &self,
+        source_person_id: &str,
+        target_person_id: &str,
+        evidence_json: &str,
+    ) -> Result<CanonicalPersonMergeResult, PeopleError> {
+        if !is_valid_person_id(source_person_id) {
+            return Err(PeopleError::InvalidComponent(source_person_id.to_owned()));
+        }
+        if !is_valid_person_id(target_person_id) {
+            return Err(PeopleError::InvalidComponent(target_person_id.to_owned()));
+        }
+        validate_component(source_person_id)?;
+        validate_component(target_person_id)?;
+        if source_person_id == target_person_id {
+            return Err(PeopleError::Conflict(format!(
+                "cannot merge canonical person '{source_person_id}' into itself"
+            )));
+        }
+
+        let database = self
+            .database
+            .as_ref()
+            .ok_or_else(|| PeopleError::Storage("people database is not configured".to_owned()))?;
+        let merged = database
+            .merge_canonical_person(
+                source_person_id,
+                target_person_id,
+                "MANUAL_ADMIN_MERGE",
+                Some(1.0),
+                evidence_json,
+            )
+            .await
+            .map_err(|error| match error {
+                crate::storage::StorageError::Conflict(message)
+                    if message.contains("not found") =>
+                {
+                    PeopleError::NotFound(message)
+                }
+                crate::storage::StorageError::Conflict(message) => PeopleError::Conflict(message),
+                other => PeopleError::Storage(other.to_string()),
+            })?;
+
+        self.sync_merged_canonical_person_artifacts(&merged, "MANUAL_ADMIN_MERGE", evidence_json)
+            .await?;
+
+        Ok(CanonicalPersonMergeResult {
+            source_person_id: merged.source_person_id,
+            target_person_id: merged.target_person_id,
+            moved_identities: merged
+                .moved_identities
+                .into_iter()
+                .map(|(provider, id)| PersonIdentity { provider, id })
+                .collect(),
+        })
+    }
+
+    pub(super) async fn sync_merged_canonical_person_artifacts(
+        &self,
+        merged: &crate::storage::StoredCanonicalPersonMerge,
+        event_type: &str,
+        evidence_json: &str,
+    ) -> Result<(), PeopleError> {
+        let target_manifest_path = self
+            .find_person_manifest_path(&merged.target_person_id, &merged.target_display_name)
+            .await?;
+        let source_manifest_path = self
+            .find_person_manifest_path(&merged.source_person_id, &merged.source_display_name)
+            .await?;
+        let target_dir = target_manifest_path.parent().ok_or_else(|| {
+            PeopleError::InvalidComponent("person manifest missing parent".to_owned())
+        })?;
+        let source_dir = source_manifest_path.parent().ok_or_else(|| {
+            PeopleError::InvalidComponent("person manifest missing parent".to_owned())
+        })?;
+
+        let (_first_lock, _second_lock) = if source_manifest_path <= target_manifest_path {
+            (
+                acquire_person_manifest_lock(&source_manifest_path).await?,
+                acquire_person_manifest_lock(&target_manifest_path).await?,
+            )
+        } else {
+            (
+                acquire_person_manifest_lock(&target_manifest_path).await?,
+                acquire_person_manifest_lock(&source_manifest_path).await?,
+            )
+        };
+
+        create_private_dir(target_dir).await?;
+        create_private_dir(source_dir).await?;
+
+        let source_manifest = match read_people_file(&source_manifest_path).await? {
+            Some(bytes) => Some(
+                serde_json::from_slice::<PersonManifest>(&bytes)
+                    .map_err(|source| PeopleError::Serialization(source.to_string()))?,
+            ),
+            None => None,
+        };
+        let mut target_manifest = match read_people_file(&target_manifest_path).await? {
+            Some(bytes) => serde_json::from_slice::<PersonManifest>(&bytes)
+                .map_err(|source| PeopleError::Serialization(source.to_string()))?,
+            None => PersonManifest {
+                schema_version: PERSON_MANIFEST_SCHEMA_VERSION,
+                generation: 0,
+                lux_person_id: merged.target_person_id.clone(),
+                display_name: merged.target_display_name.clone(),
+                ..PersonManifest::default()
+            },
+        };
+
+        let mut target_image_path = find_existing_profile_image_path(target_dir).await?;
+        if target_image_path.is_none() {
+            let mut candidate_source_image = find_existing_profile_image_path(source_dir).await?;
+            if candidate_source_image.is_none() {
+                if let Some(image) = self
+                    .indexed_profile_image_for_provider("lux", &merged.source_person_id)
+                    .await?
+                {
+                    candidate_source_image = Some(image.path);
+                }
+            }
+            if candidate_source_image.is_none() {
+                for (provider, provider_id) in &merged.moved_identities {
+                    if let Some(image) = self
+                        .indexed_profile_image_for_provider(provider, provider_id)
+                        .await?
+                    {
+                        candidate_source_image = Some(image.path);
+                        break;
+                    }
+                }
+            }
+            if let Some(source_image) = candidate_source_image
+                && let Some(ext) = source_image
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .filter(|value| PROFILE_EXTENSIONS.contains(value))
+            {
+                let bytes = fs::read(&source_image)
+                    .await
+                    .map_err(|source| PeopleError::Io {
+                        path: source_image.clone(),
+                        source,
+                    })?;
+                let destination = target_dir.join(format!("{PERSON_IMAGE}.{ext}"));
+                write_atomically_if_changed(&destination, &bytes).await?;
+                restrict_permissions(&destination, false).await?;
+                target_image_path = Some(destination);
+            }
+        }
+
+        target_manifest.merged_into_person_id = None;
+        if target_manifest.display_name.trim().is_empty() {
+            target_manifest.display_name = merged.target_display_name.clone();
+        }
+        if !merged.source_display_name.trim().is_empty()
+            && merged.source_display_name != target_manifest.display_name
+        {
+            target_manifest
+                .aliases
+                .insert(merged.source_display_name.clone());
+        }
+        if let Some(source) = &source_manifest {
+            for alias in &source.aliases {
+                if !alias.trim().is_empty() && alias != &target_manifest.display_name {
+                    target_manifest.aliases.insert(alias.clone());
+                }
+            }
+            if let Some(source_person) = source.person.clone() {
+                target_manifest.person = Some(match target_manifest.person.take() {
+                    Some(existing) => existing.supplement_missing_from(source_person),
+                    None => source_person,
+                });
+            }
+        }
+
+        let mut seen_identities = target_manifest
+            .identities
+            .iter()
+            .map(|identity| (identity.provider.clone(), identity.id.clone()))
+            .collect::<std::collections::BTreeSet<_>>();
+        for (provider, provider_id) in &merged.moved_identities {
+            if seen_identities.insert((provider.clone(), provider_id.clone())) {
+                target_manifest.identities.push(PersonIdentity {
+                    provider: provider.clone(),
+                    id: provider_id.clone(),
+                });
+            }
+        }
+        if let Some(source) = &source_manifest {
+            for identity in &source.identities {
+                if seen_identities.insert((identity.provider.clone(), identity.id.clone())) {
+                    target_manifest.identities.push(identity.clone());
+                }
+            }
+        }
+
+        let source_nfo_bytes = read_people_file(&source_dir.join(PERSON_NFO)).await?;
+        let target_nfo_path = target_dir.join(PERSON_NFO);
+        let target_nfo_bytes = read_people_file(&target_nfo_path).await?;
+        if target_nfo_bytes.is_some()
+            || source_nfo_bytes.is_some()
+            || target_manifest.person.is_some()
+        {
+            let (nfo_provider, nfo_id) = target_manifest
+                .identities
+                .first()
+                .map(|identity| (identity.provider.as_str(), identity.id.as_str()))
+                .unwrap_or(("lux", merged.target_person_id.as_str()));
+            let base_nfo = target_nfo_bytes.as_deref().or(source_nfo_bytes.as_deref());
+            let merged_nfo = match base_nfo {
+                Some(existing) => merge_person_nfo_bytes(
+                    existing,
+                    &target_manifest.display_name,
+                    nfo_provider,
+                    nfo_id,
+                    target_manifest.person.as_ref(),
+                ),
+                None => Some(person_nfo_bytes(
+                    &target_manifest.display_name,
+                    nfo_provider,
+                    nfo_id,
+                    target_manifest.person.as_ref(),
+                )),
+            };
+            if let Some(merged_nfo) = merged_nfo {
+                write_atomically_if_changed(&target_nfo_path, &merged_nfo).await?;
+                restrict_permissions(&target_nfo_path, false).await?;
+            }
+        }
+
+        let now = current_people_unix_timestamp();
+        let (event_provider, event_provider_id) = merged
+            .moved_identities
+            .first()
+            .map(|(provider, id)| (provider.clone(), id.clone()))
+            .unwrap_or_else(|| ("lux".to_owned(), merged.source_person_id.clone()));
+        let event = PersonManifestIdentityEvent {
+            event_id: Uuid::now_v7().to_string(),
+            event_type: event_type.to_owned(),
+            provider: event_provider,
+            provider_id: event_provider_id,
+            from_person_id: Some(merged.source_person_id.clone()),
+            to_person_id: Some(merged.target_person_id.clone()),
+            evidence_json: evidence_json.to_owned(),
+            created_at: now,
+        };
+        target_manifest.identity_events.push(event.clone());
+        sign_and_write_person_manifest(&target_manifest_path, &mut target_manifest).await?;
+
+        let mut updated_source_manifest = source_manifest.unwrap_or_else(|| PersonManifest {
+            schema_version: PERSON_MANIFEST_SCHEMA_VERSION,
+            generation: 0,
+            lux_person_id: merged.source_person_id.clone(),
+            display_name: merged.source_display_name.clone(),
+            ..PersonManifest::default()
+        });
+        updated_source_manifest.identities.clear();
+        updated_source_manifest.merged_into_person_id = Some(merged.target_person_id.clone());
+        updated_source_manifest.identity_events.push(event);
+        sign_and_write_person_manifest(&source_manifest_path, &mut updated_source_manifest).await?;
+
+        if let Some(image_path) = target_image_path {
+            let metadata_dir = metadata_root(&self.config_dir);
+            let relative = metadata_relative_string(&metadata_dir, &image_path)?;
+            let index = StoredPersonIndex {
+                image_path: relative,
+                person_key: Some(merged.target_person_id.clone()),
+            };
+            let index_bytes = serde_json::to_vec(&index)
+                .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+            let mut index_paths = vec![
+                people_index_path(&self.config_dir, &merged.target_person_id)?,
+                people_index_path(&self.config_dir, &merged.source_person_id)?,
+            ];
+            for identity in &target_manifest.identities {
+                if !is_valid_person_id(&identity.provider) || !is_valid_person_id(&identity.id) {
+                    continue;
+                }
+                index_paths.push(people_index_path_for_provider(
+                    &self.config_dir,
+                    &identity.provider,
+                    &identity.id,
+                )?);
+                if identity.provider.eq_ignore_ascii_case("tmdb") {
+                    index_paths.push(people_index_path(&self.config_dir, &identity.id)?);
+                }
+            }
+            for index_path in index_paths {
+                if let Some(index_dir) = index_path.parent() {
+                    create_private_dir(index_dir).await?;
+                }
+                write_atomically_if_changed(&index_path, &index_bytes).await?;
+                restrict_permissions(&index_path, false).await?;
+            }
+        }
+
+        Ok(())
+    }
+
     pub(super) async fn update_person_manifest_identity(
         &self,
         person_id: &str,
@@ -853,4 +1153,58 @@ impl PeopleService {
         }
         .await
     }
+}
+
+async fn find_existing_profile_image_path(
+    person_dir: &Path,
+) -> Result<Option<PathBuf>, PeopleError> {
+    for extension in PROFILE_EXTENSIONS {
+        let candidate = person_dir.join(format!("{PERSON_IMAGE}.{extension}"));
+        if safe_metadata(&candidate)
+            .await?
+            .is_some_and(|metadata| metadata.is_file())
+        {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+async fn sign_and_write_person_manifest(
+    manifest_path: &Path,
+    manifest: &mut PersonManifest,
+) -> Result<(), PeopleError> {
+    manifest.generation = manifest.generation.saturating_add(1);
+    manifest.checksum.clear();
+    let checksum_source = serde_json::to_vec(manifest)
+        .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+    let digest = Sha256::digest(checksum_source);
+    manifest.checksum = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let bytes = serde_json::to_vec_pretty(manifest)
+        .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+    write_atomically_if_changed(manifest_path, &bytes).await?;
+    restrict_permissions(manifest_path, false).await
+}
+
+fn metadata_relative_string(metadata_dir: &Path, path: &Path) -> Result<String, PeopleError> {
+    let relative = path.strip_prefix(metadata_dir).map_err(|_| {
+        PeopleError::Serialization("person image path is outside metadata".to_owned())
+    })?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(segment) => parts.push(segment.to_string_lossy().into_owned()),
+            _ => {
+                return Err(PeopleError::Serialization(
+                    "person image index contains an unsafe path".to_owned(),
+                ));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(PeopleError::Serialization(
+            "person image index path is empty".to_owned(),
+        ));
+    }
+    Ok(parts.join("/"))
 }

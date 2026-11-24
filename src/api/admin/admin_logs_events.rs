@@ -20,27 +20,40 @@ pub(crate) async fn record_audit_event(
     target_id: Option<&str>,
     metadata_json: &str,
 ) {
-    let (actor_user_id, actor_username, metadata_json) =
-        if let Some(candidate) = lux_api_key_from_headers(headers) {
-            let service = state.admin_api_key();
-            let Ok(Some(_)) = service.resolve_principal(&candidate).await else {
-                return;
-            };
-            (None, None, audit_metadata_for_shared_api_key(metadata_json))
-        } else {
-            let auth = state.auth();
-            let Some(session_token) = request_cookie(headers, "lux_session") else {
-                return;
-            };
-            let Ok(Some(session)) = auth.resolve(&session_token).await else {
-                return;
-            };
-            (
-                Some(session.user.id.to_string()),
-                Some(session.user.username_normalized.clone()),
-                metadata_json.to_owned(),
-            )
+    let (actor_user_id, actor_username, metadata_json) = if let Some(candidate) =
+        lux_api_key_from_headers(headers)
+        && state
+            .admin_api_key()
+            .resolve_principal(&candidate)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        (None, None, audit_metadata_for_shared_api_key(metadata_json))
+    } else if let Some(token) = users::lux_user_token_from_headers(headers) {
+        let Ok(Some(user)) = state.emby_auth().resolve_token(&token).await else {
+            return;
         };
+        (
+            Some(user.id.to_string()),
+            Some(user.username_normalized),
+            metadata_json.to_owned(),
+        )
+    } else {
+        let auth = state.auth();
+        let Some(session_token) = request_cookie(headers, "lux_session") else {
+            return;
+        };
+        let Ok(Some(session)) = auth.resolve(&session_token).await else {
+            return;
+        };
+        (
+            Some(session.user.id.to_string()),
+            Some(session.user.username_normalized.clone()),
+            metadata_json.to_owned(),
+        )
+    };
     let Some(config_dir) = state.config_dir.as_deref() else {
         return;
     };

@@ -1,5 +1,7 @@
 use super::*;
+use crate::application::metadata::NfoError;
 use crate::application::playback::session::EMBY_DIRECT_STREAM_TICKET_VERSION;
+use std::collections::BTreeSet;
 use tokio::{sync::Semaphore, task::JoinSet};
 
 const EMBY_ITEM_EXTRA_CONCURRENCY: usize = 8;
@@ -9,6 +11,14 @@ pub(super) const EMBY_MAX_PAGE_LIMIT: i64 = 1_000;
 use crate::application::catalog::CatalogItemCounts;
 use crate::storage::{GLOBAL_COLLECTION_LIBRARY_ID, MediaFacetKind};
 
+/// Emby 条目列表端点共用的查询参数（`/Items`、`/Users/{id}/Items` 及其
+/// `Resume`/`Latest`/`NextUp`、`/Shows/{id}/Episodes`、`/Shows/{id}/Seasons`）。
+///
+/// Emby 本身是 ASP.NET，查询绑定不区分大小写，客户端因此各有各的拼写：Hills/Yamby 发
+/// `ParentId`/`IncludeItemTypes`，Entryway 1.0.18 的 Emby 适配层发
+/// `parentId`/`includeItemTypes`/`limit`/`startIndex`/`fields`。只有 `rename` 的 serde 字段会
+/// **静默丢弃** camelCase 键：媒体库范围、类型过滤和分页同时失效，而且返回 200，客户端无从察觉
+/// （LUX-914）。所以每个改名的字段都带 camelCase `alias`，两种拼写必须完全等价。
 #[derive(Deserialize, Default)]
 pub(super) struct EmbyItemsQuery {
     #[serde(
@@ -26,40 +36,44 @@ pub(super) struct EmbyItemsQuery {
     pub(super) user_id: Option<String>,
     #[serde(rename = "SeriesId", alias = "seriesId", default)]
     pub(super) series_id: Option<String>,
-    #[serde(rename = "ParentId", default)]
+    #[serde(rename = "ParentId", alias = "parentId", default)]
     pub(super) parent_id: Option<String>,
-    #[serde(rename = "Ids", default)]
+    #[serde(rename = "Ids", alias = "ids", default)]
     pub(super) ids: Option<String>,
     #[serde(rename = "AnyProviderIdEquals", alias = "anyProviderIdEquals", default)]
     pub(super) any_provider_id_equals: Option<String>,
-    #[serde(rename = "IncludeItemTypes", default)]
+    #[serde(rename = "IncludeItemTypes", alias = "includeItemTypes", default)]
     pub(super) include_item_types: Option<String>,
-    #[serde(rename = "ExcludeItemTypes", default)]
+    #[serde(rename = "ExcludeItemTypes", alias = "excludeItemTypes", default)]
     pub(super) exclude_item_types: Option<String>,
-    #[serde(rename = "SeasonId", default)]
+    #[serde(rename = "SeasonId", alias = "seasonId", default)]
     pub(super) season_id: Option<String>,
     #[serde(rename = "SearchTerm", alias = "searchTerm", default)]
     pub(super) search_term: Option<String>,
     #[serde(
         rename = "StartIndex",
+        alias = "startIndex",
         default,
         deserialize_with = "deserialize_optional_i64"
     )]
     pub(super) start_index: Option<i64>,
     #[serde(
         rename = "Limit",
+        alias = "limit",
         default,
         deserialize_with = "deserialize_optional_i64"
     )]
     pub(super) limit: Option<i64>,
     #[serde(
         rename = "IsPlayed",
+        alias = "isPlayed",
         default,
         deserialize_with = "deserialize_optional_bool"
     )]
     pub(super) is_played: Option<bool>,
     #[serde(
         rename = "IsFavorite",
+        alias = "isFavorite",
         default,
         deserialize_with = "deserialize_optional_bool"
     )]
@@ -73,33 +87,36 @@ pub(super) struct EmbyItemsQuery {
         deserialize_with = "deserialize_optional_emby_timestamp"
     )]
     pub(super) min_date_last_saved: Option<i64>,
-    #[serde(rename = "Years", default)]
+    #[serde(rename = "Years", alias = "years", default)]
     pub(super) years: Option<String>,
     /// Emby separates several values with `|`; an item matches when it has any of them.
-    #[serde(rename = "Genres", default)]
+    #[serde(rename = "Genres", alias = "genres", default)]
     pub(super) genres: Option<String>,
-    #[serde(rename = "Studios", default)]
+    #[serde(rename = "Studios", alias = "studios", default)]
     pub(super) studios: Option<String>,
     #[serde(rename = "SortBy", alias = "sortBy", default)]
     pub(super) sort_by: Option<String>,
     #[serde(rename = "SortOrder", alias = "sortOrder", default)]
     pub(super) sort_order: Option<String>,
-    #[serde(rename = "Fields", default)]
+    #[serde(rename = "Fields", alias = "fields", default)]
     pub(super) fields: Option<String>,
     #[serde(
         rename = "GroupItems",
+        alias = "groupItems",
         default,
         deserialize_with = "deserialize_optional_bool"
     )]
     pub(super) group_items: Option<bool>,
     #[serde(
         rename = "EnableTotalRecordCount",
+        alias = "enableTotalRecordCount",
         default,
         deserialize_with = "deserialize_optional_bool"
     )]
     pub(super) enable_total_record_count: Option<bool>,
     #[serde(
         rename = "Recursive",
+        alias = "recursive",
         default,
         deserialize_with = "deserialize_optional_bool"
     )]
@@ -2063,7 +2080,7 @@ pub(super) async fn emby_catalog_items_for_user_with_preferred_source(
         if include_people && let Value::Object(object) = &mut value {
             let mut people = actors
                 .into_iter()
-                .map(|actor| emby_person_json(actor, &state.server_id))
+                .map(|actor| emby_credit_person_json(actor, &state.server_id))
                 .collect::<Vec<_>>();
             if let Some(nfo) = nfo.as_ref() {
                 people.extend(emby_nfo_crew_json(nfo));
@@ -2588,7 +2605,7 @@ pub(super) async fn emby_single_id_lookup_response(
         if let Value::Object(object) = &mut item_json {
             let mut people = actors
                 .into_iter()
-                .map(|actor| emby_person_json(actor, &state.server_id))
+                .map(|actor| emby_credit_person_json(actor, &state.server_id))
                 .collect::<Vec<_>>();
             if let Some(nfo) = nfo.as_ref() {
                 people.extend(emby_nfo_crew_json(nfo));
@@ -2893,7 +2910,11 @@ pub(super) async fn emby_delete_item(
     if let Err(status) = emby_access_principal(&auth_principal, None) {
         return status.into_response();
     }
-    delete_media_item(&headers, &state, &item_id, query.source_id.as_deref()).await
+    // Emby clients send the public item id (a decimal u128) and the public source id (32 hex for
+    // STRM sources); the deletion service needs the stored identifiers.
+    let item_id = emby_internal_id(&item_id);
+    let source_id = query.source_id.as_deref().map(emby_internal_source_id);
+    delete_media_item(&headers, &state, &item_id, source_id.as_deref()).await
 }
 
 #[derive(Deserialize)]
@@ -2930,21 +2951,50 @@ pub(super) struct EmbyPersonUpdateRequest {
     pub(super) taglines: Vec<String>,
 }
 
+/// `POST /Items/{Id}` serves two different Emby editors.
+///
+/// A `Person` item (or any id Lux only knows as a people-catalogue key rather than a media item
+/// uuid) keeps the existing person metadata update. Everything else is a `BaseItemDto` edit of a
+/// `Movie`/`Series`/`Season`/`Episode`; that body is much wider than the person one (it echoes
+/// `Genres`, `Studios`, `ProviderIds`, `People`, `LockData`, ...), so the body is parsed as raw
+/// JSON and only the editable fields are read.
 pub(super) async fn emby_update_item(
     headers: HeaderMap,
     Path(item_id): Path<String>,
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<ReadyAppState>,
-    Json(request): Json<EmbyPersonUpdateRequest>,
+    Json(body): Json<Value>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
+    let internal_id = emby_internal_id(&item_id);
+    match emby_item_update_target(&state, &item_id, &internal_id, &body).await {
+        Ok(EmbyItemUpdateTarget::Person) => {}
+        Ok(EmbyItemUpdateTarget::Media(current)) => {
+            return emby_update_media_item(
+                &auth_principal,
+                &headers,
+                &state,
+                &internal_id,
+                &body,
+                current.map(|current| *current),
+            )
+            .await;
+        }
+        Err(status) => return status.into_response(),
+    }
     let principal = match emby_access_principal(&auth_principal, None) {
         Ok(principal) => principal,
         Err(status) => return status.into_response(),
+    };
+    // Same rejection the `Json<EmbyPersonUpdateRequest>` extractor produced before the body type
+    // widened, so a malformed person edit keeps answering 422.
+    let request = match serde_json::from_value::<EmbyPersonUpdateRequest>(body) {
+        Ok(request) => request,
+        Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
     };
     if request.id != item_id {
         return StatusCode::BAD_REQUEST.into_response();
@@ -2995,6 +3045,316 @@ pub(super) async fn emby_update_item(
         .into_response(),
         Ok(None) | Err(PeopleError::InvalidComponent(_)) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+/// Whether the request body explicitly edits a `Person` item.
+///
+/// Emby clients echo the whole `BaseItemDto` back, so only an exact `Type: "Person"` (either
+/// spelling) routes to the person editor.
+fn emby_body_declares_person(body: &Value) -> bool {
+    emby_body_field(body, "Type", "type")
+        .and_then(Value::as_str)
+        .is_some_and(|item_type| item_type.trim().eq_ignore_ascii_case("Person"))
+}
+
+/// Whether the request body names a media item type (`Movie`, `Series`, `Season`, `Episode`, ...).
+fn emby_body_declares_media_type(body: &Value) -> bool {
+    emby_body_field(body, "Type", "type")
+        .and_then(Value::as_str)
+        .is_some_and(|item_type| normalize_emby_item_type(item_type).is_some())
+}
+
+/// Whether a path id can only be a media item identifier.
+///
+/// Lux exposes an item uuid as a decimal u128, and `Uuid::v7` values convert to integers far above
+/// `u64::MAX`, so a decimal wider than that is always a 128-bit public media id. A hyphenated uuid
+/// is the internal id. Small decimals are the legacy people-catalogue ids (`104`) that
+/// `emby_internal_id` maps onto uuid-shaped strings, and slugs are local person keys.
+fn emby_id_looks_like_media_item(item_id: &str) -> bool {
+    let item_id = item_id.trim();
+    if Uuid::parse_str(item_id).is_ok() {
+        return true;
+    }
+    match item_id.parse::<u128>() {
+        Ok(value) => value > u128::from(u64::MAX),
+        Err(_) => false,
+    }
+}
+
+/// Which Emby editor a `POST /Items/{Id}` request addresses.
+enum EmbyItemUpdateTarget {
+    Person,
+    /// A media item metadata edit. The payload is `None` when the id does not name a stored media
+    /// item: the media editor still runs its permission and body-`Id` checks before answering 404.
+    /// The row is boxed because it is much larger than the `Person` variant.
+    Media(Option<Box<crate::storage::StoredMediaMetadata>>),
+}
+
+/// Splits the single Emby `POST /Items/{Id}` endpoint between the person editor and the media item
+/// editor.
+///
+/// An explicit `Type` decides on its own. Without one the stored media item wins, and only when
+/// the id is not a media item at all does its shape decide: `emby_internal_id` also turns the
+/// people-catalogue id `104` into a valid uuid, and older clients post person bodies without a
+/// `Type`, so a uuid-shaped internal id alone cannot mean "media item". A hyphenated uuid or a
+/// decimal wider than `u64::MAX` can only be a media item, so those still reach the media editor
+/// (and its 403/404 answers), while a small decimal or a slug stays on the person editor.
+async fn emby_item_update_target(
+    state: &ReadyAppState,
+    item_id: &str,
+    internal_id: &str,
+    body: &Value,
+) -> Result<EmbyItemUpdateTarget, StatusCode> {
+    if emby_body_declares_person(body) {
+        return Ok(EmbyItemUpdateTarget::Person);
+    }
+    // Resolved once for both branches: the media editor reuses it instead of querying again.
+    let current = state
+        .database()
+        .find_media_item_metadata(internal_id)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    if current.is_some()
+        || emby_body_declares_media_type(body)
+        || emby_id_looks_like_media_item(item_id)
+    {
+        return Ok(EmbyItemUpdateTarget::Media(current.map(Box::new)));
+    }
+    Ok(EmbyItemUpdateTarget::Person)
+}
+
+/// Reads a field by its PascalCase name with the camelCase spelling as fallback.
+fn emby_body_field<'a>(body: &'a Value, pascal_case: &str, camel_case: &str) -> Option<&'a Value> {
+    body.get(pascal_case).or_else(|| body.get(camel_case))
+}
+
+/// Reads one editable Emby text field with partial-update semantics.
+///
+/// `Ok(None)` means the key was absent (keep the stored value), `Ok(Some(None))` is an explicit
+/// `null` (clear the field) and `Ok(Some(Some(value)))` carries the new text. A JSON value that is
+/// neither a string nor `null` cannot be a `BaseItemDto` text field, so it is a bad request.
+fn emby_optional_text_field(
+    body: &Value,
+    pascal_case: &str,
+    camel_case: &str,
+) -> Result<Option<Option<String>>, StatusCode> {
+    match emby_body_field(body, pascal_case, camel_case) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(value)) => Ok(Some(Some(value.clone()))),
+        Some(_) => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+/// Reads `ProductionYear` with the same presence rules as [`emby_optional_text_field`].
+fn emby_optional_year_field(
+    body: &Value,
+    pascal_case: &str,
+    camel_case: &str,
+) -> Result<Option<Option<i32>>, StatusCode> {
+    match emby_body_field(body, pascal_case, camel_case) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(value) => match value.as_i64().and_then(|year| i32::try_from(year).ok()) {
+            Some(year) => Ok(Some(Some(year))),
+            None => Err(StatusCode::BAD_REQUEST),
+        },
+    }
+}
+
+/// Resolves the lock request of an Emby `BaseItemDto` on top of the locks already stored on the
+/// item.
+///
+/// Emby's own item DTO always serializes `LockData: false` with `LockedFields: []`, and it never
+/// reports the locks an administrator set in Lux, so an echoed DTO must not be able to unlock
+/// them. Field locks are therefore only ever additive from this endpoint:
+///
+/// - `LockData: true` is Emby's "lock everything" and wins over `LockedFields`, so all four
+///   editable fields are locked whatever field list the client sent.
+/// - Otherwise a `LockedFields` list is unioned with the stored locks: a client that cannot see an
+///   existing `overview` lock must not silently drop it when it saves a `Name`/`ProductionYear`
+///   edit, and the same list never removes a lock either.
+/// - A missing, empty or entirely unmodelled list keeps the stored locks unchanged.
+///
+/// Emby's `MetadataFields` enum is longer than the set Lux tracks (`Genres`, `Tags`, `Studios`,
+/// `Cast`, `OfficialRating`, ...). Those members are accepted and dropped: Lux never overwrites
+/// them automatically, so refusing the whole edit over an unmodelled lock would only break stock
+/// clients.
+fn emby_locked_metadata_fields(
+    body: &Value,
+    stored: &BTreeSet<MetadataField>,
+) -> Result<BTreeSet<MetadataField>, StatusCode> {
+    let lock_data = match emby_body_field(body, "LockData", "lockData") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(lock_data)) => Some(*lock_data),
+        Some(_) => return Err(StatusCode::BAD_REQUEST),
+    };
+    let requested = match emby_body_field(body, "LockedFields", "lockedFields") {
+        None => BTreeSet::new(),
+        Some(Value::Array(entries)) => entries
+            .iter()
+            .filter_map(Value::as_str)
+            .filter_map(emby_locked_metadata_field)
+            .collect::<BTreeSet<_>>(),
+        Some(_) => return Err(StatusCode::BAD_REQUEST),
+    };
+    if lock_data == Some(true) {
+        return Ok([
+            MetadataField::Title,
+            MetadataField::OriginalTitle,
+            MetadataField::Overview,
+            MetadataField::ProductionYear,
+        ]
+        .into_iter()
+        .collect());
+    }
+    if requested.is_empty() {
+        return Ok(stored.clone());
+    }
+    Ok(stored.union(&requested).copied().collect())
+}
+
+fn emby_locked_metadata_field(name: &str) -> Option<MetadataField> {
+    let name = name.trim();
+    if name.eq_ignore_ascii_case("Name") || name.eq_ignore_ascii_case("Title") {
+        Some(MetadataField::Title)
+    } else if name.eq_ignore_ascii_case("OriginalTitle") {
+        Some(MetadataField::OriginalTitle)
+    } else if name.eq_ignore_ascii_case("Overview") {
+        Some(MetadataField::Overview)
+    } else if name.eq_ignore_ascii_case("ProductionYear") || name.eq_ignore_ascii_case("Year") {
+        Some(MetadataField::ProductionYear)
+    } else {
+        None
+    }
+}
+
+/// The locks already stored on the item, the base an Emby edit can only extend.
+fn stored_locked_metadata_fields(raw: Option<&str>) -> BTreeSet<MetadataField> {
+    raw.and_then(|raw| serde_json::from_str::<BTreeSet<MetadataField>>(raw).ok())
+        .unwrap_or_default()
+}
+
+/// Maps a metadata write failure to the bare status code Emby clients expect.
+///
+/// Emby answers these edits with a status only, so the Lux JSON error body (and its message) is
+/// not reused here. The mapping matches `/api/v1/items/{id}/metadata`: a missing item is 404,
+/// invalid metadata is 400, a path outside the library root is 403, an oversized NFO is 413 and an
+/// NFO Lux refuses to parse or rewrite is 422. Only storage, I/O and concurrent-modification
+/// failures stay retryable 503s.
+fn emby_metadata_write_status(error: NfoWriteError) -> StatusCode {
+    match error {
+        NfoWriteError::ItemNotFound => StatusCode::NOT_FOUND,
+        NfoWriteError::InvalidMetadata(_) => StatusCode::BAD_REQUEST,
+        NfoWriteError::PathOutsideRoot(_) | NfoWriteError::SymlinkTarget(_) => {
+            StatusCode::FORBIDDEN
+        }
+        NfoWriteError::Nfo(NfoError::TooLarge) | NfoWriteError::TooLarge(_) => {
+            StatusCode::PAYLOAD_TOO_LARGE
+        }
+        NfoWriteError::Nfo(
+            NfoError::TooManyEvents
+            | NfoError::FieldTooLarge
+            | NfoError::DocTypeNotAllowed
+            | NfoError::Unbalanced
+            | NfoError::Xml(_),
+        )
+        | NfoWriteError::InvalidXml(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        NfoWriteError::Nfo(NfoError::Io(_))
+        | NfoWriteError::Io { .. }
+        | NfoWriteError::Storage(_)
+        | NfoWriteError::ConcurrentModification(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+/// `POST /Items/{Id}` for a media item (`Movie`, `Series`, `Season`, `Episode`, ...).
+///
+/// The Emby `BaseItemDto` body is a partial update: a missing key keeps the stored value, while an
+/// explicit `null` clears the optional fields. Unknown keys are ignored, because clients echo
+/// fields Lux does not model. `current` is the row the caller already resolved for the routing
+/// decision (and is `None` when the id does not name a media item).
+async fn emby_update_media_item(
+    auth_principal: &crate::auth::users::AuthenticationPrincipal,
+    headers: &HeaderMap,
+    state: &ReadyAppState,
+    internal_id: &str,
+    body: &Value,
+    current: Option<crate::storage::StoredMediaMetadata>,
+) -> Response {
+    if !auth_principal.can_manage_server() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !body.is_object() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    // The body echo of `Id` is optional, but when a client sends one it has to name this item.
+    if let Some(requested_id) = emby_body_field(body, "Id", "id").and_then(Value::as_str)
+        && emby_internal_id(requested_id) != internal_id
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some(current) = current else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let title = match emby_body_field(body, "Name", "name") {
+        None => current.title.clone(),
+        Some(Value::String(name)) => name.clone(),
+        Some(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let original_title = match emby_optional_text_field(body, "OriginalTitle", "originalTitle") {
+        Ok(None) => current.original_title.clone(),
+        Ok(Some(value)) => value,
+        Err(status) => return status.into_response(),
+    };
+    let overview = match emby_optional_text_field(body, "Overview", "overview") {
+        Ok(None) => current.overview.clone(),
+        Ok(Some(value)) => value,
+        Err(status) => return status.into_response(),
+    };
+    let production_year = match emby_optional_year_field(body, "ProductionYear", "productionYear") {
+        Ok(None) => current
+            .production_year
+            .and_then(|year| i32::try_from(year).ok()),
+        Ok(Some(value)) => value,
+        Err(status) => return status.into_response(),
+    };
+    let locked_fields = match emby_locked_metadata_fields(
+        body,
+        &stored_locked_metadata_fields(current.locked_fields_json.as_deref()),
+    ) {
+        Ok(fields) => fields,
+        Err(status) => return status.into_response(),
+    };
+    let writes = state.metadata_writes();
+    match writes
+        .write_partial_item_metadata(
+            internal_id,
+            MetadataWriteRequest {
+                title,
+                original_title,
+                overview,
+                production_year,
+                locked_fields,
+            },
+        )
+        .await
+    {
+        Ok(_) => {
+            // Same audit event the Lux metadata endpoint records, tagged with the Emby origin.
+            record_audit_event(
+                state,
+                headers,
+                "METADATA_EDITED",
+                Some("item"),
+                Some(internal_id),
+                r#"{"source":"emby_item_update"}"#,
+            )
+            .await;
+            // Emby answers a successful media item edit with 204 No Content.
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => emby_metadata_write_status(error).into_response(),
     }
 }
 
@@ -3239,7 +3599,7 @@ pub(super) async fn emby_item_response(
             {
                 let mut people = actors
                     .into_iter()
-                    .map(|actor| emby_person_json(actor, &state.server_id))
+                    .map(|actor| emby_credit_person_json(actor, &state.server_id))
                     .collect::<Vec<_>>();
                 if let Some(nfo) = nfo.as_ref() {
                     people.extend(emby_nfo_crew_json(nfo));
@@ -3378,6 +3738,20 @@ pub(super) fn emby_person_json(
     server_id: &str,
 ) -> Value {
     emby_person_json_with_fields(actor, server_id, None)
+}
+
+/// A cast credit inside a media item. Emby's `BaseItemPerson.Type` is the
+/// credit type (`Actor`), not the person item type (`Person`); the standalone
+/// `/Persons` entries keep using [`emby_person_json`].
+pub(super) fn emby_credit_person_json(
+    actor: crate::application::people::ActorView,
+    server_id: &str,
+) -> Value {
+    let mut value = emby_person_json(actor, server_id);
+    if let Value::Object(object) = &mut value {
+        object.insert("Type".to_owned(), json!("Actor"));
+    }
+    value
 }
 
 pub(super) fn emby_person_json_with_fields(
@@ -3763,6 +4137,17 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
     }
     if let Some(tag) = item.wallpaper_image_tag.as_ref() {
         image_tags.insert("Wallpaper".to_owned(), json!(tag));
+    }
+    if let Some(tag) = item
+        .fanart_image_tags
+        .first()
+        .or(item.fanart_image_tag.as_ref())
+    {
+        // Emby exposes the first backdrop through `ImageTags` as well as the
+        // full list in `BackdropImageTags`. Filmly derives its backdrop tag
+        // from `ImageTags["Backdrop"]`, so an item without this key renders no
+        // background even though `BackdropImageTags` is populated.
+        image_tags.insert("Backdrop".to_owned(), json!(tag));
     }
     let parent_id = emby_public_id(item.parent_id.as_deref().unwrap_or(&item.library_id));
     let child_count = match item.item_type.as_str() {

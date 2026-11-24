@@ -1562,6 +1562,11 @@ COMPATIBILITY.md 是唯一兼容性事实来源。不能因为实现了官方 Sw
 - Years、Genres、Tags 等筛选辅助端点。（Years、Genres、Studios、OfficialRatings 已实现，见 `docs/COMPATIBILITY.md`；Tags 已由 LUX-900 的 TAG 投影提供，Lux 原生 `GET /api/v1/tags` 与 Emby `/Tags` 读取同一数据；`/Items` 的标签筛选仍未实现。）
 - Collections 与合集成员。
 - 多版本选择所需的 AlternateSources 等端点。
+- 管理员任务、条目刷新、识别（RemoteSearch）与远程图片端点，仅在目标客户端确有依赖时实现。
+  （**已因 Yamby/Hills 实现**：Yamby 2.1.0.11 的条目菜单与“管理服务器”面板会点
+  `POST /Items/{id}/Refresh`、`POST /Items/RemoteSearch/*`、`GET /Items/{id}/RemoteImages`、
+  `GET /ScheduledTasks` 与 `POST /ScheduledTasks/Running/{id}`，Hills 1.11.0 另有媒体库列表与删除；
+  LUX-916/917 实现了前者，媒体库删除与服务器重启/日志仍缺，见 `docs/COMPATIBILITY.md`。）
 - Sessions WebSocket 或实时消息，仅在目标客户端确有依赖时实现。（**已因 Yamby 实现**：Yamby 2.1.0.11 的「服务器状态」页固定连接 `/embywebsocket` 并依赖 `Sessions`/`ScheduledTasksInfo` 推送，失败后无退避重连，见 `docs/COMPATIBILITY.md` 的 LUX-891 一节与 `docs/reviews/2026-11-06-hills-yamby-static-analysis.md` §9.6。其余实时消息类型仍按"仅在有依赖时实现"处理。）
 - 图片变体、尺寸和索引端点。
 
@@ -1721,6 +1726,7 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 - 账户设置可调整首页媒体库顺序；顺序按用户持久化到服务端，并同步用于 Web 与 Emby 兼容视图。
 - 管理员可以在服务器设置中开启“媒体库顺序强制按照管理员排序”。普通用户的个人设置默认开启“按照管理员顺序排序”；开启时使用管理员账号的首页媒体库顺序，关闭后可以使用自己的顺序。服务器强制项开启后，普通用户的该项始终有效且不可取消，Web 与 Emby 兼容视图都必须使用管理员顺序。
 - 媒体库列表：类型、年份、已看、收藏筛选；名称、最近添加、发行日期、评分排序。
+- “最近添加”排序中，剧集使用自身入库时间与其最新可播放分集入库时间中的较新者：剧集新增分集后会重新排到媒体库列表最前，已移除或文件缺失的分集不参与；电影、季和分集仍按各自入库时间排序。Lux 与 Emby 使用同一排序语义。
 - 搜索结果。
 - 演员搜索结果可进入人物详情；人物详情显示当前用户有权限访问的全部参演电影和剧集，分
   页加载并按发行日期倒序。分集出演关系聚合为所属剧集，同一剧集只展示一次。
@@ -2968,6 +2974,7 @@ services:
 
 - 类型、年份、已看、收藏筛选。
 - 名称、最近添加、发行日期、评分排序；评分为空的条目稳定排在有评分条目之后。
+- “最近添加”按剧集自身与最新可用分集中较新的入库时间排序，新增分集使该剧集回到列表最前；该键同时用于 Lux 列表与 Emby `SortBy=DateCreated`。
 - Lux 和 Emby 查询语义映射。
 
 验证：组合筛选测试。
@@ -20706,8 +20713,9 @@ LUX-890 合并后的去重与 P3 修正（2026-11-06）：
   `LibraryChanged` 等不推送（客户端对这些类型本就忽略）。若将来某个客户端依赖它们，需要另开任务。
 - 推送是"按客户端要求的间隔轮询现有应用服务"，不是事件驱动：最小间隔 1 s，因此最多 1 s 的额外延迟；
   每次推送还会做一次 token 校验（一次或两次数据库读），在 32 条连接、1 s 间隔的上限下属于可接受量级。
-- `ScheduledTasksInfo` 只有一个 `RefreshMediaLibrary` 任务项（与 HTTP 端点一致），不是 Emby 的完整任务
-  列表；`Sessions` 条目来自 Lux 的现有投影，没有为 WebSocket 增加字段。
+- `ScheduledTasksInfo` 只有一个扫描任务项（与 HTTP 端点一致），不是 Emby 的完整任务列表；`Sessions` 条目
+  来自 Lux 的现有投影，没有为 WebSocket 增加字段。该任务项的 `Key` 自 LUX-916 起为 `RefreshLibrary`
+  （原 `RefreshMediaLibrary`，改名原因见 COMPATIBILITY.md 的 LUX-916/917 小节）。
 - 空闲超时依赖客户端回应心跳 ping（Yamby 用 OkHttp，读取线程会自动回 pong）；如果某个客户端完全不读
   连接，120 s 后会被关闭——这是有意的资源保护。
 
@@ -21720,6 +21728,486 @@ content light level）只出现在帧级 side data，`-show_streams` 的 `side_d
 - [x] 相关 `cargo test --locked --test library catalog::`、`--lib` 过滤、fmt、clippy 通过。
 
 预计文件：`src/api/media.rs`、`src/application/catalog.rs`、`tests/library/catalog.rs`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`、`docs/TEST-TARGETS.md`。
+
+#### LUX-910：候选搜索失败提示真实原因
+
+状态：已完成（2026-11-15，提交 `aff4aaba`）。依赖：无。验证：`--lib reidentify::` 51/51、`--test metadata metadata_api::` 10/10、
+`--test reidentify` 25/25、`--lib legacy::tests::` 57/57、`--lib scraper::tests::` 1/1、fmt、
+`clippy --all-targets --all-features -D warnings`、`check-migration-parity.py`、`check-backend-branches.py` 通过。
+
+背景：管理员在详情页点「元数据匹配 → 搜索候选」时，只要刮削器这一层没有可用结果，接口一律返回
+`503 PLUGIN_UNAVAILABLE` 和「刮削器暂时不可用，请稍后重试」。插件未安装、被停用、配置未完成、进程崩溃、
+调用超时、上游 401/429/网络不通全部长成同一句话，日志也只有 `error_kind=SCRAPER_UNAVAILABLE`，无法判断
+该去插件库、检查代理还是等一会儿再试。项目所有者要求提示实际原因。
+
+范围：
+
+- 新增宿主自有的 `ScraperFailureCause`（`src/application/scraper.rs`）：从 `ScraperError` 与
+  `docs/PLUGIN-SDK.md` §5.4 的稳定插件错误码分类，输出固定原因码。插件 `error.message`（可能含上游 URL
+  或 API Key）永不进入响应体或日志字段；未知插件错误码保持笼统分类。
+- `MetadataCandidateError` 新增 `ScraperFailed(Vec<ScraperAttemptFailure>)`（每条带 scraper ID、插件显示名、
+  原因）、`ScraperNotConfigured` 和 `VideoItemUnsupported`。手动候选搜索按来源收集全部失败，不再只保留
+  最后一个错误；媒体库没有可用刮削器（含宿主未配置占位）与 VIDEO 家庭视频条目单独区分。
+- 管理 API 按原因返回：配置类 `409 PLUGIN_UNAVAILABLE`（未安装 / 已停用 / 配置未完成 / 不支持
+  `metadata.search` / 上游鉴权失败 / 无该媒体类型）、家庭视频 `409 INVALID_REQUEST`、瞬态类
+  `503 PLUGIN_UNAVAILABLE`（超时 / 进程退出 / 启动失败 / 无法解析 / 上游不可达 / 限流 / 内部错误）、
+  数据库 `503 DATABASE_UNAVAILABLE`。消息为宿主文案，插件显示名取自 catalog manifest。
+- 失败日志新增 `failure_reason` 与 `scraper_id`；`error_kind` 保留并新增 `SCRAPER_NOT_CONFIGURED`。
+  后台任务诊断复用同一分类，插件上报码从笼统的 `PLUGIN_REPORTED_ERROR` 细化为具体 `PLUGIN_REPORTED_*`。
+
+不做：不新增 HTTP 错误码、不改数据库与迁移、不改插件协议与 Web 组件（匹配对话框继续显示 `error.message`）。
+
+验收：
+
+- [x] 分类覆盖宿主错误与全部文档化插件错误码，且不输出插件文本
+  （`scraper_failure_cause_names_the_real_reason_without_plugin_text`）。
+- [x] 媒体库没有可用刮削器时返回 `409 PLUGIN_UNAVAILABLE` 并说明原因
+  （`candidate_search_names_the_missing_scraper_instead_of_a_generic_outage`）。
+- [x] 每个失败来源都带 scraper ID 与原因（`manual_candidate_search_reports_each_failed_scraper`）。
+- [x] 家庭视频条目返回 `409 INVALID_REQUEST`（`manual_candidate_search_rejects_home_video_items`）。
+- [x] 每个原因的状态码、错误码与文案由 `metadata_candidate_errors_name_the_real_scraper_cause` 固定，
+  `PLUGIN_UNAVAILABLE` 与 `DATABASE_UNAVAILABLE` 不混用。
+- [x] `docs/API.md` 记录候选搜索失败的状态码、消息与日志字段。
+- [x] 相关测试、fmt、clippy、迁移与后端分支检查通过。
+- [ ] 未验证：真实 `org.lux.tmdb` 插件在 fnOS 上返回 `PLUGIN_RATE_LIMITED` / `PLUGIN_AUTH_FAILED` 的端到端
+  提示（需要所有者环境）。
+
+预计文件：`src/application/scraper.rs`、`src/application/candidates.rs`、`src/application/reidentify.rs`、
+`src/application/plugins.rs`、`src/api/admin/admin_metadata.rs`、`src/api/legacy.rs`、
+`tests/metadata/metadata_api.rs`、`docs/API.md`、`docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-911：图片搜索空结果说明原因
+
+状态：已完成（2026-11-15，提交 `7a959ddb`）。依赖：LUX-910 的 `ScraperFailureCause`。验证：`--test images` 67/67、
+`pnpm --dir web test` 1619/1619、`pnpm --dir web build`、fmt、`clippy --all-targets --all-features -D warnings`
+通过。
+
+背景：管理员给「黑暗荣耀」搜徽标，结果为空，界面却仍显示搜索前的提示「选择语言和来源后搜索徽标。」，
+无法判断是没搜到、被语言过滤掉还是刮削器坏了。实际链路是插件先按请求语言取图，宿主再按
+`image_language_matches` 过滤一次；仅当原语言模式开启时才保留原语言/英语/无语言图片。徽标多为韩语或英语，
+默认「简体中文」下会被宿主全部丢弃，而空列表与「还没搜索」在 Web 上长得一样。另外家庭视频等条目类型静默
+返回空列表，图片搜索的刮削器失败仍返回笼统的 `503 INTERNAL`「刮削器暂时不可用」。
+
+范围：
+
+- `ImageCandidateService::search` 返回 `ImageSearchOutcome`：匹配图片、语言过滤前的刮削器语言码
+  `available_languages`（小写、排序、去重、最多 8 个）和 `filtered_by_language` 计数。不增加上游请求。
+- 条目类型不是电影/剧集/季/集时返回 `ImageCandidateError::ItemNotScrapable`（409 `INVALID_REQUEST`
+  「家庭视频和其他本地条目不支持在线图片搜索」），不再用空列表冒充成功。
+- `POST /api/v1/items/{itemId}/images/search` 响应新增 `availableLanguages` 与 `filteredByLanguage`；
+  `images` 上限 50 不变。
+- 图片搜索的刮削器失败复用 LUX-910 的原因分类与日志/文案，并新增 `ScraperRequestKind` 让「不支持能力」
+  区分「不支持元数据搜索 / 不支持图片搜索」；错误码从 `INTERNAL` 改为 `PLUGIN_UNAVAILABLE`。
+- Web 图像编辑器区分「未搜索」和「搜索后为空」：空结果按诊断显示
+  「没有「简体中文」的徽标；刮削器返回的徽标是 en / ko，可以换成「不限语言」或其他语言再搜索。」
+  之类的原因；切换语言/来源时，只要该图片类型搜索过就自动重搜（原实现仅在已有结果时才重搜，空结果会卡住）。
+
+不做：不改变图片语言匹配语义、不自动放宽语言过滤、不新增 HTTP 错误码、不改数据库与插件协议。
+
+验收：
+
+- [x] 简体中文搜徽标返回空时给出 en/ko 语言列表和过滤计数
+  （`logo_search_reports_the_languages_it_filtered_out`）。
+- [x] 不限语言能拿到 ko/en 徽标且 `filteredByLanguage` 为 0（同上）。
+- [x] 家庭视频条目返回 `409 INVALID_REQUEST` 并说明原因（同上）。
+- [x] 空结果提示不再是搜索前占位文案，且包含可用语言
+  （Web `explains why image search came back empty instead of repeating the pre-search hint`）。
+- [x] `docs/API.md` 记录响应字段与错误语义；`docs/TEST-TARGETS.md` 更新计数。
+- [x] `cargo test --locked --test images`、`pnpm --dir web test`、`pnpm --dir web build`、fmt、clippy 通过。
+- [ ] 未验证：真实 TMDb 上「黑暗荣耀」的徽标语言分布（需要所有者环境与出网）。本任务只保证 Lux 能如实
+  报告过滤情况，不宣称上游存在某种语言的徽标。
+
+预计文件：`src/application/images.rs`、`src/api/media.rs`、`src/api/admin/admin_metadata.rs`、
+`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/src/features/media/MediaImageEditor.tsx`、
+`tests/images/image_api.rs`、`web/tests/media-editors.test.tsx`、`docs/API.md`、`docs/TEST-TARGETS.md`、
+`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-912：带版本标签的季目录写回剧集级元数据
+
+状态：已完成（2026-11-15，提交 `fe623a24`）。依赖：LUX-883 的 `Season N <标签>` 季目录。验证：
+`--lib application::metadata` 31/31、`--test metadata metadata_selection::` 50/50、
+`--test metadata scanned_series_metadata::` 3/3、`--test metadata series_metadata::` 6/6、
+`--test images image_writer::` 21/21、`--lib application::images` 36/36、fmt、
+`clippy --all-targets --all-features -D warnings` 通过。
+
+背景：`Season 1 DV`、`Season 1 HDR`、`Season1 SDR` 这类同季多版本目录在扫描阶段已经合并成一个剧集
+（LUX-883），但元数据写回用的是另一套季目录判断（`src/application/metadata.rs` 的 `is_season_directory`），
+只认 `Season N`、`SN`、`Specials` 和 `Season N (数字)`。于是 `series_directory` 找不到季目录并返回 `None`，
+剧集级 `tvshow.nfo` 与海报写回都被判成 `PathOutsideRoot`（403 `NFO_PATH_OUTSIDE_ROOT` /
+`IMAGE_PATH_OUTSIDE_ROOT`「元数据路径不在媒体根目录内」）。同一个 helper 也用于本地元数据读取，带标签目录里
+已有的 `tvshow.nfo` 和剧集图片同样被跳过；集与季的写回不受影响。
+
+范围：
+
+- `src/application/metadata.rs` 的 `series_directory` 改用扫描器的 `parse_season_directory`，删除重复的
+  `is_season_directory`，让扫描、写回和本地读取共用同一套季目录规则。
+- `parse_season_directory` 从 `pub(super)` 提为 `pub(crate)`，由 `application::scanner` 以
+  `pub(crate) use` 重导出，避免两套规则再次漂移。
+- 行为对齐扫描器：`Season 1 DV`、`S01 HDR`、`Season 1 国语` 算季目录；`Season 1DV`、`Season 1 Part Two`、
+  `Season DV`、`Extras` 仍不算。集和季的写回路径不变。
+
+不做：不改变季目录标签的语义与多版本合并规则（LUX-883 已定），不改数据库、API 与 Web，不迁移旧版已经
+拆成多个条目的库。
+
+验收：
+
+- [x] `series_directory` 对带标签季目录返回剧集目录
+  （`series_directory_stops_at_a_labelled_season_directory`）。
+- [x] `Season 1 DV` 下选择剧集候选能写出 `tvshow.nfo`，且不会凭空创建 `Season 01`
+  （`series_selection_writes_tvshow_nfo_when_the_season_directory_has_a_version_label`）。
+- [x] 既有集/季写回与本地 NFO/图片读取用例全部通过（`metadata_selection::`、`scanned_series_metadata::`、
+  `series_metadata::`、`image_writer::`）。
+- [ ] 未验证：真实 115 挂载上对既有剧集重新刮削（需要所有者环境）。本任务只保证路径推导正确。
+
+预计文件：`src/application/metadata.rs`、`src/application/scanner.rs`、`src/application/scanner/names.rs`、
+`tests/metadata/metadata_selection.rs`、`docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-913：图片搜索按来源说明空结果
+
+状态：已完成（2026-11-15，提交 `483b484f`）。原编号 LUX-912 与并发登记的「带版本标签的季目录写回剧集级
+元数据」重号，按登记顺序改为 LUX-913。依赖：LUX-911。验证：`--test images` 67/67、`--lib images::tests::`、
+`pnpm --dir web test` 1620/1620、`pnpm --dir web build`、fmt、`clippy --all-targets --all-features -D warnings` 通过。
+
+背景：LUX-911 之后仍有一类空结果无法解释——把语言改成「不限语言」、来源改成「不限来源」仍然没有徽标。
+两个真实原因此前都不可见：
+
+- 豆瓣插件（`Lux-plugins` 的 `lux-plugin-douban.rs`）的 `image_payload` 只返回一张 `Primary` 海报，
+  不提供 `Logo`/`Backdrop`/`Thumb`，所以豆瓣库的徽标搜索永远是空；
+- 图片请求原先固定发给媒体库顺序里的第一个刮削器，但 provider ID 取自条目保存的命名空间。两者不一致时
+  （例如条目按 TMDb 匹配、媒体库首位是豆瓣），请求会带着 TMDb ID 去问豆瓣，或反之。
+
+范围：
+
+- `ImageSearchOutcome` 增加 `available_image_types`（`POSTER`/`LOGO`/`BACKDROP`，来自本次响应，不额外
+  请求）和 `source`（实际应答的刮削器显示名，取自插件清单；无解析器时用 provider key）。
+- 图片搜索按条目 provider ID 的命名空间选择已配置刮削器：`Tmdb` → `tmdb` 插件、`Douban` → `douban`
+  插件；没有匹配时退回媒体库顺序第一位（`pick_scraper_index` 单测固定）。条目不是电影/剧集/季/集时
+  仍返回 `ItemNotScrapable`。
+- API 响应新增 `availableImageTypes` 与 `source`；Web 空结果按优先级解释：语言过滤 → 来源没有该图片类型
+  （例如「「豆瓣元数据插件」没有返回这个条目的徽标（它返回了海报）」）→ 来源没有返回任何在线图片。
+- 不改变图片语言匹配语义、不新增错误码、不改数据库与插件协议；豆瓣插件补齐徽标需要在 `Lux-plugins` 仓库另立任务。
+
+验收：
+
+- [x] 图片搜索按 provider 命名空间选择刮削器（`image_search_uses_the_scraper_that_owns_the_stored_provider_id`）。
+- [x] 响应包含 `availableImageTypes` 与 `source`（`logo_search_reports_the_languages_it_filtered_out`）。
+- [x] Web 能指出「来源只返回海报」，并点名插件
+  （Web `names a source that only returns posters instead of leaving the logo search unexplained`）。
+- [x] `docs/API.md` 记录两个新字段与来源选择规则。
+- [x] 相关 Rust/Web 测试、fmt、clippy 通过。
+- [ ] 未验证：真实豆瓣库与真实 TMDb 库上的端到端表现（需要所有者环境）；豆瓣插件本身不支持徽标，
+  本任务只保证 Lux 如实说明。
+
+预计文件：`src/application/images.rs`、`src/api/media.rs`、`web/src/lib/api/types.ts`、
+`web/src/features/media/MediaImageEditor.tsx`、`tests/images/image_api.rs`、`web/tests/media-editors.test.tsx`、
+`docs/API.md`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-914：Emby 查询参数大小写兼容
+
+状态：已完成（2026-11-16，提交 `6ac1a8bd`）。依赖：无。验证：`--test emby` 92/92、`--test emby query_case::` 7/7、
+`--test emby -- --list` 92 例 / 17 个模块、fmt、`clippy --all-targets --all-features -D warnings` 通过。
+
+背景：标准 Emby 是 ASP.NET，查询字符串绑定不区分大小写，客户端因此各有各的拼写。Hills/Yamby 发
+PascalCase（`ParentId`/`IncludeItemTypes`/`Limit`），Entryway 1.0.18 的 Emby 适配层
+（`02-反编译/entryway-phone/1.0.18/jadx/sources/defpackage/zy5.java` 的 `@jx7` 参数名，浏览入口
+`defpackage/px5.java` 的 `zy5.c0`）发 camelCase（`parentId`/`includeItemTypes`/`limit`/`startIndex`/
+`fields`）。Lux 的 Emby 查询结构体只有 serde `rename`，camelCase 键被**静默丢弃**：`/Users/{userId}/Items`
+因此丢掉媒体库范围、类型过滤和分页——媒体库页退化成「全服所有库混在一起、电影格里混进剧集、翻页无效」，
+而且返回 200，客户端无从判断。Entryway 此前只被记录为「未适配」，本任务把它固化成合同。
+
+范围（只加 camelCase 别名，不改既有拼写、路由、默认值或错误码）：
+
+- `EmbyItemsQuery`（`src/api/emby_catalog.rs`）：`parentId`、`ids`、`includeItemTypes`、`excludeItemTypes`、
+  `seasonId`、`startIndex`、`limit`、`isPlayed`、`isFavorite`、`years`、`genres`、`studios`、`fields`、
+  `groupItems`、`enableTotalRecordCount`、`recursive`。该结构体是 `/Items`、`/Users/{id}/Items` 及
+  `Resume`/`Latest`/`NextUp`、`/Shows/{id}/Episodes`、`/Shows/{id}/Seasons`、`/Items/{id}/Children` 共用的
+  查询类型，一处改动覆盖全部列表端点。
+- `EmbySimilarQuery`（`src/api/emby_similar.rs`）：`fields`、`limit`、`imageTypeLimit`、`enableImageTypes`
+  （Entryway 的 `Items/{id}/Similar` 带 `limit`/`fields`；此前 `limit` 被忽略，`limit=-1` 不再是 400）。
+- `EmbyTokenQuery`（`src/api/emby_handlers.rs`）：`fields`，用于 `GET /Items/{id}` 与
+  `GET /Users/{userId}/Items/{id}` 的详情投影。
+- `ResumeVisibilityQuery`（`src/api/emby_resume_visibility.rs`）：`hide`（此前只认 `Hide=`，小写被当成没给，
+  直接 400）。
+- 校验规则逐端点保持原样：`limit=0` 的计数语义、`limit>1000`/`startIndex=-1`/`startIndex=abc` 的 400、
+  空 `Limit=`（LUX-888）按未提供处理，两种拼写对同一请求必须返回逐字节相同的响应。
+
+不做：不支持**任意**大小写（全大写 `PARENTID` 仍不识别，serde 别名只能枚举拼写，本任务只补客户端实际会发
+的 camelCase）；不改 JSON 请求体字段名（`Username`/`Pw`/`Hide` 等，客户端发的就是 PascalCase）；不改
+`/Shows/{id}/Episodes` 的季过滤语义（该端点的季作用域在 LUX-915 核实本来生效，本任务只补别名），也不补
+Entryway 会用到的 `MediaSegments`、`QuickConnect` 等缺失端点。
+
+验收：
+
+- [x] 16 组 camelCase/PascalCase 参数对同一请求返回逐字节相同的响应，根路径与 `/emby` 前缀各一遍
+  （`item_list_accepts_camel_case_query_parameters`）。
+- [x] `parentId` + `includeItemTypes` 真正把列表缩小到目标库与目标类型，不再跨库
+  （`camel_case_parent_id_and_type_filter_scope_the_list`）。
+- [x] `limit`/`startIndex` 三页覆盖全集；`limit=2001`、`startIndex=-1`、`startIndex=abc` 仍 400
+  （`camel_case_paging_parameters_page_and_validate`）。
+- [x] `fields` 控制列表与详情的投影（`camel_case_fields_selects_the_list_projection`、
+  `item_detail_accepts_camel_case_fields`），`Similar` 的 `limit`/`fields` 等价且 `limit=-1` 仍 400
+  （`similar_accepts_camel_case_limit_and_fields`）。
+- [x] `hide=`/`Hide=` 都能隐藏继续观看（`hide_from_resume_accepts_camel_case_hide`）。
+- [x] `cargo test --locked --test emby` 92 passed、0 failed；fmt 与 clippy 全 target 通过。
+- [x] `docs/COMPATIBILITY.md` 记录分级、范围与剩余缺口；`docs/TEST-TARGETS.md` 三处计数闭合。
+- [ ] 未验证：Entryway 1.0.18 / TV 1.0.17 真机 APK 上重测媒体库页与翻页（需要所有者设备）。本任务只保证
+  Lux 侧按 Emby 的大小写不敏感语义解析参数。
+
+预计文件：`src/api/emby_catalog.rs`、`src/api/emby_similar.rs`、`src/api/emby_handlers.rs`、
+`src/api/emby_resume_visibility.rs`、`tests/emby/query_case.rs`、`tests/emby/main.rs`、
+`docs/COMPATIBILITY.md`、`docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-915：`Shows/{seriesId}/Episodes` 季作用域核实
+
+状态：已完成（2026-11-16，提交 `72907db2`）。依赖：LUX-914（`seasonId` 别名）。验证：
+`--test emby emby_season_scope::` 8/8、`--test emby` 100/100、`--test emby -- --list` 100 例 /
+18 个模块、fmt、`clippy --all-targets --all-features -D warnings` 通过。
+
+背景：LUX-914 记录把「`/Shows/{id}/Episodes` 对 `SeasonId` 的过滤在两种拼写下都被忽略」写成了遗留缺口。
+复核后这句话是错的。季过滤一直在 `ApplicationCatalog::list_series_episodes` 里（`mi.parent_id = ?`），
+先前的实测现象来自 `emby_show_episodes` 的 VidHub 兼容分支：季 id 解析不到时
+（`Err(CatalogError::LibraryNotFound) if season_id.is_some()`）去掉季选择器重取整剧，理由是库重扫后客户端
+可能留着旧选择器，不该把页面清空。真正缺的只有 camelCase 别名，已由 LUX-914 补上。
+
+范围：
+
+- 不改产品行为：合法季 id 继续按季过滤；空值、`null`、`undefined` 继续按「没选季」；失效或跨剧的季 id
+  继续回退到本剧全集（VidHub 兼容，本次把它写成测试合同，避免以后被误判成 bug 改掉）。
+- 新增 `tests/emby/emby_season_scope.rs`（`tests/emby/main.rs` 追加 `mod emby_season_scope;`）8 例：
+  无选择器返回整剧、合法 `SeasonId` 分季、`seasonId` 与 `SeasonId` 等价、空/占位值回退、失效 id 回退、
+  季内分页与季集数总数、跨剧季 id 不泄漏、`/emby` 前缀一致。
+- 修正 `docs/COMPATIBILITY.md` 的 LUX-914 小节里那句错误推断，并新增 LUX-915 小节。
+
+不做：不改季过滤的 SQL 与兼容回退策略；不新增 `SeasonIndex` 之类的季号选择器；不补缺失端点。
+
+验收：
+
+- [x] 合法 `SeasonId` 只返回该季的集，`TotalRecordCount` 是季内集数
+  （`season_id_scopes_the_episode_list`）。
+- [x] `seasonId` 与 `SeasonId` 返回同一份列表且都真的过滤（`season_id_accepts_camel_case`）。
+- [x] 空值/`null`/`undefined` 按没选季处理，不返回空页（`blank_season_selector_means_every_season`）。
+- [x] 失效季 id 回退到整剧，两种拼写一致（`stale_season_id_falls_back_to_the_whole_show`）。
+- [x] 季内分页与总数正确（`season_scope_and_paging_combine`）；跨剧季 id 不泄漏别的季的集
+  （`season_id_from_another_show_does_not_leak_episodes`）；根路径与 `/emby` 一致
+  （`season_scope_is_the_same_under_the_emby_prefix`）。
+- [x] `cargo test --locked --test emby` 100 passed、0 failed；fmt 与 clippy 全 target 通过。
+- [ ] 未验证：Entryway 真机上传的 `seasonId` 是季条目 id 还是季号（静态看是 `px5.K` 的 `str2` 位置参数）。
+  若某些路径传季号，Lux 会回退到整剧，客户端需自行过滤；这需要真机抓包确认。
+
+预计文件：`tests/emby/emby_season_scope.rs`、`tests/emby/main.rs`、`docs/COMPATIBILITY.md`、
+`docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-916：Emby 管理员任务端点与条目刷新语义
+
+状态：已完成（2026-11-18）。依赖：无。验证：`--test emby emby_admin_tasks::` 5/5、`--test emby` 111/111、
+fmt、`clippy --all-targets --all-features -D warnings` 通过。
+
+背景：Yamby 2.1.0.11 的管理员“扫描/刷新元数据”与任务面板分别落在 `POST /Items/{id}/Refresh` 和
+`GET+POST /ScheduledTasks*` 上。Lux 此前只实现了一部分，并且两处语义不成立：普通电影/剧集的
+`/Items/{id}/Refresh` 返回 404，`MetadataRefreshMode`/`ReplaceAll*` 参数被静默丢弃；扫描任务的 `Key`
+是 `RefreshMediaLibrary`，而 Yamby 的 `ScheduledTasksInfo.m4370()` 用 `Collection.contains` 精确比对
+`markers`/`RefreshLibrary`/`RefreshChapterImages`/`RestartPlugins`，旧键名会让任务面板为空。
+
+范围：
+
+- `src/api/emby_handlers.rs`：扫描任务的 `Key` 改为 `RefreshLibrary`、`Id` 保持
+  `lux-refresh-media-library`（`EMBY_SCAN_TASK_KEY`/`EMBY_SCAN_TASK_ID`）；新增
+  `POST /ScheduledTasks/Running/{taskId}`，管理员启动唯一扫描任务（等同 `POST /Library/Refresh` 的排队/复用
+  逻辑，抽成 `queue_all_library_scans`），成功 204、未知任务 404、普通用户 403；`POST /Items/{id}/Refresh`
+  读取 `MetadataRefreshMode`/`ImageRefreshMode`/`ReplaceAllMetadata`/`ReplaceAllImages`（PascalCase 与
+  camelCase），全量刷新入队条目元数据任务（202 + `scope: ITEM_METADATA`），其余走文件系统扫描并新增
+  `scope: ITEM_FOLDER`（媒体源所在文件夹）；`Recursive=false` 仍 422，既有 `FOLDER`/`LIBRARY_ROOT` 语义不变。
+- `src/api/emby.rs`：注册 `POST /ScheduledTasks/Running/{task_id}` 与 `DELETE /Items/{item_id}/Delete`。
+- `src/api/emby_catalog.rs`：删除处理器先把公共条目 id（十进制 u128）与 `MediaSourceId`（STRM 的 32 位
+  十六进制）还原为内部标识；此前合法删除请求会返回 400。
+- `src/api/admin.rs`：导出 `metadata_reidentify_job_json`，让 Emby 适配层复用同一个作业 DTO。
+- `tests/emby/emby_admin_tasks.rs`（新模块，5 例）：任务键与启动、重复启动复用活动任务、未知任务/普通用户、
+  全量刷新入队元数据任务、默认模式走条目文件夹扫描、`/Delete` 别名删除。
+
+不做：不实现 `POST /System/Restart`、`System/Logs`、`ActivityLog/Entries`、`Library/VirtualFolders` 的删除；
+不按 Hills 字符串表里的 `RefreshMetadataMode` 分流（不是 Emby 参数，抓包无法证明用途）；不改
+`/Library/Refresh` 的 202 body。
+
+验收：
+
+- [x] `GET /emby/ScheduledTasks` 的任务 `Key` 为 `RefreshLibrary`，且该 `Id` 可被
+  `POST /emby/ScheduledTasks/Running/{id}` 启动，返回 204（`scan_task_key_is_startable_and_queues_every_enabled_library`）。
+- [x] 启动任务为每个启用库排队全库校验，重复启动不重复排队；未知任务 404，普通用户 403
+  （`scan_task_start_rejects_unknown_tasks_and_non_administrators`）。
+- [x] `MetadataRefreshMode=FullRefresh` + `ReplaceAll*` 入队 `FULL_REFRESH` 元数据任务并返回
+  `scope: ITEM_METADATA`（`item_refresh_full_refresh_queues_a_metadata_job`）。
+- [x] `MetadataRefreshMode=Default` 只做条目所在文件夹的增量扫描（`scope: ITEM_FOLDER`，不创建元数据任务）
+  （`item_refresh_default_mode_scans_the_item_folder`）。
+- [x] `DELETE /emby/Items/{id}/Delete` 返回 204 并删除媒体文件，未知条目 404，普通用户 403
+  （`item_delete_accepts_the_emby_delete_suffix`）。
+- [x] `cargo test --locked --test emby` 111 passed、0 failed；fmt 与 clippy 全 target 通过。
+- [ ] 未验证：Yamby/Hills 真机上按钮点击后的完整 UI 反馈（需要所有者设备）。
+
+预计文件：`src/api/emby.rs`、`src/api/emby_handlers.rs`、`src/api/emby_catalog.rs`、`src/api/admin.rs`、
+`tests/emby/emby_admin_tasks.rs`、`tests/emby/main.rs`、`docs/API.md`、`docs/COMPATIBILITY.md`、
+`docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-917：Emby 识别与远程图片端点
+
+状态：已完成（2026-11-18）。依赖：LUX-916（公共 id 还原、管理员鉴权模式）。验证：
+`--test emby emby_admin_media::` 6/6、`--lib emby_admin_media` 3/3、`--test emby` 111/111、fmt、clippy 通过。
+
+背景：Yamby 的“识别”与“编辑图片”分别使用 `POST /Items/RemoteSearch/{Movie|Series}` +
+`POST /Items/RemoteSearch/Apply/{id}`、`GET /Items/{id}/RemoteImages` + `/RemoteImages/Download` +
+`DELETE /Items/{id}/Images/{Type}/{Index}/Delete`（Hills 1.11.0 的字符串表同样包含这些路径）。Lux 已有
+候选搜索/选择、图片候选搜索与图片写回服务，缺的只是 Emby 协议层。
+
+范围：
+
+- 新模块 `src/api/emby_admin_media.rs`（`src/api/legacy.rs` 注册 `mod emby_admin_media`）：
+  `POST /Items/RemoteSearch/{type}`（解析 `RemoteSearchQuery`，返回 `RemoteSearchResult[]`，带 `ProviderIds`
+  时匹配候选置顶）、`POST /Items/RemoteSearch/Apply/{itemId}`（按候选 id → provider id → 重新搜索的顺序解析，
+  选中复用 `select_metadata_candidate`，成功 204）、`GET /Items/{id}/RemoteImages`（Emby 图片类型映射到 Lux
+  的 POSTER/BACKDROP/LOGO/THUMB/BANNER/DISC/ART，分页限幅）、`POST /Items/{id}/RemoteImages/Download`、
+  `DELETE /Items/{id}/Images/{Type}/{Index}/Delete`（按类型与序号定位已存储图片）。
+- `src/api/emby.rs`：注册上述五条路由（JSON body 上限 64 KiB）。
+- 错误映射沿用应用服务：未知条目 404、非法请求 400、视频/家庭视频条目 422、库无可用刮削器 409、
+  刮削器失败 503；配置问题不会伪装成“没有候选”的空数组。
+- `tests/emby/emby_admin_media.rs`（新模块，6 例）：识别鉴权/未知条目/空标题/非法类型/无刮削器 409；Apply
+  未知候选与未知条目 404；RemoteImages 类型校验与未识别条目冲突态；Download body 校验；图片删除的类型/
+  序号解析与缺失 404。模块内另有 3 例单元测试覆盖 DTO 映射、图片类型双向映射与 provider id 匹配。
+
+不做：不实现条目自由字段编辑（`POST /Items/{id}` 对电影/剧集仍只处理 `Person`，需要独立的 Lux 元数据
+编辑用例与 NFO 写回设计）；不实现 `Library/VirtualFolders` 的增删；不新增 Lux 侧端点（Emby 适配层只调用
+既有应用服务）。
+
+验收：
+
+- [x] 识别端点要求管理员，未知条目 404，空标题/非法类型 400，库无刮削器 409
+  （`remote_search_validates_the_client_and_the_item`）。
+- [x] 非管理员访问识别、Apply、RemoteImages 一律 403（`remote_search_rejects_non_administrators`）。
+- [x] Apply 对未知候选与未知条目返回 404（`remote_search_apply_rejects_unknown_candidates`）。
+- [x] RemoteImages 校验图片类型，未识别条目返回 409/503 而不是空数组
+  （`remote_images_validate_type_and_item`）。
+- [x] Download 缺 URL 或类型非法返回 400（`remote_image_download_validates_the_body`）。
+- [x] 删除图片按类型与序号定位，非法序号/类型 400，无图片 404（`image_delete_maps_type_and_index`）。
+- [x] `RemoteSearchResult` 的字段名与 Emby 一致（`remote_search_result_uses_the_emby_field_names`）。
+- [x] `cargo test --locked --test emby` 111 passed、0 failed；fmt 与 clippy 全 target 通过。
+- [ ] 未验证：Yamby/Hills 真机上的识别结果列表、图片选择与删除流程；当前只固定服务端合同。
+
+预计文件：`src/api/emby_admin_media.rs`、`src/api/emby.rs`、`src/api/legacy.rs`、
+`tests/emby/emby_admin_media.rs`、`tests/emby/main.rs`、`docs/API.md`、`docs/COMPATIBILITY.md`、
+`docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-918：互补合并同片 `movie.nfo` 与 `<片名>.nfo` 的演员身份并稳固本地演员索引
+
+状态：已完成（2026-11-24，本机 `arm64` 验证；`fnos` 实机部署未验证）。依赖：LUX-178（跨 provider 规范人物）、LUX-188（可恢复人物索引重建）、
+LUX-841（`<video>.nfo` 优先与防串片保护）。验证：`--test metadata` 166/166、`--test scanned_metadata` 23/23、`--test emby search::` 3/3、`--lib` 2057 passed / 41 ignored / 0 failed（其中 `application::people` 57/57、`application::nfo` 34/34、`application::metadata` 28/28）、`cargo fmt --all -- --check`、`cargo build --locked`、`check-migration-parity.py` 与 `check-backend-branches.py` 均通过；`--all-targets` 在 `--test auth_users` 的 `resume_favorites::resume_thresholds_and_favorite_played_endpoints_share_user_state` 因宿主机环境存在代理变量（`networkProxy.configured == true`）失败而未跑完后续目标，`cargo clippy --locked --all-targets --all-features -- -D warnings` 因 `rustc 1.100.0` 对既有代码的新增 lint（`result_large_err`、`chunks_exact_to_as_chunks`、`single_element_loop`）报错 33 处（均非本任务新增逻辑）。
+
+背景：
+
+- 本地 NFO 解析目前在同个 `<actor>` 同时出现多个 provider ID 标签（如 `<tmdbid>` 与 `<imdbid>`）时会用后
+  出现的标签覆盖前者，并把 `ActorCredit.identities` 置空，导致同片可桥接的多源身份丢失；电影 NFO 写回也
+  只写出单个 provider ID。
+- 当电影目录同时存在 `<片名>.nfo` 与 `movie.nfo` 时，LUX-841 只读取 `<片名>.nfo`，导致其中一方缺失的
+  演员 ID（或条目级外部 ID）无法从同片另一份 NFO 互补补齐。
+- 没有任何 provider ID 的演员目前通过 `local_actor_id(name, character)` 按“姓名 + 角色”哈希生成
+  `local-*`，同一演员在不同影片饰演不同角色会在搜索中分裂为多条；同时部分已有 `person_identities` 映射
+  的 `person_credits` 行因历史同步遗漏 `lux_person_id` 为空。
+
+范围：
+
+- `src/application/nfo.rs`：
+  - 解析 `<actor>` 时保留全部合法的 `<tmdbid>`、`<doubanid>`、`<imdbid>` 到 `ActorCredit.identities`
+    （去重排序，主 `(provider, id)` 按 `tmdb > douban > imdb` 确定），电影 NFO 写回保留全部已支持
+    `identities`。
+  - 新增同片 NFO 校验与互补合并助手：仅当 `<片名>.nfo`（主）与同目录 `movie.nfo`（辅）确认描述同一部
+    影片时（外部 ID 无冲突且至少匹配一个外部 ID，或外部 ID 无冲突且规范化片名一致、年份不冲突），用
+    `movie.nfo` 互补补齐缺失的条目 `provider_ids` 以及同片演员缺失的 `identities`/主 ID/角色/排序；两
+    份 NFO 描述不同影片时绝不合并（保留 LUX-841 防串片约束）。
+- `src/application/metadata.rs`：
+  - 电影读取 `<片名>.nfo` 时若同目录存在 `movie.nfo`，将双文件纳入文件指纹与语义缓存指纹，并在同片校
+    验通过后执行互补合并；目录内 `movie.nfo` 变更时也触发同目录电影条目局部增量重读。
+- `src/application/people/helpers.rs`、`src/application/people/rebuild.rs`、
+  `src/application/people/service.rs`：
+  - `local_actor_id` 仅按规范化姓名生成稳定的 `local-*` ID，不再混入 `character`。
+  - 人物索引重建任务对旧格式（`identities` 为空但有非 `local-*` `id` 与 `provider`）也查询
+    `person_identities` 并回填 `lux_person_id`，同时将 `PERSON_INDEX_REBUILD_SCHEMA_VERSION` 递增到 `2`，
+    使存量库重启后自动重建 `person_credits`。
+
+不做：不新增后台在线抓取 TMDb/豆瓣人物 `birthday` / `external_ids` 任务；不新增管理员手动合并两个
+`lux-*` 规范人物接口；不修改数据库表结构（不新增 migration）；不改变不同影片间跨 provider 自动合并条件。
+
+验收：
+
+- [x] `<actor>` 同时包含 `<tmdbid>`、`<imdbid>`、`<doubanid>` 时解析保留全部 `identities` 且写回不丢失（`nfo_writer::movie_nfo_parser_preserves_multiple_actor_provider_ids_and_writes_them_back`）。
+- [x] 同目录同时存在 `<片名>.nfo` 与 `movie.nfo` 且为同一部影片时，两者缺失的演员 ID 与条目外部 ID 互补
+  合并；若 `movie.nfo` 描述不同影片（标题或外部 ID 冲突），绝不合并（`nfo_writer::complementary_movie_nfo_merge_supplements_actor_ids_only_for_same_film`、`metadata::movie_enrichment_complementarily_merges_same_film_movie_nfo_and_per_file_nfo`）。
+- [x] 修改 `movie.nfo` 或 `<片名>.nfo` 任一文件，电影重新扫描/增量刷新后 `people.json` 与 `person_credits`
+  都会更新；单文件场景保持现有指纹跳过逻辑（`metadata::movie_enrichment_complementarily_merges_same_film_movie_nfo_and_per_file_nfo`）。
+- [x] 无 provider ID 的本地演员在不同电影饰演不同角色时使用同一个 `local-*` ID，人物搜索聚合为一条且
+  人物详情页可列出全部参演影片（`people_api::local_actors_without_provider_id_merge_across_roles_and_rebuild_backfills_identities`）。
+- [x] `PERSON_INDEX_REBUILD_SCHEMA_VERSION` 升至 `2` 后，索引重建能重算 `local-*` 并从 `person_identities`
+  回填缺失的 `lux_person_id`（`people_api::local_actors_without_provider_id_merge_across_roles_and_rebuild_backfills_identities`）。
+- [x] 相关单元测试与 `--test metadata`、`--test scanned_metadata`、`--lib` 校验、fmt 与脚本校验通过；`clippy` 既有存量告警与 `auth_users` 宿主机代理环境干扰已如实记录。
+- [ ] 未验证：部署到 `fnos` 实机并执行扫描/重启重建后的线上人物数量收敛结果。
+
+预计文件：`src/application/nfo.rs`、`src/application/metadata.rs`、`src/application/people/helpers.rs`、
+`src/application/people/rebuild.rs`、`src/application/people/service.rs`、`tests/metadata/nfo_writer.rs`、
+`tests/metadata/metadata.rs`、`tests/metadata/people_api.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-919：规范人物合并、多身份碰撞自动收敛与管理员合并接口
+
+状态：已完成（2026-11-24）。依赖：LUX-178（跨 provider 规范人物）、LUX-188（人物索引重建）、
+LUX-918（NFO 多源演员身份解析与双 NFO 互补合并）。
+
+背景：
+
+- 现有库中（如 `fnos` 实测）同一演员已分别以 `tmdb`、`imdb`、`douban` 建成了不同的 `lux-*` 规范人物
+  （例如沈腾 `lux-002286` 与 `lux-005709`）。
+- 目前 `resolve_person_key_with_mapped_identities`（`relations.rs`）与索引重建 `person_credits_from_relation_with_lookup`
+  （`rebuild.rs`）在遇到单个演员的多条 `identities` 分属不同 `lux-*` 时会直接放弃归属（返回 `None`），
+  既不会自动合并，也缺乏将两个已建好的 `lux-*` 人物合并的存储原语与管理员端点。
+
+范围：
+
+- `src/storage/people.rs`：
+  - 新增 `choose_preferred_canonical_person` 与 `merge_canonical_person`（含事务/savepoint 变体供
+    `CanonicalPersonBatch` 复用）：按 `tmdb` 身份优先、其次高 `person_credits` 计数、再次较小 `lux-*`
+    ID 选定主记录，把源 `lux-*` 的 `person_identities`、`person_credits.lux_person_id`、
+    `user_person_state`（保留收藏并取较新更新时间）、`emby_migration_person_favorites`、
+    `person_match_candidates` 引用迁移到目标人物，将源 `people.status` 置为 `MERGED` 并清理其
+    `person_manifest_index_state`。
+- `src/application/people/service.rs`、`src/application/people/matching.rs`：
+  - 新增 `PeopleService::merge_canonical_people` 与合并清单同步助手：将源人物头像（目标缺图时）、缺失
+    元数据字段、别名、`identities` 与 `MANUAL_MERGE` / `AUTO_MULTI_IDENTITY_MERGE` 事件同步写入目标
+    `person.json` / `person.nfo` 与 `people/index/*.json`；在源 `person.json` 记录可向后兼容的可选
+    `mergedIntoPersonId` 并清空其 `identities`。
+  - 将 `PERSON_INDEX_REBUILD_SCHEMA_VERSION` 递增到 `3`，并在 `restore_person_manifests` 中避免把已标记
+    `mergedIntoPersonId` 的人物重新恢复为 `ACTIVE`。
+- `src/application/people/helpers.rs`、`src/application/people/relations.rs`、`src/application/people/rebuild.rs`、`src/storage/people.rs`、`src/api/legacy.rs`：
+  - 当演员的 `identities` 映射到 2 个及以上活跃 `lux-*` 人物时，不再放弃归属，而是自动选定主记录并将
+    其余碰撞人物合并到主记录（支持批量扫描页事务与索引重建）。
+  - 在索引重建中增加本地人物 ID 算法升级的兼容迁移：`legacy_local_actor_id(name, character)` 对无显式
+    ID 的关系记录推导旧 `local-*` ID，分批将 `user_person_state` 旧收藏迁移到新版 `local_actor_id(name)`，
+    并把旧 `people/index/*.json`、`people/` 或 `people/profiles/` 头像索引平滑衔接到新 ID；同时对齐
+    `lux_get_person`/`lux_set_person_favorite` 收藏键与 `person.lookup_id`（兼容回退 `person.id`）。
+- `src/api/admin/admin_people.rs`：
+  - 新增 `POST /api/v1/admin/people/merge`（管理员 + CSRF，支持 `sourcePersonId`、`targetPersonId`、
+    `evidence`，记录 `PEOPLE_MERGED` 审计事件；同人/已合并返回 409，非法输入返回 400，不存在返回 404）。
+
+不做：不新增后台在线请求 TMDb `external_ids` / `birthday` 任务（留给后续任务）；不基于纯姓名自动合并无共
+同 ID 的 `local-*` 或同源同名人物（防止误并同名不同人）；不新增数据库 migration。
+
+验收：
+
+- [x] `merge_canonical_people` 将源 `lux-*` 的身份映射、`person_credits.lux_person_id`、用户收藏与
+  头像/简介迁移到目标 `lux-*`，源人物标为 `MERGED`，且重启清单恢复不会将已合并源人物重新激活。
+- [x] 当同一个演员携带多个 provider ID（例如 `tmdb` + `imdb`）且分别已属不同 `lux-*` 时，入库持久化
+  和人物索引重建都会自动选主合并，最终在搜索与详情中收敛为 1 条。
+- [x] 本地人物 ID 算法升级重建时自动迁移旧 `local-*` 的 `user_person_state` 收藏与已上传头像/索引资产，
+  收敛后搜索、详情收藏态及头像请求保持可用（`people_api::rebuilding_people_migrates_legacy_local_actor_favorites_and_assets_after_id_algorithm_change`）。
+- [x] `POST /api/v1/admin/people/merge` 校验管理员与 CSRF、迁移状态并写审计事件，对非法/自合并/已合并/
+  缺失人物返回对应 400/409/404。
+- [x] 相关单测、`--test metadata`、`--lib` 校验、fmt 与脚本校验通过。
+- [ ] 未验证：部署到 `fnos` 实机并触发 `rebuild`/手动合并接口检查线上人物收敛与权限行为。
+
+预计文件：`src/storage/people.rs`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/application/people/service.rs`、`src/application/people/helpers.rs`、`src/application/people/matching.rs`、`src/application/people/relations.rs`、`src/application/people/rebuild.rs`、`src/api/admin/admin_people.rs`、`src/api/legacy.rs`、`tests/metadata/people_api.rs`、`docs/LUX-DEVELOPMENT.md`。
 
 ## 31. 参考资料
 

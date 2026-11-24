@@ -15,7 +15,7 @@ use crate::storage::{
 
 /// Bumped whenever the derived row shape or its inputs change, so a read model written by an older
 /// build is rebuilt instead of trusted.
-const READ_MODEL_SCHEMA_VERSION: i64 = 2;
+const READ_MODEL_SCHEMA_VERSION: i64 = 3;
 
 /// Watermark name for the `catalog_items` rebuild; its presence means the read model is complete.
 /// The name carries [`READ_MODEL_SCHEMA_VERSION`], so watermarks from older builds are ignored.

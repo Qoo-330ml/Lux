@@ -1,5 +1,6 @@
 use super::*;
 use crate::application::metadata::NfoError;
+use crate::application::scraper::ScraperFailureCause;
 
 pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new()
@@ -37,8 +38,12 @@ pub(super) fn api_routes() -> Router<ReadyAppState> {
             get(admin_list_item_images),
         )
         .route(
-            "/api/v1/admin/items/{item_id}/images/{image_id}",
-            delete(admin_delete_item_image),
+            "/api/v1/admin/items/{item_id}/images/{image_type}",
+            put(admin_upload_item_image)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    crate::application::images::MAX_MANUAL_ITEM_IMAGE_BYTES as usize,
+                ))
+                .delete(admin_delete_item_image),
         )
         .route(
             "/api/v1/admin/libraries/{library_id}/refresh-local-metadata",
@@ -70,8 +75,11 @@ pub(crate) struct MetadataCandidateQuery {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MetadataCandidateSearchRequest {
-    pub(crate) query: String,
+    #[serde(default)]
+    pub(crate) query: Option<String>,
     pub(crate) year: Option<i32>,
+    #[serde(default)]
+    pub(crate) provider_ids: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -802,8 +810,14 @@ pub(crate) async fn admin_search_item_candidates(
         .into_response();
     }
     let metadata_reidentify = state.metadata_reidentify();
+    let provider_ids = (!request.provider_ids.is_empty()).then_some(&request.provider_ids);
     match metadata_reidentify
-        .search_item_candidates(&item_id, &request.query, request.year)
+        .search_item_candidates_with_provider_ids(
+            &item_id,
+            request.query.as_deref(),
+            request.year,
+            provider_ids,
+        )
         .await
     {
         Ok(page) => {
@@ -874,6 +888,55 @@ pub(crate) async fn admin_list_item_images(
             image_write_error(&headers, error)
         }
     }
+}
+
+pub(crate) async fn admin_upload_item_image(
+    headers: HeaderMap,
+    Path((item_id, image_type)): Path<(String, String)>,
+    State(state): State<ReadyAppState>,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if item_id.parse::<crate::domain::ids::ItemId>().is_err() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体条目 ID 无效",
+        )
+        .into_response();
+    }
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let images = require_service!(state.image_writes);
+    let report = match images
+        .upload_item_image(&item_id, &image_type, content_type, &body)
+        .await
+    {
+        Ok(report) => report,
+        Err(error) => return image_write_error(&headers, error),
+    };
+    let image = match images.list_item_images(&item_id).await {
+        Ok(images) => images.into_iter().find(|image| image.id == report.id),
+        Err(error) => return image_write_error(&headers, error),
+    };
+    let Some(image) = image else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    record_audit_event(
+        &state,
+        &headers,
+        "IMAGE_UPLOADED",
+        Some("item_image"),
+        Some(&image.id),
+        &json!({ "itemId": item_id, "imageType": image.image_type }).to_string(),
+    )
+    .await;
+    Json(json!({ "image": item_image_json(&item_id, &image) })).into_response()
 }
 
 pub(crate) async fn admin_delete_item_image(
@@ -1192,6 +1255,13 @@ pub(crate) fn image_write_error(headers: &HeaderMap, error: ImageWriteError) -> 
             "该图片正在下载，请稍后重试",
         )
         .into_response(),
+        ImageWriteError::TooLarge { .. } => api_error(
+            headers,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            lux::ApiErrorCode::InvalidRequest,
+            "图片不能超过 5 MiB",
+        )
+        .into_response(),
         _ => api_error(
             headers,
             StatusCode::BAD_REQUEST,
@@ -1272,6 +1342,13 @@ pub(crate) fn image_candidate_error(headers: &HeaderMap, error: ImageCandidateEr
             "媒体条目尚未完成元数据匹配，暂时无法搜索图片",
         )
         .into_response(),
+        ImageCandidateError::ItemNotScrapable => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "该条目类型没有在线图片：家庭视频和其他本地条目不支持在线图片搜索",
+        )
+        .into_response(),
         ImageCandidateError::InvalidItem
         | ImageCandidateError::InvalidImageType(_)
         | ImageCandidateError::InvalidLanguage
@@ -1282,13 +1359,15 @@ pub(crate) fn image_candidate_error(headers: &HeaderMap, error: ImageCandidateEr
             "图片搜索请求无效",
         )
         .into_response(),
-        ImageCandidateError::Scraper(_) => api_error(
+        // Image search talks to the same scraper layer as metadata search, so it reports the same
+        // concrete cause instead of one generic "scraper unavailable" line.
+        ImageCandidateError::Scraper(error) => scraper_failure_response(
             headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::Internal,
-            "刮削器暂时不可用",
-        )
-        .into_response(),
+            ScraperFailureCause::from_error(&error),
+            None,
+            1,
+            ScraperRequestKind::ImageSearch,
+        ),
         ImageCandidateError::Storage(_) => api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1504,6 +1583,9 @@ pub(crate) fn metadata_reidentify_error(
             .into_response()
         }
         MetadataReidentifyError::Candidate(MetadataCandidateError::Scraper(_))
+        | MetadataReidentifyError::Candidate(MetadataCandidateError::ScraperFailed(_))
+        | MetadataReidentifyError::Candidate(MetadataCandidateError::ScraperNotConfigured)
+        | MetadataReidentifyError::Candidate(MetadataCandidateError::VideoItemUnsupported)
         | MetadataReidentifyError::Scraper(_)
         | MetadataReidentifyError::Selection(_)
         | MetadataReidentifyError::SelectionUnavailable
@@ -1526,6 +1608,7 @@ pub(crate) enum MetadataCandidateFailureKind {
     InvalidSearch,
     InvalidCandidateJson,
     ScraperUnavailable,
+    ScraperNotConfigured,
     StorageUnavailable,
 }
 
@@ -1536,6 +1619,7 @@ impl MetadataCandidateFailureKind {
             Self::InvalidSearch => "INVALID_SEARCH",
             Self::InvalidCandidateJson => "INVALID_CANDIDATE_JSON",
             Self::ScraperUnavailable => "SCRAPER_UNAVAILABLE",
+            Self::ScraperNotConfigured => "SCRAPER_NOT_CONFIGURED",
             Self::StorageUnavailable => "STORAGE_UNAVAILABLE",
         }
     }
@@ -1550,8 +1634,64 @@ pub(crate) fn metadata_candidate_failure_kind(
         MetadataCandidateError::InvalidCandidateJson(_) => {
             MetadataCandidateFailureKind::InvalidCandidateJson
         }
-        MetadataCandidateError::Scraper(_) => MetadataCandidateFailureKind::ScraperUnavailable,
+        MetadataCandidateError::Scraper(_) | MetadataCandidateError::ScraperFailed(_) => {
+            MetadataCandidateFailureKind::ScraperUnavailable
+        }
+        MetadataCandidateError::ScraperNotConfigured
+        | MetadataCandidateError::VideoItemUnsupported => {
+            MetadataCandidateFailureKind::ScraperNotConfigured
+        }
         MetadataCandidateError::Storage(_) => MetadataCandidateFailureKind::StorageUnavailable,
+    }
+}
+
+/// Shown when the item has no online metadata source: no library scraper, or the host's
+/// unconfigured placeholder.
+const NO_SCRAPER_CONFIGURED_MESSAGE: &str =
+    "该媒体库还没有可用的元数据刮削器，请先在「插件库」安装并启用刮削器，再在媒体库设置里选择它";
+
+/// The stable reason code and scraper id of a failed candidate search.
+///
+/// The code is host-owned (never a plugin message), so it is safe in a log line; the id names the
+/// plugin the administrator has to look at.
+struct MetadataCandidateFailureDetail<'a> {
+    reason: &'static str,
+    scraper_id: &'a str,
+}
+
+fn metadata_candidate_failure_detail(
+    error: &MetadataCandidateError,
+) -> MetadataCandidateFailureDetail<'_> {
+    match error {
+        MetadataCandidateError::Scraper(error) => MetadataCandidateFailureDetail {
+            reason: ScraperFailureCause::from_error(error).as_str(),
+            scraper_id: "",
+        },
+        MetadataCandidateError::ScraperFailed(failures) => {
+            let first = failures.first();
+            MetadataCandidateFailureDetail {
+                reason: first.map_or("SCRAPER_UNAVAILABLE", |failure| failure.cause.as_str()),
+                scraper_id: first.map_or("", |failure| failure.scraper_id.as_str()),
+            }
+        }
+        MetadataCandidateError::ScraperNotConfigured => MetadataCandidateFailureDetail {
+            reason: "NO_SCRAPER_CONFIGURED",
+            scraper_id: "",
+        },
+        MetadataCandidateError::VideoItemUnsupported => MetadataCandidateFailureDetail {
+            reason: "VIDEO_ITEM_UNSUPPORTED",
+            scraper_id: "",
+        },
+        MetadataCandidateError::Storage(_) => MetadataCandidateFailureDetail {
+            reason: "STORAGE_ERROR",
+            scraper_id: "",
+        },
+        MetadataCandidateError::ItemNotFound
+        | MetadataCandidateError::InvalidSearch
+        | MetadataCandidateError::InvalidCandidateJson(_) => MetadataCandidateFailureDetail {
+            reason: "",
+            scraper_id: "",
+        },
     }
 }
 
@@ -1560,10 +1700,13 @@ pub(crate) fn metadata_candidate_error(
     error: MetadataCandidateError,
 ) -> Response {
     let failure_kind = metadata_candidate_failure_kind(&error);
+    let failure = metadata_candidate_failure_detail(&error);
     let request_id = header_str(headers, "x-request-id").unwrap_or("unknown");
     tracing::warn!(
         event = "metadata_candidate_request_failed",
         error_kind = failure_kind.as_str(),
+        failure_reason = failure.reason,
+        scraper_id = failure.scraper_id,
         request_id = %request_id,
         "metadata candidate request failed"
     );
@@ -1590,11 +1733,41 @@ pub(crate) fn metadata_candidate_error(
             "候选数据损坏",
         )
         .into_response(),
-        MetadataCandidateError::Scraper(_) => api_error(
+        MetadataCandidateError::Scraper(error) => scraper_failure_response(
             headers,
-            StatusCode::SERVICE_UNAVAILABLE,
+            ScraperFailureCause::from_error(&error),
+            None,
+            1,
+            ScraperRequestKind::MetadataSearch,
+        ),
+        MetadataCandidateError::ScraperFailed(failures) => match failures.first() {
+            Some(first) => scraper_failure_response(
+                headers,
+                first.cause,
+                first.label.as_deref(),
+                failures.len(),
+                ScraperRequestKind::MetadataSearch,
+            ),
+            None => api_error(
+                headers,
+                StatusCode::CONFLICT,
+                lux::ApiErrorCode::PluginUnavailable,
+                NO_SCRAPER_CONFIGURED_MESSAGE,
+            )
+            .into_response(),
+        },
+        MetadataCandidateError::ScraperNotConfigured => api_error(
+            headers,
+            StatusCode::CONFLICT,
             lux::ApiErrorCode::PluginUnavailable,
-            "刮削器暂时不可用，请稍后重试",
+            NO_SCRAPER_CONFIGURED_MESSAGE,
+        )
+        .into_response(),
+        MetadataCandidateError::VideoItemUnsupported => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "家庭视频条目不支持在线元数据匹配",
         )
         .into_response(),
         MetadataCandidateError::Storage(_) => api_error(
@@ -1604,6 +1777,147 @@ pub(crate) fn metadata_candidate_error(
             "数据库暂时不可用",
         )
         .into_response(),
+    }
+}
+
+/// Whether the failed scraper call was a metadata search or an image search.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ScraperRequestKind {
+    MetadataSearch,
+    ImageSearch,
+}
+
+impl ScraperRequestKind {
+    fn unsupported_capability(self) -> &'static str {
+        match self {
+            Self::MetadataSearch => "不支持元数据搜索",
+            Self::ImageSearch => "不支持图片搜索",
+        }
+    }
+}
+
+/// Maps one stable scraper failure cause to the status, error code and message an administrator
+/// sees, naming the plugin when the host knows its display name.
+fn scraper_failure_response(
+    headers: &HeaderMap,
+    cause: ScraperFailureCause,
+    label: Option<&str>,
+    failed_sources: usize,
+    kind: ScraperRequestKind,
+) -> Response {
+    let source = scraper_source_label(label);
+    let (status, code, message) = match cause {
+        ScraperFailureCause::Storage => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "数据库暂时不可用".to_owned(),
+        ),
+        ScraperFailureCause::PluginNotInstalled => (
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::PluginUnavailable,
+            format!("元数据刮削器{source}未安装，请到「插件库」安装"),
+        ),
+        ScraperFailureCause::PluginDisabled => (
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::PluginUnavailable,
+            format!("元数据刮削器{source}已停用或不可用，请到「插件库」检查"),
+        ),
+        ScraperFailureCause::PluginConfigInvalid => (
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::PluginUnavailable,
+            format!("元数据刮削器{source}配置未完成，请补全插件配置"),
+        ),
+        ScraperFailureCause::PluginUnsupported | ScraperFailureCause::UnsupportedCapability => (
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::PluginUnavailable,
+            format!("元数据刮削器{source}{}", kind.unsupported_capability()),
+        ),
+        ScraperFailureCause::UpstreamAuthFailed => (
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::PluginUnavailable,
+            format!("元数据刮削器{source}上游鉴权失败，请在插件配置里检查 API Key"),
+        ),
+        ScraperFailureCause::UpstreamNotFound => (
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::PluginUnavailable,
+            format!("元数据刮削器{source}没有找到匹配的条目或媒体类型"),
+        ),
+        ScraperFailureCause::PluginTimeout | ScraperFailureCause::UpstreamTimeout => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::PluginUnavailable,
+            format!("元数据刮削器{source}请求超时，请稍后重试"),
+        ),
+        ScraperFailureCause::PluginExited => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::PluginUnavailable,
+            format!("元数据刮削器{source}进程已退出，请稍后重试"),
+        ),
+        ScraperFailureCause::PluginStartFailed => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::PluginUnavailable,
+            format!("元数据刮削器{source}启动失败，请检查插件文件是否可执行"),
+        ),
+        ScraperFailureCause::PluginProtocolFailed
+        | ScraperFailureCause::InvalidResponse
+        | ScraperFailureCause::UpstreamInvalidResponse => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::PluginUnavailable,
+            format!("元数据刮削器{source}返回了无法解析的数据"),
+        ),
+        ScraperFailureCause::UpstreamUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::PluginUnavailable,
+            format!("元数据刮削器{source}连不上上游，请检查网络或代理"),
+        ),
+        ScraperFailureCause::UpstreamRateLimited => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::PluginUnavailable,
+            format!("元数据刮削器{source}被上游限流，请稍后重试"),
+        ),
+        ScraperFailureCause::PluginInternal => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::PluginUnavailable,
+            format!("元数据刮削器{source}内部错误"),
+        ),
+        ScraperFailureCause::ProviderFailed => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::PluginUnavailable,
+            format!("元数据刮削器{source}请求失败"),
+        ),
+        ScraperFailureCause::PluginInvalidRequest
+        | ScraperFailureCause::PluginNotReady
+        | ScraperFailureCause::PluginInvalidResponse
+        | ScraperFailureCause::PluginAssetFailed
+        | ScraperFailureCause::PluginConfigIoFailed
+        | ScraperFailureCause::PluginStoreFailed
+        | ScraperFailureCause::PluginReportedUnknown => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::PluginUnavailable,
+            format!("元数据刮削器{source}暂时不可用，请稍后重试"),
+        ),
+    };
+    let message = if failed_sources > 1 {
+        format!("{message}（共 {failed_sources} 个刮削器失败）")
+    } else {
+        message
+    };
+    api_error(headers, status, code, &message).into_response()
+}
+
+/// Renders a plugin display name for a message: trimmed, control characters removed, bounded.
+fn scraper_source_label(label: Option<&str>) -> String {
+    let Some(label) = label.map(str::trim).filter(|label| !label.is_empty()) else {
+        return String::new();
+    };
+    let label = label
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(48)
+        .collect::<String>();
+    if label.is_empty() {
+        String::new()
+    } else {
+        format!("「{label}」")
     }
 }
 

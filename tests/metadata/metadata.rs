@@ -1306,3 +1306,115 @@ async fn metadata_enrichment_rejects_conflicting_nfo_for_flat_movie_files()
     assert_eq!(report.nfo_failed, 1);
     Ok(())
 }
+
+#[tokio::test]
+async fn movie_enrichment_complementarily_merges_same_film_movie_nfo_and_per_file_nfo()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let same_dir = root.join("Pegasus 2 (2024)");
+    let conflict_dir = root.join("Conflict (2024)");
+    tokio::fs::create_dir_all(&same_dir).await?;
+    tokio::fs::create_dir_all(&conflict_dir).await?;
+
+    tokio::fs::write(same_dir.join("Pegasus 2 (2024) - 1080p.mkv"), b"movie").await?;
+    tokio::fs::write(
+        same_dir.join("Pegasus 2 (2024) - 1080p.nfo"),
+        r#"<movie><title>飞驰人生2</title><year>2024</year><tmdbid>1212266</tmdbid><actor><name>沈腾</name><role>Zhang Chi</role></actor></movie>"#,
+    )
+    .await?;
+    tokio::fs::write(
+        same_dir.join("movie.nfo"),
+        r#"<movie><title>飞驰人生2</title><year>2024</year><tmdbid>1212266</tmdbid><actor><name>沈腾</name><role>Zhang Chi</role><tmdbid>1519026</tmdbid><imdbid>nm7613067</imdbid></actor></movie>"#,
+    )
+    .await?;
+
+    tokio::fs::write(conflict_dir.join("Conflict (2024).mkv"), b"movie2").await?;
+    tokio::fs::write(
+        conflict_dir.join("Conflict (2024).nfo"),
+        r#"<movie><title>正确电影</title><year>2024</year><tmdbid>200</tmdbid><actor><name>演员甲</name><role>角色甲</role></actor></movie>"#,
+    )
+    .await?;
+    tokio::fs::write(
+        conflict_dir.join("movie.nfo"),
+        r#"<movie><title>串片电影</title><year>2024</year><tmdbid>999</tmdbid><actor><name>演员甲</name><role>角色甲</role><tmdbid>888</tmdbid></actor></movie>"#,
+    )
+    .await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let people = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+    let enricher = MetadataEnricher::new(database.clone()).with_people(people.clone());
+    let report = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(report.nfo_loaded, 2);
+
+    let same_item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE title = '飞驰人生2'")
+            .fetch_one(database.pool())
+            .await?;
+    let same_actors = people.list_item_actors(&same_item_id).await?;
+    assert_eq!(same_actors.len(), 1);
+    assert_eq!(same_actors[0].id, "nm7613067");
+    assert_eq!(same_actors[0].provider.as_deref(), Some("imdb"));
+    let lux_person_id: Option<String> = sqlx::query_scalar(
+        "SELECT lux_person_id FROM person_credits WHERE item_id = ? AND person_name = '沈腾'",
+    )
+    .bind(&same_item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert!(
+        lux_person_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("lux-"))
+    );
+    let mapped_tmdb: Option<String> = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities WHERE provider = 'tmdb' AND provider_id = '1519026'",
+    )
+    .fetch_optional(database.pool())
+    .await?;
+    assert_eq!(mapped_tmdb, lux_person_id);
+    let mapped_imdb: Option<String> = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities WHERE provider = 'imdb' AND provider_id = 'nm7613067'",
+    )
+    .fetch_optional(database.pool())
+    .await?;
+    assert_eq!(mapped_imdb, lux_person_id);
+
+    let conflict_item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE title = '正确电影'")
+            .fetch_one(database.pool())
+            .await?;
+    let conflict_actors = people.list_item_actors(&conflict_item_id).await?;
+    assert_eq!(conflict_actors.len(), 1);
+    assert!(conflict_actors[0].id.starts_with("local-"));
+
+    // Updating only the sibling movie.nfo should invalidate the combined fingerprint and refresh actors.
+    tokio::fs::write(
+        same_dir.join("movie.nfo"),
+        r#"<movie><title>飞驰人生2</title><year>2024</year><tmdbid>1212266</tmdbid><actor><name>沈腾</name><role>Zhang Chi</role><tmdbid>1519026</tmdbid><imdbid>nm7613067</imdbid><doubanid>1325700</doubanid></actor></movie>"#,
+    )
+    .await?;
+    let refresh_report = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(refresh_report.nfo_loaded, 1);
+    let mapped_douban: Option<String> = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities WHERE provider = 'douban' AND provider_id = '1325700'",
+    )
+    .fetch_optional(database.pool())
+    .await?;
+    assert_eq!(mapped_douban, lux_person_id);
+    Ok(())
+}

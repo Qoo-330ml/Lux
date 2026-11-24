@@ -532,6 +532,7 @@ impl UserStore {
         current_password: &str,
         new_password: &str,
         keep_session_token_hash: Option<&[u8]>,
+        keep_access_token_hash: Option<&[u8]>,
     ) -> Result<bool, UserStoreError> {
         let user_id = user_id.to_string();
         let Some(stored) = self.database.find_user_by_id(&user_id).await? else {
@@ -564,12 +565,12 @@ impl UserStore {
             .await?;
         if updated.is_some() {
             // A password change must invalidate credentials that were issued for the old one;
-            // the caller keeps its own session so the web UI is not logged out mid-flow.
+            // the caller keeps its own session/token so the active client is not logged out mid-flow.
             self.database
                 .revoke_all_web_sessions_for_user(&user_id, keep_session_token_hash)
                 .await?;
             self.database
-                .revoke_all_access_tokens_for_user(&user_id)
+                .revoke_all_access_tokens_for_user_except(&user_id, keep_access_token_hash)
                 .await?;
         }
         Ok(updated.is_some())
@@ -992,7 +993,13 @@ mod tests {
 
         assert!(
             users
-                .change_password(&user.id, "old password", "new password", Some(b"kept"))
+                .change_password(
+                    &user.id,
+                    "old password",
+                    "new password",
+                    Some(b"kept"),
+                    None
+                )
                 .await?
         );
 

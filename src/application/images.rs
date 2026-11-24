@@ -43,6 +43,11 @@ use crate::{
 };
 
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+pub const MAX_MANUAL_ITEM_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+/// Upper bound for a client-selected multi-image index on a manual upload. Multi-image artwork is
+/// normally capped by [`MAX_IMAGE_VARIANTS`]; this only keeps an arbitrary Emby index from becoming
+/// a file name, so a client can still replace a slot the scanner numbered above the cap.
+pub(crate) const MAX_MANUAL_IMAGE_INDEX: i64 = 100;
 const IMAGE_DOWNLOAD_MAX_RETRIES: u32 = 2;
 const IMAGE_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const IMAGE_RETRY_MAX_DELAY: Duration = Duration::from_secs(4);
@@ -1095,6 +1100,108 @@ impl ImageWriteService {
             .await
     }
 
+    pub async fn upload_item_image(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> Result<ImageWriteReport, ImageWriteError> {
+        self.upload_item_image_with_index(item_id, image_type, None, content_type, bytes)
+            .await
+    }
+
+    /// Uploads manual artwork, optionally replacing one multi-image index.
+    ///
+    /// `target_index = None` keeps the append behavior: fanart takes `max(index) + 1` and every
+    /// single-slot type writes index 0. `Some(index)` writes fanart into that slot in place so an
+    /// Emby client can replace `Backdrop/0` without appending a new image; single-slot types only
+    /// accept index 0, and indices outside `0..=MAX_MANUAL_IMAGE_INDEX` are rejected instead of
+    /// turning into arbitrary file names.
+    pub async fn upload_item_image_with_index(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        target_index: Option<i64>,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> Result<ImageWriteReport, ImageWriteError> {
+        let image_type = normalize_image_type(image_type)
+            .ok_or_else(|| ImageWriteError::InvalidImageType(image_type.to_owned()))?;
+        let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if size > MAX_MANUAL_ITEM_IMAGE_BYTES {
+            return Err(ImageWriteError::TooLarge {
+                size,
+                max: MAX_MANUAL_ITEM_IMAGE_BYTES,
+            });
+        }
+        let detected = match image::guess_format(bytes).ok() {
+            Some(image::ImageFormat::Jpeg) => ImageFormat::Jpeg,
+            Some(image::ImageFormat::Png) => ImageFormat::Png,
+            Some(image::ImageFormat::WebP) => ImageFormat::Webp,
+            _ => {
+                return Err(ImageWriteError::UnsupportedContentType {
+                    content_type: "invalid".to_owned(),
+                });
+            }
+        };
+        let requested_content_type = content_type
+            .split(';')
+            .next()
+            .map(str::trim)
+            .unwrap_or_default();
+        if !requested_content_type.is_empty()
+            && !requested_content_type.eq_ignore_ascii_case("application/octet-stream")
+            && ImageFormat::from_content_type(requested_content_type) != Some(detected)
+        {
+            return Err(ImageWriteError::UnsupportedContentType {
+                content_type: requested_content_type.to_owned(),
+            });
+        }
+        validate_image_payload(detected, bytes)?;
+
+        let (image_index, reuse_existing_path) = match target_index {
+            Some(image_index) => {
+                if !(0..=MAX_MANUAL_IMAGE_INDEX).contains(&image_index) {
+                    return Err(ImageWriteError::InvalidImageType(format!(
+                        "image index {image_index}"
+                    )));
+                }
+                if image_type == "FANART" {
+                    // Replace the requested backdrop slot instead of appending to `max + 1`.
+                    (image_index, true)
+                } else if image_index > 0 {
+                    // Single-slot image types only have index 0.
+                    return Err(ImageWriteError::ItemNotFound);
+                } else {
+                    (0, true)
+                }
+            }
+            None => {
+                let image_index = if image_type == "FANART" {
+                    self.next_image_index(item_id, image_type).await?
+                } else {
+                    0
+                };
+                (image_index, image_type != "FANART")
+            }
+        };
+        self.store_item_image_bytes(
+            item_id,
+            image_type,
+            image_index,
+            detected,
+            bytes.to_vec(),
+            "MANUAL",
+            None,
+            ImageTargetWrite {
+                reuse_existing_path,
+                attempt: None,
+            },
+        )
+        .await
+    }
+
     /// Downloads, writes and indexes one image.
     ///
     /// `write.attempt` is the claim an attempt-scoped caller already holds: the image row and that
@@ -1186,6 +1293,39 @@ impl ImageWriteService {
         validate_image_payload(format, &body)?;
         drop(_download_permit);
 
+        self.store_item_image_bytes(
+            item_id,
+            image_type,
+            image_index,
+            format,
+            body,
+            source,
+            Some(image_url),
+            ImageTargetWrite {
+                reuse_existing_path,
+                attempt,
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn store_item_image_bytes(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_index: i64,
+        format: ImageFormat,
+        body: Vec<u8>,
+        source: &str,
+        source_url: Option<&str>,
+        write: ImageTargetWrite<'_>,
+    ) -> Result<ImageWriteReport, ImageWriteError> {
+        let ImageTargetWrite {
+            reuse_existing_path,
+            attempt,
+        } = write;
+        let size = u64::try_from(body.len()).unwrap_or(u64::MAX);
         let _image_write_lock = acquire_image_write_lock(item_id).await;
         let (root, directory, movie_stem, episode_stem) = self.writeback_paths(item_id).await?;
         let indexed_images = self.database.list_item_images(item_id).await?;
@@ -1268,7 +1408,7 @@ impl ImageWriteService {
             height: dimensions.map(|(_, height)| height),
             content_tag: &content_tag,
             source,
-            source_url: Some(image_url),
+            source_url,
         };
         let id = match attempt {
             Some(attempt) => self
@@ -1577,6 +1717,27 @@ pub struct ImageCandidateService {
     resolver: Option<ScraperResolver>,
 }
 
+/// One interactive image search.
+///
+/// `images` holds the candidates that passed every filter. The diagnostics describe what the
+/// scraper returned before the language filter, so an empty result can say why it is empty instead
+/// of looking like a broken search.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ImageSearchOutcome {
+    pub images: Vec<ImageCandidate>,
+    /// Language codes of the scraper images of the requested type, before the language filter.
+    pub available_languages: Vec<String>,
+    /// How many typed scraper images the language filter removed.
+    pub filtered_by_language: usize,
+    /// Normalized image types the scraper returned for this item (`POSTER`, `LOGO`, `BACKDROP`).
+    ///
+    /// A source that only returns posters (the Douban plugin does) makes `LOGO` searches empty;
+    /// this list lets the administrator see that instead of guessing.
+    pub available_image_types: Vec<String>,
+    /// Display name of the scraper that answered, when the host knows it.
+    pub source: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImageCandidate {
     pub id: String,
@@ -1618,7 +1779,7 @@ impl ImageCandidateService {
         image_type: &str,
         language: Option<&str>,
         source: Option<&str>,
-    ) -> Result<Vec<ImageCandidate>, ImageCandidateError> {
+    ) -> Result<ImageSearchOutcome, ImageCandidateError> {
         let image_type = normalize_image_type(image_type)
             .ok_or_else(|| ImageCandidateError::InvalidImageType(image_type.to_owned()))?;
         let source = source.map(str::trim).filter(|value| !value.is_empty());
@@ -1644,9 +1805,11 @@ impl ImageCandidateService {
             "SERIES" => ScraperItemType::Series,
             "SEASON" => ScraperItemType::Season,
             "EPISODE" => ScraperItemType::Episode,
-            _ => return Ok(Vec::new()),
+            _ => return Err(ImageCandidateError::ItemNotScrapable),
         };
-        let scraper = self.provider_for_item(item_id).await?;
+        let (scraper, source_name) = self
+            .provider_for_item(item_id, identity.provider_name.as_deref())
+            .await?;
         let mut image_request = ScraperImageRequest::new(item_type, provider_id, language);
         image_request.original_language = identity.original_language.clone();
         image_request.season_number = identity
@@ -1662,13 +1825,13 @@ impl ImageCandidateService {
             .await
             .map_err(ImageCandidateError::Scraper)?;
         let original_language_mode = image_response.original_language_mode;
+        let available_image_types = available_image_types(&image_response.images);
         let images = image_response.images;
         let requested_language = language.split('-').next().filter(|value| !value.is_empty());
-        Ok(images
+        let typed_images = images
             .into_iter()
-            .enumerate()
-            .filter(|(_, image)| matches_image_type(image, image_type))
-            .filter(|(_, image)| {
+            .filter(|image| matches_image_type(image, image_type))
+            .filter(|image| {
                 source.is_none_or(|source| {
                     image
                         .provider_name
@@ -1676,14 +1839,25 @@ impl ImageCandidateService {
                         .is_some_and(|value| value.eq_ignore_ascii_case(source))
                 })
             })
+            .collect::<Vec<_>>();
+        let available_languages = available_image_languages(&typed_images);
+        let original_language_for_filter = original_language_mode
+            .then_some(identity.original_language.as_deref())
+            .flatten();
+        let mut filtered_by_language = 0;
+        let images = typed_images
+            .into_iter()
+            .enumerate()
             .filter(|(_, image)| {
-                image_language_matches(
+                let matches = image_language_matches(
                     image.language.as_deref(),
                     requested_language,
-                    original_language_mode
-                        .then_some(identity.original_language.as_deref())
-                        .flatten(),
-                )
+                    original_language_for_filter,
+                );
+                if !matches {
+                    filtered_by_language += 1;
+                }
+                matches
             })
             .map(|(index, image)| {
                 let provider_name = image
@@ -1706,26 +1880,104 @@ impl ImageCandidateService {
                 }
             })
             .take(50)
-            .collect())
+            .collect();
+        Ok(ImageSearchOutcome {
+            images,
+            available_languages,
+            filtered_by_language,
+            available_image_types,
+            source: source_name,
+        })
     }
 
+    /// The scraper that owns the item's stored provider id, with its display name.
+    ///
+    /// The provider id lives in one namespace (`Tmdb`, `Douban`, ...). Sending it to the library's
+    /// first scraper only works when that scraper produced it; otherwise the request either fails
+    /// or asks the wrong provider for images. Fall back to the first configured scraper (and the
+    /// host's default) when nothing matches.
     async fn provider_for_item(
         &self,
         item_id: &str,
-    ) -> Result<ScraperProvider, ImageCandidateError> {
+        provider_name: Option<&str>,
+    ) -> Result<(ScraperProvider, Option<String>), ImageCandidateError> {
         let Some(resolver) = &self.resolver else {
-            return Ok(self.scraper.clone());
+            return Ok((self.scraper.clone(), provider_label(&self.scraper)));
         };
-        resolver
-            .for_item(item_id)
+        let scrapers = resolver
+            .for_item_ordered(item_id)
             .await
-            .map_err(ImageCandidateError::Scraper)
-            .map(|client| {
-                client
-                    .map(ScraperProvider::from_scraper)
-                    .unwrap_or_else(|| self.scraper.clone())
-            })
+            .map_err(ImageCandidateError::Scraper)?;
+        let provider_keys = scrapers
+            .iter()
+            .map(|scraper| scraper.provider.provider_key())
+            .collect::<Vec<_>>();
+        let Some(index) = pick_scraper_index(&provider_keys, provider_name) else {
+            return Ok((self.scraper.clone(), provider_label(&self.scraper)));
+        };
+        let selected = &scrapers[index];
+        let label = resolver
+            .scraper_display_name(&selected.scraper_id)
+            .await
+            .or_else(|| provider_label(&selected.provider));
+        Ok((selected.provider.clone(), label))
     }
+}
+
+/// The language codes the scraper returned for one image type, sorted and bounded.
+///
+/// Only codes reach a response body: they are short upstream values, never URLs or free text.
+fn available_image_languages(images: &[ScraperImage]) -> Vec<String> {
+    let mut languages = images
+        .iter()
+        .filter_map(|image| image.language.as_deref())
+        .map(str::trim)
+        .filter(|language| !language.is_empty() && language.len() <= 32)
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    languages.sort();
+    languages.dedup();
+    languages.truncate(8);
+    languages
+}
+
+/// Normalized image types present in one scraper response, independent of the requested type.
+fn available_image_types(images: &[ScraperImage]) -> Vec<String> {
+    let mut types = images
+        .iter()
+        .filter_map(|image| match image.image_type.as_str() {
+            "Primary" | "Poster" | "POSTER" => Some("POSTER".to_owned()),
+            "Logo" | "LOGO" => Some("LOGO".to_owned()),
+            "Backdrop" | "Fanart" | "FANART" => Some("BACKDROP".to_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    types.sort_unstable();
+    types.dedup();
+    types
+}
+
+/// The index of the configured scraper whose provider key owns the stored provider id namespace.
+///
+/// The stored provider ids live in one namespace (`Tmdb`, `Douban`, ...). Matching that namespace
+/// keeps a Douban id from being sent to TMDb (or the reverse); when nothing matches, the first
+/// configured scraper stays the default.
+fn pick_scraper_index(provider_keys: &[&str], provider_name: Option<&str>) -> Option<usize> {
+    if let Some(name) = provider_name.map(str::trim).filter(|name| !name.is_empty())
+        && let Some(index) = provider_keys.iter().position(|key| {
+            let key = key.trim();
+            !key.is_empty() && key.eq_ignore_ascii_case(name)
+        })
+    {
+        return Some(index);
+    }
+    (!provider_keys.is_empty()).then_some(0)
+}
+
+/// The display name for a scraper provider when the plugin catalog is not involved.
+fn provider_label(provider: &ScraperProvider) -> Option<String> {
+    let key = provider.provider_key().trim();
+    (!key.is_empty()).then(|| key.to_owned())
 }
 
 fn image_language_matches(
@@ -1763,6 +2015,8 @@ fn matches_image_type(image: &ScraperImage, image_type: &str) -> bool {
 pub enum ImageCandidateError {
     ItemNotFound,
     ItemNotIdentified,
+    /// The item type has no online image source (home videos, folders and unresolved items).
+    ItemNotScrapable,
     InvalidItem,
     InvalidImageType(String),
     InvalidLanguage,
@@ -1776,6 +2030,9 @@ impl fmt::Display for ImageCandidateError {
         match self {
             Self::ItemNotFound => formatter.write_str("media item not found"),
             Self::ItemNotIdentified => formatter.write_str("media item has no provider identity"),
+            Self::ItemNotScrapable => {
+                formatter.write_str("media item type has no online image source")
+            }
             Self::InvalidItem => formatter.write_str("media item image identity is invalid"),
             Self::InvalidImageType(_) => formatter.write_str("unsupported image type"),
             Self::InvalidLanguage => formatter.write_str("image language is invalid"),
@@ -3376,8 +3633,8 @@ mod tests {
         global_image_write_permits, image_attempt_failure,
         image_content_tag_and_dimensions_from_bytes, image_download_retry_delay,
         image_language_matches, image_lookup_stems, image_row_write_error, image_target,
-        is_allowed_scraper_image_url, retryable_image_status, should_suppress_internal_image_write,
-        write_image_atomically,
+        is_allowed_scraper_image_url, pick_scraper_index, retryable_image_status,
+        should_suppress_internal_image_write, write_image_atomically,
     };
     use crate::{
         application::access::MediaAccessService,
@@ -3594,6 +3851,18 @@ mod tests {
             "http://img.douban.example/poster.jpg",
             true
         ));
+    }
+
+    #[test]
+    fn image_search_uses_the_scraper_that_owns_the_stored_provider_id() {
+        let keys = ["douban", "tmdb"];
+        assert_eq!(pick_scraper_index(&keys, Some("Tmdb")), Some(1));
+        assert_eq!(pick_scraper_index(&keys, Some(" tmdb ")), Some(1));
+        assert_eq!(pick_scraper_index(&keys, Some("douban")), Some(0));
+        // An unknown namespace keeps the configured order instead of failing the search.
+        assert_eq!(pick_scraper_index(&keys, Some("Imdb")), Some(0));
+        assert_eq!(pick_scraper_index(&keys, None), Some(0));
+        assert_eq!(pick_scraper_index(&[], Some("Tmdb")), None);
     }
 
     #[test]

@@ -677,6 +677,97 @@ impl Database {
         Ok(result.rows_affected())
     }
 
+    pub(crate) async fn migrate_person_favorite_ids(
+        &self,
+        mappings: &[(String, String)],
+    ) -> Result<(), StorageError> {
+        let mut deduplicated = std::collections::BTreeMap::<String, String>::new();
+        for (old_id, new_id) in mappings {
+            let old_trimmed = old_id.trim();
+            let new_trimmed = new_id.trim();
+            if old_trimmed.is_empty() || new_trimmed.is_empty() || old_trimmed == new_trimmed {
+                continue;
+            }
+            deduplicated.insert(old_trimmed.to_owned(), new_trimmed.to_owned());
+        }
+        if deduplicated.is_empty() {
+            return Ok(());
+        }
+
+        let old_ids = deduplicated.keys().cloned().collect::<Vec<_>>();
+        let mut present = std::collections::HashSet::<String>::new();
+        for chunk in old_ids.chunks(200) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "SELECT DISTINCT person_id FROM user_person_state WHERE person_id IN ({placeholders})"
+            )));
+            for person_id in chunk {
+                query = query.bind(person_id);
+            }
+            let rows = query.fetch_all(&self.pool).await.map_err(self.sqlx_err())?;
+            for row in rows {
+                let person_id: String = row.try_get("person_id").map_err(self.sqlx_err())?;
+                present.insert(person_id);
+            }
+        }
+        let to_migrate = deduplicated
+            .into_iter()
+            .filter(|(old_id, _)| present.contains(old_id))
+            .collect::<Vec<_>>();
+        if to_migrate.is_empty() {
+            return Ok(());
+        }
+
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        for (old_id, new_id) in &to_migrate {
+            if let Err(error) = self
+                .migrate_user_person_state_in_transaction(&mut transaction, old_id, new_id)
+                .await
+            {
+                Self::rollback_write_transaction(transaction, "migrate_person_favorite_ids").await;
+                return Err(error);
+            }
+        }
+        transaction.commit().await.map_err(self.sqlx_err())?;
+        Ok(())
+    }
+
+    async fn migrate_user_person_state_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        source_person_id: &str,
+        target_person_id: &str,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO user_person_state (user_id, person_id, is_favorite, updated_at)
+             SELECT user_id, ?, is_favorite, updated_at
+             FROM user_person_state
+             WHERE person_id = ?
+             ON CONFLICT(user_id, person_id) DO UPDATE SET
+                 is_favorite = CASE
+                     WHEN user_person_state.is_favorite <> 0 OR excluded.is_favorite <> 0 THEN 1
+                     ELSE 0
+                 END,
+                 updated_at = CASE
+                     WHEN excluded.updated_at > user_person_state.updated_at THEN excluded.updated_at
+                     ELSE user_person_state.updated_at
+                 END",
+        )
+        .bind(target_person_id)
+        .bind(source_person_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(self.sqlx_err())?;
+        self.query("DELETE FROM user_person_state WHERE person_id = ?")
+            .bind(source_person_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())?;
+        Ok(())
+    }
+
     pub(crate) async fn resolve_or_create_canonical_person(
         &self,
         display_name: &str,
@@ -1505,68 +1596,474 @@ impl Database {
         Ok(StoredCanonicalPerson { id: new_person_id })
     }
 
+    pub(crate) async fn choose_preferred_canonical_person(
+        &self,
+        person_ids: &[String],
+    ) -> Result<String, StorageError> {
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let result = self
+            .choose_preferred_canonical_person_in_transaction(&mut transaction, person_ids)
+            .await;
+        Self::rollback_write_transaction(transaction, "choose_preferred_canonical_person").await;
+        result
+    }
+
+    async fn choose_preferred_canonical_person_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        person_ids: &[String],
+    ) -> Result<String, StorageError> {
+        let unique_ids = person_ids
+            .iter()
+            .filter(|id| !id.trim().is_empty())
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if unique_ids.is_empty() {
+            return Err(StorageError::Conflict(
+                "cannot choose preferred canonical person from an empty set".to_owned(),
+            ));
+        }
+        if unique_ids.len() == 1 {
+            return Ok(unique_ids[0].clone());
+        }
+
+        let placeholders = std::iter::repeat_n("?", unique_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let mut active_by_id = std::collections::HashMap::<String, bool>::new();
+        let mut people_query = self.query(sqlx::AssertSqlSafe(format!(
+            "SELECT id, status FROM people WHERE id IN ({placeholders})"
+        )));
+        for id in &unique_ids {
+            people_query = people_query.bind(id);
+        }
+        let people_rows = people_query
+            .fetch_all(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())?;
+        for row in people_rows {
+            let id: String = row.try_get("id").map_err(self.sqlx_err())?;
+            let status: String = row.try_get("status").map_err(self.sqlx_err())?;
+            active_by_id.insert(id, status == "ACTIVE");
+        }
+
+        let mut rank_by_id = std::collections::HashMap::<String, u8>::new();
+        let mut identities_query = self.query(sqlx::AssertSqlSafe(format!(
+            "SELECT person_id, provider FROM person_identities WHERE person_id IN ({placeholders})"
+        )));
+        for id in &unique_ids {
+            identities_query = identities_query.bind(id);
+        }
+        let identity_rows = identities_query
+            .fetch_all(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())?;
+        for row in identity_rows {
+            let person_id: String = row.try_get("person_id").map_err(self.sqlx_err())?;
+            let provider: String = row.try_get("provider").map_err(self.sqlx_err())?;
+            let rank = canonical_provider_priority(&provider);
+            rank_by_id
+                .entry(person_id)
+                .and_modify(|existing| *existing = (*existing).max(rank))
+                .or_insert(rank);
+        }
+
+        let mut credits_by_id = std::collections::HashMap::<String, i64>::new();
+        let mut credits_query = self.query(sqlx::AssertSqlSafe(format!(
+            "SELECT lux_person_id, COUNT(*) AS credit_count
+             FROM person_credits
+             WHERE lux_person_id IN ({placeholders})
+             GROUP BY lux_person_id"
+        )));
+        for id in &unique_ids {
+            credits_query = credits_query.bind(id);
+        }
+        let credit_rows = credits_query
+            .fetch_all(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())?;
+        for row in credit_rows {
+            let person_id: String = row.try_get("lux_person_id").map_err(self.sqlx_err())?;
+            let count: i64 = row.try_get("credit_count").map_err(self.sqlx_err())?;
+            credits_by_id.insert(person_id, count);
+        }
+
+        let preferred = unique_ids
+            .into_iter()
+            .max_by_key(|id| {
+                (
+                    active_by_id.get(id).copied().unwrap_or(false),
+                    rank_by_id.get(id).copied().unwrap_or(0),
+                    credits_by_id.get(id).copied().unwrap_or(0),
+                    std::cmp::Reverse(id.clone()),
+                )
+            })
+            .ok_or_else(|| {
+                StorageError::Conflict(
+                    "cannot choose preferred canonical person from an empty set".to_owned(),
+                )
+            })?;
+        Ok(preferred)
+    }
+
+    pub(crate) async fn merge_canonical_person(
+        &self,
+        source_person_id: &str,
+        target_person_id: &str,
+        match_method: &str,
+        confidence: Option<f64>,
+        evidence_json: &str,
+    ) -> Result<crate::storage::StoredCanonicalPersonMerge, StorageError> {
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let result = self
+            .merge_canonical_person_in_transaction(
+                &mut transaction,
+                source_person_id,
+                target_person_id,
+                match_method,
+                confidence,
+                evidence_json,
+            )
+            .await;
+        match result {
+            Ok(merged) => {
+                transaction.commit().await.map_err(self.sqlx_err())?;
+                Ok(merged)
+            }
+            Err(error) => {
+                Self::rollback_write_transaction(transaction, "merge_canonical_person").await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn merge_canonical_person_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        source_person_id: &str,
+        target_person_id: &str,
+        match_method: &str,
+        confidence: Option<f64>,
+        evidence_json: &str,
+    ) -> Result<crate::storage::StoredCanonicalPersonMerge, StorageError> {
+        if source_person_id == target_person_id {
+            return Err(StorageError::Conflict(format!(
+                "cannot merge canonical person '{source_person_id}' into itself"
+            )));
+        }
+
+        let source_row = self
+            .query("SELECT display_name, status FROM people WHERE id = ?")
+            .bind(source_person_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())?
+            .ok_or_else(|| {
+                StorageError::Conflict(format!("canonical person '{source_person_id}' not found"))
+            })?;
+        let source_display_name: String = source_row
+            .try_get("display_name")
+            .map_err(self.sqlx_err())?;
+        let source_status: String = source_row.try_get("status").map_err(self.sqlx_err())?;
+        if source_status != "ACTIVE" {
+            return Err(StorageError::Conflict(format!(
+                "canonical person '{source_person_id}' is not active (status '{source_status}')"
+            )));
+        }
+
+        let target_row = self
+            .query("SELECT display_name, status FROM people WHERE id = ?")
+            .bind(target_person_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())?
+            .ok_or_else(|| {
+                StorageError::Conflict(format!("canonical person '{target_person_id}' not found"))
+            })?;
+        let target_display_name: String = target_row
+            .try_get("display_name")
+            .map_err(self.sqlx_err())?;
+        let target_status: String = target_row.try_get("status").map_err(self.sqlx_err())?;
+        if target_status != "ACTIVE" {
+            return Err(StorageError::Conflict(format!(
+                "canonical person '{target_person_id}' is not active (status '{target_status}')"
+            )));
+        }
+
+        let moved_rows = self
+            .query(
+                "SELECT provider, provider_id
+                 FROM person_identities
+                 WHERE person_id = ?
+                 ORDER BY provider ASC, provider_id ASC",
+            )
+            .bind(source_person_id)
+            .fetch_all(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())?;
+        let moved_identities = moved_rows
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<String, _>("provider")?,
+                    row.try_get::<String, _>("provider_id")?,
+                ))
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(self.sqlx_err())?;
+
+        let now = current_unix_timestamp();
+
+        self.query(
+            "UPDATE person_identities
+             SET person_id = ?, match_method = ?, confidence = ?, evidence_json = ?, updated_at = ?
+             WHERE person_id = ?",
+        )
+        .bind(target_person_id)
+        .bind(match_method)
+        .bind(confidence)
+        .bind(evidence_json)
+        .bind(now)
+        .bind(source_person_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(self.sqlx_err())?;
+
+        self.query("UPDATE person_credits SET lux_person_id = ? WHERE lux_person_id = ?")
+            .bind(target_person_id)
+            .bind(source_person_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())?;
+
+        self.migrate_user_person_state_in_transaction(
+            transaction,
+            source_person_id,
+            target_person_id,
+        )
+        .await?;
+
+        self.query(
+            "UPDATE emby_migration_person_favorites
+             SET lux_person_id = ?
+             WHERE lux_person_id = ?",
+        )
+        .bind(target_person_id)
+        .bind(source_person_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(self.sqlx_err())?;
+
+        self.query(
+            "UPDATE person_match_candidates
+             SET target_person_id = ?
+             WHERE target_person_id = ?",
+        )
+        .bind(target_person_id)
+        .bind(source_person_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(self.sqlx_err())?;
+        self.query(
+            "UPDATE person_match_candidates
+             SET previous_person_id = ?
+             WHERE previous_person_id = ?",
+        )
+        .bind(target_person_id)
+        .bind(source_person_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(self.sqlx_err())?;
+
+        let candidate_rows = self
+            .query(
+                "SELECT id, candidate_person_ids_json
+                 FROM person_match_candidates
+                 WHERE status = 'PENDING'
+                   AND candidate_person_ids_json LIKE ?",
+            )
+            .bind(format!("%\"{source_person_id}\"%"))
+            .fetch_all(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())?;
+        for row in candidate_rows {
+            let candidate_id: String = row.try_get("id").map_err(self.sqlx_err())?;
+            let raw_json: String = row
+                .try_get("candidate_person_ids_json")
+                .map_err(self.sqlx_err())?;
+            let ids: Vec<String> = serde_json::from_str(&raw_json)
+                .map_err(|source| StorageError::Serialization(source.to_string()))?;
+            if !ids.iter().any(|id| id == source_person_id) {
+                continue;
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            let mut rewritten = Vec::with_capacity(ids.len());
+            for id in ids {
+                let mapped = if id == source_person_id {
+                    target_person_id.to_owned()
+                } else {
+                    id
+                };
+                if seen.insert(mapped.clone()) {
+                    rewritten.push(mapped);
+                }
+            }
+            let rewritten_json = serde_json::to_string(&rewritten)
+                .map_err(|source| StorageError::Serialization(source.to_string()))?;
+            self.query(
+                "UPDATE person_match_candidates
+                 SET candidate_person_ids_json = ?, updated_at = ?
+                 WHERE id = ?",
+            )
+            .bind(rewritten_json)
+            .bind(now)
+            .bind(candidate_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())?;
+        }
+
+        self.query("UPDATE people SET status = 'MERGED', updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(source_person_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())?;
+        self.query("UPDATE people SET updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(target_person_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())?;
+
+        self.query("DELETE FROM person_manifest_index_state WHERE person_id IN (?, ?)")
+            .bind(source_person_id)
+            .bind(target_person_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())?;
+
+        Ok(crate::storage::StoredCanonicalPersonMerge {
+            source_person_id: source_person_id.to_owned(),
+            target_person_id: target_person_id.to_owned(),
+            source_display_name,
+            target_display_name,
+            moved_identities,
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) async fn restore_canonical_person(
         &self,
         person_id: &str,
         display_name: &str,
         identities: &[(&str, &str)],
     ) -> Result<StoredCanonicalPerson, StorageError> {
-        let now = current_unix_timestamp();
-        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
-        let mut identity_owners = HashMap::<(String, String), String>::new();
-        for chunk in identities.chunks(PERSON_MANIFEST_IDENTITY_BATCH_SIZE) {
-            let conditions = std::iter::repeat_n("(provider = ? AND provider_id = ?)", chunk.len())
-                .collect::<Vec<_>>()
-                .join(" OR ");
-            let mut statement = self.query(sqlx::AssertSqlSafe(format!(
-                "SELECT provider, provider_id, person_id
-                 FROM person_identities
-                 WHERE {conditions}"
-            )));
-            for (provider, provider_id) in chunk {
-                statement = statement.bind(provider).bind(provider_id);
-            }
-            let rows = statement
-                .fetch_all(&mut *transaction)
-                .await
-                .map_err(self.sqlx_err())?;
-            identity_owners.extend(rows.into_iter().map(|row| {
-                (
-                    (
-                        row.get::<String, _>("provider"),
-                        row.get::<String, _>("provider_id"),
-                    ),
-                    row.get::<String, _>("person_id"),
-                )
-            }));
-        }
-        for (provider, provider_id) in identities {
-            if let Some(owner) =
-                identity_owners.get(&((*provider).to_owned(), (*provider_id).to_owned()))
-                && owner != person_id
-            {
-                return Err(StorageError::Conflict(format!(
-                    "provider identity '{provider}:{provider_id}' belongs to '{owner}'"
+        self.restore_canonical_person_with_status(person_id, display_name, identities, "ACTIVE")
+            .await
+    }
+
+    pub(crate) async fn restore_canonical_person_with_status(
+        &self,
+        person_id: &str,
+        display_name: &str,
+        identities: &[(&str, &str)],
+        status: &str,
+    ) -> Result<StoredCanonicalPerson, StorageError> {
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        if status == "ACTIVE" {
+            let mut identity_owners = HashMap::<(String, String), String>::new();
+            for chunk in identities.chunks(PERSON_MANIFEST_IDENTITY_BATCH_SIZE) {
+                let conditions =
+                    std::iter::repeat_n("(provider = ? AND provider_id = ?)", chunk.len())
+                        .collect::<Vec<_>>()
+                        .join(" OR ");
+                let mut statement = self.query(sqlx::AssertSqlSafe(format!(
+                    "SELECT provider, provider_id, person_id
+                     FROM person_identities
+                     WHERE {conditions}"
                 )));
+                for (provider, provider_id) in chunk {
+                    statement = statement.bind(provider).bind(provider_id);
+                }
+                let rows = statement
+                    .fetch_all(&mut *transaction)
+                    .await
+                    .map_err(self.sqlx_err())?;
+                identity_owners.extend(rows.into_iter().map(|row| {
+                    (
+                        (
+                            row.get::<String, _>("provider"),
+                            row.get::<String, _>("provider_id"),
+                        ),
+                        row.get::<String, _>("person_id"),
+                    )
+                }));
+            }
+            for (provider, provider_id) in identities {
+                if let Some(owner) =
+                    identity_owners.get(&((*provider).to_owned(), (*provider_id).to_owned()))
+                    && owner != person_id
+                {
+                    return Err(StorageError::Conflict(format!(
+                        "provider identity '{provider}:{provider_id}' belongs to '{owner}'"
+                    )));
+                }
             }
         }
+        self.restore_canonical_person_with_status_body(
+            &mut transaction,
+            person_id,
+            display_name,
+            if status == "MERGED" { &[] } else { identities },
+            status,
+        )
+        .await?;
+        let row = self
+            .query("SELECT id FROM people WHERE id = ?")
+            .bind(person_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(self.sqlx_err())?;
+        let stored = stored_canonical_person(row).map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
+        Ok(stored)
+    }
+
+    async fn restore_canonical_person_with_status_body(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        person_id: &str,
+        display_name: &str,
+        identities: &[(&str, &str)],
+        status: &str,
+    ) -> Result<(), StorageError> {
+        let now = current_unix_timestamp();
         self.query(
             "INSERT INTO people (
                 id, display_name, directory_name, normalized_name, status, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, 'ACTIVE', ?, ?)
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 display_name = excluded.display_name,
                 directory_name = excluded.directory_name,
                 normalized_name = excluded.normalized_name,
+                status = CASE
+                    WHEN excluded.status = 'MERGED' THEN 'MERGED'
+                    ELSE people.status
+                END,
                 updated_at = excluded.updated_at",
         )
         .bind(person_id)
         .bind(display_name)
         .bind(display_name)
         .bind(normalize_person_name(display_name))
+        .bind(status)
         .bind(now)
         .bind(now)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await
         .map_err(self.sqlx_err())?;
         if let Some(sequence) = person_id
@@ -1578,7 +2075,7 @@ impl Database {
                  ON CONFLICT(id) DO NOTHING",
             )
             .bind(sequence)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await
             .map_err(self.sqlx_err())?;
             if self.backend == DatabaseBackend::Postgres {
@@ -1589,7 +2086,7 @@ impl Database {
                         true
                     )",
                 )
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(self.sqlx_err())?;
             }
@@ -1617,19 +2114,11 @@ impl Database {
                     .bind(now);
             }
             statement
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(self.sqlx_err())?;
         }
-        let row = self
-            .query("SELECT id FROM people WHERE id = ?")
-            .bind(person_id)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(self.sqlx_err())?;
-        let stored = stored_canonical_person(row).map_err(self.sqlx_err())?;
-        transaction.commit().await.map_err(self.sqlx_err())?;
-        Ok(stored)
+        Ok(())
     }
 
     pub(crate) async fn person_manifest_restore_needed(
@@ -1757,11 +2246,12 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) async fn restore_canonical_person_if_manifest_changed(
+    pub(crate) async fn restore_canonical_person_with_status_if_manifest_changed(
         &self,
         person_id: &str,
         display_name: &str,
         identities: &[(&str, &str)],
+        status: &str,
         manifest_checksum: &str,
         manifest_schema_version: i64,
     ) -> Result<bool, StorageError> {
@@ -1782,7 +2272,7 @@ impl Database {
             return Ok(false);
         }
 
-        self.restore_canonical_person(person_id, display_name, identities)
+        self.restore_canonical_person_with_status(person_id, display_name, identities, status)
             .await?;
         self.query(
             "INSERT INTO person_manifest_index_state (
@@ -2699,6 +3189,41 @@ impl CanonicalPersonBatch<'_> {
         self.finish_savepoint(&savepoint, result).await
     }
 
+    pub(crate) async fn choose_preferred_person(
+        &mut self,
+        person_ids: &[String],
+    ) -> Result<String, StorageError> {
+        let savepoint = self.open_savepoint().await?;
+        let result = self
+            .database
+            .choose_preferred_canonical_person_in_transaction(&mut self.transaction, person_ids)
+            .await;
+        self.finish_savepoint(&savepoint, result).await
+    }
+
+    pub(crate) async fn merge_person(
+        &mut self,
+        source_person_id: &str,
+        target_person_id: &str,
+        match_method: &str,
+        confidence: Option<f64>,
+        evidence_json: &str,
+    ) -> Result<crate::storage::StoredCanonicalPersonMerge, StorageError> {
+        let savepoint = self.open_savepoint().await?;
+        let result = self
+            .database
+            .merge_canonical_person_in_transaction(
+                &mut self.transaction,
+                source_person_id,
+                target_person_id,
+                match_method,
+                confidence,
+                evidence_json,
+            )
+            .await;
+        self.finish_savepoint(&savepoint, result).await
+    }
+
     /// Commits the whole page.
     ///
     /// Call it even after an actor failed: the actors resolved before the failure are only kept if
@@ -2757,5 +3282,19 @@ impl CanonicalPersonBatch<'_> {
             .await
             .map_err(self.database.sqlx_err())?;
         Ok(())
+    }
+}
+
+fn canonical_provider_priority(provider: &str) -> u8 {
+    if provider.eq_ignore_ascii_case("tmdb") {
+        4
+    } else if provider.eq_ignore_ascii_case("douban") {
+        3
+    } else if provider.eq_ignore_ascii_case("imdb") {
+        2
+    } else if !provider.eq_ignore_ascii_case("local") && !provider.trim().is_empty() {
+        1
+    } else {
+        0
     }
 }

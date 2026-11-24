@@ -455,6 +455,68 @@ pub(super) async fn emby_auth_keys(
     Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
 }
 
+/// The scheduled task Lux reports to Emby clients.
+///
+/// Emby calls its scan task key RefreshLibrary, and Yamby 2.1.0.11 keeps only tasks whose Key is
+/// exactly one of markers, RefreshLibrary, RefreshChapterImages or RestartPlugins
+/// (ScheduledTasksInfo.m4370()); any other key never reaches its task panel.
+const EMBY_SCAN_TASK_KEY: &str = "RefreshLibrary";
+
+/// Emby task ids are GUIDs to clients, which treat them as opaque; a stable readable id keeps the
+/// scan state recognizable in logs and in the Lux task views.
+const EMBY_SCAN_TASK_ID: &str = "lux-refresh-media-library";
+
+fn is_library_scan_task(task_id: &str) -> bool {
+    let task_id = task_id.trim();
+    task_id.eq_ignore_ascii_case(EMBY_SCAN_TASK_ID)
+        || task_id.eq_ignore_ascii_case(EMBY_SCAN_TASK_KEY)
+}
+
+/// POST /ScheduledTasks/Running/{taskId}: clients start a scheduled task here.
+///
+/// Lux reports a single task, so starting it queues the same library-wide scan as
+/// POST /Library/Refresh and answers 204 like Emby instead of the Lux 202 body. An unknown task id
+/// is 404, and a non-administrator is 403 before the id is even looked at.
+pub(super) async fn emby_run_scheduled_task(
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<ReadyAppState>,
+) -> Response {
+    let auth_principal =
+        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
+    if !auth_principal.can_manage_server() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !is_library_scan_task(&task_id) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match queue_all_library_scans(&state).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(status) => status.into_response(),
+    }
+}
+
+/// Queues one library-wide reconciliation job per enabled library, reusing an active job when the
+/// library already has one.
+async fn queue_all_library_scans(state: &ReadyAppState) -> Result<Vec<Value>, StatusCode> {
+    let queued = super::admin::queue_all_library_scans(state).await?;
+    Ok(queued.into_iter().map(|entry| entry.job_json).collect())
+}
+
+/// POST /Items/{itemId}/Refresh: Emby clients use this endpoint for both "scan library files"
+/// and "refresh metadata" and separate the two only through MetadataRefreshMode,
+/// ImageRefreshMode and ReplaceAll*.
+///
+/// - A full-refresh request queues the Lux item metadata refresh in FULL_REFRESH mode and answers
+///   202 with scope ITEM_METADATA. It does not scan the filesystem.
+/// - Everything else stays a filesystem scan: FOLDER for a registered folder, ITEM_FOLDER for an
+///   ordinary item (the folder that holds its media source), LIBRARY_ROOT for a library id.
+///
+/// Recursive=false remains 422: Lux never scans a single file in place of a folder.
 pub(super) async fn emby_refresh_item(
     headers: HeaderMap,
     Path(item_id): Path<String>,
@@ -472,16 +534,28 @@ pub(super) async fn emby_refresh_item(
     if query.recursive == Some(false) {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
-    let scan_jobs = state.scan_jobs();
     let item_id = emby_internal_id(&item_id);
+    if query.wants_full_metadata_refresh() {
+        return emby_refresh_item_metadata(&headers, &state, &item_id).await;
+    }
+    let scan_jobs = state.scan_jobs();
     let (job, scope) = match scan_jobs.create_folder_scan_job(&item_id).await {
         Ok(job) => (job, "FOLDER"),
         Err(ScanJobError::ItemNotFound) => {
-            let Ok(library_id) = item_id.parse::<crate::domain::ids::LibraryId>() else {
-                return StatusCode::NOT_FOUND.into_response();
-            };
-            match scan_jobs.create_library_root_scan_job(library_id).await {
-                Ok(job) => (job, "LIBRARY_ROOT"),
+            match scan_jobs.create_item_folder_scan_job(&item_id).await {
+                Ok(job) => (job, "ITEM_FOLDER"),
+                Err(ScanJobError::ItemNotFound) => {
+                    let Ok(library_id) = item_id.parse::<crate::domain::ids::LibraryId>() else {
+                        return StatusCode::NOT_FOUND.into_response();
+                    };
+                    match scan_jobs.create_library_root_scan_job(library_id).await {
+                        Ok(job) => (job, "LIBRARY_ROOT"),
+                        Err(ScanJobError::LibraryNotFound) => {
+                            return StatusCode::NOT_FOUND.into_response();
+                        }
+                        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                    }
+                }
                 Err(ScanJobError::LibraryNotFound) => {
                     return StatusCode::NOT_FOUND.into_response();
                 }
@@ -498,7 +572,7 @@ pub(super) async fn emby_refresh_item(
         "EMBY_REFRESH_STARTED",
         Some("scan_job"),
         Some(&job.id),
-        "{}",
+        &format!(r#"{{"scope":"{scope}"}}"#),
     )
     .await;
     (
@@ -511,6 +585,55 @@ pub(super) async fn emby_refresh_item(
         .into_response()
 }
 
+/// Queues the Lux item metadata refresh for an Emby "refresh metadata" request.
+async fn emby_refresh_item_metadata(
+    headers: &HeaderMap,
+    state: &ReadyAppState,
+    item_id: &str,
+) -> Response {
+    use crate::application::reidentify::{MetadataRefreshMode, MetadataReidentifyError};
+
+    let reidentify = state.metadata_reidentify();
+    let job = match reidentify
+        .create_item_refresh_job(item_id, MetadataRefreshMode::FullRefresh)
+        .await
+    {
+        Ok(job) => job,
+        Err(MetadataReidentifyError::ItemNotFound(_)) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        // A video item has no online metadata source and an invalid id was rejected by the caller:
+        // both stay a client error instead of pretending a job exists.
+        Err(MetadataReidentifyError::InvalidItemCount)
+        | Err(MetadataReidentifyError::InvalidRefreshMode) => {
+            return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if reidentify.dispatch_job(&job).await.is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    record_audit_event(
+        state,
+        headers,
+        "EMBY_REFRESH_STARTED",
+        Some("metadata_job"),
+        Some(&job.id),
+        r#"{"scope":"ITEM_METADATA","mode":"FULL_REFRESH"}"#,
+    )
+    .await;
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "scope": "ITEM_METADATA",
+            "job": metadata_reidentify_job_json(&job),
+        })),
+    )
+        .into_response()
+}
+
+/// POST /Library/Refresh: queues every enabled library and reports the jobs. Clients call it from a
+/// menu and ignore the body, so the Lux job list stays in the payload.
 pub(super) async fn emby_refresh_library(
     headers: HeaderMap,
     Query(query): Query<EmbyTokenQuery>,
@@ -524,42 +647,17 @@ pub(super) async fn emby_refresh_library(
     if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let database = state.database();
-    let scan_jobs = state.scan_jobs();
-    let library_ids = match database.list_enabled_library_ids().await {
-        Ok(library_ids) => library_ids,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    let mut jobs = Vec::with_capacity(library_ids.len());
-    for library_id in library_ids {
-        let Ok(library_id) = library_id.parse::<crate::domain::ids::LibraryId>() else {
-            continue;
-        };
-        match scan_jobs.create_movie_scan_job(library_id).await {
-            Ok(job) => {
-                let job_id = job.id.clone();
-                jobs.push(scan_job_json(&job));
-                spawn_emby_scan_job(&state, job_id);
-            }
-            Err(ScanJobError::AlreadyActive(job_id)) => {
-                match database.find_scan_job(&job_id).await {
-                    Ok(Some(job)) => jobs.push(scan_job_json_from_storage(&job)),
-                    Ok(None) => {}
-                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                }
-            }
-            Err(ScanJobError::LibraryNotFound) => {}
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        }
+    match queue_all_library_scans(&state).await {
+        Ok(jobs) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "scope": "ALL",
+                "jobs": jobs,
+            })),
+        )
+            .into_response(),
+        Err(status) => status.into_response(),
     }
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({
-            "scope": "ALL",
-            "jobs": jobs,
-        })),
-    )
-        .into_response()
 }
 
 pub(super) async fn emby_media_updated(
@@ -740,9 +838,9 @@ pub(super) async fn emby_scheduled_task_entries(
         })
         .unwrap_or(0.0);
     Ok(vec![json!({
-        "Id": "lux-refresh-media-library",
+        "Id": EMBY_SCAN_TASK_ID,
         "Name": "Scan media library",
-        "Key": "RefreshMediaLibrary",
+        "Key": EMBY_SCAN_TASK_KEY,
         "Description": "Scans the media library for new and updated items.",
         "Category": "Library",
         "IsHidden": false,
@@ -1144,18 +1242,42 @@ pub(super) async fn emby_user(
         Ok(Some(_) | None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let server_name = current_emby_server_name(&state).await;
-    let ordered_views = emby_ordered_views(&state, &user).await;
-    let configuration = emby_user_configuration(&state, &user, &ordered_views).await;
-    let snapshots = emby_user_access_snapshots(&state, std::slice::from_ref(&user)).await;
-    Json(emby_user_json(
-        &user,
+    Json(emby_user_response_json(&state, &user).await).into_response()
+}
+
+/// GET /Users/Me: the authenticated user, in exactly the shape `GET /Users/{Id}` returns.
+///
+/// Emby clients (and Yamby) resolve the signed-in account through this alias instead of caching
+/// the user id from the login response. Disabled accounts are rejected during token resolution
+/// (401), so the disabled check below is only a defensive fallback.
+pub(super) async fn emby_current_user(
+    headers: HeaderMap,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<ReadyAppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if user.is_disabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Json(emby_user_response_json(&state, &user).await).into_response()
+}
+
+/// Builds the Emby user DTO shared by `/Users/{Id}` and `/Users/Me`.
+async fn emby_user_response_json(state: &ReadyAppState, user: &UserRecord) -> Value {
+    let server_name = current_emby_server_name(state).await;
+    let ordered_views = emby_ordered_views(state, user).await;
+    let configuration = emby_user_configuration(state, user, &ordered_views).await;
+    let snapshots = emby_user_access_snapshots(state, std::slice::from_ref(user)).await;
+    emby_user_json(
+        user,
         &state.server_id,
         &server_name,
         configuration,
         snapshots.get(&user.id.to_string()),
-    ))
-    .into_response()
+    )
 }
 
 #[derive(Deserialize, Default)]
@@ -2450,7 +2572,7 @@ pub(super) struct EmbyTokenQuery {
     pub(super) api_key: Option<String>,
     #[serde(rename = "tag", alias = "Tag")]
     pub(super) tag: Option<String>,
-    #[serde(rename = "Fields", default)]
+    #[serde(rename = "Fields", alias = "fields", default)]
     pub(super) fields: Option<String>,
     #[serde(
         rename = "ActiveWithinSeconds",
@@ -2591,6 +2713,48 @@ pub(super) struct EmbyRefreshQuery {
         deserialize_with = "deserialize_optional_bool"
     )]
     pub(super) recursive: Option<bool>,
+    /// Emby refresh modes. Clients implement "refresh metadata" and "scan library files" on the
+    /// same endpoint and only differ here, so the mode decides which Lux action runs.
+    #[serde(rename = "MetadataRefreshMode", alias = "metadataRefreshMode", default)]
+    pub(super) metadata_refresh_mode: Option<String>,
+    #[serde(rename = "ImageRefreshMode", alias = "imageRefreshMode", default)]
+    pub(super) image_refresh_mode: Option<String>,
+    /// Emby sets these when the client asked to replace every image/metadata field. Hills sends
+    /// the lowercase spelling observed in its string table, so both are accepted.
+    #[serde(
+        rename = "ReplaceAllMetadata",
+        alias = "replaceAllMetadata",
+        default,
+        deserialize_with = "deserialize_optional_bool"
+    )]
+    pub(super) replace_all_metadata: Option<bool>,
+    #[serde(
+        rename = "ReplaceAllImages",
+        alias = "replaceAllImages",
+        default,
+        deserialize_with = "deserialize_optional_bool"
+    )]
+    pub(super) replace_all_images: Option<bool>,
+}
+
+impl EmbyRefreshQuery {
+    /// Whether the client asked for an online metadata pass rather than a filesystem scan.
+    ///
+    /// Only the parameters Emby documents count as intent. Hills also carries the string
+    /// RefreshMetadataMode=FullRefresh, but that name is not an Emby parameter and the captured
+    /// screenshot pairing is unknown, so it is ignored instead of flipping a scan into a scrape.
+    fn wants_full_metadata_refresh(&self) -> bool {
+        if self.replace_all_metadata == Some(true) || self.replace_all_images == Some(true) {
+            return true;
+        }
+        [
+            self.metadata_refresh_mode.as_deref(),
+            self.image_refresh_mode.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|mode| mode.trim().eq_ignore_ascii_case("FullRefresh"))
+    }
 }
 
 /// Upper bound for one `/Library/Media/Updated` batch.

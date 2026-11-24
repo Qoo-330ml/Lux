@@ -123,7 +123,7 @@ import type {
   ItemMetadata,
   ItemImagesResponse,
   ItemImageSelectResponse,
-  ImageSearchResult,
+  ImageSearchResponse,
   LoginBackgroundResponse,
   MetadataFieldName,
   PageResponse,
@@ -880,7 +880,7 @@ export class LuxApiClient {
   }
 
   searchItemImages(itemId: string, input: { imageType: string; language: string; source: string }) {
-    return this.request<{ images?: ImageSearchResult[] }>(
+    return this.request<ImageSearchResponse>(
       `/api/v1/items/${encodeURIComponent(itemId)}/images/search`,
       { method: "POST", body: JSON.stringify(input) },
     );

@@ -1326,44 +1326,57 @@ fn sqlite_recent_catalog_rows_by_library_query(
     format!("WITH selected AS (\n             {libraries}\n             )")
 }
 
-fn catalog_item_order(sort_by: CatalogSort, descending: bool) -> &'static str {
+/// Series ordering key of the "recently added" sort: the newest `added_at` of the series'
+/// available episodes, or the series' own `added_at` before any episode is indexed. A series that
+/// receives a new episode therefore moves back to the top of the library list.
+const CATALOG_SERIES_ADDED_AT: &str = "CASE WHEN mi.item_type = 'SERIES' THEN COALESCE(
+    (SELECT MAX(latest_episode.added_at)
+     FROM media_items latest_episode
+     WHERE latest_episode.item_type = 'EPISODE'
+       AND latest_episode.removed_at IS NULL
+       AND latest_episode.has_available_source = 1
+       AND latest_episode.merged_into_item_id IS NULL
+       AND (latest_episode.series_id = mi.id OR latest_episode.parent_id = mi.id)),
+    mi.added_at) ELSE mi.added_at END";
+
+fn catalog_item_order(sort_by: CatalogSort, descending: bool) -> String {
     match (sort_by, descending) {
-        (CatalogSort::DateCreated, true) => {
-            "mi.added_at DESC, LOWER(mi.title) ASC, mi.id ASC"
-        }
-        (CatalogSort::DateCreated, false) => {
-            "mi.added_at ASC, LOWER(mi.title) ASC, mi.id ASC"
-        }
+        (CatalogSort::DateCreated, true) => format!(
+            "{CATALOG_SERIES_ADDED_AT} DESC, LOWER(mi.title) ASC, mi.id ASC"
+        ),
+        (CatalogSort::DateCreated, false) => format!(
+            "{CATALOG_SERIES_ADDED_AT} ASC, LOWER(mi.title) ASC, mi.id ASC"
+        ),
         (CatalogSort::PremiereDate, true) => {
             "CASE WHEN NULLIF(mi.premiere_date, '') IS NULL AND mi.production_year IS NULL THEN 1 ELSE 0 END ASC,
              COALESCE(NULLIF(mi.premiere_date, ''), CAST(mi.production_year AS TEXT) || '-01-01') DESC,
-             LOWER(mi.title) ASC, mi.id ASC"
+             LOWER(mi.title) ASC, mi.id ASC".to_owned()
         }
         (CatalogSort::PremiereDate, false) => {
             "CASE WHEN NULLIF(mi.premiere_date, '') IS NULL AND mi.production_year IS NULL THEN 1 ELSE 0 END ASC,
              COALESCE(NULLIF(mi.premiere_date, ''), CAST(mi.production_year AS TEXT) || '-01-01') ASC,
-             LOWER(mi.title) ASC, mi.id ASC"
+             LOWER(mi.title) ASC, mi.id ASC".to_owned()
         }
         (CatalogSort::ProductionYear, true) => {
             "CASE WHEN mi.production_year IS NULL THEN 1 ELSE 0 END ASC,
-             mi.production_year DESC, LOWER(mi.title) ASC, mi.id ASC"
+             mi.production_year DESC, LOWER(mi.title) ASC, mi.id ASC".to_owned()
         }
         (CatalogSort::ProductionYear, false) => {
             "CASE WHEN mi.production_year IS NULL THEN 1 ELSE 0 END ASC,
-             mi.production_year ASC, LOWER(mi.title) ASC, mi.id ASC"
+             mi.production_year ASC, LOWER(mi.title) ASC, mi.id ASC".to_owned()
         }
         (CatalogSort::Rating, true) => {
             "CASE WHEN mi.rating IS NULL THEN 1 ELSE 0 END ASC,
-             mi.rating DESC, LOWER(mi.title) ASC, mi.id ASC"
+             mi.rating DESC, LOWER(mi.title) ASC, mi.id ASC".to_owned()
         }
         (CatalogSort::Rating, false) => {
             "CASE WHEN mi.rating IS NULL THEN 1 ELSE 0 END ASC,
-             mi.rating ASC, LOWER(mi.title) ASC, mi.id ASC"
+             mi.rating ASC, LOWER(mi.title) ASC, mi.id ASC".to_owned()
         }
-        (CatalogSort::SortName, true) => "LOWER(mi.sort_title) DESC, mi.id DESC",
-        (CatalogSort::SortName, false) => "LOWER(mi.sort_title) ASC, mi.id ASC",
-        (CatalogSort::Name, true) => "LOWER(mi.title) DESC, mi.id DESC",
-        (CatalogSort::Name, false) => "LOWER(mi.title) ASC, mi.id ASC",
+        (CatalogSort::SortName, true) => "LOWER(mi.sort_title) DESC, mi.id DESC".to_owned(),
+        (CatalogSort::SortName, false) => "LOWER(mi.sort_title) ASC, mi.id ASC".to_owned(),
+        (CatalogSort::Name, true) => "LOWER(mi.title) DESC, mi.id DESC".to_owned(),
+        (CatalogSort::Name, false) => "LOWER(mi.title) ASC, mi.id ASC".to_owned(),
     }
 }
 
@@ -2940,7 +2953,9 @@ impl Database {
             .join(", ");
         let item_order = sort
             .map(|(sort_by, descending)| catalog_item_order(sort_by, descending))
-            .unwrap_or("mi.season_number, mi.episode_number, mi.sort_title, mi.id");
+            .unwrap_or_else(|| {
+                "mi.season_number, mi.episode_number, mi.sort_title, mi.id".to_owned()
+            });
         let mut content_restriction_predicate = String::new();
         let mut content_restriction_binds = Vec::new();
         append_content_restriction_predicate(
@@ -11298,16 +11313,17 @@ fn filtered_catalog_list_query<'a>(
 ) -> (String, Vec<CatalogBind<'a>>) {
     let (where_clause, binds) = catalog_filter_where_clause(filter);
     let item_order = catalog_item_order(filter.sort_by, filter.descending);
+
     let fetch_limit = if filter.include_total {
         filter.limit
     } else {
         filter.limit.saturating_add(1)
     };
     if let Some((selected_sql, union_binds)) =
-        catalog_list_union_selected_sql(filter, &where_clause, &binds, item_order, fetch_limit)
+        catalog_list_union_selected_sql(filter, &where_clause, &binds, &item_order, fetch_limit)
     {
         return (
-            catalog_list_query_from_selected(&selected_sql, item_order, projection),
+            catalog_list_query_from_selected(&selected_sql, &item_order, projection),
             union_binds,
         );
     }
@@ -11323,7 +11339,7 @@ fn filtered_catalog_list_query<'a>(
     binds.push(CatalogBind::Integer(fetch_limit));
     binds.push(CatalogBind::Integer(filter.offset));
     (
-        catalog_list_query_from_selected(&selected_sql, item_order, projection),
+        catalog_list_query_from_selected(&selected_sql, &item_order, projection),
         binds,
     )
 }
@@ -11336,6 +11352,10 @@ fn catalog_list_query_from_selected(
     let stream_columns = catalog_stream_columns(projection);
     let stream_join = catalog_stream_join(projection);
     let stream_order = catalog_stream_order(projection);
+    // Applied to the joined row this would evaluate every term against the outer `media_items` row,
+    // so a per-item term such as the series rollup would read the wrong item. The page is already
+    // limited by `selected_sql`; ordering the projection only keeps its rows in that page order.
+    let wrapper_order = item_order;
     format!(
         "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                 mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
@@ -11365,7 +11385,7 @@ fn catalog_list_query_from_selected(
               WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
           )
          {stream_join}
-         ORDER BY {item_order}, ms.id{stream_order}"
+         ORDER BY {wrapper_order}, ms.id{stream_order}"
     )
 }
 
@@ -11530,6 +11550,8 @@ fn catalog_list_union_selected_sql<'a>(
     }
     let library_count = filter.library_ids.len();
     let rest_binds = binds.get(library_count..)?.to_vec();
+    // Each branch carries the series rollup so the merged page can order by it; without the column
+    // a series would be sorted by its own added_at after the branches are combined.
     let marker = "AND mi.library_id IN (";
     let start = where_clause.find(marker)?;
     let values_start = start + marker.len();
@@ -11547,7 +11569,8 @@ fn catalog_list_union_selected_sql<'a>(
         // globally before the per-source detail join runs.
         branches.push(format!(
             "SELECT * FROM (
-                 SELECT mi.id AS id, mi.added_at AS added_at, mi.title AS title
+                 SELECT mi.id AS id, mi.added_at AS added_at, mi.title AS title,
+                        {CATALOG_SERIES_ADDED_AT} AS series_added_at
                  FROM media_items mi
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                  {branch_where}
@@ -11559,14 +11582,16 @@ fn catalog_list_union_selected_sql<'a>(
         union_binds.extend(rest_binds.iter().copied());
         union_binds.push(CatalogBind::Integer(branch_limit));
     }
-    // Page on item ids, not on the joined media_source/media_stream rows: one item can expand
-    // into several detail rows, so the row-level LIMIT would drop items from a full page.
+    // Each branch pages in the shared item order and carries it, so the merged page re-sorts on the
+    // same key and a series keeps the position its own row earned. Page on item ids, not on the
+    // joined media_source/media_stream rows: one item can expand into several detail rows, so the
+    // row-level LIMIT would drop items from a full page.
     let paged_sql = format!(
         "SELECT paged.id
          FROM (
              {}
          ) paged
-         ORDER BY paged.added_at DESC, LOWER(paged.title) ASC, paged.id ASC
+         ORDER BY paged.series_added_at DESC, LOWER(paged.title) ASC, paged.id ASC
          LIMIT ? OFFSET ?",
         branches.join("\nUNION ALL\n")
     );
@@ -11852,6 +11877,174 @@ mod tests {
                 .await?
                 .is_empty(),
             "seasons are not rating-sync candidates"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn date_created_sort_uses_the_newest_available_episode_of_a_series()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        database
+            .query(
+                "INSERT INTO libraries (id, name, kind) VALUES
+                     ('series-sort', 'Shows', 'SERIES'), ('movie-sort', 'Movies', 'MOVIE')",
+            )
+            .execute(&database.pool)
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items
+                     (id, library_id, item_type, title, sort_title, added_at,
+                      has_available_source, identification_status)
+                 VALUES
+                     ('series-old', 'series-sort', 'SERIES', 'Old Show', 'old show',
+                      100, 1, 'LOCAL_CONFIRMED'),
+                     ('movie-newer', 'series-sort', 'MOVIE', 'Newer Movie', 'newer movie',
+                      300, 1, 'LOCAL_CONFIRMED'),
+                     ('episode-new', 'series-sort', 'EPISODE', 'Old Show S02E01',
+                      'old show s02e01', 500, 1, 'LOCAL_CONFIRMED'),
+                     ('episode-removed', 'series-sort', 'EPISODE', 'Old Show S03E01',
+                      'old show s03e01', 900, 1, 'LOCAL_CONFIRMED'),
+                     ('other-series', 'series-sort', 'SERIES', 'Other Show', 'other show',
+                      50, 1, 'LOCAL_CONFIRMED'),
+                     ('episode-missing-file', 'series-sort', 'EPISODE', 'Other Show S01E01',
+                      'other show s01e01', 800, 1, 'LOCAL_CONFIRMED')",
+            )
+            .execute(&database.pool)
+            .await?;
+        database
+            .query(
+                "UPDATE media_items
+                 SET series_id = 'series-old'
+                 WHERE id IN ('episode-new', 'episode-removed')",
+            )
+            .execute(&database.pool)
+            .await?;
+        database
+            .query("UPDATE media_items SET series_id = 'other-series' WHERE id = ?")
+            .bind("episode-missing-file")
+            .execute(&database.pool)
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_sources (id, item_id, source_kind, is_default)
+                 VALUES ('source-new', 'episode-new', 'LOCAL_FILE', 1),
+                        ('source-removed', 'episode-removed', 'LOCAL_FILE', 1),
+                        ('source-missing', 'episode-missing-file', 'LOCAL_FILE', 1),
+                        ('source-movie', 'movie-newer', 'LOCAL_FILE', 1)",
+            )
+            .execute(&database.pool)
+            .await?;
+        database
+            .query(
+                "INSERT INTO library_roots
+                     (id, library_id, canonical_path, display_path, is_available, is_writable)
+                 VALUES ('sort-root', 'series-sort', '/media/series-sort', '/media/series-sort', 1, 1)",
+            )
+            .execute(&database.pool)
+            .await?;
+        database
+            .query(
+                "INSERT INTO filesystem_entries
+                     (id, library_root_id, relative_path, entry_kind, size, modified_at,
+                      last_seen_generation, is_missing)
+                 VALUES ('entry-new', 'sort-root', 'Old Show/S02E01.mkv', 'FILE', 1, 1, 'g', 0),
+                        ('entry-removed', 'sort-root', 'Old Show/S03E01.mkv', 'FILE', 1, 1, 'g', 0),
+                        ('entry-missing', 'sort-root', 'Other Show/S01E01.mkv', 'FILE', 1, 1, 'g', 1),
+                        ('entry-movie', 'sort-root', 'Newer Movie.mkv', 'FILE', 1, 1, 'g', 0)",
+            )
+            .execute(&database.pool)
+            .await?;
+        for (source_id, entry_id) in [
+            ("source-new", "entry-new"),
+            ("source-removed", "entry-removed"),
+            ("source-missing", "entry-missing"),
+            ("source-movie", "entry-movie"),
+        ] {
+            database
+                .query("UPDATE media_sources SET filesystem_entry_id = ? WHERE id = ?")
+                .bind(entry_id)
+                .bind(source_id)
+                .execute(&database.pool)
+                .await?;
+        }
+        // A removed episode and an episode whose file is missing must not lift their series.
+        database
+            .query("UPDATE media_items SET removed_at = 1 WHERE id = 'episode-removed'")
+            .execute(&database.pool)
+            .await?;
+
+        let library_ids = vec!["series-sort".to_owned()];
+        let filter = CatalogFilterQuery {
+            library_ids: &library_ids,
+            user_id: "user",
+            item_types: &[],
+            excluded_item_types: &[],
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            provider_id_equals: None,
+            years: &[],
+            genre_keys: &[],
+            studio_keys: &[],
+            is_played: None,
+            is_favorite: None,
+            is_resumable: None,
+            min_date_last_saved: None,
+            metadata_pending: false,
+            parent_id_scope: None,
+            content_restrictions: None,
+            sort_by: CatalogSort::DateCreated,
+            descending: true,
+            offset: 0,
+            limit: 10,
+            include_total: true,
+        };
+        let (rows, _) = database.list_filtered_catalog_rows(&filter).await?;
+        let ids = rows
+            .iter()
+            .map(|row| row.item_id.as_str())
+            .collect::<Vec<_>>();
+        let series_position = |item_id: &str| ids.iter().position(|id| *id == item_id);
+        assert_eq!(
+            series_position("series-old"),
+            Some(0),
+            "the series with the newest available episode must come first: {ids:?}"
+        );
+        assert!(
+            series_position("movie-newer").is_some(),
+            "movies must stay in the page: {ids:?}"
+        );
+        assert!(
+            series_position("movie-newer") < series_position("other-series"),
+            "a series added earlier keeps its movie as the sort key: {ids:?}"
+        );
+
+        let ascending = CatalogFilterQuery {
+            descending: false,
+            ..filter
+        };
+        let (rows, _) = database.list_filtered_catalog_rows(&ascending).await?;
+        let ascending_series_position = rows
+            .iter()
+            .position(|row| row.item_id == "series-old")
+            .ok_or("the series must stay in the ascending page")?;
+        let ascending_movie_position = rows
+            .iter()
+            .position(|row| row.item_id == "movie-newer")
+            .ok_or("the movie must stay in the ascending page")?;
+        assert!(
+            ascending_movie_position < ascending_series_position,
+            "ascending order must mirror the series rollup: {:?}",
+            rows.iter()
+                .map(|row| row.item_id.as_str())
+                .collect::<Vec<_>>()
         );
         Ok(())
     }

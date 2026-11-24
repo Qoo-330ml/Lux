@@ -111,6 +111,7 @@ pub use jobs::{
 pub use library::LibraryScanner;
 use library::{FileBatchWalker, is_strm_file, is_supported_movie_file, is_supported_sidecar_file};
 use manifest::*;
+pub(crate) use names::parse_season_directory;
 use names::{
     EpisodeHierarchy, ManifestFilenameInput, MixedClassification, MixedClassificationCache,
     PreparedManifestFilename, classify_mixed_file, classify_mixed_manifest_file,

@@ -2549,6 +2549,25 @@ impl Database {
         Ok(revoked)
     }
 
+    pub(crate) async fn find_active_access_token_session_id(
+        &self,
+        user_id: &str,
+        token_hash: &[u8],
+    ) -> Result<Option<String>, StorageError> {
+        self.query_scalar(
+            "SELECT id
+             FROM access_tokens
+             WHERE user_id = ? AND token_hash = ? AND revoked_at IS NULL AND scope = 'FULL'
+               AND (expires_at IS NULL OR expires_at > unixepoch())
+             LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(self.sqlx_err())
+    }
+
     pub(crate) async fn find_access_token_device(
         &self,
         token_hash: &[u8],
@@ -2644,13 +2663,34 @@ impl Database {
         &self,
         user_id: &str,
     ) -> Result<u64, StorageError> {
-        let revoked = self
-            .query(
-                "UPDATE access_tokens
-                 SET revoked_at = unixepoch(), updated_at = unixepoch()
-                 WHERE user_id = ? AND revoked_at IS NULL",
-            )
-            .bind(user_id)
+        self.revoke_all_access_tokens_for_user_except(user_id, None)
+            .await
+    }
+
+    /// Revokes every active Emby access token of a user except an optional kept token hash.
+    pub(crate) async fn revoke_all_access_tokens_for_user_except(
+        &self,
+        user_id: &str,
+        keep_token_hash: Option<&[u8]>,
+    ) -> Result<u64, StorageError> {
+        let statement = match keep_token_hash {
+            Some(keep) => self
+                .query(
+                    "UPDATE access_tokens
+                     SET revoked_at = unixepoch(), updated_at = unixepoch()
+                     WHERE user_id = ? AND revoked_at IS NULL AND token_hash <> ?",
+                )
+                .bind(user_id)
+                .bind(keep),
+            None => self
+                .query(
+                    "UPDATE access_tokens
+                     SET revoked_at = unixepoch(), updated_at = unixepoch()
+                     WHERE user_id = ? AND revoked_at IS NULL",
+                )
+                .bind(user_id),
+        };
+        let revoked = statement
             .execute(&self.pool)
             .await
             .map_err(self.sqlx_err())?

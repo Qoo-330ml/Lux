@@ -307,6 +307,7 @@ export type MediaItem = {
   productionYear?: number | null;
   rating?: number | null;
   ratingSource?: string | null;
+  genres?: string[];
   providerIds?: Record<string, string> | null;
   seasonCount?: number | null;
   episodeCount?: number | null;
@@ -388,6 +389,18 @@ export type ImageSearchResult = {
   height?: number | null;
   source: string;
   url: string;
+};
+
+export type ImageSearchResponse = {
+  images?: ImageSearchResult[];
+  /** Language codes the scraper returned for this image type before the language filter. */
+  availableLanguages?: string[];
+  /** How many scraper images the language filter removed from the result. */
+  filteredByLanguage?: number;
+  /** Normalized image types the scraper returned for the item (POSTER, LOGO, BACKDROP). */
+  availableImageTypes?: string[];
+  /** Display name of the scraper that answered, when known. */
+  source?: string | null;
 };
 
 export type HomeResponse = {

@@ -2633,6 +2633,9 @@ impl CatalogService {
         {
             let rows = self.database.list_catalog_rows_by_ids(&item_ids).await?;
             let mut items = reorder_catalog_items(assemble_items(rows), &item_ids);
+            // Same reason as the fresh batch below: a slide is looked up by its external ids.
+            let details = self.database.list_catalog_details_by_ids(&item_ids).await?;
+            apply_catalog_details(&mut items, &details);
             items.retain(|item| {
                 library_ids
                     .iter()
@@ -2655,6 +2658,11 @@ impl CatalogService {
             .await?;
         let rows = self.database.list_catalog_rows_by_ids(&item_ids).await?;
         let mut items = reorder_catalog_items(assemble_items(rows), &item_ids);
+        // The stored detail row is where an item's external identifiers live, and the carousel is read
+        // by them: the client asks the ratings service about a slide by TMDb / IMDb / TVDb id, so a
+        // slide assembled without this answers an empty providerIds and has nothing to ask about.
+        let details = self.database.list_catalog_details_by_ids(&item_ids).await?;
+        apply_catalog_details(&mut items, &details);
         items.retain(|item| {
             library_ids
                 .iter()
@@ -3831,6 +3839,17 @@ fn reorder_catalog_items(items: Vec<CatalogItem>, item_ids: &[String]) -> Vec<Ca
         .iter()
         .filter_map(|item_id| items_by_id.remove(item_id))
         .collect()
+}
+
+fn apply_catalog_details(
+    items: &mut [CatalogItem],
+    details: &HashMap<String, StoredCatalogDetail>,
+) {
+    for item in items {
+        if let Some(detail) = details.get(&item.id) {
+            apply_catalog_detail(item, detail);
+        }
+    }
 }
 
 fn apply_catalog_detail(item: &mut CatalogItem, detail: &StoredCatalogDetail) {

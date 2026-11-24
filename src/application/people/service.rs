@@ -79,7 +79,7 @@ const MAX_PEOPLE_FILE_BYTES: u64 = 256 * 1024;
 const MAX_PROFILE_BYTES: usize = 10 * 1024 * 1024;
 const PROFILE_EXTENSIONS: [&str; 3] = ["jpg", "png", "webp"];
 const PERSON_INDEX_REBUILD_BATCH_SIZE: i64 = 100;
-const PERSON_INDEX_REBUILD_SCHEMA_VERSION: i64 = 1;
+const PERSON_INDEX_REBUILD_SCHEMA_VERSION: i64 = 3;
 const PERSON_LOCKABLE_FIELDS: [&str; 14] = [
     "name",
     "biography",
@@ -299,6 +299,14 @@ pub struct PersonMetadataUpdate {
 pub struct PersonIdentity {
     pub provider: String,
     pub id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonicalPersonMergeResult {
+    pub source_person_id: String,
+    pub target_person_id: String,
+    pub moved_identities: Vec<PersonIdentity>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -536,6 +544,8 @@ struct PersonManifest {
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     aliases: BTreeSet<String>,
     identities: Vec<PersonIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    merged_into_person_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     person: Option<PersonMetadata>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1054,6 +1064,8 @@ pub enum PeopleError {
     UpstreamStatus(u16),
     Download(String),
     Serialization(String),
+    NotFound(String),
+    Conflict(String),
     Storage(String),
     Symlink(PathBuf),
     Io {
@@ -1074,6 +1086,7 @@ impl fmt::Display for PeopleError {
                 write!(formatter, "people image upstream returned {status}")
             }
             Self::Serialization(message) => write!(formatter, "people data is invalid: {message}"),
+            Self::NotFound(message) | Self::Conflict(message) => formatter.write_str(message),
             Self::Storage(message) => write!(formatter, "people index storage failed: {message}"),
             Self::Symlink(path) => {
                 write!(formatter, "people path is a symlink: {}", path.display())
@@ -1096,6 +1109,8 @@ impl std::error::Error for PeopleError {
             | Self::UpstreamStatus(_)
             | Self::Download(_)
             | Self::Serialization(_)
+            | Self::NotFound(_)
+            | Self::Conflict(_)
             | Self::Storage(_)
             | Self::Symlink(_) => None,
         }
@@ -4362,6 +4377,7 @@ mod tests {
             display_name: "演员甲".to_owned(),
             aliases: BTreeSet::new(),
             identities: Vec::new(),
+            merged_into_person_id: None,
             person: Some(PersonMetadata {
                 biography: Some("本地简介".to_owned()),
                 ..PersonMetadata::default()

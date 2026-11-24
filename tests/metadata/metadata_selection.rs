@@ -2242,6 +2242,44 @@ async fn series_and_season_selection_writes_to_their_media_directories()
 }
 
 #[tokio::test]
+async fn series_selection_writes_tvshow_nfo_when_the_season_directory_has_a_version_label()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_series_fixture_with_season_directory("Season 1 DV").await?;
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.series_id,
+        json!({
+            "title": "Online Series",
+            "overview": "Online Series Overview",
+            "providerIds": { "Tmdb": "603" }
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+    );
+
+    selection
+        .select(
+            &fixture.series_id,
+            &candidate_id,
+            MetadataSelectionMode::FillMissing,
+        )
+        .await
+        .map_err(|error| format!("series selection failed: {error:?}"))?;
+
+    let series_nfo = tokio::fs::read_to_string(fixture.series_dir.join("tvshow.nfo")).await?;
+    assert!(series_nfo.starts_with("<tvshow>"));
+    assert!(series_nfo.contains("<plot>Online Series Overview</plot>"));
+    assert!(
+        !fixture.series_dir.join("Season 01").exists(),
+        "writeback must not invent a season directory"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn scraper_role_policy_limits_which_source_may_supply_artwork()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(false).await?;
@@ -4113,10 +4151,16 @@ async fn prepare_fixture(with_local_nfo: bool) -> Result<Fixture, Box<dyn std::e
 }
 
 async fn prepare_series_fixture() -> Result<SeriesFixture, Box<dyn std::error::Error>> {
+    prepare_series_fixture_with_season_directory("Season 01").await
+}
+
+async fn prepare_series_fixture_with_season_directory(
+    season_directory: &str,
+) -> Result<SeriesFixture, Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let root = temp_dir.path().join("Shows");
     let series_dir = root.join("Drama").join("Example Show (2020)");
-    let season_dir = series_dir.join("Season 01");
+    let season_dir = series_dir.join(season_directory);
     tokio::fs::create_dir_all(&season_dir).await?;
     tokio::fs::write(season_dir.join("Example.Show.S01E01.mkv"), b"fixture").await?;
     let config = Config {

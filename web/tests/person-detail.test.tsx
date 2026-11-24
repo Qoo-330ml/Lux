@@ -191,4 +191,88 @@ describe("person detail", () => {
     });
     expect(updatePerson).toHaveBeenCalledWith("person-3", expect.objectContaining({ name: "演员丙（编辑）" }));
   });
+
+  it("groups works into a descending year timeline with type filter, expandable biography and dossier dialog", async () => {
+    const longBio = "田曦薇，1997年10月14日出生于重庆市，毕业于上海戏剧学院，中国内地女演员。".repeat(4);
+    vi.spyOn(api, "person").mockResolvedValue({
+      id: "person-timeline",
+      name: "田曦薇",
+      biography: longBio,
+      birthday: "1997-10-14",
+      placeOfBirth: "重庆市",
+      knownForDepartment: "Acting",
+      providerIds: { Tmdb: "2457819" },
+      tags: ["古装"],
+    });
+    vi.spyOn(api, "personItems").mockResolvedValue({
+      items: [
+        { id: "s-2022", title: "卿卿日常", itemType: "SERIES", productionYear: 2022, rating: 8.2, episodeCount: 40 },
+        { id: "s-2026", title: "嫁金钗", itemType: "SERIES", productionYear: 2026, rating: 9.0 },
+        { id: "m-2026", title: "低智商犯罪", itemType: "MOVIE", premiereDate: "2026-05-01", rating: 8.0 },
+        { id: "m-unknown", title: "未定档作品", itemType: "MOVIE" },
+      ],
+      total: 4,
+      page: 1,
+      pageSize: 24,
+    });
+    const showModalMock = vi.fn(function (this: HTMLDialogElement) {
+      this.setAttribute("open", "");
+    });
+    const closeMock = vi.fn(function (this: HTMLDialogElement) {
+      this.removeAttribute("open");
+    });
+    HTMLDialogElement.prototype.showModal = showModalMock;
+    HTMLDialogElement.prototype.close = closeMock;
+
+    root = createRoot(container!);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/people/person-timeline"]}>
+            <Routes>
+              <Route path="people/:personId" element={<PersonDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const yearHeadings = Array.from(container?.querySelectorAll(".lux-person-timeline-year-title") ?? []).map((el) => el.textContent);
+    expect(yearHeadings).toEqual(["2026年", "2022年", "年份未知"]);
+
+    const summary = container?.querySelector(".lux-person-summary")?.textContent ?? "";
+    expect(summary).toContain("2022年–2026年");
+    expect(summary).toContain("4 部");
+
+    const bioParagraph = container?.querySelector(".lux-person-overview p");
+    expect(bioParagraph?.classList.contains("is-clamped")).toBe(true);
+    const bioToggle = container?.querySelector<HTMLButtonElement>(".lux-person-bio-toggle");
+    expect(bioToggle?.getAttribute("aria-expanded")).toBe("false");
+    await act(async () => bioToggle?.click());
+    expect(bioToggle?.getAttribute("aria-expanded")).toBe("true");
+    expect(bioParagraph?.classList.contains("is-clamped")).toBe(false);
+
+    const seriesFilter = container?.querySelector<HTMLButtonElement>("[data-works-filter='SERIES']");
+    expect(seriesFilter).not.toBeNull();
+    await act(async () => seriesFilter?.click());
+    expect(seriesFilter?.getAttribute("aria-pressed")).toBe("true");
+    const filteredYears = Array.from(container?.querySelectorAll(".lux-person-timeline-year-title") ?? []).map((el) => el.textContent);
+    expect(filteredYears).toEqual(["2026年", "2022年"]);
+    expect(container?.textContent).not.toContain("低智商犯罪");
+
+    const allFilter = container?.querySelector<HTMLButtonElement>("[data-works-filter='all']");
+    await act(async () => allFilter?.click());
+    expect(container?.textContent).toContain("低智商犯罪");
+
+    const dossierBtn = container?.querySelector<HTMLButtonElement>("[data-open-dossier]");
+    expect(dossierBtn).not.toBeNull();
+    await act(async () => dossierBtn?.click());
+    expect(showModalMock).toHaveBeenCalledTimes(1);
+    expect(container?.querySelector("dialog.lux-person-dossier-dialog")?.hasAttribute("open")).toBe(true);
+  });
 });
