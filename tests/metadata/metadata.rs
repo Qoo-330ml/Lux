@@ -913,7 +913,7 @@ async fn semantically_unchanged_nfo_revision_skips_metadata_and_relation_rewrite
             .await?;
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&upgraded_cache)?["schemaVersion"],
-        1
+        2
     );
     let upgraded_fast_path = enricher.enrich_movie_library(library.id).await?;
     assert_eq!(upgraded_fast_path.nfo_loaded, 0);

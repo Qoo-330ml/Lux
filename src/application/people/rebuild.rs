@@ -227,6 +227,25 @@ impl PeopleService {
         if replayed_decisions > 0 {
             tracing::info!(replayed_decisions, "person decision operations replayed");
         }
+        let should_recover_legacy_quarantine = !database
+            .people_quarantine_legacy_fp_recovery_completed()
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        if should_recover_legacy_quarantine {
+            let recovered_relations = self
+                .recover_quarantined_legacy_people_relations(database)
+                .await?;
+            if recovered_relations > 0 {
+                tracing::info!(
+                    recovered_relations,
+                    "restored mistakenly quarantined legacy v1 people relations"
+                );
+            }
+            database
+                .mark_people_quarantine_legacy_fp_recovery_completed()
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        }
         let library_metadata_root = metadata_root(&self.config_dir).join("library");
         match fs::metadata(&library_metadata_root).await {
             Ok(metadata) if metadata.is_dir() => {}
@@ -1034,6 +1053,110 @@ impl PeopleService {
             })?;
         restrict_permissions(&target, false).await?;
         Ok(true)
+    }
+
+    async fn recover_quarantined_legacy_people_relations(
+        &self,
+        database: &Database,
+    ) -> Result<usize, PeopleError> {
+        let quarantine_root = metadata_root(&self.config_dir)
+            .join("quarantine")
+            .join(PEOPLE_RELATION_QUARANTINE_DIR);
+        let mut entries = match fs::read_dir(&quarantine_root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(source) => {
+                return Err(PeopleError::Io {
+                    path: quarantine_root,
+                    source,
+                });
+            }
+        };
+
+        let mut best_by_item: BTreeMap<String, (PathBuf, StoredPeopleRelation)> = BTreeMap::new();
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|source| PeopleError::Io {
+                path: quarantine_root.clone(),
+                source,
+            })?
+        {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(bytes) = (match read_people_file(&path).await {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            }) else {
+                continue;
+            };
+            let Ok(relation) = parse_relation(&bytes) else {
+                continue;
+            };
+            let Some(item_id) = relation
+                .item_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            if !relation
+                .media_fingerprint
+                .as_deref()
+                .and_then(decode_fingerprint)
+                .is_some_and(|fp| fp.len() == 32)
+            {
+                continue;
+            }
+            let replace = best_by_item
+                .get(&item_id)
+                .is_none_or(|(existing_path, existing)| {
+                    relation.generation > existing.generation
+                        || (relation.generation == existing.generation && &path > existing_path)
+                });
+            if replace {
+                best_by_item.insert(item_id, (path, relation));
+            }
+        }
+
+        let mut recovered = 0usize;
+        for (item_id, (quarantine_path, relation)) in best_by_item {
+            let Ok(item_dir) = library_item_directory(&self.config_dir, &item_id) else {
+                continue;
+            };
+            let target_path = item_dir.join("people.json");
+            if safe_metadata(&target_path).await?.is_some() {
+                continue;
+            }
+            let Some(locator) = database
+                .find_item_source_locator(&item_id)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?
+            else {
+                continue;
+            };
+            let has_v2 = locator
+                .fingerprint
+                .as_deref()
+                .is_some_and(crate::application::scanner::is_v2_scan_fingerprint);
+            if !has_v2 || !relation_source_snapshot_matches(&relation, &locator) {
+                continue;
+            }
+            create_private_dir(&item_dir).await?;
+            fs::rename(&quarantine_path, &target_path)
+                .await
+                .map_err(|source| PeopleError::Io {
+                    path: target_path.clone(),
+                    source,
+                })?;
+            restrict_permissions(&target_path, false).await?;
+            recovered += 1;
+        }
+        Ok(recovered)
     }
 
     fn person_credits_from_relation_with_lookup(

@@ -399,10 +399,13 @@ pub(super) async fn budgeted_file_fingerprint(
     })
 }
 
+pub(crate) fn is_v2_scan_fingerprint(fingerprint: &[u8]) -> bool {
+    fingerprint.len() == SCAN_FINGERPRINT_V2_PREFIX.len() + 16
+        && fingerprint.starts_with(SCAN_FINGERPRINT_V2_PREFIX)
+}
+
 pub(crate) fn is_supported_scan_fingerprint(fingerprint: &[u8]) -> bool {
-    fingerprint.len() == 32
-        || fingerprint.len() == SCAN_FINGERPRINT_V2_PREFIX.len() + 16
-            && fingerprint.starts_with(SCAN_FINGERPRINT_V2_PREFIX)
+    fingerprint.len() == 32 || is_v2_scan_fingerprint(fingerprint)
 }
 
 pub(crate) fn scan_fingerprint_matches_observation(

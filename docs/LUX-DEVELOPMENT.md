@@ -22204,8 +22204,21 @@ LUX-918（NFO 多源演员身份解析与双 NFO 互补合并）。
   收敛后搜索、详情收藏态及头像请求保持可用（`people_api::rebuilding_people_migrates_legacy_local_actor_favorites_and_assets_after_id_algorithm_change`）。
 - [x] `POST /api/v1/admin/people/merge` 校验管理员与 CSRF、迁移状态并写审计事件，对非法/自合并/已合并/
   缺失人物返回对应 400/409/404。
-- [x] 相关单测、`--test metadata`、`--lib` 校验、fmt 与脚本校验通过。
-- [ ] 未验证：部署到 `fnos` 实机并触发 `rebuild`/手动合并接口检查线上人物收敛与权限行为。
+- [x] `fnos` 实机升级核查补充修复（2026-11-24）：
+  - 修复 `relation_media_snapshot_matches` / `legacy_relation_is_current`：当 32 字节旧版 `LUX-FP-1`
+    快照遇到 `LUX-FP-2` 升级且容器/FUSE 挂载设备号 `st_dev` 漂移时，回退校验精确尺寸、纳秒修改时间、
+    片名与年份，不再误隔离正常 `people.json`。
+  - 新增启动重建一次性误隔离恢复（`lux_meta` `people_quarantine_legacy_fp_recovery_v1`），将因该问题
+    移入 `quarantine/people-relations/` 且仍匹配在库 `LUX-FP-2` 媒体的 `v1` 快照迁回并重建索引
+    （`PERSON_INDEX_REBUILD_SCHEMA_VERSION = 4`）。
+  - 补齐 `start_local_metadata_outbox_worker` 与 `run_local_metadata_refresh` 对 `PeopleService`
+    的注入，修正 `DeferredNfoActorCredits` 批内并发合并重定向，并递增
+    `LOCAL_NFO_CACHE_SCHEMA_VERSION = 2`、`PEOPLE_RELATION_SCHEMA_VERSION = 5`，启动后一次性重排
+    已完成根目录的本地元数据回填（`lux_meta` `nfo_actor_identities_backfill_v1`）以重读存量双 NFO 并
+    自动收敛碰撞人物。
+- [x] 相关单测、`--test metadata`、`--test scanned_metadata`、`--test emby search::`、`--lib` 校验、fmt
+  与脚本校验通过。
+- [ ] 未验证：将本轮修复重新部署到 `fnos` 实机后的线上重建与搜索收敛结果。
 
 预计文件：`src/storage/people.rs`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/application/people/service.rs`、`src/application/people/helpers.rs`、`src/application/people/matching.rs`、`src/application/people/relations.rs`、`src/application/people/rebuild.rs`、`src/api/admin/admin_people.rs`、`src/api/legacy.rs`、`tests/metadata/people_api.rs`、`docs/LUX-DEVELOPMENT.md`。
 

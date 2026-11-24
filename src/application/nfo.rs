@@ -221,7 +221,7 @@ pub struct MovieNfoMetadata {
 
 pub(crate) const MAX_LOCAL_NFO_BYTES: usize = 1024 * 1024;
 const MAX_LOCAL_NFO_EVENTS: usize = 20_000;
-const LOCAL_NFO_CACHE_SCHEMA_VERSION: u8 = 1;
+const LOCAL_NFO_CACHE_SCHEMA_VERSION: u8 = 2;
 const MAX_MOVIE_NFO_ACTORS: usize = 100;
 const MAX_MOVIE_NFO_STREAMS: usize = 128;
 const MAX_MOVIE_ACTOR_FIELD_BYTES: usize = 256 * 1024;

@@ -61,7 +61,7 @@ const LEGACY_PROFILES_DIR: &str = "profiles";
 const PERSON_NFO: &str = "person.nfo";
 const PERSON_MANIFEST: &str = "person.json";
 const PERSON_IMAGE: &str = "folder";
-const PEOPLE_RELATION_SCHEMA_VERSION: u32 = 4;
+const PEOPLE_RELATION_SCHEMA_VERSION: u32 = 5;
 const PERSON_MANIFEST_SCHEMA_VERSION: u32 = 3;
 const LEGACY_PERSON_MIGRATION_SCHEMA_VERSION: i64 = 1;
 const PENDING_PERSON_DIRECTORY: &str = "personDirectory";
@@ -79,7 +79,7 @@ const MAX_PEOPLE_FILE_BYTES: u64 = 256 * 1024;
 const MAX_PROFILE_BYTES: usize = 10 * 1024 * 1024;
 const PROFILE_EXTENSIONS: [&str; 3] = ["jpg", "png", "webp"];
 const PERSON_INDEX_REBUILD_BATCH_SIZE: i64 = 100;
-const PERSON_INDEX_REBUILD_SCHEMA_VERSION: i64 = 3;
+const PERSON_INDEX_REBUILD_SCHEMA_VERSION: i64 = 4;
 const PERSON_LOCKABLE_FIELDS: [&str; 14] = [
     "name",
     "biography",
@@ -375,6 +375,7 @@ pub struct ActorPersistReport {
 #[derive(Clone)]
 pub(crate) struct DeferredNfoActorCredits {
     pending: Arc<AsyncMutex<Vec<PendingNfoActorCredits>>>,
+    merged_redirects: Arc<AsyncMutex<HashMap<String, String>>>,
     flush_lock: Arc<AsyncMutex<()>>,
     manifest_restore_pending: Arc<AsyncMutex<bool>>,
     person_asset_results: Arc<AsyncMutex<HashMap<String, Arc<OnceCell<PersonAssetResult>>>>>,
@@ -409,6 +410,7 @@ impl Default for DeferredNfoActorCredits {
     fn default() -> Self {
         Self {
             pending: Arc::default(),
+            merged_redirects: Arc::default(),
             flush_lock: Arc::new(AsyncMutex::new(())),
             manifest_restore_pending: Arc::default(),
             person_asset_results: Arc::default(),
@@ -846,6 +848,9 @@ impl PeopleService {
         };
         let relation_checksum = relation_snapshot_checksum(&relation_bytes);
         let relation = parse_relation(&relation_bytes)?;
+        if relation.schema_version < PEOPLE_RELATION_SCHEMA_VERSION {
+            return Ok(false);
+        }
         let relation_is_current = relation
             .source_fingerprint
             .as_deref()
@@ -901,6 +906,8 @@ impl PeopleService {
                 (Some(stored), Some(locator), Some(old_relative_path)) => {
                     legacy_scan_fingerprint_for_path(&locator, old_relative_path)
                         .is_some_and(|legacy| stored == legacy)
+                        || (stored.len() == 32
+                            && relation_source_snapshot_matches(&relation, &locator))
                 }
                 _ => false,
             }
@@ -935,6 +942,9 @@ impl PeopleService {
         };
         let relation_checksum = relation_snapshot_checksum(&relation_bytes);
         let relation = parse_relation(&relation_bytes)?;
+        if relation.schema_version < PEOPLE_RELATION_SCHEMA_VERSION {
+            return Ok(false);
+        }
         let source_fingerprint = relation
             .source_fingerprint
             .as_deref()
@@ -1720,6 +1730,76 @@ mod tests {
         assert!(super::relation_media_snapshot_matches(&relation, &moved));
     }
 
+    #[test]
+    fn relation_matching_accepts_legacy_v1_relation_after_v2_upgrade_and_device_drift() {
+        let relative_path = "抓娃娃 (2024)/抓娃娃 (2024) - 2160p H.265 DDP5.1.strm";
+        let legacy_fp_dev_56 = crate::application::scanner::compute_file_fingerprint(
+            relative_path,
+            182,
+            1_785_114_731_307_599_639,
+            Some(56),
+            Some(107_192),
+        );
+        let current_fp_v2_dev_57 = crate::application::scanner::compute_scan_fingerprint_v2(
+            relative_path,
+            182,
+            1_785_114_731_307_599_639,
+            Some(57),
+            Some(107_192),
+        );
+        let relation = super::StoredPeopleRelation {
+            schema_version: 4,
+            generation: 6,
+            source_fingerprint: None,
+            item_id: Some("item-zhua".to_owned()),
+            source_key: None,
+            source_root: Some("/media/strm/video/movie/华语电影".to_owned()),
+            source_relative_path: Some(relative_path.to_owned()),
+            media_fingerprint: Some(super::encode_fingerprint(&legacy_fp_dev_56)),
+            media_size: Some(182),
+            media_modified_at: Some(1_785_114_731_307_599_639),
+            media_title: Some("抓娃娃".to_owned()),
+            media_production_year: Some(2024),
+            actors: Vec::new(),
+        };
+        let current = crate::storage::StoredItemSourceLocator {
+            root_path: "/media/strm/video/movie/华语电影".to_owned(),
+            relative_path: relative_path.to_owned(),
+            fingerprint: Some(current_fp_v2_dev_57),
+            size: 182,
+            modified_at: 1_785_114_731_307_599_639,
+            device: Some(57),
+            inode: Some(107_192),
+            title: "抓娃娃".to_owned(),
+            production_year: Some(2024),
+        };
+
+        assert!(super::relation_source_snapshot_matches(&relation, &current));
+        assert!(super::relation_media_snapshot_matches(&relation, &current));
+
+        let modified = crate::storage::StoredItemSourceLocator {
+            root_path: current.root_path.clone(),
+            relative_path: current.relative_path.clone(),
+            fingerprint: current.fingerprint.clone(),
+            size: current.size,
+            modified_at: 1_785_114_731_307_599_640,
+            device: current.device,
+            inode: current.inode,
+            title: current.title.clone(),
+            production_year: current.production_year,
+        };
+        assert!(!super::relation_source_snapshot_matches(
+            &relation, &modified
+        ));
+        let resized = crate::storage::StoredItemSourceLocator {
+            size: 183,
+            ..current
+        };
+        assert!(!super::relation_source_snapshot_matches(
+            &relation, &resized
+        ));
+    }
+
     #[tokio::test]
     async fn database_backed_people_reuse_lux_id_when_provider_changes()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2460,7 +2540,10 @@ mod tests {
         let relation = library_item_directory(config.path(), "item-1")?.join("people.json");
         let relation: serde_json::Value =
             serde_json::from_slice(&tokio::fs::read(relation).await?)?;
-        assert_eq!(relation["schemaVersion"], 4);
+        assert_eq!(
+            relation["schemaVersion"],
+            super::PEOPLE_RELATION_SCHEMA_VERSION
+        );
         assert_eq!(relation["actors"][0]["provider"], "tmdb");
         assert_eq!(relation["actors"][0]["imageFile"], "folder.png");
 

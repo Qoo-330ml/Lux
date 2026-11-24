@@ -1811,28 +1811,52 @@ impl Database {
         Ok(row.version)
     }
 
-    pub(crate) async fn identity_stability_repair_completed(&self) -> Result<bool, StorageError> {
-        self.query_scalar::<String>(
-            "SELECT value FROM lux_meta WHERE key = 'identity_stability_repair_v1'",
+    async fn lux_meta_flag_completed(&self, key: &str) -> Result<bool, StorageError> {
+        self.query_scalar::<String>("SELECT value FROM lux_meta WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .map(|value| value.as_deref() == Some("completed"))
+            .map_err(self.sqlx_err())
+    }
+
+    async fn mark_lux_meta_flag_completed(&self, key: &str) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO lux_meta (key, value)
+             VALUES (?, 'completed')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         )
-        .fetch_optional(&self.pool)
+        .bind(key)
+        .execute(&self.pool)
         .await
-        .map(|value| value.as_deref() == Some("completed"))
+        .map(|_| ())
         .map_err(self.sqlx_err())
+    }
+
+    pub(crate) async fn identity_stability_repair_completed(&self) -> Result<bool, StorageError> {
+        self.lux_meta_flag_completed("identity_stability_repair_v1")
+            .await
     }
 
     pub(crate) async fn mark_identity_stability_repair_completed(
         &self,
     ) -> Result<(), StorageError> {
-        self.query(
-            "INSERT INTO lux_meta (key, value)
-             VALUES ('identity_stability_repair_v1', 'completed')
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        )
-        .execute(&self.pool)
-        .await
-        .map(|_| ())
-        .map_err(self.sqlx_err())
+        self.mark_lux_meta_flag_completed("identity_stability_repair_v1")
+            .await
+    }
+
+    pub(crate) async fn people_quarantine_legacy_fp_recovery_completed(
+        &self,
+    ) -> Result<bool, StorageError> {
+        self.lux_meta_flag_completed("people_quarantine_legacy_fp_recovery_v1")
+            .await
+    }
+
+    pub(crate) async fn mark_people_quarantine_legacy_fp_recovery_completed(
+        &self,
+    ) -> Result<(), StorageError> {
+        self.mark_lux_meta_flag_completed("people_quarantine_legacy_fp_recovery_v1")
+            .await
     }
 
     /// Verifies that SQLite can commit a real write transaction.
