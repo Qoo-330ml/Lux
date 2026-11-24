@@ -1,9 +1,10 @@
 use std::{
+    collections::{HashMap, VecDeque, hash_map::Entry},
     fmt,
     future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 
@@ -21,6 +22,10 @@ use crate::{
 const DEFAULT_USER_AGENT: &str = "Lux/strm-playback";
 const MAX_REDIRECTS: usize = 8;
 const MAX_URL_CHARS: usize = 8 * 1024;
+/// Upper bound for pinned clients kept for connection reuse. Players issue frequent Range seeks
+/// against the same upstream, so a small cache keeps their TCP/TLS connections alive without
+/// letting a long-lived resolver accumulate clients.
+const CLIENT_CACHE_CAPACITY: usize = 32;
 pub const MAX_RANGE_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug)]
@@ -90,11 +95,66 @@ pub struct StrmPlaybackResolver {
 #[derive(Clone)]
 enum StrmEgress {
     /// Production direct connections. Every host name is resolved, the whole answer is checked,
-    /// and the chosen address is pinned into the client that issues that hop.
-    Direct { lookup: HostLookup },
+    /// every checked address is pinned into the client that issues that hop, and those clients are
+    /// pooled so repeated Range seeks reuse their TCP/TLS connections.
+    Direct {
+        lookup: HostLookup,
+        clients: PinnedClients,
+    },
     /// Explicit test HTTP proxy. The proxy, not this process, performs the host name resolution,
     /// so the direct-path DNS checks are skipped while the literal/name blacklist still applies.
     Proxy(Client),
+}
+
+/// Bounded FIFO cache of pinned clients, keyed by the exact address set they may connect to.
+#[derive(Clone, Default)]
+struct PinnedClients {
+    inner: Arc<Mutex<PinnedClientCache>>,
+}
+
+#[derive(Default)]
+struct PinnedClientCache {
+    order: VecDeque<PinnedClientKey>,
+    clients: HashMap<PinnedClientKey, Client>,
+}
+
+/// The resolution result a client was pinned to. A changed address set is a different key, so a
+/// rebinding answer can never reuse a client that still trusts the previous answer.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PinnedClientKey {
+    scheme: String,
+    host: String,
+    port: u16,
+    addresses: Vec<SocketAddr>,
+}
+
+impl PinnedClients {
+    fn get(&self, key: &PinnedClientKey) -> Option<Client> {
+        self.lock().clients.get(key).cloned()
+    }
+
+    fn insert(&self, key: PinnedClientKey, client: Client) {
+        let mut cache = self.lock();
+        if let Entry::Occupied(mut entry) = cache.clients.entry(key.clone()) {
+            entry.insert(client);
+            return;
+        }
+        while cache.clients.len() >= CLIENT_CACHE_CAPACITY {
+            let Some(oldest) = cache.order.pop_front() else {
+                break;
+            };
+            cache.clients.remove(&oldest);
+        }
+        cache.order.push_back(key.clone());
+        cache.clients.insert(key, client);
+    }
+
+    fn lock(&self) -> MutexGuard<'_, PinnedClientCache> {
+        // A poisoned lock only means an earlier holder panicked; the map itself stays usable.
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 pub struct StrmRangeResponse {
@@ -110,6 +170,7 @@ impl StrmPlaybackResolver {
         Ok(Self {
             egress: StrmEgress::Direct {
                 lookup: system_host_lookup(),
+                clients: PinnedClients::default(),
             },
         })
     }
@@ -139,6 +200,7 @@ impl StrmPlaybackResolver {
         Ok(Self {
             egress: StrmEgress::Direct {
                 lookup: Arc::new(lookup),
+                clients: PinnedClients::default(),
             },
         })
     }
@@ -263,41 +325,59 @@ impl StrmPlaybackResolver {
         Err(StrmPlaybackError::TooManyRedirects)
     }
 
-    /// Builds the client for one hop.
+    /// Builds (or reuses) the client for one hop.
     ///
-    /// A host name is resolved exactly once here, every returned address is checked, and the
-    /// selected address is pinned through [`ClientBuilder::resolve_to_addrs`] so the connection
-    /// cannot be re-routed by a second DNS answer. IP literals need no lookup.
+    /// A host name is resolved exactly once here and every returned address is checked. All
+    /// checked addresses are pinned through [`ClientBuilder::resolve_to_addrs`] so a second DNS
+    /// answer can never redirect the connection, while the client may still fall back between the
+    /// verified addresses (dual-stack hosts, one dead peer). Clients are pooled by
+    /// `(scheme, host, port, checked addresses)` so repeated Range seeks reuse connections. IP
+    /// literals need no lookup.
     async fn client_for(&self, url: &Url) -> Result<Client, StrmPlaybackError> {
         match &self.egress {
             StrmEgress::Proxy(client) => Ok(client.clone()),
-            StrmEgress::Direct { lookup } => {
-                let mut builder = base_client_builder().no_proxy();
-                match url.host() {
-                    Some(Host::Domain(domain)) => {
-                        let host = url.host_str().unwrap_or(domain);
-                        let port = url
-                            .port_or_known_default()
-                            .ok_or(StrmPlaybackError::InvalidUrl)?;
-                        let candidates = lookup(host.to_owned(), port)
-                            .await
-                            .map_err(|_| StrmPlaybackError::HostLookupFailed)?;
-                        let pinned = pinned_address(candidates)?;
-                        builder = builder.resolve_to_addrs(host, &[pinned]);
-                        // A trailing root dot names the same host, but the resolver override is
-                        // keyed by the literal authority. Pin both spellings so neither one can
-                        // fall back to a fresh system lookup.
-                        let without_root_dot = host.trim_end_matches('.');
-                        if without_root_dot.len() != host.len() && !without_root_dot.is_empty() {
-                            builder = builder.resolve_to_addrs(without_root_dot, &[pinned]);
-                        }
-                    }
-                    Some(Host::Ipv4(_) | Host::Ipv6(_)) => {}
-                    None => return Err(StrmPlaybackError::InvalidUrl),
+            StrmEgress::Direct { lookup, clients } => {
+                let host = url
+                    .host_str()
+                    .ok_or(StrmPlaybackError::InvalidUrl)?
+                    .to_owned();
+                let port = url
+                    .port_or_known_default()
+                    .ok_or(StrmPlaybackError::InvalidUrl)?;
+                let domain = matches!(url.host(), Some(Host::Domain(_)));
+                let addresses = if domain {
+                    let candidates = lookup(host.clone(), port)
+                        .await
+                        .map_err(|_| StrmPlaybackError::HostLookupFailed)?;
+                    pinned_addresses(candidates)?
+                } else {
+                    Vec::new()
+                };
+                let key = PinnedClientKey {
+                    scheme: url.scheme().to_owned(),
+                    host: host.clone(),
+                    port,
+                    addresses: addresses.clone(),
+                };
+                if let Some(client) = clients.get(&key) {
+                    return Ok(client);
                 }
-                builder
+                let mut builder = base_client_builder().no_proxy();
+                if domain {
+                    builder = builder.resolve_to_addrs(&host, &addresses);
+                    // A trailing root dot names the same host, but the resolver override is keyed
+                    // by the literal authority. Pin both spellings so neither one can fall back to
+                    // a fresh system lookup.
+                    let without_root_dot = host.trim_end_matches('.');
+                    if without_root_dot.len() != host.len() && !without_root_dot.is_empty() {
+                        builder = builder.resolve_to_addrs(without_root_dot, &addresses);
+                    }
+                }
+                let client = builder
                     .build()
-                    .map_err(|error| StrmPlaybackError::ClientBuild(error.to_string()))
+                    .map_err(|error| StrmPlaybackError::ClientBuild(error.to_string()))?;
+                clients.insert(key, client.clone());
+                Ok(client)
             }
         }
     }
@@ -319,21 +399,30 @@ fn system_host_lookup() -> HostLookup {
     })
 }
 
-/// Checks a complete resolver answer and returns the address to pin.
+/// Checks a complete resolver answer and returns every address that may be pinned.
 ///
 /// A single forbidden candidate rejects the whole answer: otherwise an attacker could race a
-/// mixed response or rebind between the check and the connection.
-fn pinned_address(candidates: Vec<SocketAddr>) -> Result<SocketAddr, StrmPlaybackError> {
-    let Some(first) = candidates.first().copied() else {
+/// mixed response or rebind between the check and the connection. The remaining checked addresses
+/// are all kept (deduplicated, order preserved) so the client can still fall back between them,
+/// which preserves dual-stack and dead-peer resilience without ever touching an unchecked address.
+fn pinned_addresses(candidates: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, StrmPlaybackError> {
+    if candidates.is_empty() {
         return Err(StrmPlaybackError::HostLookupFailed);
-    };
+    }
     if candidates
         .iter()
         .any(|candidate| is_disallowed_address(candidate.ip()))
     {
         return Err(StrmPlaybackError::InvalidUrl);
     }
-    Ok(unwrap_embedded_ipv4(first))
+    let mut addresses: Vec<SocketAddr> = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let address = unwrap_embedded_ipv4(candidate);
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+    Ok(addresses)
 }
 
 /// Maps an IPv4-mapped or IPv4-compatible IPv6 socket back to its IPv4 target.
@@ -489,10 +578,11 @@ fn is_disallowed_address(address: IpAddr) -> bool {
     }
 }
 
-/// The STRM policy deliberately keeps RFC1918 (`10/8`, `172.16/12`, `192.168/16`) and ULA
-/// (`fc00::/7`) LAN playback targets allowed. Everything that is not a routable unicast peer is
-/// rejected instead, so this must not be replaced by a generic "block all private addresses"
-/// policy.
+/// The STRM policy deliberately keeps RFC1918 (`10/8`, `172.16/12`, `192.168/16`), ULA
+/// (`fc00::/7`) and carrier-grade NAT (`100.64/10`) LAN playback targets allowed; self-hosted
+/// setups reach their media sources through Tailscale or ZeroTier, which use `100.64.0.0/10`.
+/// Everything that is not a routable unicast peer is rejected instead, so this must not be
+/// replaced by a generic "block all private addresses" policy.
 fn is_disallowed_ipv4(address: Ipv4Addr) -> bool {
     let [first, second, third, _] = address.octets();
     address.is_loopback()
@@ -503,8 +593,6 @@ fn is_disallowed_ipv4(address: Ipv4Addr) -> bool {
         || first == 0
         // 240/4 is reserved for future use and never a unicast destination.
         || first >= 240
-        // Carrier-grade NAT reaches shared operator hosts instead of the user's LAN.
-        || (first == 100 && (64..=127).contains(&second))
         // Special-purpose, documentation and benchmark blocks are not playable media hosts.
         || (first == 192 && second == 0 && matches!(third, 0 | 2))
         || (first == 192 && second == 88 && third == 99)
@@ -531,6 +619,8 @@ fn is_disallowed_ipv6(address: Ipv6Addr) -> bool {
         || segments[0] == 0x2002
         || (segments[0] == 0x2001 && segments[1] == 0)
         || (segments[0] == 0x0064 && segments[1] == 0xff9b)
+        // 2001:db8::/32 is the IPv6 documentation range and never routable.
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
         // 100::/64 is discard-only.
         || (segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0)
 }
@@ -542,10 +632,12 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
+    use reqwest::Client;
+
     use super::{
-        MAX_RANGE_BYTES, StrmHostLookupFuture, StrmPlaybackError, StrmPlaybackResolver,
-        content_range_matches, is_disallowed_address, pinned_address, upstream_range,
-        validate_range, validate_url,
+        CLIENT_CACHE_CAPACITY, MAX_RANGE_BYTES, PinnedClientKey, PinnedClients,
+        StrmHostLookupFuture, StrmPlaybackError, StrmPlaybackResolver, content_range_matches,
+        is_disallowed_address, pinned_addresses, upstream_range, validate_range, validate_url,
     };
 
     fn lookup_returning(
@@ -606,7 +698,6 @@ mod tests {
             "http://224.0.0.1/video.mkv",
             "http://255.255.255.255/video.mkv",
             "http://240.0.0.1/video.mkv",
-            "http://100.64.0.1/video.mkv",
             "http://192.0.2.7/video.mkv",
             "http://198.18.0.1/video.mkv",
             "http://198.51.100.9/video.mkv",
@@ -614,6 +705,7 @@ mod tests {
             "http://[2002:7f00:1::1]/video.mkv",
             "http://[2001:0:4136:e378:8000:63bf:3fff:fdd2]/video.mkv",
             "http://[64:ff9b::7f00:1]/video.mkv",
+            "http://[2001:db8::1]/video.mkv",
             "http://[::127.0.0.1]/video.mkv",
         ] {
             assert!(
@@ -633,6 +725,9 @@ mod tests {
             "http://[fd00::1]:8080/video.mkv",
             "http://[::ffff:10.0.0.5]/video.mkv",
             "http://[::10.0.0.5]/video.mkv",
+            // Tailscale / ZeroTier use the carrier-grade NAT range for self-hosted media sources.
+            "http://100.64.0.1/video.mkv",
+            "http://100.100.100.100:8096/video.mkv",
             "https://93.184.216.34/video.mkv",
             "https://media.example.test/video.mkv",
         ] {
@@ -656,6 +751,7 @@ mod tests {
             "64:ff9b::7f00:1",
             "2002:7f00:1::",
             "2001:0::1",
+            "2001:db8::1",
             "100::1",
             "255.255.255.255",
         ] {
@@ -669,6 +765,8 @@ mod tests {
             "192.168.10.50",
             "10.0.0.5",
             "172.16.0.1",
+            "100.64.0.1",
+            "100.127.255.254",
             "93.184.216.34",
             "2606:4700:4700::1111",
         ] {
@@ -678,33 +776,90 @@ mod tests {
     }
 
     #[test]
-    fn pins_one_checked_address_and_unwraps_embedded_ipv4() {
+    fn keeps_every_checked_address_and_unwraps_embedded_ipv4() {
         let global_v6 = SocketAddr::new(
             IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111)),
             443,
         );
         let public_v4 = socket([93, 184, 216, 34], 443);
-        // The first checked candidate is pinned; no second resolution can replace it.
-        assert_eq!(
-            pinned_address(vec![global_v6, public_v4]).expect("answer should be accepted"),
-            global_v6
+        let mapped_lan = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0005)),
+            8080,
         );
+        let lan_v4 = socket([10, 0, 0, 5], 8080);
+        // Every checked candidate stays pinned so the client can still fall back between them.
         assert_eq!(
-            pinned_address(vec![SocketAddr::new(
-                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0005)),
-                8080,
-            )])
-            .expect("mapped LAN address should be accepted"),
-            socket([10, 0, 0, 5], 8080)
+            pinned_addresses(vec![global_v6, public_v4]).expect("answer should be accepted"),
+            vec![global_v6, public_v4]
+        );
+        // Embedded IPv4 forms are unwrapped, and duplicates collapse while order is preserved.
+        assert_eq!(
+            pinned_addresses(vec![mapped_lan, lan_v4, public_v4, lan_v4])
+                .expect("mapped LAN address should be accepted"),
+            vec![lan_v4, public_v4]
         );
         assert!(matches!(
-            pinned_address(vec![public_v4, socket([127, 0, 0, 1], 443)]),
+            pinned_addresses(vec![public_v4, socket([127, 0, 0, 1], 443)]),
             Err(StrmPlaybackError::InvalidUrl)
         ));
         assert!(matches!(
-            pinned_address(Vec::new()),
+            pinned_addresses(Vec::new()),
             Err(StrmPlaybackError::HostLookupFailed)
         ));
+    }
+
+    fn pinned_client_key(host: &str, addresses: Vec<SocketAddr>) -> PinnedClientKey {
+        PinnedClientKey {
+            scheme: "http".to_owned(),
+            host: host.to_owned(),
+            port: 80,
+            addresses,
+        }
+    }
+
+    fn test_client() -> Client {
+        Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client should build")
+    }
+
+    #[test]
+    fn pinned_client_cache_reuses_clients_and_stays_bounded() {
+        let clients = PinnedClients::default();
+        let key = pinned_client_key("media.example.test", vec![socket([93, 184, 216, 34], 80)]);
+        assert!(clients.get(&key).is_none());
+        clients.insert(key.clone(), test_client());
+        assert!(clients.get(&key).is_some());
+        // A changed resolution answer never reuses a client pinned to the old addresses.
+        assert!(
+            clients
+                .get(&pinned_client_key(
+                    "media.example.test",
+                    vec![socket([10, 0, 0, 5], 80)]
+                ))
+                .is_none()
+        );
+
+        for index in 0..CLIENT_CACHE_CAPACITY {
+            clients.insert(
+                pinned_client_key(&format!("host{index}.example.test"), Vec::new()),
+                test_client(),
+            );
+        }
+        assert_eq!(clients.lock().clients.len(), CLIENT_CACHE_CAPACITY);
+        assert!(
+            clients.get(&key).is_none(),
+            "the oldest client should be evicted once the cache is full"
+        );
+        assert!(
+            clients
+                .get(&pinned_client_key(
+                    &format!("host{}.example.test", CLIENT_CACHE_CAPACITY - 1),
+                    Vec::new()
+                ))
+                .is_some()
+        );
     }
 
     #[tokio::test]

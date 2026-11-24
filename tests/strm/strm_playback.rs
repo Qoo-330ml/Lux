@@ -68,6 +68,67 @@ async fn start_lan_media_server()
     Ok((port, server))
 }
 
+/// Serves range reads over a keep-alive connection and reports how many TCP connections it
+/// accepted, so a test can assert that pooled clients reuse connections.
+async fn start_keepalive_media_server()
+-> Result<(u16, tokio::task::JoinHandle<usize>), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
+    let port = listener.local_addr()?.port();
+    let server = tokio::spawn(async move {
+        let mut accepted = 0;
+        while let Ok(Ok((mut stream, _))) =
+            tokio::time::timeout(Duration::from_millis(200), listener.accept()).await
+        {
+            accepted += 1;
+            loop {
+                let request = match tokio::time::timeout(
+                    Duration::from_millis(400),
+                    read_http_request(&mut stream),
+                )
+                .await
+                {
+                    Ok(Ok(request)) if !request.is_empty() => request,
+                    _ => break,
+                };
+                let (range, body) = if request.to_ascii_lowercase().contains("range: bytes=0-1") {
+                    ("0-1", "01")
+                } else {
+                    ("2-3", "23")
+                };
+                let response = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes {range}/16\r\nContent-Type: video/mp4\r\nConnection: keep-alive\r\n\r\n{body}"
+                );
+                if stream.write_all(response.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        }
+        accepted
+    });
+    Ok((port, server))
+}
+
+/// A LAN neighbour address whose TCP port refuses connections immediately, if the network has
+/// one. Used to prove the pinned address group still falls back after one peer refuses.
+fn fast_refusing_neighbor(lan: Ipv4Addr, port: u16) -> Option<SocketAddr> {
+    let octets = lan.octets();
+    for last in [254_u8, 253, 252, 251, 250] {
+        if octets[3] == last {
+            continue;
+        }
+        let candidate = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(octets[0], octets[1], octets[2], last)),
+            port,
+        );
+        if std::net::TcpStream::connect_timeout(&candidate, Duration::from_millis(500))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn lookup_returning(
     addresses: Vec<SocketAddr>,
 ) -> impl Fn(String, u16) -> StrmHostLookupFuture<'static> + Send + Sync + 'static {
@@ -389,6 +450,75 @@ async fn direct_redirects_that_resolve_to_loopback_are_rejected()
         server.await?,
         1,
         "the forbidden redirect target must not be requested"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_playback_falls_back_between_pinned_addresses()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(lan) = local_lan_address() else {
+        eprintln!(
+            "skipping multi-address fallback test: no non-loopback RFC1918 address available"
+        );
+        return Ok(());
+    };
+    let (port, server) = start_lan_media_server().await?;
+    let allowed = socket(lan, port);
+    let Some(refusing) = fast_refusing_neighbor(lan, port) else {
+        eprintln!(
+            "skipping multi-address fallback test: no LAN neighbour refuses connections quickly"
+        );
+        return Ok(());
+    };
+    // The first checked address refuses immediately; the request must still reach the second
+    // pinned address instead of failing with a 502.
+    let resolver = StrmPlaybackResolver::new_with_host_lookup_for_tests(lookup_returning(vec![
+        refusing, allowed,
+    ]))?;
+    let target = format!("http://media.example.test:{port}/video.mkv");
+    let range = resolver.fetch_range(&target, "bytes=0-3", None).await?;
+    assert_eq!(range.body, b"0123");
+    assert_eq!(server.await?, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_playback_reuses_one_connection_for_range_seeks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(lan) = local_lan_address() else {
+        eprintln!("skipping client reuse test: no non-loopback RFC1918 address available");
+        return Ok(());
+    };
+    let (port, server) = start_keepalive_media_server().await?;
+    let allowed = socket(lan, port);
+    let calls = Arc::new(Mutex::new(0_usize));
+    let lookup = {
+        let calls = Arc::clone(&calls);
+        move |_host: String, _port: u16| -> StrmHostLookupFuture<'static> {
+            let calls = Arc::clone(&calls);
+            Box::pin(async move {
+                *calls.lock().expect("lookup counter") += 1;
+                Ok(vec![allowed])
+            })
+        }
+    };
+
+    let resolver = StrmPlaybackResolver::new_with_host_lookup_for_tests(lookup)?;
+    let target = format!("http://media.example.test:{port}/video.mkv");
+    let first = resolver.fetch_range(&target, "bytes=0-1", None).await?;
+    assert_eq!(first.body, b"01");
+    let second = resolver.fetch_range(&target, "bytes=2-3", None).await?;
+    assert_eq!(second.body, b"23");
+    assert_eq!(
+        *calls.lock().expect("lookup counter"),
+        2,
+        "each request must revalidate the host before reusing a pooled client"
+    );
+    assert_eq!(
+        server.await?,
+        1,
+        "both range seeks must reuse the pooled client connection"
     );
     Ok(())
 }
