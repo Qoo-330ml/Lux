@@ -2,6 +2,16 @@ import type { ChangelogRelease } from "../types";
 
 export const changelogReleases07: ChangelogRelease[] = [
   {
+    version: "0.7.28",
+    date: "2026-11-24",
+    sections: [
+      { kind: "fixed", items: [
+        "🐛 fix(scanner): 带连字符标签的季目录能被识别了 — Season 1 - CMCTV、Season 2 - HHWEB、S01 - HDR 这类目录以前因为连字符后有空格不被当成季目录，扫描时季目录自己会变成一部「剧集」，剧名、tvshow.nfo 和海报全对不上；现在按第 N 季处理，标签只用来区分同季的不同版本并合并到同一个剧集下，Season 1-2 这类季区间和 Season 1 - Part Two 这类多词描述仍然不当作标签。",
+        "🐛 fix(metadata): 平铺剧集不再让本地元数据批次一直重试 — 剧集文件直接放在剧集目录下（没有季子目录）时，读本地 NFO 和海报完整性会被判成越出媒体库根，日志刷 image path ... is outside the allowed image roots 并让 local_metadata 批次无限失败重试；现在没有季目录时按文件所在目录处理，直接放在库根的文件视为没有本地旁挂跳过。升级后重扫一次即可。",
+      ] },
+    ],
+  },
+  {
     version: "0.7.27",
     date: "2026-11-24",
     sections: [
