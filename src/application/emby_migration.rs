@@ -2,9 +2,11 @@ use std::{fmt, net::IpAddr};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use url::{Host, Url};
+use url::Url;
 
-use crate::application::remote_url_policy::is_private_or_reserved;
+use crate::application::remote_url_policy::{
+    LOCAL_HOST_SUFFIXES, OutboundHost, domain_matches_any, is_private_or_reserved,
+};
 
 use super::{
     plugin_protocol::{
@@ -91,21 +93,17 @@ impl EmbyMigrationSource {
         // This classifies the URL host literal only and performs no DNS resolution, so a public
         // name that resolves to a private address is not covered by this check.
         //
-        // `host_str()` keeps IPv6 addresses bracketed (`[::1]`), so the typed `Host` variants are
-        // used instead of parsing the string form.
-        let requires_approval = match url.host().ok_or(MigrationInputError::InvalidSourceUrl)? {
-            Host::Ipv4(address) => is_private_or_reserved(IpAddr::V4(address)),
-            Host::Ipv6(address) => is_private_or_reserved(IpAddr::V6(address)),
-            Host::Domain(domain) => {
-                // A trailing root dot is accepted by DNS resolvers and by this URL parser, so
-                // normalizing it here is what keeps `localhost.` equivalent to `localhost`.
-                let host = domain.trim_end_matches('.').to_ascii_lowercase();
-                if host.is_empty() {
-                    return Err(MigrationInputError::InvalidSourceUrl);
+        // The shared host type uses the typed `url::Host` variants, so `host_str()` never has to be
+        // parsed by hand, and it folds the trailing root dot that DNS resolvers accept: `localhost.`
+        // stays equivalent to `localhost`, and `.` alone is not a destination.
+        let requires_approval =
+            match OutboundHost::from_url(&url).ok_or(MigrationInputError::InvalidSourceUrl)? {
+                OutboundHost::Ipv4(address) => is_private_or_reserved(IpAddr::V4(address)),
+                OutboundHost::Ipv6(address) => is_private_or_reserved(IpAddr::V6(address)),
+                OutboundHost::Domain { normalized, .. } => {
+                    domain_matches_any(&normalized, &LOCAL_HOST_SUFFIXES)
                 }
-                is_private_name(&host)
-            }
-        };
+            };
         if requires_approval && !self.allow_private_network {
             return Err(MigrationInputError::PrivateNetworkNotAllowed);
         }
@@ -999,14 +997,6 @@ fn validate_id(value: &str) -> Result<String, PluginServiceError> {
         return Err(PluginServiceError::InvalidConfig);
     }
     Ok(value.to_owned())
-}
-
-fn is_private_name(host: &str) -> bool {
-    host == "localhost"
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
-        || host.ends_with(".internal")
-        || host.ends_with(".home.arpa")
 }
 
 #[cfg(test)]

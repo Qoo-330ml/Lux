@@ -1,9 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque, hash_map::Entry},
     fmt,
-    future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    pin::Pin,
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
@@ -12,10 +10,17 @@ use reqwest::{
     Client, ClientBuilder, Proxy, Url,
     header::{ACCEPT_ENCODING, CONTENT_RANGE, CONTENT_TYPE, ETAG, LOCATION, RANGE, USER_AGENT},
 };
-use url::Host;
 
+#[cfg(test)]
+use crate::application::remote_url_policy::checked_addresses;
 use crate::{
-    application::remote_url_policy::ipv4_compatible_target,
+    application::remote_url_policy::{
+        AddressCheckError, HostResolutionError, HostResolver, OutboundHost, SystemHostResolver,
+        canonical_ip, domain_matches_any, ipv4_is_6to4_relay_anycast, ipv4_is_benchmark,
+        ipv4_is_documentation, ipv4_is_ietf_protocol_assignment, ipv4_is_reserved,
+        ipv4_is_this_network, ipv6_is_discard_only, ipv6_is_documentation, ipv6_is_tunnel,
+        pin_resolved_addresses, resolve_checked_addresses,
+    },
     network::{NetworkProxyError, normalize_proxy_url},
 };
 
@@ -81,10 +86,9 @@ impl fmt::Display for StrmPlaybackError {
 impl std::error::Error for StrmPlaybackError {}
 
 /// Future returned by a [`StrmPlaybackResolver`] host lookup.
-pub type StrmHostLookupFuture<'a> =
-    Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send + 'a>>;
+pub type StrmHostLookupFuture<'a> = crate::application::remote_url_policy::HostLookupFuture<'a>;
 
-type HostLookup = Arc<dyn Fn(String, u16) -> StrmHostLookupFuture<'static> + Send + Sync>;
+type HostLookup = Arc<dyn HostResolver>;
 
 #[derive(Clone)]
 pub struct StrmPlaybackResolver {
@@ -169,7 +173,7 @@ impl StrmPlaybackResolver {
     pub fn new() -> Result<Self, StrmPlaybackError> {
         Ok(Self {
             egress: StrmEgress::Direct {
-                lookup: system_host_lookup(),
+                lookup: Arc::new(SystemHostResolver),
                 clients: PinnedClients::default(),
             },
         })
@@ -328,34 +332,34 @@ impl StrmPlaybackResolver {
     /// Builds (or reuses) the client for one hop.
     ///
     /// A host name is resolved exactly once here and every returned address is checked. All
-    /// checked addresses are pinned through [`ClientBuilder::resolve_to_addrs`] so a second DNS
-    /// answer can never redirect the connection, while the client may still fall back between the
-    /// verified addresses (dual-stack hosts, one dead peer). Clients are pooled by
+    /// checked addresses are pinned through [`pin_resolved_addresses`] so a second DNS answer can
+    /// never redirect the connection, while the client may still fall back between the verified
+    /// addresses (dual-stack hosts, one dead peer). Clients are pooled by
     /// `(scheme, host, port, checked addresses)` so repeated Range seeks reuse connections. IP
     /// literals need no lookup.
     async fn client_for(&self, url: &Url) -> Result<Client, StrmPlaybackError> {
         match &self.egress {
             StrmEgress::Proxy(client) => Ok(client.clone()),
             StrmEgress::Direct { lookup, clients } => {
-                let host = url
-                    .host_str()
-                    .ok_or(StrmPlaybackError::InvalidUrl)?
-                    .to_owned();
+                let host = OutboundHost::from_url(url).ok_or(StrmPlaybackError::InvalidUrl)?;
                 let port = url
                     .port_or_known_default()
                     .ok_or(StrmPlaybackError::InvalidUrl)?;
-                let domain = matches!(url.host(), Some(Host::Domain(_)));
-                let addresses = if domain {
-                    let candidates = lookup(host.clone(), port)
+                let request_host = host.request_host();
+                let addresses = match request_host {
+                    Some(request_host) => {
+                        resolve_checked_addresses(lookup.as_ref(), request_host, port, |address| {
+                            !is_disallowed_address(address)
+                        })
                         .await
-                        .map_err(|_| StrmPlaybackError::HostLookupFailed)?;
-                    pinned_addresses(candidates)?
-                } else {
-                    Vec::new()
+                        .map_err(resolution_error)?
+                    }
+                    // A literal cannot be redirected by DNS, so there is nothing to pin.
+                    None => Vec::new(),
                 };
                 let key = PinnedClientKey {
                     scheme: url.scheme().to_owned(),
-                    host: host.clone(),
+                    host: url.host_str().unwrap_or_default().to_owned(),
                     port,
                     addresses: addresses.clone(),
                 };
@@ -363,15 +367,8 @@ impl StrmPlaybackResolver {
                     return Ok(client);
                 }
                 let mut builder = base_client_builder().no_proxy();
-                if domain {
-                    builder = builder.resolve_to_addrs(&host, &addresses);
-                    // A trailing root dot names the same host, but the resolver override is keyed
-                    // by the literal authority. Pin both spellings so neither one can fall back to
-                    // a fresh system lookup.
-                    let without_root_dot = host.trim_end_matches('.');
-                    if without_root_dot.len() != host.len() && !without_root_dot.is_empty() {
-                        builder = builder.resolve_to_addrs(without_root_dot, &addresses);
-                    }
+                if let Some(request_host) = request_host {
+                    builder = pin_resolved_addresses(builder, request_host, &addresses);
                 }
                 let client = builder
                     .build()
@@ -390,52 +387,20 @@ fn base_client_builder() -> ClientBuilder {
         .read_timeout(Duration::from_secs(30))
 }
 
-fn system_host_lookup() -> HostLookup {
-    Arc::new(|host: String, port: u16| {
-        Box::pin(async move {
-            let addresses = tokio::net::lookup_host((host.as_str(), port)).await?;
-            Ok(addresses.collect())
-        })
-    })
+/// Maps a resolution failure onto the STRM error contract.
+fn resolution_error(error: HostResolutionError) -> StrmPlaybackError {
+    match error {
+        HostResolutionError::Lookup(_) => StrmPlaybackError::HostLookupFailed,
+        HostResolutionError::Check(AddressCheckError::Empty) => StrmPlaybackError::HostLookupFailed,
+        HostResolutionError::Check(AddressCheckError::Rejected) => StrmPlaybackError::InvalidUrl,
+    }
 }
 
 /// Checks a complete resolver answer and returns every address that may be pinned.
-///
-/// A single forbidden candidate rejects the whole answer: otherwise an attacker could race a
-/// mixed response or rebind between the check and the connection. The remaining checked addresses
-/// are all kept (deduplicated, order preserved) so the client can still fall back between them,
-/// which preserves dual-stack and dead-peer resilience without ever touching an unchecked address.
+#[cfg(test)]
 fn pinned_addresses(candidates: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, StrmPlaybackError> {
-    if candidates.is_empty() {
-        return Err(StrmPlaybackError::HostLookupFailed);
-    }
-    if candidates
-        .iter()
-        .any(|candidate| is_disallowed_address(candidate.ip()))
-    {
-        return Err(StrmPlaybackError::InvalidUrl);
-    }
-    let mut addresses: Vec<SocketAddr> = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        let address = unwrap_embedded_ipv4(candidate);
-        if !addresses.contains(&address) {
-            addresses.push(address);
-        }
-    }
-    Ok(addresses)
-}
-
-/// Maps an IPv4-mapped or IPv4-compatible IPv6 socket back to its IPv4 target.
-fn unwrap_embedded_ipv4(address: SocketAddr) -> SocketAddr {
-    match address.ip() {
-        IpAddr::V6(ipv6) => ipv6
-            .to_ipv4_mapped()
-            .or_else(|| ipv4_compatible_target(ipv6))
-            .map_or(address, |ipv4| {
-                SocketAddr::new(IpAddr::V4(ipv4), address.port())
-            }),
-        IpAddr::V4(_) => address,
-    }
+    checked_addresses(candidates, |address| !is_disallowed_address(address))
+        .map_err(|error| resolution_error(HostResolutionError::Check(error)))
 }
 
 fn validate_range(value: &str) -> Result<(), StrmPlaybackError> {
@@ -531,22 +496,21 @@ fn validate_url(value: &str) -> Result<Url, StrmPlaybackError> {
     {
         return Err(StrmPlaybackError::InvalidUrl);
     }
-    match url.host() {
-        Some(Host::Domain(domain)) => {
-            // A trailing root dot (`localhost.`) is the same name to DNS, so normalize before the
-            // blacklist comparison instead of comparing the raw authority.
-            let normalized = normalized_domain(domain).ok_or(StrmPlaybackError::InvalidUrl)?;
+    match OutboundHost::from_url(&url) {
+        Some(OutboundHost::Domain { normalized, .. }) => {
+            // A trailing root dot (`localhost.`) is the same name to DNS, so the shared host type
+            // has already normalized it before the blacklist comparison.
             if is_blocked_domain(&normalized) {
                 return Err(StrmPlaybackError::InvalidUrl);
             }
         }
-        Some(Host::Ipv4(address)) => {
+        Some(OutboundHost::Ipv4(address)) => {
             if is_disallowed_ipv4(address) {
                 return Err(StrmPlaybackError::InvalidUrl);
             }
         }
-        Some(Host::Ipv6(address)) => {
-            if is_disallowed_ipv6(address) {
+        Some(OutboundHost::Ipv6(address)) => {
+            if is_disallowed_address(IpAddr::V6(address)) {
                 return Err(StrmPlaybackError::InvalidUrl);
             }
         }
@@ -555,24 +519,13 @@ fn validate_url(value: &str) -> Result<Url, StrmPlaybackError> {
     Ok(url)
 }
 
-/// Lowercases a domain and strips the trailing root dot; an empty result is not a valid host.
-fn normalized_domain(domain: &str) -> Option<String> {
-    let trimmed = domain.trim_end_matches('.');
-    (!trimmed.is_empty()).then(|| trimmed.to_ascii_lowercase())
-}
-
 fn is_blocked_domain(host: &str) -> bool {
     const BLOCKED: [&str; 2] = ["localhost", "metadata.google.internal"];
-    BLOCKED.iter().any(|blocked| {
-        host == *blocked
-            || host
-                .strip_suffix(blocked)
-                .is_some_and(|prefix| prefix.ends_with('.'))
-    })
+    domain_matches_any(host, &BLOCKED)
 }
 
 fn is_disallowed_address(address: IpAddr) -> bool {
-    match address {
+    match canonical_ip(address) {
         IpAddr::V4(address) => is_disallowed_ipv4(address),
         IpAddr::V6(address) => is_disallowed_ipv6(address),
     }
@@ -584,45 +537,34 @@ fn is_disallowed_address(address: IpAddr) -> bool {
 /// Everything that is not a routable unicast peer is rejected instead, so this must not be
 /// replaced by a generic "block all private addresses" policy.
 fn is_disallowed_ipv4(address: Ipv4Addr) -> bool {
-    let [first, second, third, _] = address.octets();
     address.is_loopback()
         || address.is_link_local()
         || address.is_unspecified()
         || address.is_multicast()
         || address.is_broadcast()
-        || first == 0
+        || ipv4_is_this_network(address)
         // 240/4 is reserved for future use and never a unicast destination.
-        || first >= 240
+        || ipv4_is_reserved(address)
         // Special-purpose, documentation and benchmark blocks are not playable media hosts.
-        || (first == 192 && second == 0 && matches!(third, 0 | 2))
-        || (first == 192 && second == 88 && third == 99)
-        || (first == 198 && matches!(second, 18 | 19))
-        || (first == 198 && second == 51 && third == 100)
-        || (first == 203 && second == 0 && third == 113)
+        || ipv4_is_ietf_protocol_assignment(address)
+        || ipv4_is_documentation(address)
+        || ipv4_is_6to4_relay_anycast(address)
+        || ipv4_is_benchmark(address)
 }
 
+/// Keeps ULA (`fc00::/7`) reachable for LAN playback and rejects every tunnelled, non-unicast or
+/// documentation range.
 fn is_disallowed_ipv6(address: Ipv6Addr) -> bool {
-    // Mapped and deprecated IPv4-compatible forms reach an IPv4 destination, so unwrap first:
-    // otherwise a tunnel could smuggle a loopback or link-local target past the IPv4 policy.
-    if let Some(mapped) = address.to_ipv4_mapped() {
-        return is_disallowed_ipv4(mapped);
-    }
-    if let Some(compatible) = ipv4_compatible_target(address) {
-        return is_disallowed_ipv4(compatible);
-    }
-    let segments = address.segments();
     address.is_loopback()
         || address.is_unspecified()
         || address.is_multicast()
         || address.is_unicast_link_local()
         // 6to4 and Teredo wrap arbitrary IPv4 peers; NAT64 reaches an embedded IPv4 target.
-        || segments[0] == 0x2002
-        || (segments[0] == 0x2001 && segments[1] == 0)
-        || (segments[0] == 0x0064 && segments[1] == 0xff9b)
+        || ipv6_is_tunnel(address)
         // 2001:db8::/32 is the IPv6 documentation range and never routable.
-        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        || ipv6_is_documentation(address)
         // 100::/64 is discard-only.
-        || (segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0)
+        || ipv6_is_discard_only(address)
 }
 
 #[cfg(test)]

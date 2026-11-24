@@ -1,12 +1,10 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     fmt,
-    future::Future,
     io::Cursor,
     net::{IpAddr, SocketAddr},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    pin::Pin,
     sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock, Weak},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -31,6 +29,11 @@ use crate::{
         metadata_paths::{library_item_directory, metadata_root},
         metadata_writeback::item_metadata_writeback_enabled,
         remote_body::{LimitedBodyError, read_response_body_limited},
+        remote_url_policy::{
+            AddressCheckError, HostResolutionError, HostResolver, LOCAL_HOST_SUFFIXES,
+            OutboundHost, SystemHostResolver, domain_matches_any, is_private_or_reserved,
+            pin_resolved_addresses, resolve_checked_addresses,
+        },
         scraper::{
             ScraperError, ScraperImage, ScraperImageRequest, ScraperItemType, ScraperProvider,
             ScraperResolver,
@@ -349,7 +352,7 @@ impl ImageHttpClient {
         url: &Url,
         allow_loopback_http: bool,
     ) -> Result<Client, ImageWriteError> {
-        self.checked_request_client_with(url, allow_loopback_http, &system_image_host_lookup)
+        self.checked_request_client_with(url, allow_loopback_http, &SystemHostResolver)
             .await
     }
 
@@ -357,7 +360,7 @@ impl ImageHttpClient {
         &self,
         url: &Url,
         allow_loopback_http: bool,
-        lookup: &ImageHostLookup,
+        lookup: &dyn HostResolver,
     ) -> Result<Client, ImageWriteError> {
         let route = self.routing.route(url, self.direct_connection_only);
         if route == ImageProxyRoute::RemoteDns {
@@ -405,14 +408,14 @@ impl ImageHttpClient {
         {
             return Ok(client);
         }
-        let client = image_http_builder(
+        let builder = image_http_builder(
             self.proxy_url.as_deref(),
             self.timeout,
             self.direct_connection_only || bypass_proxy,
-        )?
-        .resolve_to_addrs(host, addresses)
-        .build()
-        .map_err(|error| ImageWriteError::ClientBuild(error.to_string()))?;
+        )?;
+        let client = pin_resolved_addresses(builder, host, addresses)
+            .build()
+            .map_err(|error| ImageWriteError::ClientBuild(error.to_string()))?;
         if let Ok(mut cache) = self.pinned_clients.lock() {
             cache.insert(key, client.clone());
         }
@@ -853,7 +856,7 @@ pub struct ImageWriteService {
     resources: Option<ResourceMetrics>,
     /// Resolves an image hostname to every candidate address. Injectable so tests can change the
     /// DNS answer between lookups without touching the system resolver.
-    host_lookup: Arc<ImageHostLookup>,
+    host_lookup: Arc<dyn HostResolver>,
 }
 
 /// How the download writes its target path and whether an attempt owns the write.
@@ -1007,7 +1010,7 @@ impl ImageWriteService {
             download_permits,
             write_permits,
             resources: None,
-            host_lookup: Arc::new(system_image_host_lookup),
+            host_lookup: Arc::new(SystemHostResolver),
         })
     }
 
@@ -1017,7 +1020,7 @@ impl ImageWriteService {
     }
 
     #[cfg(test)]
-    fn with_host_lookup(mut self, host_lookup: Arc<ImageHostLookup>) -> Self {
+    fn with_host_lookup(mut self, host_lookup: Arc<dyn HostResolver>) -> Self {
         self.host_lookup = host_lookup;
         self
     }
@@ -4158,22 +4161,6 @@ pub(crate) enum PinnedImageHost {
     },
 }
 
-/// A future that resolves one image hostname to every candidate address.
-type ImageHostLookupFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
-
-/// Resolves an image hostname to every candidate address it may connect to.
-type ImageHostLookup = dyn Fn(&str, u16) -> ImageHostLookupFuture + Send + Sync;
-
-/// The system resolver behind a production image download.
-fn system_image_host_lookup(host: &str, port: u16) -> ImageHostLookupFuture {
-    let host = host.to_owned();
-    Box::pin(async move {
-        tokio::net::lookup_host((host.as_str(), port))
-            .await
-            .map(|addresses| addresses.collect())
-    })
-}
-
 /// What the address policy already knows about an image URL host before any DNS lookup.
 #[derive(Debug)]
 enum ImageUrlHost {
@@ -4193,17 +4180,12 @@ fn classify_image_url_host(
     url: &Url,
     allow_loopback_http: bool,
 ) -> Result<ImageUrlHost, ImageWriteError> {
-    let Some(host) = url.host_str() else {
+    let Some(host) = OutboundHost::from_url(url) else {
         return Err(ImageWriteError::InvalidUrl(
             "image URL must include a host".to_owned(),
         ));
     };
-    let literal_address = match url.host() {
-        Some(url::Host::Ipv4(address)) => Some(IpAddr::V4(address)),
-        Some(url::Host::Ipv6(address)) => Some(IpAddr::V6(address)),
-        _ => None,
-    };
-    if let Some(address) = literal_address {
+    if let Some(address) = host.literal_address() {
         return if image_address_allowed(address, allow_loopback_http) {
             Ok(ImageUrlHost::Literal)
         } else {
@@ -4212,46 +4194,37 @@ fn classify_image_url_host(
             ))
         };
     }
-    let Some((request_host, name)) = normalize_image_host(host) else {
+    let OutboundHost::Domain {
+        request_host,
+        normalized,
+    } = host
+    else {
+        // `literal_address` handles both literal variants above.
+        return Err(ImageWriteError::InvalidUrl(
+            "image URL must include a host".to_owned(),
+        ));
+    };
+    // At most one trailing root dot and no empty label: `images..example` is not a name a policy
+    // may compare, and `images.example..` is not the same authority as `images.example.` either.
+    if normalized.split('.').any(str::is_empty) || request_host.ends_with("..") {
         return Err(ImageWriteError::InvalidUrl(
             "image URL must include a usable host".to_owned(),
         ));
-    };
+    }
     // A trailing root dot or ASCII case must not turn a reserved name into a public one.
-    if is_reserved_image_hostname(&name) && !allow_loopback_http {
+    if domain_matches_any(&normalized, &LOCAL_HOST_SUFFIXES) && !allow_loopback_http {
         return Err(ImageWriteError::InvalidUrl(format!(
-            "image host {host} is a reserved local name"
+            "image host {request_host} is a reserved local name"
         )));
     }
-    Ok(ImageUrlHost::Name { request_host, name })
-}
-
-/// Splits a URL host into the exact request host (the client pin key) and the name the policy
-/// compares, which drops one trailing root dot and folds ASCII case.
-fn normalize_image_host(host: &str) -> Option<(String, String)> {
-    let request_host = host.to_ascii_lowercase();
-    let name = request_host
-        .strip_suffix('.')
-        .unwrap_or(&request_host)
-        .to_owned();
-    if name.is_empty() || name.split('.').any(str::is_empty) {
-        return None;
-    }
-    Some((request_host, name))
-}
-
-fn is_reserved_image_hostname(name: &str) -> bool {
-    name == "localhost"
-        || name.ends_with(".localhost")
-        // Local-only suffixes: a scraped image host never legitimately lives there.
-        || name.ends_with(".local")
-        || name.ends_with(".internal")
-        || name.ends_with(".home.arpa")
+    Ok(ImageUrlHost::Name {
+        request_host,
+        name: normalized,
+    })
 }
 
 fn image_address_allowed(address: IpAddr, allow_loopback_http: bool) -> bool {
-    !crate::application::remote_url_policy::is_private_or_reserved(address)
-        || (allow_loopback_http && address.is_loopback())
+    !is_private_or_reserved(address) || (allow_loopback_http && address.is_loopback())
 }
 
 /// Rejects image targets that live on private or reserved addresses and returns the address set a
@@ -4265,7 +4238,7 @@ fn image_address_allowed(address: IpAddr, allow_loopback_http: bool) -> bool {
 async fn resolve_and_pin_image_host(
     url: &Url,
     allow_loopback_http: bool,
-    lookup: &ImageHostLookup,
+    lookup: &dyn HostResolver,
 ) -> Result<PinnedImageHost, ImageWriteError> {
     let (request_host, name) = match classify_image_url_host(url, allow_loopback_http)? {
         ImageUrlHost::Literal => return Ok(PinnedImageHost::IpLiteral),
@@ -4274,21 +4247,19 @@ async fn resolve_and_pin_image_host(
     let port = url
         .port_or_known_default()
         .ok_or_else(|| ImageWriteError::InvalidUrl("image URL has no usable port".to_owned()))?;
-    let addresses = lookup(&request_host, port)
-        .await
-        .map_err(|error| ImageWriteError::Download(error.to_string()))?;
-    if addresses.is_empty() {
-        return Err(ImageWriteError::Download(format!(
-            "image host {name} did not resolve"
-        )));
-    }
-    for address in &addresses {
-        if !image_address_allowed(address.ip(), allow_loopback_http) {
-            return Err(ImageWriteError::InvalidUrl(format!(
-                "image host {name} resolves to a non-public address"
-            )));
+    let addresses = resolve_checked_addresses(lookup, &request_host, port, |address| {
+        image_address_allowed(address, allow_loopback_http)
+    })
+    .await
+    .map_err(|error| match error {
+        HostResolutionError::Lookup(error) => ImageWriteError::Download(error.to_string()),
+        HostResolutionError::Check(AddressCheckError::Empty) => {
+            ImageWriteError::Download(format!("image host {name} did not resolve"))
         }
-    }
+        HostResolutionError::Check(AddressCheckError::Rejected) => ImageWriteError::InvalidUrl(
+            format!("image host {name} resolves to a non-public address"),
+        ),
+    })?;
     Ok(PinnedImageHost::Resolved {
         host: request_host,
         addresses,
@@ -4317,7 +4288,7 @@ async fn check_proxied_image_host_locally(
     url: &Url,
     host: ImageUrlHost,
     allow_loopback_http: bool,
-    lookup: &ImageHostLookup,
+    lookup: &dyn HostResolver,
 ) -> Result<(), ImageWriteError> {
     let ImageUrlHost::Name { request_host, name } = host else {
         return Ok(());
@@ -4325,20 +4296,20 @@ async fn check_proxied_image_host_locally(
     let Some(port) = url.port_or_known_default() else {
         return Ok(());
     };
-    let Ok(Ok(addresses)) =
-        tokio::time::timeout(IMAGE_PROXY_LOCAL_DNS_CHECK, lookup(&request_host, port)).await
-    else {
-        // Only the proxy can resolve this name, or it is too slow to check here.
-        return Ok(());
-    };
-    for address in &addresses {
-        if !image_address_allowed(address.ip(), allow_loopback_http) {
-            return Err(ImageWriteError::InvalidUrl(format!(
+    let check = resolve_checked_addresses(lookup, &request_host, port, |address| {
+        image_address_allowed(address, allow_loopback_http)
+    });
+    match tokio::time::timeout(IMAGE_PROXY_LOCAL_DNS_CHECK, check).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(HostResolutionError::Check(AddressCheckError::Rejected))) => {
+            Err(ImageWriteError::InvalidUrl(format!(
                 "image host {name} resolves to a non-public address"
-            )));
+            )))
         }
+        // Only the proxy can resolve this name, it answered with nothing, or it was too slow to
+        // check here.
+        Ok(Err(_)) | Err(_) => Ok(()),
     }
-    Ok(())
 }
 
 fn retryable_image_status(status: u16) -> bool {
@@ -4358,18 +4329,20 @@ mod tests {
     use super::{
         IMAGE_GLOBAL_CONCURRENCY, IMAGE_RESOLUTION_CACHE_CAPACITY, IMAGE_RETRY_BASE_DELAY,
         IMAGE_RETRY_MAX_DELAY, ImageDownloadConfig, ImageEnvironmentProxy, ImageError,
-        ImageExplicitProxy, ImageFormat, ImageHostLookup, ImageHostLookupFuture, ImageHttpClient,
-        ImagePermitPool, ImageProxyDns, ImageProxyExclusions, ImageProxyRoute, ImageProxyRouting,
-        ImageResolutionCache, ImageResolutionKey, ImageSchemeProxy, ImageService,
-        ImageTargetRequest, ImageWriteError, ImageWriteService, PINNED_CLIENT_CACHE_LIMIT,
-        PinnedClientCache, PinnedImageHost, background_image_content_tag_and_dimensions_from_bytes,
-        canonical_image_stems, check_proxied_image_host, explicit_proxy_url,
-        global_image_download_permits, global_image_write_permits, image_attempt_failure,
+        ImageExplicitProxy, ImageFormat, ImageHttpClient, ImagePermitPool, ImageProxyDns,
+        ImageProxyExclusions, ImageProxyRoute, ImageProxyRouting, ImageResolutionCache,
+        ImageResolutionKey, ImageSchemeProxy, ImageService, ImageTargetRequest, ImageWriteError,
+        ImageWriteService, PINNED_CLIENT_CACHE_LIMIT, PinnedClientCache, PinnedImageHost,
+        background_image_content_tag_and_dimensions_from_bytes, canonical_image_stems,
+        check_proxied_image_host, explicit_proxy_url, global_image_download_permits,
+        global_image_write_permits, image_attempt_failure,
         image_content_tag_and_dimensions_from_bytes, image_download_retry_delay,
         image_language_matches, image_lookup_stems, image_row_write_error, image_target,
         is_allowed_scraper_image_url, pick_scraper_index, resolve_and_pin_image_host,
-        retryable_image_status, should_suppress_internal_image_write, system_image_host_lookup,
-        write_image_atomically,
+        retryable_image_status, should_suppress_internal_image_write, write_image_atomically,
+    };
+    use crate::application::remote_url_policy::{
+        HostLookupFuture, HostResolver, SystemHostResolver,
     };
     use crate::{
         application::access::MediaAccessService,
@@ -4559,7 +4532,7 @@ mod tests {
     fn scripted_image_host_lookup(
         answers: Vec<Vec<std::net::SocketAddr>>,
     ) -> (
-        std::sync::Arc<ImageHostLookup>,
+        std::sync::Arc<dyn HostResolver>,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
         let answers = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
@@ -4567,15 +4540,15 @@ mod tests {
         )));
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = std::sync::Arc::clone(&calls);
-        let lookup: std::sync::Arc<ImageHostLookup> =
-            std::sync::Arc::new(move |_host: &str, _port: u16| {
+        let lookup: std::sync::Arc<dyn HostResolver> =
+            std::sync::Arc::new(move |_host: String, _port: u16| {
                 counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let addresses = answers
                     .lock()
                     .ok()
                     .and_then(|mut answers| answers.pop_front())
                     .unwrap_or_default();
-                Box::pin(std::future::ready(Ok(addresses))) as ImageHostLookupFuture
+                Box::pin(std::future::ready(Ok(addresses))) as HostLookupFuture<'static>
             });
         (lookup, calls)
     }
@@ -4584,12 +4557,12 @@ mod tests {
     async fn public_host_guard_rejects_private_targets_without_dns() {
         let loopback = Url::parse("http://127.0.0.1:8099/poster.jpg").expect("url");
         assert!(
-            resolve_and_pin_image_host(&loopback, false, &system_image_host_lookup)
+            resolve_and_pin_image_host(&loopback, false, &SystemHostResolver)
                 .await
                 .is_err()
         );
         assert_eq!(
-            resolve_and_pin_image_host(&loopback, true, &system_image_host_lookup)
+            resolve_and_pin_image_host(&loopback, true, &SystemHostResolver)
                 .await
                 .expect("the loopback opt-in allows the local stub"),
             PinnedImageHost::IpLiteral
@@ -4597,14 +4570,14 @@ mod tests {
 
         let private = Url::parse("https://192.168.1.10/poster.jpg").expect("url");
         assert!(
-            resolve_and_pin_image_host(&private, true, &system_image_host_lookup)
+            resolve_and_pin_image_host(&private, true, &SystemHostResolver)
                 .await
                 .is_err()
         );
 
         let public = Url::parse("https://[2606:4700:4700::1111]/poster.jpg").expect("url");
         assert_eq!(
-            resolve_and_pin_image_host(&public, false, &system_image_host_lookup)
+            resolve_and_pin_image_host(&public, false, &SystemHostResolver)
                 .await
                 .expect("a public literal needs no DNS override"),
             PinnedImageHost::IpLiteral
@@ -4613,7 +4586,7 @@ mod tests {
         // The IPv4-mapped loopback form is not the IPv6 loopback the opt-in widens to.
         let mapped = Url::parse("https://[::ffff:127.0.0.1]/poster.jpg").expect("url");
         assert!(
-            resolve_and_pin_image_host(&mapped, true, &system_image_host_lookup)
+            resolve_and_pin_image_host(&mapped, true, &SystemHostResolver)
                 .await
                 .is_err()
         );
@@ -5238,11 +5211,12 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         // Only the proxy can resolve this name, so it owns the final remote DNS boundary.
-        let failing: std::sync::Arc<ImageHostLookup> = std::sync::Arc::new(|_host, _port| {
-            Box::pin(std::future::ready(Err(std::io::Error::other(
-                "no local answer",
-            ))))
-        });
+        let failing: std::sync::Arc<dyn HostResolver> =
+            std::sync::Arc::new(|_host: String, _port: u16| {
+                let answer: std::io::Result<Vec<std::net::SocketAddr>> =
+                    Err(std::io::Error::other("no local answer"));
+                Box::pin(std::future::ready(answer)) as HostLookupFuture<'static>
+            });
         http.checked_request_client_with(&url, false, failing.as_ref())
             .await
             .expect("a proxy-only name is delegated to the proxy");
