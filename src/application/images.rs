@@ -305,7 +305,8 @@ const PINNED_CLIENT_CACHE_LIMIT: usize = 32;
 ///
 /// A direct download cannot reuse the shared client: the checked DNS answer has to be pinned onto
 /// the client that opens the TCP connection, and `Client` is immutable once built. The policy
-/// fields keep the pinned client identical to the shared one apart from the pin.
+/// fields keep the pinned client identical to the shared one apart from the pin, except that a
+/// direct route also disables every proxy on the pinned client so the pin decides the connection.
 #[derive(Clone)]
 pub(crate) struct ImageHttpClient {
     client: Client,
@@ -365,8 +366,9 @@ impl ImageHttpClient {
             return Ok(self.client.clone());
         }
         // `LocalDns` keeps the socks proxy on the pinned client: reqwest resolves through this
-        // process there and the pin replaces that lookup with the checked addresses. A route that
-        // bypasses a proxy disables proxies on the pinned client so the pin always takes effect.
+        // process there and the pin replaces that lookup with the checked addresses. A direct route
+        // disables every proxy on the pinned client, including an operating-system proxy the host
+        // cannot see, so the pin is authoritative there.
         let pinned = resolve_and_pin_image_host(url, allow_loopback_http, lookup).await?;
         self.pinned_client(&pinned, route.bypass_proxy())
     }
@@ -379,6 +381,9 @@ impl ImageHttpClient {
 
     /// Returns the client for one checked target, reusing the cached one when the checked address
     /// set repeats so keep-alive connections and TLS sessions survive across downloads.
+    ///
+    /// `bypass_proxy` builds the client with `no_proxy()`, which also turns off the operating-system
+    /// proxy, so a direct route always connects to the checked address instead.
     fn pinned_client(
         &self,
         pinned: &PinnedImageHost,
@@ -468,22 +473,52 @@ enum ImageProxyDns {
 }
 
 impl ImageProxyDns {
+    /// Parses a configured proxy URL.
+    ///
+    /// Both `Url` and `http::Uri` must accept the value: reqwest builds explicit proxies from a
+    /// `Url`, but the proxy environment variables go through its `http::Uri` matcher, which rejects
+    /// non-ASCII userinfo and fragments. A value only one of them accepts is a config the host must
+    /// not trust, so it is treated as unknown and the request pins a direct connection instead.
     fn from_url(value: &str) -> Option<Self> {
-        // reqwest parses the raw value as a URI, where surrounding whitespace is invalid. Trimming
-        // it here would claim a proxy that reqwest ignores and skip the pin for a direct request.
-        if value.trim() != value {
+        if value.trim() != value || !value.is_ascii() {
             return None;
         }
+        if value.contains('#') {
+            return None;
+        }
+        value.parse::<axum::http::Uri>().ok()?;
         let url = Url::parse(value).ok()?;
         if url.host_str().is_none_or(str::is_empty) {
             return None;
         }
-        match url.scheme() {
+        Self::from_scheme(url.scheme())
+    }
+
+    fn from_scheme(scheme: &str) -> Option<Self> {
+        match scheme {
             "http" | "https" | "socks4a" | "socks5h" => Some(Self::Remote),
             "socks4" | "socks5" => Some(Self::Local),
             _ => None,
         }
     }
+}
+
+/// Parses one proxy environment variable exactly like reqwest's proxy matcher.
+///
+/// The raw value is parsed as an `http::Uri`; a value without a scheme is an `http://` proxy (curl
+/// and hyper-util do the same), and only the authority decides the destination. Anything reqwest
+/// would ignore - whitespace, non-ASCII, a fragment, an unsupported scheme - is not a proxy here.
+fn environment_proxy_dns(value: &str) -> Option<ImageProxyDns> {
+    if value.trim() != value || value.is_empty() || !value.is_ascii() {
+        return None;
+    }
+    if value.contains('#') {
+        return None;
+    }
+    let uri = value.parse::<axum::http::Uri>().ok()?;
+    uri.authority()?;
+    let scheme = uri.scheme_str().unwrap_or("http");
+    ImageProxyDns::from_scheme(scheme)
 }
 
 /// Where one image request is connected.
@@ -503,9 +538,25 @@ enum ImageProxyRoute {
 }
 
 impl ImageProxyRoute {
+    /// Whether the pinned client must disable every proxy so the checked address is used.
+    ///
+    /// A direct route disables proxies, including the operating-system one reqwest's `system-proxy`
+    /// feature would otherwise apply: the pin promise covers the whole direct path. A `LocalDns`
+    /// socks proxy stays on the client, because there the pin travels through the socks resolver.
     fn bypass_proxy(self) -> bool {
-        matches!(self, Self::DirectWithoutProxy)
+        matches!(self, Self::Direct | Self::DirectWithoutProxy)
     }
+}
+
+/// The configured proxy URL, when one was given.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ImageExplicitProxy {
+    #[default]
+    None,
+    Proxy(ImageProxyDns),
+    /// A proxy URL is configured but does not survive the checks reqwest's proxy layers apply. The
+    /// route then connects directly with proxies disabled, so the pin is never silently bypassed.
+    Unknown,
 }
 
 /// Decides how one image request is connected.
@@ -516,16 +567,22 @@ impl ImageProxyRoute {
 /// that still use this process's resolver, because only the former may skip the pin.
 #[derive(Clone, Debug, Default)]
 struct ImageProxyRouting {
-    /// An explicit proxy URL or `LUX_PROXY_URL`, when it parses.
-    explicit: Option<ImageProxyDns>,
+    explicit: ImageExplicitProxy,
     environment: ImageEnvironmentProxy,
     exclusions: ImageProxyExclusions,
 }
 
 impl ImageProxyRouting {
     fn from_environment(proxy_url: Option<&str>) -> Self {
+        let explicit = match explicit_proxy_url(proxy_url) {
+            None => ImageExplicitProxy::None,
+            Some(url) => match ImageProxyDns::from_url(&url) {
+                Some(dns) => ImageExplicitProxy::Proxy(dns),
+                None => ImageExplicitProxy::Unknown,
+            },
+        };
         Self {
-            explicit: explicit_proxy_url(proxy_url).and_then(|url| ImageProxyDns::from_url(&url)),
+            explicit,
             environment: ImageEnvironmentProxy::from_env(),
             exclusions: ImageProxyExclusions::from_env(),
         }
@@ -543,8 +600,9 @@ impl ImageProxyRouting {
             return ImageProxyRoute::Direct;
         };
         let proxy = match self.explicit {
-            Some(dns) => Some(dns),
-            None => match self.environment.for_scheme(url.scheme()) {
+            ImageExplicitProxy::Proxy(dns) => Some(dns),
+            ImageExplicitProxy::Unknown => return ImageProxyRoute::DirectWithoutProxy,
+            ImageExplicitProxy::None => match self.environment.for_scheme(url.scheme()) {
                 ImageSchemeProxy::Proxy(dns) => Some(dns),
                 ImageSchemeProxy::Unknown => return ImageProxyRoute::DirectWithoutProxy,
                 ImageSchemeProxy::None => None,
@@ -628,7 +686,7 @@ fn environment_proxy(names: &[&str], lookup: &impl Fn(&str) -> Option<String>) -
     if value.trim().is_empty() {
         return ImageSchemeProxy::None;
     }
-    match ImageProxyDns::from_url(&value) {
+    match environment_proxy_dns(&value) {
         Some(dns) => ImageSchemeProxy::Proxy(dns),
         None => ImageSchemeProxy::Unknown,
     }
@@ -648,7 +706,7 @@ fn scheme_proxy(
     if value.trim().is_empty() {
         return all;
     }
-    match ImageProxyDns::from_url(&value) {
+    match environment_proxy_dns(&value) {
         Some(dns) => ImageSchemeProxy::Proxy(dns),
         None => match all {
             ImageSchemeProxy::Proxy(dns) => ImageSchemeProxy::Proxy(dns),
@@ -4299,14 +4357,14 @@ fn image_download_retry_delay(retry_count: u32) -> Duration {
 mod tests {
     use super::{
         IMAGE_GLOBAL_CONCURRENCY, IMAGE_RESOLUTION_CACHE_CAPACITY, IMAGE_RETRY_BASE_DELAY,
-        IMAGE_RETRY_MAX_DELAY, ImageDownloadConfig, ImageEnvironmentProxy, ImageError, ImageFormat,
-        ImageHostLookup, ImageHostLookupFuture, ImageHttpClient, ImagePermitPool, ImageProxyDns,
-        ImageProxyExclusions, ImageProxyRoute, ImageProxyRouting, ImageResolutionCache,
-        ImageResolutionKey, ImageSchemeProxy, ImageService, ImageTargetRequest, ImageWriteError,
-        ImageWriteService, PINNED_CLIENT_CACHE_LIMIT, PinnedClientCache, PinnedImageHost,
-        background_image_content_tag_and_dimensions_from_bytes, canonical_image_stems,
-        check_proxied_image_host, explicit_proxy_url, global_image_download_permits,
-        global_image_write_permits, image_attempt_failure,
+        IMAGE_RETRY_MAX_DELAY, ImageDownloadConfig, ImageEnvironmentProxy, ImageError,
+        ImageExplicitProxy, ImageFormat, ImageHostLookup, ImageHostLookupFuture, ImageHttpClient,
+        ImagePermitPool, ImageProxyDns, ImageProxyExclusions, ImageProxyRoute, ImageProxyRouting,
+        ImageResolutionCache, ImageResolutionKey, ImageSchemeProxy, ImageService,
+        ImageTargetRequest, ImageWriteError, ImageWriteService, PINNED_CLIENT_CACHE_LIMIT,
+        PinnedClientCache, PinnedImageHost, background_image_content_tag_and_dimensions_from_bytes,
+        canonical_image_stems, check_proxied_image_host, explicit_proxy_url,
+        global_image_download_permits, global_image_write_permits, image_attempt_failure,
         image_content_tag_and_dimensions_from_bytes, image_download_retry_delay,
         image_language_matches, image_lookup_stems, image_row_write_error, image_target,
         is_allowed_scraper_image_url, pick_scraper_index, resolve_and_pin_image_host,
@@ -4755,7 +4813,7 @@ mod tests {
     #[test]
     fn proxy_routing_mirrors_no_proxy_scheme_and_socks_rules() {
         let routing = ImageProxyRouting {
-            explicit: Some(ImageProxyDns::Remote),
+            explicit: ImageExplicitProxy::Proxy(ImageProxyDns::Remote),
             environment: ImageEnvironmentProxy::default(),
             exclusions: ImageProxyExclusions {
                 raw: Some("images.example, .internal.example, 10.0.0.0/8".to_owned()),
@@ -4793,7 +4851,7 @@ mod tests {
 
         // socks4/socks5 still resolve here, so they keep the pinned path with the proxy on.
         let socks = ImageProxyRouting {
-            explicit: Some(ImageProxyDns::Local),
+            explicit: ImageExplicitProxy::Proxy(ImageProxyDns::Local),
             environment: ImageEnvironmentProxy::default(),
             exclusions: ImageProxyExclusions::default(),
         };
@@ -4806,7 +4864,7 @@ mod tests {
         );
         // `NO_PROXY` bypasses even a local-DNS socks proxy.
         let socks_excluded = ImageProxyRouting {
-            explicit: Some(ImageProxyDns::Local),
+            explicit: ImageExplicitProxy::Proxy(ImageProxyDns::Local),
             environment: ImageEnvironmentProxy::default(),
             exclusions: ImageProxyExclusions {
                 raw: Some("images.example".to_owned()),
@@ -4822,7 +4880,7 @@ mod tests {
 
         // An environment-only proxy is scheme specific.
         let environment = ImageProxyRouting {
-            explicit: None,
+            explicit: ImageExplicitProxy::None,
             environment: ImageEnvironmentProxy {
                 http: ImageSchemeProxy::Proxy(ImageProxyDns::Remote),
                 https: ImageSchemeProxy::None,
@@ -4844,10 +4902,22 @@ mod tests {
             ImageProxyRoute::Direct
         );
 
-        // An environment proxy this process cannot interpret is treated as direct with proxies
+        // A configured proxy this process cannot interpret is treated as direct with proxies
         // disabled, so the pin is guaranteed to connect instead of trusting an unknown route.
+        let unknown_explicit = ImageProxyRouting {
+            explicit: ImageExplicitProxy::Unknown,
+            environment: ImageEnvironmentProxy::default(),
+            exclusions: ImageProxyExclusions::default(),
+        };
+        assert_eq!(
+            unknown_explicit.route(
+                &Url::parse("https://other.example/poster.jpg").expect("url"),
+                false
+            ),
+            ImageProxyRoute::DirectWithoutProxy
+        );
         let unknown = ImageProxyRouting {
-            explicit: None,
+            explicit: ImageExplicitProxy::None,
             environment: ImageEnvironmentProxy {
                 http: ImageSchemeProxy::Unknown,
                 https: ImageSchemeProxy::Unknown,
@@ -4871,6 +4941,11 @@ mod tests {
             ),
             ImageProxyRoute::Direct
         );
+
+        // Every direct route disables proxies on the pinned client; a local-DNS socks proxy stays.
+        assert!(ImageProxyRoute::Direct.bypass_proxy());
+        assert!(ImageProxyRoute::DirectWithoutProxy.bypass_proxy());
+        assert!(!ImageProxyRoute::LocalDns.bypass_proxy());
     }
 
     #[test]
@@ -4939,11 +5014,30 @@ mod tests {
             ImageSchemeProxy::Proxy(ImageProxyDns::Remote),
             "socks5h resolves inside the proxy"
         );
-        // reqwest parses the raw value: trailing whitespace makes it invalid, so the route is
-        // unknown and the request connects directly with proxies disabled.
-        let trailing_space = environment(&[("HTTP_PROXY", "http://10.0.0.2:7890 ")]);
-        assert_eq!(trailing_space.for_scheme("http"), ImageSchemeProxy::Unknown);
-        assert_eq!(trailing_space.for_scheme("https"), ImageSchemeProxy::None);
+        // A valueless scheme is an `http://` proxy, matching curl and hyper-util.
+        assert_eq!(
+            environment(&[("HTTP_PROXY", "proxy.internal:3128")]).for_scheme("http"),
+            ImageSchemeProxy::Proxy(ImageProxyDns::Remote)
+        );
+        assert_eq!(
+            environment(&[("ALL_PROXY", "10.0.0.2:1080")]).for_scheme("https"),
+            ImageSchemeProxy::Proxy(ImageProxyDns::Remote)
+        );
+        // reqwest parses the raw value with `http::Uri`: trailing whitespace, non-ASCII userinfo and
+        // fragments make it invalid, so the route is unknown and the pin protects a direct request.
+        for rejected in [
+            "http://10.0.0.2:7890 ",
+            "http://user:密码@proxy.example:8080",
+            "http://10.0.0.2:7890#fragment",
+        ] {
+            let value = environment(&[("HTTP_PROXY", rejected)]);
+            assert_eq!(
+                value.for_scheme("http"),
+                ImageSchemeProxy::Unknown,
+                "{rejected} must not be trusted as a proxy"
+            );
+            assert_eq!(value.for_scheme("https"), ImageSchemeProxy::None);
+        }
         // The first set variable wins; the lowercase spelling is not consulted after it.
         assert_eq!(
             environment(&[
@@ -4985,11 +5079,41 @@ mod tests {
                 .for_scheme("http"),
             ImageSchemeProxy::Proxy(ImageProxyDns::Remote)
         );
-        // The configured proxy URL itself is trimmed by `normalize_proxy_url`.
+        // The configured proxy URL itself is trimmed by `normalize_proxy_url`, but a value only one
+        // of reqwest's proxy parsers accepts becomes an unknown explicit proxy.
         assert_eq!(explicit_proxy_url(Some("  ")), None);
         assert_eq!(
             explicit_proxy_url(Some(" http://10.0.0.2:7890 ")),
             Some("http://10.0.0.2:7890".to_owned())
+        );
+        assert_eq!(
+            ImageProxyDns::from_url("http://10.0.0.2:7890"),
+            Some(ImageProxyDns::Remote)
+        );
+        assert_eq!(
+            ImageProxyDns::from_url("socks5://10.0.0.2:1080"),
+            Some(ImageProxyDns::Local)
+        );
+        // The configured value is trimmed before these checks, so only values reqwest cannot use
+        // are rejected here.
+        for rejected in [
+            "http://user:密码@proxy.example:8080",
+            "http://10.0.0.2:7890#fragment",
+        ] {
+            assert_eq!(
+                ImageProxyDns::from_url(rejected),
+                None,
+                "{rejected} must not be trusted as an explicit proxy"
+            );
+            assert_eq!(
+                ImageProxyRouting::from_environment(Some(rejected)).explicit,
+                ImageExplicitProxy::Unknown
+            );
+        }
+        assert_eq!(
+            ImageProxyRouting::from_environment(Some(" http://10.0.0.2:7890 ")).explicit,
+            ImageExplicitProxy::Proxy(ImageProxyDns::Remote),
+            "the configured proxy URL is trimmed, like `normalize_proxy_url`"
         );
     }
 
@@ -5018,6 +5142,40 @@ mod tests {
         assert_eq!(response.status().as_u16(), 200);
     }
 
+    /// A direct route must disable even a proxy the host cannot see (for example an operating-system
+    /// proxy): the pinned client would otherwise let the proxy resolve and open the connection.
+    #[tokio::test]
+    async fn direct_routes_disable_system_proxies_on_the_pinned_client() {
+        let address = spawn_image_stub("image/png", TEST_PNG_1X1).await;
+        // A closed loopback port stands in for a proxy the routing cannot observe: reaching it would
+        // fail the download, while a pinned direct client never connects to it.
+        let closed_proxy = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("closed proxy listener");
+            listener.local_addr().expect("closed proxy address").port()
+        };
+        let http = test_image_http_with_proxy(
+            ImageProxyRouting::default(),
+            &format!("http://127.0.0.1:{closed_proxy}"),
+        );
+        let url = Url::parse(&format!(
+            "http://images.example:{}/poster.png",
+            address.port()
+        ))
+        .expect("url");
+        assert_eq!(http.route(&url), ImageProxyRoute::Direct);
+        let (lookup, _calls) = scripted_image_host_lookup(vec![vec![address]]);
+
+        let client = http
+            .checked_request_client_with(&url, true, lookup.as_ref())
+            .await
+            .expect("pinned client");
+        let response = client.get(url).send().await.expect("direct pinned request");
+
+        assert_eq!(response.status().as_u16(), 200);
+    }
+
     /// A `NO_PROXY` match connects directly from this process, so it must take the resolved and
     /// pinned path instead of being handed to the proxy.
     #[tokio::test]
@@ -5025,7 +5183,7 @@ mod tests {
         let address = spawn_image_stub("image/png", TEST_PNG_1X1).await;
         let http = test_image_http(
             ImageProxyRouting {
-                explicit: Some(ImageProxyDns::Remote),
+                explicit: ImageExplicitProxy::Proxy(ImageProxyDns::Remote),
                 environment: ImageEnvironmentProxy::default(),
                 exclusions: ImageProxyExclusions {
                     raw: Some("images.example".to_owned()),
@@ -5061,7 +5219,7 @@ mod tests {
     async fn remote_dns_proxy_routes_check_local_answers_best_effort() {
         let http = test_image_http(
             ImageProxyRouting {
-                explicit: Some(ImageProxyDns::Remote),
+                explicit: ImageExplicitProxy::Proxy(ImageProxyDns::Remote),
                 environment: ImageEnvironmentProxy::default(),
                 exclusions: ImageProxyExclusions::default(),
             },
@@ -5211,7 +5369,7 @@ mod tests {
         let (socks, targets) = spawn_socks5_proxy(image).await;
         let http = test_image_http_with_proxy(
             ImageProxyRouting {
-                explicit: Some(ImageProxyDns::Local),
+                explicit: ImageExplicitProxy::Proxy(ImageProxyDns::Local),
                 environment: ImageEnvironmentProxy::default(),
                 exclusions: ImageProxyExclusions::default(),
             },
@@ -5244,7 +5402,7 @@ mod tests {
         let (socks, targets) = spawn_socks5_proxy(image).await;
         let http = test_image_http_with_proxy(
             ImageProxyRouting {
-                explicit: Some(ImageProxyDns::Remote),
+                explicit: ImageExplicitProxy::Proxy(ImageProxyDns::Remote),
                 environment: ImageEnvironmentProxy::default(),
                 exclusions: ImageProxyExclusions::default(),
             },
