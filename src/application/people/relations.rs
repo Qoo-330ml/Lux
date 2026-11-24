@@ -29,6 +29,50 @@ enum CanonicalPersonWriter<'a, 'db> {
 }
 
 impl CanonicalPersonWriter<'_, '_> {
+    async fn choose_preferred_person(
+        &mut self,
+        person_ids: &[String],
+    ) -> Result<String, StorageError> {
+        match self {
+            Self::Pool(database) => database.choose_preferred_canonical_person(person_ids).await,
+            Self::Batch(batch) => batch.choose_preferred_person(person_ids).await,
+        }
+    }
+
+    async fn merge_person(
+        &mut self,
+        source_person_id: &str,
+        target_person_id: &str,
+        match_method: &str,
+        confidence: Option<f64>,
+        evidence_json: &str,
+    ) -> Result<crate::storage::StoredCanonicalPersonMerge, StorageError> {
+        match self {
+            Self::Pool(database) => {
+                database
+                    .merge_canonical_person(
+                        source_person_id,
+                        target_person_id,
+                        match_method,
+                        confidence,
+                        evidence_json,
+                    )
+                    .await
+            }
+            Self::Batch(batch) => {
+                batch
+                    .merge_person(
+                        source_person_id,
+                        target_person_id,
+                        match_method,
+                        confidence,
+                        evidence_json,
+                    )
+                    .await
+            }
+        }
+    }
+
     async fn resolve_or_create(
         &mut self,
         display_name: &str,
@@ -195,14 +239,26 @@ impl PeopleService {
             return Ok(person_key_for_identities(identities));
         };
         let mut writer = CanonicalPersonWriter::Pool(database);
-        self.resolve_person_key_with_mapped_identities(
-            actor,
-            identities,
-            bridge_person_key,
-            None,
-            &mut writer,
-        )
-        .await
+        let mut merged_people = Vec::new();
+        let resolved = self
+            .resolve_person_key_with_mapped_identities(
+                actor,
+                identities,
+                bridge_person_key,
+                None,
+                &mut writer,
+                &mut merged_people,
+            )
+            .await?;
+        for (merged, evidence_json) in &merged_people {
+            self.sync_merged_canonical_person_artifacts(
+                merged,
+                "MULTI_IDENTITY_AUTO_MERGE",
+                evidence_json,
+            )
+            .await?;
+        }
+        Ok(resolved)
     }
 
     async fn resolve_person_key_with_mapped_identities(
@@ -212,6 +268,7 @@ impl PeopleService {
         bridge_person_key: Option<&str>,
         preloaded_identities: Option<&[(String, String, String)]>,
         writer: &mut CanonicalPersonWriter<'_, '_>,
+        merged_people: &mut Vec<(crate::storage::StoredCanonicalPersonMerge, String)>,
     ) -> Result<Option<String>, PeopleError> {
         if identities.is_empty() {
             return Ok(bridge_person_key.map(str::to_owned));
@@ -231,20 +288,47 @@ impl PeopleService {
                 .await
                 .map_err(|error| PeopleError::Storage(error.to_string()))?,
         };
-        let mut mapped_person: Option<String> = None;
+        let mut distinct_candidates = Vec::new();
+        let mut seen_candidates = HashSet::new();
         for (_, _, candidate_id) in &mapped_identities {
-            if mapped_person
-                .as_ref()
-                .is_some_and(|person_id| person_id != candidate_id)
-            {
-                tracing::warn!(
-                    actor = %actor.name,
-                    "actor provider identities map to different canonical people"
-                );
-                return Ok(None);
+            if seen_candidates.insert(candidate_id.clone()) {
+                distinct_candidates.push(candidate_id.clone());
             }
-            mapped_person = Some(candidate_id.clone());
         }
+        let mapped_person: Option<String> = if distinct_candidates.len() > 1 {
+            let target_person_id = writer
+                .choose_preferred_person(&distinct_candidates)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+            let evidence_json = serde_json::json!({
+                "method": "multi-identity-collision",
+                "actor": actor.name,
+                "identities": identity_pairs
+                    .iter()
+                    .map(|(provider, id)| format!("{provider}:{id}"))
+                    .collect::<Vec<_>>(),
+            })
+            .to_string();
+            for source_person_id in &distinct_candidates {
+                if source_person_id == &target_person_id {
+                    continue;
+                }
+                let merged = writer
+                    .merge_person(
+                        source_person_id,
+                        &target_person_id,
+                        "MULTI_IDENTITY_AUTO_MERGE",
+                        Some(1.0),
+                        &evidence_json,
+                    )
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?;
+                merged_people.push((merged, evidence_json.clone()));
+            }
+            Some(target_person_id)
+        } else {
+            distinct_candidates.into_iter().next()
+        };
         let mapped_identity_keys = mapped_identities
             .iter()
             .map(|(provider, provider_id, _)| (provider.clone(), provider_id.clone()))
@@ -686,7 +770,15 @@ impl PeopleService {
             prepared_actors
                 .iter()
                 .any(|(_, identities, bridge_candidates)| {
+                    let distinct_mapped = identities
+                        .iter()
+                        .filter_map(|identity| {
+                            person_by_identity
+                                .get(&(identity.provider.clone(), identity.id.clone()))
+                        })
+                        .collect::<std::collections::BTreeSet<_>>();
                     (bridge_candidates.len() > 1 && !identities.is_empty())
+                        || distinct_mapped.len() > 1
                         || identities.iter().any(|identity| {
                             !person_by_identity
                                 .contains_key(&(identity.provider.clone(), identity.id.clone()))
@@ -701,6 +793,7 @@ impl PeopleService {
             ),
             _ => None,
         };
+        let mut merged_people = Vec::new();
         let resolution = {
             let mut writer = canonical_people_batch
                 .as_mut()
@@ -710,6 +803,7 @@ impl PeopleService {
                 prepared_actors,
                 &mut person_by_identity,
                 writer.as_mut(),
+                &mut merged_people,
             )
             .await
         };
@@ -724,6 +818,14 @@ impl PeopleService {
             }
         }
         let resolved_actors = resolution?;
+        for (merged, evidence_json) in &merged_people {
+            self.sync_merged_canonical_person_artifacts(
+                merged,
+                "MULTI_IDENTITY_AUTO_MERGE",
+                evidence_json,
+            )
+            .await?;
+        }
 
         let asset_results = self
             .persist_resolved_nfo_person_assets(&resolved_actors, deferred_credits)
@@ -847,8 +949,9 @@ impl PeopleService {
         prepared_actors: Vec<(&ActorCredit, Vec<PersonIdentity>, Vec<&StoredActor>)>,
         person_by_identity: &mut HashMap<(String, String), String>,
         mut writer: Option<&mut CanonicalPersonWriter<'_, '_>>,
+        merged_people: &mut Vec<(crate::storage::StoredCanonicalPersonMerge, String)>,
     ) -> Result<Vec<ResolvedNfoActor>, PeopleError> {
-        let mut resolved_actors = Vec::with_capacity(prepared_actors.len());
+        let mut resolved_actors: Vec<ResolvedNfoActor> = Vec::with_capacity(prepared_actors.len());
         for (actor, identities, bridge_candidates) in prepared_actors {
             let primary = identities.first();
             let actor_id = primary
@@ -959,6 +1062,7 @@ impl PeopleService {
                         })
                 })
                 .collect::<Vec<_>>();
+            let merge_start = merged_people.len();
             let person_key = if identities.is_empty() {
                 self.resolve_person_key(actor, &identities, bridge_person_key)
                     .await?
@@ -969,6 +1073,7 @@ impl PeopleService {
                     bridge_person_key,
                     Some(&mapped_identities),
                     writer,
+                    merged_people,
                 )
                 .await?
             } else if let Some(database) = &self.database {
@@ -981,11 +1086,26 @@ impl PeopleService {
                     bridge_person_key,
                     Some(&mapped_identities),
                     &mut pool_writer,
+                    merged_people,
                 )
                 .await?
             } else {
                 person_key_for_identities(&identities)
             };
+            for (merged, _) in &merged_people[merge_start..] {
+                for mapped_person_id in person_by_identity.values_mut() {
+                    if *mapped_person_id == merged.source_person_id {
+                        *mapped_person_id = merged.target_person_id.clone();
+                    }
+                }
+                for previously_resolved in &mut resolved_actors {
+                    if previously_resolved.person_key.as_deref()
+                        == Some(merged.source_person_id.as_str())
+                    {
+                        previously_resolved.person_key = Some(merged.target_person_id.clone());
+                    }
+                }
+            }
             if let Some(person_key) = person_key.as_deref() {
                 for identity in &identities {
                     person_by_identity.insert(

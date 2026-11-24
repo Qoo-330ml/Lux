@@ -22094,6 +22094,121 @@ fmt、`clippy --all-targets --all-features -D warnings` 通过。
 `tests/emby/emby_admin_media.rs`、`tests/emby/main.rs`、`docs/API.md`、`docs/COMPATIBILITY.md`、
 `docs/TEST-TARGETS.md`、`docs/LUX-DEVELOPMENT.md`。
 
+#### LUX-918：互补合并同片 `movie.nfo` 与 `<片名>.nfo` 的演员身份并稳固本地演员索引
+
+状态：已完成（2026-11-24，本机 `arm64` 验证；`fnos` 实机部署未验证）。依赖：LUX-178（跨 provider 规范人物）、LUX-188（可恢复人物索引重建）、
+LUX-841（`<video>.nfo` 优先与防串片保护）。验证：`--test metadata` 166/166、`--test scanned_metadata` 23/23、`--test emby search::` 3/3、`--lib` 2057 passed / 41 ignored / 0 failed（其中 `application::people` 57/57、`application::nfo` 34/34、`application::metadata` 28/28）、`cargo fmt --all -- --check`、`cargo build --locked`、`check-migration-parity.py` 与 `check-backend-branches.py` 均通过；`--all-targets` 在 `--test auth_users` 的 `resume_favorites::resume_thresholds_and_favorite_played_endpoints_share_user_state` 因宿主机环境存在代理变量（`networkProxy.configured == true`）失败而未跑完后续目标，`cargo clippy --locked --all-targets --all-features -- -D warnings` 因 `rustc 1.100.0` 对既有代码的新增 lint（`result_large_err`、`chunks_exact_to_as_chunks`、`single_element_loop`）报错 33 处（均非本任务新增逻辑）。
+
+背景：
+
+- 本地 NFO 解析目前在同个 `<actor>` 同时出现多个 provider ID 标签（如 `<tmdbid>` 与 `<imdbid>`）时会用后
+  出现的标签覆盖前者，并把 `ActorCredit.identities` 置空，导致同片可桥接的多源身份丢失；电影 NFO 写回也
+  只写出单个 provider ID。
+- 当电影目录同时存在 `<片名>.nfo` 与 `movie.nfo` 时，LUX-841 只读取 `<片名>.nfo`，导致其中一方缺失的
+  演员 ID（或条目级外部 ID）无法从同片另一份 NFO 互补补齐。
+- 没有任何 provider ID 的演员目前通过 `local_actor_id(name, character)` 按“姓名 + 角色”哈希生成
+  `local-*`，同一演员在不同影片饰演不同角色会在搜索中分裂为多条；同时部分已有 `person_identities` 映射
+  的 `person_credits` 行因历史同步遗漏 `lux_person_id` 为空。
+
+范围：
+
+- `src/application/nfo.rs`：
+  - 解析 `<actor>` 时保留全部合法的 `<tmdbid>`、`<doubanid>`、`<imdbid>` 到 `ActorCredit.identities`
+    （去重排序，主 `(provider, id)` 按 `tmdb > douban > imdb` 确定），电影 NFO 写回保留全部已支持
+    `identities`。
+  - 新增同片 NFO 校验与互补合并助手：仅当 `<片名>.nfo`（主）与同目录 `movie.nfo`（辅）确认描述同一部
+    影片时（外部 ID 无冲突且至少匹配一个外部 ID，或外部 ID 无冲突且规范化片名一致、年份不冲突），用
+    `movie.nfo` 互补补齐缺失的条目 `provider_ids` 以及同片演员缺失的 `identities`/主 ID/角色/排序；两
+    份 NFO 描述不同影片时绝不合并（保留 LUX-841 防串片约束）。
+- `src/application/metadata.rs`：
+  - 电影读取 `<片名>.nfo` 时若同目录存在 `movie.nfo`，将双文件纳入文件指纹与语义缓存指纹，并在同片校
+    验通过后执行互补合并；目录内 `movie.nfo` 变更时也触发同目录电影条目局部增量重读。
+- `src/application/people/helpers.rs`、`src/application/people/rebuild.rs`、
+  `src/application/people/service.rs`：
+  - `local_actor_id` 仅按规范化姓名生成稳定的 `local-*` ID，不再混入 `character`。
+  - 人物索引重建任务对旧格式（`identities` 为空但有非 `local-*` `id` 与 `provider`）也查询
+    `person_identities` 并回填 `lux_person_id`，同时将 `PERSON_INDEX_REBUILD_SCHEMA_VERSION` 递增到 `2`，
+    使存量库重启后自动重建 `person_credits`。
+
+不做：不新增后台在线抓取 TMDb/豆瓣人物 `birthday` / `external_ids` 任务；不新增管理员手动合并两个
+`lux-*` 规范人物接口；不修改数据库表结构（不新增 migration）；不改变不同影片间跨 provider 自动合并条件。
+
+验收：
+
+- [x] `<actor>` 同时包含 `<tmdbid>`、`<imdbid>`、`<doubanid>` 时解析保留全部 `identities` 且写回不丢失（`nfo_writer::movie_nfo_parser_preserves_multiple_actor_provider_ids_and_writes_them_back`）。
+- [x] 同目录同时存在 `<片名>.nfo` 与 `movie.nfo` 且为同一部影片时，两者缺失的演员 ID 与条目外部 ID 互补
+  合并；若 `movie.nfo` 描述不同影片（标题或外部 ID 冲突），绝不合并（`nfo_writer::complementary_movie_nfo_merge_supplements_actor_ids_only_for_same_film`、`metadata::movie_enrichment_complementarily_merges_same_film_movie_nfo_and_per_file_nfo`）。
+- [x] 修改 `movie.nfo` 或 `<片名>.nfo` 任一文件，电影重新扫描/增量刷新后 `people.json` 与 `person_credits`
+  都会更新；单文件场景保持现有指纹跳过逻辑（`metadata::movie_enrichment_complementarily_merges_same_film_movie_nfo_and_per_file_nfo`）。
+- [x] 无 provider ID 的本地演员在不同电影饰演不同角色时使用同一个 `local-*` ID，人物搜索聚合为一条且
+  人物详情页可列出全部参演影片（`people_api::local_actors_without_provider_id_merge_across_roles_and_rebuild_backfills_identities`）。
+- [x] `PERSON_INDEX_REBUILD_SCHEMA_VERSION` 升至 `2` 后，索引重建能重算 `local-*` 并从 `person_identities`
+  回填缺失的 `lux_person_id`（`people_api::local_actors_without_provider_id_merge_across_roles_and_rebuild_backfills_identities`）。
+- [x] 相关单元测试与 `--test metadata`、`--test scanned_metadata`、`--lib` 校验、fmt 与脚本校验通过；`clippy` 既有存量告警与 `auth_users` 宿主机代理环境干扰已如实记录。
+- [ ] 未验证：部署到 `fnos` 实机并执行扫描/重启重建后的线上人物数量收敛结果。
+
+预计文件：`src/application/nfo.rs`、`src/application/metadata.rs`、`src/application/people/helpers.rs`、
+`src/application/people/rebuild.rs`、`src/application/people/service.rs`、`tests/metadata/nfo_writer.rs`、
+`tests/metadata/metadata.rs`、`tests/metadata/people_api.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+#### LUX-919：规范人物合并、多身份碰撞自动收敛与管理员合并接口
+
+状态：已完成（2026-11-24）。依赖：LUX-178（跨 provider 规范人物）、LUX-188（人物索引重建）、
+LUX-918（NFO 多源演员身份解析与双 NFO 互补合并）。
+
+背景：
+
+- 现有库中（如 `fnos` 实测）同一演员已分别以 `tmdb`、`imdb`、`douban` 建成了不同的 `lux-*` 规范人物
+  （例如沈腾 `lux-002286` 与 `lux-005709`）。
+- 目前 `resolve_person_key_with_mapped_identities`（`relations.rs`）与索引重建 `person_credits_from_relation_with_lookup`
+  （`rebuild.rs`）在遇到单个演员的多条 `identities` 分属不同 `lux-*` 时会直接放弃归属（返回 `None`），
+  既不会自动合并，也缺乏将两个已建好的 `lux-*` 人物合并的存储原语与管理员端点。
+
+范围：
+
+- `src/storage/people.rs`：
+  - 新增 `choose_preferred_canonical_person` 与 `merge_canonical_person`（含事务/savepoint 变体供
+    `CanonicalPersonBatch` 复用）：按 `tmdb` 身份优先、其次高 `person_credits` 计数、再次较小 `lux-*`
+    ID 选定主记录，把源 `lux-*` 的 `person_identities`、`person_credits.lux_person_id`、
+    `user_person_state`（保留收藏并取较新更新时间）、`emby_migration_person_favorites`、
+    `person_match_candidates` 引用迁移到目标人物，将源 `people.status` 置为 `MERGED` 并清理其
+    `person_manifest_index_state`。
+- `src/application/people/service.rs`、`src/application/people/matching.rs`：
+  - 新增 `PeopleService::merge_canonical_people` 与合并清单同步助手：将源人物头像（目标缺图时）、缺失
+    元数据字段、别名、`identities` 与 `MANUAL_MERGE` / `AUTO_MULTI_IDENTITY_MERGE` 事件同步写入目标
+    `person.json` / `person.nfo` 与 `people/index/*.json`；在源 `person.json` 记录可向后兼容的可选
+    `mergedIntoPersonId` 并清空其 `identities`。
+  - 将 `PERSON_INDEX_REBUILD_SCHEMA_VERSION` 递增到 `3`，并在 `restore_person_manifests` 中避免把已标记
+    `mergedIntoPersonId` 的人物重新恢复为 `ACTIVE`。
+- `src/application/people/helpers.rs`、`src/application/people/relations.rs`、`src/application/people/rebuild.rs`、`src/storage/people.rs`、`src/api/legacy.rs`：
+  - 当演员的 `identities` 映射到 2 个及以上活跃 `lux-*` 人物时，不再放弃归属，而是自动选定主记录并将
+    其余碰撞人物合并到主记录（支持批量扫描页事务与索引重建）。
+  - 在索引重建中增加本地人物 ID 算法升级的兼容迁移：`legacy_local_actor_id(name, character)` 对无显式
+    ID 的关系记录推导旧 `local-*` ID，分批将 `user_person_state` 旧收藏迁移到新版 `local_actor_id(name)`，
+    并把旧 `people/index/*.json`、`people/` 或 `people/profiles/` 头像索引平滑衔接到新 ID；同时对齐
+    `lux_get_person`/`lux_set_person_favorite` 收藏键与 `person.lookup_id`（兼容回退 `person.id`）。
+- `src/api/admin/admin_people.rs`：
+  - 新增 `POST /api/v1/admin/people/merge`（管理员 + CSRF，支持 `sourcePersonId`、`targetPersonId`、
+    `evidence`，记录 `PEOPLE_MERGED` 审计事件；同人/已合并返回 409，非法输入返回 400，不存在返回 404）。
+
+不做：不新增后台在线请求 TMDb `external_ids` / `birthday` 任务（留给后续任务）；不基于纯姓名自动合并无共
+同 ID 的 `local-*` 或同源同名人物（防止误并同名不同人）；不新增数据库 migration。
+
+验收：
+
+- [x] `merge_canonical_people` 将源 `lux-*` 的身份映射、`person_credits.lux_person_id`、用户收藏与
+  头像/简介迁移到目标 `lux-*`，源人物标为 `MERGED`，且重启清单恢复不会将已合并源人物重新激活。
+- [x] 当同一个演员携带多个 provider ID（例如 `tmdb` + `imdb`）且分别已属不同 `lux-*` 时，入库持久化
+  和人物索引重建都会自动选主合并，最终在搜索与详情中收敛为 1 条。
+- [x] 本地人物 ID 算法升级重建时自动迁移旧 `local-*` 的 `user_person_state` 收藏与已上传头像/索引资产，
+  收敛后搜索、详情收藏态及头像请求保持可用（`people_api::rebuilding_people_migrates_legacy_local_actor_favorites_and_assets_after_id_algorithm_change`）。
+- [x] `POST /api/v1/admin/people/merge` 校验管理员与 CSRF、迁移状态并写审计事件，对非法/自合并/已合并/
+  缺失人物返回对应 400/409/404。
+- [x] 相关单测、`--test metadata`、`--lib` 校验、fmt 与脚本校验通过。
+- [ ] 未验证：部署到 `fnos` 实机并触发 `rebuild`/手动合并接口检查线上人物收敛与权限行为。
+
+预计文件：`src/storage/people.rs`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/application/people/service.rs`、`src/application/people/helpers.rs`、`src/application/people/matching.rs`、`src/application/people/relations.rs`、`src/application/people/rebuild.rs`、`src/api/admin/admin_people.rs`、`src/api/legacy.rs`、`tests/metadata/people_api.rs`、`docs/LUX-DEVELOPMENT.md`。
+
 ## 31. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

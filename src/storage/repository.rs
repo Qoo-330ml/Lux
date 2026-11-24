@@ -3828,6 +3828,15 @@ pub(crate) struct StoredCanonicalPerson {
     pub(crate) id: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredCanonicalPersonMerge {
+    pub(crate) source_person_id: String,
+    pub(crate) target_person_id: String,
+    pub(crate) source_display_name: String,
+    pub(crate) target_display_name: String,
+    pub(crate) moved_identities: Vec<(String, String)>,
+}
+
 #[derive(Debug)]
 pub(crate) struct StoredCanonicalPersonMatch {
     pub(crate) id: String,

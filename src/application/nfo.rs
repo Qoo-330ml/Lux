@@ -29,7 +29,7 @@ use crate::application::metadata::{
 };
 use crate::application::metadata_paths::{library_item_directory, metadata_root};
 use crate::application::metadata_writeback::item_metadata_writeback_enabled;
-use crate::application::people::ActorCredit;
+use crate::application::people::{ActorCredit, PersonIdentity};
 use crate::application::probe::{MediaProbeResult, MediaStreamResult, StreamType};
 use crate::storage::{
     Database, MediaMetadataUpdate, StorageError, StoredMediaItemKind, StoredMediaSourcePath,
@@ -237,6 +237,248 @@ const MAX_NFO_RATING_ENTRIES: usize = 64;
 /// fields, and actor relations always come from the same source revision.
 pub fn parse_local_nfo_projection(bytes: &[u8]) -> Result<LocalNfoProjection, NfoError> {
     parse_local_nfo_projection_inner(bytes, false).map(|(projection, _)| projection)
+}
+
+fn normalize_nfo_match_text(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn actor_identity_priority(provider: &str) -> u8 {
+    match provider {
+        "tmdb" => 0,
+        "douban" => 1,
+        "imdb" => 2,
+        _ => 3,
+    }
+}
+
+fn select_primary_actor_identity(identities: &[PersonIdentity]) -> Option<&PersonIdentity> {
+    identities.iter().min_by(|left, right| {
+        actor_identity_priority(&left.provider)
+            .cmp(&actor_identity_priority(&right.provider))
+            .then_with(|| left.provider.cmp(&right.provider))
+            .then_with(|| left.id.cmp(&right.id))
+    })
+}
+
+fn push_unique_actor_identity(identities: &mut Vec<PersonIdentity>, provider: &str, id: &str) {
+    let provider = provider.trim().to_ascii_lowercase();
+    let id = id.trim();
+    if provider.is_empty() || id.is_empty() {
+        return;
+    }
+    if !identities
+        .iter()
+        .any(|existing| existing.provider == provider && existing.id == id)
+    {
+        identities.push(PersonIdentity {
+            provider,
+            id: id.to_owned(),
+        });
+    }
+}
+
+fn collect_actor_identities(actor: &ActorCredit) -> Vec<PersonIdentity> {
+    let mut identities = Vec::new();
+    for identity in &actor.identities {
+        push_unique_actor_identity(&mut identities, &identity.provider, &identity.id);
+    }
+    if !actor.id.trim().is_empty() {
+        let provider = actor.provider.as_deref().unwrap_or("tmdb");
+        push_unique_actor_identity(&mut identities, provider, &actor.id);
+    }
+    identities.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    identities
+}
+
+fn normalized_provider_ids(details: &LocalNfoDetails) -> BTreeMap<String, String> {
+    let mut ids = BTreeMap::new();
+    for (provider, value) in &details.provider_ids {
+        let key = provider.trim().to_ascii_lowercase();
+        let value = value.trim();
+        if !key.is_empty() && !value.is_empty() {
+            ids.entry(key).or_insert_with(|| value.to_owned());
+        }
+    }
+    ids
+}
+
+fn nfo_projections_describe_same_movie(
+    primary: &LocalNfoProjection,
+    fallback: &LocalNfoProjection,
+) -> bool {
+    let primary_ids = normalized_provider_ids(&primary.details);
+    let fallback_ids = normalized_provider_ids(&fallback.details);
+    let mut shared_provider_id = false;
+    for (provider, primary_value) in &primary_ids {
+        if let Some(fallback_value) = fallback_ids.get(provider) {
+            if !primary_value.eq_ignore_ascii_case(fallback_value) {
+                return false;
+            }
+            shared_provider_id = true;
+        }
+    }
+    if let (Some(left_year), Some(right_year)) = (
+        primary.metadata.production_year,
+        fallback.metadata.production_year,
+    ) && left_year != right_year
+    {
+        return false;
+    }
+    if shared_provider_id {
+        return true;
+    }
+    let primary_titles = [
+        primary.metadata.title.as_deref(),
+        primary.metadata.original_title.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(normalize_nfo_match_text)
+    .filter(|title| !title.is_empty())
+    .collect::<Vec<_>>();
+    let fallback_titles = [
+        fallback.metadata.title.as_deref(),
+        fallback.metadata.original_title.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(normalize_nfo_match_text)
+    .filter(|title| !title.is_empty())
+    .collect::<Vec<_>>();
+    primary_titles
+        .iter()
+        .any(|title| fallback_titles.contains(title))
+}
+
+fn find_matching_fallback_actor<'a>(
+    primary: &ActorCredit,
+    fallback_actors: &'a [ActorCredit],
+) -> Option<&'a ActorCredit> {
+    let name = normalize_nfo_match_text(&primary.name);
+    if name.is_empty() {
+        return None;
+    }
+    let candidates = fallback_actors
+        .iter()
+        .filter(|candidate| normalize_nfo_match_text(&candidate.name) == name)
+        .collect::<Vec<_>>();
+    if candidates.len() == 1 {
+        return candidates.into_iter().next();
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    if let Some(character) = primary
+        .character
+        .as_deref()
+        .map(normalize_nfo_match_text)
+        .filter(|value| !value.is_empty())
+    {
+        let role_matches = candidates
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                candidate
+                    .character
+                    .as_deref()
+                    .map(normalize_nfo_match_text)
+                    .as_deref()
+                    == Some(character.as_str())
+            })
+            .collect::<Vec<_>>();
+        if role_matches.len() == 1 {
+            return role_matches.into_iter().next();
+        }
+    }
+    if let Some(order) = primary.order {
+        let order_matches = candidates
+            .into_iter()
+            .filter(|candidate| candidate.order == Some(order))
+            .collect::<Vec<_>>();
+        if order_matches.len() == 1 {
+            return order_matches.into_iter().next();
+        }
+    }
+    None
+}
+
+/// Complementarily merges `fallback` (`movie.nfo`) into `primary` (`<video>.nfo`) when both
+/// describe the same film, supplementing missing item provider IDs and actor identities without
+/// overriding `<video>.nfo` or mixing a conflicting `movie.nfo`.
+pub fn merge_complementary_movie_nfo_projections(
+    primary: &mut LocalNfoProjection,
+    fallback: &LocalNfoProjection,
+) -> bool {
+    if !nfo_projections_describe_same_movie(primary, fallback) {
+        return false;
+    }
+    for (provider, value) in &fallback.details.provider_ids {
+        let key = provider.trim();
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        let already_present = primary
+            .details
+            .provider_ids
+            .keys()
+            .any(|existing| existing.eq_ignore_ascii_case(key));
+        if !already_present {
+            primary
+                .details
+                .provider_ids
+                .insert(key.to_owned(), value.to_owned());
+        }
+    }
+    if primary.actors.is_empty() {
+        if !fallback.actors.is_empty() {
+            primary.actors = fallback.actors.clone();
+        }
+        return true;
+    }
+    for actor in &mut primary.actors {
+        let Some(fallback_actor) = find_matching_fallback_actor(actor, &fallback.actors) else {
+            continue;
+        };
+        let mut merged_identities = collect_actor_identities(actor);
+        for identity in collect_actor_identities(fallback_actor) {
+            push_unique_actor_identity(&mut merged_identities, &identity.provider, &identity.id);
+        }
+        merged_identities.sort_by(|left, right| {
+            left.provider
+                .cmp(&right.provider)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        if let Some(primary_identity) = select_primary_actor_identity(&merged_identities) {
+            let primary_missing = actor.id.trim().is_empty();
+            let upgrades_priority = actor.provider.as_deref().is_some_and(|existing| {
+                actor_identity_priority(&primary_identity.provider)
+                    < actor_identity_priority(&existing.to_ascii_lowercase())
+            });
+            if primary_missing || upgrades_priority {
+                actor.id = primary_identity.id.clone();
+                actor.provider = Some(primary_identity.provider.clone());
+            }
+        }
+        actor.identities = merged_identities;
+        if actor.character.is_none() {
+            actor.character = fallback_actor.character.clone();
+        }
+        if actor.order.is_none() {
+            actor.order = fallback_actor.order;
+        }
+    }
+    true
 }
 
 pub(crate) fn parse_local_nfo_projection_with_semantic_fingerprint(
@@ -763,8 +1005,7 @@ pub fn parse_movie_nfo_actors(bytes: &[u8]) -> Result<Vec<ActorCredit>, NfoError
 struct ParsedMovieActor {
     name: Option<String>,
     role: Option<String>,
-    tmdb_id: Option<String>,
-    provider: Option<String>,
+    identities: Vec<PersonIdentity>,
     order: Option<i32>,
 }
 
@@ -805,16 +1046,13 @@ fn assign_movie_actor_field(
         MovieActorField::Name => actor.name = Some(value),
         MovieActorField::Role => actor.role = Some(value),
         MovieActorField::TmdbId => {
-            actor.tmdb_id = Some(value);
-            actor.provider = Some("tmdb".to_owned());
+            push_unique_actor_identity(&mut actor.identities, "tmdb", &value)
         }
         MovieActorField::ImdbId => {
-            actor.tmdb_id = Some(value);
-            actor.provider = Some("imdb".to_owned());
+            push_unique_actor_identity(&mut actor.identities, "imdb", &value)
         }
         MovieActorField::DoubanId => {
-            actor.tmdb_id = Some(value);
-            actor.provider = Some("douban".to_owned());
+            push_unique_actor_identity(&mut actor.identities, "douban", &value)
         }
         MovieActorField::Order => actor.order = value.parse::<i32>().ok(),
     }
@@ -963,20 +1201,26 @@ fn assign_base_value(
     Ok(())
 }
 
-fn push_parsed_actor(actors: &mut Vec<ActorCredit>, actor: ParsedMovieActor) {
+fn push_parsed_actor(actors: &mut Vec<ActorCredit>, mut actor: ParsedMovieActor) {
     let Some(name) = actor.name.map(|value| value.trim().to_owned()) else {
         return;
     };
     if name.is_empty() || actors.len() >= MAX_MOVIE_NFO_ACTORS {
         return;
     }
-    let id = actor
-        .tmdb_id
-        .map(|value| value.trim().to_owned())
+    actor.identities.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let primary = select_primary_actor_identity(&actor.identities);
+    let id = primary
+        .map(|identity| identity.id.clone())
         .unwrap_or_default();
+    let provider = primary.map(|identity| identity.provider.clone());
     actors.push(ActorCredit {
-        provider: actor.provider,
-        identities: Vec::new(),
+        provider,
+        identities: actor.identities,
         id,
         name,
         character: actor.role,
@@ -2522,13 +2766,40 @@ fn write_movie_nfo_fields(
             write_simple_element(writer, "role", character)?;
         }
         write_simple_element(writer, "type", "Actor")?;
+        let mut written_identities: Vec<(String, String)> = Vec::new();
         if !actor.id.trim().is_empty() {
-            let tag = match actor.provider.as_deref().map(str::trim) {
-                Some("imdb") => "imdbid",
-                Some("douban") => "doubanid",
+            let provider = actor
+                .provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("tmdb")
+                .to_ascii_lowercase();
+            let id = actor.id.trim();
+            written_identities.push((provider, id.to_owned()));
+        }
+        for identity in &actor.identities {
+            let provider = identity.provider.trim().to_ascii_lowercase();
+            let id = identity.id.trim();
+            if !matches!(provider.as_str(), "tmdb" | "imdb" | "douban") || id.is_empty() {
+                continue;
+            }
+            if !written_identities
+                .iter()
+                .any(|(existing_provider, existing_id)| {
+                    existing_provider == &provider && existing_id == id
+                })
+            {
+                written_identities.push((provider, id.to_owned()));
+            }
+        }
+        for (provider, id) in written_identities {
+            let tag = match provider.as_str() {
+                "imdb" => "imdbid",
+                "douban" => "doubanid",
                 _ => "tmdbid",
             };
-            write_simple_element(writer, tag, actor.id.trim())?;
+            write_simple_element(writer, tag, &id)?;
         }
         if let Some(order) = actor.order {
             write_simple_element(writer, "order", &order.to_string())?;

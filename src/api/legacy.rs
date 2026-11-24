@@ -2207,13 +2207,24 @@ async fn lux_get_person(
     {
         Ok(Some(mut person)) => {
             person.is_favorite = match auth_principal.user_id() {
-                Some(user_id) => match database
-                    .find_user_person_favorite(&user_id.to_string(), &person.id)
-                    .await
-                {
-                    Ok(is_favorite) => is_favorite,
-                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                },
+                Some(user_id) => {
+                    let user_id_str = user_id.to_string();
+                    match database
+                        .find_user_person_favorite(&user_id_str, &person.lookup_id)
+                        .await
+                    {
+                        Ok(true) => true,
+                        Ok(false) if person.lookup_id != person.id => match database
+                            .find_user_person_favorite(&user_id_str, &person.id)
+                            .await
+                        {
+                            Ok(is_favorite) => is_favorite,
+                            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                        },
+                        Ok(false) => false,
+                        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                    }
+                }
                 None => false,
             };
             Json(person).into_response()
@@ -2270,10 +2281,19 @@ async fn lux_set_person_favorite(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let database = state.database();
-    match database
-        .set_user_person_favorite(&user.id.to_string(), &person.id, request.favorite)
+    let user_id = user.id.to_string();
+    let favorite_result = match database
+        .set_user_person_favorite(&user_id, &person.lookup_id, request.favorite)
         .await
     {
+        Ok(()) if !request.favorite && person.lookup_id != person.id => {
+            database
+                .set_user_person_favorite(&user_id, &person.id, false)
+                .await
+        }
+        other => other,
+    };
+    match favorite_result {
         Ok(()) => {
             state
                 .user_events

@@ -8,6 +8,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::{
     fs,
     sync::{Mutex, OnceCell, Semaphore},
@@ -23,7 +24,8 @@ use crate::{
             image_content_tag_and_dimensions_from_bytes,
         },
         nfo::{
-            LocalNfoMetadataStore, LocalNfoMetadataStoreError, nfo_content_fingerprint,
+            LocalNfoMetadataStore, LocalNfoMetadataStoreError, MAX_LOCAL_NFO_BYTES,
+            merge_complementary_movie_nfo_projections, nfo_content_fingerprint,
             parse_local_nfo_projection, parse_local_nfo_projection_with_semantic_fingerprint,
         },
         people::{DeferredNfoActorCredits, PeopleService},
@@ -2129,10 +2131,22 @@ impl MetadataEnricher {
                 .identity_conflict_gate = Some(Arc::clone(gate));
         }
         if let Some(changed_nfo_path) = changed_nfo_path {
+            let movie_item_ids = sources
+                .iter()
+                .filter(|source| source.item_type == "MOVIE")
+                .map(|source| source.item_id.as_str())
+                .collect::<HashSet<_>>();
+            let changed_is_movie_nfo =
+                changed_nfo_path.file_name() == Some(std::ffi::OsStr::new("movie.nfo"));
             let affected_item_ids = nfo_snapshot
                 .nfo_paths_by_item
                 .iter()
-                .filter(|(_, nfo_path)| nfo_path.as_path() == changed_nfo_path)
+                .filter(|(item_id, nfo_path)| {
+                    nfo_path.as_path() == changed_nfo_path
+                        || (changed_is_movie_nfo
+                            && movie_item_ids.contains(item_id.as_str())
+                            && nfo_path.parent() == changed_nfo_path.parent())
+                })
                 .map(|(item_id, _)| item_id.clone())
                 .collect::<HashSet<_>>();
             nfo_snapshot
@@ -3431,7 +3445,10 @@ impl MetadataEnricher {
         background_cpu_budgeted: bool,
     ) -> Result<MetadataReport, MetadataError> {
         let mut report = MetadataReport::default();
-        let fingerprint = nfo_fingerprint(nfo_path).await.ok();
+        let complementary_nfo_path =
+            movie_complementary_nfo_path(nfo_path, metadata.as_ref()).await;
+        let fingerprint =
+            combined_nfo_fingerprint(nfo_path, complementary_nfo_path.as_deref()).await;
         let already_checked = fingerprint.as_deref().is_some_and(|fingerprint| {
             metadata
                 .as_ref()
@@ -3521,10 +3538,18 @@ impl MetadataEnricher {
                 return Ok(report);
             }
         };
+        let complementary_bytes: Option<Arc<[u8]>> = match complementary_nfo_path.as_deref() {
+            Some(path) => read_complementary_movie_nfo_bytes(path).await,
+            None => None,
+        };
         let source_fingerprint = if background_cpu_budgeted {
             let fingerprint_bytes = Arc::clone(&bytes);
+            let complementary_fingerprint_bytes = complementary_bytes.clone();
             run_process_background_blocking(BackgroundWorkStage::LocalNfo, move || {
-                nfo_content_fingerprint(&fingerprint_bytes)
+                combined_content_fingerprint(
+                    &fingerprint_bytes,
+                    complementary_fingerprint_bytes.as_deref(),
+                )
             })
             .await
             .map_err(|error| MetadataError::Io {
@@ -3532,7 +3557,7 @@ impl MetadataEnricher {
                 source: std::io::Error::other(error.to_string()),
             })?
         } else {
-            nfo_content_fingerprint(&bytes)
+            combined_content_fingerprint(&bytes, complementary_bytes.as_deref())
         };
         if !actor_relation_missing
             && let (Some(metadata), Some((details, cached_fingerprint, _, _))) =
@@ -3568,23 +3593,25 @@ impl MetadataEnricher {
         let needs_semantic_fingerprint = self.local_nfo.is_some();
         let parsed_projection = if background_cpu_budgeted {
             let parse_bytes = Arc::clone(&bytes);
+            let parse_complementary_bytes = complementary_bytes.clone();
             run_process_background_blocking(BackgroundWorkStage::LocalNfo, move || {
-                if needs_semantic_fingerprint {
-                    parse_local_nfo_projection_with_semantic_fingerprint(&parse_bytes)
-                } else {
-                    parse_local_nfo_projection(&parse_bytes)
-                        .map(|projection| (projection, Vec::new()))
-                }
+                parse_movie_nfo_with_complementary(
+                    &parse_bytes,
+                    parse_complementary_bytes.as_deref(),
+                    needs_semantic_fingerprint,
+                )
             })
             .await
             .map_err(|error| MetadataError::Io {
                 path: nfo_path.to_owned(),
                 source: std::io::Error::other(error.to_string()),
             })?
-        } else if needs_semantic_fingerprint {
-            parse_local_nfo_projection_with_semantic_fingerprint(&bytes)
         } else {
-            parse_local_nfo_projection(&bytes).map(|projection| (projection, Vec::new()))
+            parse_movie_nfo_with_complementary(
+                &bytes,
+                complementary_bytes.as_deref(),
+                needs_semantic_fingerprint,
+            )
         };
         let (projection, semantic_fingerprint) = match parsed_projection {
             Ok(parsed) => parsed,
@@ -4514,6 +4541,107 @@ pub(crate) fn nfo_fingerprint_from_stamp(path: &Path, size: u64, modified_at: u1
     let modified_at = i64::try_from(modified_at).unwrap_or(0);
     let path = path.to_string_lossy();
     compute_file_fingerprint(&path, size, modified_at, None, None)
+}
+
+async fn movie_complementary_nfo_path(
+    nfo_path: &Path,
+    metadata: Option<&StoredMediaMetadata>,
+) -> Option<PathBuf> {
+    if !metadata.is_some_and(|item| item.item_type == "MOVIE") {
+        return None;
+    }
+    if nfo_path.file_name() == Some(std::ffi::OsStr::new("movie.nfo")) {
+        return None;
+    }
+    let movie_nfo = nfo_path.parent()?.join("movie.nfo");
+    fs::try_exists(&movie_nfo)
+        .await
+        .ok()
+        .filter(|exists| *exists)
+        .map(|_| movie_nfo)
+}
+
+async fn combined_nfo_fingerprint(
+    primary_path: &Path,
+    complementary_path: Option<&Path>,
+) -> Option<Vec<u8>> {
+    let primary = nfo_fingerprint(primary_path).await.ok()?;
+    let Some(complementary_path) = complementary_path else {
+        return Some(primary);
+    };
+    let Ok(complementary) = nfo_fingerprint(complementary_path).await else {
+        return Some(primary);
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(&primary);
+    hasher.update(b"\0movie.nfo\0");
+    hasher.update(&complementary);
+    Some(hasher.finalize().to_vec())
+}
+
+async fn read_complementary_movie_nfo_bytes(path: &Path) -> Option<Arc<[u8]>> {
+    let metadata = fs::metadata(path).await.ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_LOCAL_NFO_BYTES as u64 {
+        return None;
+    }
+    fs::read(path).await.ok().map(Arc::from)
+}
+
+fn combined_content_fingerprint(
+    primary_bytes: &[u8],
+    complementary_bytes: Option<&[u8]>,
+) -> Vec<u8> {
+    let primary = nfo_content_fingerprint(primary_bytes);
+    let Some(complementary_bytes) = complementary_bytes else {
+        return primary;
+    };
+    let complementary = nfo_content_fingerprint(complementary_bytes);
+    let mut hasher = Sha256::new();
+    hasher.update(&primary);
+    hasher.update(b"\0movie.nfo\0");
+    hasher.update(&complementary);
+    hasher.finalize().to_vec()
+}
+
+fn parse_movie_nfo_with_complementary(
+    primary_bytes: &[u8],
+    complementary_bytes: Option<&[u8]>,
+    needs_semantic_fingerprint: bool,
+) -> Result<(crate::application::nfo::LocalNfoProjection, Vec<u8>), NfoError> {
+    let (mut projection, mut semantic_fingerprint) = if needs_semantic_fingerprint {
+        parse_local_nfo_projection_with_semantic_fingerprint(primary_bytes)?
+    } else {
+        (parse_local_nfo_projection(primary_bytes)?, Vec::new())
+    };
+    let Some(complementary_bytes) = complementary_bytes else {
+        return Ok((projection, semantic_fingerprint));
+    };
+    let complementary_parsed = if needs_semantic_fingerprint {
+        parse_local_nfo_projection_with_semantic_fingerprint(complementary_bytes)
+    } else {
+        parse_local_nfo_projection(complementary_bytes).map(|projection| (projection, Vec::new()))
+    };
+    match complementary_parsed {
+        Ok((complementary_projection, complementary_semantic)) => {
+            merge_complementary_movie_nfo_projections(&mut projection, &complementary_projection);
+            if needs_semantic_fingerprint {
+                let mut hasher = Sha256::new();
+                hasher.update(&semantic_fingerprint);
+                hasher.update(b"\0movie.nfo\0");
+                hasher.update(&complementary_semantic);
+                semantic_fingerprint = hasher.finalize().to_vec();
+            }
+        }
+        Err(_) if needs_semantic_fingerprint => {
+            let mut hasher = Sha256::new();
+            hasher.update(&semantic_fingerprint);
+            hasher.update(b"\0movie.nfo-error\0");
+            hasher.update(nfo_content_fingerprint(complementary_bytes));
+            semantic_fingerprint = hasher.finalize().to_vec();
+        }
+        Err(_) => {}
+    }
+    Ok((projection, semantic_fingerprint))
 }
 
 #[cfg(test)]

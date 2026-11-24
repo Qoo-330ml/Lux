@@ -1920,3 +1920,821 @@ async fn emby_item_update_accepts_local_only_actor() -> Result<(), Box<dyn std::
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn local_actors_without_provider_id_merge_across_roles_and_rebuild_backfills_identities()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+
+    for (item_id, title) in [
+        ("local-role-movie-1", "本地一"),
+        ("local-role-movie-2", "本地二"),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status,
+                has_available_source
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .bind(title)
+        .bind(title)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let people = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+    people
+        .persist_nfo_item_actors(
+            "local-role-movie-1",
+            "tmdb",
+            &[ActorCredit {
+                id: String::new(),
+                provider: None,
+                identities: Vec::new(),
+                name: "本地张飞".to_owned(),
+                character: Some("角色A".to_owned()),
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+            &[1],
+        )
+        .await?;
+    people
+        .persist_nfo_item_actors(
+            "local-role-movie-2",
+            "tmdb",
+            &[ActorCredit {
+                id: String::new(),
+                provider: None,
+                identities: Vec::new(),
+                name: "本地张飞".to_owned(),
+                character: Some("角色B".to_owned()),
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+            &[2],
+        )
+        .await?;
+
+    let (results, total) = people
+        .search_actors(&[library.id.to_string()], "本地张飞", 0, 20)
+        .await?;
+    assert_eq!(
+        total, 1,
+        "local actor across different roles should merge into one search result"
+    );
+    assert_eq!(results.len(), 1);
+    assert!(results[0].id.starts_with("local-"));
+
+    // Legacy people.json with `id` + `provider` but empty `identities` should backfill `lux_person_id`
+    // from existing `person_identities` during rebuild.
+    for (item_id, title) in [
+        ("seed-id-movie", "种子电影"),
+        ("legacy-id-movie", "旧映射电影"),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status,
+                has_available_source
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .bind(title)
+        .bind(title)
+        .execute(database.pool())
+        .await?;
+    }
+    people
+        .persist_item_actors(
+            "seed-id-movie",
+            "tmdb",
+            &[ActorCredit {
+                id: "424242".to_owned(),
+                provider: Some("tmdb".to_owned()),
+                identities: Vec::new(),
+                name: "已知演员".to_owned(),
+                character: None,
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+    let expected_lux_id: String = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities WHERE provider = 'tmdb' AND provider_id = '424242'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let legacy_relation_path =
+        library_item_directory(&config.config_dir, "legacy-id-movie")?.join("people.json");
+    tokio::fs::create_dir_all(
+        legacy_relation_path
+            .parent()
+            .ok_or("missing legacy relation parent")?,
+    )
+    .await?;
+    tokio::fs::write(
+        &legacy_relation_path,
+        serde_json::to_vec(&json!({
+            "schemaVersion": 4,
+            "actors": [
+                {
+                    "id": "424242",
+                    "name": "已知演员",
+                    "provider": "tmdb",
+                    "order": 0
+                }
+            ]
+        }))?,
+    )
+    .await?;
+    people.rebuild_person_credit_index().await?;
+    let backfilled_lux_id: Option<String> = sqlx::query_scalar(
+        "SELECT lux_person_id FROM person_credits WHERE item_id = 'legacy-id-movie' AND person_name = '已知演员'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(backfilled_lux_id.as_deref(), Some(expected_lux_id.as_str()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn multi_identity_actor_collision_auto_merges_canonical_people_on_persist_and_rebuild()
+-> Result<(), Box<dyn std::error::Error>> {
+    use luxd::application::people::PersonIdentity;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+
+    for (item_id, title) in [
+        ("merge-tmdb-only", "纯TMDb电影"),
+        ("merge-imdb-only", "纯IMDb电影"),
+        ("merge-both-ids", "双ID电影"),
+        ("rebuild-tmdb-only", "重建TMDb电影"),
+        ("rebuild-imdb-only", "重建IMDb电影"),
+        ("rebuild-both-ids", "重建双ID电影"),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status,
+                has_available_source
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .bind(title)
+        .bind(title)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let people = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+    people
+        .persist_item_actors(
+            "merge-tmdb-only",
+            "tmdb",
+            &[ActorCredit {
+                id: "1519026".to_owned(),
+                provider: Some("tmdb".to_owned()),
+                identities: Vec::new(),
+                name: "沈腾".to_owned(),
+                character: Some("夏洛".to_owned()),
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+    people
+        .persist_item_actors(
+            "merge-imdb-only",
+            "imdb",
+            &[ActorCredit {
+                id: "nm7613067".to_owned(),
+                provider: Some("imdb".to_owned()),
+                identities: Vec::new(),
+                name: "沈腾".to_owned(),
+                character: Some("张扬".to_owned()),
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+
+    let (_, before_total) = people
+        .search_actors(&[library.id.to_string()], "沈腾", 0, 20)
+        .await?;
+    assert_eq!(before_total, 2);
+
+    let tmdb_lux_id: String = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities WHERE provider = 'tmdb' AND provider_id = '1519026'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let imdb_lux_id: String = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities WHERE provider = 'imdb' AND provider_id = 'nm7613067'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_ne!(tmdb_lux_id, imdb_lux_id);
+
+    // Persisting a cast member carrying both IDs must automatically merge the IMDb person into
+    // the TMDb-backed canonical person.
+    people
+        .persist_item_actors(
+            "merge-both-ids",
+            "tmdb",
+            &[ActorCredit {
+                id: "1519026".to_owned(),
+                provider: Some("tmdb".to_owned()),
+                identities: vec![
+                    PersonIdentity {
+                        provider: "tmdb".to_owned(),
+                        id: "1519026".to_owned(),
+                    },
+                    PersonIdentity {
+                        provider: "imdb".to_owned(),
+                        id: "nm7613067".to_owned(),
+                    },
+                ],
+                name: "沈腾".to_owned(),
+                character: Some("张驰".to_owned()),
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+
+    let (after_results, after_total) = people
+        .search_actors(&[library.id.to_string()], "沈腾", 0, 20)
+        .await?;
+    assert_eq!(after_total, 1);
+    assert_eq!(after_results.len(), 1);
+
+    let imdb_owner: String = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities WHERE provider = 'imdb' AND provider_id = 'nm7613067'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(imdb_owner, tmdb_lux_id);
+
+    let merged_status: String = sqlx::query_scalar("SELECT status FROM people WHERE id = ?")
+        .bind(&imdb_lux_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(merged_status, "MERGED");
+
+    let unmerged_credits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM person_credits
+         WHERE item_id IN ('merge-tmdb-only', 'merge-imdb-only', 'merge-both-ids')
+           AND lux_person_id <> ?",
+    )
+    .bind(&tmdb_lux_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(unmerged_credits, 0);
+
+    // Rebuild path: pre-existing people.json carrying conflicting mapped identities also converges.
+    people
+        .persist_item_actors(
+            "rebuild-tmdb-only",
+            "tmdb",
+            &[ActorCredit {
+                id: "777001".to_owned(),
+                provider: Some("tmdb".to_owned()),
+                identities: Vec::new(),
+                name: "马丽".to_owned(),
+                character: None,
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+    people
+        .persist_item_actors(
+            "rebuild-imdb-only",
+            "imdb",
+            &[ActorCredit {
+                id: "nm777001".to_owned(),
+                provider: Some("imdb".to_owned()),
+                identities: Vec::new(),
+                name: "马丽".to_owned(),
+                character: None,
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+    let rebuild_tmdb_lux: String = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities WHERE provider = 'tmdb' AND provider_id = '777001'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let rebuild_relation_path =
+        library_item_directory(&config.config_dir, "rebuild-both-ids")?.join("people.json");
+    tokio::fs::create_dir_all(
+        rebuild_relation_path
+            .parent()
+            .ok_or("missing rebuild relation parent")?,
+    )
+    .await?;
+    tokio::fs::write(
+        &rebuild_relation_path,
+        serde_json::to_vec(&json!({
+            "schemaVersion": 4,
+            "actors": [
+                {
+                    "id": "777001",
+                    "name": "马丽",
+                    "provider": "tmdb",
+                    "identities": [
+                        { "provider": "imdb", "id": "nm777001" },
+                        { "provider": "tmdb", "id": "777001" }
+                    ],
+                    "order": 0
+                }
+            ]
+        }))?,
+    )
+    .await?;
+    people.rebuild_person_credit_index().await?;
+    let (_, mali_total) = people
+        .search_actors(&[library.id.to_string()], "马丽", 0, 20)
+        .await?;
+    assert_eq!(mali_total, 1);
+    let mali_credit_lux: Option<String> = sqlx::query_scalar(
+        "SELECT lux_person_id FROM person_credits WHERE item_id = 'rebuild-both-ids' AND person_name = '马丽'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(mali_credit_lux.as_deref(), Some(rebuild_tmdb_lux.as_str()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_people_merge_endpoint_merges_identities_favorites_assets_and_survives_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let viewer = luxd::auth::users::UserStore::new(database.clone())?
+        .create_user("viewer", "Viewer", "viewer password", false)
+        .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+
+    for (item_id, title) in [("adm-merge-1", "手动合并一"), ("adm-merge-2", "手动合并二")]
+    {
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status,
+                has_available_source
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .bind(title)
+        .bind(title)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let people = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+    people
+        .persist_item_actors(
+            "adm-merge-1",
+            "tmdb",
+            &[ActorCredit {
+                id: "888001".to_owned(),
+                provider: Some("tmdb".to_owned()),
+                identities: Vec::new(),
+                name: "艾伦".to_owned(),
+                character: None,
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+    people
+        .persist_item_actors(
+            "adm-merge-2",
+            "imdb",
+            &[ActorCredit {
+                id: "nm888001".to_owned(),
+                provider: Some("imdb".to_owned()),
+                identities: Vec::new(),
+                name: "艾伦".to_owned(),
+                character: None,
+                order: Some(0),
+                profile_url: None,
+                person: Some(PersonMetadata {
+                    biography: Some("来自 IMDb 的补充简介".to_owned()),
+                    ..PersonMetadata::default()
+                }),
+            }],
+        )
+        .await?;
+    people
+        .update_person_image("nm888001", "艾伦", Some("imdb"), Some("image/png"), PNG_1X1)
+        .await?;
+
+    let target_id: String = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities WHERE provider = 'tmdb' AND provider_id = '888001'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let source_id: String = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities WHERE provider = 'imdb' AND provider_id = 'nm888001'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+
+    sqlx::query("INSERT INTO user_person_state (user_id, person_id, is_favorite) VALUES (?, ?, 1)")
+        .bind(viewer.id.to_string())
+        .bind(&source_id)
+        .execute(database.pool())
+        .await?;
+
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config.clone(),
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+    let base_url = format!("http://{address}");
+
+    let viewer_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({"username": "viewer", "password": "viewer password"}))
+        .send()
+        .await?;
+    let viewer_cookies = cookie_pair(viewer_login.headers());
+    let viewer_csrf = cookie_value(viewer_login.headers(), "lux_csrf");
+    let forbidden = client
+        .post(format!("{base_url}/api/v1/admin/people/merge"))
+        .header(COOKIE, &viewer_cookies)
+        .header("x-csrf-token", &viewer_csrf)
+        .json(&json!({"sourcePersonId": source_id, "targetPersonId": target_id}))
+        .send()
+        .await?;
+    assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let admin_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({"username": "admin", "password": "correct password"}))
+        .send()
+        .await?;
+    let admin_cookies = cookie_pair(admin_login.headers());
+    let admin_csrf = cookie_value(admin_login.headers(), "lux_csrf");
+
+    let missing_csrf = client
+        .post(format!("{base_url}/api/v1/admin/people/merge"))
+        .header(COOKIE, &admin_cookies)
+        .json(&json!({"sourcePersonId": source_id, "targetPersonId": target_id}))
+        .send()
+        .await?;
+    assert_eq!(missing_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let self_merge = client
+        .post(format!("{base_url}/api/v1/admin/people/merge"))
+        .header(COOKIE, &admin_cookies)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({"sourcePersonId": target_id, "targetPersonId": target_id}))
+        .send()
+        .await?;
+    assert_eq!(self_merge.status(), reqwest::StatusCode::CONFLICT);
+
+    let missing_person = client
+        .post(format!("{base_url}/api/v1/admin/people/merge"))
+        .header(COOKIE, &admin_cookies)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({"sourcePersonId": "lux-999999", "targetPersonId": target_id}))
+        .send()
+        .await?;
+    assert_eq!(missing_person.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let merged = client
+        .post(format!("{base_url}/api/v1/admin/people/merge"))
+        .header(COOKIE, &admin_cookies)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({
+            "sourcePersonId": source_id,
+            "targetPersonId": target_id,
+            "evidence": { "reason": "manual merge" }
+        }))
+        .send()
+        .await?;
+    assert_eq!(merged.status(), reqwest::StatusCode::OK);
+    let merged_body: Value = merged.json().await?;
+    assert_eq!(merged_body["status"], "MERGED");
+    assert_eq!(merged_body["sourcePersonId"], source_id);
+    assert_eq!(merged_body["targetPersonId"], target_id);
+
+    let duplicate_merge = client
+        .post(format!("{base_url}/api/v1/admin/people/merge"))
+        .header(COOKIE, &admin_cookies)
+        .header("x-csrf-token", &admin_csrf)
+        .json(&json!({"sourcePersonId": source_id, "targetPersonId": target_id}))
+        .send()
+        .await?;
+    assert_eq!(duplicate_merge.status(), reqwest::StatusCode::CONFLICT);
+
+    let search = client
+        .get(format!(
+            "{base_url}/api/v1/people?q=艾伦&page=1&pageSize=12"
+        ))
+        .header(COOKIE, &viewer_cookies)
+        .send()
+        .await?;
+    assert_eq!(search.status(), reqwest::StatusCode::OK);
+    let search_body: Value = search.json().await?;
+    assert_eq!(search_body["total"], 1);
+    assert!(search_body["items"][0]["imageUrl"].is_string());
+
+    let detail = client
+        .get(format!("{base_url}/api/v1/people/{target_id}"))
+        .header(COOKIE, &viewer_cookies)
+        .send()
+        .await?;
+    assert_eq!(detail.status(), reqwest::StatusCode::OK);
+    let detail_body: Value = detail.json().await?;
+    assert_eq!(detail_body["isFavorite"], true);
+
+    let items = client
+        .get(format!(
+            "{base_url}/api/v1/people/{target_id}/items?page=1&pageSize=20"
+        ))
+        .header(COOKIE, &viewer_cookies)
+        .send()
+        .await?;
+    assert_eq!(items.status(), reqwest::StatusCode::OK);
+    let items_body: Value = items.json().await?;
+    assert_eq!(items_body["total"], 2);
+
+    // Simulating manifest restore after restart must keep the merged source MERGED.
+    sqlx::query("UPDATE person_manifest_restore_state SET status = 'PENDING'")
+        .execute(database.pool())
+        .await?;
+    people.rebuild_person_credit_index().await?;
+    let source_status: String = sqlx::query_scalar("SELECT status FROM people WHERE id = ?")
+        .bind(&source_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(source_status, "MERGED");
+
+    let audit = client
+        .get(format!("{base_url}/api/v1/admin/audit"))
+        .header(COOKIE, &admin_cookies)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert!(audit["events"].as_array().is_some_and(|events| {
+        events
+            .iter()
+            .any(|event| event["eventType"] == "PEOPLE_MERGED")
+    }));
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn rebuilding_people_migrates_legacy_local_actor_favorites_and_assets_after_id_algorithm_change()
+-> Result<(), Box<dyn std::error::Error>> {
+    use sha2::{Digest, Sha256};
+
+    fn legacy_local_id(name: &str, character: Option<&str>) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(name.trim().as_bytes());
+        hasher.update([0]);
+        hasher.update(character.unwrap_or_default().trim().as_bytes());
+        let digest = hasher.finalize();
+        let hex = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("local-{hex}")
+    }
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let viewer = luxd::auth::users::UserStore::new(database.clone())?
+        .create_user("viewer", "Viewer", "viewer password", false)
+        .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query("INSERT INTO user_library_access (user_id, library_id, can_view) VALUES (?, ?, 1)")
+        .bind(viewer.id.to_string())
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+    for (item_id, title) in [
+        ("legacy-local-a", "旧本地角色甲"),
+        ("legacy-local-b", "旧本地角色乙"),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status,
+                has_available_source
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .bind(title)
+        .bind(title)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let people = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+    people
+        .persist_item_actors(
+            "legacy-local-a",
+            "tmdb",
+            &[ActorCredit {
+                id: String::new(),
+                provider: None,
+                identities: Vec::new(),
+                name: "群演甲".to_owned(),
+                character: Some("路人A".to_owned()),
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+    people
+        .persist_item_actors(
+            "legacy-local-b",
+            "tmdb",
+            &[ActorCredit {
+                id: String::new(),
+                provider: None,
+                identities: Vec::new(),
+                name: "群演甲".to_owned(),
+                character: Some("路人B".to_owned()),
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+
+    // Simulate a pre-LUX-918 library state where movie A's local actor had `sha256(name|role)`,
+    // a user favorite, and an uploaded avatar under that old ID, and an older rebuild schema ran.
+    let old_local_a = legacy_local_id("群演甲", Some("路人A"));
+    let old_local_b = legacy_local_id("群演甲", Some("路人B"));
+    sqlx::query("UPDATE person_credits SET person_id = ? WHERE item_id = 'legacy-local-a'")
+        .bind(&old_local_a)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE person_credits SET person_id = ? WHERE item_id = 'legacy-local-b'")
+        .bind(&old_local_b)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DELETE FROM person_index_item_state")
+        .execute(database.pool())
+        .await?;
+
+    people
+        .update_person_image(&old_local_a, "群演甲", None, Some("image/png"), PNG_1X1)
+        .await?;
+    sqlx::query("INSERT INTO user_person_state (user_id, person_id, is_favorite) VALUES (?, ?, 1)")
+        .bind(viewer.id.to_string())
+        .bind(&old_local_a)
+        .execute(database.pool())
+        .await?;
+
+    // Upgrading and running rebuild should converge credits AND migrate the old favorite & avatar.
+    people.rebuild_person_credit_index().await?;
+
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config.clone(),
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+    let base_url = format!("http://{address}");
+
+    let viewer_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({"username": "viewer", "password": "viewer password"}))
+        .send()
+        .await?;
+    let viewer_cookies = cookie_pair(viewer_login.headers());
+
+    let search = client
+        .get(format!(
+            "{base_url}/api/v1/people?q=群演甲&page=1&pageSize=12"
+        ))
+        .header(COOKIE, &viewer_cookies)
+        .send()
+        .await?;
+    assert_eq!(search.status(), reqwest::StatusCode::OK);
+    let search_body: Value = search.json().await?;
+    assert_eq!(search_body["total"], 1);
+    let converged_id = search_body["items"][0]["id"]
+        .as_str()
+        .expect("converged local id")
+        .to_owned();
+    assert_ne!(converged_id, old_local_a);
+    assert_ne!(converged_id, old_local_b);
+
+    let detail = client
+        .get(format!("{base_url}/api/v1/people/{converged_id}"))
+        .header(COOKIE, &viewer_cookies)
+        .send()
+        .await?;
+    assert_eq!(detail.status(), reqwest::StatusCode::OK);
+    let detail_body: Value = detail.json().await?;
+    assert_eq!(detail_body["isFavorite"], true);
+    let image_url = detail_body["imageUrl"]
+        .as_str()
+        .expect("migrated imageUrl")
+        .to_owned();
+
+    let image = client
+        .get(format!("{base_url}{image_url}"))
+        .header(COOKIE, &viewer_cookies)
+        .send()
+        .await?;
+    assert_eq!(image.status(), reqwest::StatusCode::OK);
+    assert_eq!(image.bytes().await?.as_ref(), PNG_1X1);
+
+    let items = client
+        .get(format!(
+            "{base_url}/api/v1/people/{converged_id}/items?page=1&pageSize=20"
+        ))
+        .header(COOKIE, &viewer_cookies)
+        .send()
+        .await?;
+    assert_eq!(items.status(), reqwest::StatusCode::OK);
+    assert_eq!(items.json::<Value>().await?["total"], 2);
+
+    server.abort();
+    Ok(())
+}

@@ -38,6 +38,7 @@ pub(super) fn api_routes() -> Router<ReadyAppState> {
             "/api/v1/admin/people/{person_id}/locks",
             post(admin_set_person_field_locks),
         )
+        .route("/api/v1/admin/people/merge", post(admin_merge_people))
 }
 
 #[derive(Deserialize)]
@@ -555,6 +556,76 @@ pub(crate) async fn admin_set_person_field_locks(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PersonMergeRequest {
+    source_person_id: String,
+    target_person_id: String,
+    #[serde(default = "default_person_merge_evidence")]
+    evidence: serde_json::Value,
+}
+
+fn default_person_merge_evidence() -> serde_json::Value {
+    json!({})
+}
+
+pub(crate) async fn admin_merge_people(
+    headers: HeaderMap,
+    State(state): State<ReadyAppState>,
+    Json(request): Json<PersonMergeRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let people = state.people();
+    let evidence_json = match serde_json::to_string(&request.evidence) {
+        Ok(value) if value.len() <= 16 * 1024 => value,
+        Ok(_) | Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "合并证据无效或过大",
+            )
+            .into_response();
+        }
+    };
+    match people
+        .merge_canonical_people(
+            &request.source_person_id,
+            &request.target_person_id,
+            &evidence_json,
+        )
+        .await
+    {
+        Ok(result) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "PEOPLE_MERGED",
+                Some("person"),
+                Some(&result.target_person_id),
+                &json!({
+                    "sourcePersonId": result.source_person_id,
+                    "targetPersonId": result.target_person_id,
+                    "movedIdentities": result.moved_identities,
+                    "evidence": request.evidence,
+                })
+                .to_string(),
+            )
+            .await;
+            Json(json!({
+                "sourcePersonId": result.source_person_id,
+                "targetPersonId": result.target_person_id,
+                "movedIdentities": result.moved_identities,
+                "status": "MERGED",
+            }))
+            .into_response()
+        }
+        Err(error) => people_match_error(&headers, error),
+    }
+}
+
 pub(crate) fn people_match_error(headers: &HeaderMap, error: PeopleError) -> Response {
     match error {
         PeopleError::InvalidComponent(_) | PeopleError::Serialization(_) => api_error(
@@ -562,6 +633,20 @@ pub(crate) fn people_match_error(headers: &HeaderMap, error: PeopleError) -> Res
             StatusCode::BAD_REQUEST,
             lux::ApiErrorCode::InvalidRequest,
             "人物匹配请求无效",
+        )
+        .into_response(),
+        PeopleError::NotFound(_) => api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "人物不存在",
+        )
+        .into_response(),
+        PeopleError::Conflict(_) => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "人物状态冲突或无法合并",
         )
         .into_response(),
         PeopleError::Storage(message) if message.contains("candidate") => api_error(
