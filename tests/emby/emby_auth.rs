@@ -5,7 +5,7 @@ use luxd::{
     application::setup::SetupService,
     auth::{
         admin_api_key::AdminApiKeyService,
-        emby::{EmbyAuthService, EmbyDeviceInfo},
+        emby::{EmbyAuthError, EmbyAuthService, EmbyDeviceInfo},
         sessions::WebAuthService,
         users::{UserStore, UserUpdate},
     },
@@ -2045,8 +2045,11 @@ async fn emby_login_and_existing_tokens_enforce_ip_blacklists_through_trusted_pr
                 user_id: None,
             },
         )
-        .await?;
-    assert!(no_peer_auth.is_none());
+        .await;
+    assert!(
+        matches!(no_peer_auth, Err(EmbyAuthError::AccessDenied)),
+        "a blacklisted login must be reported as an access-rule refusal, not a bad credential"
+    );
 
     let trusted_xff = login("198.51.100.8").send().await?;
     assert_eq!(trusted_xff.status(), reqwest::StatusCode::UNAUTHORIZED);
@@ -2575,5 +2578,227 @@ async fn unknown_emby_user_ids_emit_the_failed_login_event()
     let logs = captured_login_logs(&server.buffer)?;
     assert!(!logs.contains("missing password"));
     assert!(!logs.contains("event-device"));
+    Ok(())
+}
+
+async fn authenticate_by_name_status(
+    client: &reqwest::Client,
+    address: std::net::SocketAddr,
+    username: &str,
+    password: &str,
+) -> Result<reqwest::StatusCode, Box<dyn std::error::Error>> {
+    let response = client
+        .post(format!("http://{address}/Users/AuthenticateByName"))
+        .json(&json!({ "Username": username, "Pw": password }))
+        .send()
+        .await?;
+    Ok(response.status())
+}
+
+async fn authenticate_by_id_status(
+    client: &reqwest::Client,
+    address: std::net::SocketAddr,
+    user_id: &str,
+    password: &str,
+) -> Result<reqwest::StatusCode, Box<dyn std::error::Error>> {
+    let response = client
+        .post(format!("http://{address}/Users/{user_id}/Authenticate"))
+        .json(&json!({ "Pw": password }))
+        .send()
+        .await?;
+    Ok(response.status())
+}
+
+/// Emby authentication must share one failure budget for every route to one account.
+///
+/// An account is reachable by its username (in any Unicode casing), by a unique exact
+/// display-name match (`/Users/Public` advertises both) and by `/Users/{id}/Authenticate`. Keying
+/// the limiter on the submitted string gave each of them a fresh `MAX_FAILURES` window.
+#[tokio::test]
+async fn emby_login_rate_limit_shares_one_budget_across_username_display_name_and_id()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
+    let users = UserStore::new(database.clone())?;
+    let target = users
+        .create_user("Ädmin", "显示名别名", "correct password", false)
+        .await?;
+    users
+        .create_user("Control", "Control", "control password", false)
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let _server = AbortOnDrop(tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    }));
+    let client = reqwest::Client::builder().no_proxy().build()?;
+
+    let target_id = target.id.to_string();
+
+    // Every advertised identity works before the window is consumed.
+    for name in ["Ädmin", "显示名别名"] {
+        assert_eq!(
+            authenticate_by_name_status(&client, address, name, "correct password").await?,
+            reqwest::StatusCode::OK,
+            "{name}"
+        );
+    }
+    assert_eq!(
+        authenticate_by_id_status(&client, address, &target_id, "correct password").await?,
+        reqwest::StatusCode::OK
+    );
+
+    // Five wrong passwords spread over both names, three spellings and the id route.
+    for spelling in ["Ädmin", "ädmin", "显示名别名", " ÄDMIN "] {
+        assert_eq!(
+            authenticate_by_name_status(&client, address, spelling, "wrong password").await?,
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{spelling}"
+        );
+    }
+    assert_eq!(
+        authenticate_by_id_status(&client, address, &target_id, "wrong password").await?,
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
+    // The budget is exhausted for the account, so the correct password is refused no matter
+    // which route or spelling is used to reach it.
+    for name in ["Ädmin", "显示名别名"] {
+        assert_eq!(
+            authenticate_by_name_status(&client, address, name, "correct password").await?,
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{name}"
+        );
+    }
+    assert_eq!(
+        authenticate_by_id_status(&client, address, &target_id, "correct password").await?,
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        authenticate_by_name_status(&client, address, "Control", "control password").await?,
+        reqwest::StatusCode::OK,
+        "an unrelated account from the same peer keeps its own budget"
+    );
+
+    Ok(())
+}
+
+/// A blacklist refusal is not a failed password: the device/client/IP rule runs after the
+/// password matched, so it must not consume the account's failure budget or raise the
+/// `AUTH_LOGIN_FAILED` event that brute-force tooling reacts to.
+#[tokio::test]
+async fn emby_blacklist_refusal_does_not_consume_the_password_failure_budget()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
+    let target = UserStore::new(database.clone())?
+        .create_user(
+            "blacklist-quota",
+            "Blacklist Quota",
+            "target password",
+            false,
+        )
+        .await?;
+    sqlx::query(
+        "INSERT INTO user_access_blacklist_rules (
+             id, user_id, rule_type, match_value, is_enabled, created_by, created_at, updated_at
+         ) VALUES ('blacklist-quota-device', ?, 'DEVICE', 'blocked-device', 1, ?, unixepoch(), unixepoch())",
+    )
+    .bind(target.id.to_string())
+    .bind(admin.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let _server = AbortOnDrop(tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    }));
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let login = |device_id: &'static str, password: &'static str| {
+        client
+            .post(format!("http://{address}/Users/AuthenticateByName"))
+            .header(
+                AUTHORIZATION,
+                format!(
+                    r#"Emby Client="Infuse", Device="Test Device", DeviceId="{device_id}", Version="1.0""#
+                ),
+            )
+            .json(&json!({ "Username": "blacklist-quota", "Pw": password }))
+    };
+
+    for attempt in 0..6 {
+        let denied = login("blocked-device", "target password").send().await?;
+        assert_eq!(
+            denied.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "attempt {attempt}"
+        );
+    }
+    let failed_password_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_activity_events
+         WHERE user_id = ? AND event_type = 'AUTH_LOGIN_FAILED'",
+    )
+    .bind(target.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        failed_password_events, 0,
+        "a blacklisted client must not be recorded as a failed password"
+    );
+
+    // Six refusals would have exhausted `MAX_FAILURES`; the seventh attempt overall still signs
+    // in from a device that the rule does not block.
+    let allowed = login("clean-device", "target password").send().await?;
+    assert_eq!(allowed.status(), reqwest::StatusCode::OK);
+
+    // The limiter keeps counting real credential failures for the same account.
+    for _ in 0..5 {
+        let wrong = login("clean-device", "wrong password").send().await?;
+        assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+    let blocked_by_failures = login("clean-device", "target password").send().await?;
+    assert_eq!(
+        blocked_by_failures.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
     Ok(())
 }

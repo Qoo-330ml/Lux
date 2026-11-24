@@ -60,8 +60,7 @@ Lux 的 Web 播放优先直放，浏览器无法直接播放时才按需启用�
 增加连接不会突破单写者限制，NAS 上应结合前台 p95、写锁和内存观察后再调整。
 
 本地文件索引默认使用 4 路 worker，在线元数据刮削默认使用 4 路 worker；`FILL_MISSING` 的进程级上限也是 4。
-Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=4`、`LUX_PROBE_CONCURRENCY=8` 和
-`LUX_FFMPEG_CONCURRENCY=2`。
+Docker 镜像与 Compose 默认注入 `LUX_SCAN_CONCURRENCY=4` 与 `LUX_FFMPEG_CONCURRENCY=2`；`LUX_PROBE_CONCURRENCY` 在 Compose 中默认留空以启用自动预算，传入显式整数时则作为手动覆盖。
 `LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime
 使用的 OS 线程总数；媒体技术信息探测和缩略图生成是独立阶段，分别由
 `LUX_PROBE_CONCURRENCY` 和 `LUX_FFMPEG_CONCURRENCY` 限制。可分别调节这些局部上限，也可用进程级后台预算限制它们与扫描准备等工作的叠加。
