@@ -1162,6 +1162,118 @@ async fn atomic_image_write_leaves_no_temp_file() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+/// A minimal HTTP proxy: answers every absolute-form request with the PNG and reports what it saw.
+async fn start_image_proxy()
+-> Result<(std::net::SocketAddr, Arc<std::sync::Mutex<Vec<String>>>), Box<dyn std::error::Error>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&requests);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let seen = Arc::clone(&seen);
+            tokio::spawn(async move {
+                let mut buffer = vec![0_u8; 4096];
+                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                if let Ok(mut requests) = seen.lock() {
+                    requests.push(request);
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    PNG_1X1.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(PNG_1X1).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    Ok((address, requests))
+}
+
+/// A proxied download keeps using the configured proxy: the host cannot resolve or pin the target
+/// itself, so the proxy client must stay in charge of the request (review #4).
+#[tokio::test]
+async fn proxied_image_downloads_keep_using_the_configured_proxy()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, item_id, root, movie_dir) = prepared_movie().await?;
+    let (proxy, requests) = start_image_proxy().await?;
+    let service = ImageWriteService::with_config_proxy_and_config_dir(
+        database.clone(),
+        ImageDownloadConfig {
+            max_bytes: 1024 * 1024,
+            ..ImageDownloadConfig::default()
+        },
+        Some(format!("http://{proxy}")),
+        root.join("config"),
+    )?;
+
+    let report = service
+        .download_item_image(&item_id, "poster", "http://images.example/poster.png")
+        .await?;
+
+    assert_eq!(report.content_type, "image/png");
+    assert_eq!(tokio::fs::read(&report.path).await?, PNG_1X1);
+    assert_eq!(
+        report.path,
+        tokio::fs::canonicalize(&movie_dir)
+            .await?
+            .join("poster.png")
+    );
+    let requests = requests.lock().expect("proxy request log");
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].starts_with("GET http://images.example/poster.png HTTP/1.1"),
+        "the proxy must receive the absolute image URL: {}",
+        requests[0]
+    );
+    Ok(())
+}
+
+/// A private target never reaches the proxy: the host checks literals and reserved names before the
+/// proxy can resolve them (review #4).
+#[tokio::test]
+async fn proxied_image_downloads_reject_private_targets_before_the_proxy()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, item_id, root, _movie_dir) = prepared_movie().await?;
+    let (proxy, requests) = start_image_proxy().await?;
+    let service = ImageWriteService::with_config_proxy_and_config_dir(
+        database.clone(),
+        ImageDownloadConfig {
+            max_bytes: 1024 * 1024,
+            ..ImageDownloadConfig::default()
+        },
+        Some(format!("http://{proxy}")),
+        root.join("config"),
+    )?;
+
+    for target in [
+        format!("http://{proxy}/poster.png"),
+        "http://10.0.0.5/poster.png".to_owned(),
+        "http://localhost./poster.png".to_owned(),
+    ] {
+        let error = service
+            .download_item_image(&item_id, "poster", &target)
+            .await
+            .expect_err("a private image target must be rejected");
+        assert!(
+            matches!(error, ImageWriteError::InvalidUrl(_)),
+            "{target} must be rejected: {error:?}"
+        );
+    }
+    assert!(
+        requests.lock().expect("proxy request log").is_empty(),
+        "no rejected target may be handed to the proxy"
+    );
+    Ok(())
+}
+
 async fn prepared_movie() -> Result<(Database, String, PathBuf, PathBuf), Box<dyn std::error::Error>>
 {
     let temp_dir = tempfile::tempdir()?;
