@@ -2577,3 +2577,114 @@ async fn unknown_emby_user_ids_emit_the_failed_login_event()
     assert!(!logs.contains("event-device"));
     Ok(())
 }
+
+async fn authenticate_by_name_status(
+    client: &reqwest::Client,
+    address: std::net::SocketAddr,
+    username: &str,
+    password: &str,
+) -> Result<reqwest::StatusCode, Box<dyn std::error::Error>> {
+    let response = client
+        .post(format!("http://{address}/Users/AuthenticateByName"))
+        .json(&json!({ "Username": username, "Pw": password }))
+        .send()
+        .await?;
+    Ok(response.status())
+}
+
+async fn authenticate_by_id_status(
+    client: &reqwest::Client,
+    address: std::net::SocketAddr,
+    user_id: &str,
+    password: &str,
+) -> Result<reqwest::StatusCode, Box<dyn std::error::Error>> {
+    let response = client
+        .post(format!("http://{address}/Users/{user_id}/Authenticate"))
+        .json(&json!({ "Pw": password }))
+        .send()
+        .await?;
+    Ok(response.status())
+}
+
+/// Emby authentication must share the same failure budget for every spelling of one account.
+///
+/// The lookup lowercases with Unicode rules while the limiter key used to lowercase ASCII only,
+/// so `Ädmin` and `ädmin` were two buckets for one password check - five more guesses each.
+#[tokio::test]
+async fn emby_login_rate_limit_covers_every_spelling_of_one_non_ascii_username()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
+    let users = UserStore::new(database.clone())?;
+    let target = users
+        .create_user("Ädmin", "Ädmin", "correct password", false)
+        .await?;
+    users
+        .create_user("Control", "Control", "control password", false)
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let _server = AbortOnDrop(tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    }));
+    let client = reqwest::Client::builder().no_proxy().build()?;
+
+    // The canonical spelling is accepted before the window is consumed.
+    assert_eq!(
+        authenticate_by_name_status(&client, address, "Ädmin", "correct password").await?,
+        reqwest::StatusCode::OK
+    );
+
+    for spelling in ["Ädmin", "ädmin", " ÄDMIN ", "ädmin", "ÄDmin"] {
+        assert_eq!(
+            authenticate_by_name_status(&client, address, spelling, "wrong password").await?,
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{spelling}"
+        );
+    }
+    assert_eq!(
+        authenticate_by_name_status(&client, address, "ädmin", "correct password").await?,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "the sixth attempt for one identity must be refused whatever its spelling"
+    );
+    assert_eq!(
+        authenticate_by_name_status(&client, address, "Control", "control password").await?,
+        reqwest::StatusCode::OK,
+        "an unrelated account from the same peer keeps its own budget"
+    );
+
+    // `/Users/{id}/Authenticate` authenticates the same account through its id, and gets its own
+    // window; the sixth attempt is refused there too.
+    let target_id = target.id.to_string();
+    for _ in 0..5 {
+        assert_eq!(
+            authenticate_by_id_status(&client, address, &target_id, "wrong password").await?,
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        authenticate_by_id_status(&client, address, &target_id, "correct password").await?,
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
+    Ok(())
+}

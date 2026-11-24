@@ -1988,11 +1988,17 @@ fn trusted_proxy_networks(
     }
     Ok(networks)
 }
+/// Rate-limit bucket for one peer and one login identity.
+///
+/// The identity half comes from [`crate::auth::users::normalize_login_identity`], the same
+/// function that produces the stored/looked-up username, so two spellings that authenticate the
+/// same account always share one failure budget. ASCII-only lowercasing here used to split
+/// `Ädmin` and `ädmin` into separate buckets while both authenticated the same user.
 fn login_attempt_key(headers: &HeaderMap, username: &str) -> String {
     format!(
         "{}:{}",
         header_str(headers, "x-lux-peer-ip").unwrap_or("local"),
-        username.trim().to_ascii_lowercase()
+        crate::auth::users::normalize_login_identity(username)
     )
 }
 
@@ -2540,7 +2546,7 @@ mod tests {
         emby_source_needs_strm_resolver, filmly_image_compat_mode_from_env_value,
         is_catalog_aggregation_path, is_emby_legacy_strm_path, is_emby_media_stream_segment,
         is_emby_playback_callback_path, is_emby_subtitle_path, is_emby_transcoding_path,
-        is_emby_video_path, is_filmly_user_agent, is_registered_emby_video_path,
+        is_emby_video_path, is_filmly_user_agent, is_registered_emby_video_path, login_attempt_key,
         lux_catalog_source_json, metadata_candidate_error, metadata_candidate_failure_kind,
         normalize_strm_http_location, playback_client_label, playback_identifier_prefix,
         record_activity_event, request_access_ip, safe_trace_path, secure_cookie_for_request,
@@ -3463,6 +3469,25 @@ mod tests {
         assert_eq!(
             trusted_proxy_networks(&["not-a-cidr".to_owned()], Some(gateway)),
             Err(AccessIpResolutionError::TrustedProxySettingsUnavailable)
+        );
+    }
+
+    /// The limiter bucket must fold exactly like the stored username, or one account gets one
+    /// failure window per spelling and the brute-force budget multiplies.
+    #[test]
+    fn login_attempt_key_normalizes_non_ascii_identities() {
+        let headers = HeaderMap::new();
+        let canonical = login_attempt_key(&headers, "Ädmin");
+        assert_eq!(canonical, "local:ädmin");
+        assert_eq!(canonical, login_attempt_key(&headers, "ädmin"));
+        assert_eq!(canonical, login_attempt_key(&headers, " ÄDMIN "));
+
+        let mut forwarded = HeaderMap::new();
+        forwarded.insert("x-lux-peer-ip", HeaderValue::from_static("203.0.113.9"));
+        assert_ne!(login_attempt_key(&forwarded, "Ädmin"), canonical);
+        assert_eq!(
+            login_attempt_key(&forwarded, "Ädmin"),
+            login_attempt_key(&forwarded, "ädmin")
         );
     }
 
