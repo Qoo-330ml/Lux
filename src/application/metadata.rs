@@ -6622,6 +6622,10 @@ mod tests {
             "Season 1 DV",
             "Season1 SDR",
             "S01 HDR",
+            "Season 1 - CMCTV",
+            "Season 2 - HHWEB",
+            "S01 - HDR",
+            "Season 1-CMCTV",
         ] {
             assert_eq!(
                 series_directory(
@@ -6632,7 +6636,15 @@ mod tests {
                 "season directory '{season}' must resolve to the series directory"
             );
         }
-        for directory in ["Season 1DV", "Season 1 Part Two", "Season DV", "Extras"] {
+        for directory in [
+            "Season 1DV",
+            "Season 1 Part Two",
+            "Season 1 - Part Two",
+            "Season 1-2",
+            "Season 1 - 2",
+            "Season DV",
+            "Extras",
+        ] {
             assert_eq!(
                 series_directory(root, &format!("剧 (2025)/{directory}/ep.mkv")),
                 None,

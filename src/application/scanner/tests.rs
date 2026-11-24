@@ -3516,10 +3516,105 @@ fn season_directory_accepts_a_single_trailing_label_word() {
         parse_season_directory("S01 HDR"),
         Some((1, Some("HDR".to_owned())))
     );
+    assert_eq!(
+        parse_season_directory("Season 1 - CMCTV"),
+        Some((1, Some("CMCTV".to_owned())))
+    );
+    assert_eq!(
+        parse_season_directory("Season 2 - HHWEB"),
+        Some((2, Some("HHWEB".to_owned())))
+    );
+    assert_eq!(
+        parse_season_directory("S01 - HDR"),
+        Some((1, Some("HDR".to_owned())))
+    );
+    assert_eq!(
+        parse_season_directory("Season 1-CMCTV"),
+        Some((1, Some("CMCTV".to_owned())))
+    );
+    assert_eq!(parse_season_directory("Season 1 - Part Two"), None);
+    assert_eq!(parse_season_directory("Season 1-2"), None);
+    assert_eq!(parse_season_directory("Season 1 - 2"), None);
+    assert_eq!(parse_season_directory("Season 1 -"), None);
+    assert_eq!(parse_season_directory("Season 1 - -"), None);
     assert_eq!(parse_season_directory("Season 1 Part Two"), None);
     assert_eq!(parse_season_directory("Season 1DV"), None);
     assert_eq!(parse_season_directory("Season DV"), None);
     assert_eq!(parse_season_directory("Extras"), None);
+}
+
+#[tokio::test]
+async fn season_directories_with_hyphen_label_merge_into_multi_version_episodes()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::{
+        application::libraries::LibraryService, config::Config, library::LibraryKind,
+        storage::Database,
+    };
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Shows");
+    let series_dir = media_root
+        .join("2019")
+        .join("优雅的母女 (2019) {tmdb-94952}");
+    for group in ["CMCTV", "HHWEB"] {
+        let season_dir = series_dir.join(format!("Season 1 - {group}"));
+        tokio::fs::create_dir_all(&season_dir).await?;
+        tokio::fs::write(
+            season_dir.join("优雅的母女-S01E01-1080p-H.265.25fps-AAC 2.0.strm"),
+            "http://example.invalid/stream\n",
+        )
+        .await?;
+    }
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-UTF8 media root")?,
+        )
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_series_library(library.id)
+        .await?;
+
+    let count = |item_type: &'static str| {
+        let database = database.clone();
+        let library_id = library.id.to_string();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM media_items WHERE library_id = ? AND item_type = ?",
+            )
+            .bind(library_id)
+            .bind(item_type)
+            .fetch_one(database.pool())
+            .await
+        }
+    };
+    assert_eq!(count("SERIES").await?, 1);
+    assert_eq!(count("SEASON").await?, 1);
+    assert_eq!(count("EPISODE").await?, 1);
+    let labels: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT s.edition_name FROM media_sources s
+         JOIN media_items i ON i.id = s.item_id
+         WHERE i.library_id = ? AND i.item_type = 'EPISODE'
+         ORDER BY s.edition_name",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        labels,
+        vec![Some("CMCTV".to_owned()), Some("HHWEB".to_owned())]
+    );
+    Ok(())
 }
 
 #[tokio::test]

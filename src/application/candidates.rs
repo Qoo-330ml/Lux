@@ -7481,4 +7481,80 @@ mod tests {
         assert!(!supplement_only.allows("BOTH"));
         assert!(supplement_only.allows("SUPPLEMENT"));
     }
+
+    #[tokio::test]
+    async fn local_metadata_completeness_plans_succeed_for_hyphen_season_and_flat_series_strm()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{libraries::LibraryService, scanner::LibraryScanner},
+            config::Config,
+            library::LibraryKind,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let root = directory.path().join("Shows");
+        let hyphen_season = root
+            .join("2019")
+            .join("优雅的母女 (2019) {tmdb-94952}")
+            .join("Season 1 - CMCTV");
+        let flat_series = root.join("Flat Show (2025)");
+        tokio::fs::create_dir_all(&hyphen_season).await?;
+        tokio::fs::create_dir_all(&flat_series).await?;
+        tokio::fs::write(
+            hyphen_season.join("优雅的母女-S01E01-1080p-H.265.25fps-AAC 2.0-CMCTV.strm"),
+            "http://example.invalid/1\n",
+        )
+        .await?;
+        tokio::fs::write(
+            flat_series.join("Flat.Show.S01E01.strm"),
+            "http://example.invalid/2\n",
+        )
+        .await?;
+        tokio::fs::write(root.join("Stray.S01E01.strm"), "http://example.invalid/3\n").await?;
+
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Shows", LibraryKind::Series, false)
+            .await?;
+        LibraryService::new(database.clone())
+            .add_root(library.id, root.to_str().ok_or("non-UTF8 media root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_series_library(library.id)
+            .await?;
+
+        let item_ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM media_items WHERE library_id = ? ORDER BY id",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await?;
+        assert!(!item_ids.is_empty());
+        let metadata_by_item = database
+            .list_active_media_item_metadata_with_libraries(&item_ids)
+            .await?;
+        let plan_inputs = item_ids
+            .iter()
+            .filter_map(|item_id| {
+                metadata_by_item
+                    .get(item_id)
+                    .map(|(_, current)| (item_id.as_str(), current))
+            })
+            .collect::<Vec<_>>();
+        let service = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new_with_config_dir(database.clone(), config.config_dir.clone())?,
+            config.config_dir,
+        );
+
+        let plans = service
+            .local_metadata_completeness_plans(&plan_inputs)
+            .await?;
+        assert_eq!(plans.len(), item_ids.len());
+        Ok(())
+    }
 }

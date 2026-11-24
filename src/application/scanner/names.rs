@@ -433,10 +433,11 @@ pub(super) fn parse_season_directory_name(value: &str) -> Option<u32> {
 
 /// Parses a season directory name into its season number and optional version label.
 ///
-/// Accepts `Season N`, `SN`, `Specials`, the legacy `Season N (digits)` form and
-/// `Season N <label>` where `<label>` is exactly one whitespace-free word (for
-/// example `DV`, `HDR` or `国语`). Directories sharing a season number belong to
-/// the same season; the label only names the media version.
+/// Accepts `Season N`, `SN`, `Specials`, the legacy `Season N (digits)` form, and
+/// `Season N <label>` or `Season N - <label>` (also `Season N-<label>`) where
+/// `<label>` is one whitespace-free, non-numeric word (for example `DV`, `HDR`,
+/// `CMCTV`, or `国语`). Directories sharing a season number belong to the same
+/// season; the label only names the media version.
 pub(crate) fn parse_season_directory(value: &str) -> Option<(u32, Option<String>)> {
     let trimmed = value.trim();
     if trimmed.eq_ignore_ascii_case("specials") {
@@ -462,8 +463,8 @@ pub(crate) fn parse_season_directory(value: &str) -> Option<(u32, Option<String>
     // A duplicated folder is named `Season 1 (1)` by most tools but `Season 1(1)` by some, so the
     // copy marker is recognised with or without the separating space. A version label such as
     // `Season 1DV` still stays rejected: only a parenthesised number is a copy marker.
-    let label = remainder.trim();
-    if let Some(inner) = label
+    let trimmed_remainder = remainder.trim();
+    if let Some(inner) = trimmed_remainder
         .strip_prefix('(')
         .and_then(|value| value.strip_suffix(')'))
         && !inner.is_empty()
@@ -471,10 +472,23 @@ pub(crate) fn parse_season_directory(value: &str) -> Option<(u32, Option<String>
     {
         return Some((season, None));
     }
-    if !remainder.starts_with(char::is_whitespace) {
+    if !remainder.starts_with(char::is_whitespace) && !remainder.starts_with('-') {
         return None;
     }
-    if label.is_empty() || label.contains(char::is_whitespace) {
+    let label = if let Some(after_dash) = trimmed_remainder.strip_prefix('-') {
+        let label = after_dash.trim();
+        // Reject season ranges like `Season 1-2` / `Season 1 - 2` and bare punctuation like `-`.
+        if label.chars().all(|character| character.is_ascii_digit()) {
+            return None;
+        }
+        label
+    } else {
+        trimmed_remainder
+    };
+    if label.is_empty()
+        || label.contains(char::is_whitespace)
+        || !label.chars().any(char::is_alphanumeric)
+    {
         return None;
     }
     Some((season, Some(label.to_owned())))
