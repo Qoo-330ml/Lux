@@ -8,6 +8,29 @@ struct PersonManifestRestoreCandidate {
     manifest: PersonManifest,
 }
 
+async fn manifest_matches_person_id(path: &Path, person_id: &str) -> Result<bool, PeopleError> {
+    let Some(bytes) = read_people_file(path).await? else {
+        return Ok(false);
+    };
+    let Ok(manifest) = serde_json::from_slice::<PersonManifest>(&bytes) else {
+        return Ok(false);
+    };
+    Ok(manifest.lux_person_id == person_id)
+}
+
+fn extract_unique_lux_person_dir_id(dir_name: &str) -> Option<&str> {
+    if dir_name.starts_with("lux-") && is_valid_person_id(dir_name) {
+        return Some(dir_name);
+    }
+    let mut matches = dir_name.match_indices("-lux-");
+    let (idx, _) = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    let candidate = &dir_name[idx + 1..];
+    is_valid_person_id(candidate).then_some(candidate)
+}
+
 impl PeopleService {
     pub(super) async fn find_person_manifest_path(
         &self,
@@ -25,23 +48,65 @@ impl PeopleService {
             .map(|path| path.join(PERSON_MANIFEST))
     }
 
-    /// Looks up an existing manifest without falling back to a new Lux person
-    /// directory, so callers can handle people that only have local IDs.
-    pub(super) async fn find_existing_person_manifest_path(
+    pub(super) async fn record_person_manifest_path(&self, person_id: &str, manifest_path: &Path) {
+        if !person_id.starts_with("lux-") {
+            return;
+        }
+        let mut cache = self.manifest_dir_index.lock().await;
+        if let Some(map) = cache.as_mut() {
+            map.insert(person_id.to_owned(), manifest_path.to_path_buf());
+        }
+    }
+
+    async fn cached_person_manifest_path(
         &self,
         person_id: &str,
-        display_name: &str,
-    ) -> Result<Option<PathBuf>, PeopleError> {
+    ) -> Result<(bool, Option<PathBuf>), PeopleError> {
+        let (is_populated, candidate) = {
+            let cache = self.manifest_dir_index.lock().await;
+            (
+                cache.is_some(),
+                cache.as_ref().and_then(|map| map.get(person_id).cloned()),
+            )
+        };
+        let Some(candidate_path) = candidate else {
+            return Ok((is_populated, None));
+        };
+        if manifest_matches_person_id(&candidate_path, person_id).await? {
+            return Ok((true, Some(candidate_path)));
+        }
+        let mut cache = self.manifest_dir_index.lock().await;
+        if let Some(map) = cache.as_mut()
+            && map.get(person_id) == Some(&candidate_path)
+        {
+            map.remove(person_id);
+        }
+        Ok((true, None))
+    }
+
+    async fn ensure_manifest_dir_index(&self) -> Result<(), PeopleError> {
+        if self.manifest_dir_index.lock().await.is_some() {
+            return Ok(());
+        }
+        let _scan_guard = self.manifest_dir_index_scan_lock.lock().await;
+        if self.manifest_dir_index.lock().await.is_some() {
+            return Ok(());
+        }
+        let built = self.scan_person_manifest_dir_index().await?;
+        *self.manifest_dir_index.lock().await = Some(built);
+        Ok(())
+    }
+
+    async fn scan_person_manifest_dir_index(
+        &self,
+    ) -> Result<HashMap<String, PathBuf>, PeopleError> {
+        let mut discovered = HashMap::new();
         let root = metadata_root(&self.config_dir)
             .join(LEGACY_PEOPLE_DIR)
             .join("person");
         let mut initials = match fs::read_dir(&root).await {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return self
-                    .find_person_manifest_path_from_index(person_id, display_name)
-                    .await;
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(discovered),
             Err(source) => return Err(PeopleError::Io { path: root, source }),
         };
         while let Some(initial) = initials
@@ -53,10 +118,14 @@ impl PeopleService {
             })?
         {
             let initial_path = initial.path();
-            if safe_metadata(&initial_path)
-                .await?
-                .is_none_or(|metadata| !metadata.is_dir())
-            {
+            let is_dir = match initial.file_type().await {
+                Ok(file_type) if file_type.is_dir() => true,
+                Ok(file_type) if file_type.is_file() => false,
+                _ => safe_metadata(&initial_path)
+                    .await?
+                    .is_some_and(|metadata| metadata.is_dir()),
+            };
+            if !is_dir {
                 continue;
             }
             let mut persons =
@@ -76,17 +145,135 @@ impl PeopleService {
                     })?
             {
                 let candidate_path = person.path().join(PERSON_MANIFEST);
+                if let Some(dir_name) = person.file_name().to_str()
+                    && let Some(lux_id) = extract_unique_lux_person_dir_id(dir_name)
+                {
+                    discovered.insert(lux_id.to_owned(), candidate_path);
+                    continue;
+                }
                 let Some(bytes) = read_people_file(&candidate_path).await? else {
                     continue;
                 };
                 let Ok(manifest) = serde_json::from_slice::<PersonManifest>(&bytes) else {
                     continue;
                 };
-                if manifest.lux_person_id == person_id {
-                    return Ok(Some(candidate_path));
+                if !manifest.lux_person_id.is_empty() {
+                    discovered.insert(manifest.lux_person_id, candidate_path);
                 }
             }
         }
+        Ok(discovered)
+    }
+
+    fn safe_manifest_path_from_index(&self, index: &StoredPersonIndex) -> Option<PathBuf> {
+        let relative = Path::new(&index.image_path);
+        if index.image_path.is_empty()
+            || relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return None;
+        }
+        let metadata_dir = metadata_root(&self.config_dir);
+        let full_image_path = metadata_dir.join(relative);
+        if !full_image_path.starts_with(&metadata_dir) {
+            return None;
+        }
+        full_image_path
+            .parent()
+            .map(|parent| parent.join(PERSON_MANIFEST))
+    }
+
+    async fn read_person_index_manifest_candidate(
+        &self,
+        index_path: &Path,
+        person_id: &str,
+        display_name: &str,
+    ) -> Result<Option<(PathBuf, bool)>, PeopleError> {
+        let Some(bytes) = read_people_file(index_path).await? else {
+            return Ok(None);
+        };
+        let Ok(index) = serde_json::from_slice::<StoredPersonIndex>(&bytes) else {
+            return Ok(None);
+        };
+        if let Some(indexed_manifest_path) = self.safe_manifest_path_from_index(&index) {
+            let expected_id = index
+                .person_key
+                .as_deref()
+                .filter(|key| key.starts_with("lux-"))
+                .unwrap_or(person_id);
+            if manifest_matches_person_id(&indexed_manifest_path, expected_id).await? {
+                return Ok(Some((indexed_manifest_path, true)));
+            }
+        }
+        let Some(person_key) = index
+            .person_key
+            .as_deref()
+            .filter(|person_key| person_key.starts_with("lux-"))
+        else {
+            return Ok(None);
+        };
+        let path = lux_person_directory(&self.config_dir, display_name, person_key)
+            .map(|path| path.join(PERSON_MANIFEST))
+            .map_err(PeopleError::from)?;
+        let exists = manifest_matches_person_id(&path, person_key).await?;
+        Ok(Some((path, exists)))
+    }
+
+    /// Looks up an existing manifest without falling back to a new Lux person
+    /// directory, so callers can handle people that only have local IDs.
+    pub(super) async fn find_existing_person_manifest_path(
+        &self,
+        person_id: &str,
+        display_name: &str,
+    ) -> Result<Option<PathBuf>, PeopleError> {
+        let (is_cache_populated, cached) = self.cached_person_manifest_path(person_id).await?;
+        if let Some(path) = cached {
+            return Ok(Some(path));
+        }
+
+        if person_id.starts_with("lux-")
+            && !display_name.trim().is_empty()
+            && let Ok(direct_dir) = lux_person_directory(&self.config_dir, display_name, person_id)
+        {
+            let direct_path = direct_dir.join(PERSON_MANIFEST);
+            if manifest_matches_person_id(&direct_path, person_id).await? {
+                self.record_person_manifest_path(person_id, &direct_path)
+                    .await;
+                return Ok(Some(direct_path));
+            }
+        }
+
+        if let Ok(direct_index_path) = people_index_path(&self.config_dir, person_id)
+            && let Some((candidate_path, true)) = self
+                .read_person_index_manifest_candidate(&direct_index_path, person_id, display_name)
+                .await?
+        {
+            self.record_person_manifest_path(person_id, &candidate_path)
+                .await;
+            return Ok(Some(candidate_path));
+        }
+        if person_id.starts_with("lux-")
+            && let Ok(lux_index_path) =
+                people_index_path_for_provider(&self.config_dir, "lux", person_id)
+            && let Some((candidate_path, true)) = self
+                .read_person_index_manifest_candidate(&lux_index_path, person_id, display_name)
+                .await?
+        {
+            self.record_person_manifest_path(person_id, &candidate_path)
+                .await;
+            return Ok(Some(candidate_path));
+        }
+
+        if !is_cache_populated {
+            self.ensure_manifest_dir_index().await?;
+            let (_, found) = self.cached_person_manifest_path(person_id).await?;
+            if let Some(path) = found {
+                return Ok(Some(path));
+            }
+        }
+
         self.find_person_manifest_path_from_index(person_id, display_name)
             .await
     }
@@ -96,6 +283,39 @@ impl PeopleService {
         person_id: &str,
         display_name: &str,
     ) -> Result<Option<PathBuf>, PeopleError> {
+        if let Ok(direct_index_path) = people_index_path(&self.config_dir, person_id)
+            && let Some((candidate_path, _)) = self
+                .read_person_index_manifest_candidate(&direct_index_path, person_id, display_name)
+                .await?
+        {
+            return Ok(Some(candidate_path));
+        }
+        if person_id.starts_with("lux-") {
+            if let Ok(lux_index_path) =
+                people_index_path_for_provider(&self.config_dir, "lux", person_id)
+                && let Some((candidate_path, _)) = self
+                    .read_person_index_manifest_candidate(&lux_index_path, person_id, display_name)
+                    .await?
+            {
+                return Ok(Some(candidate_path));
+            }
+            return Ok(None);
+        }
+        for provider in ["tmdb", "imdb", "douban", "tvdb", "bgmtv"] {
+            if let Ok(provider_index_path) =
+                people_index_path_for_provider(&self.config_dir, provider, person_id)
+                && let Some((candidate_path, _)) = self
+                    .read_person_index_manifest_candidate(
+                        &provider_index_path,
+                        person_id,
+                        display_name,
+                    )
+                    .await?
+            {
+                return Ok(Some(candidate_path));
+            }
+        }
+
         let index_root = people_index_directory(&self.config_dir);
         let mut entries = match fs::read_dir(&index_root).await {
             Ok(entries) => entries,
@@ -124,23 +344,12 @@ impl PeopleService {
             if file_name != direct_name && !file_name.ends_with(&provider_name_suffix) {
                 continue;
             }
-            let path = entry.path();
-            let Some(bytes) = read_people_file(&path).await? else {
-                continue;
-            };
-            let Ok(index) = serde_json::from_slice::<StoredPersonIndex>(&bytes) else {
-                continue;
-            };
-            let Some(person_key) = index
-                .person_key
-                .as_deref()
-                .filter(|person_key| person_key.starts_with("lux-"))
-            else {
-                continue;
-            };
-            return lux_person_directory(&self.config_dir, display_name, person_key)
-                .map(|path| Some(path.join(PERSON_MANIFEST)))
-                .map_err(PeopleError::from);
+            if let Some((candidate_path, _)) = self
+                .read_person_index_manifest_candidate(&entry.path(), person_id, display_name)
+                .await?
+            {
+                return Ok(Some(candidate_path));
+            }
         }
         Ok(None)
     }

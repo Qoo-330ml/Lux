@@ -1610,14 +1610,20 @@ struct DecodedLocalNfoCache {
     relation_fingerprint: Option<Vec<u8>>,
 }
 
-fn decode_local_nfo_cache(json: &str) -> Result<DecodedLocalNfoCache, String> {
-    let value =
-        serde_json::from_str::<serde_json::Value>(json).map_err(|error| error.to_string())?;
+#[derive(Debug)]
+enum DecodeLocalNfoCacheError {
+    UnsupportedSchemaVersion,
+    Malformed(String),
+}
+
+fn decode_local_nfo_cache(json: &str) -> Result<DecodedLocalNfoCache, DecodeLocalNfoCacheError> {
+    let value = serde_json::from_str::<serde_json::Value>(json)
+        .map_err(|error| DecodeLocalNfoCacheError::Malformed(error.to_string()))?;
     if value.get("schemaVersion").is_some() {
         let envelope = serde_json::from_value::<LocalNfoCacheEnvelope>(value)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| DecodeLocalNfoCacheError::Malformed(error.to_string()))?;
         if envelope.schema_version != LOCAL_NFO_CACHE_SCHEMA_VERSION {
-            return Err("unsupported local NFO cache schema version".to_owned());
+            return Err(DecodeLocalNfoCacheError::UnsupportedSchemaVersion);
         }
         let semantic_fingerprint = envelope
             .semantic_fingerprint
@@ -1637,7 +1643,7 @@ fn decode_local_nfo_cache(json: &str) -> Result<DecodedLocalNfoCache, String> {
             semantic_fingerprint: None,
             relation_fingerprint: None,
         })
-        .map_err(|error| error.to_string())
+        .map_err(|error| DecodeLocalNfoCacheError::Malformed(error.to_string()))
 }
 
 pub(crate) fn local_nfo_details_from_cache_json(json: &str) -> Option<LocalNfoDetails> {
@@ -1856,19 +1862,39 @@ impl LocalNfoMetadataStore {
         match decode_local_nfo_cache(json) {
             Ok(decoded) => Ok(Some(decoded.details)),
             Err(error) => {
+                self.forget_details(item_id);
+                self.clear_stale_or_malformed_cache(item_id, json, error)
+                    .await?;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn clear_stale_or_malformed_cache(
+        &self,
+        item_id: &str,
+        json: &str,
+        error: DecodeLocalNfoCacheError,
+    ) -> Result<(), LocalNfoMetadataStoreError> {
+        match error {
+            DecodeLocalNfoCacheError::UnsupportedSchemaVersion => {
+                tracing::debug!(
+                    item_id,
+                    "clearing outdated local NFO cache entry for schema rebuild"
+                );
+            }
+            DecodeLocalNfoCacheError::Malformed(error) => {
                 tracing::warn!(
                     item_id,
                     error = %error,
                     "derived local NFO cache is malformed; clearing it for rebuild"
                 );
-                self.forget_details(item_id);
-                self.database
-                    .clear_media_item_nfo_metadata_if_json(item_id, json)
-                    .await
-                    .map_err(LocalNfoMetadataStoreError::Storage)?;
-                Ok(None)
             }
         }
+        self.database
+            .clear_media_item_nfo_metadata_if_json(item_id, json)
+            .await
+            .map_err(LocalNfoMetadataStoreError::Storage)
     }
 
     pub async fn state(
@@ -1957,15 +1983,9 @@ impl LocalNfoMetadataStore {
                 decoded.relation_fingerprint,
             ))),
             Err(error) => {
-                tracing::warn!(
-                    item_id,
-                    error = %error,
-                    "derived local NFO cache is malformed; clearing it for rebuild"
-                );
-                self.database
-                    .clear_media_item_nfo_metadata_if_json(item_id, &json)
-                    .await
-                    .map_err(LocalNfoMetadataStoreError::Storage)?;
+                self.forget_details(item_id);
+                self.clear_stale_or_malformed_cache(item_id, &json, error)
+                    .await?;
                 Ok(None)
             }
         }

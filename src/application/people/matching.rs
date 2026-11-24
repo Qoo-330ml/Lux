@@ -102,6 +102,8 @@ impl PeopleService {
                 .map_err(|source| PeopleError::Serialization(source.to_string()))?;
             self.mark_person_manifest_restore_pending().await?;
             write_atomically(&manifest_path, &bytes).await?;
+            self.record_person_manifest_path(person_id, &manifest_path)
+                .await;
             Ok::<_, PeopleError>(locked_fields.iter().cloned().collect::<Vec<_>>())
         }
         .await
@@ -1025,6 +1027,8 @@ impl PeopleService {
         };
         target_manifest.identity_events.push(event.clone());
         sign_and_write_person_manifest(&target_manifest_path, &mut target_manifest).await?;
+        self.record_person_manifest_path(&merged.target_person_id, &target_manifest_path)
+            .await;
 
         let mut updated_source_manifest = source_manifest.unwrap_or_else(|| PersonManifest {
             schema_version: PERSON_MANIFEST_SCHEMA_VERSION,
@@ -1037,6 +1041,8 @@ impl PeopleService {
         updated_source_manifest.merged_into_person_id = Some(merged.target_person_id.clone());
         updated_source_manifest.identity_events.push(event);
         sign_and_write_person_manifest(&source_manifest_path, &mut updated_source_manifest).await?;
+        self.record_person_manifest_path(&merged.source_person_id, &source_manifest_path)
+            .await;
 
         if let Some(image_path) = target_image_path {
             let metadata_dir = metadata_root(&self.config_dir);
@@ -1149,7 +1155,10 @@ impl PeopleService {
             let bytes = serde_json::to_vec_pretty(&manifest)
                 .map_err(|source| PeopleError::Serialization(source.to_string()))?;
             self.mark_person_manifest_restore_pending().await?;
-            write_atomically(&manifest_path, &bytes).await
+            write_atomically(&manifest_path, &bytes).await?;
+            self.record_person_manifest_path(person_id, &manifest_path)
+                .await;
+            Ok(())
         }
         .await
     }
