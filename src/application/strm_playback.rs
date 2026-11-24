@@ -11,13 +11,15 @@ use reqwest::{
     header::{ACCEPT_ENCODING, CONTENT_RANGE, CONTENT_TYPE, ETAG, LOCATION, RANGE, USER_AGENT},
 };
 
+#[cfg(test)]
+use crate::application::remote_url_policy::checked_addresses;
 use crate::{
     application::remote_url_policy::{
         AddressCheckError, HostResolutionError, HostResolver, OutboundHost, SystemHostResolver,
-        canonical_ip, checked_addresses, domain_matches_any, ipv4_is_6to4_relay_anycast,
-        ipv4_is_benchmark, ipv4_is_documentation, ipv4_is_ietf_protocol_assignment,
-        ipv4_is_reserved, ipv4_is_this_network, ipv6_is_discard_only, ipv6_is_documentation,
-        ipv6_is_tunnel, pin_resolved_addresses, resolve_checked_addresses,
+        canonical_ip, domain_matches_any, ipv4_is_6to4_relay_anycast, ipv4_is_benchmark,
+        ipv4_is_documentation, ipv4_is_ietf_protocol_assignment, ipv4_is_reserved,
+        ipv4_is_this_network, ipv6_is_discard_only, ipv6_is_documentation, ipv6_is_tunnel,
+        pin_resolved_addresses, resolve_checked_addresses,
     },
     network::{NetworkProxyError, normalize_proxy_url},
 };
