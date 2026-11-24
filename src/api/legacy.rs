@@ -1883,6 +1883,25 @@ pub(super) async fn request_client_ip(
     }
 }
 
+/// Whether the request came in from outside the local network.
+///
+/// This is the only sanctioned way for an authorization decision to answer that question. The
+/// answer comes from [`request_access_ip`], which starts at the connection peer the server
+/// middleware attached and walks the `X-Forwarded-For` chain from right to left only while the
+/// current hop is an explicitly trusted proxy (or the single container default gateway). A raw
+/// forwarded value on its own never decides remote access.
+///
+/// A resolver failure is returned to the caller instead of being folded into "local": a malformed
+/// peer, a malformed forwarded chain, or an unreadable trusted-proxy setting must fail closed at
+/// the call site.
+pub(super) async fn request_is_remote(
+    headers: &HeaderMap,
+    state: &CoreState,
+) -> Result<bool, AccessIpResolutionError> {
+    let client_ip = request_access_ip(headers, state).await?;
+    Ok(state.remote_access.is_remote_address(client_ip))
+}
+
 async fn request_access_ip(
     headers: &HeaderMap,
     state: &CoreState,
@@ -1958,7 +1977,7 @@ async fn cached_trusted_proxy_cidrs(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AccessIpResolutionError {
+pub(super) enum AccessIpResolutionError {
     InvalidPeerAddress,
     TrustedProxySettingsUnavailable,
     MalformedForwardedFor,

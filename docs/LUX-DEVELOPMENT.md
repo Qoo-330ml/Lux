@@ -356,8 +356,12 @@ Lux 的核心价值不是功能数量，而是：
 - 网络代理设置是全局出站配置，支持 HTTP、HTTPS、SOCKS4、SOCKS4a、SOCKS5 和 SOCKS5h；可通过代理 URL 携带认证信息。
 - 出站代理可使用 Lux 的统一配置或标准 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 环境变量；配置影响 TMDb、插件、图片和下载等出站请求。URL 型 `.strm` 的解析请求由 Lux 直连目标并绕过全局出站代理，但不代理客户端最终读取的媒体字节和入站反向代理。
 - 管理员可在网络代理设置中检测 TMDb、百度、Google 和 Cloudflare 的逐站延迟，并查看通过 Cloudflare trace 获取的网络出口 IP 与国家/地区代码。
-- 远程访问权限由用户策略控制。
-- Lux 展示的客户端 IP 按有效的 X-Forwarded-For、X-Real-IP、Forwarded 顺序读取；Forwarded 只采用首个代理元素的 for 参数，支持 IPv4、带方括号的 IPv6 和可选端口。转发 IP 缺失或无效时不把反代对端地址当作真实客户端 IP。HTTPS 判断仍读取 X-Forwarded-Proto；远程访问权限不再依据来源 IP 判断。
+- 远程访问权限由用户策略 `can_remote_access` 控制。
+- 本地与远程由统一的可信 `access-IP resolver` 判定。resolver 从连接对端（服务器中间件写入的 `peer`）开始，仅当当前跳点属于显式配置的可信代理网段、或容器内检测到的单一默认网关主机地址时，才读取完整 `X-Forwarded-For` 链并从右向左逐跳校验。解析出的客户端 IP 属于本地地址时为本地请求；其余地址为远程请求。
+- 本地地址指 loopback `127.0.0.0/8`、`::1`、RFC1918 私网、IPv4 链路本地 `169.254.0.0/16`、IPv6 ULA `fc00::/7`、IPv6 链路本地 `fe80::/10` 及上述地址的 IPv4-mapped IPv6 形式，与 `user_access_rules::is_private_or_loopback` 保持一致。公网 IP 以及 Tailscale/CGNAT `100.64.0.0/10` 等非局域网地址一律视为远程。
+- 未配置可信代理 CIDR、或连接对端不在可信代理内时，转发头被忽略并回退连接对端地址；原始 `X-Forwarded-For` 绝不单独用于远程访问判定。可信代理设置不可读或转发链畸形时失败关闭（返回 `503`），不回退放行。
+- `can_remote_access` 在所有入口统一执行：Web 登录、Web session 与 CSRF 校验、用户级客户端令牌、共享管理员 API Key、管理后台、Emby 兼容登录与接口、Web 播放资源（签名直链、Range、HLS、字幕）、图片与下载端点，以及 `/api/v1/ws` 与 `/embywebsocket` 的握手和周期性重校验。远程登录被拒绝时撤销刚签发的凭证并返回 `403`；已登录的远程请求在下一次请求即被阻断，无需重新登录。
+- Lux 展示的客户端 IP 仍按有效的 X-Forwarded-For、X-Real-IP、Forwarded 顺序读取；Forwarded 只采用首个代理元素的 for 参数，支持 IPv4、带方括号的 IPv6 和可选端口。转发 IP 缺失或无效时不把反代对端地址当作真实客户端 IP。HTTPS 判断仍读取 X-Forwarded-Proto，仅用于 Cookie 的 `Secure` 标记，不参与认证、授权或 ACL。
 - 反向代理场景必须使用 HTTPS；用户名和密码登录协议本身不能替代 TLS。
 
 ### 3.14 管理与可观测性
@@ -3171,10 +3175,11 @@ Web 侧 `node --test tests/*.test.mjs`（150 项）、`vitest run`（861 项，�
 
 验收：
 
-- 无需配置代理 CIDR，始终优先使用有效的转发头。
-- 远程访问只依赖账号认证和媒体库 ACL，不再依据来源 IP 或 can_remote_access 阻止请求。
+- 连接对端属于显式可信代理（或容器默认网关）时，按完整 `X-Forwarded-For` 链从右向左解析客户端 IP；未配置可信代理网段或对端不可信时忽略转发头、回退连接对端 IP。
+- 远程访问只依据可信 `access-IP resolver` 解析出的客户端 IP 判定，并对远程请求统一执行 `can_remote_access` 策略；解析或可信代理设置读取失败时失败关闭。
+- 远程被拒绝的登录撤销刚签发的会话或令牌；已签发的 Web session、Emby token、签名播放资源 URL 和共享管理员 API Key 在远程请求上重新执行同一策略。
 
-验证：转发头解析、无转发头回退和反代 HTTPS Cookie 测试。
+验证：转发头解析、无转发头回退、伪造转发头防绕过、失败关闭和反代 HTTPS Cookie 测试。
 
 依赖：LUX-090。
 

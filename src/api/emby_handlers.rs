@@ -2362,7 +2362,10 @@ pub(super) async fn emby_authenticate(
         .await
     {
         Ok(Some(result)) => {
-            emby_authentication_success_response(&headers, &state, &auth, &login_key, result).await
+            emby_authentication_success_response(
+                &headers, &state, &auth, &login_key, client_ip, result,
+            )
+            .await
         }
         Err(crate::auth::emby::EmbyAuthError::AccessDenied) => {
             // The password matched; a device, client or IP rule refused the session. Release the
@@ -2443,7 +2446,10 @@ pub(super) async fn emby_authenticate_user_id(
         .await
     {
         Ok(Some(result)) => {
-            emby_authentication_success_response(&headers, &state, &auth, &login_key, result).await
+            emby_authentication_success_response(
+                &headers, &state, &auth, &login_key, client_ip, result,
+            )
+            .await
         }
         Err(crate::auth::emby::EmbyAuthError::AccessDenied) => {
             // The password matched; a device, client or IP rule refused the session. Release the
@@ -2486,17 +2492,16 @@ async fn emby_authentication_success_response(
     state: &ReadyAppState,
     auth: &EmbyAuthService,
     login_key: &str,
+    client_ip: Option<std::net::IpAddr>,
     result: crate::auth::emby::EmbyAuthResult,
 ) -> Response {
     // The password was verified, so the caller's window is cleared before the remote-access
     // decision (the Web handler does the same): a rule or policy refusal is not a bad password
     // and must not leave the reservation counted.
     state.login_rate_limiter.record_success(login_key).await;
-    if state.remote_access.is_remote(
-        header_str(headers, "x-lux-peer-ip"),
-        header_str(headers, "x-forwarded-for"),
-    ) && !result.user.can_remote_access
-    {
+    // The login attempt was already judged with this resolved address; the policy decision reuses
+    // it instead of resolving a second, possibly different, client IP.
+    if state.remote_access.is_remote_address(client_ip) && !result.user.can_remote_access {
         let _ = auth.logout(&result.token).await;
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -3028,11 +3033,7 @@ pub(super) async fn require_emby_user_with_query(
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let user = resolve_emby_user_with_auth(headers, query, auth, client_ip).await?;
-    if state.remote_access.is_remote(
-        header_str(headers, "x-lux-peer-ip"),
-        header_str(headers, "x-forwarded-for"),
-    ) && !user.can_remote_access
-    {
+    if state.remote_access.is_remote_address(client_ip) && !user.can_remote_access {
         return Err(StatusCode::FORBIDDEN);
     }
     if let Some(token) = emby_token_from_headers(headers).or_else(|| query.api_key.clone()) {
@@ -3095,6 +3096,12 @@ async fn require_emby_principal_scoped(
     if crate::auth::emby::is_playback_token(&token) && !allow_playback_token {
         return Err(StatusCode::UNAUTHORIZED);
     }
+    // Resolve the trusted client address once, before the credential is resolved: the same
+    // address feeds the access rules and the remote-access policy, and every credential type
+    // (shared admin API key, Emby token, playback token) is judged by it.
+    let client_ip = super::request_access_ip(headers, state)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let principal = {
         let service = state.admin_api_key();
         match service.resolve_principal(&token).await {
@@ -3106,9 +3113,6 @@ async fn require_emby_principal_scoped(
     let principal = if let Some(principal) = principal {
         principal
     } else {
-        let client_ip = super::request_access_ip(headers, state)
-            .await
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         let resolved = if allow_playback_token {
             auth.resolve_emby_route_token_with_ip(&token, client_ip)
                 .await
@@ -3124,11 +3128,7 @@ async fn require_emby_principal_scoped(
             Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
         }
     };
-    if state.remote_access.is_remote(
-        header_str(headers, "x-lux-peer-ip"),
-        header_str(headers, "x-forwarded-for"),
-    ) && !principal.can_remote_access()
-    {
+    if state.remote_access.is_remote_address(client_ip) && !principal.can_remote_access() {
         return Err(StatusCode::FORBIDDEN);
     }
     if let Some(user) = principal.user() {
