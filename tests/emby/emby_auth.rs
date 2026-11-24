@@ -1204,6 +1204,12 @@ async fn emby_authenticated_access_refreshes_device_activity()
         .build()
         .expect("test client");
     let device_id = "emby-activity-device";
+    // The forwarded address below resolves through a trusted proxy to a public client, which is a
+    // remote request: the account needs the remote-access grant.
+    sqlx::query("UPDATE users SET can_remote_access = 1 WHERE id = ?")
+        .bind(admin.id.to_string())
+        .execute(database.pool())
+        .await?;
     database
         .set_trusted_proxy_cidrs_json("[\"127.0.0.1/32\"]")
         .await?;
@@ -1510,6 +1516,11 @@ async fn emby_password_logins_update_device_inventory_without_blocking_auth()
         .expect("test client");
     let device_id = "emby-shared-device";
     let remote_ip = "203.0.113.10";
+    // A public forwarded address resolved through the trusted proxy is a remote request.
+    sqlx::query("UPDATE users SET can_remote_access = 1 WHERE id = ?")
+        .bind(admin.id.to_string())
+        .execute(database.pool())
+        .await?;
     database
         .set_trusted_proxy_cidrs_json("[\"127.0.0.1/32\"]")
         .await?;
@@ -1976,6 +1987,12 @@ async fn emby_login_and_existing_tokens_enforce_ip_blacklists_through_trusted_pr
         .await?;
     let target = UserStore::new(database.clone())?
         .create_user("emby-ip-target", "Emby IP Target", "target password", false)
+        .await?;
+    // The blacklisted addresses below are public and arrive through a trusted proxy, so the
+    // account needs the remote-access grant for the IP rules to be the thing under test.
+    sqlx::query("UPDATE users SET can_remote_access = 1 WHERE id = ?")
+        .bind(target.id.to_string())
+        .execute(database.pool())
         .await?;
     let admin_key = AdminApiKeyService::new(config.config_dir.clone(), database.clone())
         .rotate()
