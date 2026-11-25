@@ -2,6 +2,25 @@ import type { ChangelogRelease } from "../types";
 
 export const changelogReleases07: ChangelogRelease[] = [
   {
+    version: "0.7.30",
+    date: "2026-11-24",
+    sections: [
+      { kind: "added", items: [
+        "✨ feat(access): 「允许远程访问」重新生效了 — 之前这个用户策略实际上一直没起作用。现在只按可信代理链解析出的地址判断：内网、回环算本地，公网和 Tailscale/CGNAT 算远程，Web 登录、客户端令牌、管理后台、Emby 接口、播放直链、图片下载和 WebSocket 握手统一执行；远程登录被拒会撤销刚发的凭证，代理配置读不出来返回 503 而不是放行。",
+      ] },
+      { kind: "fixed", items: [
+        "🐛 fix(images): 图片下载只连校验过的地址 — 以前校验完域名、建连时还会重新解析一次，DNS 可以在这中间换成内网地址。现在只解析一次并把这组地址固定到客户端，重试也复用；演员资料图同样处理，配了代理时按私网规则拒绝。",
+        "🐛 fix(strm): 禁止的播放目标直接拒绝 — localhost、metadata 主机名、链路本地、CGNAT、组播等地址一律拒绝，局域网 RFC1918/ULA 仍然放行；域名解析后任一候选不合格就整体拒绝，初始请求和每次重定向都固定地址，Web 播放命中禁止目标直接 502。",
+        "🐛 fix(auth): 登录限流先占额度再验密码 — 以前并发请求会读到同一个失败计数，一波并发猜测能在记账前全被放行；现在额度检查与自增在同一把锁内完成。Web 登录和 Emby 两个登录入口也按解析后的账户共用同一份额度，服务端故障会归还额度、不算成密码错误。",
+        "🐛 fix(config): 数据库凭据改为原子写入 — 临时文件从创建起就是 0600，写完 fsync 再改名，失败路径会清理临时文件，不会留下写了一半的密码；NFS/SMB 上父目录 fsync 失败只影响掉电持久性，不再报保存失败。",
+        "🐛 fix(metadata): PostgreSQL 人物序列不再撞号、FILL_MISSING 不再误报条目不存在（PR #61） — 并发建人物用事务级 advisory lock 串行推进序列，分配重试不会让 PG 事务进入 aborted；只读探查把「条目不存在」干净地转成 ItemNotFound，已合并或已移除的条目不再发多余的 MetadataUpdated webhook。",
+      ] },
+      { kind: "changed", items: [
+        "♻️ refactor(remote_url_policy): 出站地址的 host 分类、地址判定与 DNS 固定抽成一套共用原语，STRM、图片、webhook 和 Emby 迁移都改用同一份实现；顺带修正展开地址的判断并固定 IANA 特殊网段边界。",
+      ] },
+    ],
+  },
+  {
     version: "0.7.29",
     date: "2026-11-24",
     sections: [
