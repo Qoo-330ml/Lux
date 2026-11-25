@@ -1349,7 +1349,13 @@ impl ImageWriteService {
         {
             return Ok(true);
         }
-        let (_, directory, movie_stem, episode_stem) = self.writeback_paths(item_id).await?;
+        let (_, directory, movie_stem, episode_stem) = match self.writeback_paths(item_id).await {
+            Ok(paths) => paths,
+            // Items without a writable media directory (missing/merged sources, or root-level
+            // series with no per-series folder) have no media sidecar image at this path.
+            Err(ImageWriteError::ItemNotFound) => return Ok(false),
+            Err(error) => return Err(error),
+        };
         let Some(path) = find_image_path_at_index(
             &directory,
             image_type,
@@ -1415,6 +1421,17 @@ impl ImageWriteService {
         image_type: &str,
     ) -> Result<bool, ImageWriteError> {
         self.local_image_exists(item_id, image_type).await
+    }
+
+    pub(crate) async fn has_local_writeback_directory(
+        &self,
+        item_id: &str,
+    ) -> Result<bool, ImageWriteError> {
+        match self.writeback_paths(item_id).await {
+            Ok(_) => Ok(true),
+            Err(ImageWriteError::ItemNotFound) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) async fn local_image_types(
@@ -1593,19 +1610,16 @@ impl ImageWriteService {
             }
         }
 
-        let (_, directory, movie_stem, episode_stem) = match writeback_context {
-            Some(context) => match self.writeback_paths_for_context(item_id, context).await {
-                Ok(paths) => paths,
-                // A series whose episodes sit directly under the library root has no per-series
-                // directory for sidecar images, so skip the directory scan cleanly.
-                Err(ImageWriteError::ItemNotFound)
-                    if context.item_type == "SERIES" && context.source.is_some() =>
-                {
-                    return Ok(found);
-                }
-                Err(error) => return Err(error),
-            },
-            None => self.writeback_paths(item_id).await?,
+        let (_, directory, movie_stem, episode_stem) = match match writeback_context {
+            Some(context) => self.writeback_paths_for_context(item_id, context).await,
+            None => self.writeback_paths(item_id).await,
+        } {
+            Ok(paths) => paths,
+            // Items without a writable media directory (missing/merged sources, or a series whose
+            // episodes sit directly under the library root) have no media sidecar directory to
+            // scan, so keep whatever was already found in the database or metadata directory.
+            Err(ImageWriteError::ItemNotFound) => return Ok(found),
+            Err(error) => return Err(error),
         };
         let paths = read_image_directory_entries(&directory).await?;
         for &image_type in image_types {
@@ -6671,6 +6685,130 @@ mod tests {
             )
             .await?;
         assert!(root_found.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_image_probes_skip_missing_source_and_root_series_without_item_not_found()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{
+                libraries::LibraryService, metadata_paths::library_item_directory,
+                scanner::LibraryScanner,
+            },
+            library::LibraryKind,
+        };
+
+        let temp = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp.path().join("config"),
+        };
+        let shows_root = temp.path().join("Shows");
+        let movies_root = temp.path().join("Movies");
+        let movie_dir = movies_root.join("Missing Source Movie (2020)");
+        tokio::fs::create_dir_all(&shows_root).await?;
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(
+            shows_root.join("Stray.S01E01.strm"),
+            b"http://example.invalid/stray\n",
+        )
+        .await?;
+        tokio::fs::write(movie_dir.join("Missing.Source.2020.mkv"), b"movie").await?;
+
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let shows_lib = libraries
+            .create_library("Shows", LibraryKind::Series, false)
+            .await?;
+        libraries
+            .add_root(shows_lib.id, shows_root.to_str().ok_or("non-utf8 root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_series_library(shows_lib.id)
+            .await?;
+        let series_id: String = sqlx::query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'SERIES' LIMIT 1",
+        )
+        .bind(shows_lib.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+
+        let movies_lib = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(movies_lib.id, movies_root.to_str().ok_or("non-utf8 root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(movies_lib.id)
+            .await?;
+        let movie_id: String = sqlx::query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' LIMIT 1",
+        )
+        .bind(movies_lib.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE filesystem_entries
+             SET is_missing = 1
+             WHERE id IN (SELECT filesystem_entry_id FROM media_sources WHERE item_id = ?)",
+        )
+        .bind(&movie_id)
+        .execute(database.pool())
+        .await?;
+
+        let address = spawn_image_stub("image/png", TEST_PNG_1X1).await;
+        let service = ImageWriteService::with_config_and_config_dir(
+            database.clone(),
+            ImageDownloadConfig {
+                max_bytes: 1024 * 1024,
+                allow_loopback_http: true,
+                direct_connection_only: true,
+                ..ImageDownloadConfig::default()
+            },
+            config.config_dir.clone(),
+        )?;
+
+        assert!(!service.has_local_writeback_directory(&series_id).await?);
+        assert!(!service.has_local_writeback_directory(&movie_id).await?);
+        assert!(
+            service
+                .local_image_types(&series_id, &["POSTER", "FANART"])
+                .await?
+                .is_empty()
+        );
+        assert!(!service.has_local_image(&series_id, "POSTER").await?);
+        assert!(
+            service
+                .local_image_types(&movie_id, &["POSTER", "FANART"])
+                .await?
+                .is_empty()
+        );
+        assert!(!service.has_local_image(&movie_id, "POSTER").await?);
+
+        let managed_dir = library_item_directory(&config.config_dir, &movie_id)?;
+        tokio::fs::create_dir_all(&managed_dir).await?;
+        tokio::fs::write(managed_dir.join("poster.png"), TEST_PNG_1X1).await?;
+        assert!(
+            service
+                .local_image_types(&movie_id, &["POSTER", "FANART"])
+                .await?
+                .contains("POSTER")
+        );
+        assert!(service.has_local_image(&movie_id, "POSTER").await?);
+
+        assert!(matches!(
+            service
+                .download_item_image(&movie_id, "poster", &format!("http://{address}/poster"))
+                .await,
+            Err(ImageWriteError::ItemNotFound)
+        ));
+        assert!(matches!(
+            service.delete_item_image(&movie_id, "missing-image").await,
+            Err(ImageWriteError::ItemNotFound)
+        ));
+        database.close().await;
         Ok(())
     }
 }
