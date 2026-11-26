@@ -1565,10 +1565,23 @@ impl Database {
     pub(crate) async fn refresh_recommendation_stats_if_needed(
         &self,
     ) -> Result<bool, StorageError> {
-        let _refresh_guard = acquire_write_lock(
+        let now = current_unix_timestamp();
+        let batch_key = recommendation_batch_key_at(now);
+        let stored_batch_key = self
+            .query_scalar::<i64>(
+                "SELECT batch_key
+                 FROM recommendation_stats_state
+                 WHERE id = 1",
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        if stored_batch_key == Some(batch_key) {
+            return Ok(false);
+        }
+        let _refresh_guard = acquire_write_lock_without_outbox_signal(
             &self.recommendation_stats_refresh_lock,
             "recommendation_stats",
-            self.outbox_signals(),
         )
         .await;
         let now = current_unix_timestamp();

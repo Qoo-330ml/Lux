@@ -571,7 +571,8 @@ pub(crate) struct WriteLockGuard {
     caller: &'static std::panic::Location<'static>,
     acquired_at: Instant,
     /// Signalled when the guarded write finishes, so the outbox consumers see the committed rows.
-    outbox_signals: Arc<OutboxSignals>,
+    /// `None` for maintenance/derived locks whose tables do not feed any outbox trigger.
+    outbox_signals: Option<Arc<OutboxSignals>>,
 }
 
 /// How long one writer may hold a process-wide write lock before the hold is reported.
@@ -583,7 +584,9 @@ impl Drop for WriteLockGuard {
         // that goes through `acquire_metadata_write_lock` wakes the derived-data consumers without
         // each write site having to remember to. On PostgreSQL there is no shared lock (the guard
         // carries none) but the drop still signals.
-        self.outbox_signals.notify_writers();
+        if let Some(outbox_signals) = &self.outbox_signals {
+            outbox_signals.notify_writers();
+        }
         let held = self.acquired_at.elapsed();
         if held >= WRITE_LOCK_HOLD_LOG_THRESHOLD {
             tracing::warn!(
@@ -601,7 +604,7 @@ async fn acquire_write_lock_after(
     operation: &'static str,
     threshold: Duration,
     caller: &'static std::panic::Location<'static>,
-    outbox_signals: Arc<OutboxSignals>,
+    outbox_signals: Option<Arc<OutboxSignals>>,
 ) -> WriteLockGuard {
     match tokio::time::timeout(threshold, lock.clone().lock_owned()).await {
         Ok(guard) => WriteLockGuard {
@@ -652,7 +655,28 @@ fn acquire_write_lock(
             operation,
             WRITE_LOCK_WAIT_LOG_THRESHOLD,
             caller,
-            outbox_signals,
+            Some(outbox_signals),
+        )
+        .await
+    }
+}
+
+/// Serialises a writer whose tables do not feed any outbox trigger, so releasing the lock never
+/// wakes the derived-data outbox consumers.
+#[track_caller]
+fn acquire_write_lock_without_outbox_signal(
+    lock: &Arc<AsyncMutex<()>>,
+    operation: &'static str,
+) -> impl std::future::Future<Output = WriteLockGuard> {
+    let caller = std::panic::Location::caller();
+    let lock = lock.clone();
+    async move {
+        acquire_write_lock_after(
+            &lock,
+            operation,
+            WRITE_LOCK_WAIT_LOG_THRESHOLD,
+            caller,
+            None,
         )
         .await
     }
@@ -1456,7 +1480,7 @@ impl Database {
                         "metadata_write",
                         WRITE_LOCK_WAIT_LOG_THRESHOLD,
                         caller,
-                        outbox_signals,
+                        Some(outbox_signals),
                     )
                     .await,
                 )
@@ -1468,7 +1492,7 @@ impl Database {
                     operation: "metadata_write",
                     caller,
                     acquired_at: Instant::now(),
-                    outbox_signals,
+                    outbox_signals: Some(outbox_signals),
                 })
             }
         }

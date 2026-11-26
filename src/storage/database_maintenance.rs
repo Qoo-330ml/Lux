@@ -469,10 +469,9 @@ impl Database {
         if self.backend != DatabaseBackend::Sqlite {
             return Ok(SqliteStatisticsRefresh::SkippedBackend);
         }
-        let _refresh_guard = acquire_write_lock(
+        let _refresh_guard = acquire_write_lock_without_outbox_signal(
             &self.statistics_refresh_lock,
             "sqlite_statistics",
-            self.outbox_signals(),
         )
         .await;
         if self.maintenance_scan_in_progress().await? {
@@ -518,10 +517,9 @@ impl Database {
         if self.backend != DatabaseBackend::Sqlite {
             return Ok(SqliteStatisticsRefresh::SkippedBackend);
         }
-        let _refresh_guard = acquire_write_lock(
+        let _refresh_guard = acquire_write_lock_without_outbox_signal(
             &self.statistics_refresh_lock,
             "sqlite_statistics",
-            self.outbox_signals(),
         )
         .await;
         if self.maintenance_scan_in_progress().await? {

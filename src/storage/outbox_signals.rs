@@ -244,4 +244,76 @@ mod tests {
             .await
             .expect("the collection worker must be signalled");
     }
+
+    /// Recommendation tables and SQLite planner statistics do not feed any outbox trigger, so
+    /// neither the 15-second idle check, a real recommendation stats refresh, nor a planner
+    /// statistics pass should wake the outbox consumers.
+    #[tokio::test]
+    async fn refresh_recommendation_stats_if_needed_does_not_signal_outbox_consumers() {
+        let (_temp, database) = match test_database().await {
+            Ok(database) => database,
+            Err(error) => panic!("test database: {error}"),
+        };
+        let signals = database.outbox_signals();
+        // Drain any permit left by database setup.
+        let _ =
+            tokio::time::timeout(Duration::from_millis(20), signals.notified_catalog_items()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(20), signals.notified_search_reindex())
+            .await;
+        let _ =
+            tokio::time::timeout(Duration::from_millis(20), signals.notified_collections()).await;
+
+        for (reset_state, expected_refreshed) in [(false, false), (true, true)] {
+            if reset_state {
+                sqlx::query("DELETE FROM recommendation_stats_state")
+                    .execute(database.pool())
+                    .await
+                    .expect("clear recommendation_stats_state");
+            }
+            let catalog = signals.notified_catalog_items();
+            tokio::pin!(catalog);
+            catalog.as_mut().enable();
+            let search = signals.notified_search_reindex();
+            tokio::pin!(search);
+            search.as_mut().enable();
+            let collections = signals.notified_collections();
+            tokio::pin!(collections);
+            collections.as_mut().enable();
+
+            let refreshed = database
+                .refresh_recommendation_stats_if_needed()
+                .await
+                .expect("refresh recommendation stats");
+            assert_eq!(refreshed, expected_refreshed);
+
+            tokio::select! {
+                _ = catalog => panic!("recommendation stats (refreshed={expected_refreshed}) must not wake the catalog consumer"),
+                _ = search => panic!("recommendation stats (refreshed={expected_refreshed}) must not wake the search consumer"),
+                _ = collections => panic!("recommendation stats (refreshed={expected_refreshed}) must not wake the collection consumer"),
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+        }
+
+        let catalog = signals.notified_catalog_items();
+        tokio::pin!(catalog);
+        catalog.as_mut().enable();
+        let search = signals.notified_search_reindex();
+        tokio::pin!(search);
+        search.as_mut().enable();
+        let collections = signals.notified_collections();
+        tokio::pin!(collections);
+        collections.as_mut().enable();
+
+        database
+            .refresh_query_statistics()
+            .await
+            .expect("refresh sqlite query statistics");
+
+        tokio::select! {
+            _ = catalog => panic!("sqlite query statistics refresh must not wake the catalog consumer"),
+            _ = search => panic!("sqlite query statistics refresh must not wake the search consumer"),
+            _ = collections => panic!("sqlite query statistics refresh must not wake the collection consumer"),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+    }
 }

@@ -36573,7 +36573,7 @@ async fn write_lock_waits_for_the_current_writer_instead_of_failing() {
         "test",
         Duration::from_millis(1),
         std::panic::Location::caller(),
-        Arc::new(OutboxSignals::default()),
+        Some(Arc::new(OutboxSignals::default())),
     )
     .await;
     let waited = started.elapsed();
