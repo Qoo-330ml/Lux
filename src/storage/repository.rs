@@ -2131,6 +2131,7 @@ pub(crate) struct CachedDashboardStats {
 pub(crate) struct StoredCatalogItemCounts {
     pub(crate) movie_count: i64,
     pub(crate) series_count: i64,
+    pub(crate) video_count: i64,
     pub(crate) episode_count: i64,
     pub(crate) box_set_count: i64,
     pub(crate) item_count: i64,

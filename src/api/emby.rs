@@ -167,6 +167,7 @@ pub(super) fn api_routes() -> (Router<ReadyAppState>, Vec<String>) {
         )
         // Yamby deletes through the legacy `/Items/{Id}/Delete` suffix.
         .route("/Items/{item_id}/Delete", delete(emby_delete_item))
+        .route("/Items/{item_id}/Ancestors", get(emby_item_ancestors))
         .route("/Items/{item_id}/Similar", get(emby_item_similar))
         .route(
             "/Items/RemoteSearch/{search_type}",

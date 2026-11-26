@@ -600,6 +600,12 @@ pub(super) struct EmbySearchQuery {
         alias = "x-media-browser-token"
     )]
     api_key: Option<String>,
+    #[serde(rename = "UserId", alias = "userId", alias = "userid", default)]
+    user_id: Option<String>,
+    #[serde(rename = "ParentId", alias = "parentId", default)]
+    parent_id: Option<String>,
+    #[serde(rename = "IncludeItemTypes", alias = "includeItemTypes", default)]
+    include_item_types: Option<String>,
     #[serde(rename = "SearchTerm", alias = "searchTerm")]
     search_term: Option<String>,
     #[serde(
@@ -628,10 +634,13 @@ pub(super) async fn emby_search_hints(
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    let principal = match emby_access_principal(&auth_principal, None) {
-        Ok(principal) => principal,
-        Err(status) => return status.into_response(),
-    };
+    let principal =
+        match emby_access_principal_for_target(&state, &auth_principal, query.user_id.as_deref())
+            .await
+        {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
     let Some(raw_query) = query.search_term.as_deref() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -650,16 +659,21 @@ pub(super) async fn emby_search_hints(
         Ok(params) => params,
         Err(status) => return status.into_response(),
     };
-    let catalog = state.catalog();
-    let page = match catalog
-        .search_items(principal, &search_query, &like_query, offset, limit)
-        .await
+    let page = match emby_scoped_search_page(
+        &state,
+        principal,
+        query.parent_id.as_deref(),
+        query.include_item_types.as_deref(),
+        &search_query,
+        &like_query,
+        offset,
+        limit,
+        true,
+    )
+    .await
     {
         Ok(page) => page,
-        Err(CatalogError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
-            return StatusCode::FORBIDDEN.into_response();
-        }
+        Err(status) => return status.into_response(),
     };
     let hints = page
         .items

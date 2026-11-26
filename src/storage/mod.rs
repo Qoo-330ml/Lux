@@ -5,6 +5,9 @@ pub(crate) struct CatalogSearchQuery<'a> {
     pub(crate) like_query: &'a str,
     pub(crate) item_types: &'a [String],
     pub(crate) library_ids: Option<&'a [String]>,
+    /// Optional container item ID (`SERIES`, `SEASON`, `FOLDER`, or `BOX_SET`) whose descendant
+    /// subtree (or collection membership) bounds the search.
+    pub(crate) parent_item_id: Option<&'a str>,
     pub(crate) offset: i64,
     pub(crate) limit: i64,
     pub(crate) content_restrictions: Option<&'a repository::UserContentRestrictions>,
