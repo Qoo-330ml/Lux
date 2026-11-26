@@ -874,13 +874,32 @@ async fn record_web_device_observation(
     state: &ReadyAppState,
     user_id: &str,
     device_id: Option<&str>,
-    remote_ip: Option<String>,
+    remote_ip: Option<std::net::IpAddr>,
 ) {
     let Some(device_id) = device_id else {
         return;
     };
+    if !state
+        .auth()
+        .device_observation_due(user_id, device_id, remote_ip)
+    {
+        return;
+    }
+    record_web_device_observation_now(state, user_id, Some(device_id), remote_ip).await;
+}
+
+async fn record_web_device_observation_now(
+    state: &ReadyAppState,
+    user_id: &str,
+    device_id: Option<&str>,
+    remote_ip: Option<std::net::IpAddr>,
+) {
+    let Some(device_id) = device_id else {
+        return;
+    };
+    let remote_ip_text = remote_ip.map(|address| address.to_string());
     let database = state.database();
-    if let Err(error) = database
+    match database
         .upsert_user_device(NewUserDeviceObservation {
             user_id,
             device_id,
@@ -888,12 +907,17 @@ async fn record_web_device_observation(
             device_type: Some("WEB"),
             client_name: "Lux Web",
             client_version: None,
-            last_remote_ip: remote_ip.as_deref(),
+            last_remote_ip: remote_ip_text.as_deref(),
             seen_at: super::playback::current_unix_timestamp(),
         })
         .await
     {
-        tracing::warn!(%error, "failed to update web user device inventory");
+        Ok(()) => state
+            .auth()
+            .mark_device_observed(user_id, device_id, remote_ip),
+        Err(error) => {
+            tracing::warn!(%error, "failed to update web user device inventory");
+        }
     }
 }
 
@@ -1077,14 +1101,8 @@ pub(super) async fn auth_login(
     }
 
     let user_id = session.user.id.to_string();
-    let login_remote_ip = request_client_ip(&headers, &state).await;
-    record_web_device_observation(
-        &state,
-        &user_id,
-        login_device_id.as_deref(),
-        login_remote_ip,
-    )
-    .await;
+    record_web_device_observation_now(&state, &user_id, login_device_id.as_deref(), client_ip)
+        .await;
     record_activity_event(
         Some(state.database()),
         &state.admin_events,
@@ -1092,7 +1110,7 @@ pub(super) async fn auth_login(
         "AUTH_LOGIN",
         None,
         json!({
-            "remoteIp": request_client_ip(&headers, &state).await,
+            "remoteIp": client_ip.map(|address| address.to_string()),
         }),
     )
     .await;
@@ -2087,7 +2105,10 @@ async fn require_web_session_csrf(
         .device_id
         .clone()
         .or_else(|| web_login_device_id(headers));
-    let remote_ip = request_client_ip(headers, state).await;
+    let remote_ip = super::request_access_ip(headers, state)
+        .await
+        .ok()
+        .flatten();
     record_web_device_observation(state, &user_id, device_id.as_deref(), remote_ip).await;
     Ok(session)
 }
@@ -3142,13 +3163,8 @@ async fn require_web_principal_observing_device(
                     .device_id
                     .clone()
                     .or_else(|| web_login_device_id(headers));
-                record_web_device_observation(
-                    state,
-                    &user_id,
-                    device_id.as_deref(),
-                    client_ip.map(|address| address.to_string()),
-                )
-                .await;
+                record_web_device_observation(state, &user_id, device_id.as_deref(), client_ip)
+                    .await;
             }
             Ok(crate::auth::users::AuthenticationPrincipal::User(
                 session.user,

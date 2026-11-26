@@ -110,7 +110,7 @@ async fn successful_login_is_written_to_the_user_activity_index()
     let web_auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let app = app_with_state(AppState::ready(
-        config,
+        config.clone(),
         database.clone(),
         setup,
         web_auth,
@@ -194,13 +194,10 @@ async fn successful_login_is_written_to_the_user_activity_index()
     .bind(device_id)
     .fetch_one(database.pool())
     .await?;
-    assert!(last_seen_without_header > 1);
+    // The login just observed this (user, device, IP), so immediate follow-up requests skip
+    // rewriting `user_devices` within the throttle window.
+    assert_eq!(last_seen_without_header, 1);
 
-    sqlx::query("UPDATE user_devices SET last_seen_at = 1 WHERE user_id = ? AND device_id = ?")
-        .bind(&user_id)
-        .bind(device_id)
-        .execute(database.pool())
-        .await?;
     let alternate_device_id = "00000000-0000-4000-8000-000000000002";
     let authenticated_access = client
         .get(format!("http://{address}/api/v1/admin/audit?pageSize=20"))
@@ -217,7 +214,7 @@ async fn successful_login_is_written_to_the_user_activity_index()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(refreshed_first_seen_at, first_seen_at);
-    assert!(refreshed_last_seen_at > 1);
+    assert_eq!(refreshed_last_seen_at, 1);
     let inventory_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM user_devices WHERE user_id = ?")
             .bind(&user_id)
@@ -225,11 +222,6 @@ async fn successful_login_is_written_to_the_user_activity_index()
             .await?;
     assert_eq!(inventory_count, 1);
 
-    sqlx::query("UPDATE user_devices SET last_seen_at = 1 WHERE user_id = ? AND device_id = ?")
-        .bind(&user_id)
-        .bind(device_id)
-        .execute(database.pool())
-        .await?;
     let invalid_device_access = client
         .get(format!("http://{address}/api/v1/admin/audit?pageSize=20"))
         .header("X-Lux-Device-Id", "not-a-uuid")
@@ -243,7 +235,38 @@ async fn successful_login_is_written_to_the_user_activity_index()
             .fetch_one(database.pool())
             .await?;
     assert_eq!(invalid_device_count, 1);
-    assert!(refreshed_last_seen_at > 1);
+    assert_eq!(refreshed_last_seen_at, 1);
+
+    // After a process restart (fresh throttle state), a bound session without a header refreshes
+    // the device row once and still ignores alternate or invalid headers.
+    let restarted_app = app_with_state(AppState::ready(
+        config.clone(),
+        database.clone(),
+        SetupService::new(database.clone())?,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let restarted_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let restarted_address = restarted_listener.local_addr()?;
+    let restarted_server =
+        tokio::spawn(async move { axum::serve(restarted_listener, restarted_app).await });
+    let refreshed_after_restart = client
+        .get(format!(
+            "http://{restarted_address}/api/v1/admin/audit?pageSize=20"
+        ))
+        .header(COOKIE, &authenticated_cookie)
+        .send()
+        .await?;
+    assert_eq!(refreshed_after_restart.status(), reqwest::StatusCode::OK);
+    let refreshed_last_seen: i64 = sqlx::query_scalar(
+        "SELECT last_seen_at FROM user_devices WHERE user_id = ? AND device_id = ?",
+    )
+    .bind(&user_id)
+    .bind(device_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert!(refreshed_last_seen > 1);
+    restarted_server.abort();
 
     let invalid_device_login = client
         .post(format!("http://{address}/api/v1/auth/login"))

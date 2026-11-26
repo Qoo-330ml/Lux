@@ -1,4 +1,9 @@
-use std::{net::IpAddr, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand_core::{OsRng, RngCore};
@@ -23,6 +28,99 @@ const SESSION_LIFETIME_SECONDS: i64 = 30 * 24 * 60 * 60;
 
 /// Upper bound for one access-rule snapshot; the per-user rule list is tiny in practice.
 const ACCESS_RULE_SNAPSHOT_LIMIT: i64 = 400;
+
+/// Device inventory timestamps (`user_devices.last_seen_at`) do not need second-level precision.
+/// Upserting `user_devices` on every authenticated Web request (API calls plus every image load)
+/// turns a single page load into dozens of concurrent SQLite write transactions, so keep an
+/// in-process throttle aligned with [`crate::auth::emby`]'s 5-minute refresh window while still
+/// writing immediately on login, on a new device, or when the client IP changes.
+const WEB_DEVICE_OBSERVATION_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const DEVICE_ACTIVITY_CACHE_MAX_ENTRIES: usize = 4_096;
+const DEVICE_ACTIVITY_CACHE_RETENTION: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Clone, Copy, Debug)]
+struct ObservedWebDevice {
+    observed_at: Instant,
+    remote_ip: Option<IpAddr>,
+}
+
+#[derive(Debug, Default)]
+struct WebDeviceActivityCache {
+    by_user: HashMap<String, HashMap<String, ObservedWebDevice>>,
+    total_entries: usize,
+}
+
+impl WebDeviceActivityCache {
+    fn observation_due(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        remote_ip: Option<IpAddr>,
+        now: Instant,
+    ) -> bool {
+        let Some(entry) = self
+            .by_user
+            .get(user_id)
+            .and_then(|devices| devices.get(device_id))
+        else {
+            return true;
+        };
+        entry.remote_ip != remote_ip
+            || now.saturating_duration_since(entry.observed_at)
+                >= WEB_DEVICE_OBSERVATION_REFRESH_INTERVAL
+    }
+
+    fn mark_observed(
+        &mut self,
+        user_id: &str,
+        device_id: &str,
+        remote_ip: Option<IpAddr>,
+        now: Instant,
+    ) {
+        let entry = ObservedWebDevice {
+            observed_at: now,
+            remote_ip,
+        };
+        let inserted = if let Some(devices) = self.by_user.get_mut(user_id) {
+            if let Some(existing) = devices.get_mut(device_id) {
+                *existing = entry;
+                false
+            } else {
+                devices.insert(device_id.to_owned(), entry);
+                true
+            }
+        } else {
+            let mut devices = HashMap::new();
+            devices.insert(device_id.to_owned(), entry);
+            self.by_user.insert(user_id.to_owned(), devices);
+            true
+        };
+        if inserted {
+            self.total_entries = self.total_entries.saturating_add(1);
+            self.prune(now);
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        if self.total_entries <= DEVICE_ACTIVITY_CACHE_MAX_ENTRIES {
+            return;
+        }
+        let mut remaining = 0usize;
+        self.by_user.retain(|_, devices| {
+            devices.retain(|_, entry| {
+                now.saturating_duration_since(entry.observed_at) < DEVICE_ACTIVITY_CACHE_RETENTION
+            });
+            remaining = remaining.saturating_add(devices.len());
+            !devices.is_empty()
+        });
+        if remaining > DEVICE_ACTIVITY_CACHE_MAX_ENTRIES {
+            self.by_user.clear();
+            self.total_entries = 0;
+        } else {
+            self.total_entries = remaining;
+        }
+    }
+}
 
 fn authenticated_session_from_stored(
     stored: crate::storage::StoredWebSession,
@@ -75,6 +173,7 @@ pub struct WebAuthService {
     database: Database,
     users: UserStore,
     principal_cache: Arc<ExpiringCache<CachedWebPrincipal>>,
+    device_activity_cache: Arc<Mutex<WebDeviceActivityCache>>,
 }
 
 impl WebAuthService {
@@ -82,6 +181,7 @@ impl WebAuthService {
         Ok(Self {
             users: UserStore::new(database.clone())?,
             principal_cache: Arc::new(ExpiringCache::default()),
+            device_activity_cache: Arc::new(Mutex::new(WebDeviceActivityCache::default())),
             database,
         })
     }
@@ -375,6 +475,41 @@ impl WebAuthService {
         };
         ip_blacklist_rules_match_address(client_ip, &rules)
             .map_err(|_| WebAuthError::AccessRulesUnavailable)
+    }
+
+    pub(crate) fn device_observation_due(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        remote_ip: Option<IpAddr>,
+    ) -> bool {
+        let now = Instant::now();
+        self.with_device_activity_cache(|cache| {
+            cache.observation_due(user_id, device_id, remote_ip, now)
+        })
+    }
+
+    pub(crate) fn mark_device_observed(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        remote_ip: Option<IpAddr>,
+    ) {
+        let now = Instant::now();
+        self.with_device_activity_cache(|cache| {
+            cache.mark_observed(user_id, device_id, remote_ip, now)
+        });
+    }
+
+    fn with_device_activity_cache<T>(
+        &self,
+        action: impl FnOnce(&mut WebDeviceActivityCache) -> T,
+    ) -> T {
+        let mut cache = self
+            .device_activity_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        action(&mut cache)
     }
 
     pub async fn logout(&self, session_token: &str) -> Result<(), WebAuthError> {
@@ -964,5 +1099,61 @@ mod principal_tests {
                 .is_ok()
         );
         Ok(())
+    }
+
+    #[test]
+    fn web_device_observation_is_throttled_within_window_and_refreshes_on_change_or_expiry() {
+        use super::{WEB_DEVICE_OBSERVATION_REFRESH_INTERVAL, WebDeviceActivityCache};
+        use std::net::IpAddr;
+        use std::time::{Duration, Instant};
+
+        let mut cache = WebDeviceActivityCache::default();
+        let start = Instant::now();
+        let loopback: IpAddr = "127.0.0.1".parse().expect("loopback ip");
+        let lan: IpAddr = "10.0.0.2".parse().expect("lan ip");
+
+        assert!(cache.observation_due("user-1", "device-1", Some(loopback), start));
+        cache.mark_observed("user-1", "device-1", Some(loopback), start);
+
+        // Repeated requests for the same (user, device, IP) within the window skip writes.
+        assert!(!cache.observation_due(
+            "user-1",
+            "device-1",
+            Some(loopback),
+            start + Duration::from_secs(60),
+        ));
+        // A changed remote IP or different device refreshes immediately.
+        assert!(cache.observation_due(
+            "user-1",
+            "device-1",
+            Some(lan),
+            start + Duration::from_secs(1),
+        ));
+        assert!(cache.observation_due(
+            "user-1",
+            "device-2",
+            Some(loopback),
+            start + Duration::from_secs(1),
+        ));
+        // Once the refresh window elapses, the same (user, device, IP) becomes due again.
+        assert!(cache.observation_due(
+            "user-1",
+            "device-1",
+            Some(loopback),
+            start + WEB_DEVICE_OBSERVATION_REFRESH_INTERVAL,
+        ));
+    }
+
+    #[test]
+    fn web_device_activity_cache_stays_bounded() {
+        use super::{DEVICE_ACTIVITY_CACHE_MAX_ENTRIES, WebDeviceActivityCache};
+        use std::time::Instant;
+
+        let mut cache = WebDeviceActivityCache::default();
+        let now = Instant::now();
+        for index in 0..=DEVICE_ACTIVITY_CACHE_MAX_ENTRIES {
+            cache.mark_observed("user-1", &format!("device-{index}"), None, now);
+        }
+        assert!(cache.total_entries <= DEVICE_ACTIVITY_CACHE_MAX_ENTRIES);
     }
 }
