@@ -1,15 +1,15 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fmt, io,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand_core::{OsRng, RngCore};
-use reqwest::{Client, StatusCode, redirect::Policy};
+use reqwest::{Client, ClientBuilder, StatusCode, redirect::Policy};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -57,6 +57,8 @@ const HISTORY_RETENTION_SECONDS: i64 = 30 * 86_400;
 const HISTORY_RETENTION_BATCH_SIZE: i64 = 500;
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const DELIVERY_CONCURRENCY: usize = 4;
+/// Upper bound for DNS-pinned webhook delivery clients kept for TCP/TLS connection reuse.
+const WEBHOOK_PINNED_CLIENT_CACHE_CAPACITY: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -167,6 +169,85 @@ pub struct WebhookService {
     worker: Arc<tokio::sync::Mutex<Option<super::background_loop::BackgroundLoop>>>,
     /// Wakes the delivery worker as soon as [`Self::publish`] commits a delivery row.
     delivery_notify: Arc<tokio::sync::Notify>,
+    /// Shared literal client + bounded LRU of DNS-pinned delivery clients.
+    http_clients: WebhookHttpClients,
+}
+
+#[derive(Clone, Default)]
+struct WebhookHttpClients {
+    inner: Arc<StdMutex<WebhookHttpClientPool>>,
+}
+
+#[derive(Default)]
+struct WebhookHttpClientPool {
+    literal_client: Option<Client>,
+    pinned: VecDeque<((String, Vec<SocketAddr>), Client)>,
+}
+
+impl WebhookHttpClients {
+    fn client_for(&self, target: &WebhookTarget) -> Result<Client, WebhookError> {
+        if target.addresses.is_empty() {
+            if let Some(client) = self.lock().literal_client.clone() {
+                return Ok(client);
+            }
+            let built = webhook_client_builder()
+                .build()
+                .map_err(|error| WebhookError::RequestSetup(error.to_string()))?;
+            let mut pool = self.lock();
+            return Ok(pool.literal_client.get_or_insert(built).clone());
+        }
+
+        let mut key_addresses = target.addresses.clone();
+        key_addresses.sort_unstable();
+        key_addresses.dedup();
+        let key = (target.host.clone(), key_addresses);
+        if let Some(client) = self.get_pinned(&key) {
+            return Ok(client);
+        }
+
+        let built =
+            pin_resolved_addresses(webhook_client_builder(), &target.host, &target.addresses)
+                .build()
+                .map_err(|error| WebhookError::RequestSetup(error.to_string()))?;
+        self.insert_pinned(key, built.clone());
+        Ok(built)
+    }
+
+    fn get_pinned(&self, key: &(String, Vec<SocketAddr>)) -> Option<Client> {
+        let mut pool = self.lock();
+        let index = pool.pinned.iter().position(|(cached, _)| cached == key)?;
+        let entry = pool.pinned.remove(index)?;
+        let client = entry.1.clone();
+        pool.pinned.push_back(entry);
+        Some(client)
+    }
+
+    fn insert_pinned(&self, key: (String, Vec<SocketAddr>), client: Client) {
+        let mut pool = self.lock();
+        if let Some(index) = pool.pinned.iter().position(|(cached, _)| cached == &key) {
+            pool.pinned.remove(index);
+        } else if pool.pinned.len() >= WEBHOOK_PINNED_CLIENT_CACHE_CAPACITY {
+            pool.pinned.pop_front();
+        }
+        pool.pinned.push_back((key, client));
+    }
+
+    fn lock(&self) -> StdMutexGuard<'_, WebhookHttpClientPool> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[cfg(test)]
+    fn pinned_len(&self) -> usize {
+        self.lock().pinned.len()
+    }
+}
+
+fn webhook_client_builder() -> ClientBuilder {
+    Client::builder()
+        .timeout(DELIVERY_TIMEOUT)
+        .redirect(Policy::none())
 }
 
 async fn run_webhook_delivery_worker(
@@ -231,6 +312,7 @@ impl WebhookService {
             plugins: None,
             worker: Arc::new(tokio::sync::Mutex::new(None)),
             delivery_notify: Arc::new(tokio::sync::Notify::new()),
+            http_clients: WebhookHttpClients::default(),
         })
     }
 
@@ -1036,15 +1118,7 @@ impl WebhookService {
     ) -> Result<u16, WebhookError> {
         let url = validate_destination(raw_url, allow_private_network)?;
         let target = resolve_webhook_address(&url, allow_private_network).await?;
-        let mut builder = Client::builder()
-            .timeout(DELIVERY_TIMEOUT)
-            .redirect(Policy::none());
-        if !target.addresses.is_empty() {
-            builder = pin_resolved_addresses(builder, &target.host, &target.addresses);
-        }
-        let client = builder
-            .build()
-            .map_err(|error| WebhookError::RequestSetup(error.to_string()))?;
+        let client = self.client_for_target(&target)?;
         let timestamp = unix_now().to_string();
         let response = client
             .post(url)
@@ -1074,6 +1148,15 @@ impl WebhookService {
                 SystemTime::now(),
             ),
         })
+    }
+
+    fn client_for_target(&self, target: &WebhookTarget) -> Result<Client, WebhookError> {
+        self.http_clients.client_for(target)
+    }
+
+    #[cfg(test)]
+    fn cached_pinned_client_count(&self) -> usize {
+        self.http_clients.pinned_len()
     }
 
     async fn view_by_id(&self, id: &str) -> Result<Option<WebhookDestinationView>, WebhookError> {
@@ -3806,6 +3889,73 @@ mod tests {
         assert_eq!(
             stored_secret(&service, &destination.id).await.as_deref(),
             Some(rotated.as_str())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_http_clients_pool_pinned_and_literal_targets_and_stay_bounded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::net::SocketAddr;
+
+        let temp_dir = tempfile::tempdir()?;
+        let database = test_database(&temp_dir).await?;
+        let service = super::WebhookService::new(database, test_config_dir(&temp_dir))?;
+
+        let literal = super::WebhookTarget {
+            host: "127.0.0.1".to_owned(),
+            addresses: Vec::new(),
+        };
+        let _ = service.client_for_target(&literal)?;
+        let _ = service.client_for_target(&literal)?;
+        assert_eq!(
+            service.cached_pinned_client_count(),
+            0,
+            "IP literals must share the literal client without using pinned cache slots"
+        );
+
+        let ip_a = SocketAddr::from(([93, 184, 216, 34], 443));
+        let ip_b = SocketAddr::from(([93, 184, 216, 35], 443));
+        let ip_c = SocketAddr::from(([93, 184, 216, 36], 443));
+        let target_ab = super::WebhookTarget {
+            host: "hooks.example.test".to_owned(),
+            addresses: vec![ip_a, ip_b],
+        };
+        let target_ba = super::WebhookTarget {
+            host: "hooks.example.test".to_owned(),
+            addresses: vec![ip_b, ip_a],
+        };
+        let target_changed = super::WebhookTarget {
+            host: "hooks.example.test".to_owned(),
+            addresses: vec![ip_c],
+        };
+
+        let _ = service.client_for_target(&target_ab)?;
+        let _ = service.client_for_target(&target_ba)?;
+        assert_eq!(
+            service.cached_pinned_client_count(),
+            1,
+            "rotated DNS answer order must reuse the same pinned client"
+        );
+
+        let _ = service.client_for_target(&target_changed)?;
+        assert_eq!(
+            service.cached_pinned_client_count(),
+            2,
+            "a changed DNS address set must never reuse the previous pinned client"
+        );
+
+        for index in 0..40_u8 {
+            let target = super::WebhookTarget {
+                host: format!("hook-{index}.example.test"),
+                addresses: vec![SocketAddr::from(([93, 184, 217, index + 1], 443))],
+            };
+            let _ = service.client_for_target(&target)?;
+        }
+        assert_eq!(
+            service.cached_pinned_client_count(),
+            super::WEBHOOK_PINNED_CLIENT_CACHE_CAPACITY,
+            "pinned webhook client cache must stay bounded"
         );
         Ok(())
     }

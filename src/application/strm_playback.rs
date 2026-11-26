@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque, hash_map::Entry},
+    collections::VecDeque,
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{Arc, Mutex, MutexGuard},
@@ -103,6 +103,7 @@ enum StrmEgress {
     /// pooled so repeated Range seeks reuse their TCP/TLS connections.
     Direct {
         lookup: HostLookup,
+        literal_client: Client,
         clients: PinnedClients,
     },
     /// Explicit test HTTP proxy. The proxy, not this process, performs the host name resolution,
@@ -110,7 +111,8 @@ enum StrmEgress {
     Proxy(Client),
 }
 
-/// Bounded FIFO cache of pinned clients, keyed by the exact address set they may connect to.
+/// Bounded LRU cache of pinned clients, keyed by the normalized checked address set they may
+/// connect to.
 #[derive(Clone, Default)]
 struct PinnedClients {
     inner: Arc<Mutex<PinnedClientCache>>,
@@ -118,13 +120,12 @@ struct PinnedClients {
 
 #[derive(Default)]
 struct PinnedClientCache {
-    order: VecDeque<PinnedClientKey>,
-    clients: HashMap<PinnedClientKey, Client>,
+    entries: VecDeque<(PinnedClientKey, Client)>,
 }
 
 /// The resolution result a client was pinned to. A changed address set is a different key, so a
 /// rebinding answer can never reuse a client that still trusts the previous answer.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq)]
 struct PinnedClientKey {
     scheme: String,
     host: String,
@@ -134,27 +135,31 @@ struct PinnedClientKey {
 
 impl PinnedClients {
     fn get(&self, key: &PinnedClientKey) -> Option<Client> {
-        self.lock().clients.get(key).cloned()
+        let mut cache = self.lock();
+        let index = cache.entries.iter().position(|(cached, _)| cached == key)?;
+        let entry = cache.entries.remove(index)?;
+        let client = entry.1.clone();
+        cache.entries.push_back(entry);
+        Some(client)
     }
 
     fn insert(&self, key: PinnedClientKey, client: Client) {
         let mut cache = self.lock();
-        if let Entry::Occupied(mut entry) = cache.clients.entry(key.clone()) {
-            entry.insert(client);
-            return;
+        if let Some(index) = cache.entries.iter().position(|(cached, _)| cached == &key) {
+            cache.entries.remove(index);
+        } else if cache.entries.len() >= CLIENT_CACHE_CAPACITY {
+            cache.entries.pop_front();
         }
-        while cache.clients.len() >= CLIENT_CACHE_CAPACITY {
-            let Some(oldest) = cache.order.pop_front() else {
-                break;
-            };
-            cache.clients.remove(&oldest);
-        }
-        cache.order.push_back(key.clone());
-        cache.clients.insert(key, client);
+        cache.entries.push_back((key, client));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.lock().entries.len()
     }
 
     fn lock(&self) -> MutexGuard<'_, PinnedClientCache> {
-        // A poisoned lock only means an earlier holder panicked; the map itself stays usable.
+        // A poisoned lock only means an earlier holder panicked; the queue itself stays usable.
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -174,6 +179,7 @@ impl StrmPlaybackResolver {
         Ok(Self {
             egress: StrmEgress::Direct {
                 lookup: Arc::new(SystemHostResolver),
+                literal_client: build_direct_literal_client()?,
                 clients: PinnedClients::default(),
             },
         })
@@ -204,6 +210,7 @@ impl StrmPlaybackResolver {
         Ok(Self {
             egress: StrmEgress::Direct {
                 lookup: Arc::new(lookup),
+                literal_client: build_direct_literal_client()?,
                 clients: PinnedClients::default(),
             },
         })
@@ -340,36 +347,42 @@ impl StrmPlaybackResolver {
     async fn client_for(&self, url: &Url) -> Result<Client, StrmPlaybackError> {
         match &self.egress {
             StrmEgress::Proxy(client) => Ok(client.clone()),
-            StrmEgress::Direct { lookup, clients } => {
+            StrmEgress::Direct {
+                lookup,
+                literal_client,
+                clients,
+            } => {
                 let host = OutboundHost::from_url(url).ok_or(StrmPlaybackError::InvalidUrl)?;
                 let port = url
                     .port_or_known_default()
                     .ok_or(StrmPlaybackError::InvalidUrl)?;
-                let request_host = host.request_host();
-                let addresses = match request_host {
-                    Some(request_host) => {
-                        resolve_checked_addresses(lookup.as_ref(), request_host, port, |address| {
-                            !is_disallowed_address(address)
-                        })
-                        .await
-                        .map_err(resolution_error)?
-                    }
+                let Some(request_host) = host.request_host() else {
                     // A literal cannot be redirected by DNS, so there is nothing to pin.
-                    None => Vec::new(),
+                    return Ok(literal_client.clone());
                 };
+                let addresses =
+                    resolve_checked_addresses(lookup.as_ref(), request_host, port, |address| {
+                        !is_disallowed_address(address)
+                    })
+                    .await
+                    .map_err(resolution_error)?;
+                let mut key_addresses = addresses.clone();
+                key_addresses.sort_unstable();
+                key_addresses.dedup();
                 let key = PinnedClientKey {
                     scheme: url.scheme().to_owned(),
-                    host: url.host_str().unwrap_or_default().to_owned(),
+                    host: request_host.to_owned(),
                     port,
-                    addresses: addresses.clone(),
+                    addresses: key_addresses,
                 };
                 if let Some(client) = clients.get(&key) {
                     return Ok(client);
                 }
-                let mut builder = base_client_builder().no_proxy();
-                if let Some(request_host) = request_host {
-                    builder = pin_resolved_addresses(builder, request_host, &addresses);
-                }
+                let builder = pin_resolved_addresses(
+                    base_client_builder().no_proxy(),
+                    request_host,
+                    &addresses,
+                );
                 let client = builder
                     .build()
                     .map_err(|error| StrmPlaybackError::ClientBuild(error.to_string()))?;
@@ -378,6 +391,21 @@ impl StrmPlaybackResolver {
             }
         }
     }
+
+    #[cfg(test)]
+    fn cached_pinned_client_count(&self) -> usize {
+        match &self.egress {
+            StrmEgress::Direct { clients, .. } => clients.len(),
+            StrmEgress::Proxy(_) => 0,
+        }
+    }
+}
+
+fn build_direct_literal_client() -> Result<Client, StrmPlaybackError> {
+    base_client_builder()
+        .no_proxy()
+        .build()
+        .map_err(|error| StrmPlaybackError::ClientBuild(error.to_string()))
 }
 
 fn base_client_builder() -> ClientBuilder {
@@ -789,7 +817,7 @@ mod tests {
                 test_client(),
             );
         }
-        assert_eq!(clients.lock().clients.len(), CLIENT_CACHE_CAPACITY);
+        assert_eq!(clients.len(), CLIENT_CACHE_CAPACITY);
         assert!(
             clients.get(&key).is_none(),
             "the oldest client should be evicted once the cache is full"
@@ -801,6 +829,97 @@ mod tests {
                     Vec::new()
                 ))
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn pinned_client_cache_evicts_least_recently_used_entry() {
+        let clients = PinnedClients::default();
+        let first = pinned_client_key("host0.example.test", vec![socket([93, 184, 216, 1], 80)]);
+        let second = pinned_client_key("host1.example.test", vec![socket([93, 184, 216, 2], 80)]);
+        clients.insert(first.clone(), test_client());
+        clients.insert(second.clone(), test_client());
+        for index in 2..CLIENT_CACHE_CAPACITY {
+            clients.insert(
+                pinned_client_key(
+                    &format!("host{index}.example.test"),
+                    vec![socket(
+                        [93, 184, 216, u8::try_from(index + 1).expect("u8")],
+                        80,
+                    )],
+                ),
+                test_client(),
+            );
+        }
+        // Touching `first` should promote it ahead of `second` so `second` is evicted next.
+        assert!(clients.get(&first).is_some());
+        clients.insert(
+            pinned_client_key("newest.example.test", vec![socket([93, 184, 216, 200], 80)]),
+            test_client(),
+        );
+        assert!(
+            clients.get(&first).is_some(),
+            "recently used client must stay cached"
+        );
+        assert!(
+            clients.get(&second).is_none(),
+            "least recently used client should be evicted when full"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_for_reuses_rotated_dns_answers_and_shares_literal_client() {
+        let call_index = Arc::new(Mutex::new(0_usize));
+        let counter = Arc::clone(&call_index);
+        let resolver = StrmPlaybackResolver::new_with_host_lookup_for_tests(
+            move |_host: String, port: u16| -> StrmHostLookupFuture<'static> {
+                let counter = Arc::clone(&counter);
+                Box::pin(async move {
+                    let mut guard = counter.lock().expect("lookup counter");
+                    let current = *guard;
+                    *guard += 1;
+                    let a = socket([93, 184, 216, 34], port);
+                    let b = socket([93, 184, 216, 35], port);
+                    if current.is_multiple_of(2) {
+                        Ok(vec![a, b])
+                    } else {
+                        Ok(vec![b, a])
+                    }
+                })
+            },
+        )
+        .expect("resolver should build");
+
+        let domain_url =
+            reqwest::Url::parse("http://cdn.example.test/video.mkv").expect("valid url");
+        let _ = resolver
+            .client_for(&domain_url)
+            .await
+            .expect("first lookup");
+        let _ = resolver
+            .client_for(&domain_url)
+            .await
+            .expect("second lookup with rotated DNS order");
+        assert_eq!(
+            resolver.cached_pinned_client_count(),
+            1,
+            "rotated DNS answer order must reuse the same pinned client"
+        );
+
+        let literal_a = reqwest::Url::parse("http://10.0.0.5:8080/a.mkv").expect("valid literal");
+        let literal_b = reqwest::Url::parse("http://10.0.0.6:8080/b.mkv").expect("valid literal");
+        let _ = resolver
+            .client_for(&literal_a)
+            .await
+            .expect("first literal");
+        let _ = resolver
+            .client_for(&literal_b)
+            .await
+            .expect("second literal");
+        assert_eq!(
+            resolver.cached_pinned_client_count(),
+            1,
+            "IP literals should reuse the shared direct client without occupying pinned slots"
         );
     }
 
