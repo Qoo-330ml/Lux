@@ -53,21 +53,35 @@ impl PeopleService {
             return;
         }
         let mut cache = self.manifest_dir_index.lock().await;
-        if let Some(map) = cache.as_mut() {
-            map.insert(person_id.to_owned(), manifest_path.to_path_buf());
+        if let Some(index) = cache.as_mut() {
+            if index.is_fresh() {
+                index
+                    .entries
+                    .insert(person_id.to_owned(), manifest_path.to_path_buf());
+            } else {
+                *cache = None;
+            }
         }
     }
 
-    async fn cached_person_manifest_path(
+    pub(super) async fn clear_manifest_dir_index(&self) {
+        *self.manifest_dir_index.lock().await = None;
+    }
+
+    pub(super) async fn cached_person_manifest_path(
         &self,
         person_id: &str,
     ) -> Result<(bool, Option<PathBuf>), PeopleError> {
         let (is_populated, candidate) = {
-            let cache = self.manifest_dir_index.lock().await;
-            (
-                cache.is_some(),
-                cache.as_ref().and_then(|map| map.get(person_id).cloned()),
-            )
+            let mut cache = self.manifest_dir_index.lock().await;
+            match cache.as_ref() {
+                Some(index) if index.is_fresh() => (true, index.entries.get(person_id).cloned()),
+                Some(_) => {
+                    *cache = None;
+                    (false, None)
+                }
+                None => (false, None),
+            }
         };
         let Some(candidate_path) = candidate else {
             return Ok((is_populated, None));
@@ -76,24 +90,36 @@ impl PeopleService {
             return Ok((true, Some(candidate_path)));
         }
         let mut cache = self.manifest_dir_index.lock().await;
-        if let Some(map) = cache.as_mut()
-            && map.get(person_id) == Some(&candidate_path)
+        if let Some(index) = cache.as_mut()
+            && index.entries.get(person_id) == Some(&candidate_path)
         {
-            map.remove(person_id);
+            index.entries.remove(person_id);
         }
         Ok((true, None))
     }
 
     async fn ensure_manifest_dir_index(&self) -> Result<(), PeopleError> {
-        if self.manifest_dir_index.lock().await.is_some() {
+        if self
+            .manifest_dir_index
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(CachedManifestDirIndex::is_fresh)
+        {
             return Ok(());
         }
         let _scan_guard = self.manifest_dir_index_scan_lock.lock().await;
-        if self.manifest_dir_index.lock().await.is_some() {
+        if self
+            .manifest_dir_index
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(CachedManifestDirIndex::is_fresh)
+        {
             return Ok(());
         }
         let built = self.scan_person_manifest_dir_index().await?;
-        *self.manifest_dir_index.lock().await = Some(built);
+        *self.manifest_dir_index.lock().await = Some(CachedManifestDirIndex::new(built));
         Ok(())
     }
 
@@ -379,6 +405,14 @@ impl PeopleService {
 
     pub async fn rebuild_person_credit_index(&self) -> Result<usize, PeopleError> {
         let _rebuild_guard = self.rebuild_lock.lock().await;
+        let result = self.rebuild_person_credit_index_inner().await;
+        // Release the full directory map after rebuild finishes so large libraries do not keep
+        // tens of thousands of manifest paths resident while idle.
+        self.clear_manifest_dir_index().await;
+        result
+    }
+
+    async fn rebuild_person_credit_index_inner(&self) -> Result<usize, PeopleError> {
         let Some(database) = &self.database else {
             return Err(PeopleError::Storage(
                 "people database index is unavailable".to_owned(),

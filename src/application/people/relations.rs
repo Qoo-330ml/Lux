@@ -1325,13 +1325,7 @@ impl PeopleService {
             .filter(|key| key.starts_with("lux-"))
             .map(str::to_owned)
             .unwrap_or_else(|| format!("{provider}:{provider_id}"));
-        let person_asset_lock = {
-            let mut locks = self.person_asset_locks.lock().await;
-            locks
-                .entry(lock_key)
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone()
-        };
+        let person_asset_lock = self.person_asset_lock_for(&lock_key).await;
         let _person_asset_guard = person_asset_lock.lock().await;
         let mut pending_assets = Vec::new();
         let person_dir = if let Some(person_key) = person_key.filter(|key| key.starts_with("lux-"))

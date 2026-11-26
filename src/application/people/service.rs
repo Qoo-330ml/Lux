@@ -4,7 +4,7 @@ use std::{
     fmt::Write as _,
     io::Cursor,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Weak},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -624,6 +624,57 @@ pub struct PersonImage {
     pub content_length: u64,
 }
 
+const KEYED_LOCK_PRUNE_THRESHOLD: usize = 256;
+const MANIFEST_DIR_INDEX_TTL: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Clone, Default)]
+struct KeyedAsyncLocks {
+    locks: Arc<AsyncMutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
+}
+
+impl KeyedAsyncLocks {
+    async fn lock_for(&self, key: &str) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.locks.lock().await;
+        if let Some(existing) = locks.get(key).and_then(Weak::upgrade) {
+            return existing;
+        }
+        if locks.len() >= KEYED_LOCK_PRUNE_THRESHOLD {
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if locks.capacity() > KEYED_LOCK_PRUNE_THRESHOLD * 4
+                && locks.len() <= KEYED_LOCK_PRUNE_THRESHOLD
+            {
+                locks.shrink_to(KEYED_LOCK_PRUNE_THRESHOLD);
+            }
+        }
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(key.to_owned(), Arc::downgrade(&lock));
+        lock
+    }
+
+    #[cfg(test)]
+    async fn len(&self) -> usize {
+        self.locks.lock().await.len()
+    }
+}
+
+pub(super) struct CachedManifestDirIndex {
+    pub(super) entries: HashMap<String, PathBuf>,
+    pub(super) refreshed_at: Instant,
+}
+
+impl CachedManifestDirIndex {
+    pub(super) fn new(entries: HashMap<String, PathBuf>) -> Self {
+        Self {
+            entries,
+            refreshed_at: Instant::now(),
+        }
+    }
+
+    pub(super) fn is_fresh(&self) -> bool {
+        self.refreshed_at.elapsed() < MANIFEST_DIR_INDEX_TTL
+    }
+}
+
 #[derive(Clone)]
 pub struct PeopleService {
     config_dir: PathBuf,
@@ -632,9 +683,9 @@ pub struct PeopleService {
     image_http: Option<ImageHttpClient>,
     database: Option<Database>,
     rebuild_lock: Arc<AsyncMutex<()>>,
-    person_asset_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
-    relation_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
-    manifest_dir_index: Arc<AsyncMutex<Option<HashMap<String, PathBuf>>>>,
+    person_asset_locks: KeyedAsyncLocks,
+    relation_locks: KeyedAsyncLocks,
+    manifest_dir_index: Arc<AsyncMutex<Option<CachedManifestDirIndex>>>,
     manifest_dir_index_scan_lock: Arc<AsyncMutex<()>>,
     rebuild_coordinator: PersonIndexRebuildCoordinator,
 }
@@ -713,13 +764,23 @@ impl PeopleService {
         }
     }
 
+    pub(super) async fn person_asset_lock_for(&self, key: &str) -> Arc<AsyncMutex<()>> {
+        self.person_asset_locks.lock_for(key).await
+    }
+
     pub(super) async fn relation_lock_for(&self, relation_path: &Path) -> Arc<AsyncMutex<()>> {
-        let key = relation_path.to_string_lossy().into_owned();
-        let mut locks = self.relation_locks.lock().await;
-        locks
-            .entry(key)
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-            .clone()
+        let key = relation_path.to_string_lossy();
+        self.relation_locks.lock_for(&key).await
+    }
+
+    #[cfg(test)]
+    async fn relation_locks_len(&self) -> usize {
+        self.relation_locks.len().await
+    }
+
+    #[cfg(test)]
+    async fn person_asset_locks_len(&self) -> usize {
+        self.person_asset_locks.len().await
     }
 
     fn with_proxy(config_dir: PathBuf, proxy_url: Option<String>) -> Self {
@@ -735,8 +796,8 @@ impl PeopleService {
             image_http,
             database: None,
             rebuild_lock: Arc::new(AsyncMutex::new(())),
-            person_asset_locks: Arc::new(AsyncMutex::new(HashMap::new())),
-            relation_locks: Arc::new(AsyncMutex::new(HashMap::new())),
+            person_asset_locks: KeyedAsyncLocks::default(),
+            relation_locks: KeyedAsyncLocks::default(),
             manifest_dir_index: Arc::new(AsyncMutex::new(None)),
             manifest_dir_index_scan_lock: Arc::new(AsyncMutex::new(())),
             rebuild_coordinator: PersonIndexRebuildCoordinator::default(),
@@ -1171,7 +1232,7 @@ mod tests {
         sync::Arc,
         sync::atomic::{AtomicUsize, Ordering},
     };
-    use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+    use tokio::sync::Semaphore;
 
     use super::{
         ActorCredit, DeferredNfoActorCredits, LOCAL_NFO_PERSON_ASSET_BATCH_CONCURRENCY,
@@ -1385,23 +1446,80 @@ mod tests {
                 .path()
                 .to_owned(),
         );
-        let first = {
-            let mut locks = service.person_asset_locks.lock().await;
-            locks
-                .entry("lux-000001".to_owned())
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone()
-        };
-        let second = {
-            let mut locks = service.person_asset_locks.lock().await;
-            locks
-                .entry("lux-000002".to_owned())
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone()
-        };
+        let first = service.person_asset_lock_for("lux-000001").await;
+        let second = service.person_asset_lock_for("lux-000002").await;
         assert!(!Arc::ptr_eq(&first, &second));
         let _first_guard = first.lock().await;
         assert!(second.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn keyed_locks_reclaim_dropped_entries_instead_of_growing_unboundedly() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let service = PeopleService::new(temp_dir.path().to_owned());
+
+        let active = service
+            .relation_lock_for(Path::new("active-item/people.json"))
+            .await;
+        let same_active = service
+            .relation_lock_for(Path::new("active-item/people.json"))
+            .await;
+        assert!(
+            Arc::ptr_eq(&active, &same_active),
+            "concurrent callers for the same key must share one lock"
+        );
+
+        let active_asset = service.person_asset_lock_for("lux-active").await;
+        for index in 0..320 {
+            let path = std::path::PathBuf::from(format!("ephemeral-{index}/people.json"));
+            let _lock = service.relation_lock_for(&path).await;
+            let _asset_lock = service
+                .person_asset_lock_for(&format!("lux-ephemeral-{index}"))
+                .await;
+        }
+
+        assert!(
+            service.relation_locks_len().await < 100,
+            "dropped relation locks must be pruned instead of leaking forever"
+        );
+        assert!(
+            service.person_asset_locks_len().await < 100,
+            "dropped person asset locks must be pruned instead of leaking forever"
+        );
+        let still_active = service
+            .relation_lock_for(Path::new("active-item/people.json"))
+            .await;
+        assert!(
+            Arc::ptr_eq(&active, &still_active),
+            "pruning must keep locks that still have live holders"
+        );
+        let still_active_asset = service.person_asset_lock_for("lux-active").await;
+        assert!(
+            Arc::ptr_eq(&active_asset, &still_active_asset),
+            "pruning must keep active person asset locks"
+        );
+
+        // Verify manifest_dir_index drops expired entries cleanly.
+        {
+            let mut entries = std::collections::HashMap::new();
+            entries.insert(
+                "lux-000001".to_owned(),
+                temp_dir.path().join("expired-manifest.json"),
+            );
+            *service.manifest_dir_index.lock().await = Some(super::CachedManifestDirIndex {
+                entries,
+                refreshed_at: std::time::Instant::now()
+                    .checked_sub(super::MANIFEST_DIR_INDEX_TTL + std::time::Duration::from_secs(1))
+                    .expect("expired timestamp"),
+            });
+        }
+        let (populated, found) = service
+            .cached_person_manifest_path("lux-000001")
+            .await
+            .expect("manifest cache lookup");
+        assert!(!populated);
+        assert!(found.is_none());
+        assert!(service.manifest_dir_index.lock().await.is_none());
     }
 
     #[tokio::test]

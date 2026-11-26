@@ -153,6 +153,16 @@ impl ScanJobService {
             Err(poisoned) => poisoned.into_inner(),
         };
         flags.remove(job_id);
+        let mut symlink_origins = match self.symlink_origins.lock() {
+            Ok(origins) => origins,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        symlink_origins.remove(job_id);
+        let mut visited_directories = match self.visited_directories.lock() {
+            Ok(visited) => visited,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        visited_directories.remove(job_id);
     }
 
     pub(in crate::application::scanner) fn track_scan_job_run(
@@ -1339,5 +1349,64 @@ impl ScanJobService {
         } else {
             self.admin_events.publish_jobs_now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn clear_cancellation_flag_releases_symlink_origins_and_visited_directories() {
+        let (_temp, database) = crate::storage::test_database()
+            .await
+            .expect("test database");
+        let service = ScanJobService::new(database);
+        let job_id = "failed-or-cancelled-job";
+
+        let _flag = service.cancellation_flag(job_id);
+        service
+            .symlink_origins
+            .lock()
+            .expect("symlink origins lock")
+            .entry(job_id.to_owned())
+            .or_default()
+            .insert(
+                (1, 2),
+                ("link.mkv".to_owned(), "/target/link.mkv".to_owned()),
+            );
+        service
+            .visited_directories
+            .lock()
+            .expect("visited directories lock")
+            .entry(job_id.to_owned())
+            .or_default()
+            .insert((1, 99));
+
+        service.clear_cancellation_flag(job_id);
+
+        assert!(
+            !service
+                .cancellation_flags
+                .lock()
+                .expect("cancellation flags")
+                .contains_key(job_id)
+        );
+        assert!(
+            !service
+                .symlink_origins
+                .lock()
+                .expect("symlink origins")
+                .contains_key(job_id),
+            "terminal job cleanup must release symlink_origins for the job"
+        );
+        assert!(
+            !service
+                .visited_directories
+                .lock()
+                .expect("visited directories")
+                .contains_key(job_id),
+            "terminal job cleanup must release visited_directories for the job"
+        );
     }
 }
