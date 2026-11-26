@@ -6,6 +6,7 @@ services:
     mem_limit: ${LUX_MEMORY_LIMIT:-2g}
     environment:
       MALLOC_ARENA_MAX: ${LUX_MALLOC_ARENA_MAX:-2}
+      _RJEM_MALLOC_CONF: ${LUX_JEMALLOC_CONF:-background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000,narenas:4}
       LUX_DB_MAX_CONNECTIONS: ${LUX_DB_MAX_CONNECTIONS-}
       LUX_SCAN_CONCURRENCY: ${LUX_SCAN_CONCURRENCY:-4}
       LUX_PROBE_CONCURRENCY: ${LUX_PROBE_CONCURRENCY-}

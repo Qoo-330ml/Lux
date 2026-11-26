@@ -31,17 +31,18 @@ Compose 默认把 Lux 容器的内存硬上限设为 `2g`。这不是正常内�
 ```dotenv
 LUX_MEMORY_LIMIT=2g
 LUX_MALLOC_ARENA_MAX=2
+LUX_JEMALLOC_CONF=background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000,narenas:4
 ```
 
-`LUX_MALLOC_ARENA_MAX` 限制 Debian/glibc 为多线程分配的堆 arena 数，减少任务结束后每线程 arena
-保留大量匿名页的概率；镜像默认值同样为 `2`。该设置可覆盖，但应先在相同 NAS 架构和媒体库上比较
-任务耗时、RSS 峰值和任务结束后的 RSS，再提高数值。修改后需重建容器，单纯重启旧容器不会应用新的
+`LUX_MALLOC_ARENA_MAX` 限制 Debian/glibc 为多线程分配的堆 arena 数（主要影响 SQLite 等 C 侧分配），减少任务结束后每线程 arena
+保留大量匿名页的概率；`LUX_JEMALLOC_CONF` 映射到 `_RJEM_MALLOC_CONF`，为 Linux 镜像内的 Rust `tikv-jemallocator` 开启后台回收线程（`background_thread:true`）、5 秒脏页/模糊页衰减并限制 `narenas:4`，让扫描与图片解码峰值结束后尽快把闲置内存页归还宿主机。镜像默认值同样为上述配置，可按需覆盖，但应先在相同 NAS 架构和媒体库上比较
+任务耗时、RSS 峰值和任务结束后的 RSS，再调整数值。修改后需重建容器，单纯重启旧容器不会应用新的
 Compose 配置：
 
 ```bash
 docker compose up -d --force-recreate lux
 docker inspect --format '{{.HostConfig.Memory}}' lux
-docker exec lux sh -c 'cat /sys/fs/cgroup/memory.max; printf "%s\n" "$MALLOC_ARENA_MAX"'
+docker exec lux sh -c 'cat /sys/fs/cgroup/memory.max; printf "%s\n%s\n" "$MALLOC_ARENA_MAX" "$_RJEM_MALLOC_CONF"'
 ```
 
 上面的默认命令只启动 Lux，使用内置 SQLite。若希望由同一个 Compose 项目额外运行 PostgreSQL，先设置

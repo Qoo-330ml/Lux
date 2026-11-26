@@ -60,6 +60,7 @@ ENV LUX_HTTP_ADDR=0.0.0.0:8097 \
     LUX_SCAN_CONCURRENCY=4 \
     LUX_FFMPEG_CONCURRENCY=2 \
     MALLOC_ARENA_MAX=2 \
+    _RJEM_MALLOC_CONF=background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000,narenas:4 \
     RUST_LOG=luxd=info,tower_http=info \
     TZ=UTC
 
