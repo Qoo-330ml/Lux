@@ -1661,12 +1661,13 @@ impl Database {
         &self,
         person_ids: &[String],
     ) -> Result<String, StorageError> {
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        let result = self
-            .choose_preferred_canonical_person_in_transaction(&mut transaction, person_ids)
-            .await;
-        Self::rollback_write_transaction(transaction, "choose_preferred_canonical_person").await;
-        result
+        let unique_ids = normalize_preferred_person_ids(person_ids)?;
+        if unique_ids.len() == 1 {
+            return Ok(unique_ids[0].clone());
+        }
+        let mut connection = self.pool.acquire().await.map_err(self.sqlx_err())?;
+        self.choose_preferred_canonical_person_on_connection(&mut connection, &unique_ids)
+            .await
     }
 
     async fn choose_preferred_canonical_person_in_transaction(
@@ -1674,22 +1675,19 @@ impl Database {
         transaction: &mut sqlx::Transaction<'_, Any>,
         person_ids: &[String],
     ) -> Result<String, StorageError> {
-        let unique_ids = person_ids
-            .iter()
-            .filter(|id| !id.trim().is_empty())
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        if unique_ids.is_empty() {
-            return Err(StorageError::Conflict(
-                "cannot choose preferred canonical person from an empty set".to_owned(),
-            ));
-        }
+        let unique_ids = normalize_preferred_person_ids(person_ids)?;
         if unique_ids.len() == 1 {
             return Ok(unique_ids[0].clone());
         }
+        self.choose_preferred_canonical_person_on_connection(transaction, &unique_ids)
+            .await
+    }
 
+    async fn choose_preferred_canonical_person_on_connection(
+        &self,
+        connection: &mut sqlx::AnyConnection,
+        unique_ids: &[String],
+    ) -> Result<String, StorageError> {
         let placeholders = std::iter::repeat_n("?", unique_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
@@ -1698,11 +1696,11 @@ impl Database {
         let mut people_query = self.query(sqlx::AssertSqlSafe(format!(
             "SELECT id, status FROM people WHERE id IN ({placeholders})"
         )));
-        for id in &unique_ids {
+        for id in unique_ids {
             people_query = people_query.bind(id);
         }
         let people_rows = people_query
-            .fetch_all(&mut **transaction)
+            .fetch_all(&mut *connection)
             .await
             .map_err(self.sqlx_err())?;
         for row in people_rows {
@@ -1715,11 +1713,11 @@ impl Database {
         let mut identities_query = self.query(sqlx::AssertSqlSafe(format!(
             "SELECT person_id, provider FROM person_identities WHERE person_id IN ({placeholders})"
         )));
-        for id in &unique_ids {
+        for id in unique_ids {
             identities_query = identities_query.bind(id);
         }
         let identity_rows = identities_query
-            .fetch_all(&mut **transaction)
+            .fetch_all(&mut *connection)
             .await
             .map_err(self.sqlx_err())?;
         for row in identity_rows {
@@ -1739,11 +1737,11 @@ impl Database {
              WHERE lux_person_id IN ({placeholders})
              GROUP BY lux_person_id"
         )));
-        for id in &unique_ids {
+        for id in unique_ids {
             credits_query = credits_query.bind(id);
         }
         let credit_rows = credits_query
-            .fetch_all(&mut **transaction)
+            .fetch_all(&mut *connection)
             .await
             .map_err(self.sqlx_err())?;
         for row in credit_rows {
@@ -1753,15 +1751,16 @@ impl Database {
         }
 
         let preferred = unique_ids
-            .into_iter()
+            .iter()
             .max_by_key(|id| {
                 (
-                    active_by_id.get(id).copied().unwrap_or(false),
-                    rank_by_id.get(id).copied().unwrap_or(0),
-                    credits_by_id.get(id).copied().unwrap_or(0),
-                    std::cmp::Reverse(id.clone()),
+                    active_by_id.get(id.as_str()).copied().unwrap_or(false),
+                    rank_by_id.get(id.as_str()).copied().unwrap_or(0),
+                    credits_by_id.get(id.as_str()).copied().unwrap_or(0),
+                    std::cmp::Reverse(id.as_str()),
                 )
             })
+            .cloned()
             .ok_or_else(|| {
                 StorageError::Conflict(
                     "cannot choose preferred canonical person from an empty set".to_owned(),
@@ -3339,6 +3338,22 @@ impl CanonicalPersonBatch<'_> {
     }
 }
 
+fn normalize_preferred_person_ids(person_ids: &[String]) -> Result<Vec<String>, StorageError> {
+    let unique_ids = person_ids
+        .iter()
+        .filter(|id| !id.trim().is_empty())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if unique_ids.is_empty() {
+        return Err(StorageError::Conflict(
+            "cannot choose preferred canonical person from an empty set".to_owned(),
+        ));
+    }
+    Ok(unique_ids)
+}
+
 fn canonical_provider_priority(provider: &str) -> u8 {
     if provider.eq_ignore_ascii_case("tmdb") {
         4
@@ -3542,5 +3557,77 @@ mod tests {
             super::adapt_postgres_sql_uncached(PERSON_ID_SEQUENCE_LOCK_POSTGRES_SQL).as_str(),
             PERSON_ID_SEQUENCE_LOCK_POSTGRES_SQL
         );
+    }
+
+    #[tokio::test]
+    async fn choose_preferred_canonical_person_is_read_only_without_write_tx_or_outbox_signal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = connect_test_database(&temp_dir).await?;
+
+        let imdb_person = database
+            .resolve_or_create_canonical_person(
+                "测试演员甲",
+                "imdb",
+                "nm-choose-1",
+                "PROVIDER_ID",
+                Some(1.0),
+                r#"{"source":"imdb"}"#,
+            )
+            .await?;
+        let tmdb_person = database
+            .resolve_or_create_canonical_person(
+                "测试演员甲",
+                "tmdb",
+                "tmdb-choose-1",
+                "PROVIDER_ID",
+                Some(1.0),
+                r#"{"source":"tmdb"}"#,
+            )
+            .await?;
+
+        let signals = database.outbox_signals();
+        let _ =
+            tokio::time::timeout(Duration::from_millis(20), signals.notified_catalog_items()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(20), signals.notified_search_reindex())
+            .await;
+        let _ =
+            tokio::time::timeout(Duration::from_millis(20), signals.notified_collections()).await;
+
+        database.reset_metadata_write_transaction_count();
+
+        let catalog = signals.notified_catalog_items();
+        tokio::pin!(catalog);
+        catalog.as_mut().enable();
+        let search = signals.notified_search_reindex();
+        tokio::pin!(search);
+        search.as_mut().enable();
+        let collections = signals.notified_collections();
+        tokio::pin!(collections);
+        collections.as_mut().enable();
+
+        let preferred = database
+            .choose_preferred_canonical_person(&[imdb_person.id.clone(), tmdb_person.id.clone()])
+            .await?;
+        assert_eq!(preferred, tmdb_person.id);
+        assert_eq!(
+            database.metadata_write_transaction_count(),
+            0,
+            "choose_preferred_canonical_person is read-only and must not open a metadata write transaction"
+        );
+
+        let single = database
+            .choose_preferred_canonical_person(std::slice::from_ref(&imdb_person.id))
+            .await?;
+        assert_eq!(single, imdb_person.id);
+        assert_eq!(database.metadata_write_transaction_count(), 0);
+
+        tokio::select! {
+            _ = catalog => panic!("choose_preferred_canonical_person must not wake the catalog consumer"),
+            _ = search => panic!("choose_preferred_canonical_person must not wake the search consumer"),
+            _ = collections => panic!("choose_preferred_canonical_person must not wake the collection consumer"),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+        Ok(())
     }
 }
