@@ -38,6 +38,7 @@ pub(crate) struct AuthCacheEpochs {
     credentials: AtomicU64,
     rules: AtomicU64,
     users: AtomicU64,
+    admin_api_key: AtomicU64,
 }
 
 impl AuthCacheEpochs {
@@ -77,6 +78,16 @@ impl AuthCacheEpochs {
     pub(crate) fn invalidate_users(&self) {
         self.users.fetch_add(1, Ordering::SeqCst);
     }
+
+    /// Current epoch of the shared admin API key file.
+    pub(crate) fn admin_api_key_epoch(&self) -> u64 {
+        self.admin_api_key.load(Ordering::SeqCst)
+    }
+
+    /// Invalidates every cached shared admin API key hash after `rotate` or `revoke`.
+    pub(crate) fn invalidate_admin_api_key(&self) {
+        self.admin_api_key.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
@@ -115,5 +126,15 @@ mod tests {
 
         assert!(epochs.principal_is_current(snapshot));
         assert!(epochs.principal_is_current(epochs.principal_snapshot()));
+    }
+
+    #[test]
+    fn admin_api_key_invalidation_advances_its_epoch() {
+        let epochs = AuthCacheEpochs::default();
+        let before = epochs.admin_api_key_epoch();
+
+        epochs.invalidate_admin_api_key();
+
+        assert_ne!(epochs.admin_api_key_epoch(), before);
     }
 }

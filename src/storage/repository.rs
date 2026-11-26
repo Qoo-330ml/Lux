@@ -1935,6 +1935,10 @@ impl Database {
         &self.auth_cache
     }
 
+    pub(crate) fn auth_cache_epochs(&self) -> Arc<AuthCacheEpochs> {
+        Arc::clone(&self.auth_cache)
+    }
+
     /// The wake-up signal of the mail outbox queue this database owns.
     ///
     /// The delivery worker waits on it; every path that appends a mail row signals it through
