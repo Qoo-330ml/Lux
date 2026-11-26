@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeSet, HashMap},
-    io::{self, Write},
+    io::{self, BufWriter, Write},
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
@@ -10,7 +10,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeMap};
 use serde_json::Value;
 use tokio::{
     sync::{Mutex as AsyncMutex, Notify, OnceCell, futures::OwnedNotified},
@@ -21,6 +21,11 @@ use crate::observability::resources::ResourceMetrics;
 
 const MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CACHE_ENTRIES: usize = 4096;
+/// Upper bound on total serialized JSON payload bytes held in the in-memory provider cache.
+/// Because `serde_json::Value` AST expands ~3-5× in RAM, capping serialized bytes at 16 MiB keeps
+/// worst-case cache RSS bounded even when plugins return large responses.
+const MAX_CACHE_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+const NEGATIVE_ENTRY_BYTES: usize = 4;
 const CACHE_PERSIST_DEBOUNCE: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
@@ -39,6 +44,7 @@ pub(crate) struct ProviderResponseCache {
 struct CacheState {
     entries: HashMap<String, CacheEntry>,
     expiry_order: BTreeSet<(i64, String)>,
+    total_bytes: usize,
     inflight: HashMap<String, Arc<Notify>>,
     /// Bumped by `clear`; an owner that began before the clear must not write its result back.
     generation: u64,
@@ -48,14 +54,24 @@ struct CacheState {
 }
 
 impl CacheState {
+    fn entry_weight(key: &str, entry: &CacheEntry) -> usize {
+        key.len().saturating_add(entry.serialized_bytes)
+    }
+
     fn insert(&mut self, key: String, entry: CacheEntry) {
         self.remove(&key);
+        self.total_bytes = self
+            .total_bytes
+            .saturating_add(Self::entry_weight(&key, &entry));
         self.expiry_order.insert((entry.expires_at, key.clone()));
         self.entries.insert(key, entry);
     }
 
     fn remove(&mut self, key: &str) -> Option<CacheEntry> {
         let entry = self.entries.remove(key)?;
+        self.total_bytes = self
+            .total_bytes
+            .saturating_sub(Self::entry_weight(key, &entry));
         self.expiry_order
             .remove(&(entry.expires_at, key.to_owned()));
         Some(entry)
@@ -97,8 +113,11 @@ impl CacheState {
                 .entries
                 .get(&key)
                 .is_some_and(|entry| entry.expires_at == expires_at)
+                && let Some(entry) = self.entries.remove(&key)
             {
-                self.entries.remove(&key);
+                self.total_bytes = self
+                    .total_bytes
+                    .saturating_sub(Self::entry_weight(&key, &entry));
                 removed += 1;
             }
         }
@@ -106,9 +125,27 @@ impl CacheState {
     }
 
     fn evict_oldest(&mut self) -> Option<String> {
-        let (_, key) = self.expiry_order.pop_first()?;
-        self.entries.remove(&key);
-        Some(key)
+        while let Some((_, key)) = self.expiry_order.pop_first() {
+            if let Some(entry) = self.entries.remove(&key) {
+                self.total_bytes = self
+                    .total_bytes
+                    .saturating_sub(Self::entry_weight(&key, &entry));
+                return Some(key);
+            }
+        }
+        None
+    }
+
+    fn evict_to_budget(
+        &mut self,
+        max_entries: usize,
+        max_total_bytes: usize,
+        incoming_bytes: usize,
+    ) {
+        while (self.entries.len() >= max_entries
+            || self.total_bytes.saturating_add(incoming_bytes) > max_total_bytes)
+            && self.evict_oldest().is_some()
+        {}
     }
 }
 
@@ -121,6 +158,10 @@ struct CacheEntry {
     value: Arc<Value>,
     expires_at: i64,
     negative: bool,
+    /// Serialized JSON size in bytes for total-budget accounting. Skipped on disk to keep the
+    /// persisted file format unchanged.
+    #[serde(skip)]
+    serialized_bytes: usize,
 }
 
 fn serialize_shared_value<S>(value: &Arc<Value>, serializer: S) -> Result<S::Ok, S::Error>
@@ -272,7 +313,14 @@ impl ProviderResponseCache {
         ttl_seconds: i64,
         owner: Option<&CacheOwner>,
     ) -> bool {
-        if ttl_seconds <= 0 || !serialized_value_fits_limit(value.as_ref(), MAX_ENTRY_BYTES) {
+        if ttl_seconds <= 0 {
+            return false;
+        }
+        let Some(serialized_bytes) = serialized_value_size(value.as_ref(), MAX_ENTRY_BYTES) else {
+            return false;
+        };
+        let incoming_bytes = key.len().saturating_add(serialized_bytes);
+        if incoming_bytes > MAX_CACHE_TOTAL_BYTES {
             return false;
         }
         let Some(expires_at) = unix_now().checked_add(ttl_seconds) else {
@@ -285,15 +333,14 @@ impl ProviderResponseCache {
             }
             state.remove_expired(unix_now());
             state.remove(key);
-            if state.entries.len() >= MAX_CACHE_ENTRIES {
-                state.evict_oldest();
-            }
+            state.evict_to_budget(MAX_CACHE_ENTRIES, MAX_CACHE_TOTAL_BYTES, incoming_bytes);
             state.insert(
                 key.to_owned(),
                 CacheEntry {
                     value,
                     expires_at,
                     negative: false,
+                    serialized_bytes,
                 },
             );
         }
@@ -324,6 +371,10 @@ impl ProviderResponseCache {
         let Some(expires_at) = unix_now().checked_add(ttl_seconds) else {
             return false;
         };
+        let incoming_bytes = key.len().saturating_add(NEGATIVE_ENTRY_BYTES);
+        if incoming_bytes > MAX_CACHE_TOTAL_BYTES {
+            return false;
+        }
         {
             let mut state = lock_state(&self.state);
             if owner.is_some_and(|owner| !owner.is_current(&state)) {
@@ -331,15 +382,14 @@ impl ProviderResponseCache {
             }
             state.remove_expired(unix_now());
             state.remove(key);
-            if state.entries.len() >= MAX_CACHE_ENTRIES {
-                state.evict_oldest();
-            }
+            state.evict_to_budget(MAX_CACHE_ENTRIES, MAX_CACHE_TOTAL_BYTES, incoming_bytes);
             state.insert(
                 key.to_owned(),
                 CacheEntry {
                     value: Arc::new(Value::Null),
                     expires_at,
                     negative: true,
+                    serialized_bytes: NEGATIVE_ENTRY_BYTES,
                 },
             );
         }
@@ -354,6 +404,7 @@ impl ProviderResponseCache {
             state.generation = state.generation.wrapping_add(1);
             state.entries.clear();
             state.expiry_order.clear();
+            state.total_bytes = 0;
         }
         self.persist_after_clear().await;
     }
@@ -411,26 +462,20 @@ impl ProviderResponseCache {
         let _ = self
             .load_once
             .get_or_init(|| async {
-                let Ok(bytes) = tokio::fs::read(&path).await else {
+                let loaded =
+                    tokio::task::spawn_blocking(move || load_cache_entries_from_disk(&path)).await;
+                let Ok(Some(entries)) = loaded else {
                     return;
                 };
-                let Ok(entries) = serde_json::from_slice::<HashMap<String, CacheEntry>>(&bytes)
-                else {
-                    tracing::debug!(path = %path.display(), "provider response cache is invalid");
-                    return;
-                };
-                let now = unix_now();
                 let mut state = lock_state(&self.state);
-                state.entries = entries
-                    .into_iter()
-                    .filter(|(_, entry)| entry.expires_at > now)
-                    .take(MAX_CACHE_ENTRIES)
-                    .collect();
-                state.expiry_order = state
-                    .entries
-                    .iter()
-                    .map(|(key, entry)| (entry.expires_at, key.clone()))
-                    .collect();
+                for (key, entry) in entries {
+                    let incoming_bytes = CacheState::entry_weight(&key, &entry);
+                    if incoming_bytes > MAX_CACHE_TOTAL_BYTES {
+                        continue;
+                    }
+                    state.evict_to_budget(MAX_CACHE_ENTRIES, MAX_CACHE_TOTAL_BYTES, incoming_bytes);
+                    state.insert(key, entry);
+                }
             })
             .await;
     }
@@ -481,31 +526,94 @@ impl ProviderResponseCache {
     async fn persist_now_to_path(&self, path: &Path) -> bool {
         let _guard = self.persist_lock.lock().await;
         let state = Arc::clone(&self.state);
-        let bytes = tokio::task::spawn_blocking(move || {
-            let entries = lock_state(&state).entries.clone();
-            serde_json::to_vec(&entries)
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let snapshot = {
+                let guard = lock_state(&state);
+                guard
+                    .entries
+                    .iter()
+                    .map(|(key, entry)| (key.clone(), entry.clone()))
+                    .collect::<Vec<_>>()
+            };
+            write_cache_entries_to_disk(&path, &snapshot)
         })
-        .await;
-        let Ok(Ok(bytes)) = bytes else {
-            return false;
-        };
-        let Some(parent) = path.parent() else {
-            return false;
-        };
-        if tokio::fs::create_dir_all(parent).await.is_err() {
-            return false;
-        }
-        let temporary = path.with_extension("json.tmp");
-        if tokio::fs::write(&temporary, bytes).await.is_err() {
-            let _ = tokio::fs::remove_file(&temporary).await;
-            return false;
-        }
-        if tokio::fs::rename(&temporary, path).await.is_err() {
-            let _ = tokio::fs::remove_file(&temporary).await;
-            return false;
-        }
-        true
+        .await
+        .unwrap_or(false)
     }
+}
+
+struct PersistedCacheMap<'a>(&'a [(String, CacheEntry)]);
+
+impl Serialize for PersistedCacheMap<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (key, entry) in self.0 {
+            map.serialize_entry(key, entry)?;
+        }
+        map.end()
+    }
+}
+
+fn load_cache_entries_from_disk(path: &Path) -> Option<Vec<(String, CacheEntry)>> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let entries = match serde_json::from_reader::<_, HashMap<String, CacheEntry>>(reader) {
+        Ok(entries) => entries,
+        Err(_) => {
+            tracing::debug!(path = %path.display(), "provider response cache is invalid");
+            return None;
+        }
+    };
+    let now = unix_now();
+    let mut live = entries
+        .into_iter()
+        .filter_map(|(key, mut entry)| {
+            if entry.expires_at <= now {
+                return None;
+            }
+            let size = if entry.negative {
+                NEGATIVE_ENTRY_BYTES
+            } else {
+                serialized_value_size(entry.value.as_ref(), MAX_ENTRY_BYTES)?
+            };
+            entry.serialized_bytes = size;
+            Some((key, entry))
+        })
+        .collect::<Vec<_>>();
+    // Keep the freshest entries when trimming a persisted file down to the in-memory budget.
+    live.sort_by_key(|(_, entry)| entry.expires_at);
+    Some(live)
+}
+
+fn write_cache_entries_to_disk(path: &Path, snapshot: &[(String, CacheEntry)]) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return false;
+    }
+    let temporary = path.with_extension("json.tmp");
+    let write_result = (|| -> io::Result<()> {
+        let file = std::fs::File::create(&temporary)?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer(&mut writer, &PersistedCacheMap(snapshot))
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        writer.flush()?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        return false;
+    }
+    if std::fs::rename(&temporary, path).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        return false;
+    }
+    true
 }
 
 fn lock_state(state: &Mutex<CacheState>) -> MutexGuard<'_, CacheState> {
@@ -540,7 +648,7 @@ pub(crate) fn ttl_for_method(method: &str) -> i64 {
     }
 }
 
-fn serialized_value_fits_limit(value: &Value, max_bytes: usize) -> bool {
+fn serialized_value_size(value: &Value, max_bytes: usize) -> Option<usize> {
     struct SizeLimitWriter {
         written: usize,
         max_bytes: usize,
@@ -566,14 +674,18 @@ fn serialized_value_fits_limit(value: &Value, max_bytes: usize) -> bool {
         }
     }
 
-    serde_json::to_writer(
-        &mut SizeLimitWriter {
-            written: 0,
-            max_bytes,
-        },
-        value,
-    )
-    .is_ok()
+    let mut writer = SizeLimitWriter {
+        written: 0,
+        max_bytes,
+    };
+    serde_json::to_writer(&mut writer, value)
+        .ok()
+        .map(|()| writer.written)
+}
+
+#[cfg(test)]
+fn serialized_value_fits_limit(value: &Value, max_bytes: usize) -> bool {
+    serialized_value_size(value, max_bytes).is_some()
 }
 
 fn unix_now() -> i64 {
@@ -601,6 +713,7 @@ mod tests {
                 value: Arc::new(json!({"id": 1})),
                 expires_at: 100,
                 negative: false,
+                serialized_bytes: 8,
             },
         );
         state.insert(
@@ -609,6 +722,7 @@ mod tests {
                 value: Arc::new(json!({"id": 2})),
                 expires_at: 120,
                 negative: false,
+                serialized_bytes: 8,
             },
         );
         state.insert(
@@ -617,6 +731,7 @@ mod tests {
                 value: Arc::new(json!({"id": 3})),
                 expires_at: 300,
                 negative: false,
+                serialized_bytes: 8,
             },
         );
 
@@ -626,6 +741,7 @@ mod tests {
                 value: Arc::new(json!({"id": 4})),
                 expires_at: 250,
                 negative: false,
+                serialized_bytes: 8,
             },
         );
         assert_eq!(state.expiry_order.len(), 3);
@@ -649,6 +765,7 @@ mod tests {
                 value: Arc::new(json!({"nested": [1, 2, 3]})),
                 expires_at: 10,
                 negative: false,
+                serialized_bytes: 18,
             },
         );
         state.insert(
@@ -657,6 +774,7 @@ mod tests {
                 value: Arc::new(json!({"nested": [4, 5, 6]})),
                 expires_at: 20,
                 negative: false,
+                serialized_bytes: 18,
             },
         );
 
@@ -1018,5 +1136,51 @@ mod tests {
             cache.begin(&key).await,
             CacheLookup::Hit(value) if value["images"][0] == 1
         ));
+    }
+
+    #[tokio::test]
+    async fn cache_evicts_oldest_entries_when_total_byte_budget_is_exceeded() {
+        let directory = tempfile::tempdir().expect("temporary cache directory");
+        let path = directory.path().join("provider-cache.json");
+        let cache = ProviderResponseCache::new(Some(path.clone()));
+        let chunk = "x".repeat(3 * 1024 * 1024);
+
+        for index in 0..6_i64 {
+            let key = format!("org.lux.tmdb\nmetadata.get\n{index}");
+            let CacheLookup::Owner(owner) = cache.begin(&key).await else {
+                panic!("first lookup should own {key}");
+            };
+            cache
+                .store_shared(&key, Arc::new(json!({ "blob": chunk })), 60 + index * 10)
+                .await;
+            owner.finish();
+        }
+
+        // 6 × 3 MiB = 18 MiB exceeds the 16 MiB total cache budget, so the earliest-expiring
+        // entry must have been evicted while the newest entry remains cached.
+        assert!(
+            matches!(
+                cache.begin("org.lux.tmdb\nmetadata.get\n0").await,
+                CacheLookup::Owner(_)
+            ),
+            "earliest-expiring entry must be evicted once total byte budget is exceeded"
+        );
+        assert!(
+            matches!(
+                cache.begin("org.lux.tmdb\nmetadata.get\n5").await,
+                CacheLookup::Hit(value) if value["blob"].as_str().is_some_and(|blob| blob.len() == 3 * 1024 * 1024)
+            ),
+            "newest entry must remain cached within budget"
+        );
+
+        cache.flush().await;
+        let restored = ProviderResponseCache::new(Some(path));
+        assert!(
+            matches!(
+                restored.begin("org.lux.tmdb\nmetadata.get\n5").await,
+                CacheLookup::Hit(value) if value["blob"].as_str().is_some_and(|blob| blob.len() == 3 * 1024 * 1024)
+            ),
+            "streamed persist and blocking load must round-trip valid entries"
+        );
     }
 }
