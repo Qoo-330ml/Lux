@@ -2475,19 +2475,19 @@ pub(super) async fn lux_danmaku_info(
     }
     let service = state.danmaku();
     match service
-        .read_for_playback(
+        .has_for_playback(
             &item_id,
             query.source_id.as_deref(),
             DanmakuSidecarScope::RegisteredTrack,
         )
         .await
     {
-        Ok(Some(_)) => Json(danmaku_info_json(
+        Ok(true) => Json(danmaku_info_json(
             query.source_id.as_deref(),
             &lux_danmaku_raw_url(&item_id, query.source_id.as_deref()),
         ))
         .into_response(),
-        Ok(None) => lux_danmaku_not_found(&headers),
+        Ok(false) => lux_danmaku_not_found(&headers),
         Err(_) => lux_danmaku_unavailable(&headers),
     }
 }
@@ -2507,18 +2507,21 @@ pub(super) async fn lux_danmaku_raw(
     }
     let service = state.danmaku();
     match service
-        .read_for_playback(
+        .open_for_playback(
             &item_id,
             query.source_id.as_deref(),
             DanmakuSidecarScope::RegisteredTrack,
         )
         .await
     {
-        Ok(Some(bytes)) => Response::builder()
+        Ok(Some(stream)) => Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "application/xml; charset=utf-8")
+            .header("Content-Length", stream.content_length)
             .header("Cache-Control", "private, no-cache")
-            .body(Body::from(bytes))
+            .body(Body::from_stream(tokio_util::io::ReaderStream::new(
+                tokio::io::AsyncReadExt::take(stream.file, stream.content_length),
+            )))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         Ok(None) => lux_danmaku_not_found(&headers),
         Err(_) => lux_danmaku_unavailable(&headers),

@@ -22,7 +22,11 @@
 //! valid entry. Dirty entries are counted and skipped instead of failing the
 //! whole file.
 
-use std::fmt;
+use std::{
+    fmt,
+    io::{self, BufRead, BufReader, Cursor, Read},
+    path::Path,
+};
 
 use quick_xml::{
     events::{BytesStart, Event},
@@ -54,21 +58,54 @@ impl DanmakuXmlStats {
     }
 }
 
+const STREAM_READER_BUFFER_BYTES: usize = 64 * 1024;
+
 pub fn validate_danmaku_xml(bytes: &[u8]) -> Result<(), DanmakuXmlError> {
     inspect_danmaku_xml(bytes).map(|_| ())
 }
 
-/// Validates the document and returns the per-entry counts.
+/// Validates a danmaku sidecar file by streaming through a bounded 64 KiB buffer without reading
+/// the whole file into a `Vec<u8>` or retaining parsed entries in memory.
+pub(crate) fn validate_danmaku_xml_file(path: &Path) -> Result<(), DanmakuXmlError> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| DanmakuXmlError::InvalidXml(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| DanmakuXmlError::InvalidXml(error.to_string()))?;
+    if metadata.len() == 0 {
+        return Err(DanmakuXmlError::Empty);
+    }
+    if metadata.len() > MAX_DANMAKU_XML_BYTES as u64 {
+        return Err(DanmakuXmlError::TooLarge);
+    }
+    let reader = BufReader::with_capacity(STREAM_READER_BUFFER_BYTES, file);
+    inspect_danmaku_xml_reader(reader).map(|_| ())
+}
+
+/// Validates the document and returns the per-entry counts without retaining a DOM of entries.
 ///
 /// Structural problems (empty payload, oversize, wrong root, DOCTYPE,
 /// malformed XML) fail the whole document. A document with no valid entry is
 /// [`DanmakuXmlError::MissingDanmaku`].
 pub fn inspect_danmaku_xml(bytes: &[u8]) -> Result<DanmakuXmlStats, DanmakuXmlError> {
-    let document = parse_danmaku_document(bytes)?;
-    if document.entries.is_empty() {
+    if bytes.is_empty() {
+        return Err(DanmakuXmlError::Empty);
+    }
+    if bytes.len() > MAX_DANMAKU_XML_BYTES {
+        return Err(DanmakuXmlError::TooLarge);
+    }
+    inspect_danmaku_xml_reader(Cursor::new(bytes))
+}
+
+/// Streams a danmaku XML reader and returns per-entry validity counts in constant memory.
+pub(crate) fn inspect_danmaku_xml_reader<R: BufRead>(
+    reader: R,
+) -> Result<DanmakuXmlStats, DanmakuXmlError> {
+    let stats = walk_danmaku_xml(reader, |_| {})?;
+    if stats.valid_entries == 0 {
         return Err(DanmakuXmlError::MissingDanmaku);
     }
-    Ok(document.stats())
+    Ok(stats)
 }
 
 /// One `<d>` entry that passed the shared entry rules.
@@ -92,15 +129,67 @@ pub(crate) struct ParsedDanmakuDocument {
 }
 
 impl ParsedDanmakuDocument {
-    pub(crate) fn stats(&self) -> DanmakuXmlStats {
-        DanmakuXmlStats {
-            valid_entries: self.entries.len(),
-            dropped_entries: self.dropped_entries,
-        }
-    }
-
     pub(crate) fn total_entries(&self) -> usize {
         self.entries.len() + self.dropped_entries
+    }
+}
+
+struct BoundedBufReader<R> {
+    inner: R,
+    max_bytes: usize,
+    bytes_read: usize,
+    saw_any: bool,
+    overflowed: bool,
+}
+
+impl<R> BoundedBufReader<R> {
+    fn new(inner: R, max_bytes: usize) -> Self {
+        Self {
+            inner,
+            max_bytes,
+            bytes_read: 0,
+            saw_any: false,
+            overflowed: false,
+        }
+    }
+}
+
+impl<R: BufRead> Read for BoundedBufReader<R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let buf = self.fill_buf()?;
+        let len = buf.len().min(out.len());
+        out[..len].copy_from_slice(&buf[..len]);
+        self.consume(len);
+        Ok(len)
+    }
+}
+
+impl<R: BufRead> BufRead for BoundedBufReader<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.overflowed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "danmaku XML exceeds size limit",
+            ));
+        }
+        let buf = self.inner.fill_buf()?;
+        if !buf.is_empty() {
+            self.saw_any = true;
+        }
+        let remaining = self.max_bytes.saturating_sub(self.bytes_read);
+        if buf.len() > remaining {
+            self.overflowed = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "danmaku XML exceeds size limit",
+            ));
+        }
+        Ok(buf)
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.bytes_read = self.bytes_read.saturating_add(amt);
+        self.inner.consume(amt);
     }
 }
 
@@ -119,12 +208,25 @@ pub(crate) fn parse_danmaku_document(
         return Err(DanmakuXmlError::TooLarge);
     }
 
-    let mut reader = Reader::from_reader(bytes);
+    let mut document = ParsedDanmakuDocument::default();
+    let stats = walk_danmaku_xml(Cursor::new(bytes), |parsed| {
+        document.entries.push(parsed);
+    })?;
+    document.dropped_entries = stats.dropped_entries;
+    Ok(document)
+}
+
+fn walk_danmaku_xml<R, F>(input: R, mut on_valid: F) -> Result<DanmakuXmlStats, DanmakuXmlError>
+where
+    R: BufRead,
+    F: FnMut(ParsedDanmakuEntry),
+{
+    let mut reader = Reader::from_reader(BoundedBufReader::new(input, MAX_DANMAKU_XML_BYTES));
     reader.config_mut().trim_text(false);
     let mut buffer = Vec::new();
     let mut depth = 0_usize;
     let mut saw_root = false;
-    let mut document = ParsedDanmakuDocument::default();
+    let mut stats = DanmakuXmlStats::default();
     let mut entry: Option<EntryState> = None;
     loop {
         match reader.read_event_into(&mut buffer) {
@@ -153,7 +255,7 @@ pub(crate) fn parse_danmaku_document(
                     saw_root = true;
                 } else if depth == 1 && name == b"d" {
                     // A self-closing `<d/>` has no text and no usable fields.
-                    document.dropped_entries += 1;
+                    stats.dropped_entries += 1;
                 } else if let Some(state) = entry.as_mut() {
                     state.invalid = true;
                 }
@@ -171,8 +273,11 @@ pub(crate) fn parse_danmaku_document(
                 {
                     if let Some(state) = entry.take() {
                         match state.finish() {
-                            Some(parsed) => document.entries.push(parsed),
-                            None => document.dropped_entries += 1,
+                            Some(parsed) => {
+                                stats.valid_entries += 1;
+                                on_valid(parsed);
+                            }
+                            None => stats.dropped_entries += 1,
                         }
                     }
                 }
@@ -213,16 +318,27 @@ pub(crate) fn parse_danmaku_document(
                     "document type declarations are not allowed".to_owned(),
                 ));
             }
-            Err(error) => return Err(DanmakuXmlError::InvalidXml(error.to_string())),
+            Err(error) => {
+                if reader.get_ref().overflowed {
+                    return Err(DanmakuXmlError::TooLarge);
+                }
+                return Err(DanmakuXmlError::InvalidXml(error.to_string()));
+            }
         }
         buffer.clear();
+    }
+    if reader.get_ref().overflowed {
+        return Err(DanmakuXmlError::TooLarge);
+    }
+    if !reader.get_ref().saw_any {
+        return Err(DanmakuXmlError::Empty);
     }
     if !saw_root || depth != 0 {
         return Err(DanmakuXmlError::InvalidXml(
             "danmaku XML document is incomplete".to_owned(),
         ));
     }
-    Ok(document)
+    Ok(stats)
 }
 
 /// Entry while its `<d>` element is still open.
@@ -575,5 +691,28 @@ mod tests {
                 dropped_entries: 1,
             })
         );
+    }
+
+    #[test]
+    fn streaming_reader_validation_matches_slice_across_small_chunks() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(SHARED_VECTORS).expect("validity vectors are valid JSON");
+        for vector in vectors["vectors"].as_array().expect("vectors array") {
+            let xml = vector["xml"].as_str().expect("vector xml");
+            let expected = inspect_danmaku_xml(xml.as_bytes());
+            let chunked = super::inspect_danmaku_xml_reader(std::io::BufReader::with_capacity(
+                7,
+                std::io::Cursor::new(xml.as_bytes()),
+            ));
+            assert_eq!(chunked, expected);
+        }
+        assert_eq!(
+            super::inspect_danmaku_xml_reader(std::io::Cursor::new(b"".as_slice())),
+            Err(DanmakuXmlError::Empty)
+        );
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file_path = dir.path().join("sample.xml");
+        std::fs::write(&file_path, br#"<i><d p="1,1,25,16777215">ok</d></i>"#).expect("write");
+        assert!(super::validate_danmaku_xml_file(&file_path).is_ok());
     }
 }

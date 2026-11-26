@@ -28,7 +28,9 @@ pub use manual::{DEFAULT_MANUAL_SEARCH_LIMIT, ManualMatchJobStart, ManualMatchTa
 pub use matching::{ProviderBaseUrl, ProviderUrlError, validate_provider_base_url};
 pub use normalize::{DanmakuNormalization, normalize_danmaku_xml};
 pub use path::{DanmakuPathError, danmaku_sidecar_path};
-pub use sidecar::{DanmakuSidecarScope, DanmakuWriteError, atomic_write_danmaku_xml};
+pub use sidecar::{
+    DanmakuPlaybackStream, DanmakuSidecarScope, DanmakuWriteError, atomic_write_danmaku_xml,
+};
 pub use xml::{
     DanmakuXmlError, DanmakuXmlStats, MAX_DANMAKU_COLOR, MAX_DANMAKU_FONT_SIZE, MAX_DANMAKU_MODE,
     MAX_DANMAKU_TEXT_CHARS, MAX_DANMAKU_TIME_SECONDS, MAX_DANMAKU_XML_BYTES, MIN_DANMAKU_FONT_SIZE,
@@ -41,6 +43,7 @@ use crate::{
     application::plugins::PluginService, observability::resources::ResourceMetrics,
     storage::Database,
 };
+use std::sync::Arc;
 
 /// Danmaku application service.
 ///
@@ -51,6 +54,7 @@ pub struct DanmakuService {
     database: Database,
     plugins: Option<PluginService>,
     resources: ResourceMetrics,
+    validation_cache: Arc<sidecar::DanmakuValidationCache>,
 }
 
 impl DanmakuService {
@@ -59,6 +63,7 @@ impl DanmakuService {
             database,
             plugins: None,
             resources: ResourceMetrics::new(),
+            validation_cache: Arc::new(sidecar::DanmakuValidationCache::default()),
         }
     }
 

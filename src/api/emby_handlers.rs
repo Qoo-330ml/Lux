@@ -335,10 +335,10 @@ pub(super) async fn emby_danmaku_info(
     }
     let service = state.danmaku();
     match service
-        .read_for_playback(&item_id, None, DanmakuSidecarScope::AnySource)
+        .has_for_playback(&item_id, None, DanmakuSidecarScope::AnySource)
         .await
     {
-        Ok(Some(_)) => Json(json!({
+        Ok(true) => Json(json!({
             "hasDanmaku": true,
             "format": "xml",
             "url": format!("/api/danmu/{public_item_id}/raw"),
@@ -346,7 +346,7 @@ pub(super) async fn emby_danmaku_info(
             "option": query.option,
         }))
         .into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
@@ -375,14 +375,17 @@ pub(super) async fn emby_danmaku_raw(
     }
     let service = state.danmaku();
     match service
-        .read_for_playback(&item_id, None, DanmakuSidecarScope::AnySource)
+        .open_for_playback(&item_id, None, DanmakuSidecarScope::AnySource)
         .await
     {
-        Ok(Some(bytes)) => Response::builder()
+        Ok(Some(stream)) => Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "application/xml; charset=utf-8")
+            .header("Content-Length", stream.content_length)
             .header("Cache-Control", "private, no-cache")
-            .body(Body::from(bytes))
+            .body(Body::from_stream(tokio_util::io::ReaderStream::new(
+                tokio::io::AsyncReadExt::take(stream.file, stream.content_length),
+            )))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
