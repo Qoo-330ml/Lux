@@ -4,7 +4,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -153,6 +153,9 @@ impl ReadModelMode {
 const LIBRARY_PAGE_CACHE_TTL: Duration = Duration::from_secs(15);
 const LIBRARY_PAGE_REFRESH_DEBOUNCE: Duration = Duration::from_secs(2);
 const MAX_LIBRARY_PAGE_CACHE_ENTRIES: usize = 256;
+/// Upper bound on estimated heap bytes held across cached library pages. Emby pages can carry up
+/// to 1,000 full items with per-stream `details_json`, so an entry count cap alone is not enough.
+const MAX_LIBRARY_PAGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 // Cold pages are refreshed on demand; the background worker keeps only hot pages warm.
 const MAX_LIBRARY_PAGE_REFRESH_ENTRIES: usize = 64;
 const MAX_SEARCH_FLIGHTS: usize = 256;
@@ -309,12 +312,31 @@ struct LibraryPageCacheEntry {
     request: LibraryPageRequest,
     value: Mutex<Option<CachedLibraryPage>>,
     compute_lock: Mutex<()>,
-    last_accessed_at: Mutex<Instant>,
+    last_accessed_at: std::sync::Mutex<Instant>,
+    estimated_bytes: AtomicUsize,
+}
+
+impl LibraryPageCacheEntry {
+    fn touch(&self) {
+        *self
+            .last_accessed_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+    }
+
+    fn last_accessed(&self) -> Instant {
+        *self
+            .last_accessed_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 struct LibraryPageCache {
     generation: AtomicU64,
     entries: Mutex<HashMap<LibraryPageCacheKey, Arc<LibraryPageCacheEntry>>>,
+    total_bytes: AtomicUsize,
+    max_bytes: AtomicUsize,
     refresh_tx: mpsc::Sender<()>,
     refresh_pending: AtomicBool,
     /// The warm-up runs on its own [`CatalogService`], so the cache keeps the pieces it needs to
@@ -341,6 +363,8 @@ impl LibraryPageCache {
         let cache = Arc::new(Self {
             generation: AtomicU64::new(0),
             entries: Mutex::new(HashMap::new()),
+            total_bytes: AtomicUsize::new(0),
+            max_bytes: AtomicUsize::new(MAX_LIBRARY_PAGE_CACHE_BYTES),
             refresh_tx,
             refresh_pending: AtomicBool::new(false),
             database,
@@ -364,6 +388,21 @@ impl LibraryPageCache {
             }
         });
         cache
+    }
+
+    #[cfg(test)]
+    fn set_max_bytes_for_tests(&self, max_bytes: usize) {
+        self.max_bytes.store(max_bytes, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    async fn cached_entry_count(&self) -> usize {
+        self.entries.lock().await.len()
+    }
+
+    #[cfg(test)]
+    fn cached_total_bytes(&self) -> usize {
+        self.total_bytes.load(Ordering::Acquire)
     }
 
     /// Recompute the hot entries with a service built from the cache's own configuration.
@@ -401,14 +440,68 @@ impl LibraryPageCache {
         }
     }
 
+    fn evict_one_lru(
+        &self,
+        entries: &mut HashMap<LibraryPageCacheKey, Arc<LibraryPageCacheEntry>>,
+        protect: Option<&LibraryPageCacheKey>,
+    ) -> bool {
+        let victim = entries
+            .iter()
+            .filter(|(candidate_key, _)| {
+                protect.is_none_or(|protected| *candidate_key != protected)
+            })
+            .min_by_key(|(_, candidate)| candidate.last_accessed())
+            .map(|(candidate_key, _)| candidate_key.clone());
+        let Some(victim_key) = victim else {
+            return false;
+        };
+        if let Some(removed) = entries.remove(&victim_key) {
+            let released = removed.estimated_bytes.swap(0, Ordering::AcqRel);
+            self.total_bytes.fetch_sub(released, Ordering::AcqRel);
+            return true;
+        }
+        false
+    }
+
+    async fn record_entry_bytes(
+        &self,
+        key: &LibraryPageCacheKey,
+        entry: &Arc<LibraryPageCacheEntry>,
+        new_bytes: usize,
+    ) {
+        let mut entries = self.entries.lock().await;
+        let is_current = entries
+            .get(key)
+            .is_some_and(|stored| Arc::ptr_eq(stored, entry));
+        if !is_current {
+            return;
+        }
+        let previous = entry.estimated_bytes.swap(new_bytes, Ordering::AcqRel);
+        if new_bytes >= previous {
+            self.total_bytes
+                .fetch_add(new_bytes - previous, Ordering::AcqRel);
+        } else {
+            self.total_bytes
+                .fetch_sub(previous - new_bytes, Ordering::AcqRel);
+        }
+        let max_bytes = self.max_bytes.load(Ordering::Acquire);
+        while (entries.len() > MAX_LIBRARY_PAGE_CACHE_ENTRIES
+            || self.total_bytes.load(Ordering::Acquire) > max_bytes)
+            && entries.len() > 1
+            && self.evict_one_lru(&mut entries, Some(key))
+        {}
+    }
+
     async fn entry(
         &self,
         key: LibraryPageCacheKey,
         request: LibraryPageRequest,
     ) -> Arc<LibraryPageCacheEntry> {
         let mut entries = self.entries.lock().await;
-        if !entries.contains_key(&key) && entries.len() >= MAX_LIBRARY_PAGE_CACHE_ENTRIES {
-            entries.clear();
+        if !entries.contains_key(&key) {
+            while entries.len() >= MAX_LIBRARY_PAGE_CACHE_ENTRIES
+                && self.evict_one_lru(&mut entries, None)
+            {}
         }
         entries
             .entry(key)
@@ -417,7 +510,8 @@ impl LibraryPageCache {
                     request,
                     value: Mutex::new(None),
                     compute_lock: Mutex::new(()),
-                    last_accessed_at: Mutex::new(Instant::now()),
+                    last_accessed_at: std::sync::Mutex::new(Instant::now()),
+                    estimated_bytes: AtomicUsize::new(0),
                 })
             })
             .clone()
@@ -441,7 +535,7 @@ impl LibraryPageCache {
         &self,
         service: &CatalogService,
         request: LibraryPageRequest,
-    ) -> Result<CatalogPage, CatalogError> {
+    ) -> Result<Arc<CatalogPage>, CatalogError> {
         let key = LibraryPageCacheKey {
             user_id: request.principal.user_id_string(),
             is_admin: request.principal.is_admin,
@@ -456,8 +550,8 @@ impl LibraryPageCache {
                 .map(|restrictions| restrictions.version),
             projection: request.projection,
         };
-        let entry = self.entry(key, request).await;
-        *entry.last_accessed_at.lock().await = Instant::now();
+        let entry = self.entry(key.clone(), request).await;
+        entry.touch();
         let generation = self.generation.load(Ordering::Acquire);
         {
             let cached = entry.value.lock().await;
@@ -467,7 +561,7 @@ impl LibraryPageCache {
                 {
                     self.schedule_refresh();
                 }
-                return Ok((*cached.page).clone());
+                return Ok(Arc::clone(&cached.page));
             }
         }
 
@@ -481,16 +575,18 @@ impl LibraryPageCache {
                 {
                     self.schedule_refresh();
                 }
-                return Ok((*cached.page).clone());
+                return Ok(Arc::clone(&cached.page));
             }
         }
 
-        let page = service.load_library_page(&entry.request).await?;
+        let page = Arc::new(service.load_library_page(&entry.request).await?);
+        let estimated_bytes = estimate_catalog_page_bytes(&page);
         *entry.value.lock().await = Some(CachedLibraryPage {
             generation,
             refreshed_at: Instant::now(),
-            page: Arc::new(page.clone()),
+            page: Arc::clone(&page),
         });
+        self.record_entry_bytes(&key, &entry, estimated_bytes).await;
         Ok(page)
     }
 
@@ -499,16 +595,15 @@ impl LibraryPageCache {
             .entries
             .lock()
             .await
-            .values()
-            .cloned()
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.clone()))
             .collect::<Vec<_>>();
-        let mut recently_accessed = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let last_accessed_at = *entry.last_accessed_at.lock().await;
-            recently_accessed.push((last_accessed_at, entry));
-        }
+        let recently_accessed = entries
+            .into_iter()
+            .map(|(key, entry)| (entry.last_accessed(), (key, entry)))
+            .collect::<Vec<_>>();
         let entries = take_recent_entries(recently_accessed, MAX_LIBRARY_PAGE_REFRESH_ENTRIES);
-        for entry in entries {
+        for (key, entry) in entries {
             let Ok(_compute_guard) = entry.compute_lock.try_lock() else {
                 continue;
             };
@@ -523,17 +618,130 @@ impl LibraryPageCache {
             drop(cached);
             match service.load_library_page(&entry.request).await {
                 Ok(page) if self.generation.load(Ordering::Acquire) == generation => {
+                    let page = Arc::new(page);
+                    let estimated_bytes = estimate_catalog_page_bytes(&page);
                     *entry.value.lock().await = Some(CachedLibraryPage {
                         generation,
                         refreshed_at: Instant::now(),
-                        page: Arc::new(page),
+                        page,
                     });
+                    self.record_entry_bytes(&key, &entry, estimated_bytes).await;
                 }
                 Ok(_) => self.schedule_refresh(),
                 Err(error) => tracing::debug!(%error, "library page cache refresh failed"),
             }
         }
     }
+}
+
+fn estimate_option_str_bytes(value: &Option<String>) -> usize {
+    value.as_ref().map_or(0, String::len)
+}
+
+fn estimate_json_value_bytes(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            std::mem::size_of::<serde_json::Value>()
+        }
+        serde_json::Value::String(text) => {
+            std::mem::size_of::<serde_json::Value>().saturating_add(text.len())
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .fold(std::mem::size_of::<serde_json::Value>(), |total, item| {
+                total.saturating_add(estimate_json_value_bytes(item))
+            }),
+        serde_json::Value::Object(map) => map.iter().fold(
+            std::mem::size_of::<serde_json::Value>(),
+            |total, (key, item)| {
+                total
+                    .saturating_add(key.len())
+                    .saturating_add(estimate_json_value_bytes(item))
+            },
+        ),
+    }
+}
+
+fn estimate_catalog_page_bytes(page: &CatalogPage) -> usize {
+    let mut bytes = std::mem::size_of::<CatalogPage>();
+    for item in &page.items {
+        bytes = bytes
+            .saturating_add(std::mem::size_of::<CatalogItem>())
+            .saturating_add(item.id.len())
+            .saturating_add(item.library_id.len())
+            .saturating_add(item.item_type.len())
+            .saturating_add(estimate_option_str_bytes(&item.parent_id))
+            .saturating_add(estimate_option_str_bytes(&item.series_id))
+            .saturating_add(estimate_option_str_bytes(&item.series_name))
+            .saturating_add(item.title.len())
+            .saturating_add(item.sort_title.len())
+            .saturating_add(estimate_option_str_bytes(&item.original_title))
+            .saturating_add(estimate_option_str_bytes(&item.overview))
+            .saturating_add(estimate_option_str_bytes(&item.premiere_date))
+            .saturating_add(estimate_option_str_bytes(&item.last_air_date))
+            .saturating_add(estimate_option_str_bytes(&item.status))
+            .saturating_add(estimate_option_str_bytes(&item.original_language))
+            .saturating_add(estimate_option_str_bytes(&item.rating_source))
+            .saturating_add(estimate_option_str_bytes(&item.poster_image_tag))
+            .saturating_add(estimate_option_str_bytes(&item.series_primary_image_tag))
+            .saturating_add(estimate_option_str_bytes(&item.series_logo_image_tag))
+            .saturating_add(estimate_option_str_bytes(&item.series_thumb_image_tag))
+            .saturating_add(estimate_option_str_bytes(&item.fanart_image_tag))
+            .saturating_add(estimate_option_str_bytes(&item.thumb_image_tag))
+            .saturating_add(estimate_option_str_bytes(&item.logo_image_tag))
+            .saturating_add(estimate_option_str_bytes(&item.banner_image_tag))
+            .saturating_add(estimate_option_str_bytes(&item.disc_image_tag))
+            .saturating_add(estimate_option_str_bytes(&item.art_image_tag))
+            .saturating_add(estimate_option_str_bytes(&item.wallpaper_image_tag));
+        for (provider, id) in &item.provider_ids {
+            bytes = bytes
+                .saturating_add(provider.len())
+                .saturating_add(id.len())
+                .saturating_add(48);
+        }
+        for tag in item
+            .series_fanart_image_tags
+            .iter()
+            .chain(item.fanart_image_tags.iter())
+        {
+            bytes = bytes
+                .saturating_add(std::mem::size_of::<String>())
+                .saturating_add(tag.len());
+        }
+        for source in &item.media_sources {
+            bytes = bytes
+                .saturating_add(std::mem::size_of::<CatalogSource>())
+                .saturating_add(source.id.len())
+                .saturating_add(source.source_kind.len())
+                .saturating_add(estimate_option_str_bytes(&source.file_name))
+                .saturating_add(estimate_option_str_bytes(&source.container))
+                .saturating_add(estimate_option_str_bytes(&source.external_url))
+                .saturating_add(estimate_option_str_bytes(&source.edition_name))
+                .saturating_add(estimate_option_str_bytes(&source.quality_label))
+                .saturating_add(source.probe_status.len());
+            for stream in &source.streams {
+                bytes = bytes
+                    .saturating_add(std::mem::size_of::<CatalogStream>())
+                    .saturating_add(stream.stream_type.len())
+                    .saturating_add(estimate_option_str_bytes(&stream.codec))
+                    .saturating_add(estimate_option_str_bytes(&stream.language))
+                    .saturating_add(estimate_option_str_bytes(&stream.title));
+                for (key, value) in &stream.details {
+                    bytes = bytes
+                        .saturating_add(key.len())
+                        .saturating_add(estimate_json_value_bytes(value))
+                        .saturating_add(48);
+                }
+            }
+            for chapter in &source.chapters {
+                bytes = bytes
+                    .saturating_add(std::mem::size_of::<CatalogChapter>())
+                    .saturating_add(estimate_option_str_bytes(&chapter.name))
+                    .saturating_add(chapter.marker_type.len());
+            }
+        }
+    }
+    bytes
 }
 
 fn take_recent_entries<T>(mut entries: Vec<(Instant, T)>, limit: usize) -> Vec<T> {
@@ -1102,6 +1310,26 @@ impl CatalogService {
         Ok(CatalogPage::new(items, total, offset, limit))
     }
 
+    pub async fn list_library_items_filtered_shared(
+        &self,
+        principal: AccessPrincipal,
+        library_id: &str,
+        filter: &CatalogFilter,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Arc<CatalogPage>, CatalogError> {
+        self.list_library_items_in_scope_with_projection_shared(
+            principal,
+            library_id,
+            filter,
+            None,
+            offset,
+            limit,
+            CatalogItemProjection::Full,
+        )
+        .await
+    }
+
     pub async fn list_library_items_filtered(
         &self,
         principal: AccessPrincipal,
@@ -1135,14 +1363,10 @@ impl CatalogService {
         .await
     }
 
-    /// Library page with an explicit DTO projection.
-    ///
-    /// A [`CatalogItemProjection::Card`] page is read with the summary row projection: the grid
-    /// renders the item columns, the image tags and the preferred source duration, so the
-    /// per-source stream rows are not read at all. Cached pages keep the projection in their key,
-    /// so a card page can never be served to a full-projection request.
+    /// Library page with an explicit DTO projection, returning a shared `Arc<CatalogPage>` so
+    /// read-only HTTP handlers serve cached pages without deep-cloning every item.
     #[allow(clippy::too_many_arguments)]
-    pub async fn list_library_items_in_scope_with_projection(
+    pub async fn list_library_items_in_scope_with_projection_shared(
         &self,
         principal: AccessPrincipal,
         library_id: &str,
@@ -1151,7 +1375,7 @@ impl CatalogService {
         offset: i64,
         limit: i64,
         projection: CatalogItemProjection,
-    ) -> Result<CatalogPage, CatalogError> {
+    ) -> Result<Arc<CatalogPage>, CatalogError> {
         let Some(library) = self.database.find_library(library_id).await? else {
             return Err(CatalogError::LibraryNotFound);
         };
@@ -1178,7 +1402,37 @@ impl CatalogService {
             content_restrictions,
             projection,
         };
-        return self.library_page_cache.get_or_load(self, request).await;
+        self.library_page_cache.get_or_load(self, request).await
+    }
+
+    /// Library page with an explicit DTO projection.
+    ///
+    /// A [`CatalogItemProjection::Card`] page is read with the summary row projection: the grid
+    /// renders the item columns, the image tags and the preferred source duration, so the
+    /// per-source stream rows are not read at all. Cached pages keep the projection in their key,
+    /// so a card page can never be served to a full-projection request.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_library_items_in_scope_with_projection(
+        &self,
+        principal: AccessPrincipal,
+        library_id: &str,
+        filter: &CatalogFilter,
+        parent_scope: Option<CatalogParentScope>,
+        offset: i64,
+        limit: i64,
+        projection: CatalogItemProjection,
+    ) -> Result<CatalogPage, CatalogError> {
+        self.list_library_items_in_scope_with_projection_shared(
+            principal,
+            library_id,
+            filter,
+            parent_scope,
+            offset,
+            limit,
+            projection,
+        )
+        .await
+        .map(|page| (*page).clone())
     }
 
     /// Sort key supported by the read-model slice. `None` means the filter set is not covered yet
@@ -7454,6 +7708,73 @@ mod tests {
             .await?;
         assert_eq!(tag_names(&tags), ["Series Only"]);
         assert_eq!(total, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn library_page_cache_shares_arc_without_deep_cloning_and_evicts_by_byte_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database, catalog, principal, visible_library_id, _hidden) =
+            tag_test_setup().await?;
+        insert_tag_item(&database, "cache-alpha", &visible_library_id, "Alpha", "PG").await?;
+        insert_tag_item(&database, "cache-bravo", &visible_library_id, "Bravo", "PG").await?;
+
+        let filter = super::CatalogFilter::default();
+        let first = catalog
+            .list_library_items_in_scope_with_projection_shared(
+                principal,
+                &visible_library_id,
+                &filter,
+                None,
+                0,
+                10,
+                super::CatalogItemProjection::Full,
+            )
+            .await?;
+        let second = catalog
+            .list_library_items_in_scope_with_projection_shared(
+                principal,
+                &visible_library_id,
+                &filter,
+                None,
+                0,
+                10,
+                super::CatalogItemProjection::Full,
+            )
+            .await?;
+
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "cache hits must return the shared Arc<CatalogPage> without deep-cloning the page"
+        );
+        let one_page_bytes = catalog.library_page_cache.cached_total_bytes();
+        assert!(one_page_bytes > 0);
+
+        // Set a byte cap that fits one page but forces eviction when a second distinct page arrives.
+        catalog
+            .library_page_cache
+            .set_max_bytes_for_tests(one_page_bytes);
+        let third = catalog
+            .list_library_items_in_scope_with_projection_shared(
+                principal,
+                &visible_library_id,
+                &filter,
+                None,
+                1,
+                10,
+                super::CatalogItemProjection::Full,
+            )
+            .await?;
+        assert_eq!(third.items.len(), 1);
+        assert_eq!(
+            catalog.library_page_cache.cached_entry_count().await,
+            1,
+            "byte-budget eviction must drop the least-recently-accessed page instead of growing unboundedly"
+        );
+        assert!(
+            catalog.library_page_cache.cached_total_bytes() <= one_page_bytes,
+            "cached total bytes must stay within the configured budget"
+        );
         Ok(())
     }
 }

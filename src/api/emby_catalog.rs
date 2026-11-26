@@ -1348,7 +1348,7 @@ pub(super) async fn emby_library_root_count(
         LibraryKind::HomeVideos => vec!["VIDEO".to_owned()],
     };
     catalog
-        .list_library_items_filtered(
+        .list_library_items_filtered_shared(
             principal,
             library_id,
             &CatalogFilter {
@@ -1455,7 +1455,9 @@ pub(super) async fn emby_user_latest(
     };
     if group_items && emby_latest_groups_children(&query) {
         let (grouped_page, group_counts) =
-            match emby_group_latest_page(&state, principal, page).await {
+            match emby_group_latest_page(&state, principal, std::sync::Arc::unwrap_or_clone(page))
+                .await
+            {
                 Ok(result) => result,
                 Err(status) => return status.into_response(),
             };
@@ -2676,7 +2678,7 @@ pub(super) async fn emby_catalog_page_from_query(
     state: &ReadyAppState,
     principal: AccessPrincipal,
     query: &EmbyItemsQuery,
-) -> Result<CatalogPage, StatusCode> {
+) -> Result<std::sync::Arc<CatalogPage>, StatusCode> {
     let (offset, limit) = match emby_catalog_items_page_params(query) {
         Ok(params) => params,
         Err(status) => return Err(status),
@@ -2694,7 +2696,12 @@ pub(super) async fn emby_catalog_page_from_query(
             normalize_search_query(raw_query),
             normalize_search_like_query(raw_query),
         ) else {
-            return Ok(CatalogPage::new(Vec::new(), 0, offset, limit));
+            return Ok(std::sync::Arc::new(CatalogPage::new(
+                Vec::new(),
+                0,
+                offset,
+                limit,
+            )));
         };
         let item_types = query
             .include_item_types
@@ -2716,6 +2723,7 @@ pub(super) async fn emby_catalog_page_from_query(
                 query.enable_total_record_count.unwrap_or(true),
             )
             .await
+            .map(std::sync::Arc::new)
             .map_err(emby_catalog_error_status);
     }
     let mut filter = catalog_filter_from_emby(query);
@@ -2730,7 +2738,7 @@ pub(super) async fn emby_catalog_page_from_query(
         Some(parent_id) => {
             if let Ok(library_id) = parent_id.parse::<crate::domain::ids::LibraryId>() {
                 match catalog
-                    .list_library_items_filtered(
+                    .list_library_items_filtered_shared(
                         principal,
                         &library_id.to_string(),
                         &filter,
@@ -2740,12 +2748,11 @@ pub(super) async fn emby_catalog_page_from_query(
                     .await
                 {
                     Ok(page) => Ok(page),
-                    Err(CatalogError::LibraryNotFound) => {
-                        emby_catalog_page_for_item_parent(
-                            state, catalog, principal, parent_id, query, offset, limit,
-                        )
-                        .await
-                    }
+                    Err(CatalogError::LibraryNotFound) => emby_catalog_page_for_item_parent(
+                        state, catalog, principal, parent_id, query, offset, limit,
+                    )
+                    .await
+                    .map(std::sync::Arc::new),
                     Err(error) => Err(error),
                 }
             } else {
@@ -2753,13 +2760,13 @@ pub(super) async fn emby_catalog_page_from_query(
                     state, catalog, principal, parent_id, query, offset, limit,
                 )
                 .await
+                .map(std::sync::Arc::new)
             }
         }
-        None => {
-            catalog
-                .list_all_items_filtered(principal, &filter, offset, limit)
-                .await
-        }
+        None => catalog
+            .list_all_items_filtered(principal, &filter, offset, limit)
+            .await
+            .map(std::sync::Arc::new),
     };
     match page {
         Ok(page) => Ok(page),

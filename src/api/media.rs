@@ -1062,7 +1062,7 @@ pub(super) async fn lux_list_library_items(
         }
     }
     match catalog
-        .list_library_items_in_scope_with_projection(
+        .list_library_items_in_scope_with_projection_shared(
             principal,
             &library_id,
             &filter,
