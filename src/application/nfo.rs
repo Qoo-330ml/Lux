@@ -221,7 +221,7 @@ pub struct MovieNfoMetadata {
 
 pub(crate) const MAX_LOCAL_NFO_BYTES: usize = 1024 * 1024;
 const MAX_LOCAL_NFO_EVENTS: usize = 20_000;
-const LOCAL_NFO_CACHE_SCHEMA_VERSION: u8 = 1;
+const LOCAL_NFO_CACHE_SCHEMA_VERSION: u8 = 2;
 const MAX_MOVIE_NFO_ACTORS: usize = 100;
 const MAX_MOVIE_NFO_STREAMS: usize = 128;
 const MAX_MOVIE_ACTOR_FIELD_BYTES: usize = 256 * 1024;
@@ -1610,14 +1610,20 @@ struct DecodedLocalNfoCache {
     relation_fingerprint: Option<Vec<u8>>,
 }
 
-fn decode_local_nfo_cache(json: &str) -> Result<DecodedLocalNfoCache, String> {
-    let value =
-        serde_json::from_str::<serde_json::Value>(json).map_err(|error| error.to_string())?;
+#[derive(Debug)]
+enum DecodeLocalNfoCacheError {
+    UnsupportedSchemaVersion,
+    Malformed(String),
+}
+
+fn decode_local_nfo_cache(json: &str) -> Result<DecodedLocalNfoCache, DecodeLocalNfoCacheError> {
+    let value = serde_json::from_str::<serde_json::Value>(json)
+        .map_err(|error| DecodeLocalNfoCacheError::Malformed(error.to_string()))?;
     if value.get("schemaVersion").is_some() {
         let envelope = serde_json::from_value::<LocalNfoCacheEnvelope>(value)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| DecodeLocalNfoCacheError::Malformed(error.to_string()))?;
         if envelope.schema_version != LOCAL_NFO_CACHE_SCHEMA_VERSION {
-            return Err("unsupported local NFO cache schema version".to_owned());
+            return Err(DecodeLocalNfoCacheError::UnsupportedSchemaVersion);
         }
         let semantic_fingerprint = envelope
             .semantic_fingerprint
@@ -1637,7 +1643,7 @@ fn decode_local_nfo_cache(json: &str) -> Result<DecodedLocalNfoCache, String> {
             semantic_fingerprint: None,
             relation_fingerprint: None,
         })
-        .map_err(|error| error.to_string())
+        .map_err(|error| DecodeLocalNfoCacheError::Malformed(error.to_string()))
 }
 
 pub(crate) fn local_nfo_details_from_cache_json(json: &str) -> Option<LocalNfoDetails> {
@@ -1856,19 +1862,39 @@ impl LocalNfoMetadataStore {
         match decode_local_nfo_cache(json) {
             Ok(decoded) => Ok(Some(decoded.details)),
             Err(error) => {
+                self.forget_details(item_id);
+                self.clear_stale_or_malformed_cache(item_id, json, error)
+                    .await?;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn clear_stale_or_malformed_cache(
+        &self,
+        item_id: &str,
+        json: &str,
+        error: DecodeLocalNfoCacheError,
+    ) -> Result<(), LocalNfoMetadataStoreError> {
+        match error {
+            DecodeLocalNfoCacheError::UnsupportedSchemaVersion => {
+                tracing::debug!(
+                    item_id,
+                    "clearing outdated local NFO cache entry for schema rebuild"
+                );
+            }
+            DecodeLocalNfoCacheError::Malformed(error) => {
                 tracing::warn!(
                     item_id,
                     error = %error,
                     "derived local NFO cache is malformed; clearing it for rebuild"
                 );
-                self.forget_details(item_id);
-                self.database
-                    .clear_media_item_nfo_metadata_if_json(item_id, json)
-                    .await
-                    .map_err(LocalNfoMetadataStoreError::Storage)?;
-                Ok(None)
             }
         }
+        self.database
+            .clear_media_item_nfo_metadata_if_json(item_id, json)
+            .await
+            .map_err(LocalNfoMetadataStoreError::Storage)
     }
 
     pub async fn state(
@@ -1957,15 +1983,9 @@ impl LocalNfoMetadataStore {
                 decoded.relation_fingerprint,
             ))),
             Err(error) => {
-                tracing::warn!(
-                    item_id,
-                    error = %error,
-                    "derived local NFO cache is malformed; clearing it for rebuild"
-                );
-                self.database
-                    .clear_media_item_nfo_metadata_if_json(item_id, &json)
-                    .await
-                    .map_err(LocalNfoMetadataStoreError::Storage)?;
+                self.forget_details(item_id);
+                self.clear_stale_or_malformed_cache(item_id, &json, error)
+                    .await?;
                 Ok(None)
             }
         }
@@ -3508,7 +3528,13 @@ impl NfoWriteService {
         &self,
         item_id: &str,
     ) -> Result<Option<LocalNfoProjection>, NfoWriteError> {
-        let target = self.item_nfo_target(item_id).await?;
+        let target = match self.item_nfo_target(item_id).await {
+            Ok(target) => target,
+            // A missing/merged source or a series whose episodes sit directly under the library
+            // root has no sidecar NFO target to read.
+            Err(NfoWriteError::ItemNotFound) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         self.read_item_projection_at_target(&target).await
     }
 
@@ -3543,10 +3569,12 @@ impl NfoWriteService {
         context: &StoredMediaWritebackContext,
         cache: &LocalNfoProjectionCache,
     ) -> Result<(Option<LocalNfoProjection>, bool), NfoWriteError> {
-        let source = context.source.as_ref().ok_or(NfoWriteError::ItemNotFound)?;
-        let target = self
-            .item_nfo_target_from_source(&context.item_type, season_number, source)
-            .await?;
+        let Some(target) = self
+            .resolve_writeback_projection_target(season_number, context)
+            .await?
+        else {
+            return Ok((None, false));
+        };
         let cell = {
             let mut entries = cache.entries.lock().await;
             entries
@@ -3574,11 +3602,31 @@ impl NfoWriteService {
         season_number: Option<i64>,
         context: &crate::storage::StoredMediaWritebackContext,
     ) -> Result<Option<LocalNfoProjection>, NfoWriteError> {
-        let source = context.source.as_ref().ok_or(NfoWriteError::ItemNotFound)?;
-        let target = self
-            .item_nfo_target_from_source(&context.item_type, season_number, source)
-            .await?;
+        let Some(target) = self
+            .resolve_writeback_projection_target(season_number, context)
+            .await?
+        else {
+            return Ok(None);
+        };
         self.read_item_projection_at_target(&target).await
+    }
+
+    async fn resolve_writeback_projection_target(
+        &self,
+        season_number: Option<i64>,
+        context: &StoredMediaWritebackContext,
+    ) -> Result<Option<PathBuf>, NfoWriteError> {
+        let Some(source) = context.source.as_ref() else {
+            return Ok(None);
+        };
+        match self
+            .item_nfo_target_from_source(&context.item_type, season_number, source)
+            .await
+        {
+            Ok(target) => Ok(Some(target)),
+            Err(NfoWriteError::ItemNotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     async fn read_item_projection_at_target(
@@ -3845,15 +3893,19 @@ impl NfoWriteService {
             "EPISODE" => find_episode_nfo_target(&media_path, &directory).await,
             "VIDEO" => media_path.with_extension("nfo"),
             "SERIES" => {
-                let series_dir = series_directory(&root, &source.relative_path)
-                    .ok_or_else(|| NfoWriteError::PathOutsideRoot(directory.clone()))?;
-                let series_dir = fs::canonicalize(&series_dir)
-                    .await
-                    .map_err(|error| io_error(&series_dir, error))?;
-                if !series_dir.starts_with(&root) {
-                    return Err(NfoWriteError::PathOutsideRoot(series_dir));
+                if let Some(series_dir) = series_directory(&root, &source.relative_path) {
+                    let series_dir = fs::canonicalize(&series_dir)
+                        .await
+                        .map_err(|error| io_error(&series_dir, error))?;
+                    if !series_dir.starts_with(&root) {
+                        return Err(NfoWriteError::PathOutsideRoot(series_dir));
+                    }
+                    series_dir.join("tvshow.nfo")
+                } else if directory != root {
+                    directory.join("tvshow.nfo")
+                } else {
+                    return Err(NfoWriteError::ItemNotFound);
                 }
-                series_dir.join("tvshow.nfo")
             }
             "SEASON" => find_season_nfo_target(&directory, season_number).await,
             _ => return Err(NfoWriteError::ItemNotFound),
@@ -5464,5 +5516,173 @@ mod tests {
             result,
             Err(NfoWriteError::InvalidMetadata(message)) if message == "metadata field is too long"
         ));
+    }
+
+    #[tokio::test]
+    async fn series_without_season_folder_reads_tvshow_nfo_and_skips_root_level_without_path_outside_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let writer = NfoWriteService::new(database);
+        let root = directory.path().join("Shows");
+        let flat_show = root.join("Flat Show (2025)");
+        fs::create_dir_all(&flat_show).await?;
+        fs::write(
+            flat_show.join("Flat.Show.S01E01.strm"),
+            b"http://example.invalid/stream\n",
+        )
+        .await?;
+        fs::write(
+            flat_show.join("tvshow.nfo"),
+            b"<tvshow><title>Flat Show</title></tvshow>",
+        )
+        .await?;
+        fs::write(
+            root.join("Stray.S01E01.strm"),
+            b"http://example.invalid/stream\n",
+        )
+        .await?;
+
+        let root_path = root.to_string_lossy().into_owned();
+        let flat_context = StoredMediaWritebackContext {
+            item_type: "SERIES".to_owned(),
+            source: Some(StoredMediaSourcePath {
+                source_id: "src-flat".to_owned(),
+                item_id: "ep-flat".to_owned(),
+                probe_status: "DONE".to_owned(),
+                root_path: root_path.clone(),
+                relative_path: "Flat Show (2025)/Flat.Show.S01E01.strm".to_owned(),
+            }),
+        };
+        let cache = LocalNfoProjectionCache::default();
+        let (projection, _) = writer
+            .read_item_projection_with_writeback_context_cached(None, &flat_context, &cache)
+            .await?;
+        assert_eq!(
+            projection.and_then(|item| item.metadata.title),
+            Some("Flat Show".to_owned())
+        );
+
+        let root_context = StoredMediaWritebackContext {
+            item_type: "SERIES".to_owned(),
+            source: Some(StoredMediaSourcePath {
+                source_id: "src-root".to_owned(),
+                item_id: "ep-root".to_owned(),
+                probe_status: "DONE".to_owned(),
+                root_path,
+                relative_path: "Stray.S01E01.strm".to_owned(),
+            }),
+        };
+        let (root_cached, _) = writer
+            .read_item_projection_with_writeback_context_cached(None, &root_context, &cache)
+            .await?;
+        assert!(root_cached.is_none());
+        let root_uncached = writer
+            .read_item_projection_with_writeback_context(None, &root_context)
+            .await?;
+        assert!(root_uncached.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_item_projection_returns_none_for_root_series_and_missing_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let shows_root = directory.path().join("Shows");
+        let movies_root = directory.path().join("Movies");
+        let movie_dir = movies_root.join("Missing Source (2020)");
+        fs::create_dir_all(&shows_root).await?;
+        fs::create_dir_all(&movie_dir).await?;
+        fs::write(
+            shows_root.join("Stray.S01E01.strm"),
+            b"http://example.invalid/stray\n",
+        )
+        .await?;
+        fs::write(movie_dir.join("Missing.Source.2020.mkv"), b"movie").await?;
+
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let shows_lib = libraries
+            .create_library("Shows", LibraryKind::Series, false)
+            .await?;
+        libraries
+            .add_root(shows_lib.id, shows_root.to_str().ok_or("non-utf8 root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_series_library(shows_lib.id)
+            .await?;
+        let series_id: String = sqlx::query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'SERIES' LIMIT 1",
+        )
+        .bind(shows_lib.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+
+        let movies_lib = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(movies_lib.id, movies_root.to_str().ok_or("non-utf8 root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(movies_lib.id)
+            .await?;
+        let movie_id: String = sqlx::query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' LIMIT 1",
+        )
+        .bind(movies_lib.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE filesystem_entries
+             SET is_missing = 1
+             WHERE id IN (SELECT filesystem_entry_id FROM media_sources WHERE item_id = ?)",
+        )
+        .bind(&movie_id)
+        .execute(database.pool())
+        .await?;
+
+        let writer = NfoWriteService::new(database);
+        assert!(writer.read_item_projection(&series_id).await?.is_none());
+        assert!(writer.read_item_projection(&movie_id).await?.is_none());
+
+        let missing_context = StoredMediaWritebackContext {
+            item_type: "MOVIE".to_owned(),
+            source: None,
+        };
+        let cache = LocalNfoProjectionCache::default();
+        assert!(
+            writer
+                .read_item_projection_with_writeback_context(None, &missing_context)
+                .await?
+                .is_none()
+        );
+        assert_eq!(
+            writer
+                .read_item_projection_with_writeback_context_cached(None, &missing_context, &cache)
+                .await?,
+            (None, false)
+        );
+        assert!(matches!(
+            writer
+                .write_item_series_nfo(&series_id, &super::MovieNfoMetadata::default())
+                .await,
+            Err(NfoWriteError::ItemNotFound)
+        ));
+        assert!(matches!(
+            writer
+                .write_item_nfo(&movie_id, &super::NfoMetadata::default())
+                .await,
+            Err(NfoWriteError::ItemNotFound)
+        ));
+        Ok(())
     }
 }

@@ -8,6 +8,129 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 >
 > 发版时两处都要改：本文档，以及应用内「设置 → 更新日志」页面使用的内置列表：新版本条目追加到 `web/src/features/admin/changelog/releases/` 下对应大版本的文件（如 `v0-7.ts`）；新大版本需新增文件，并在 `releases/index.ts` 中按倒序插入（该页面不读取本文件）。
 
+## [0.7.30] - 2026-11-24
+
+这版几乎全是安全与稳定性收紧：图片、STRM、webhook 与 Emby 迁移四条访问外部地址的路径统一到同一套「解析一次、只连校验过的
+地址」的原语上；登录限流改成先占额度再验密码，Web 与 Emby 三个登录入口共用一份额度；`can_remote_access` 重新生效，且只按
+可信解析出的地址判断。另外合入了 PR #61 的 PostgreSQL 人物序列并发与 FILL_MISSING 修复。
+
+### ✨ feat
+
+* **access:** `can_remote_access` 重新生效，只看解析后的地址
+
+  `RemoteAccessPolicy::is_remote` 之前被简化成恒 `false`，用户策略实际上一直没生效。现在只接受可信 `access-IP resolver`
+  解析出的客户端地址（对端 + 已配置可信代理 + 容器默认网关，从右向左）：loopback、RFC1918、IPv4 链路本地、IPv6 ULA/链路
+  本地算本地，公网与 Tailscale/CGNAT `100.64.0.0/10` 算远程。Web 登录、Web session、客户端令牌、共享 API Key、管理后台、
+  Emby 接口、播放资源（签名直链/HLS）、图片下载与 WebSocket 握手统一执行；远程登录被拒时撤销新凭证并返回 403，可信代理
+  配置读不出来或转发链畸形返回 503 而不放行。原来直接读 `X-Forwarded-For` 的 `client_ip` 助手已删除，调用方无法再从请求头
+  自行判断本地/远程。
+
+### 🐛 fix
+
+* **images:** 图片下载只连校验过的地址
+
+  校验域名之后到真正建连之间还会再解析一次，DNS 可以在两者之间换成内网地址。现在只解析一次、要求每个候选地址都通过
+  `remote_url_policy`，直连时用 `resolve_to_addrs` 固定这组地址，重试复用同一个客户端；演员资料图也走同一条路径。配了代理
+  时最终连接由代理发起、host 侧无法固定，仍按私网规则拒绝，并修掉了 socks 代理与 reqwest 代理规则（`HTTP_PROXY`、
+  `NO_PROXY` 等）的解析差异。
+
+* **strm:** 拒绝禁止的播放目标并固定解析结果
+
+  URL host 改按 `url::Host` 解析、去掉结尾根点、大小写不敏感地拒绝 `localhost`/`metadata.google.internal`；新增独立的 STRM
+  地址策略（局域网 RFC1918 与 ULA 允许，loopback、链路本地、未指定、组播、广播、0/8、240/4、CGNAT、文档网段以及
+  IPv4-mapped/compatible/6to4/Teredo/NAT64 形式拒绝）；域名解析后任一候选被拒就整体拒绝，初始请求与每次重定向都用
+  `resolve_to_addrs` 固定地址。Web Range 路径命中禁止目标直接 502，不转发上游 body、也不联系目标。
+
+* **emby:** 迁移来源的 URL host 也走 host 侧私网闸门
+
+  带类型的 URL host 在 Emby 迁移里按同一套分类判断，不再依赖字符串前缀。
+
+* **auth:** 登录限流先占额度，且按账户归并
+
+  `is_allowed` 与 `record_failure` 拆成两次调用时，同一账户的并发请求会读到同一个未递增的失败数，一波并发猜测全被放行之后
+  才记账。现在合并成一次「预留一次尝试」：额度检查与自增在同一把锁内完成，锁在跑 Argon2 之前释放；凭证错误保留预留，登录
+  成功清空，访问地址解析失败、`AccessDenied`、规则读取失败或存储错误则归还预留，不会把服务端故障算成密码错误。限流键改为
+  解析后的账户（`user:<id>`），Web 登录、`/Users/AuthenticateByName` 与 `/Users/{id}/Authenticate` 共用一份额度，解析不到
+  的用户名或 id 才退回 `name:`/`id:` 桶。
+
+* **config:** 数据库凭据写入与宿主机挂载下的持久化加固
+
+  `database.json` 与选择标记改走同一个私有原子写入：临时文件从创建起就是 `0600`，写完 `fsync`、改名、再 `fsync` 父目录，
+  任何失败路径都会删掉临时文件，不会留下写了一半的密码文件。配置目录缺失时按 `0700` 创建，宿主机给的 `0755` 保留，
+  world-writable 会在写入前收紧（NFS/SMB 上 `chmod` 失败视为尽力而为并记录）。改名之后父目录 `fsync` 失败（FUSE/SMB、
+  部分 NFS）只影响掉电持久性，降级为日志而不是报保存失败。
+
+* **metadata:** PostgreSQL 人物序列并发与 FILL_MISSING 的条目不存在（PR #61）
+
+  并发建人物时 `person_id_sequence` 会撞号：现在用 `pg_advisory_xact_lock` 串行推进，单条 CTE 里读
+  `pg_sequence_last_value` 再 `setval`，恢复时先插入显式序列行，`ON CONFLICT DO NOTHING` 的分配重试不再让 PostgreSQL 事务
+  进入 aborted 状态，拆分人物身份也加了元数据写锁与事务。FILL_MISSING 里只读的图片/NFO 探查把「条目不存在」干净地转成
+  `ItemNotFound`，图片写回前先预检本地目录；只为指纹的写入同步到 `media_item_nfo_cache`，已合并或已移除的条目不再发多余的
+  `MetadataUpdated` webhook。
+
+### ♻️ refactor
+
+* **remote_url_policy:** 抽出一套共用的出站地址原语（host 分类、地址判定、DNS pinning），STRM、图片、webhook 与 Emby 迁移
+  共用同一份实现；同时修正「展开后的地址」判断并把 IANA 特殊用途网段边界固定下来。
+
+### ⚡ perf
+
+* **people:** 规范化人物合并时不再遍历整个 manifest 目录。
+
+### 📝 docs
+
+* 对齐 `lux-env` 的加载方式、探测默认值、Docker root 规范与安全 cookie 检查的说明。
+
+## [0.7.29] - 2026-11-24
+
+0.7.27 的人物收敛上线后在实机上暴露了两个问题：旧版人物关系快照会被误判成过期、整块挪进隔离区；已经存在的双 NFO 也不
+会自己重新读一遍。这版把两件事都补上。
+
+### 🐛 fix
+
+* **people:** 旧版人物关系快照不再被误隔离
+
+  `LUX-FP-1` 时代写下的 32 字节快照，遇到 `LUX-FP-2` 且容器/FUSE 挂载的设备号 `st_dev` 发生漂移时，会被判成「和设备
+  不一致」而把好好的 `people.json` 挪进 `quarantine/people-relations/`。现在这种情况回退到精确文件尺寸、纳秒级修改时间、
+  片名与年份一起校验，正常的 `people.json` 不会再被隔离。
+
+* **people:** 被误隔离的快照会自动搬回来
+
+  升级后首次启动会跑一次一次性恢复（`lux_meta` 的 `people_quarantine_legacy_fp_recovery_v1`）：把当初因为这个原因被
+  隔离、且仍能匹配在库媒体的旧快照迁回原位并重建人物索引（索引 schema 升到 4）。
+
+* **metadata:** 存量的双 NFO 会重新读一遍
+
+  本地元数据队列（`start_local_metadata_outbox_worker`）和手动刷新路径之前没有拿到 `PeopleService`，双 NFO 的演员合并
+  在批处理里跑不到；同一批里并发写同一个演员时，`DeferredNfoActorCredits` 的重定向也会指错。两处都已修好，并把本地 NFO
+  缓存与人物关系 schema 分别升到 2 和 5，启动后对已完成扫描的根目录重排一次本地元数据回填
+  （`nfo_actor_identities_backfill_v1`），已有的 `<片名>.nfo` + `movie.nfo` 会被重新读取，碰撞的演员自动收敛。
+
+升级后首启仍会重建人物索引并额外跑一次本地元数据回填，大库上会有明显耗时；本次没有数据库结构变更。
+
+## [0.7.28] - 2026-11-24
+
+这版只有两个「剧集目录」相关的修复：`Season 1 - CMCTV` 这类带连字符标签的季目录能被识别，剧集不会再被挂到季目录
+名下；没有季子目录的平铺剧集也不会再让本地元数据批次一直失败重试。
+
+### 🐛 fix
+
+* **scanner:** `Season N - <标签>` 形式的季目录不再被当成剧集本身
+
+  剧集目录下的 `Season 1 - CMCTV`、`Season 2 - HHWEB`、`S01 - HDR` 这类季目录，以前因为连字符后带着空格不被识别成
+  季目录，扫描时该目录自己会被当成一部剧集（剧名、`tvshow.nfo` 和海报全部对不上）。现在 `Season N - <标签>` 和
+  `Season N-<标签>` 都按第 N 季处理，标签仍然只用于区分同一季的不同版本（`CMCTV`、`HHWEB` 各成一条来源，合并到同
+  一个剧集下）；季区间（`Season 1-2`、`Season 1 - 2`）和多词描述（`Season 1 - Part Two`）仍然不当作标签。
+
+* **metadata:** 平铺剧集不再报 `image path ... is outside the allowed image roots`
+
+  剧集文件直接放在剧集目录下（没有季子目录）时，读取本地 NFO 与图片完整性会把它判成越出媒体库根，日志里刷
+  `image path '...' is outside the allowed image roots`，`local_metadata` 批次因此一直失败重试。现在先校验文件所在
+  目录在媒体库根内，没有季目录时回退到该目录（与扫描判定剧集目录的规则一致）；文件直接躺在媒体库根下这种没有按剧集
+  分目录的情况按「没有本地旁挂」处理，读完整性直接跳过，写入仍然返回未找到。
+
+这次没有数据库结构变更，也不需要重建索引。受影响的目录重扫一次即可看到修正后的剧集归属与版本标签。
+
 ## [0.7.27] - 2026-11-24
 
 这版收的是「人物」这条线：同一个演员因为不同来源的 ID 被拆成好几个人物的，现在会自己收敛成一条；NFO 里一个演员写的多个

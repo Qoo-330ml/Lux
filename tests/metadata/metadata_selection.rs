@@ -1723,7 +1723,7 @@ async fn admin_selection_persists_cast_in_config_and_detail_api()
     let people_file =
         library_item_directory(&fixture.config.config_dir, &fixture.item_id)?.join("people.json");
     let people: Value = serde_json::from_slice(&tokio::fs::read(people_file).await?)?;
-    assert_eq!(people["schemaVersion"], 4);
+    assert_eq!(people["schemaVersion"], 5);
     assert_eq!(people["actors"][0]["name"], "演员甲");
     assert_eq!(people["actors"][0]["provider"], "tmdb");
     let person_key = people["actors"][0]["personKey"]

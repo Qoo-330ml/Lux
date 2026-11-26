@@ -1883,6 +1883,25 @@ pub(super) async fn request_client_ip(
     }
 }
 
+/// Whether the request came in from outside the local network.
+///
+/// This is the only sanctioned way for an authorization decision to answer that question. The
+/// answer comes from [`request_access_ip`], which starts at the connection peer the server
+/// middleware attached and walks the `X-Forwarded-For` chain from right to left only while the
+/// current hop is an explicitly trusted proxy (or the single container default gateway). A raw
+/// forwarded value on its own never decides remote access.
+///
+/// A resolver failure is returned to the caller instead of being folded into "local": a malformed
+/// peer, a malformed forwarded chain, or an unreadable trusted-proxy setting must fail closed at
+/// the call site.
+pub(super) async fn request_is_remote(
+    headers: &HeaderMap,
+    state: &CoreState,
+) -> Result<bool, AccessIpResolutionError> {
+    let client_ip = request_access_ip(headers, state).await?;
+    Ok(state.remote_access.is_remote_address(client_ip))
+}
+
 async fn request_access_ip(
     headers: &HeaderMap,
     state: &CoreState,
@@ -1958,7 +1977,7 @@ async fn cached_trusted_proxy_cidrs(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AccessIpResolutionError {
+pub(super) enum AccessIpResolutionError {
     InvalidPeerAddress,
     TrustedProxySettingsUnavailable,
     MalformedForwardedFor,
@@ -1988,11 +2007,51 @@ fn trusted_proxy_networks(
     }
     Ok(networks)
 }
-fn login_attempt_key(headers: &HeaderMap, username: &str) -> String {
+/// Identity half of a login bucket for an account the handler resolved to a user row.
+///
+/// Keying on the resolved account is what makes every spelling and every route share one failure
+/// budget: the web login name, the Emby display-name fallback and `/Users/{id}/Authenticate` all
+/// end up here, so an attacker cannot multiply `MAX_FAILURES` by switching between them.
+fn login_attempt_identity_for_user(user_id: &str) -> String {
+    format!(
+        "user:{}",
+        crate::auth::users::normalize_login_identity(user_id)
+    )
+}
+
+/// Identity half of a login bucket for a name that matches no account.
+///
+/// Unknown names have no user row to share, so they keep one bucket per normalized spelling:
+/// `Ädmin` and `ädmin` still count as the same guess, but two unrelated unknown names do not
+/// share a budget (which would let one victim's failures lock out arbitrary other names).
+fn login_attempt_identity_for_unknown_name(username: &str) -> String {
+    // Fold before adding the label: `trim()` on the composed `name:<submitted>` string cannot
+    // remove padding that now sits between the label and the value, which would hand
+    // `" ghost"` and `"ghost"` two different budgets.
+    format!(
+        "name:{}",
+        crate::auth::users::normalize_login_identity(username)
+    )
+}
+
+/// Identity half of a login bucket for an Emby user id that matches no account.
+fn login_attempt_identity_for_unknown_id(user_id: &str) -> String {
+    format!(
+        "id:{}",
+        crate::auth::users::normalize_login_identity(user_id)
+    )
+}
+
+/// Rate-limit bucket for one peer and one resolved login identity.
+///
+/// The identity half is folded with [`crate::auth::users::normalize_login_identity`], the same
+/// function that produces the stored/looked-up username, so spelling differences never split one
+/// account: `Ädmin` and `ädmin` are the same budget whether or not a user row was found.
+fn login_attempt_key(headers: &HeaderMap, identity: &str) -> String {
     format!(
         "{}:{}",
         header_str(headers, "x-lux-peer-ip").unwrap_or("local"),
-        username.trim().to_ascii_lowercase()
+        crate::auth::users::normalize_login_identity(identity)
     )
 }
 
@@ -2541,10 +2600,12 @@ mod tests {
         is_catalog_aggregation_path, is_emby_legacy_strm_path, is_emby_media_stream_segment,
         is_emby_playback_callback_path, is_emby_subtitle_path, is_emby_transcoding_path,
         is_emby_video_path, is_filmly_user_agent, is_registered_emby_video_path,
-        lux_catalog_source_json, metadata_candidate_error, metadata_candidate_failure_kind,
-        normalize_strm_http_location, playback_client_label, playback_identifier_prefix,
-        record_activity_event, request_access_ip, safe_trace_path, secure_cookie_for_request,
-        trusted_proxy_networks, validate_media_strategy,
+        login_attempt_identity_for_unknown_id, login_attempt_identity_for_unknown_name,
+        login_attempt_identity_for_user, login_attempt_key, lux_catalog_source_json,
+        metadata_candidate_error, metadata_candidate_failure_kind, normalize_strm_http_location,
+        playback_client_label, playback_identifier_prefix, record_activity_event,
+        request_access_ip, safe_trace_path, secure_cookie_for_request, trusted_proxy_networks,
+        validate_media_strategy,
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
     use crate::application::candidates::MetadataCandidateError;
@@ -3463,6 +3524,77 @@ mod tests {
         assert_eq!(
             trusted_proxy_networks(&["not-a-cidr".to_owned()], Some(gateway)),
             Err(AccessIpResolutionError::TrustedProxySettingsUnavailable)
+        );
+    }
+
+    /// Unknown names fold like the stored username, so one spelling cannot buy a fresh budget.
+    #[test]
+    fn login_attempt_key_normalizes_non_ascii_unknown_names() {
+        let headers = HeaderMap::new();
+        let canonical =
+            login_attempt_key(&headers, &login_attempt_identity_for_unknown_name("Ädmin"));
+        assert_eq!(canonical, "local:name:ädmin");
+        assert_eq!(
+            canonical,
+            login_attempt_key(&headers, &login_attempt_identity_for_unknown_name("ädmin"))
+        );
+        assert_eq!(
+            canonical,
+            login_attempt_key(
+                &headers,
+                &login_attempt_identity_for_unknown_name(" ÄDMIN ")
+            )
+        );
+
+        let mut forwarded = HeaderMap::new();
+        forwarded.insert("x-lux-peer-ip", HeaderValue::from_static("203.0.113.9"));
+        assert_ne!(
+            login_attempt_key(
+                &forwarded,
+                &login_attempt_identity_for_unknown_name("Ädmin")
+            ),
+            canonical
+        );
+    }
+
+    /// The resolved-account identity is the join point of every login route, so the web name, the
+    /// Emby display-name fallback and the Emby id route must produce one identical bucket.
+    #[test]
+    fn resolved_accounts_share_one_login_bucket_across_name_id_and_spelling() {
+        let headers = HeaderMap::new();
+        let user_id = "6b29fc40-ca47-1067-b31d-00dd010662da";
+        let from_username = login_attempt_key(&headers, &login_attempt_identity_for_user(user_id));
+        assert_eq!(from_username, format!("local:user:{user_id}"));
+        // A route that knows the account by id, or a differently cased spelling of it, resolves to
+        // the very same account identity.
+        assert_eq!(
+            from_username,
+            login_attempt_key(
+                &headers,
+                &login_attempt_identity_for_user(&user_id.to_uppercase())
+            )
+        );
+        // An unresolvable name never collides with the account bucket, even if it spells one.
+        assert_ne!(
+            from_username,
+            login_attempt_key(
+                &headers,
+                &login_attempt_identity_for_unknown_name(&format!("user:{user_id}"))
+            )
+        );
+        assert_eq!(
+            login_attempt_key(
+                &headers,
+                &login_attempt_identity_for_unknown_id("AAAAAAAA-0000-4000-8000-000000000000")
+            ),
+            "local:id:aaaaaaaa-0000-4000-8000-000000000000"
+        );
+        assert_eq!(
+            login_attempt_key(
+                &headers,
+                &login_attempt_identity_for_unknown_id("  AAAAAAAA-0000-4000-8000-000000000000 ")
+            ),
+            "local:id:aaaaaaaa-0000-4000-8000-000000000000"
         );
     }
 

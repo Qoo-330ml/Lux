@@ -1007,13 +1007,24 @@ pub(super) fn relation_media_snapshot_matches(
             .source_relative_path
             .as_deref()
             .unwrap_or(&current.relative_path);
-        if !matches
-            && legacy_scan_fingerprint_for_path(current, legacy_path)
+        let legacy_matches = legacy_scan_fingerprint_for_path(current, legacy_path)
+            .as_deref()
+            .map(encode_fingerprint)
+            .as_deref()
+            == Some(expected_fingerprint);
+        // Legacy 32-byte LUX-FP-1 fingerprints included st_dev, which drifts across
+        // container/FUSE remounts after filesystem_entries upgrades to 25-byte LUX-FP-2.
+        let upgraded_stat_matches = !matches
+            && !legacy_matches
+            && decode_fingerprint(expected_fingerprint).is_some_and(|fp| fp.len() == 32)
+            && current
+                .fingerprint
                 .as_deref()
-                .map(encode_fingerprint)
-                .as_deref()
-                != Some(expected_fingerprint)
-        {
+                .is_some_and(crate::application::scanner::is_v2_scan_fingerprint)
+            && current.size >= 0
+            && current.modified_at > 0
+            && relation_stat_and_metadata_match(relation, current);
+        if !matches && !legacy_matches && !upgraded_stat_matches {
             return false;
         }
         if relation.media_title.as_deref().is_some_and(|title| {
@@ -1025,6 +1036,13 @@ pub(super) fn relation_media_snapshot_matches(
             || relation.media_production_year == current.production_year;
     }
 
+    relation_stat_and_metadata_match(relation, current)
+}
+
+fn relation_stat_and_metadata_match(
+    relation: &StoredPeopleRelation,
+    current: &crate::storage::StoredItemSourceLocator,
+) -> bool {
     let Some(expected_size) = relation.media_size else {
         return false;
     };

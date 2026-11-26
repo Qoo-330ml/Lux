@@ -635,6 +635,7 @@ impl Database {
                  FROM item_metadata_completeness completeness
                  JOIN media_items item ON item.id = completeness.item_id
                  WHERE item.library_id = ? AND item.removed_at IS NULL
+                   AND item.merged_into_item_id IS NULL
                    AND item.item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')
                    AND completeness.local_state = 'READY'
                    AND completeness.is_missing = 1
@@ -1813,7 +1814,7 @@ impl Database {
         update: SelectedMetadataUpdate<'_>,
         collection_reference: Option<&GlobalMovieCollectionReference>,
         nfo_metadata_json: &str,
-        nfo_metadata_fingerprint: &[u8],
+        nfo_metadata_fingerprint: Option<&[u8]>,
     ) -> Result<bool, StorageError> {
         self.select_metadata_candidate_with_cache_and_collection_reference(
             update,
@@ -1827,11 +1828,11 @@ impl Database {
         &self,
         update: SelectedMetadataUpdate<'_>,
         collection_reference: Option<&GlobalMovieCollectionReference>,
-        nfo_cache: Option<(&str, &[u8])>,
+        nfo_cache: Option<(&str, Option<&[u8]>)>,
     ) -> Result<bool, StorageError> {
         let sort_title = update.title.to_lowercase();
         let (nfo_metadata_json, nfo_metadata_fingerprint) = nfo_cache
-            .map(|(json, fingerprint)| (Some(json), Some(fingerprint)))
+            .map(|(json, fingerprint)| (Some(json), fingerprint))
             .unwrap_or((None, None));
         let _write_guard = self.acquire_metadata_write_lock().await;
         // SQLite WAL can reject a deferred read-to-write upgrade with
@@ -1885,7 +1886,7 @@ impl Database {
                    OR metadata_provenance_json IS DISTINCT FROM ?
                    OR locked_fields_json IS DISTINCT FROM ?
                    OR nfo_metadata_json IS NOT NULL
-                   OR (? IS NOT NULL AND nfo_metadata_fingerprint IS DISTINCT FROM ?)
+                   OR (? = 1 AND nfo_metadata_fingerprint IS DISTINCT FROM ?)
                    OR poster_fallback_required IS DISTINCT FROM ?
                )",
         )
@@ -1936,7 +1937,7 @@ impl Database {
         .bind(update.metadata_fingerprint)
         .bind(update.provenance_json)
         .bind(update.locked_fields_json)
-        .bind(nfo_metadata_fingerprint)
+        .bind(database_flag(nfo_metadata_fingerprint.is_some()))
         .bind(nfo_metadata_fingerprint)
         .bind(database_flag(update.poster_fallback_required))
         .execute(&mut *transaction)

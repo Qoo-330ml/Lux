@@ -2,14 +2,14 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     fmt,
     io::Cursor,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock, Weak},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use reqwest::{Client, Url, header::CONTENT_TYPE};
+use reqwest::{Client, ClientBuilder, Url, header::CONTENT_TYPE};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -29,6 +29,11 @@ use crate::{
         metadata_paths::{library_item_directory, metadata_root},
         metadata_writeback::item_metadata_writeback_enabled,
         remote_body::{LimitedBodyError, read_response_body_limited},
+        remote_url_policy::{
+            AddressCheckError, HostResolutionError, HostResolver, LOCAL_HOST_SUFFIXES,
+            OutboundHost, SystemHostResolver, domain_matches_any, is_private_or_reserved,
+            pin_resolved_addresses, resolve_checked_addresses,
+        },
         scraper::{
             ScraperError, ScraperImage, ScraperImageRequest, ScraperItemType, ScraperProvider,
             ScraperResolver,
@@ -49,6 +54,9 @@ pub const MAX_MANUAL_ITEM_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 /// a file name, so a client can still replace a slot the scanner numbered above the cap.
 pub(crate) const MAX_MANUAL_IMAGE_INDEX: i64 = 100;
 const IMAGE_DOWNLOAD_MAX_RETRIES: u32 = 2;
+/// Bound for the best-effort local lookup run before a remote-DNS proxy request. A name only the
+/// proxy can resolve keeps working; the download never waits on a slow local resolver for long.
+const IMAGE_PROXY_LOCAL_DNS_CHECK: Duration = Duration::from_secs(2);
 const IMAGE_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const IMAGE_RETRY_MAX_DELAY: Duration = Duration::from_secs(4);
 const IMAGE_ATTEMPT_LEASE: Duration = Duration::from_secs(5 * 60);
@@ -292,16 +300,563 @@ impl Default for ImageDownloadConfig {
     }
 }
 
+/// Bound for the pinned client cache. A scrape repeats a handful of image hosts, so their TLS
+/// sessions and pooled connections stay reusable without unbounded growth.
+const PINNED_CLIENT_CACHE_LIMIT: usize = 32;
+
+/// The HTTP client shared by every image download plus the connection policy it was built with.
+///
+/// A direct download cannot reuse the shared client: the checked DNS answer has to be pinned onto
+/// the client that opens the TCP connection, and `Client` is immutable once built. The policy
+/// fields keep the pinned client identical to the shared one apart from the pin, except that a
+/// direct route also disables every proxy on the pinned client so the pin decides the connection.
+#[derive(Clone)]
+pub(crate) struct ImageHttpClient {
+    client: Client,
+    proxy_url: Option<String>,
+    timeout: Duration,
+    direct_connection_only: bool,
+    routing: ImageProxyRouting,
+    pinned_clients: Arc<StdMutex<PinnedClientCache>>,
+}
+
+impl ImageHttpClient {
+    pub(crate) fn new(
+        proxy_url: Option<String>,
+        timeout: Duration,
+        direct_connection_only: bool,
+    ) -> Result<Self, ImageWriteError> {
+        let routing = ImageProxyRouting::from_environment(proxy_url.as_deref());
+        let client = image_http_builder(proxy_url.as_deref(), timeout, direct_connection_only)?
+            .build()
+            .map_err(|error| ImageWriteError::ClientBuild(error.to_string()))?;
+        Ok(Self {
+            client,
+            proxy_url,
+            timeout,
+            direct_connection_only,
+            routing,
+            pinned_clients: Arc::new(StdMutex::new(PinnedClientCache::default())),
+        })
+    }
+
+    /// Checks an image target and returns the client that may fetch it.
+    ///
+    /// `http`, `https`, `socks4a` and `socks5h` proxies resolve the target themselves, so such a
+    /// request is only pre-checked: a host-side pin could not reach the proxy connection. Every
+    /// other request - no proxy, a `NO_PROXY` match, or a `socks4`/`socks5` proxy that still uses
+    /// this process's resolver - is resolved here, every candidate address is validated and the
+    /// client is pinned to exactly that set.
+    pub(crate) async fn checked_request_client(
+        &self,
+        url: &Url,
+        allow_loopback_http: bool,
+    ) -> Result<Client, ImageWriteError> {
+        self.checked_request_client_with(url, allow_loopback_http, &SystemHostResolver)
+            .await
+    }
+
+    async fn checked_request_client_with(
+        &self,
+        url: &Url,
+        allow_loopback_http: bool,
+        lookup: &dyn HostResolver,
+    ) -> Result<Client, ImageWriteError> {
+        let route = self.routing.route(url, self.direct_connection_only);
+        if route == ImageProxyRoute::RemoteDns {
+            let host = check_proxied_image_host(url, allow_loopback_http)?;
+            check_proxied_image_host_locally(url, host, allow_loopback_http, lookup).await?;
+            return Ok(self.client.clone());
+        }
+        // `LocalDns` keeps the socks proxy on the pinned client: reqwest resolves through this
+        // process there and the pin replaces that lookup with the checked addresses. A direct route
+        // disables every proxy on the pinned client, including an operating-system proxy the host
+        // cannot see, so the pin is authoritative there.
+        let pinned = resolve_and_pin_image_host(url, allow_loopback_http, lookup).await?;
+        self.pinned_client(&pinned, route.bypass_proxy())
+    }
+
+    /// How reqwest will connect this URL, including who resolves its name.
+    #[cfg(test)]
+    fn route(&self, url: &Url) -> ImageProxyRoute {
+        self.routing.route(url, self.direct_connection_only)
+    }
+
+    /// Returns the client for one checked target, reusing the cached one when the checked address
+    /// set repeats so keep-alive connections and TLS sessions survive across downloads.
+    ///
+    /// `bypass_proxy` builds the client with `no_proxy()`, which also turns off the operating-system
+    /// proxy, so a direct route always connects to the checked address instead.
+    fn pinned_client(
+        &self,
+        pinned: &PinnedImageHost,
+        bypass_proxy: bool,
+    ) -> Result<Client, ImageWriteError> {
+        let PinnedImageHost::Resolved { host, addresses } = pinned else {
+            // An approved literal cannot resolve anything, so the shared client already connects
+            // only to the checked address.
+            return Ok(self.client.clone());
+        };
+        let mut key_addresses = addresses.clone();
+        key_addresses.sort_unstable();
+        let key = (host.clone(), key_addresses, bypass_proxy);
+        if let Some(client) = self
+            .pinned_clients
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.get(&key))
+        {
+            return Ok(client);
+        }
+        let builder = image_http_builder(
+            self.proxy_url.as_deref(),
+            self.timeout,
+            self.direct_connection_only || bypass_proxy,
+        )?;
+        let client = pin_resolved_addresses(builder, host, addresses)
+            .build()
+            .map_err(|error| ImageWriteError::ClientBuild(error.to_string()))?;
+        if let Ok(mut cache) = self.pinned_clients.lock() {
+            cache.insert(key, client.clone());
+        }
+        Ok(client)
+    }
+
+    #[cfg(test)]
+    fn cached_pinned_client_count(&self) -> usize {
+        self.pinned_clients
+            .lock()
+            .map(|cache| cache.len())
+            .unwrap_or_default()
+    }
+}
+
+/// A bounded LRU of pinned clients keyed by the host and the exact checked address set.
+#[derive(Default)]
+struct PinnedClientCache {
+    entries: VecDeque<(PinnedClientKey, Client)>,
+}
+
+/// A pinned client only matches a request whose host, checked address set and proxy bypass agree.
+type PinnedClientKey = (String, Vec<SocketAddr>, bool);
+
+impl PinnedClientCache {
+    fn get(&mut self, key: &PinnedClientKey) -> Option<Client> {
+        let index = self.entries.iter().position(|(cached, _)| cached == key)?;
+        let entry = self.entries.remove(index)?;
+        let client = entry.1.clone();
+        self.entries.push_front(entry);
+        Some(client)
+    }
+
+    fn insert(&mut self, key: PinnedClientKey, client: Client) {
+        if let Some(index) = self.entries.iter().position(|(cached, _)| *cached == key) {
+            self.entries.remove(index);
+        }
+        while self.entries.len() >= PINNED_CLIENT_CACHE_LIMIT {
+            self.entries.pop_back();
+        }
+        self.entries.push_front((key, client));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// How a proxy handles the target name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImageProxyDns {
+    /// The proxy resolves the target itself (`http`, `https`, `socks4a`, `socks5h`).
+    Remote,
+    /// A `socks4`/`socks5` proxy still asks this process for the address, so the request has to be
+    /// resolved, validated and pinned here while the socks proxy stays on the client.
+    Local,
+}
+
+impl ImageProxyDns {
+    /// Parses a configured proxy URL.
+    ///
+    /// Both `Url` and `http::Uri` must accept the value: reqwest builds explicit proxies from a
+    /// `Url`, but the proxy environment variables go through its `http::Uri` matcher, which rejects
+    /// non-ASCII userinfo and fragments. A value only one of them accepts is a config the host must
+    /// not trust, so it is treated as unknown and the request pins a direct connection instead.
+    fn from_url(value: &str) -> Option<Self> {
+        if value.trim() != value || !value.is_ascii() {
+            return None;
+        }
+        if value.contains('#') {
+            return None;
+        }
+        value.parse::<axum::http::Uri>().ok()?;
+        let url = Url::parse(value).ok()?;
+        if url.host_str().is_none_or(str::is_empty) {
+            return None;
+        }
+        Self::from_scheme(url.scheme())
+    }
+
+    fn from_scheme(scheme: &str) -> Option<Self> {
+        match scheme {
+            "http" | "https" | "socks4a" | "socks5h" => Some(Self::Remote),
+            "socks4" | "socks5" => Some(Self::Local),
+            _ => None,
+        }
+    }
+}
+
+/// Parses one proxy environment variable exactly like reqwest's proxy matcher.
+///
+/// The raw value is parsed as an `http::Uri`; a value without a scheme is an `http://` proxy (curl
+/// and hyper-util do the same), and only the authority decides the destination. Anything reqwest
+/// would ignore - whitespace, non-ASCII, a fragment, an unsupported scheme - is not a proxy here.
+fn environment_proxy_dns(value: &str) -> Option<ImageProxyDns> {
+    if value.trim() != value || value.is_empty() || !value.is_ascii() {
+        return None;
+    }
+    if value.contains('#') {
+        return None;
+    }
+    let uri = value.parse::<axum::http::Uri>().ok()?;
+    uri.authority()?;
+    let scheme = uri.scheme_str().unwrap_or("http");
+    ImageProxyDns::from_scheme(scheme)
+}
+
+/// Where one image request is connected.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImageProxyRoute {
+    /// No proxy applies: resolve here, validate every address and pin the client.
+    Direct,
+    /// A proxy that resolves the target itself. Only the literal and reserved-name checks plus a
+    /// best-effort local lookup run here; the proxy owns the final remote DNS boundary.
+    RemoteDns,
+    /// A `socks4`/`socks5` proxy still resolves locally: resolve, validate and pin while keeping the
+    /// proxy on the client.
+    LocalDns,
+    /// A proxy may apply but cannot be interpreted, or `NO_PROXY` excludes the target: connect from
+    /// this process with proxies disabled so the pin is guaranteed to take effect.
+    DirectWithoutProxy,
+}
+
+impl ImageProxyRoute {
+    /// Whether the pinned client must disable every proxy so the checked address is used.
+    ///
+    /// A direct route disables proxies, including the operating-system one reqwest's `system-proxy`
+    /// feature would otherwise apply: the pin promise covers the whole direct path. A `LocalDns`
+    /// socks proxy stays on the client, because there the pin travels through the socks resolver.
+    fn bypass_proxy(self) -> bool {
+        matches!(self, Self::Direct | Self::DirectWithoutProxy)
+    }
+}
+
+/// The configured proxy URL, when one was given.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ImageExplicitProxy {
+    #[default]
+    None,
+    Proxy(ImageProxyDns),
+    /// A proxy URL is configured but does not survive the checks reqwest's proxy layers apply. The
+    /// route then connects directly with proxies disabled, so the pin is never silently bypassed.
+    Unknown,
+}
+
+/// Decides how one image request is connected.
+///
+/// The decision mirrors reqwest's proxy layer: an explicit proxy first, then the standard proxy
+/// environment variables for the URL scheme, minus the `NO_PROXY` exclusions. It keeps reqwest's
+/// distinction between proxies that resolve the target themselves and `socks4`/`socks5` proxies
+/// that still use this process's resolver, because only the former may skip the pin.
+#[derive(Clone, Debug, Default)]
+struct ImageProxyRouting {
+    explicit: ImageExplicitProxy,
+    environment: ImageEnvironmentProxy,
+    exclusions: ImageProxyExclusions,
+}
+
+impl ImageProxyRouting {
+    fn from_environment(proxy_url: Option<&str>) -> Self {
+        let explicit = match explicit_proxy_url(proxy_url) {
+            None => ImageExplicitProxy::None,
+            Some(url) => match ImageProxyDns::from_url(&url) {
+                Some(dns) => ImageExplicitProxy::Proxy(dns),
+                None => ImageExplicitProxy::Unknown,
+            },
+        };
+        Self {
+            explicit,
+            environment: ImageEnvironmentProxy::from_env(),
+            exclusions: ImageProxyExclusions::from_env(),
+        }
+    }
+
+    /// How this URL is connected, including whether a proxy is trusted with its DNS lookup.
+    fn route(&self, url: &Url, direct_connection_only: bool) -> ImageProxyRoute {
+        // `direct_connection_only` builds the client with `no_proxy()`, which disables every
+        // explicit, environment and system proxy, so the pin is guaranteed to take effect.
+        if direct_connection_only {
+            return ImageProxyRoute::Direct;
+        }
+        // A URL without a host is rejected by the host check; never claim it is proxied.
+        let Some(host) = url.host_str() else {
+            return ImageProxyRoute::Direct;
+        };
+        let proxy = match self.explicit {
+            ImageExplicitProxy::Proxy(dns) => Some(dns),
+            ImageExplicitProxy::Unknown => return ImageProxyRoute::DirectWithoutProxy,
+            ImageExplicitProxy::None => match self.environment.for_scheme(url.scheme()) {
+                ImageSchemeProxy::Proxy(dns) => Some(dns),
+                ImageSchemeProxy::Unknown => return ImageProxyRoute::DirectWithoutProxy,
+                ImageSchemeProxy::None => None,
+            },
+        };
+        let Some(dns) = proxy else {
+            return ImageProxyRoute::Direct;
+        };
+        // `NO_PROXY` keeps this target out of a configured proxy, so this process connects.
+        if self.exclusions.matches(host) {
+            return ImageProxyRoute::DirectWithoutProxy;
+        }
+        match dns {
+            ImageProxyDns::Remote => ImageProxyRoute::RemoteDns,
+            ImageProxyDns::Local => ImageProxyRoute::LocalDns,
+        }
+    }
+}
+
+/// The explicit proxy URL for this service: an explicit value wins, `None` falls back to
+/// `LUX_PROXY_URL`, and a blank value disables both exactly like `client_builder_from_env_or`.
+fn explicit_proxy_url(proxy_url: Option<&str>) -> Option<String> {
+    match proxy_url.map(str::trim) {
+        Some(value) => (!value.is_empty()).then(|| value.to_owned()),
+        None => crate::network::proxy_url_from_env().ok().flatten(),
+    }
+}
+
+/// What the proxy environment says about one URL scheme.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ImageSchemeProxy {
+    /// No proxy variable applies.
+    #[default]
+    None,
+    Proxy(ImageProxyDns),
+    /// A non-blank proxy variable is set but cannot be parsed here. reqwest's URI parser accepts
+    /// more shapes, so the route is unknown: connect directly with proxies disabled instead of
+    /// trusting a proxy that might not be the one this process would validate against.
+    Unknown,
+}
+
+/// The standard proxy environment variables, per URL scheme, as reqwest reads them.
+#[derive(Clone, Copy, Debug, Default)]
+struct ImageEnvironmentProxy {
+    http: ImageSchemeProxy,
+    https: ImageSchemeProxy,
+}
+
+impl ImageEnvironmentProxy {
+    fn from_env() -> Self {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        // A CGI process ignores proxy environment variables; reqwest's proxy matcher does the same.
+        if std::env::var_os("REQUEST_METHOD").is_some() {
+            return Self::default();
+        }
+        let all = environment_proxy(&["ALL_PROXY", "all_proxy"], &lookup);
+        Self {
+            http: scheme_proxy(&["HTTP_PROXY", "http_proxy"], all, &lookup),
+            https: scheme_proxy(&["HTTPS_PROXY", "https_proxy"], all, &lookup),
+        }
+    }
+
+    fn for_scheme(self, scheme: &str) -> ImageSchemeProxy {
+        match scheme {
+            "http" => self.http,
+            "https" => self.https,
+            // reqwest only proxies http(s) destinations.
+            _ => ImageSchemeProxy::None,
+        }
+    }
+}
+
+fn environment_proxy(names: &[&str], lookup: &impl Fn(&str) -> Option<String>) -> ImageSchemeProxy {
+    let Some(value) = first_environment_value(names, lookup) else {
+        return ImageSchemeProxy::None;
+    };
+    // A blank value is no proxy for reqwest either; it falls through to `ALL_PROXY`.
+    if value.trim().is_empty() {
+        return ImageSchemeProxy::None;
+    }
+    match environment_proxy_dns(&value) {
+        Some(dns) => ImageSchemeProxy::Proxy(dns),
+        None => ImageSchemeProxy::Unknown,
+    }
+}
+
+/// Mirrors reqwest: the first *set* scheme variable is parsed first, and `ALL_PROXY` is the fallback
+/// when that value is not a usable proxy either.
+fn scheme_proxy(
+    names: &[&str],
+    all: ImageSchemeProxy,
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> ImageSchemeProxy {
+    let Some(value) = first_environment_value(names, lookup) else {
+        return all;
+    };
+    // A blank scheme variable also falls back to `ALL_PROXY`, exactly like reqwest.
+    if value.trim().is_empty() {
+        return all;
+    }
+    match environment_proxy_dns(&value) {
+        Some(dns) => ImageSchemeProxy::Proxy(dns),
+        None => match all {
+            ImageSchemeProxy::Proxy(dns) => ImageSchemeProxy::Proxy(dns),
+            _ => ImageSchemeProxy::Unknown,
+        },
+    }
+}
+
+/// The first variable of `names` that is set, read without trimming, matching reqwest.
+fn first_environment_value(
+    names: &[&str],
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    names.iter().find_map(|name| lookup(name))
+}
+
+/// The `NO_PROXY` exclusions reqwest applies, with the rules of curl's `--noproxy`.
+///
+/// Entries are comma-separated: `*`, an IP address, an IP network, or a domain that also matches
+/// its subdomains. The host is compared exactly, without trailing-dot or IDNA folding, because that
+/// is what reqwest's proxy matcher compares.
+#[derive(Clone, Debug, Default)]
+struct ImageProxyExclusions {
+    raw: Option<String>,
+}
+
+impl ImageProxyExclusions {
+    fn from_env() -> Self {
+        Self {
+            raw: std::env::var("NO_PROXY")
+                .ok()
+                .or_else(|| std::env::var("no_proxy").ok()),
+        }
+    }
+
+    fn matches(&self, host: &str) -> bool {
+        let Some(raw) = self.raw.as_deref() else {
+            return false;
+        };
+        // Brackets are URL syntax, not part of the address the matcher compares.
+        let host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        match host.parse::<IpAddr>() {
+            Ok(address) => raw
+                .split(',')
+                .map(str::trim)
+                .any(|entry| address_entry_excludes(entry, address)),
+            Err(_) => raw
+                .split(',')
+                .map(str::trim)
+                .any(|entry| domain_entry_excludes(entry, host)),
+        }
+    }
+}
+
+fn address_entry_excludes(entry: &str, address: IpAddr) -> bool {
+    let (base, prefix) = match entry.split_once('/') {
+        Some((base, prefix)) => match (base.parse::<IpAddr>(), prefix.parse::<u8>()) {
+            (Ok(base), Ok(prefix)) => (base, Some(prefix)),
+            _ => return false,
+        },
+        None => match entry.parse::<IpAddr>() {
+            Ok(base) => (base, None),
+            Err(_) => return false,
+        },
+    };
+    if base.is_ipv4() != address.is_ipv4() {
+        return false;
+    }
+    let Some(prefix) = prefix else {
+        return base == address;
+    };
+    match (base, address) {
+        (IpAddr::V4(base), IpAddr::V4(address)) => {
+            let mask = u32::MAX
+                .checked_shl(32 - u32::from(prefix.min(32)))
+                .unwrap_or(0);
+            u32::from(base) & mask == u32::from(address) & mask
+        }
+        (IpAddr::V6(base), IpAddr::V6(address)) => {
+            let mask = u128::MAX
+                .checked_shl(128 - u32::from(prefix.min(128)))
+                .unwrap_or(0);
+            u128::from(base) & mask == u128::from(address) & mask
+        }
+        _ => false,
+    }
+}
+
+fn domain_entry_excludes(entry: &str, host: &str) -> bool {
+    if entry == "*" || entry.eq_ignore_ascii_case(host) {
+        return true;
+    }
+    if entry
+        .strip_prefix('.')
+        .is_some_and(|entry| entry.eq_ignore_ascii_case(host))
+    {
+        return true;
+    }
+    let Some(offset) = host.len().checked_sub(entry.len()) else {
+        return false;
+    };
+    if !host.is_char_boundary(offset) || !host[offset..].eq_ignore_ascii_case(entry) {
+        return false;
+    }
+    // A leading-dot entry already carries the label boundary; a plain entry matches only whole
+    // labels, so `images.example` never excludes `notimages.example`.
+    entry.starts_with('.') || (offset > 0 && host.as_bytes()[offset - 1] == b'.')
+}
+
+/// Builds the image HTTP client configuration shared by every download.
+///
+/// The same builder feeds the long-lived client and each pinned direct client so the timeout, the
+/// disabled redirects and the loopback-test escape hatch can never drift apart.
+fn image_http_builder(
+    proxy_url: Option<&str>,
+    timeout: Duration,
+    direct_connection_only: bool,
+) -> Result<ClientBuilder, ImageWriteError> {
+    let builder = client_builder_from_env_or(proxy_url)
+        .map_err(|error| ImageWriteError::ClientBuild(error.to_string()))?
+        .timeout(timeout)
+        // A redirect would bypass the URL checks done before the request.
+        .redirect(reqwest::redirect::Policy::none());
+    Ok(if direct_connection_only {
+        // Disables every explicit, environment and system proxy so the pin always takes effect.
+        builder.no_proxy()
+    } else {
+        builder
+    })
+}
+
 #[derive(Clone)]
 pub struct ImageWriteService {
     database: Database,
-    http: Client,
+    http: ImageHttpClient,
     max_bytes: u64,
     allow_loopback_http: bool,
     config_dir: Option<PathBuf>,
     download_permits: Arc<ImagePermitPool>,
     write_permits: Arc<ImagePermitPool>,
     resources: Option<ResourceMetrics>,
+    /// Resolves an image hostname to every candidate address. Injectable so tests can change the
+    /// DNS answer between lookups without touching the system resolver.
+    host_lookup: Arc<dyn HostResolver>,
 }
 
 /// How the download writes its target path and whether an attempt owns the write.
@@ -445,18 +1000,7 @@ impl ImageWriteService {
                 "image maximum size must be positive".to_owned(),
             ));
         }
-        let http = client_builder_from_env_or(proxy_url.as_deref())
-            .map_err(|error| ImageWriteError::ClientBuild(error.to_string()))?
-            .timeout(config.timeout)
-            // A redirect would bypass the URL checks done before the request.
-            .redirect(reqwest::redirect::Policy::none());
-        let http = if config.direct_connection_only {
-            http.no_proxy()
-        } else {
-            http
-        }
-        .build()
-        .map_err(|error| ImageWriteError::ClientBuild(error.to_string()))?;
+        let http = ImageHttpClient::new(proxy_url, config.timeout, config.direct_connection_only)?;
         Ok(Self {
             database,
             http,
@@ -466,11 +1010,18 @@ impl ImageWriteService {
             download_permits,
             write_permits,
             resources: None,
+            host_lookup: Arc::new(SystemHostResolver),
         })
     }
 
     pub(crate) fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
         self.resources = Some(resources);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_host_lookup(mut self, host_lookup: Arc<dyn HostResolver>) -> Self {
+        self.host_lookup = host_lookup;
         self
     }
 
@@ -798,7 +1349,13 @@ impl ImageWriteService {
         {
             return Ok(true);
         }
-        let (_, directory, movie_stem, episode_stem) = self.writeback_paths(item_id).await?;
+        let (_, directory, movie_stem, episode_stem) = match self.writeback_paths(item_id).await {
+            Ok(paths) => paths,
+            // Items without a writable media directory (missing/merged sources, or root-level
+            // series with no per-series folder) have no media sidecar image at this path.
+            Err(ImageWriteError::ItemNotFound) => return Ok(false),
+            Err(error) => return Err(error),
+        };
         let Some(path) = find_image_path_at_index(
             &directory,
             image_type,
@@ -864,6 +1421,17 @@ impl ImageWriteService {
         image_type: &str,
     ) -> Result<bool, ImageWriteError> {
         self.local_image_exists(item_id, image_type).await
+    }
+
+    pub(crate) async fn has_local_writeback_directory(
+        &self,
+        item_id: &str,
+    ) -> Result<bool, ImageWriteError> {
+        match self.writeback_paths(item_id).await {
+            Ok(_) => Ok(true),
+            Err(ImageWriteError::ItemNotFound) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) async fn local_image_types(
@@ -1042,9 +1610,16 @@ impl ImageWriteService {
             }
         }
 
-        let (_, directory, movie_stem, episode_stem) = match writeback_context {
-            Some(context) => self.writeback_paths_for_context(item_id, context).await?,
-            None => self.writeback_paths(item_id).await?,
+        let (_, directory, movie_stem, episode_stem) = match match writeback_context {
+            Some(context) => self.writeback_paths_for_context(item_id, context).await,
+            None => self.writeback_paths(item_id).await,
+        } {
+            Ok(paths) => paths,
+            // Items without a writable media directory (missing/merged sources, or a series whose
+            // episodes sit directly under the library root) have no media sidecar directory to
+            // scan, so keep whatever was already found in the database or metadata directory.
+            Err(ImageWriteError::ItemNotFound) => return Ok(found),
+            Err(error) => return Err(error),
         };
         let paths = read_image_directory_entries(&directory).await?;
         for &image_type in image_types {
@@ -1232,14 +1807,17 @@ impl ImageWriteService {
                 "image URL must be an http(s) URL without credentials".to_owned(),
             ));
         }
-        ensure_public_image_host(&url, self.allow_loopback_http).await?;
+        let request_client = self
+            .http
+            .checked_request_client_with(&url, self.allow_loopback_http, self.host_lookup.as_ref())
+            .await?;
 
         let _download_permit = self
             .download_permits
             .acquire(self.resources.clone(), "image_download_queue")
             .await;
         let download_started = std::time::Instant::now();
-        let response = self.fetch_image(&url).await;
+        let response = self.fetch_image(&url, request_client).await;
         if let Some(resources) = &self.resources {
             resources.record_metadata_stage("image_download", download_started.elapsed());
         }
@@ -1459,10 +2037,19 @@ impl ImageWriteService {
         })
     }
 
-    async fn fetch_image(&self, url: &Url) -> Result<reqwest::Response, ImageWriteError> {
+    /// Sends the image request for one checked target.
+    ///
+    /// The client was checked and pinned for this attempt and the retry loop below reuses it, so a
+    /// DNS answer that changes between retries never reaches the connector: no retry can re-resolve
+    /// the host unpinned.
+    async fn fetch_image(
+        &self,
+        url: &Url,
+        client: Client,
+    ) -> Result<reqwest::Response, ImageWriteError> {
         let mut retry_count = 0;
         loop {
-            let response = self.http.get(url.clone()).send().await;
+            let response = client.get(url.clone()).send().await;
             match response {
                 Ok(response)
                     if retry_count < IMAGE_DOWNLOAD_MAX_RETRIES
@@ -1674,21 +2261,35 @@ impl ImageWriteService {
         if !media_path.starts_with(&root) {
             return Err(ImageWriteError::PathOutsideRoot(media_path));
         }
-        let directory = if item_type == "SERIES" {
-            series_directory(&root, &source.relative_path)
-                .ok_or_else(|| ImageWriteError::PathOutsideRoot(media_path.clone()))?
-        } else {
-            media_path
-                .parent()
-                .ok_or_else(|| ImageWriteError::PathOutsideRoot(media_path.clone()))?
-                .to_owned()
-        };
-        let directory = fs::canonicalize(&directory)
+        let parent_directory = media_path
+            .parent()
+            .ok_or_else(|| ImageWriteError::PathOutsideRoot(media_path.clone()))?
+            .to_owned();
+        let parent_directory = fs::canonicalize(&parent_directory)
             .await
-            .map_err(|error| image_io_error(&directory, error))?;
-        if !directory.starts_with(&root) {
-            return Err(ImageWriteError::PathOutsideRoot(directory));
+            .map_err(|error| image_io_error(&parent_directory, error))?;
+        if !parent_directory.starts_with(&root) {
+            return Err(ImageWriteError::PathOutsideRoot(parent_directory));
         }
+        let directory = if item_type == "SERIES" {
+            if let Some(series_dir) = series_directory(&root, &source.relative_path) {
+                let series_dir = fs::canonicalize(&series_dir)
+                    .await
+                    .map_err(|error| image_io_error(&series_dir, error))?;
+                if !series_dir.starts_with(&root) {
+                    return Err(ImageWriteError::PathOutsideRoot(series_dir));
+                }
+                series_dir
+            } else if parent_directory != root {
+                // `episode_hierarchy` uses the episode's parent folder as the series directory
+                // whenever there is no recognised `Season N` directory, unless it is the root.
+                parent_directory
+            } else {
+                return Err(ImageWriteError::ItemNotFound);
+            }
+        } else {
+            parent_directory
+        };
         let episode_stem = (item_type == "EPISODE").then(|| {
             media_path
                 .file_stem()
@@ -3554,60 +4155,175 @@ fn is_allowed_scraper_image_url(value: &str, allow_loopback_http: bool) -> bool 
         && url.fragment().is_none()
 }
 
-/// Rejects image targets that live on private or reserved addresses.
+/// One address set that a direct image download may connect to, checked once per attempt.
 ///
-/// Host literals are classified directly; hostnames are resolved so a DNS name cannot point the
-/// server at an internal service. The HTTP client does not follow redirects, so a public host
-/// cannot bounce the request inward either.
-pub(crate) async fn ensure_public_image_host(
+/// The value is the result of a security check, so dropping it silently would let a caller fetch
+/// the URL through an unpinned client. Callers must pin it onto the request client.
+#[must_use = "a checked image host must pin the request it was checked for"]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PinnedImageHost {
+    /// The URL host is an IP literal the policy already approved. The request cannot resolve
+    /// anything, so no DNS override is needed.
+    IpLiteral,
+    /// The URL host is a name. Every address it resolved to was checked and the request must
+    /// connect only to this set, never to a fresh DNS answer.
+    Resolved {
+        /// The host exactly as the request carries it, including a trailing root dot, so the
+        /// client's DNS override matches the name hyper asks the resolver for.
+        host: String,
+        addresses: Vec<SocketAddr>,
+    },
+}
+
+/// What the address policy already knows about an image URL host before any DNS lookup.
+#[derive(Debug)]
+enum ImageUrlHost {
+    /// An approved IP literal.
+    Literal,
+    /// A name that still has to be resolved and checked.
+    Name {
+        /// The host exactly as the request carries it; also the client's pin key.
+        request_host: String,
+        /// The same name without one trailing root dot, for policy comparisons and messages.
+        name: String,
+    },
+}
+
+/// Classifies the URL host and applies the checks that need no DNS lookup.
+fn classify_image_url_host(
     url: &Url,
     allow_loopback_http: bool,
-) -> Result<(), ImageWriteError> {
-    let Some(host) = url.host_str() else {
+) -> Result<ImageUrlHost, ImageWriteError> {
+    let Some(host) = OutboundHost::from_url(url) else {
         return Err(ImageWriteError::InvalidUrl(
             "image URL must include a host".to_owned(),
         ));
     };
-    let literal_address = match url.host() {
-        Some(url::Host::Ipv4(address)) => Some(IpAddr::V4(address)),
-        Some(url::Host::Ipv6(address)) => Some(IpAddr::V6(address)),
-        _ => None,
-    };
-    if let Some(address) = literal_address {
-        return if crate::application::remote_url_policy::is_private_or_reserved(address)
-            && !(allow_loopback_http && address.is_loopback())
-        {
+    if let Some(address) = host.literal_address() {
+        return if image_address_allowed(address, allow_loopback_http) {
+            Ok(ImageUrlHost::Literal)
+        } else {
             Err(ImageWriteError::InvalidUrl(
                 "image URL points at a non-public address".to_owned(),
             ))
-        } else {
-            Ok(())
         };
     }
+    let OutboundHost::Domain {
+        request_host,
+        normalized,
+    } = host
+    else {
+        // `literal_address` handles both literal variants above.
+        return Err(ImageWriteError::InvalidUrl(
+            "image URL must include a host".to_owned(),
+        ));
+    };
+    // At most one trailing root dot and no empty label: `images..example` is not a name a policy
+    // may compare, and `images.example..` is not the same authority as `images.example.` either.
+    if normalized.split('.').any(str::is_empty) || request_host.ends_with("..") {
+        return Err(ImageWriteError::InvalidUrl(
+            "image URL must include a usable host".to_owned(),
+        ));
+    }
+    // A trailing root dot or ASCII case must not turn a reserved name into a public one.
+    if domain_matches_any(&normalized, &LOCAL_HOST_SUFFIXES) && !allow_loopback_http {
+        return Err(ImageWriteError::InvalidUrl(format!(
+            "image host {request_host} is a reserved local name"
+        )));
+    }
+    Ok(ImageUrlHost::Name {
+        request_host,
+        name: normalized,
+    })
+}
+
+fn image_address_allowed(address: IpAddr, allow_loopback_http: bool) -> bool {
+    !is_private_or_reserved(address) || (allow_loopback_http && address.is_loopback())
+}
+
+/// Rejects image targets that live on private or reserved addresses and returns the address set a
+/// direct download must be pinned to.
+///
+/// Host literals are classified directly. A hostname is resolved once here and **every** candidate
+/// must be public: one private record in a multi-address answer rejects the whole host. The checked
+/// addresses are what the request connects to, so the second DNS lookup a plain client would do
+/// between the check and the TCP connection cannot be rebound inward. The HTTP client does not
+/// follow redirects, so a public host cannot bounce the request inward either.
+async fn resolve_and_pin_image_host(
+    url: &Url,
+    allow_loopback_http: bool,
+    lookup: &dyn HostResolver,
+) -> Result<PinnedImageHost, ImageWriteError> {
+    let (request_host, name) = match classify_image_url_host(url, allow_loopback_http)? {
+        ImageUrlHost::Literal => return Ok(PinnedImageHost::IpLiteral),
+        ImageUrlHost::Name { request_host, name } => (request_host, name),
+    };
     let port = url
         .port_or_known_default()
         .ok_or_else(|| ImageWriteError::InvalidUrl("image URL has no usable port".to_owned()))?;
-    let mut resolved = false;
-    for address in tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|error| ImageWriteError::Download(error.to_string()))?
-    {
-        resolved = true;
-        let loopback_allowed = allow_loopback_http && address.ip().is_loopback();
-        if crate::application::remote_url_policy::is_private_or_reserved(address.ip())
-            && !loopback_allowed
-        {
-            return Err(ImageWriteError::InvalidUrl(format!(
-                "image host {host} resolves to a non-public address"
-            )));
+    let addresses = resolve_checked_addresses(lookup, &request_host, port, |address| {
+        image_address_allowed(address, allow_loopback_http)
+    })
+    .await
+    .map_err(|error| match error {
+        HostResolutionError::Lookup(error) => ImageWriteError::Download(error.to_string()),
+        HostResolutionError::Check(AddressCheckError::Empty) => {
+            ImageWriteError::Download(format!("image host {name} did not resolve"))
         }
+        HostResolutionError::Check(AddressCheckError::Rejected) => ImageWriteError::InvalidUrl(
+            format!("image host {name} resolves to a non-public address"),
+        ),
+    })?;
+    Ok(PinnedImageHost::Resolved {
+        host: request_host,
+        addresses,
+    })
+}
+
+/// Checks a proxied image target without resolving it.
+///
+/// With a remote-DNS proxy the final TCP connection and its lookup happen inside the proxy, so a
+/// host-side pin cannot reach it. The pre-check therefore rejects private or reserved literals and
+/// reserved local names, which never belong behind a proxy, and returns the classification so the
+/// caller can still try one best-effort local lookup.
+fn check_proxied_image_host(
+    url: &Url,
+    allow_loopback_http: bool,
+) -> Result<ImageUrlHost, ImageWriteError> {
+    classify_image_url_host(url, allow_loopback_http)
+}
+
+/// A best-effort local lookup for a target a proxy will resolve itself.
+///
+/// A name this process can already resolve to a private or reserved address is rejected instead of
+/// being forwarded to the proxy. A name that only the proxy can resolve - or that does not answer
+/// within the bound - is left to the proxy, which owns the final remote DNS boundary.
+async fn check_proxied_image_host_locally(
+    url: &Url,
+    host: ImageUrlHost,
+    allow_loopback_http: bool,
+    lookup: &dyn HostResolver,
+) -> Result<(), ImageWriteError> {
+    let ImageUrlHost::Name { request_host, name } = host else {
+        return Ok(());
+    };
+    let Some(port) = url.port_or_known_default() else {
+        return Ok(());
+    };
+    let check = resolve_checked_addresses(lookup, &request_host, port, |address| {
+        image_address_allowed(address, allow_loopback_http)
+    });
+    match tokio::time::timeout(IMAGE_PROXY_LOCAL_DNS_CHECK, check).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(HostResolutionError::Check(AddressCheckError::Rejected))) => {
+            Err(ImageWriteError::InvalidUrl(format!(
+                "image host {name} resolves to a non-public address"
+            )))
+        }
+        // Only the proxy can resolve this name, it answered with nothing, or it was too slow to
+        // check here.
+        Ok(Err(_)) | Err(_) => Ok(()),
     }
-    if !resolved {
-        return Err(ImageWriteError::Download(format!(
-            "image host {host} did not resolve"
-        )));
-    }
-    Ok(())
 }
 
 fn retryable_image_status(status: u16) -> bool {
@@ -3626,15 +4342,21 @@ fn image_download_retry_delay(retry_count: u32) -> Duration {
 mod tests {
     use super::{
         IMAGE_GLOBAL_CONCURRENCY, IMAGE_RESOLUTION_CACHE_CAPACITY, IMAGE_RETRY_BASE_DELAY,
-        IMAGE_RETRY_MAX_DELAY, ImageDownloadConfig, ImageError, ImageFormat, ImagePermitPool,
-        ImageResolutionCache, ImageResolutionKey, ImageService, ImageTargetRequest,
-        ImageWriteError, ImageWriteService, background_image_content_tag_and_dimensions_from_bytes,
-        canonical_image_stems, ensure_public_image_host, global_image_download_permits,
+        IMAGE_RETRY_MAX_DELAY, ImageDownloadConfig, ImageEnvironmentProxy, ImageError,
+        ImageExplicitProxy, ImageFormat, ImageHttpClient, ImagePermitPool, ImageProxyDns,
+        ImageProxyExclusions, ImageProxyRoute, ImageProxyRouting, ImageResolutionCache,
+        ImageResolutionKey, ImageSchemeProxy, ImageService, ImageTargetRequest, ImageWriteError,
+        ImageWriteService, PINNED_CLIENT_CACHE_LIMIT, PinnedClientCache, PinnedImageHost,
+        background_image_content_tag_and_dimensions_from_bytes, canonical_image_stems,
+        check_proxied_image_host, explicit_proxy_url, global_image_download_permits,
         global_image_write_permits, image_attempt_failure,
         image_content_tag_and_dimensions_from_bytes, image_download_retry_delay,
         image_language_matches, image_lookup_stems, image_row_write_error, image_target,
-        is_allowed_scraper_image_url, pick_scraper_index, retryable_image_status,
-        should_suppress_internal_image_write, write_image_atomically,
+        is_allowed_scraper_image_url, pick_scraper_index, resolve_and_pin_image_host,
+        retryable_image_status, should_suppress_internal_image_write, write_image_atomically,
+    };
+    use crate::application::remote_url_policy::{
+        HostLookupFuture, HostResolver, SystemHostResolver,
     };
     use crate::{
         application::access::MediaAccessService,
@@ -3815,17 +4537,955 @@ mod tests {
         }
     }
 
+    /// A public documentation-range-free address that stands in for a scraped image CDN.
+    fn public_image_address(port: u16) -> std::net::SocketAddr {
+        std::net::SocketAddr::from(([93, 184, 216, 34], port))
+    }
+
+    /// Answers the calls in order so a test can change the DNS answer between lookups.
+    fn scripted_image_host_lookup(
+        answers: Vec<Vec<std::net::SocketAddr>>,
+    ) -> (
+        std::sync::Arc<dyn HostResolver>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let answers = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+            answers,
+        )));
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&calls);
+        let lookup: std::sync::Arc<dyn HostResolver> =
+            std::sync::Arc::new(move |_host: String, _port: u16| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let addresses = answers
+                    .lock()
+                    .ok()
+                    .and_then(|mut answers| answers.pop_front())
+                    .unwrap_or_default();
+                Box::pin(std::future::ready(Ok(addresses))) as HostLookupFuture<'static>
+            });
+        (lookup, calls)
+    }
+
     #[tokio::test]
     async fn public_host_guard_rejects_private_targets_without_dns() {
         let loopback = Url::parse("http://127.0.0.1:8099/poster.jpg").expect("url");
-        assert!(ensure_public_image_host(&loopback, false).await.is_err());
-        assert!(ensure_public_image_host(&loopback, true).await.is_ok());
+        assert!(
+            resolve_and_pin_image_host(&loopback, false, &SystemHostResolver)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            resolve_and_pin_image_host(&loopback, true, &SystemHostResolver)
+                .await
+                .expect("the loopback opt-in allows the local stub"),
+            PinnedImageHost::IpLiteral
+        );
 
         let private = Url::parse("https://192.168.1.10/poster.jpg").expect("url");
-        assert!(ensure_public_image_host(&private, true).await.is_err());
+        assert!(
+            resolve_and_pin_image_host(&private, true, &SystemHostResolver)
+                .await
+                .is_err()
+        );
 
         let public = Url::parse("https://[2606:4700:4700::1111]/poster.jpg").expect("url");
-        assert!(ensure_public_image_host(&public, false).await.is_ok());
+        assert_eq!(
+            resolve_and_pin_image_host(&public, false, &SystemHostResolver)
+                .await
+                .expect("a public literal needs no DNS override"),
+            PinnedImageHost::IpLiteral
+        );
+
+        // The IPv4-mapped loopback form is not the IPv6 loopback the opt-in widens to.
+        let mapped = Url::parse("https://[::ffff:127.0.0.1]/poster.jpg").expect("url");
+        assert!(
+            resolve_and_pin_image_host(&mapped, true, &SystemHostResolver)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn image_host_guard_pins_every_checked_address() {
+        let url = Url::parse("https://Images.Example./poster.jpg").expect("url");
+        let addresses = vec![
+            public_image_address(443),
+            "[2606:4700:4700::1111]:443"
+                .parse()
+                .expect("public IPv6 address"),
+        ];
+        let (lookup, calls) = scripted_image_host_lookup(vec![addresses.clone()]);
+
+        let pinned = resolve_and_pin_image_host(&url, false, lookup.as_ref())
+            .await
+            .expect("an all-public answer is fetchable");
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // The trailing root dot stays in the pin key because that is the host the request carries.
+        assert_eq!(
+            pinned,
+            PinnedImageHost::Resolved {
+                host: "images.example.".to_owned(),
+                addresses,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn image_host_guard_rejects_a_mixed_public_and_private_answer() {
+        let url = Url::parse("https://images.example/poster.jpg").expect("url");
+        for private in ["10.0.0.1:443", "[::ffff:127.0.0.1]:443", "[fd00::1]:443"] {
+            let (lookup, _calls) = scripted_image_host_lookup(vec![vec![
+                public_image_address(443),
+                private.parse().expect("private address"),
+            ]]);
+            let error = resolve_and_pin_image_host(&url, false, lookup.as_ref())
+                .await
+                .expect_err("one private record must reject the whole answer");
+            assert!(
+                matches!(error, ImageWriteError::InvalidUrl(_)),
+                "{private} must be rejected: {error:?}"
+            );
+        }
+    }
+
+    /// The review #4 regression: the first answer is public, the next one is loopback. A download
+    /// that re-resolves before connecting must reject the second answer instead of connecting.
+    #[tokio::test]
+    async fn image_host_guard_rejects_a_second_resolution_that_switches_to_loopback() {
+        let url = Url::parse("https://images.example/poster.jpg").expect("url");
+        let (lookup, calls) = scripted_image_host_lookup(vec![
+            vec![public_image_address(443)],
+            vec!["127.0.0.1:443".parse().expect("loopback address")],
+        ]);
+
+        assert!(
+            resolve_and_pin_image_host(&url, false, lookup.as_ref())
+                .await
+                .is_ok()
+        );
+        let error = resolve_and_pin_image_host(&url, false, lookup.as_ref())
+            .await
+            .expect_err("a rebinding answer must be rejected");
+        assert!(matches!(error, ImageWriteError::InvalidUrl(_)));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn image_host_guard_rejects_a_host_without_an_address() {
+        let url = Url::parse("https://images.example/poster.jpg").expect("url");
+        let (lookup, _calls) = scripted_image_host_lookup(vec![Vec::new()]);
+        let error = resolve_and_pin_image_host(&url, false, lookup.as_ref())
+            .await
+            .expect_err("an empty answer has no address to pin");
+        assert!(
+            matches!(error, ImageWriteError::Download(_)),
+            "an unresolved host is a download failure: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn image_host_guard_normalizes_reserved_names_before_the_loopback_check() {
+        for value in [
+            "http://localhost./poster.jpg",
+            "http://LOCALHOST./poster.jpg",
+            "http://img.localhost./poster.jpg",
+            "http://router.local/poster.jpg",
+            "http://metadata.google.internal/poster.jpg",
+        ] {
+            let url = Url::parse(value).expect("url");
+            let (lookup, calls) =
+                scripted_image_host_lookup(vec![vec!["127.0.0.1:80".parse().expect("loopback")]]);
+            let error = resolve_and_pin_image_host(&url, false, lookup.as_ref())
+                .await
+                .expect_err("a reserved local name must be rejected");
+            assert!(
+                matches!(error, ImageWriteError::InvalidUrl(_)),
+                "{value} must be rejected: {error:?}"
+            );
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{value} must be rejected before any DNS lookup"
+            );
+        }
+
+        // The loopback opt-in still resolves and pins the local test stub names.
+        let url = Url::parse("http://localhost.:8099/poster.jpg").expect("url");
+        let addresses = vec!["127.0.0.1:8099".parse().expect("loopback address")];
+        let (lookup, _calls) = scripted_image_host_lookup(vec![addresses.clone()]);
+        assert_eq!(
+            resolve_and_pin_image_host(&url, true, lookup.as_ref())
+                .await
+                .expect("the loopback opt-in allows the local stub"),
+            PinnedImageHost::Resolved {
+                host: "localhost.".to_owned(),
+                addresses,
+            }
+        );
+    }
+
+    /// With a proxy the final connection belongs to the proxy, so the host checks the parts it
+    /// owns without pretending a host-side DNS answer pins the proxy's connection.
+    #[tokio::test]
+    async fn proxied_image_hosts_are_checked_without_resolving_them() {
+        let public = Url::parse("https://images.example/poster.jpg").expect("url");
+        check_proxied_image_host(&public, false).expect("a public name belongs to the proxy");
+
+        for value in [
+            "http://127.0.0.1:8099/poster.jpg",
+            "https://10.0.0.5/poster.jpg",
+            "http://localhost./poster.jpg",
+        ] {
+            let url = Url::parse(value).expect("url");
+            let error = check_proxied_image_host(&url, false)
+                .expect_err("a private target must never be handed to the proxy");
+            assert!(
+                matches!(error, ImageWriteError::InvalidUrl(_)),
+                "{value} must be rejected: {error:?}"
+            );
+        }
+
+        let loopback = Url::parse("http://127.0.0.1:8099/poster.jpg").expect("url");
+        check_proxied_image_host(&loopback, true)
+            .expect("the loopback opt-in keeps the local stub reachable behind a proxy");
+    }
+
+    /// A client whose proxy routing is fixed for the test, so no environment variable has to be
+    /// touched (tests share one process).
+    fn test_image_http(
+        routing: ImageProxyRouting,
+        direct_connection_only: bool,
+    ) -> ImageHttpClient {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .expect("test image client");
+        ImageHttpClient {
+            client,
+            proxy_url: None,
+            timeout: std::time::Duration::from_secs(5),
+            direct_connection_only,
+            routing,
+            pinned_clients: std::sync::Arc::new(
+                std::sync::Mutex::new(PinnedClientCache::default()),
+            ),
+        }
+    }
+
+    /// The same client policy with a real proxy on the shared client too, so a test can observe
+    /// which side resolves the target name.
+    fn test_image_http_with_proxy(routing: ImageProxyRouting, proxy_url: &str) -> ImageHttpClient {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .proxy(reqwest::Proxy::all(proxy_url).expect("test proxy URL"))
+            .build()
+            .expect("test proxy client");
+        ImageHttpClient {
+            client,
+            proxy_url: Some(proxy_url.to_owned()),
+            timeout: std::time::Duration::from_secs(5),
+            direct_connection_only: false,
+            routing,
+            pinned_clients: std::sync::Arc::new(
+                std::sync::Mutex::new(PinnedClientCache::default()),
+            ),
+        }
+    }
+
+    #[test]
+    fn proxy_routing_mirrors_no_proxy_scheme_and_socks_rules() {
+        let routing = ImageProxyRouting {
+            explicit: ImageExplicitProxy::Proxy(ImageProxyDns::Remote),
+            environment: ImageEnvironmentProxy::default(),
+            exclusions: ImageProxyExclusions {
+                raw: Some("images.example, .internal.example, 10.0.0.0/8".to_owned()),
+            },
+        };
+        let route = |url: &str| routing.route(&Url::parse(url).expect("url"), false);
+        assert_eq!(
+            route("https://other.example/poster.jpg"),
+            ImageProxyRoute::RemoteDns
+        );
+        assert_eq!(
+            route("https://images.example/poster.jpg"),
+            ImageProxyRoute::DirectWithoutProxy
+        );
+        assert_eq!(
+            route("https://cdn.images.example/poster.jpg"),
+            ImageProxyRoute::DirectWithoutProxy
+        );
+        assert_eq!(
+            route("https://host.internal.example/poster.jpg"),
+            ImageProxyRoute::DirectWithoutProxy
+        );
+        assert_eq!(
+            route("http://10.200.0.1/poster.jpg"),
+            ImageProxyRoute::DirectWithoutProxy
+        );
+        // `direct_connection_only` disables every proxy, so the pin always takes effect.
+        assert_eq!(
+            routing.route(
+                &Url::parse("https://other.example/poster.jpg").expect("url"),
+                true
+            ),
+            ImageProxyRoute::Direct
+        );
+
+        // socks4/socks5 still resolve here, so they keep the pinned path with the proxy on.
+        let socks = ImageProxyRouting {
+            explicit: ImageExplicitProxy::Proxy(ImageProxyDns::Local),
+            environment: ImageEnvironmentProxy::default(),
+            exclusions: ImageProxyExclusions::default(),
+        };
+        assert_eq!(
+            socks.route(
+                &Url::parse("https://images.example/poster.jpg").expect("url"),
+                false
+            ),
+            ImageProxyRoute::LocalDns
+        );
+        // `NO_PROXY` bypasses even a local-DNS socks proxy.
+        let socks_excluded = ImageProxyRouting {
+            explicit: ImageExplicitProxy::Proxy(ImageProxyDns::Local),
+            environment: ImageEnvironmentProxy::default(),
+            exclusions: ImageProxyExclusions {
+                raw: Some("images.example".to_owned()),
+            },
+        };
+        assert_eq!(
+            socks_excluded.route(
+                &Url::parse("https://images.example/poster.jpg").expect("url"),
+                false
+            ),
+            ImageProxyRoute::DirectWithoutProxy
+        );
+
+        // An environment-only proxy is scheme specific.
+        let environment = ImageProxyRouting {
+            explicit: ImageExplicitProxy::None,
+            environment: ImageEnvironmentProxy {
+                http: ImageSchemeProxy::Proxy(ImageProxyDns::Remote),
+                https: ImageSchemeProxy::None,
+            },
+            exclusions: ImageProxyExclusions::default(),
+        };
+        assert_eq!(
+            environment.route(
+                &Url::parse("http://other.example/poster.jpg").expect("url"),
+                false
+            ),
+            ImageProxyRoute::RemoteDns
+        );
+        assert_eq!(
+            environment.route(
+                &Url::parse("https://other.example/poster.jpg").expect("url"),
+                false
+            ),
+            ImageProxyRoute::Direct
+        );
+
+        // A configured proxy this process cannot interpret is treated as direct with proxies
+        // disabled, so the pin is guaranteed to connect instead of trusting an unknown route.
+        let unknown_explicit = ImageProxyRouting {
+            explicit: ImageExplicitProxy::Unknown,
+            environment: ImageEnvironmentProxy::default(),
+            exclusions: ImageProxyExclusions::default(),
+        };
+        assert_eq!(
+            unknown_explicit.route(
+                &Url::parse("https://other.example/poster.jpg").expect("url"),
+                false
+            ),
+            ImageProxyRoute::DirectWithoutProxy
+        );
+        let unknown = ImageProxyRouting {
+            explicit: ImageExplicitProxy::None,
+            environment: ImageEnvironmentProxy {
+                http: ImageSchemeProxy::Unknown,
+                https: ImageSchemeProxy::Unknown,
+            },
+            exclusions: ImageProxyExclusions::default(),
+        };
+        assert_eq!(
+            unknown.route(
+                &Url::parse("https://other.example/poster.jpg").expect("url"),
+                false
+            ),
+            ImageProxyRoute::DirectWithoutProxy
+        );
+
+        // Without any proxy every request takes the pinned path.
+        let none = ImageProxyRouting::default();
+        assert_eq!(
+            none.route(
+                &Url::parse("https://other.example/poster.jpg").expect("url"),
+                false
+            ),
+            ImageProxyRoute::Direct
+        );
+
+        // Every direct route disables proxies on the pinned client; a local-DNS socks proxy stays.
+        assert!(ImageProxyRoute::Direct.bypass_proxy());
+        assert!(ImageProxyRoute::DirectWithoutProxy.bypass_proxy());
+        assert!(!ImageProxyRoute::LocalDns.bypass_proxy());
+    }
+
+    #[test]
+    fn no_proxy_exclusions_match_like_curl() {
+        let exclusions = ImageProxyExclusions {
+            raw: Some(
+                "images.example, .suffix.example, 10.0.0.0/8, 192.168.1.0/24, 2001:db8::/32, 127.0.0.1"
+                    .to_owned(),
+            ),
+        };
+        // A plain domain matches its subdomains but not a longer sibling label.
+        assert!(exclusions.matches("images.example"));
+        assert!(exclusions.matches("cdn.images.example"));
+        assert!(exclusions.matches("IMAGES.EXAMPLE"));
+        assert!(!exclusions.matches("notimages.example"));
+        // A leading dot behaves like the plain domain.
+        assert!(exclusions.matches("suffix.example"));
+        assert!(exclusions.matches("host.suffix.example"));
+        // A sibling domain is not excluded.
+        assert!(!exclusions.matches("other.example"));
+        // IP literals use the IP and network entries.
+        assert!(exclusions.matches("10.1.2.3"));
+        assert!(!exclusions.matches("11.0.0.1"));
+        assert!(exclusions.matches("192.168.1.44"));
+        assert!(!exclusions.matches("192.168.2.44"));
+        assert!(exclusions.matches("2001:db8::5"));
+        assert!(exclusions.matches("[2001:db8::5]"));
+        assert!(exclusions.matches("127.0.0.1"));
+        assert!(!exclusions.matches("[::1]"));
+
+        // `*` excludes every domain, matching the curl rule reqwest documents.
+        let any = ImageProxyExclusions {
+            raw: Some("*".to_owned()),
+        };
+        assert!(any.matches("images.example"));
+        assert!(!any.matches("127.0.0.1"));
+    }
+
+    #[test]
+    fn proxy_environment_detection_mirrors_reqwest() {
+        fn lookup_from<'a>(
+            values: &'a [(&'a str, &'a str)],
+        ) -> impl Fn(&str) -> Option<String> + 'a {
+            move |name: &str| {
+                values
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+            }
+        }
+        let environment =
+            |values: &[(&str, &str)]| ImageEnvironmentProxy::from_lookup(lookup_from(values));
+
+        // A scheme variable is read in either spelling and keeps its scheme semantics.
+        assert_eq!(
+            environment(&[("http_proxy", "http://10.0.0.2:7890")]).for_scheme("http"),
+            ImageSchemeProxy::Proxy(ImageProxyDns::Remote)
+        );
+        assert_eq!(
+            environment(&[("HTTP_PROXY", "socks5://10.0.0.2:1080")]).for_scheme("http"),
+            ImageSchemeProxy::Proxy(ImageProxyDns::Local),
+            "socks5 still resolves in this process"
+        );
+        assert_eq!(
+            environment(&[("HTTP_PROXY", "socks5h://10.0.0.2:1080")]).for_scheme("http"),
+            ImageSchemeProxy::Proxy(ImageProxyDns::Remote),
+            "socks5h resolves inside the proxy"
+        );
+        // A valueless scheme is an `http://` proxy, matching curl and hyper-util.
+        assert_eq!(
+            environment(&[("HTTP_PROXY", "proxy.internal:3128")]).for_scheme("http"),
+            ImageSchemeProxy::Proxy(ImageProxyDns::Remote)
+        );
+        assert_eq!(
+            environment(&[("ALL_PROXY", "10.0.0.2:1080")]).for_scheme("https"),
+            ImageSchemeProxy::Proxy(ImageProxyDns::Remote)
+        );
+        // reqwest parses the raw value with `http::Uri`: trailing whitespace, non-ASCII userinfo and
+        // fragments make it invalid, so the route is unknown and the pin protects a direct request.
+        for rejected in [
+            "http://10.0.0.2:7890 ",
+            "http://user:密码@proxy.example:8080",
+            "http://10.0.0.2:7890#fragment",
+        ] {
+            let value = environment(&[("HTTP_PROXY", rejected)]);
+            assert_eq!(
+                value.for_scheme("http"),
+                ImageSchemeProxy::Unknown,
+                "{rejected} must not be trusted as a proxy"
+            );
+            assert_eq!(value.for_scheme("https"), ImageSchemeProxy::None);
+        }
+        // The first set variable wins; the lowercase spelling is not consulted after it.
+        assert_eq!(
+            environment(&[
+                ("HTTP_PROXY", "http://10.0.0.2:7890"),
+                ("http_proxy", "socks5h://10.0.0.9:1080"),
+            ])
+            .for_scheme("http"),
+            ImageSchemeProxy::Proxy(ImageProxyDns::Remote)
+        );
+        // `ALL_PROXY` covers both schemes and is the fallback for an unusable scheme value.
+        let all = environment(&[("ALL_PROXY", "socks5h://10.0.0.3:1080")]);
+        assert_eq!(
+            all.for_scheme("http"),
+            ImageSchemeProxy::Proxy(ImageProxyDns::Remote)
+        );
+        assert_eq!(
+            all.for_scheme("https"),
+            ImageSchemeProxy::Proxy(ImageProxyDns::Remote)
+        );
+        assert_eq!(
+            environment(&[
+                ("HTTP_PROXY", "not a proxy"),
+                ("ALL_PROXY", "http://10.0.0.4:7890"),
+            ])
+            .for_scheme("http"),
+            ImageSchemeProxy::Proxy(ImageProxyDns::Remote)
+        );
+        assert_eq!(
+            environment(&[("HTTP_PROXY", "not a proxy")]).for_scheme("http"),
+            ImageSchemeProxy::Unknown
+        );
+        assert_eq!(
+            environment(&[("HTTPS_PROXY", "ftp://10.0.0.5:21")]).for_scheme("https"),
+            ImageSchemeProxy::Unknown
+        );
+        // A blank scheme variable falls through to `ALL_PROXY`, like reqwest.
+        assert_eq!(
+            environment(&[("HTTP_PROXY", "  "), ("ALL_PROXY", "http://10.0.0.4:7890"),])
+                .for_scheme("http"),
+            ImageSchemeProxy::Proxy(ImageProxyDns::Remote)
+        );
+        // The configured proxy URL itself is trimmed by `normalize_proxy_url`, but a value only one
+        // of reqwest's proxy parsers accepts becomes an unknown explicit proxy.
+        assert_eq!(explicit_proxy_url(Some("  ")), None);
+        assert_eq!(
+            explicit_proxy_url(Some(" http://10.0.0.2:7890 ")),
+            Some("http://10.0.0.2:7890".to_owned())
+        );
+        assert_eq!(
+            ImageProxyDns::from_url("http://10.0.0.2:7890"),
+            Some(ImageProxyDns::Remote)
+        );
+        assert_eq!(
+            ImageProxyDns::from_url("socks5://10.0.0.2:1080"),
+            Some(ImageProxyDns::Local)
+        );
+        // The configured value is trimmed before these checks, so only values reqwest cannot use
+        // are rejected here.
+        for rejected in [
+            "http://user:密码@proxy.example:8080",
+            "http://10.0.0.2:7890#fragment",
+        ] {
+            assert_eq!(
+                ImageProxyDns::from_url(rejected),
+                None,
+                "{rejected} must not be trusted as an explicit proxy"
+            );
+            assert_eq!(
+                ImageProxyRouting::from_environment(Some(rejected)).explicit,
+                ImageExplicitProxy::Unknown
+            );
+        }
+        assert_eq!(
+            ImageProxyRouting::from_environment(Some(" http://10.0.0.2:7890 ")).explicit,
+            ImageExplicitProxy::Proxy(ImageProxyDns::Remote),
+            "the configured proxy URL is trimmed, like `normalize_proxy_url`"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_image_client_connects_only_to_the_checked_address() {
+        let address = spawn_image_stub("image/png", TEST_PNG_1X1).await;
+        let http = test_image_http(ImageProxyRouting::default(), true);
+        let client = http
+            .pinned_client(
+                &PinnedImageHost::Resolved {
+                    host: "images.example".to_owned(),
+                    addresses: vec![address],
+                },
+                false,
+            )
+            .expect("pinned client");
+
+        // `images.example` cannot resolve, so only the pinned address can answer this request.
+        let url = Url::parse(&format!(
+            "http://images.example:{}/poster.png",
+            address.port()
+        ))
+        .expect("url");
+        let response = client.get(url).send().await.expect("pinned request");
+
+        assert_eq!(response.status().as_u16(), 200);
+    }
+
+    /// A direct route must disable even a proxy the host cannot see (for example an operating-system
+    /// proxy): the pinned client would otherwise let the proxy resolve and open the connection.
+    #[tokio::test]
+    async fn direct_routes_disable_system_proxies_on_the_pinned_client() {
+        let address = spawn_image_stub("image/png", TEST_PNG_1X1).await;
+        // A closed loopback port stands in for a proxy the routing cannot observe: reaching it would
+        // fail the download, while a pinned direct client never connects to it.
+        let closed_proxy = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("closed proxy listener");
+            listener.local_addr().expect("closed proxy address").port()
+        };
+        let http = test_image_http_with_proxy(
+            ImageProxyRouting::default(),
+            &format!("http://127.0.0.1:{closed_proxy}"),
+        );
+        let url = Url::parse(&format!(
+            "http://images.example:{}/poster.png",
+            address.port()
+        ))
+        .expect("url");
+        assert_eq!(http.route(&url), ImageProxyRoute::Direct);
+        let (lookup, _calls) = scripted_image_host_lookup(vec![vec![address]]);
+
+        let client = http
+            .checked_request_client_with(&url, true, lookup.as_ref())
+            .await
+            .expect("pinned client");
+        let response = client.get(url).send().await.expect("direct pinned request");
+
+        assert_eq!(response.status().as_u16(), 200);
+    }
+
+    /// A `NO_PROXY` match connects directly from this process, so it must take the resolved and
+    /// pinned path instead of being handed to the proxy.
+    #[tokio::test]
+    async fn no_proxy_targets_take_the_pinned_direct_path() {
+        let address = spawn_image_stub("image/png", TEST_PNG_1X1).await;
+        let http = test_image_http(
+            ImageProxyRouting {
+                explicit: ImageExplicitProxy::Proxy(ImageProxyDns::Remote),
+                environment: ImageEnvironmentProxy::default(),
+                exclusions: ImageProxyExclusions {
+                    raw: Some("images.example".to_owned()),
+                },
+            },
+            false,
+        );
+        let url = Url::parse(&format!(
+            "http://images.example:{}/poster.png",
+            address.port()
+        ))
+        .expect("url");
+        assert_eq!(
+            http.route(&url),
+            ImageProxyRoute::DirectWithoutProxy,
+            "an excluded host must not be handed to the proxy"
+        );
+        let (lookup, calls) = scripted_image_host_lookup(vec![vec![address]]);
+
+        let client = http
+            .checked_request_client_with(&url, true, lookup.as_ref())
+            .await
+            .expect("pinned client");
+        let response = client.get(url).send().await.expect("pinned request");
+
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A remote-DNS proxy still refuses a name that resolves locally into the private network,
+    /// while a name only the proxy can resolve stays with the proxy.
+    #[tokio::test]
+    async fn remote_dns_proxy_routes_check_local_answers_best_effort() {
+        let http = test_image_http(
+            ImageProxyRouting {
+                explicit: ImageExplicitProxy::Proxy(ImageProxyDns::Remote),
+                environment: ImageEnvironmentProxy::default(),
+                exclusions: ImageProxyExclusions::default(),
+            },
+            false,
+        );
+        let url = Url::parse("https://images.example/poster.jpg").expect("url");
+
+        let (lookup, calls) = scripted_image_host_lookup(vec![vec![
+            "10.0.0.1:443".parse().expect("private address"),
+        ]]);
+        let error = http
+            .checked_request_client_with(&url, false, lookup.as_ref())
+            .await
+            .expect_err("a locally private answer must not reach the proxy");
+        assert!(matches!(error, ImageWriteError::InvalidUrl(_)));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Only the proxy can resolve this name, so it owns the final remote DNS boundary.
+        let failing: std::sync::Arc<dyn HostResolver> =
+            std::sync::Arc::new(|_host: String, _port: u16| {
+                let answer: std::io::Result<Vec<std::net::SocketAddr>> =
+                    Err(std::io::Error::other("no local answer"));
+                Box::pin(std::future::ready(answer)) as HostLookupFuture<'static>
+            });
+        http.checked_request_client_with(&url, false, failing.as_ref())
+            .await
+            .expect("a proxy-only name is delegated to the proxy");
+
+        // A public local answer passes the pre-check and is still fetched through the proxy.
+        let (public, _calls) = scripted_image_host_lookup(vec![vec![public_image_address(443)]]);
+        http.checked_request_client_with(&url, false, public.as_ref())
+            .await
+            .expect("a public local answer is delegated to the proxy");
+        assert_eq!(
+            http.cached_pinned_client_count(),
+            0,
+            "a remote-DNS proxy route never pins a client"
+        );
+    }
+
+    /// What a socks proxy was asked to connect to.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum SocksTarget {
+        Ipv4([u8; 4], u16),
+        Domain(String, u16),
+    }
+
+    /// A minimal socks5 CONNECT proxy that records the target it was asked for and tunnels the
+    /// connection to the image stub, so a test can tell local from remote name resolution.
+    async fn spawn_socks5_proxy(
+        upstream: std::net::SocketAddr,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<SocksTarget>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("socks listener");
+        let address = listener.local_addr().expect("socks address");
+        let targets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&targets);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut client, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen = std::sync::Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let mut greeting = [0_u8; 2];
+                    if client.read_exact(&mut greeting).await.is_err() {
+                        return;
+                    }
+                    let mut methods = vec![0_u8; usize::from(greeting[1])];
+                    if client.read_exact(&mut methods).await.is_err() {
+                        return;
+                    }
+                    if client.write_all(&[0x05, 0x00]).await.is_err() {
+                        return;
+                    }
+                    let mut head = [0_u8; 4];
+                    if client.read_exact(&mut head).await.is_err() {
+                        return;
+                    }
+                    let target = match head[3] {
+                        0x01 => {
+                            let mut raw = [0_u8; 4];
+                            let mut port = [0_u8; 2];
+                            if client.read_exact(&mut raw).await.is_err()
+                                || client.read_exact(&mut port).await.is_err()
+                            {
+                                return;
+                            }
+                            SocksTarget::Ipv4(raw, u16::from_be_bytes(port))
+                        }
+                        0x03 => {
+                            let mut length = [0_u8; 1];
+                            if client.read_exact(&mut length).await.is_err() {
+                                return;
+                            }
+                            let mut host = vec![0_u8; usize::from(length[0])];
+                            let mut port = [0_u8; 2];
+                            if client.read_exact(&mut host).await.is_err()
+                                || client.read_exact(&mut port).await.is_err()
+                            {
+                                return;
+                            }
+                            SocksTarget::Domain(
+                                String::from_utf8_lossy(&host).into_owned(),
+                                u16::from_be_bytes(port),
+                            )
+                        }
+                        _ => return,
+                    };
+                    if let Ok(mut seen) = seen.lock() {
+                        seen.push(target);
+                    }
+                    if client
+                        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let Ok(mut server) = tokio::net::TcpStream::connect(upstream).await else {
+                        return;
+                    };
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                });
+            }
+        });
+        (address, targets)
+    }
+
+    /// `socks5://` resolves in this process, so the request must be validated and pinned while the
+    /// socks proxy stays on the client. `socks5h://` leaves the name to the proxy.
+    #[tokio::test]
+    async fn socks5_proxies_resolve_locally_and_socks5h_proxies_resolve_remotely() {
+        let image = spawn_image_stub("image/png", TEST_PNG_1X1).await;
+        let url = Url::parse(&format!(
+            "http://images.example:{}/poster.png",
+            image.port()
+        ))
+        .expect("url");
+
+        // Local DNS: the proxy receives the checked address instead of the name.
+        let (socks, targets) = spawn_socks5_proxy(image).await;
+        let http = test_image_http_with_proxy(
+            ImageProxyRouting {
+                explicit: ImageExplicitProxy::Proxy(ImageProxyDns::Local),
+                environment: ImageEnvironmentProxy::default(),
+                exclusions: ImageProxyExclusions::default(),
+            },
+            &format!("socks5://{socks}"),
+        );
+        let (lookup, calls) = scripted_image_host_lookup(vec![vec![image]]);
+        let client = http
+            .checked_request_client_with(&url, true, lookup.as_ref())
+            .await
+            .expect("pinned client");
+        let response = client
+            .get(url.clone())
+            .send()
+            .await
+            .expect("socks5 request");
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "socks5 must resolve through the checked lookup"
+        );
+        assert_eq!(http.cached_pinned_client_count(), 1);
+        assert_eq!(
+            targets.lock().expect("socks targets").as_slice(),
+            [SocksTarget::Ipv4([127, 0, 0, 1], image.port())],
+            "the socks proxy must receive the checked address"
+        );
+
+        // Remote DNS: the proxy receives the name and this process does not pin a client.
+        let (socks, targets) = spawn_socks5_proxy(image).await;
+        let http = test_image_http_with_proxy(
+            ImageProxyRouting {
+                explicit: ImageExplicitProxy::Proxy(ImageProxyDns::Remote),
+                environment: ImageEnvironmentProxy::default(),
+                exclusions: ImageProxyExclusions::default(),
+            },
+            &format!("socks5h://{socks}"),
+        );
+        let (lookup, calls) = scripted_image_host_lookup(vec![vec![public_image_address(443)]]);
+        let client = http
+            .checked_request_client_with(&url, true, lookup.as_ref())
+            .await
+            .expect("proxy client");
+        let response = client
+            .get(url.clone())
+            .send()
+            .await
+            .expect("socks5h request");
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the best-effort local pre-check may resolve the name"
+        );
+        assert_eq!(
+            http.cached_pinned_client_count(),
+            0,
+            "socks5h never pins a client"
+        );
+        assert_eq!(
+            targets.lock().expect("socks targets").as_slice(),
+            [SocksTarget::Domain(
+                "images.example".to_owned(),
+                image.port()
+            )],
+            "the socks5h proxy must receive the name"
+        );
+    }
+
+    #[test]
+    fn pinned_clients_are_cached_by_host_and_checked_addresses() {
+        let http = test_image_http(ImageProxyRouting::default(), true);
+        let first = PinnedImageHost::Resolved {
+            host: "images.example".to_owned(),
+            addresses: vec![
+                public_image_address(443),
+                "[2606:4700:4700::1111]:443"
+                    .parse()
+                    .expect("public IPv6 address"),
+            ],
+        };
+        let same_set_other_order = PinnedImageHost::Resolved {
+            host: "images.example".to_owned(),
+            addresses: vec![
+                "[2606:4700:4700::1111]:443"
+                    .parse()
+                    .expect("public IPv6 address"),
+                public_image_address(443),
+            ],
+        };
+        http.pinned_client(&first, false).expect("pinned client");
+        http.pinned_client(&same_set_other_order, false)
+            .expect("the same address set reuses the cached client");
+        assert_eq!(http.cached_pinned_client_count(), 1);
+
+        http.pinned_client(&PinnedImageHost::IpLiteral, false)
+            .expect("an approved literal keeps the shared client");
+        assert_eq!(
+            http.cached_pinned_client_count(),
+            1,
+            "a literal adds nothing to the pin cache"
+        );
+
+        http.pinned_client(
+            &PinnedImageHost::Resolved {
+                host: "cdn.example".to_owned(),
+                addresses: vec![public_image_address(443)],
+            },
+            false,
+        )
+        .expect("a new host gets its own client");
+        assert_eq!(http.cached_pinned_client_count(), 2);
+
+        for index in 0..PINNED_CLIENT_CACHE_LIMIT + 4 {
+            http.pinned_client(
+                &PinnedImageHost::Resolved {
+                    host: format!("host{index}.example"),
+                    addresses: vec![public_image_address(443)],
+                },
+                false,
+            )
+            .expect("bounded pinned client");
+        }
+        assert_eq!(
+            http.cached_pinned_client_count(),
+            PINNED_CLIENT_CACHE_LIMIT,
+            "the pin cache stays bounded"
+        );
     }
 
     #[test]
@@ -4099,6 +5759,45 @@ mod tests {
         address
     }
 
+    /// Serves a transient failure first so the download has to retry, then the image.
+    async fn spawn_retrying_image_stub() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("image stub listener");
+        let address = listener.local_addr().expect("image stub address");
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let requests = std::sync::Arc::clone(&requests);
+                tokio::spawn(async move {
+                    let attempt = requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut request = [0_u8; 2048];
+                    let _ = stream.read(&mut request).await;
+                    let head = if attempt == 0 {
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_owned()
+                    } else {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            TEST_PNG_1X1.len()
+                        )
+                    };
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    if attempt != 0 {
+                        let _ = stream.write_all(TEST_PNG_1X1).await;
+                    }
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        address
+    }
+
     /// A scanned movie library plus the database a download attempt needs.
     async fn image_download_fixture()
     -> Result<(Database, String, tempfile::TempDir), Box<dyn std::error::Error>> {
@@ -4190,6 +5889,48 @@ mod tests {
         .fetch_one(database.pool())
         .await?;
         assert_eq!(images, 1);
+        database.close().await;
+        Ok(())
+    }
+
+    /// The review #4 regression at request level: retries must keep using the addresses checked
+    /// for this attempt. The scripted lookup answers loopback once and a rejected private address
+    /// afterwards, so a re-resolving retry would fail instead of finishing the download.
+    #[tokio::test]
+    async fn direct_image_download_pins_the_checked_address_across_retries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, item_id, _directory) = image_download_fixture().await?;
+        let address = spawn_retrying_image_stub().await;
+        let port = address.port();
+        let (lookup, calls) = scripted_image_host_lookup(vec![
+            vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))],
+            vec![std::net::SocketAddr::from(([10, 0, 0, 1], port))],
+        ]);
+        let service = ImageWriteService::with_config(
+            database.clone(),
+            ImageDownloadConfig {
+                timeout: std::time::Duration::from_secs(5),
+                max_bytes: 1024 * 1024,
+                allow_loopback_http: true,
+                direct_connection_only: true,
+            },
+        )?
+        .with_host_lookup(lookup);
+
+        let report = service
+            .download_item_image(
+                &item_id,
+                "poster",
+                &format!("http://images.example:{port}/poster.png"),
+            )
+            .await?;
+
+        assert_eq!(report.content_type, "image/png");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a retry must reuse the checked and pinned address instead of resolving again"
+        );
         database.close().await;
         Ok(())
     }
@@ -4880,5 +6621,194 @@ mod tests {
                 ))
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn series_without_season_folder_does_not_report_path_outside_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let service = ImageWriteService::new_with_config_dir(database, config.config_dir)?;
+        let root = temp.path().join("Shows");
+        let show_dir = root.join("Flat Show (2025)");
+        tokio::fs::create_dir_all(&show_dir).await?;
+        tokio::fs::write(
+            show_dir.join("Flat.Show.S01E01.strm"),
+            b"http://example.invalid\n",
+        )
+        .await?;
+        tokio::fs::write(show_dir.join("poster.jpg"), b"poster-bytes").await?;
+        tokio::fs::write(root.join("Stray.S01E01.strm"), b"http://example.invalid\n").await?;
+
+        let flat_context = crate::storage::StoredMediaWritebackContext {
+            item_type: "SERIES".to_owned(),
+            source: Some(crate::storage::StoredMediaSourcePath {
+                source_id: "src-flat".to_owned(),
+                item_id: "ep-flat".to_owned(),
+                probe_status: "DONE".to_owned(),
+                root_path: root.to_string_lossy().into_owned(),
+                relative_path: "Flat Show (2025)/Flat.Show.S01E01.strm".to_owned(),
+            }),
+        };
+        let found = service
+            .local_image_types_with_indexed_images_and_context(
+                "series-flat",
+                &["POSTER"],
+                false,
+                &[],
+                &flat_context,
+            )
+            .await?;
+        assert!(found.contains("POSTER"));
+
+        let root_level_context = crate::storage::StoredMediaWritebackContext {
+            item_type: "SERIES".to_owned(),
+            source: Some(crate::storage::StoredMediaSourcePath {
+                source_id: "src-root".to_owned(),
+                item_id: "ep-root".to_owned(),
+                probe_status: "DONE".to_owned(),
+                root_path: root.to_string_lossy().into_owned(),
+                relative_path: "Stray.S01E01.strm".to_owned(),
+            }),
+        };
+        let root_found = service
+            .local_image_types_with_indexed_images_and_context(
+                "series-root",
+                &["POSTER"],
+                false,
+                &[],
+                &root_level_context,
+            )
+            .await?;
+        assert!(root_found.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_image_probes_skip_missing_source_and_root_series_without_item_not_found()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{
+                libraries::LibraryService, metadata_paths::library_item_directory,
+                scanner::LibraryScanner,
+            },
+            library::LibraryKind,
+        };
+
+        let temp = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp.path().join("config"),
+        };
+        let shows_root = temp.path().join("Shows");
+        let movies_root = temp.path().join("Movies");
+        let movie_dir = movies_root.join("Missing Source Movie (2020)");
+        tokio::fs::create_dir_all(&shows_root).await?;
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(
+            shows_root.join("Stray.S01E01.strm"),
+            b"http://example.invalid/stray\n",
+        )
+        .await?;
+        tokio::fs::write(movie_dir.join("Missing.Source.2020.mkv"), b"movie").await?;
+
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let shows_lib = libraries
+            .create_library("Shows", LibraryKind::Series, false)
+            .await?;
+        libraries
+            .add_root(shows_lib.id, shows_root.to_str().ok_or("non-utf8 root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_series_library(shows_lib.id)
+            .await?;
+        let series_id: String = sqlx::query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'SERIES' LIMIT 1",
+        )
+        .bind(shows_lib.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+
+        let movies_lib = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(movies_lib.id, movies_root.to_str().ok_or("non-utf8 root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(movies_lib.id)
+            .await?;
+        let movie_id: String = sqlx::query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' LIMIT 1",
+        )
+        .bind(movies_lib.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE filesystem_entries
+             SET is_missing = 1
+             WHERE id IN (SELECT filesystem_entry_id FROM media_sources WHERE item_id = ?)",
+        )
+        .bind(&movie_id)
+        .execute(database.pool())
+        .await?;
+
+        let address = spawn_image_stub("image/png", TEST_PNG_1X1).await;
+        let service = ImageWriteService::with_config_and_config_dir(
+            database.clone(),
+            ImageDownloadConfig {
+                max_bytes: 1024 * 1024,
+                allow_loopback_http: true,
+                direct_connection_only: true,
+                ..ImageDownloadConfig::default()
+            },
+            config.config_dir.clone(),
+        )?;
+
+        assert!(!service.has_local_writeback_directory(&series_id).await?);
+        assert!(!service.has_local_writeback_directory(&movie_id).await?);
+        assert!(
+            service
+                .local_image_types(&series_id, &["POSTER", "FANART"])
+                .await?
+                .is_empty()
+        );
+        assert!(!service.has_local_image(&series_id, "POSTER").await?);
+        assert!(
+            service
+                .local_image_types(&movie_id, &["POSTER", "FANART"])
+                .await?
+                .is_empty()
+        );
+        assert!(!service.has_local_image(&movie_id, "POSTER").await?);
+
+        let managed_dir = library_item_directory(&config.config_dir, &movie_id)?;
+        tokio::fs::create_dir_all(&managed_dir).await?;
+        tokio::fs::write(managed_dir.join("poster.png"), TEST_PNG_1X1).await?;
+        assert!(
+            service
+                .local_image_types(&movie_id, &["POSTER", "FANART"])
+                .await?
+                .contains("POSTER")
+        );
+        assert!(service.has_local_image(&movie_id, "POSTER").await?);
+
+        assert!(matches!(
+            service
+                .download_item_image(&movie_id, "poster", &format!("http://{address}/poster"))
+                .await,
+            Err(ImageWriteError::ItemNotFound)
+        ));
+        assert!(matches!(
+            service.delete_item_image(&movie_id, "missing-image").await,
+            Err(ImageWriteError::ItemNotFound)
+        ));
+        database.close().await;
+        Ok(())
     }
 }

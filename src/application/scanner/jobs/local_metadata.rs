@@ -894,6 +894,7 @@ async fn dispatch_local_metadata_fill_missing_jobs(
 #[derive(Clone)]
 struct ScanLocalMetadataOutboxWorkerContext {
     database: Database,
+    people: Option<PeopleService>,
     local_nfo: Option<LocalNfoMetadataStore>,
     metadata_selection: Option<MetadataSelectionService>,
     metadata_reidentify: Option<MetadataReidentifyService>,
@@ -908,16 +909,33 @@ struct ScanLocalMetadataOutboxWorkerContext {
     error_retry: Duration,
 }
 
+fn build_local_metadata_enricher(
+    database: &Database,
+    people: Option<&PeopleService>,
+    local_nfo: Option<&LocalNfoMetadataStore>,
+    resources: &ResourceMetrics,
+) -> MetadataEnricher {
+    let enricher = MetadataEnricher::new(database.clone()).with_resource_metrics(resources.clone());
+    let enricher = match people {
+        Some(people) => enricher.with_people(people.clone()),
+        None => enricher,
+    };
+    match local_nfo {
+        Some(local_nfo) => enricher.with_nfo_store(local_nfo.clone()),
+        None => enricher,
+    }
+}
+
 async fn run_scan_local_metadata_outbox_worker(
     context: ScanLocalMetadataOutboxWorkerContext,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let enricher = MetadataEnricher::new(context.database.clone())
-        .with_resource_metrics(context.resources.clone());
-    let enricher = match context.local_nfo.clone() {
-        Some(local_nfo) => enricher.with_nfo_store(local_nfo),
-        None => enricher,
-    };
+    let enricher = build_local_metadata_enricher(
+        &context.database,
+        context.people.as_ref(),
+        context.local_nfo.as_ref(),
+        &context.resources,
+    );
     let mut nfo_tasks = JoinSet::new();
     loop {
         if *shutdown.borrow() {
@@ -1293,16 +1311,12 @@ async fn process_local_metadata_job_page(
 }
 
 async fn run_local_metadata_job_worker(context: LocalMetadataJobWorkerContext) {
-    let enricher = MetadataEnricher::new(context.database.clone())
-        .with_resource_metrics(context.resources.clone());
-    let enricher = match context.people.clone() {
-        Some(people) => enricher.with_people(people),
-        None => enricher,
-    };
-    let enricher = match context.local_nfo.clone() {
-        Some(local_nfo) => enricher.with_nfo_store(local_nfo),
-        None => enricher,
-    };
+    let enricher = build_local_metadata_enricher(
+        &context.database,
+        context.people.as_ref(),
+        context.local_nfo.as_ref(),
+        &context.resources,
+    );
     let mut stop_receiver = context.stop_receiver.clone();
     let mut loaded_lifecycle = false;
     loop {
@@ -1384,12 +1398,12 @@ impl ScanJobService {
         else {
             return;
         };
-        let enricher = MetadataEnricher::new(self.database.clone())
-            .with_resource_metrics(self.resources.clone());
-        let enricher = match self.local_nfo.clone() {
-            Some(local_nfo) => enricher.with_nfo_store(local_nfo),
-            None => enricher,
-        };
+        let enricher = build_local_metadata_enricher(
+            &self.database,
+            self.people.as_ref(),
+            self.local_nfo.as_ref(),
+            &self.resources,
+        );
         let mut failed_items = 0_usize;
         for chunk in entry_ids.chunks(64) {
             let source_snapshot = match enricher.index_scan_local_metadata_batch_images(chunk).await
@@ -1660,8 +1674,20 @@ impl ScanJobService {
                 .store(false, Ordering::Release);
             return Err(error.into());
         }
+        if let Err(error) = self
+            .database
+            .requeue_completed_scan_local_metadata_backfills_once(
+                "nfo_actor_identities_backfill_v1",
+            )
+            .await
+        {
+            self.local_metadata_outbox_worker_started
+                .store(false, Ordering::Release);
+            return Err(error.into());
+        }
 
         let database = self.database.clone();
+        let people = self.people.clone();
         let local_nfo = self.local_nfo.clone();
         let metadata_selection = self.metadata_selection.clone();
         let metadata_reidentify = self.metadata_reidentify.clone();
@@ -1672,6 +1698,7 @@ impl ScanJobService {
         let image_notifications = Arc::clone(&self.local_metadata_image_notifications);
         let worker_context = ScanLocalMetadataOutboxWorkerContext {
             database,
+            people,
             local_nfo,
             metadata_selection,
             metadata_reidentify,
@@ -1718,6 +1745,7 @@ impl ScanJobService {
         let outbox_notify = Arc::clone(&self.local_metadata_outbox_notify);
         let context = ScanLocalMetadataOutboxWorkerContext {
             database: self.database.clone(),
+            people: self.people.clone(),
             local_nfo: self.local_nfo.clone(),
             metadata_selection: self.metadata_selection.clone(),
             metadata_reidentify: self.metadata_reidentify.clone(),

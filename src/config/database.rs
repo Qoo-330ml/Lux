@@ -1,4 +1,7 @@
-use std::{fmt, io, path::PathBuf};
+use std::{
+    fmt, io,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 use tokio::fs;
@@ -184,30 +187,9 @@ impl Config {
     }
 
     pub async fn mark_database_selection_pending(&self) -> Result<(), DatabaseConfigurationError> {
-        fs::create_dir_all(&self.config_dir)
+        self.prepare_config_directory().await?;
+        self.write_private_configuration_file(DATABASE_SELECTION_MARKER_FILE, b"pending".to_vec())
             .await
-            .map_err(|source| DatabaseConfigurationError::Io {
-                path: self.config_dir.clone(),
-                source,
-            })?;
-        let path = self.config_dir.join(DATABASE_SELECTION_MARKER_FILE);
-        fs::write(&path, b"pending")
-            .await
-            .map_err(|source| DatabaseConfigurationError::Io {
-                path: path.clone(),
-                source,
-            })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                .await
-                .map_err(|source| DatabaseConfigurationError::Io {
-                    path: path.clone(),
-                    source,
-                })?;
-        }
-        Ok(())
     }
 
     pub async fn save_database_configuration(
@@ -215,43 +197,219 @@ impl Config {
         configuration: &DatabaseConfiguration,
     ) -> Result<(), DatabaseConfigurationError> {
         configuration.validate()?;
-        fs::create_dir_all(&self.config_dir)
-            .await
-            .map_err(|source| DatabaseConfigurationError::Io {
-                path: self.config_dir.clone(),
-                source,
-            })?;
-
-        let path = self.config_dir.join(DATABASE_CONFIG_FILE);
-        let temporary_path = self
-            .config_dir
-            .join(format!(".database.json.{}.tmp", Uuid::now_v7()));
         let bytes = serde_json::to_vec_pretty(configuration).map_err(|source| {
             DatabaseConfigurationError::Invalid(format!("数据库配置无法序列化: {source}"))
         })?;
-        fs::write(&temporary_path, bytes).await.map_err(|source| {
-            DatabaseConfigurationError::Io {
-                path: temporary_path.clone(),
-                source,
-            }
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&temporary_path, std::fs::Permissions::from_mode(0o600))
-                .await
-                .map_err(|source| DatabaseConfigurationError::Io {
-                    path: temporary_path.clone(),
-                    source,
-                })?;
-        }
-        if let Err(source) = fs::rename(&temporary_path, &path).await {
-            let _ = fs::remove_file(&temporary_path).await;
-            return Err(DatabaseConfigurationError::Io { path, source });
-        }
+        self.prepare_config_directory().await?;
+        self.write_private_configuration_file(DATABASE_CONFIG_FILE, bytes)
+            .await?;
         let _ = fs::remove_file(self.config_dir.join(DATABASE_SELECTION_MARKER_FILE)).await;
         Ok(())
     }
+
+    async fn prepare_config_directory(&self) -> Result<(), DatabaseConfigurationError> {
+        let config_dir = self.config_dir.clone();
+        match tokio::task::spawn_blocking(move || prepare_private_config_directory(&config_dir))
+            .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(source)) => Err(DatabaseConfigurationError::Io {
+                path: self.config_dir.clone(),
+                source,
+            }),
+            Err(error) => Err(DatabaseConfigurationError::Io {
+                path: self.config_dir.clone(),
+                source: io::Error::other(error.to_string()),
+            }),
+        }
+    }
+
+    async fn write_private_configuration_file(
+        &self,
+        file_name: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), DatabaseConfigurationError> {
+        let target = self.config_dir.join(file_name);
+        let temporary = self.config_dir.join(temporary_file_name(file_name));
+        let target_for_write = target.clone();
+        let temporary_for_write = temporary.clone();
+        match tokio::task::spawn_blocking(move || {
+            write_private_file_atomically(&target_for_write, &temporary_for_write, &bytes)
+        })
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(source)) => Err(DatabaseConfigurationError::Io {
+                path: target,
+                source,
+            }),
+            Err(error) => Err(DatabaseConfigurationError::Io {
+                path: target,
+                source: io::Error::other(error.to_string()),
+            }),
+        }
+    }
+}
+
+fn temporary_file_name(file_name: &str) -> String {
+    format!(
+        ".{}.{}.tmp",
+        file_name.trim_start_matches('.'),
+        Uuid::now_v7()
+    )
+}
+
+/// Creates a private file and atomically replaces `target` with it, removing `temporary` on every
+/// failure path so a partially written database configuration never survives.
+fn write_private_file_atomically(target: &Path, temporary: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(temporary)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(bytes)?;
+        #[cfg(test)]
+        maybe_fail_at(InjectedFailure::BeforeFileSync)?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(test)]
+        maybe_fail_at(InjectedFailure::BeforeRename)?;
+        std::fs::rename(temporary, target)?;
+        #[cfg(unix)]
+        if let Some(parent) = target.parent()
+            && let Err(source) = sync_directory(parent)
+        {
+            tracing::warn!(
+                path = %parent.display(),
+                kind = ?source.kind(),
+                "failed to sync the parent directory after writing the database configuration; \
+                 the file was renamed successfully"
+            );
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn sync_directory(directory: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    maybe_fail_at(InjectedFailure::BeforeDirectorySync)?;
+    std::fs::File::open(directory)?.sync_all()
+}
+
+/// Creates the configuration directory as owner-only when this process has to create it. Existing
+/// directories keep their host-provided permissions (Docker and NAS mounts commonly arrive as
+/// 0755), except that world-writable directories are tightened on a best-effort basis: a host
+/// mount this process cannot chmod must not stop the server from persisting its configuration.
+/// Sticky world-writable directories are left untouched because the sticky bit protects entries
+/// from other users, and system-style shared directories rely on that mode.
+fn prepare_private_config_directory(config_dir: &Path) -> io::Result<()> {
+    match std::fs::metadata(config_dir) {
+        Ok(metadata) => {
+            if !metadata.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    "database configuration path is not a directory",
+                ));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder.create(config_dir)?;
+        }
+        Err(error) => return Err(error),
+    }
+    restrict_shared_write_access(config_dir)
+}
+
+#[cfg(unix)]
+fn restrict_shared_write_access(config_dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let permissions = std::fs::metadata(config_dir)?.permissions();
+    let mode = permissions.mode();
+    if mode & 0o002 == 0 {
+        return Ok(());
+    }
+    if mode & 0o1000 != 0 {
+        tracing::warn!(
+            path = %config_dir.display(),
+            mode = %format!("{:o}", mode & 0o7777),
+            "database configuration directory is sticky and world-writable; keeping its \
+             host-provided permissions"
+        );
+        return Ok(());
+    }
+    if let Err(source) = tighten_directory_permissions(config_dir, (mode & 0o7777) & !0o022) {
+        tracing::warn!(
+            path = %config_dir.display(),
+            kind = ?source.kind(),
+            "failed to tighten a world-writable database configuration directory; continuing \
+             with its host-provided permissions"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn tighten_directory_permissions(config_dir: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(test)]
+    maybe_fail_at(InjectedFailure::BeforeDirectoryTightening)?;
+    std::fs::set_permissions(config_dir, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn restrict_shared_write_access(_config_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum InjectedFailure {
+    BeforeFileSync,
+    BeforeRename,
+    BeforeDirectorySync,
+    BeforeDirectoryTightening,
+}
+
+#[cfg(test)]
+thread_local! {
+    static INJECTED_FAILURE: std::cell::Cell<Option<InjectedFailure>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn maybe_fail_at(point: InjectedFailure) -> io::Result<()> {
+    if INJECTED_FAILURE.with(std::cell::Cell::get) == Some(point) {
+        return Err(io::Error::other(
+            "injected database configuration write failure",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_text(
@@ -306,5 +464,185 @@ impl std::error::Error for DatabaseConfigurationError {
             Self::Io { source, .. } => Some(source),
             Self::Invalid(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    use std::path::Path;
+
+    use tempfile::tempdir;
+
+    use super::{
+        INJECTED_FAILURE, InjectedFailure, prepare_private_config_directory,
+        write_private_file_atomically,
+    };
+
+    #[cfg(unix)]
+    fn permissions(path: &Path) -> Result<u32, Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        Ok(std::fs::metadata(path)?.permissions().mode() & 0o7777)
+    }
+
+    #[test]
+    fn atomic_write_installs_an_owner_only_file_without_temporary_residue()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let target = directory.path().join("database.json");
+        let temporary = directory.path().join(".database.json.test.tmp");
+
+        write_private_file_atomically(&target, &temporary, b"replacement")?;
+
+        assert_eq!(std::fs::read(&target)?, b"replacement");
+        assert!(!temporary.exists());
+        #[cfg(unix)]
+        assert_eq!(permissions(&target)?, 0o600);
+        Ok(())
+    }
+
+    #[test]
+    fn atomic_write_removes_the_temporary_file_when_rename_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let target = directory.path().join("database.json");
+        std::fs::create_dir(&target)?;
+        let temporary = directory.path().join(".database.json.test.tmp");
+
+        assert!(write_private_file_atomically(&target, &temporary, b"replacement").is_err());
+
+        assert!(target.is_dir());
+        assert!(!temporary.exists());
+        Ok(())
+    }
+
+    fn assert_injected_failure_keeps_previous_file(
+        failure: InjectedFailure,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let target = directory.path().join("database.json");
+        std::fs::write(&target, b"previous")?;
+        let temporary = directory.path().join(".database.json.test.tmp");
+        INJECTED_FAILURE.with(|injected| injected.set(Some(failure)));
+
+        let result = write_private_file_atomically(&target, &temporary, b"replacement");
+        INJECTED_FAILURE.with(|injected| injected.set(None));
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&target)?, b"previous");
+        assert!(!temporary.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn atomic_write_cleans_up_after_a_write_failure() -> Result<(), Box<dyn std::error::Error>> {
+        assert_injected_failure_keeps_previous_file(InjectedFailure::BeforeFileSync)
+    }
+
+    #[test]
+    fn atomic_write_cleans_up_after_a_rename_failure() -> Result<(), Box<dyn std::error::Error>> {
+        assert_injected_failure_keeps_previous_file(InjectedFailure::BeforeRename)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_installs_the_file_when_parent_directory_sync_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let target = directory.path().join("database.json");
+        let temporary = directory.path().join(".database.json.test.tmp");
+        INJECTED_FAILURE.with(|injected| injected.set(Some(InjectedFailure::BeforeDirectorySync)));
+
+        let result = write_private_file_atomically(&target, &temporary, b"replacement");
+        INJECTED_FAILURE.with(|injected| injected.set(None));
+
+        assert!(result.is_ok());
+        assert_eq!(std::fs::read(&target)?, b"replacement");
+        assert!(!temporary.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_directory_tightening_does_not_block_configuration_writes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir()?;
+        let config_dir = directory.path().join("config");
+        std::fs::create_dir(&config_dir)?;
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o777))?;
+        INJECTED_FAILURE
+            .with(|injected| injected.set(Some(InjectedFailure::BeforeDirectoryTightening)));
+
+        let result = prepare_private_config_directory(&config_dir);
+        INJECTED_FAILURE.with(|injected| injected.set(None));
+
+        assert!(result.is_ok());
+        assert_eq!(permissions(&config_dir)?, 0o777);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sticky_world_writable_config_directory_keeps_host_permissions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir()?;
+        let config_dir = directory.path().join("config");
+        std::fs::create_dir(&config_dir)?;
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o1777))?;
+
+        prepare_private_config_directory(&config_dir)?;
+
+        assert_eq!(permissions(&config_dir)?, 0o1777);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_config_directory_is_owner_only() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let config_dir = directory.path().join("nested").join("config");
+
+        prepare_private_config_directory(&config_dir)?;
+
+        assert_eq!(permissions(&config_dir)?, 0o700);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_shared_config_directory_is_not_rejected() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir()?;
+        let config_dir = directory.path().join("config");
+        std::fs::create_dir(&config_dir)?;
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o755))?;
+
+        prepare_private_config_directory(&config_dir)?;
+
+        assert_eq!(permissions(&config_dir)?, 0o755);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn world_writable_config_directory_is_tightened() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir()?;
+        let config_dir = directory.path().join("config");
+        std::fs::create_dir(&config_dir)?;
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o777))?;
+
+        prepare_private_config_directory(&config_dir)?;
+
+        assert_eq!(permissions(&config_dir)?, 0o755);
+        Ok(())
     }
 }

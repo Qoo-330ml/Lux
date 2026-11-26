@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
+use crate::application::remote_url_policy::{
+    LOCAL_HOST_SUFFIXES, OutboundHost, domain_matches_any, is_private_or_reserved,
+};
+
 use super::{
     plugin_protocol::{
         MIGRATION_AUTHENTICATE_USER_METHOD, MIGRATION_LIST_ITEMS_METHOD,
@@ -77,7 +81,6 @@ impl EmbyMigrationSource {
         }
         let mut url = Url::parse(value).map_err(|_| MigrationInputError::InvalidSourceUrl)?;
         if !matches!(url.scheme(), "http" | "https")
-            || url.host_str().is_none()
             || !url.username().is_empty()
             || url.password().is_some()
             || url.query().is_some()
@@ -85,19 +88,23 @@ impl EmbyMigrationSource {
         {
             return Err(MigrationInputError::InvalidSourceUrl);
         }
-        let host = url
-            .host_str()
-            .ok_or(MigrationInputError::InvalidSourceUrl)?
-            .to_ascii_lowercase();
-        if is_private_name(&host) && !self.allow_private_network {
-            return Err(MigrationInputError::PrivateNetworkNotAllowed);
-        }
-        if host
-            .parse::<IpAddr>()
-            .ok()
-            .is_some_and(is_private_or_reserved)
-            && !self.allow_private_network
-        {
+        // The private-network gate is decided in the host process, before the source URL crosses
+        // the plugin process boundary; the plugin must never be the place that approves access.
+        // This classifies the URL host literal only and performs no DNS resolution, so a public
+        // name that resolves to a private address is not covered by this check.
+        //
+        // The shared host type uses the typed `url::Host` variants, so `host_str()` never has to be
+        // parsed by hand, and it folds the trailing root dot that DNS resolvers accept: `localhost.`
+        // stays equivalent to `localhost`, and `.` alone is not a destination.
+        let requires_approval =
+            match OutboundHost::from_url(&url).ok_or(MigrationInputError::InvalidSourceUrl)? {
+                OutboundHost::Ipv4(address) => is_private_or_reserved(IpAddr::V4(address)),
+                OutboundHost::Ipv6(address) => is_private_or_reserved(IpAddr::V6(address)),
+                OutboundHost::Domain { normalized, .. } => {
+                    domain_matches_any(&normalized, &LOCAL_HOST_SUFFIXES)
+                }
+            };
+        if requires_approval && !self.allow_private_network {
             return Err(MigrationInputError::PrivateNetworkNotAllowed);
         }
         if !url.path().ends_with('/') {
@@ -992,36 +999,67 @@ fn validate_id(value: &str) -> Result<String, PluginServiceError> {
     Ok(value.to_owned())
 }
 
-fn is_private_name(host: &str) -> bool {
-    host == "localhost"
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
-        || host.ends_with(".internal")
-        || host.ends_with(".home.arpa")
-}
-
-fn is_private_or_reserved(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(value) => {
-            value.is_private()
-                || value.is_loopback()
-                || value.is_link_local()
-                || value.is_unspecified()
-                || value.is_multicast()
-        }
-        IpAddr::V6(value) => {
-            value.is_loopback()
-                || value.is_unspecified()
-                || value.is_multicast()
-                || value.is_unicast_link_local()
-                || (value.octets()[0] & 0xfe) == 0xfc
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Source URLs whose host is a private, loopback, link-local, carrier-grade NAT or otherwise
+    /// reserved destination. Every entry must require the explicit private-network approval flag.
+    const PRIVATE_SOURCE_URLS: &[&str] = &[
+        // IPv4 loopback, RFC 1918 and link-local (the cloud metadata address).
+        "http://127.0.0.1:8096",
+        "http://10.1.2.3:8096",
+        "http://192.168.1.10:8096",
+        "http://169.254.169.254:8096",
+        // Carrier-grade NAT and the reserved 240/4 range.
+        "http://100.64.0.1:8096",
+        "http://240.0.0.1:8096",
+        // IPv6 loopback, unique-local and link-local.
+        "http://[::1]:8096",
+        "http://[fd00::1]:8096",
+        "http://[fc00::1]:8096",
+        "http://[fe80::1]:8096",
+        // IPv4-mapped and deprecated IPv4-compatible IPv6 forms.
+        "http://[::ffff:127.0.0.1]:8096",
+        "http://[::ffff:192.168.1.10]:8096",
+        "http://[::ffff:169.254.169.254]:8096",
+        "http://[::127.0.0.1]:8096",
+        // 6to4 and NAT64 wrappers around private IPv4 destinations.
+        "http://[2002:7f00:1::]:8096",
+        "http://[64:ff9b::7f00:1]:8096",
+        // Documentation range and the unspecified address never reach a real host.
+        "http://[2001:db8::1]:8096",
+        "http://[::]:8096",
+    ];
+
+    /// Private host names, including the trailing-root-dot spelling that a DNS resolver accepts.
+    const PRIVATE_NAME_SOURCE_URLS: &[&str] = &[
+        "http://localhost:8096",
+        "http://emby.localhost:8096",
+        "http://emby.local:8096",
+        "http://nas.internal:8096",
+        "http://router.home.arpa:8096",
+        "http://localhost.:8096",
+        "http://emby.localhost.:8096",
+        "http://nas.local.:8096",
+        "http://emby.internal.:8096",
+        "http://box.home.arpa.:8096",
+    ];
+
+    fn source_for(base_url: &str, allow_private_network: bool) -> EmbyMigrationSource {
+        EmbyMigrationSource {
+            base_url: base_url.to_owned(),
+            api_key: "api-key".to_owned(),
+            allow_private_network,
+        }
+    }
+
+    fn validation_error(base_url: &str, allow_private_network: bool) -> MigrationInputError {
+        source_for(base_url, allow_private_network)
+            .validate()
+            .err()
+            .unwrap_or_else(|| panic!("{base_url} should not validate"))
+    }
 
     #[test]
     fn migration_text_normalization_replaces_control_characters() {
@@ -1078,6 +1116,82 @@ mod tests {
             assert_eq!(
                 source.validate(),
                 Err(MigrationInputError::InvalidSourceUrl)
+            );
+        }
+    }
+
+    #[test]
+    fn source_validation_rejects_reserved_addresses_without_approval() {
+        for base_url in PRIVATE_SOURCE_URLS {
+            assert_eq!(
+                validation_error(base_url, false),
+                MigrationInputError::PrivateNetworkNotAllowed,
+                "{base_url} must require explicit private-network approval"
+            );
+        }
+    }
+
+    #[test]
+    fn source_validation_rejects_private_names_with_and_without_root_dot() {
+        for base_url in PRIVATE_NAME_SOURCE_URLS {
+            assert_eq!(
+                validation_error(base_url, false),
+                MigrationInputError::PrivateNetworkNotAllowed,
+                "{base_url} must require explicit private-network approval"
+            );
+        }
+    }
+
+    #[test]
+    fn approved_private_network_allows_private_addresses_and_names() {
+        for base_url in PRIVATE_SOURCE_URLS.iter().chain(PRIVATE_NAME_SOURCE_URLS) {
+            let url = source_for(base_url, true)
+                .validate()
+                .expect("explicitly approved private source should validate");
+            assert!(url.host_str().is_some(), "{base_url} should keep a host");
+        }
+    }
+
+    #[test]
+    fn approved_private_network_still_rejects_invalid_source_metadata() {
+        for base_url in [
+            "",
+            "ftp://emby.local:8096",
+            "emby.local:8096",
+            "https://user:pass@emby.local:8096",
+            "https://user@emby.local:8096",
+            "https://emby.local:8096?api_key=secret",
+            "https://emby.local:8096/#fragment",
+            "http://.",
+        ] {
+            assert_eq!(
+                validation_error(base_url, true),
+                MigrationInputError::InvalidSourceUrl,
+                "{base_url} must stay invalid even with approval"
+            );
+        }
+        let long_url = format!("http://emby.local/{}/", "a".repeat(MAX_SOURCE_URL_LENGTH));
+        assert_eq!(
+            validation_error(&long_url, true),
+            MigrationInputError::InvalidSourceUrl,
+        );
+    }
+
+    #[test]
+    fn source_validation_allows_public_destinations_without_approval() {
+        for base_url in [
+            "https://emby.example.com",
+            "https://emby.example.com:8920/emby",
+            "https://emby.example.com.",
+            "http://8.8.8.8:8096",
+            "http://[2606:4700:4700::1111]:8096",
+        ] {
+            let url = source_for(base_url, false)
+                .validate()
+                .expect("public source should validate without approval");
+            assert!(
+                url.as_str().ends_with('/'),
+                "{base_url} should be normalized with a trailing slash, got {url}"
             );
         }
     }

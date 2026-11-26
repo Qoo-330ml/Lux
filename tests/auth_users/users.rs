@@ -935,15 +935,18 @@ async fn failed_emby_logins_are_indexed_only_for_known_users_and_not_rate_limite
     .await?;
     assert_eq!(
         failed_events.len(),
-        7,
-        "the sixth known-user attempt is rate limited"
+        6,
+        "the sixth attempt is refused before the password check and is not audited, and the \
+         display-name spelling shares the account's budget"
     );
     assert_eq!(
         failed_events
             .iter()
             .filter(|event| event.1 == known_user.id.to_string())
             .count(),
-        6
+        5,
+        "five audited password failures: the sixth attempt and the display-name attempt are \
+         refused by the limiter before any credential check"
     );
     assert_eq!(
         failed_events
@@ -977,7 +980,7 @@ async fn failed_emby_logins_are_indexed_only_for_known_users_and_not_rate_limite
             .iter()
             .filter(|event| event["eventType"] == "AUTH_LOGIN_FAILED")
             .count(),
-        7
+        6
     );
 
     server.abort();
@@ -6182,7 +6185,13 @@ async fn admin_access_blacklist_uses_peer_and_complete_trusted_proxy_chain()
     };
     let database = Database::connect(&config).await?;
     let setup = SetupService::new(database.clone())?;
-    setup.complete("Admin", "Admin", "admin password").await?;
+    let admin = setup.complete("Admin", "Admin", "admin password").await?;
+    // The second half of this test resolves a public forwarded address through a trusted proxy,
+    // which is a remote request: the administrator needs the remote-access grant.
+    sqlx::query("UPDATE users SET can_remote_access = 1 WHERE id = ?")
+        .bind(admin.id.to_string())
+        .execute(database.pool())
+        .await?;
     let app = app_with_state(AppState::ready(
         config,
         database.clone(),
@@ -6484,6 +6493,12 @@ async fn web_login_and_existing_sessions_enforce_ip_blacklists_through_trusted_p
     let target = UserStore::new(database.clone())?
         .create_user("web-ip-target", "Web IP Target", "target password", false)
         .await?;
+    // The scenario resolves public forwarded addresses through a trusted proxy, so the account
+    // must hold the remote-access grant; the IP rules stay the thing under test.
+    sqlx::query("UPDATE users SET can_remote_access = 1 WHERE id = ?")
+        .bind(target.id.to_string())
+        .execute(database.pool())
+        .await?;
     let web_auth = WebAuthService::new(database.clone())?;
     let app = app_with_state(AppState::ready(
         config,
@@ -6646,6 +6661,11 @@ async fn emby_tokens_enforce_ip_blacklists_in_lux_api_routes()
             "target password",
             false,
         )
+        .await?;
+    // Public forwarded addresses resolved through the trusted proxy are remote requests.
+    sqlx::query("UPDATE users SET can_remote_access = 1 WHERE id = ?")
+        .bind(target.id.to_string())
+        .execute(database.pool())
         .await?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let app = app_with_state(AppState::ready(

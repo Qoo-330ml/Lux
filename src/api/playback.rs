@@ -29,16 +29,27 @@ use crate::storage::{
 /// `is_admin` column captured when the playback session was created must not outlive an
 /// administrator demotion. Read the user's current role instead: a demoted user loses the
 /// administrator bypass immediately and a disabled user loses the resource entirely.
+///
+/// `is_remote` is the remote-access answer for the request that is presenting the URL. A valid
+/// signature only proves the URL was issued: a playback URL carries no credentials of its own, so
+/// the live user policy is the gate. Withdrawing `can_remote_access` in the admin console, or
+/// carrying the URL to another network, blocks the next asset request without a new login.
 async fn playback_resource_principal(
     database: Option<&crate::storage::Database>,
     session: &StoredWebPlaybackSession,
+    is_remote: bool,
 ) -> Result<AccessPrincipal, StatusCode> {
     let Some(database) = database else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
     let users = UserStore::new(database.clone()).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     match users.find_by_id(&session.user_id).await {
-        Ok(Some(user)) if !user.is_disabled => Ok(AccessPrincipal::new(user.id, user.is_admin)),
+        Ok(Some(user)) if !user.is_disabled => {
+            if is_remote && !user.can_remote_access {
+                return Err(StatusCode::FORBIDDEN);
+            }
+            Ok(AccessPrincipal::new(user.id, user.is_admin))
+        }
         Ok(Some(_)) | Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
     }
@@ -2965,6 +2976,10 @@ pub(super) fn web_playback_error(headers: &HeaderMap, error: WebPlaybackSessionE
     api_error(headers, status, code, &message).into_response()
 }
 
+/// Verifies a signed playback resource and returns the address it was judged with.
+///
+/// The caller reuses that address for the user-policy checks it runs after loading the live user
+/// row, so a signed URL request resolves the trusted client address exactly once.
 async fn authorize_web_playback_resource(
     headers: &HeaderMap,
     state: &ReadyAppState,
@@ -2973,14 +2988,15 @@ async fn authorize_web_playback_resource(
     resource: &str,
     expires_at: i64,
     signature: &str,
-) -> Result<AuthorizedWebPlaybackResource, WebPlaybackSessionError> {
+) -> Result<(AuthorizedWebPlaybackResource, Option<std::net::IpAddr>), WebPlaybackSessionError> {
     service.verify_resource_signature(session_id, resource, expires_at, signature)?;
     let client_ip = super::request_access_ip(headers, state)
         .await
         .map_err(|_| WebPlaybackSessionError::AccessRulesUnavailable)?;
-    service
+    let authorized = service
         .authorize_resource_with_ip(session_id, resource, expires_at, signature, client_ip)
-        .await
+        .await?;
+    Ok((authorized, client_ip))
 }
 
 fn web_playback_device_id(headers: &HeaderMap) -> Option<String> {
@@ -4617,10 +4633,13 @@ pub(super) async fn lux_web_playback_direct(
         Ok(authorized) => authorized,
         Err(error) => return web_playback_error(&headers, error),
     };
-    let AuthorizedWebPlaybackResource {
-        session,
-        policy: admission_policy,
-    } = authorized;
+    let (
+        AuthorizedWebPlaybackResource {
+            session,
+            policy: admission_policy,
+        },
+        client_ip,
+    ) = authorized;
     if session.plan != "DIRECT" {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -4630,10 +4649,14 @@ pub(super) async fn lux_web_playback_direct(
     {
         return response;
     }
-    let principal = match playback_resource_principal(Some(state.database()), &session).await {
-        Ok(principal) => principal,
-        Err(status) => return status.into_response(),
-    };
+    // A signature proves the URL was issued, not that its user may still reach this server from
+    // here: the live user policy is re-read on every asset request.
+    let is_remote = state.remote_access.is_remote_address(client_ip);
+    let principal =
+        match playback_resource_principal(Some(state.database()), &session, is_remote).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
     let response = serve_media_file(
         &state,
         principal,
@@ -4675,10 +4698,13 @@ pub(super) async fn lux_web_playback_range(
         Ok(authorized) => authorized,
         Err(error) => return web_playback_error(&headers, error),
     };
-    let AuthorizedWebPlaybackResource {
-        session,
-        policy: admission_policy,
-    } = authorized;
+    let (
+        AuthorizedWebPlaybackResource {
+            session,
+            policy: admission_policy,
+        },
+        client_ip,
+    ) = authorized;
     if session.plan != "DIRECT" {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -4688,10 +4714,14 @@ pub(super) async fn lux_web_playback_range(
     let Some(range) = headers.get("range").and_then(|value| value.to_str().ok()) else {
         return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
     };
-    let principal = match playback_resource_principal(Some(state.database()), &session).await {
-        Ok(principal) => principal,
-        Err(status) => return status.into_response(),
-    };
+    // A signature proves the URL was issued, not that its user may still reach this server from
+    // here: the live user policy is re-read on every asset request.
+    let is_remote = state.remote_access.is_remote_address(client_ip);
+    let principal =
+        match playback_resource_principal(Some(state.database()), &session, is_remote).await {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
     let access = state.access();
     let source = match access
         .authorized_playback_source(
@@ -4788,12 +4818,24 @@ pub(super) async fn lux_web_playback_hls(
         Ok(authorized) => authorized,
         Err(error) => return web_playback_error(&headers, error),
     };
-    let AuthorizedWebPlaybackResource {
-        session,
-        policy: admission_policy,
-    } = authorized;
+    let (
+        AuthorizedWebPlaybackResource {
+            session,
+            policy: admission_policy,
+        },
+        client_ip,
+    ) = authorized;
     if session.plan != "SERVER_HLS" {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    // Manifests and segments are signed resources like the direct/range ones, so they enforce the
+    // same live user policy: a distracted disabled account or a withdrawn remote-access grant
+    // stops segment fetches without waiting for the playlist to expire.
+    let is_remote = state.remote_access.is_remote_address(client_ip);
+    if let Err(status) =
+        playback_resource_principal(Some(state.database()), &session, is_remote).await
+    {
+        return status.into_response();
     }
     if matches!(asset.as_str(), "index.m3u8") {
         let path = match service.wait_for_hls_manifest(&session_id).await {
@@ -5764,10 +5806,16 @@ mod emby_playback_tests {
             .ok_or("playback session")?;
         assert!(session.is_admin);
 
-        let principal = super::playback_resource_principal(Some(&database), &session)
+        let principal = super::playback_resource_principal(Some(&database), &session, false)
             .await
             .expect("active administrator keeps the resource");
         assert!(principal.is_admin);
+        assert!(
+            super::playback_resource_principal(Some(&database), &session, true)
+                .await
+                .is_err(),
+            "a remote request needs the user's can_remote_access grant"
+        );
 
         users
             .create_user("other-admin", "Other Admin", "password-for-tests", true)
@@ -5781,7 +5829,7 @@ mod emby_playback_tests {
                 },
             )
             .await?;
-        let principal = super::playback_resource_principal(Some(&database), &session)
+        let principal = super::playback_resource_principal(Some(&database), &session, false)
             .await
             .expect("demoted administrator keeps playback access");
         assert!(
@@ -5799,7 +5847,7 @@ mod emby_playback_tests {
             )
             .await?;
         assert!(
-            super::playback_resource_principal(Some(&database), &session)
+            super::playback_resource_principal(Some(&database), &session, false)
                 .await
                 .is_err(),
             "a disabled user loses signed playback resources"

@@ -2738,3 +2738,632 @@ async fn rebuilding_people_migrates_legacy_local_actor_favorites_and_assets_afte
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn rebuild_preserves_and_recovers_legacy_v1_relations_after_v2_device_drift()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let preserved_dir = root.join("Preserved (2024)");
+    let recovered_dir = root.join("Recovered (2024)");
+    let stale_dir = root.join("Stale (2024)");
+    tokio::fs::create_dir_all(&preserved_dir).await?;
+    tokio::fs::create_dir_all(&recovered_dir).await?;
+    tokio::fs::create_dir_all(&stale_dir).await?;
+    tokio::fs::write(preserved_dir.join("Preserved.2024.mkv"), b"preserved").await?;
+    tokio::fs::write(recovered_dir.join("Recovered.2024.mkv"), b"recovered").await?;
+    tokio::fs::write(stale_dir.join("Stale.2024.mkv"), b"stale").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let (preserved_id, preserved_entry_id, preserved_rel, preserved_size, preserved_mtime): (
+        String,
+        String,
+        String,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT mi.id, fe.id, fe.relative_path, fe.size, fe.modified_at
+         FROM media_items mi
+         JOIN media_sources ms ON ms.item_id = mi.id
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE mi.library_id = ? AND fe.relative_path LIKE 'Preserved%' LIMIT 1",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let (recovered_id, recovered_rel, recovered_size, recovered_mtime): (String, String, i64, i64) =
+        sqlx::query_as(
+            "SELECT mi.id, fe.relative_path, fe.size, fe.modified_at
+             FROM media_items mi
+             JOIN media_sources ms ON ms.item_id = mi.id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             WHERE mi.library_id = ? AND fe.relative_path LIKE 'Recovered%' LIMIT 1",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+    let (stale_id, stale_rel, stale_size, stale_mtime): (String, String, i64, i64) =
+        sqlx::query_as(
+            "SELECT mi.id, fe.relative_path, fe.size, fe.modified_at
+             FROM media_items mi
+             JOIN media_sources ms ON ms.item_id = mi.id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             WHERE mi.library_id = ? AND fe.relative_path LIKE 'Stale%' LIMIT 1",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+
+    let encode_hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let preserved_v1_fp = luxd::application::scanner::compute_file_fingerprint(
+        &preserved_rel,
+        preserved_size,
+        preserved_mtime,
+        Some(56),
+        Some(10_001),
+    );
+    let recovered_v1_fp = luxd::application::scanner::compute_file_fingerprint(
+        &recovered_rel,
+        recovered_size,
+        recovered_mtime,
+        Some(56),
+        Some(10_002),
+    );
+    let stale_other_v2_fp = luxd::application::scanner::compute_scan_fingerprint_v2(
+        &stale_rel,
+        stale_size,
+        stale_mtime,
+        Some(99),
+        Some(99_999),
+    );
+
+    let canonical_root: String =
+        sqlx::query_scalar("SELECT canonical_path FROM library_roots WHERE library_id = ?")
+            .bind(library.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+    let preserved_v2_fp = luxd::application::scanner::compute_scan_fingerprint_v2(
+        &preserved_rel,
+        preserved_size,
+        preserved_mtime,
+        Some(57),
+        Some(10_001),
+    );
+    sqlx::query(
+        "UPDATE filesystem_entries SET device = 57, inode = 10001, fingerprint = ? WHERE id = ?",
+    )
+    .bind(preserved_v2_fp)
+    .bind(&preserved_entry_id)
+    .execute(database.pool())
+    .await?;
+
+    let preserved_relation_path =
+        library_item_directory(&config.config_dir, &preserved_id)?.join("people.json");
+    tokio::fs::create_dir_all(
+        preserved_relation_path
+            .parent()
+            .ok_or("missing preserved relation parent")?,
+    )
+    .await?;
+    tokio::fs::write(
+        &preserved_relation_path,
+        serde_json::to_vec_pretty(&json!({
+            "schemaVersion": 4,
+            "generation": 1,
+            "itemId": preserved_id,
+            "sourceRoot": canonical_root,
+            "sourceRelativePath": preserved_rel,
+            "mediaFingerprint": encode_hex(&preserved_v1_fp),
+            "mediaSize": preserved_size,
+            "mediaModifiedAt": preserved_mtime,
+            "mediaTitle": "Preserved",
+            "mediaProductionYear": 2024,
+            "actors": [{
+                "id": "1519026",
+                "name": "沈腾",
+                "provider": "tmdb",
+                "identities": [{"provider": "tmdb", "id": "1519026"}],
+                "order": 0
+            }]
+        }))?,
+    )
+    .await?;
+
+    let quarantine_dir = config
+        .config_dir
+        .join("metadata/quarantine/people-relations");
+    tokio::fs::create_dir_all(&quarantine_dir).await?;
+    let recovered_quarantine = quarantine_dir.join("relation-recovered.json");
+    tokio::fs::write(
+        &recovered_quarantine,
+        serde_json::to_vec_pretty(&json!({
+            "schemaVersion": 4,
+            "generation": 2,
+            "itemId": recovered_id,
+            "sourceRoot": canonical_root,
+            "sourceRelativePath": recovered_rel,
+            "mediaFingerprint": encode_hex(&recovered_v1_fp),
+            "mediaSize": recovered_size,
+            "mediaModifiedAt": recovered_mtime,
+            "mediaTitle": "Recovered",
+            "mediaProductionYear": 2024,
+            "actors": [{
+                "id": "1519026",
+                "name": "沈腾",
+                "provider": "tmdb",
+                "identities": [{"provider": "tmdb", "id": "1519026"}],
+                "order": 0
+            }]
+        }))?,
+    )
+    .await?;
+    let stale_quarantine = quarantine_dir.join("relation-stale-v2.json");
+    tokio::fs::write(
+        &stale_quarantine,
+        serde_json::to_vec_pretty(&json!({
+            "schemaVersion": 4,
+            "generation": 1,
+            "itemId": stale_id,
+            "sourceRoot": canonical_root,
+            "sourceRelativePath": stale_rel,
+            "mediaFingerprint": encode_hex(&stale_other_v2_fp),
+            "mediaSize": stale_size,
+            "mediaModifiedAt": stale_mtime,
+            "mediaTitle": "Stale",
+            "mediaProductionYear": 2024,
+            "actors": [{
+                "id": "999001",
+                "name": "失效演员",
+                "provider": "tmdb",
+                "order": 0
+            }]
+        }))?,
+    )
+    .await?;
+
+    let people = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+    people.rebuild_person_credit_index().await?;
+
+    assert!(preserved_relation_path.exists());
+    assert!(!recovered_quarantine.exists());
+    let recovered_relation_path =
+        library_item_directory(&config.config_dir, &recovered_id)?.join("people.json");
+    assert!(recovered_relation_path.exists());
+    assert!(stale_quarantine.exists());
+
+    let preserved_credits: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM person_credits WHERE item_id = ?")
+            .bind(&preserved_id)
+            .fetch_one(database.pool())
+            .await?;
+    let recovered_credits: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM person_credits WHERE item_id = ?")
+            .bind(&recovered_id)
+            .fetch_one(database.pool())
+            .await?;
+    let stale_credits: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM person_credits WHERE item_id = ?")
+            .bind(&stale_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(preserved_credits, 1);
+    assert_eq!(recovered_credits, 1);
+    assert_eq!(stale_credits, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_backfill_reparses_pre_upgrade_dual_nfos_and_merges_existing_people()
+-> Result<(), Box<dyn std::error::Error>> {
+    use luxd::application::nfo::{LocalNfoDetails, LocalNfoMetadataStore};
+    use luxd::application::scanner::ScanJobService;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let pegasus2 = root.join("飞驰人生2 (2024)");
+    let extra_imdb = root.join("你好李焕英外传 (2024)");
+    tokio::fs::create_dir_all(&pegasus2).await?;
+    tokio::fs::create_dir_all(&extra_imdb).await?;
+    tokio::fs::write(pegasus2.join("飞驰人生2 (2024) - 1080p.mkv"), b"pegasus2").await?;
+    tokio::fs::write(
+        pegasus2.join("movie.nfo"),
+        r#"<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<movie>
+  <title>飞驰人生2</title>
+  <year>2024</year>
+  <actor>
+    <name>沈腾</name>
+    <role>Zhang Chi</role>
+    <type>Actor</type>
+  </actor>
+</movie>"#,
+    )
+    .await?;
+    tokio::fs::write(
+        pegasus2.join("飞驰人生2 (2024) - 1080p.nfo"),
+        r#"<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<movie>
+  <title>飞驰人生2</title>
+  <year>2024</year>
+  <actor>
+    <name>沈腾</name>
+    <role>Zhang Chi</role>
+    <type>Actor</type>
+    <tmdbid>1519026</tmdbid>
+    <imdbid>nm7613067</imdbid>
+  </actor>
+</movie>"#,
+    )
+    .await?;
+    tokio::fs::write(extra_imdb.join("你好李焕英外传 (2024).mkv"), b"extra").await?;
+    tokio::fs::write(
+        extra_imdb.join("你好李焕英外传 (2024).nfo"),
+        r#"<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<movie>
+  <title>你好李焕英外传</title>
+  <year>2024</year>
+  <actor>
+    <name>沈腾</name>
+    <role>客串</role>
+    <type>Actor</type>
+    <imdbid>nm7613067</imdbid>
+  </actor>
+</movie>"#,
+    )
+    .await?;
+
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let pegasus2_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND title LIKE '飞驰人生2%' LIMIT 1",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let extra_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND title LIKE '你好李焕英外传%' LIMIT 1",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+
+    let people = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+    people
+        .persist_item_actors(
+            &extra_id,
+            "imdb",
+            &[ActorCredit {
+                id: "nm7613067".to_owned(),
+                provider: Some("imdb".to_owned()),
+                identities: Vec::new(),
+                name: "沈腾".to_owned(),
+                character: Some("客串".to_owned()),
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+    let seed_tmdb_dir = root.join("西虹市首富 (2018)");
+    tokio::fs::create_dir_all(&seed_tmdb_dir).await?;
+    tokio::fs::write(seed_tmdb_dir.join("西虹市首富 (2018).mkv"), b"tmdb-seed").await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let tmdb_seed_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND title LIKE '西虹市首富%' LIMIT 1",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    people
+        .persist_item_actors(
+            &tmdb_seed_id,
+            "tmdb",
+            &[ActorCredit {
+                id: "1519026".to_owned(),
+                provider: Some("tmdb".to_owned()),
+                identities: Vec::new(),
+                name: "沈腾".to_owned(),
+                character: Some("王多鱼".to_owned()),
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+    let tmdb_person_id: String = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities WHERE provider = 'tmdb' AND provider_id = '1519026'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let imdb_person_id: String = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities WHERE provider = 'imdb' AND provider_id = 'nm7613067'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_ne!(tmdb_person_id, imdb_person_id);
+
+    let pegasus2_nfo_bytes = tokio::fs::read(pegasus2.join("飞驰人生2 (2024) - 1080p.nfo")).await?;
+    let pegasus2_movie_nfo_bytes = tokio::fs::read(pegasus2.join("movie.nfo")).await?;
+    let old_combined_fp = {
+        use sha2::{Digest, Sha256};
+        let p = Sha256::digest(&pegasus2_nfo_bytes);
+        let c = Sha256::digest(&pegasus2_movie_nfo_bytes);
+        let mut h = Sha256::new();
+        h.update(&p);
+        h.update(b"\0movie.nfo\0");
+        h.update(&c);
+        h.finalize().to_vec()
+    };
+    let encode_hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let pegasus2_rel_path =
+        library_item_directory(&config.config_dir, &pegasus2_id)?.join("people.json");
+    tokio::fs::create_dir_all(pegasus2_rel_path.parent().ok_or("missing parent")?).await?;
+    tokio::fs::write(
+        &pegasus2_rel_path,
+        serde_json::to_vec_pretty(&json!({
+            "schemaVersion": 4,
+            "generation": 1,
+            "sourceFingerprint": encode_hex(&old_combined_fp),
+            "itemId": pegasus2_id,
+            "actors": [{
+                "id": null,
+                "name": "沈腾",
+                "provider": "",
+                "character": "Zhang Chi",
+                "order": 0
+            }]
+        }))?,
+    )
+    .await?;
+
+    let stale_v1_cache = serde_json::json!({
+        "schemaVersion": 1,
+        "semanticFingerprint": vec![1_u8; 32],
+        "relationFingerprint": old_combined_fp,
+        "details": serde_json::to_value(LocalNfoDetails::default())?,
+    })
+    .to_string();
+    sqlx::query(
+        "INSERT INTO media_item_nfo_cache (item_id, fingerprint, json, bytes) VALUES (?, ?, ?, ?)
+         ON CONFLICT(item_id) DO UPDATE SET fingerprint = excluded.fingerprint, json = excluded.json, bytes = excluded.bytes",
+    )
+    .bind(&pegasus2_id)
+    .bind(&old_combined_fp)
+    .bind(&stale_v1_cache)
+    .bind(i64::try_from(stale_v1_cache.len())?)
+    .execute(database.pool())
+    .await?;
+    sqlx::query("UPDATE media_items SET metadata_fingerprint = ? WHERE id = ?")
+        .bind(&old_combined_fp)
+        .bind(&pegasus2_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO scan_local_metadata_backfills (library_root_id, status)
+         SELECT id, 'COMPLETED' FROM library_roots WHERE library_id = ?
+         ON CONFLICT(library_root_id) DO UPDATE SET status = 'COMPLETED'",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let jobs = ScanJobService::new(database.clone())
+        .with_nfo_store(LocalNfoMetadataStore::new(database.clone()))
+        .with_people(people.clone());
+    jobs.start_local_metadata_outbox_worker().await?;
+
+    let wait_result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let status: String = sqlx::query_scalar(
+                "SELECT status FROM scan_local_metadata_backfills
+                 WHERE library_root_id = (SELECT id FROM library_roots WHERE library_id = ?)",
+            )
+            .bind(library.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+            let (_, total) = people
+                .search_actors(&[library.id.to_string()], "沈腾", 0, 20)
+                .await?;
+            let credit_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM person_credits WHERE item_id IN (?, ?, ?) AND person_name = '沈腾'",
+            )
+            .bind(&pegasus2_id)
+            .bind(&extra_id)
+            .bind(&tmdb_seed_id)
+            .fetch_one(database.pool())
+            .await?;
+            if status == "COMPLETED" && total == 1 && credit_count == 3 {
+                return Ok::<(), Box<dyn std::error::Error>>(());
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    if wait_result.is_err() {
+        let backfill_row: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, cursor_entry_id, error FROM scan_local_metadata_backfills
+             WHERE library_root_id = (SELECT id FROM library_roots WHERE library_id = ?)",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        let (_, total) = people
+            .search_actors(&[library.id.to_string()], "沈腾", 0, 20)
+            .await?;
+        let credits: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT item_id, person_id, provider, lux_person_id FROM person_credits WHERE person_name = '沈腾'",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        let people_rows: Vec<(String, String)> = sqlx::query_as("SELECT id, status FROM people")
+            .fetch_all(database.pool())
+            .await?;
+        panic!(
+            "timed out: backfill={backfill_row:?}, total={total}, credits={credits:?}, people={people_rows:?}"
+        );
+    }
+    wait_result??;
+
+    let (_, total) = people
+        .search_actors(&[library.id.to_string()], "沈腾", 0, 20)
+        .await?;
+    assert_eq!(total, 1);
+    let converged_person: String = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities WHERE provider = 'imdb' AND provider_id = 'nm7613067'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(converged_person, tmdb_person_id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn restoring_person_manifests_and_splitting_identity_keeps_lux_person_ids_monotonic()
+-> Result<(), Box<dyn std::error::Error>> {
+    use sha2::{Digest, Sha256};
+
+    fn signed_person_manifest_json(
+        lux_id: &str,
+        name: &str,
+        provider: &str,
+        provider_id: &str,
+    ) -> Result<String, serde_json::Error> {
+        let render = |checksum: &str| -> Result<String, serde_json::Error> {
+            Ok(format!(
+                "{{\"schemaVersion\":3,\"generation\":1,\"luxPersonId\":{},\"displayName\":{},\"identities\":[{{\"provider\":{},\"id\":{}}}],\"checksum\":{}}}",
+                serde_json::to_string(lux_id)?,
+                serde_json::to_string(name)?,
+                serde_json::to_string(provider)?,
+                serde_json::to_string(provider_id)?,
+                serde_json::to_string(checksum)?,
+            ))
+        };
+        let unsigned = render("")?;
+        let checksum: String = Sha256::digest(unsigned.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        render(&checksum)
+    }
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, title, sort_title, identification_status, has_available_source
+         ) VALUES ('movie-seq-1', ?, 'MOVIE', 'Sequence Movie', 'sequence movie', 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let people = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+
+    for (lux_id, name, provider, provider_id) in [
+        ("lux-000015", "高位演员", "tmdb", "1500"),
+        ("lux-000002", "低位演员", "tmdb", "200"),
+    ] {
+        let person_dir = lux_person_directory(&config.config_dir, name, lux_id)?;
+        tokio::fs::create_dir_all(&person_dir).await?;
+        let manifest_json = signed_person_manifest_json(lux_id, name, provider, provider_id)?;
+        tokio::fs::write(person_dir.join("person.json"), manifest_json).await?;
+    }
+
+    sqlx::query(
+        "INSERT INTO person_manifest_restore_state (id, status, schema_version, updated_at)
+         VALUES (1, 'PENDING', 3, 1)
+         ON CONFLICT(id) DO UPDATE SET status = 'PENDING', schema_version = 3",
+    )
+    .execute(database.pool())
+    .await?;
+    people.rebuild_person_credit_index().await?;
+
+    let restored_high: String = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities WHERE provider = 'tmdb' AND provider_id = '1500'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let restored_low: String = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities WHERE provider = 'tmdb' AND provider_id = '200'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(restored_high, "lux-000015");
+    assert_eq!(restored_low, "lux-000002");
+
+    people
+        .persist_item_actors(
+            "movie-seq-1",
+            "tmdb",
+            &[ActorCredit {
+                id: "1600".to_owned(),
+                provider: Some("tmdb".to_owned()),
+                identities: vec![luxd::application::people::PersonIdentity {
+                    provider: "imdb".to_owned(),
+                    id: "nm1600".to_owned(),
+                }],
+                name: "新演员".to_owned(),
+                character: Some("主角".to_owned()),
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+
+    let created_id: String = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities WHERE provider = 'tmdb' AND provider_id = '1600'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(created_id, "lux-000016");
+
+    let split_id = people
+        .split_person_identity(
+            &created_id,
+            "imdb",
+            "nm1600",
+            "拆分演员",
+            r#"{"reason":"manual split"}"#,
+        )
+        .await?;
+    assert_eq!(split_id, "lux-000017");
+    Ok(())
+}

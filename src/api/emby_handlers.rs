@@ -2332,13 +2332,29 @@ pub(super) async fn emby_authenticate(
         Err(status) => return status.into_response(),
     };
     let auth = state.emby_auth().clone();
-    let login_key = login_attempt_key(&headers, &request.username);
-    if !state.login_rate_limiter.is_allowed(&login_key).await {
+    // Resolve the account with the same rule the password check uses (normalized username, then
+    // one exact display-name match) so the username, its display name and this account's id route
+    // all share one failure budget. Unresolvable names keep a normalized name bucket, and a
+    // storage fault is answered with 503 before any reservation is taken.
+    let login_identity = match auth.login_target_user_id(&request.username).await {
+        Ok(Some(user_id)) => login_attempt_identity_for_user(&user_id),
+        Ok(None) => login_attempt_identity_for_unknown_name(&request.username),
+        Err(crate::auth::emby::EmbyAuthError::UserStore(
+            crate::auth::users::UserStoreError::InvalidUsername,
+        )) => login_attempt_identity_for_unknown_name(&request.username),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let login_key = login_attempt_key(&headers, &login_identity);
+    if !state.login_rate_limiter.try_acquire(&login_key).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let client_ip = match super::request_access_ip(&headers, &state).await {
         Ok(client_ip) => client_ip,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(_) => {
+            // No password was compared, so this attempt must not consume the window budget.
+            state.login_rate_limiter.release_attempt(&login_key).await;
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
     let device = emby_device_info_from_headers(&headers);
     match auth
@@ -2346,10 +2362,20 @@ pub(super) async fn emby_authenticate(
         .await
     {
         Ok(Some(result)) => {
-            emby_authentication_success_response(&headers, &state, &auth, &login_key, result).await
+            emby_authentication_success_response(
+                &headers, &state, &auth, &login_key, client_ip, result,
+            )
+            .await
+        }
+        Err(crate::auth::emby::EmbyAuthError::AccessDenied) => {
+            // The password matched; a device, client or IP rule refused the session. Release the
+            // reservation and emit no failed-credential event: a blacklisted client retrying must
+            // not exhaust the account's password budget or raise brute-force alerts.
+            state.login_rate_limiter.release_attempt(&login_key).await;
+            StatusCode::UNAUTHORIZED.into_response()
         }
         Ok(None) => {
-            state.login_rate_limiter.record_failure(&login_key).await;
+            // The reservation taken by `try_acquire` already counts this credential failure.
             // §18.3: every failed credential check emits the parseable event, including an
             // unknown username - guessing usernames is exactly what the ban list is for. Reuse
             // the resolver result this handler already holds instead of resolving it again.
@@ -2371,9 +2397,17 @@ pub(super) async fn emby_authenticate(
             StatusCode::UNAUTHORIZED.into_response()
         }
         Err(crate::auth::emby::EmbyAuthError::AccessRulesUnavailable) => {
+            // Rule evaluation itself failed; the password may already have matched, so this is
+            // not a failed credential either.
+            state.login_rate_limiter.release_attempt(&login_key).await;
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(_) => {
+            // A storage or rule-evaluation fault is not a failed password: release the
+            // reservation so a broken backend cannot lock the account out.
+            state.login_rate_limiter.release_attempt(&login_key).await;
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -2388,13 +2422,23 @@ pub(super) async fn emby_authenticate_user_id(
         Err(status) => return status.into_response(),
     };
     let auth = state.emby_auth().clone();
-    let login_key = login_attempt_key(&headers, &user_id);
-    if !state.login_rate_limiter.is_allowed(&login_key).await {
+    // This route authenticates the same account as `/Users/AuthenticateByName`, so it must key the
+    // attempt on the resolved account as well; only ids that match no row keep their own bucket.
+    let login_identity = match auth.user_by_id(&user_id).await {
+        Ok(Some(user)) => login_attempt_identity_for_user(&user.id.to_string()),
+        Ok(None) => login_attempt_identity_for_unknown_id(&user_id),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let login_key = login_attempt_key(&headers, &login_identity);
+    if !state.login_rate_limiter.try_acquire(&login_key).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let client_ip = match super::request_access_ip(&headers, &state).await {
         Ok(client_ip) => client_ip,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(_) => {
+            state.login_rate_limiter.release_attempt(&login_key).await;
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
     let device = emby_device_info_from_headers(&headers);
     match auth
@@ -2402,10 +2446,20 @@ pub(super) async fn emby_authenticate_user_id(
         .await
     {
         Ok(Some(result)) => {
-            emby_authentication_success_response(&headers, &state, &auth, &login_key, result).await
+            emby_authentication_success_response(
+                &headers, &state, &auth, &login_key, client_ip, result,
+            )
+            .await
+        }
+        Err(crate::auth::emby::EmbyAuthError::AccessDenied) => {
+            // The password matched; a device, client or IP rule refused the session. Release the
+            // reservation and emit no failed-credential event: a blacklisted client retrying must
+            // not exhaust the account's password budget or raise brute-force alerts.
+            state.login_rate_limiter.release_attempt(&login_key).await;
+            StatusCode::UNAUTHORIZED.into_response()
         }
         Ok(None) => {
-            state.login_rate_limiter.record_failure(&login_key).await;
+            // The reservation taken by `try_acquire` already counts this credential failure.
             // Same as above: log the attempt even when the id matches no account, once.
             let failed_login_remote_ip = client_ip.map(|ip| ip.to_string());
             log_authentication_failure(failed_login_remote_ip.as_deref());
@@ -2422,9 +2476,14 @@ pub(super) async fn emby_authenticate_user_id(
             StatusCode::UNAUTHORIZED.into_response()
         }
         Err(crate::auth::emby::EmbyAuthError::AccessRulesUnavailable) => {
+            state.login_rate_limiter.release_attempt(&login_key).await;
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(_) => {
+            // Storage or rule-evaluation fault: release, never count it as a bad password.
+            state.login_rate_limiter.release_attempt(&login_key).await;
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -2433,17 +2492,19 @@ async fn emby_authentication_success_response(
     state: &ReadyAppState,
     auth: &EmbyAuthService,
     login_key: &str,
+    client_ip: Option<std::net::IpAddr>,
     result: crate::auth::emby::EmbyAuthResult,
 ) -> Response {
-    if state.remote_access.is_remote(
-        header_str(headers, "x-lux-peer-ip"),
-        header_str(headers, "x-forwarded-for"),
-    ) && !result.user.can_remote_access
-    {
+    // The password was verified, so the caller's window is cleared before the remote-access
+    // decision (the Web handler does the same): a rule or policy refusal is not a bad password
+    // and must not leave the reservation counted.
+    state.login_rate_limiter.record_success(login_key).await;
+    // The login attempt was already judged with this resolved address; the policy decision reuses
+    // it instead of resolving a second, possibly different, client IP.
+    if state.remote_access.is_remote_address(client_ip) && !result.user.can_remote_access {
         let _ = auth.logout(&result.token).await;
         return StatusCode::FORBIDDEN.into_response();
     }
-    state.login_rate_limiter.record_success(login_key).await;
     let user_id = result.user.id.to_string();
     if let Some(device_id) = bounded_emby_device_field(&result.device.device_id) {
         {
@@ -2972,11 +3033,7 @@ pub(super) async fn require_emby_user_with_query(
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let user = resolve_emby_user_with_auth(headers, query, auth, client_ip).await?;
-    if state.remote_access.is_remote(
-        header_str(headers, "x-lux-peer-ip"),
-        header_str(headers, "x-forwarded-for"),
-    ) && !user.can_remote_access
-    {
+    if state.remote_access.is_remote_address(client_ip) && !user.can_remote_access {
         return Err(StatusCode::FORBIDDEN);
     }
     if let Some(token) = emby_token_from_headers(headers).or_else(|| query.api_key.clone()) {
@@ -3039,6 +3096,12 @@ async fn require_emby_principal_scoped(
     if crate::auth::emby::is_playback_token(&token) && !allow_playback_token {
         return Err(StatusCode::UNAUTHORIZED);
     }
+    // Resolve the trusted client address once, before the credential is resolved: the same
+    // address feeds the access rules and the remote-access policy, and every credential type
+    // (shared admin API key, Emby token, playback token) is judged by it.
+    let client_ip = super::request_access_ip(headers, state)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let principal = {
         let service = state.admin_api_key();
         match service.resolve_principal(&token).await {
@@ -3050,9 +3113,6 @@ async fn require_emby_principal_scoped(
     let principal = if let Some(principal) = principal {
         principal
     } else {
-        let client_ip = super::request_access_ip(headers, state)
-            .await
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         let resolved = if allow_playback_token {
             auth.resolve_emby_route_token_with_ip(&token, client_ip)
                 .await
@@ -3068,11 +3128,7 @@ async fn require_emby_principal_scoped(
             Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
         }
     };
-    if state.remote_access.is_remote(
-        header_str(headers, "x-lux-peer-ip"),
-        header_str(headers, "x-forwarded-for"),
-    ) && !principal.can_remote_access()
-    {
+    if state.remote_access.is_remote_address(client_ip) && !principal.can_remote_access() {
         return Err(StatusCode::FORBIDDEN);
     }
     if let Some(user) = principal.user() {

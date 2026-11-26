@@ -14,14 +14,19 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::{fs, net::lookup_host, sync::Mutex, task::JoinSet};
-use url::{Host, Url};
+use tokio::{fs, sync::Mutex, task::JoinSet};
+use url::Url;
 
 use crate::application::{
     notification_template,
     plugin_protocol::{NotificationSendRpcRequest, NotificationSendStatus, PluginConfigField},
     plugins::PluginService,
-    remote_url_policy::ipv4_compatible_target,
+    remote_url_policy::{
+        AddressCheckError, HostResolutionError, LOCAL_HOST_SUFFIXES, OutboundHost,
+        SystemHostResolver, canonical_ip, domain_matches_any, ipv4_is_benchmark,
+        ipv4_is_carrier_grade_nat, ipv4_is_ietf_protocol_assignment, ipv4_is_this_network,
+        pin_resolved_addresses, resolve_checked_addresses,
+    },
 };
 use crate::storage::{
     Database, NewNotificationDestination, NewNotificationEvent, StorageError,
@@ -1030,11 +1035,14 @@ impl WebhookService {
         body: &[u8],
     ) -> Result<u16, WebhookError> {
         let url = validate_destination(raw_url, allow_private_network)?;
-        let (host, address) = resolve_webhook_address(&url, allow_private_network).await?;
-        let client = Client::builder()
+        let target = resolve_webhook_address(&url, allow_private_network).await?;
+        let mut builder = Client::builder()
             .timeout(DELIVERY_TIMEOUT)
-            .redirect(Policy::none())
-            .resolve(&host, address)
+            .redirect(Policy::none());
+        if !target.addresses.is_empty() {
+            builder = pin_resolved_addresses(builder, &target.host, &target.addresses);
+        }
+        let client = builder
             .build()
             .map_err(|error| WebhookError::RequestSetup(error.to_string()))?;
         let timestamp = unix_now().to_string();
@@ -1323,35 +1331,39 @@ fn validate_webhook_url_with_query_policy(
     {
         return Err(WebhookUrlError::QueryOrFragment);
     }
-    let Some(host) = url.host_str() else {
-        return Err(WebhookUrlError::MissingHost);
-    };
-    let normalized_host = host.to_ascii_lowercase();
-    if (normalized_host == "localhost"
-        || normalized_host.ends_with(".localhost")
-        || normalized_host.ends_with(".local")
-        || normalized_host.ends_with(".internal")
-        || normalized_host.ends_with(".home.arpa"))
-        && !allow_private_network
-    {
-        return Err(WebhookUrlError::PrivateNetwork);
-    }
-
-    let address = match url.host() {
-        Some(Host::Ipv4(address)) => Some(IpAddr::V4(address)),
-        Some(Host::Ipv6(address)) => Some(IpAddr::V6(address)),
-        Some(Host::Domain(_)) | None => None,
-    };
-    if let Some(address) = address {
-        if is_dangerous_address(address) {
-            return Err(WebhookUrlError::DangerousAddress);
+    let host = OutboundHost::from_url(&url).ok_or(WebhookUrlError::MissingHost)?;
+    match &host {
+        OutboundHost::Ipv4(address) => {
+            validate_webhook_literal(IpAddr::V4(*address), allow_private_network)?;
         }
-        if !allow_private_network && is_private_address(address) {
-            return Err(WebhookUrlError::PrivateNetwork);
+        OutboundHost::Ipv6(address) => {
+            validate_webhook_literal(IpAddr::V6(*address), allow_private_network)?;
+        }
+        OutboundHost::Domain { normalized, .. } => {
+            // The shared host type already folded ASCII case and the trailing root dot, so
+            // `router.local.` cannot pass as a public name any more.
+            if !allow_private_network && domain_matches_any(normalized, &LOCAL_HOST_SUFFIXES) {
+                return Err(WebhookUrlError::PrivateNetwork);
+            }
         }
     }
 
     Ok(url)
+}
+
+/// The literal half of the webhook URL policy: a dangerous reserved address is never a destination,
+/// and a private one needs the explicit administrator approval.
+fn validate_webhook_literal(
+    address: IpAddr,
+    allow_private_network: bool,
+) -> Result<(), WebhookUrlError> {
+    if is_dangerous_address(address) {
+        return Err(WebhookUrlError::DangerousAddress);
+    }
+    if !allow_private_network && is_private_address(address) {
+        return Err(WebhookUrlError::PrivateNetwork);
+    }
+    Ok(())
 }
 
 pub fn canonical_signature(secret: &str, timestamp: &str, body: &[u8]) -> String {
@@ -1404,22 +1416,14 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 ///
 /// Shared with the notifier plugin SDK destination guard so both keep one classification.
 pub(crate) fn is_dangerous_address(address: IpAddr) -> bool {
-    match address {
+    match canonical_ip(address) {
         IpAddr::V4(value) => {
             value.is_unspecified()
                 || value.is_link_local()
                 || value.is_multicast()
-                || value.octets()[0] == 0
+                || ipv4_is_this_network(value)
         }
         IpAddr::V6(value) => {
-            if let Some(mapped) = value.to_ipv4_mapped() {
-                return is_dangerous_address(IpAddr::V4(mapped));
-            }
-            // A deprecated IPv4-compatible address (`::/96`) still carries an IPv4 target, so it
-            // must not bypass the IPv4 policy; `::` and `::1` keep their IPv6 meaning.
-            if let Some(compatible) = ipv4_compatible_target(value) {
-                return is_dangerous_address(IpAddr::V4(compatible));
-            }
             value.is_unspecified() || value.is_multicast() || value.is_unicast_link_local()
         }
     }
@@ -1430,24 +1434,17 @@ pub(crate) fn is_dangerous_address(address: IpAddr) -> bool {
 ///
 /// Shared with the notifier plugin SDK destination guard so both keep one classification.
 pub(crate) fn is_private_address(address: IpAddr) -> bool {
-    match address {
+    match canonical_ip(address) {
         IpAddr::V4(value) => {
             value.is_private()
                 || value.is_loopback()
                 || value.is_link_local()
-                || value.octets()[0] == 100 && (value.octets()[1] & 0b1100_0000) == 0b0100_0000
-                || value.octets()[0] == 198 && (value.octets()[1] == 18 || value.octets()[1] == 19)
-                || value.octets()[0] == 192 && value.octets()[1] == 0 && value.octets()[2] == 0
+                || ipv4_is_carrier_grade_nat(value)
+                || ipv4_is_benchmark(value)
+                || ipv4_is_ietf_protocol_assignment(value)
         }
         IpAddr::V6(value) => {
-            if let Some(mapped) = value.to_ipv4_mapped() {
-                return is_private_address(IpAddr::V4(mapped));
-            }
-            if let Some(compatible) = ipv4_compatible_target(value) {
-                return is_private_address(IpAddr::V4(compatible));
-            }
-            let octets = value.octets();
-            value.is_loopback() || value.is_unicast_link_local() || (octets[0] & 0xfe) == 0xfc
+            value.is_loopback() || value.is_unicast_link_local() || value.is_unique_local()
         }
     }
 }
@@ -1908,40 +1905,68 @@ fn event_field_allowed(event_type: WebhookEventType, key: &str) -> bool {
     }
 }
 
+/// A webhook destination whose URL and resolver answer both passed the policy.
+struct WebhookTarget {
+    /// The authority as the request carries it, which is also the resolver-override key.
+    host: String,
+    /// The checked address set the delivery client must be pinned to. Empty for an IP literal,
+    /// which DNS cannot redirect.
+    addresses: Vec<SocketAddr>,
+}
+
+/// Resolves a webhook destination and checks the whole answer.
+///
+/// One dangerous address rejects the answer even when the administrator approved private networks;
+/// a private address needs that approval. The checked addresses are what the delivery connects to,
+/// so a second DNS answer can never redirect it.
 async fn resolve_webhook_address(
     url: &Url,
     allow_private_network: bool,
-) -> Result<(String, SocketAddr), WebhookError> {
-    let Some(host) = url.host_str() else {
-        return Err(WebhookError::Invalid(
-            "webhook URL host is missing".to_owned(),
-        ));
-    };
+) -> Result<WebhookTarget, WebhookError> {
+    let host = OutboundHost::from_url(url)
+        .ok_or_else(|| WebhookError::Invalid("webhook URL host is missing".to_owned()))?;
     let port = url
         .port_or_known_default()
         .ok_or_else(|| WebhookError::Invalid("webhook URL port is missing".to_owned()))?;
-    let addresses = lookup_host((host, port))
-        .await
-        .map_err(|_| WebhookError::RequestSetup("webhook host could not be resolved".to_owned()))?
-        .collect::<Vec<_>>();
-    let Some(first) = addresses.first().copied() else {
-        return Err(WebhookError::RequestSetup(
-            "webhook host has no resolved address".to_owned(),
-        ));
+    let Some(request_host) = host.request_host() else {
+        // `validate_destination` already classified the literal; there is nothing to resolve.
+        return Ok(WebhookTarget {
+            host: url.host_str().unwrap_or_default().to_owned(),
+            addresses: Vec::new(),
+        });
     };
-    for address in &addresses {
-        if is_dangerous_address(address.ip()) {
-            return Err(WebhookError::Invalid(
-                "webhook host resolves to a reserved address".to_owned(),
-            ));
+    let addresses = resolve_checked_addresses(&SystemHostResolver, request_host, port, |address| {
+        !is_dangerous_address(address)
+    })
+    .await
+    .map_err(webhook_resolution_error)?;
+    if !allow_private_network
+        && addresses
+            .iter()
+            .any(|address| is_private_address(address.ip()))
+    {
+        return Err(WebhookError::Invalid(
+            "webhook host resolves to a private address".to_owned(),
+        ));
+    }
+    Ok(WebhookTarget {
+        host: request_host.to_owned(),
+        addresses,
+    })
+}
+
+fn webhook_resolution_error(error: HostResolutionError) -> WebhookError {
+    match error {
+        HostResolutionError::Lookup(_) => {
+            WebhookError::RequestSetup("webhook host could not be resolved".to_owned())
         }
-        if !allow_private_network && is_private_address(address.ip()) {
-            return Err(WebhookError::Invalid(
-                "webhook host resolves to a private address".to_owned(),
-            ));
+        HostResolutionError::Check(AddressCheckError::Empty) => {
+            WebhookError::RequestSetup("webhook host has no resolved address".to_owned())
+        }
+        HostResolutionError::Check(AddressCheckError::Rejected) => {
+            WebhookError::Invalid("webhook host resolves to a reserved address".to_owned())
         }
     }
-    Ok((host.to_owned(), first))
 }
 
 fn destination_view(
@@ -2487,6 +2512,28 @@ mod tests {
         let url = Url::parse("http://localhost:8097/hook").expect("test URL should parse");
         let result = super::resolve_webhook_address(&url, false).await;
         assert!(matches!(result, Err(super::WebhookError::Invalid(_))));
+    }
+
+    #[test]
+    fn url_checks_fold_the_trailing_root_dot_before_the_private_name_gate() {
+        for value in [
+            "http://localhost./hooks",
+            "http://Router.Local./hooks",
+            "http://nas.internal./hooks",
+            "http://box.home.arpa./hooks",
+        ] {
+            assert!(
+                matches!(
+                    super::validate_webhook_url(value, false),
+                    Err(super::WebhookUrlError::PrivateNetwork)
+                ),
+                "{value} must require explicit private-network approval"
+            );
+        }
+        // The approval keeps local receivers usable, and a public name with a root dot is still a
+        // public name.
+        assert!(super::validate_webhook_url("http://nas.internal./hooks", true).is_ok());
+        assert!(super::validate_webhook_url("https://hooks.example.com./hook", false).is_ok());
     }
 
     #[test]

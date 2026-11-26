@@ -159,7 +159,7 @@ impl Database {
              )
              SELECT ?, 'CANCELLED', COUNT(*), ?, ?, 'LIBRARY'
              FROM media_items
-             WHERE library_id = ? AND removed_at IS NULL
+             WHERE library_id = ? AND removed_at IS NULL AND merged_into_item_id IS NULL
                AND item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')",
         )
         .bind(job_id)
@@ -189,7 +189,7 @@ impl Database {
                  ELSE 3
              END
              FROM media_items
-             WHERE library_id = ? AND removed_at IS NULL
+             WHERE library_id = ? AND removed_at IS NULL AND merged_into_item_id IS NULL
                AND item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')",
         )
         .bind(job_id)

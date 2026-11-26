@@ -2,6 +2,46 @@ import type { ChangelogRelease } from "../types";
 
 export const changelogReleases07: ChangelogRelease[] = [
   {
+    version: "0.7.30",
+    date: "2026-11-24",
+    sections: [
+      { kind: "added", items: [
+        "✨ feat(access): 「允许远程访问」重新生效了 — 之前这个用户策略实际上一直没起作用。现在只按可信代理链解析出的地址判断：内网、回环算本地，公网和 Tailscale/CGNAT 算远程，Web 登录、客户端令牌、管理后台、Emby 接口、播放直链、图片下载和 WebSocket 握手统一执行；远程登录被拒会撤销刚发的凭证，代理配置读不出来返回 503 而不是放行。",
+      ] },
+      { kind: "fixed", items: [
+        "🐛 fix(images): 图片下载只连校验过的地址 — 以前校验完域名、建连时还会重新解析一次，DNS 可以在这中间换成内网地址。现在只解析一次并把这组地址固定到客户端，重试也复用；演员资料图同样处理，配了代理时按私网规则拒绝。",
+        "🐛 fix(strm): 禁止的播放目标直接拒绝 — localhost、metadata 主机名、链路本地、CGNAT、组播等地址一律拒绝，局域网 RFC1918/ULA 仍然放行；域名解析后任一候选不合格就整体拒绝，初始请求和每次重定向都固定地址，Web 播放命中禁止目标直接 502。",
+        "🐛 fix(auth): 登录限流先占额度再验密码 — 以前并发请求会读到同一个失败计数，一波并发猜测能在记账前全被放行；现在额度检查与自增在同一把锁内完成。Web 登录和 Emby 两个登录入口也按解析后的账户共用同一份额度，服务端故障会归还额度、不算成密码错误。",
+        "🐛 fix(config): 数据库凭据改为原子写入 — 临时文件从创建起就是 0600，写完 fsync 再改名，失败路径会清理临时文件，不会留下写了一半的密码；NFS/SMB 上父目录 fsync 失败只影响掉电持久性，不再报保存失败。",
+        "🐛 fix(metadata): PostgreSQL 人物序列不再撞号、FILL_MISSING 不再误报条目不存在（PR #61） — 并发建人物用事务级 advisory lock 串行推进序列，分配重试不会让 PG 事务进入 aborted；只读探查把「条目不存在」干净地转成 ItemNotFound，已合并或已移除的条目不再发多余的 MetadataUpdated webhook。",
+      ] },
+      { kind: "changed", items: [
+        "♻️ refactor(remote_url_policy): 出站地址的 host 分类、地址判定与 DNS 固定抽成一套共用原语，STRM、图片、webhook 和 Emby 迁移都改用同一份实现；顺带修正展开地址的判断并固定 IANA 特殊网段边界。",
+      ] },
+    ],
+  },
+  {
+    version: "0.7.29",
+    date: "2026-11-24",
+    sections: [
+      { kind: "fixed", items: [
+        "🐛 fix(people): 旧版人物关系快照不再被误隔离 — LUX-FP-1 时代的 32 字节快照遇到容器/FUSE 挂载的设备号漂移时，会被当成过期把好好的 people.json 挪进隔离区；现在回退到精确尺寸、纳秒修改时间、片名与年份一起校验。",
+        "🐛 fix(people): 被误隔离的快照会自动搬回来 — 升级后首启跑一次恢复，把当初被误隔离、且仍能匹配在库媒体的旧快照迁回原位并重建人物索引（索引 schema 升到 4）。",
+        "🐛 fix(metadata): 存量的双 NFO 会重新读一遍 — 本地元数据队列和手动刷新之前没拿到 PeopleService，双 NFO 的演员合并在批处理里跑不到，并发写同一演员时重定向也会指错；已修好并把本地 NFO 缓存与人物关系升到 2/5，启动后重排一次本地元数据回填，已有的 <片名>.nfo + movie.nfo 会重新读取、碰撞演员自动收敛。升级首启会多一次回填耗时。",
+      ] },
+    ],
+  },
+  {
+    version: "0.7.28",
+    date: "2026-11-24",
+    sections: [
+      { kind: "fixed", items: [
+        "🐛 fix(scanner): 带连字符标签的季目录能被识别了 — Season 1 - CMCTV、Season 2 - HHWEB、S01 - HDR 这类目录以前因为连字符后有空格不被当成季目录，扫描时季目录自己会变成一部「剧集」，剧名、tvshow.nfo 和海报全对不上；现在按第 N 季处理，标签只用来区分同季的不同版本并合并到同一个剧集下，Season 1-2 这类季区间和 Season 1 - Part Two 这类多词描述仍然不当作标签。",
+        "🐛 fix(metadata): 平铺剧集不再让本地元数据批次一直重试 — 剧集文件直接放在剧集目录下（没有季子目录）时，读本地 NFO 和海报完整性会被判成越出媒体库根，日志刷 image path ... is outside the allowed image roots 并让 local_metadata 批次无限失败重试；现在没有季目录时按文件所在目录处理，直接放在库根的文件视为没有本地旁挂跳过。升级后重扫一次即可。",
+      ] },
+    ],
+  },
+  {
     version: "0.7.27",
     date: "2026-11-24",
     sections: [

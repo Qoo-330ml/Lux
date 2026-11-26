@@ -762,8 +762,20 @@ impl UserStore {
     }
 }
 
+/// The one normalization shared by stored usernames, username lookups and login rate-limit keys.
+///
+/// Every path that decides "which account is this" must fold the same way: a limiter that used
+/// ASCII-only lowercasing while lookups used Unicode lowercasing would keep one failure budget
+/// per spelling of the same account (`Ädmin` and `ädmin`), which defeats brute-force protection
+/// without changing which account the password is checked against. The rule is therefore the
+/// stored form itself - trim plus Unicode lowercasing - and deliberately no NFKC/NFC folding,
+/// because that would silently change existing usernames.
+pub fn normalize_login_identity(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
 fn normalize_username(username: &str) -> Result<String, UserStoreError> {
-    let normalized = username.trim().to_lowercase();
+    let normalized = normalize_login_identity(username);
     if normalized.is_empty() || normalized.chars().count() > 128 {
         return Err(UserStoreError::InvalidUsername);
     }

@@ -6,12 +6,19 @@ pub(crate) async fn require_admin(
     require_csrf: bool,
 ) -> Result<(), Response> {
     if let Some(principal) = resolve_shared_admin_api_key(headers, state).await? {
-        if !principal.can_manage_server()
-            || (state.remote_access.is_remote(
-                header_str(headers, "x-lux-peer-ip"),
-                header_str(headers, "x-forwarded-for"),
-            ) && !principal.can_remote_access())
-        {
+        let remote = match crate::api::legacy::request_is_remote(headers, state).await {
+            Ok(remote) => remote,
+            Err(_) => {
+                return Err(api_error(
+                    headers,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    lux::ApiErrorCode::DatabaseUnavailable,
+                    "认证暂时不可用",
+                )
+                .into_response());
+            }
+        };
+        if !principal.can_manage_server() || (remote && !principal.can_remote_access()) {
             return Err(api_error(
                 headers,
                 StatusCode::FORBIDDEN,

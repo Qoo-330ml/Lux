@@ -34,25 +34,17 @@ impl Default for LoginRateLimiter {
 }
 
 impl LoginRateLimiter {
-    pub async fn is_allowed(&self, key: &str) -> bool {
-        let mut state = self.state.lock().await;
-        let now = Instant::now();
-        maybe_cleanup(&mut state, now);
-        let key = key_digest(key);
-        let Some(attempt) = state.attempts.get(&key) else {
-            // A saturated table must never deny an account that has no entry yet: otherwise a
-            // flood of unique usernames would lock every legitimate sign-in out. Unknown keys
-            // simply stay untracked until the periodic sweep frees capacity.
-            return true;
-        };
-        if now.saturating_duration_since(attempt.started_at) >= WINDOW {
-            state.attempts.remove(&key);
-            return true;
-        }
-        attempt.failures < MAX_FAILURES
-    }
-
-    pub async fn record_failure(&self, key: &str) {
+    /// Reserves one attempt for `key`; `false` means the window budget is exhausted.
+    ///
+    /// Checking the budget and counting the attempt happen inside one lock acquisition. The old
+    /// split between a check and a separate `record_failure` let a burst of concurrent guesses
+    /// observe the same pre-increment count and pass together, so a window could admit far more
+    /// than [`MAX_FAILURES`] password verifications.
+    ///
+    /// The guard is released before the caller runs Argon2; a caller that never reached the
+    /// credential check must give the reservation back with [`Self::release_attempt`], and a
+    /// successful login clears the window with [`Self::record_success`].
+    pub async fn try_acquire(&self, key: &str) -> bool {
         let mut state = self.state.lock().await;
         let now = Instant::now();
         maybe_cleanup(&mut state, now);
@@ -62,11 +54,18 @@ impl LoginRateLimiter {
                 attempt.started_at = now;
                 attempt.failures = 0;
             }
+            if attempt.failures >= MAX_FAILURES {
+                return false;
+            }
             attempt.failures = attempt.failures.saturating_add(1);
-            return;
+            return true;
         }
         if state.attempts.len() >= MAX_ENTRIES {
-            return;
+            // A saturated table must never deny an account that has no entry yet: otherwise a
+            // flood of unique usernames would lock every legitimate sign-in out. Unknown keys
+            // simply stay untracked until the periodic sweep frees capacity, and releasing such
+            // a reservation is a no-op.
+            return true;
         }
         state.attempts.insert(
             key,
@@ -75,8 +74,33 @@ impl LoginRateLimiter {
                 failures: 1,
             },
         );
+        true
     }
 
+    /// Rolls back one reservation made by [`Self::try_acquire`] after a server-side failure.
+    ///
+    /// Only one unit is released, so a storage fault cannot erase the failures other attempts
+    /// already accumulated in the same window, and an untracked key (a saturated table fails
+    /// open) stays a no-op. A window that already expired has nothing left to roll back.
+    pub async fn release_attempt(&self, key: &str) {
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        maybe_cleanup(&mut state, now);
+        let key = key_digest(key);
+        let Some(attempt) = state.attempts.get_mut(&key) else {
+            return;
+        };
+        if now.saturating_duration_since(attempt.started_at) >= WINDOW {
+            state.attempts.remove(&key);
+            return;
+        }
+        attempt.failures = attempt.failures.saturating_sub(1);
+        if attempt.failures == 0 {
+            state.attempts.remove(&key);
+        }
+    }
+
+    /// Clears the window after a successful authentication.
     pub async fn record_success(&self, key: &str) {
         let mut state = self.state.lock().await;
         let now = Instant::now();
@@ -296,37 +320,124 @@ struct RequestWindow {
 mod tests {
     use super::{
         CLEANUP_INTERVAL, DanmakuSearchRateLimiter, DevicePairingRateLimiter, LoginAttempt,
-        LoginRateLimiter, MAX_ENTRIES, RequestRateLimiter, WINDOW, key_digest,
+        LoginRateLimiter, MAX_ENTRIES, MAX_FAILURES, RequestRateLimiter, WINDOW, key_digest,
     };
-    use std::time::{Duration, Instant};
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+    use tokio::sync::Barrier;
 
     #[tokio::test]
     async fn unique_failure_keys_are_bounded_and_a_full_table_does_not_deny_new_keys() {
         let limiter = LoginRateLimiter::default();
         let active_key = "active-user";
-        limiter.record_failure(active_key).await;
+        assert!(limiter.try_acquire(active_key).await);
         for index in 0..MAX_ENTRIES.saturating_sub(1) {
-            limiter
-                .record_failure(&format!("random-user-{index}"))
-                .await;
+            assert!(limiter.try_acquire(&format!("random-user-{index}")).await);
         }
 
         let state = limiter.state.lock().await;
         assert_eq!(state.attempts.len(), MAX_ENTRIES);
         drop(state);
 
-        assert!(limiter.is_allowed(active_key).await);
-        limiter.record_failure(active_key).await;
-        assert!(limiter.is_allowed(active_key).await);
-        limiter.record_failure(active_key).await;
-        assert!(limiter.is_allowed(active_key).await);
-        limiter.record_failure(active_key).await;
-        assert!(limiter.is_allowed(active_key).await);
-        limiter.record_failure(active_key).await;
-        assert!(!limiter.is_allowed(active_key).await);
+        for _ in 1..MAX_FAILURES {
+            assert!(limiter.try_acquire(active_key).await);
+        }
+        assert!(!limiter.try_acquire(active_key).await);
         // Tracked keys keep their counters, but a saturated table must never lock out an
         // account that has no entry yet: unknown keys fail open instead.
-        assert!(limiter.is_allowed("another-new-user").await);
+        assert!(limiter.try_acquire("another-new-user").await);
+        // A reservation that was never tracked must roll back without side effects.
+        limiter.release_attempt("another-new-user").await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_attempts_never_exceed_the_failure_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const CONCURRENT: usize = 20;
+        let limiter = LoginRateLimiter::default();
+        let barrier = Arc::new(Barrier::new(CONCURRENT));
+        let mut tasks = Vec::with_capacity(CONCURRENT);
+        for _ in 0..CONCURRENT {
+            let limiter = limiter.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                limiter.try_acquire("shared-account").await
+            }));
+        }
+
+        let mut allowed = 0;
+        for task in tasks {
+            if task.await? {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, usize::from(MAX_FAILURES));
+        assert!(!limiter.try_acquire("shared-account").await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn released_attempts_do_not_consume_the_failure_budget() {
+        let limiter = LoginRateLimiter::default();
+        // A storage or access-rule fault gives the reservation back, so a run of server errors
+        // must not lock the account out.
+        for _ in 0..usize::from(MAX_FAILURES) * 3 {
+            assert!(limiter.try_acquire("infra-key").await);
+            limiter.release_attempt("infra-key").await;
+        }
+        for _ in 0..MAX_FAILURES {
+            assert!(limiter.try_acquire("infra-key").await);
+        }
+        assert!(!limiter.try_acquire("infra-key").await);
+
+        // Releasing frees exactly one reservation and never underflows below zero.
+        limiter.release_attempt("infra-key").await;
+        assert!(limiter.try_acquire("infra-key").await);
+        limiter.record_success("infra-key").await;
+        for _ in 0..10 {
+            limiter.release_attempt("infra-key").await;
+        }
+        for _ in 0..MAX_FAILURES {
+            assert!(limiter.try_acquire("infra-key").await);
+        }
+        assert!(!limiter.try_acquire("infra-key").await);
+    }
+
+    #[tokio::test]
+    async fn successful_login_clears_the_failure_budget() {
+        let limiter = LoginRateLimiter::default();
+        for _ in 0..MAX_FAILURES {
+            assert!(limiter.try_acquire("viewer").await);
+        }
+        assert!(!limiter.try_acquire("viewer").await);
+        limiter.record_success("viewer").await;
+        for _ in 0..MAX_FAILURES {
+            assert!(limiter.try_acquire("viewer").await);
+        }
+        assert!(!limiter.try_acquire("viewer").await);
+    }
+
+    #[tokio::test]
+    async fn an_expired_window_restores_attempts() {
+        let limiter = LoginRateLimiter::default();
+        let now = Instant::now();
+        limiter.state.lock().await.attempts.insert(
+            key_digest("expired-user"),
+            LoginAttempt {
+                started_at: now - WINDOW - Duration::from_secs(1),
+                failures: MAX_FAILURES,
+            },
+        );
+
+        // The stale window is thrown away, so the new attempt starts a fresh budget.
+        assert!(limiter.try_acquire("expired-user").await);
+        for _ in 1..MAX_FAILURES {
+            assert!(limiter.try_acquire("expired-user").await);
+        }
+        assert!(!limiter.try_acquire("expired-user").await);
     }
 
     #[tokio::test]
@@ -352,7 +463,8 @@ mod tests {
         state.last_cleanup = now - CLEANUP_INTERVAL - Duration::from_secs(1);
         drop(state);
 
-        assert!(limiter.is_allowed("fresh-user").await);
+        assert!(limiter.try_acquire("fresh-user").await);
+        limiter.release_attempt("fresh-user").await;
         assert!(limiter.state.lock().await.attempts.is_empty());
     }
 

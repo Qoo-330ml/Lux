@@ -356,8 +356,12 @@ Lux 的核心价值不是功能数量，而是：
 - 网络代理设置是全局出站配置，支持 HTTP、HTTPS、SOCKS4、SOCKS4a、SOCKS5 和 SOCKS5h；可通过代理 URL 携带认证信息。
 - 出站代理可使用 Lux 的统一配置或标准 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY` 环境变量；配置影响 TMDb、插件、图片和下载等出站请求。URL 型 `.strm` 的解析请求由 Lux 直连目标并绕过全局出站代理，但不代理客户端最终读取的媒体字节和入站反向代理。
 - 管理员可在网络代理设置中检测 TMDb、百度、Google 和 Cloudflare 的逐站延迟，并查看通过 Cloudflare trace 获取的网络出口 IP 与国家/地区代码。
-- 远程访问权限由用户策略控制。
-- Lux 展示的客户端 IP 按有效的 X-Forwarded-For、X-Real-IP、Forwarded 顺序读取；Forwarded 只采用首个代理元素的 for 参数，支持 IPv4、带方括号的 IPv6 和可选端口。转发 IP 缺失或无效时不把反代对端地址当作真实客户端 IP。HTTPS 判断仍读取 X-Forwarded-Proto；远程访问权限不再依据来源 IP 判断。
+- 远程访问权限由用户策略 `can_remote_access` 控制。
+- 本地与远程由统一的可信 `access-IP resolver` 判定。resolver 从连接对端（服务器中间件写入的 `peer`）开始，仅当当前跳点属于显式配置的可信代理网段、或容器内检测到的单一默认网关主机地址时，才读取完整 `X-Forwarded-For` 链并从右向左逐跳校验。解析出的客户端 IP 属于本地地址时为本地请求；其余地址为远程请求。
+- 本地地址指 loopback `127.0.0.0/8`、`::1`、RFC1918 私网、IPv4 链路本地 `169.254.0.0/16`、IPv6 ULA `fc00::/7`、IPv6 链路本地 `fe80::/10` 及上述地址的 IPv4-mapped IPv6 形式，与 `user_access_rules::is_private_or_loopback` 保持一致。公网 IP 以及 Tailscale/CGNAT `100.64.0.0/10` 等非局域网地址一律视为远程。
+- 未配置可信代理 CIDR、或连接对端不在可信代理内时，转发头被忽略并回退连接对端地址；原始 `X-Forwarded-For` 绝不单独用于远程访问判定。可信代理设置不可读或转发链畸形时失败关闭（返回 `503`），不回退放行。
+- `can_remote_access` 在所有入口统一执行：Web 登录、Web session 与 CSRF 校验、用户级客户端令牌、共享管理员 API Key、管理后台、Emby 兼容登录与接口、Web 播放资源（签名直链、Range、HLS、字幕）、图片与下载端点，以及 `/api/v1/ws` 与 `/embywebsocket` 的握手和周期性重校验。远程登录被拒绝时撤销刚签发的凭证并返回 `403`；已登录的远程请求在下一次请求即被阻断，无需重新登录。
+- Lux 展示的客户端 IP 仍按有效的 X-Forwarded-For、X-Real-IP、Forwarded 顺序读取；Forwarded 只采用首个代理元素的 for 参数，支持 IPv4、带方括号的 IPv6 和可选端口。转发 IP 缺失或无效时不把反代对端地址当作真实客户端 IP。HTTPS 判断仍读取 X-Forwarded-Proto，仅用于 Cookie 的 `Secure` 标记，不参与认证、授权或 ACL。
 - 反向代理场景必须使用 HTTPS；用户名和密码登录协议本身不能替代 TLS。
 
 ### 3.14 管理与可观测性
@@ -1838,7 +1842,7 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 - 图片验证大小和类型，防止超大文件或伪装内容。
 - 管理编辑输出在 Web 中转义，防止 NFO/TMDb 文本造成 XSS。
 - CORS 默认同源；第三方客户端不依赖浏览器 CORS。
-- Docker 非 root，默认只暴露一个 HTTP 端口。
+- Docker 默认只暴露一个 HTTP 端口；为兼容不同 NAS bind mount 的 UID/GID，当前镜像与 Compose 以 root 运行 Lux，因此必须严格保护 `/config`（数据库、密钥与凭据配置）、插件目录与媒体挂载目录的宿主机权限与访问边界，禁止将管理端口或未受保护的 `/config` 暴露给不可信用户，也不要在未授权的情况下将容器目录直接共享给低权限不可信进程。
 - 外部远程使用必须由 Tailscale 或 HTTPS 反向代理保护。
 
 ---
@@ -3171,10 +3175,11 @@ Web 侧 `node --test tests/*.test.mjs`（150 项）、`vitest run`（861 项，�
 
 验收：
 
-- 无需配置代理 CIDR，始终优先使用有效的转发头。
-- 远程访问只依赖账号认证和媒体库 ACL，不再依据来源 IP 或 can_remote_access 阻止请求。
+- 连接对端属于显式可信代理（或容器默认网关）时，按完整 `X-Forwarded-For` 链从右向左解析客户端 IP；未配置可信代理网段或对端不可信时忽略转发头、回退连接对端 IP。
+- 远程访问只依据可信 `access-IP resolver` 解析出的客户端 IP 判定，并对远程请求统一执行 `can_remote_access` 策略；解析或可信代理设置读取失败时失败关闭。
+- 远程被拒绝的登录撤销刚签发的会话或令牌；已签发的 Web session、Emby token、签名播放资源 URL 和共享管理员 API Key 在远程请求上重新执行同一策略。
 
-验证：转发头解析、无转发头回退和反代 HTTPS Cookie 测试。
+验证：转发头解析、无转发头回退、伪造转发头防绕过、失败关闭和反代 HTTPS Cookie 测试。
 
 依赖：LUX-090。
 
@@ -22204,8 +22209,21 @@ LUX-918（NFO 多源演员身份解析与双 NFO 互补合并）。
   收敛后搜索、详情收藏态及头像请求保持可用（`people_api::rebuilding_people_migrates_legacy_local_actor_favorites_and_assets_after_id_algorithm_change`）。
 - [x] `POST /api/v1/admin/people/merge` 校验管理员与 CSRF、迁移状态并写审计事件，对非法/自合并/已合并/
   缺失人物返回对应 400/409/404。
-- [x] 相关单测、`--test metadata`、`--lib` 校验、fmt 与脚本校验通过。
-- [ ] 未验证：部署到 `fnos` 实机并触发 `rebuild`/手动合并接口检查线上人物收敛与权限行为。
+- [x] `fnos` 实机升级核查补充修复（2026-11-24）：
+  - 修复 `relation_media_snapshot_matches` / `legacy_relation_is_current`：当 32 字节旧版 `LUX-FP-1`
+    快照遇到 `LUX-FP-2` 升级且容器/FUSE 挂载设备号 `st_dev` 漂移时，回退校验精确尺寸、纳秒修改时间、
+    片名与年份，不再误隔离正常 `people.json`。
+  - 新增启动重建一次性误隔离恢复（`lux_meta` `people_quarantine_legacy_fp_recovery_v1`），将因该问题
+    移入 `quarantine/people-relations/` 且仍匹配在库 `LUX-FP-2` 媒体的 `v1` 快照迁回并重建索引
+    （`PERSON_INDEX_REBUILD_SCHEMA_VERSION = 4`）。
+  - 补齐 `start_local_metadata_outbox_worker` 与 `run_local_metadata_refresh` 对 `PeopleService`
+    的注入，修正 `DeferredNfoActorCredits` 批内并发合并重定向，并递增
+    `LOCAL_NFO_CACHE_SCHEMA_VERSION = 2`、`PEOPLE_RELATION_SCHEMA_VERSION = 5`，启动后一次性重排
+    已完成根目录的本地元数据回填（`lux_meta` `nfo_actor_identities_backfill_v1`）以重读存量双 NFO 并
+    自动收敛碰撞人物。
+- [x] 相关单测、`--test metadata`、`--test scanned_metadata`、`--test emby search::`、`--lib` 校验、fmt
+  与脚本校验通过。
+- [ ] 未验证：将本轮修复重新部署到 `fnos` 实机后的线上重建与搜索收敛结果。
 
 预计文件：`src/storage/people.rs`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/application/people/service.rs`、`src/application/people/helpers.rs`、`src/application/people/matching.rs`、`src/application/people/relations.rs`、`src/application/people/rebuild.rs`、`src/api/admin/admin_people.rs`、`src/api/legacy.rs`、`tests/metadata/people_api.rs`、`docs/LUX-DEVELOPMENT.md`。
 

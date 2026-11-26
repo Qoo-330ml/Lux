@@ -496,7 +496,20 @@ impl PeopleService {
             return Vec::new();
         };
         let _flush_guard = deferred_credits.flush_lock.lock().await;
-        let pending = std::mem::take(&mut *deferred_credits.pending.lock().await);
+        let mut pending = std::mem::take(&mut *deferred_credits.pending.lock().await);
+        let redirects = std::mem::take(&mut *deferred_credits.merged_redirects.lock().await);
+        if !redirects.is_empty() {
+            for item in &mut pending {
+                for credit in &mut item.credits {
+                    let Some(current) = credit.lux_person_id.as_deref() else {
+                        continue;
+                    };
+                    if let Some(resolved) = resolve_merged_redirect(&redirects, current) {
+                        credit.lux_person_id = Some(resolved);
+                    }
+                }
+            }
+        }
         let mut failures = Vec::new();
         let mut retry_pending = Vec::new();
         for chunk in pending.chunks(16) {
@@ -825,6 +838,17 @@ impl PeopleService {
                 evidence_json,
             )
             .await?;
+        }
+        if let Some(deferred_credits) = deferred_credits
+            && !merged_people.is_empty()
+        {
+            let mut redirects = deferred_credits.merged_redirects.lock().await;
+            for (merged, _) in &merged_people {
+                redirects.insert(
+                    merged.source_person_id.clone(),
+                    merged.target_person_id.clone(),
+                );
+            }
         }
 
         let asset_results = self
@@ -1698,8 +1722,24 @@ impl PeopleService {
                 .map_err(|source| PeopleError::Serialization(source.to_string()))?;
             self.ensure_person_manifest_restore_pending(options.deferred_restore_pending)
                 .await?;
-            write_atomically(&manifest_path, &bytes).await
+            write_atomically(&manifest_path, &bytes).await?;
+            self.record_person_manifest_path(lux_person_id, &manifest_path)
+                .await;
+            Ok(())
         }
         .await
     }
+}
+
+fn resolve_merged_redirect(redirects: &HashMap<String, String>, person_id: &str) -> Option<String> {
+    let mut current = redirects.get(person_id)?;
+    let mut visited = HashSet::new();
+    visited.insert(person_id);
+    while let Some(next) = redirects.get(current.as_str()) {
+        if !visited.insert(current.as_str()) {
+            break;
+        }
+        current = next;
+    }
+    Some(current.clone())
 }

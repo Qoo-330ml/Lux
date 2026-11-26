@@ -31,6 +31,47 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
+    pub(crate) async fn requeue_completed_scan_local_metadata_backfills_once(
+        &self,
+        meta_key: &str,
+    ) -> Result<u64, StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let status: Option<String> = self
+            .query_scalar("SELECT value FROM lux_meta WHERE key = ?")
+            .bind(meta_key)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(self.sqlx_err())?;
+        if status.as_deref() == Some("completed") {
+            transaction.commit().await.map_err(self.sqlx_err())?;
+            return Ok(0);
+        }
+        let rows_affected = self
+            .query(
+                "UPDATE scan_local_metadata_backfills
+                 SET status = 'PENDING', cursor_entry_id = NULL, next_attempt_at = NULL,
+                     error = NULL, non_retryable_item_ids_json = '[]',
+                     updated_at = unixepoch()
+                 WHERE status = 'COMPLETED'",
+            )
+            .execute(&mut *transaction)
+            .await
+            .map(|result| result.rows_affected())
+            .map_err(self.sqlx_err())?;
+        self.query(
+            "INSERT INTO lux_meta (key, value)
+             VALUES (?, 'completed')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(meta_key)
+        .execute(&mut *transaction)
+        .await
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
+        Ok(rows_affected)
+    }
+
     #[cfg(test)]
     pub(crate) async fn ensure_scan_local_metadata_backfill_root(
         &self,

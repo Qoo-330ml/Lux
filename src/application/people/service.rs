@@ -17,7 +17,7 @@ use quick_xml::{
     events::Event,
     reader::Reader,
 };
-use reqwest::{Client, Url, header::CONTENT_TYPE};
+use reqwest::{Url, header::CONTENT_TYPE};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -29,6 +29,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use crate::application::images::ImageHttpClient;
 use crate::application::metadata_paths::{
     MetadataPathError, canonical_person_directory, library_item_directory, lux_person_directory,
     metadata_root, people_directory, people_index_directory, people_index_path,
@@ -61,7 +62,7 @@ const LEGACY_PROFILES_DIR: &str = "profiles";
 const PERSON_NFO: &str = "person.nfo";
 const PERSON_MANIFEST: &str = "person.json";
 const PERSON_IMAGE: &str = "folder";
-const PEOPLE_RELATION_SCHEMA_VERSION: u32 = 4;
+const PEOPLE_RELATION_SCHEMA_VERSION: u32 = 5;
 const PERSON_MANIFEST_SCHEMA_VERSION: u32 = 3;
 const LEGACY_PERSON_MIGRATION_SCHEMA_VERSION: i64 = 1;
 const PENDING_PERSON_DIRECTORY: &str = "personDirectory";
@@ -79,7 +80,7 @@ const MAX_PEOPLE_FILE_BYTES: u64 = 256 * 1024;
 const MAX_PROFILE_BYTES: usize = 10 * 1024 * 1024;
 const PROFILE_EXTENSIONS: [&str; 3] = ["jpg", "png", "webp"];
 const PERSON_INDEX_REBUILD_BATCH_SIZE: i64 = 100;
-const PERSON_INDEX_REBUILD_SCHEMA_VERSION: i64 = 3;
+const PERSON_INDEX_REBUILD_SCHEMA_VERSION: i64 = 4;
 const PERSON_LOCKABLE_FIELDS: [&str; 14] = [
     "name",
     "biography",
@@ -375,6 +376,7 @@ pub struct ActorPersistReport {
 #[derive(Clone)]
 pub(crate) struct DeferredNfoActorCredits {
     pending: Arc<AsyncMutex<Vec<PendingNfoActorCredits>>>,
+    merged_redirects: Arc<AsyncMutex<HashMap<String, String>>>,
     flush_lock: Arc<AsyncMutex<()>>,
     manifest_restore_pending: Arc<AsyncMutex<bool>>,
     person_asset_results: Arc<AsyncMutex<HashMap<String, Arc<OnceCell<PersonAssetResult>>>>>,
@@ -409,6 +411,7 @@ impl Default for DeferredNfoActorCredits {
     fn default() -> Self {
         Self {
             pending: Arc::default(),
+            merged_redirects: Arc::default(),
             flush_lock: Arc::new(AsyncMutex::new(())),
             manifest_restore_pending: Arc::default(),
             person_asset_results: Arc::default(),
@@ -624,11 +627,15 @@ pub struct PersonImage {
 #[derive(Clone)]
 pub struct PeopleService {
     config_dir: PathBuf,
-    client: Client,
+    /// The checked image download client for actor profile images. It shares the image writer's
+    /// proxy and timeout policy, and every request is pinned to the addresses checked for it.
+    image_http: Option<ImageHttpClient>,
     database: Option<Database>,
     rebuild_lock: Arc<AsyncMutex<()>>,
     person_asset_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     relation_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    manifest_dir_index: Arc<AsyncMutex<Option<HashMap<String, PathBuf>>>>,
+    manifest_dir_index_scan_lock: Arc<AsyncMutex<()>>,
     rebuild_coordinator: PersonIndexRebuildCoordinator,
 }
 
@@ -716,25 +723,22 @@ impl PeopleService {
     }
 
     fn with_proxy(config_dir: PathBuf, proxy_url: Option<String>) -> Self {
-        let client = match crate::network::client_builder_from_env_or(proxy_url.as_deref()) {
-            Ok(builder) => match builder
-                .timeout(std::time::Duration::from_secs(10))
-                // A redirect would bypass the HTTPS/private-host checks done by the caller.
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-            {
-                Ok(client) => client,
-                Err(_) => Client::new(),
-            },
-            Err(_) => Client::new(),
-        };
+        // Actor profile images download through the image writer's checked client, which pins the
+        // request to the addresses the host check approved. An unusable proxy falls back to a
+        // direct client; a broken TLS backend leaves the download unavailable instead of silently
+        // fetching through an unchecked client.
+        let image_http = ImageHttpClient::new(proxy_url, std::time::Duration::from_secs(10), false)
+            .or_else(|_| ImageHttpClient::new(None, std::time::Duration::from_secs(10), false))
+            .ok();
         Self {
             config_dir,
-            client,
+            image_http,
             database: None,
             rebuild_lock: Arc::new(AsyncMutex::new(())),
             person_asset_locks: Arc::new(AsyncMutex::new(HashMap::new())),
             relation_locks: Arc::new(AsyncMutex::new(HashMap::new())),
+            manifest_dir_index: Arc::new(AsyncMutex::new(None)),
+            manifest_dir_index_scan_lock: Arc::new(AsyncMutex::new(())),
             rebuild_coordinator: PersonIndexRebuildCoordinator::default(),
         }
     }
@@ -846,6 +850,9 @@ impl PeopleService {
         };
         let relation_checksum = relation_snapshot_checksum(&relation_bytes);
         let relation = parse_relation(&relation_bytes)?;
+        if relation.schema_version < PEOPLE_RELATION_SCHEMA_VERSION {
+            return Ok(false);
+        }
         let relation_is_current = relation
             .source_fingerprint
             .as_deref()
@@ -901,6 +908,8 @@ impl PeopleService {
                 (Some(stored), Some(locator), Some(old_relative_path)) => {
                     legacy_scan_fingerprint_for_path(&locator, old_relative_path)
                         .is_some_and(|legacy| stored == legacy)
+                        || (stored.len() == 32
+                            && relation_source_snapshot_matches(&relation, &locator))
                 }
                 _ => false,
             }
@@ -935,6 +944,9 @@ impl PeopleService {
         };
         let relation_checksum = relation_snapshot_checksum(&relation_bytes);
         let relation = parse_relation(&relation_bytes)?;
+        if relation.schema_version < PEOPLE_RELATION_SCHEMA_VERSION {
+            return Ok(false);
+        }
         let source_fingerprint = relation
             .source_fingerprint
             .as_deref()
@@ -1720,6 +1732,76 @@ mod tests {
         assert!(super::relation_media_snapshot_matches(&relation, &moved));
     }
 
+    #[test]
+    fn relation_matching_accepts_legacy_v1_relation_after_v2_upgrade_and_device_drift() {
+        let relative_path = "抓娃娃 (2024)/抓娃娃 (2024) - 2160p H.265 DDP5.1.strm";
+        let legacy_fp_dev_56 = crate::application::scanner::compute_file_fingerprint(
+            relative_path,
+            182,
+            1_785_114_731_307_599_639,
+            Some(56),
+            Some(107_192),
+        );
+        let current_fp_v2_dev_57 = crate::application::scanner::compute_scan_fingerprint_v2(
+            relative_path,
+            182,
+            1_785_114_731_307_599_639,
+            Some(57),
+            Some(107_192),
+        );
+        let relation = super::StoredPeopleRelation {
+            schema_version: 4,
+            generation: 6,
+            source_fingerprint: None,
+            item_id: Some("item-zhua".to_owned()),
+            source_key: None,
+            source_root: Some("/media/strm/video/movie/华语电影".to_owned()),
+            source_relative_path: Some(relative_path.to_owned()),
+            media_fingerprint: Some(super::encode_fingerprint(&legacy_fp_dev_56)),
+            media_size: Some(182),
+            media_modified_at: Some(1_785_114_731_307_599_639),
+            media_title: Some("抓娃娃".to_owned()),
+            media_production_year: Some(2024),
+            actors: Vec::new(),
+        };
+        let current = crate::storage::StoredItemSourceLocator {
+            root_path: "/media/strm/video/movie/华语电影".to_owned(),
+            relative_path: relative_path.to_owned(),
+            fingerprint: Some(current_fp_v2_dev_57),
+            size: 182,
+            modified_at: 1_785_114_731_307_599_639,
+            device: Some(57),
+            inode: Some(107_192),
+            title: "抓娃娃".to_owned(),
+            production_year: Some(2024),
+        };
+
+        assert!(super::relation_source_snapshot_matches(&relation, &current));
+        assert!(super::relation_media_snapshot_matches(&relation, &current));
+
+        let modified = crate::storage::StoredItemSourceLocator {
+            root_path: current.root_path.clone(),
+            relative_path: current.relative_path.clone(),
+            fingerprint: current.fingerprint.clone(),
+            size: current.size,
+            modified_at: 1_785_114_731_307_599_640,
+            device: current.device,
+            inode: current.inode,
+            title: current.title.clone(),
+            production_year: current.production_year,
+        };
+        assert!(!super::relation_source_snapshot_matches(
+            &relation, &modified
+        ));
+        let resized = crate::storage::StoredItemSourceLocator {
+            size: 183,
+            ..current
+        };
+        assert!(!super::relation_source_snapshot_matches(
+            &relation, &resized
+        ));
+    }
+
     #[tokio::test]
     async fn database_backed_people_reuse_lux_id_when_provider_changes()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2460,7 +2542,10 @@ mod tests {
         let relation = library_item_directory(config.path(), "item-1")?.join("people.json");
         let relation: serde_json::Value =
             serde_json::from_slice(&tokio::fs::read(relation).await?)?;
-        assert_eq!(relation["schemaVersion"], 4);
+        assert_eq!(
+            relation["schemaVersion"],
+            super::PEOPLE_RELATION_SCHEMA_VERSION
+        );
         assert_eq!(relation["actors"][0]["provider"], "tmdb");
         assert_eq!(relation["actors"][0]["imageFile"], "folder.png");
 
@@ -4413,6 +4498,125 @@ mod tests {
             Some("本地简介".to_owned())
         );
         assert_eq!(saved.metadata_events.len(), 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn find_existing_person_manifest_path_avoids_full_directory_walk_on_direct_and_indexed_hits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct PermissionResetGuard(std::path::PathBuf);
+        impl Drop for PermissionResetGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        let person_dir = lux_person_directory(config.path(), "沈腾", "lux-002286")?;
+        tokio::fs::create_dir_all(&person_dir).await?;
+        let manifest_path = person_dir.join(PERSON_MANIFEST);
+        let manifest = PersonManifest {
+            schema_version: PERSON_MANIFEST_SCHEMA_VERSION,
+            generation: 1,
+            lux_person_id: "lux-002286".to_owned(),
+            display_name: "沈腾".to_owned(),
+            ..PersonManifest::default()
+        };
+        tokio::fs::write(&manifest_path, serde_json::to_vec(&manifest)?).await?;
+
+        let index_path = people_index_path(config.path(), "lux-002286")?;
+        if let Some(parent) = index_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let index = super::StoredPersonIndex {
+            image_path: "people/person/沈/沈腾-lux-002286/folder.jpg".to_owned(),
+            person_key: Some("lux-002286".to_owned()),
+        };
+        tokio::fs::write(&index_path, serde_json::to_vec(&index)?).await?;
+
+        let blocked_bucket = metadata_root(config.path())
+            .join("people")
+            .join("person")
+            .join("X");
+        tokio::fs::create_dir_all(&blocked_bucket).await?;
+        std::fs::set_permissions(&blocked_bucket, std::fs::Permissions::from_mode(0o000))?;
+        let guard = PermissionResetGuard(blocked_bucket.clone());
+
+        let direct = service
+            .find_existing_person_manifest_path("lux-002286", "沈腾")
+            .await?;
+        assert_eq!(direct.as_deref(), Some(manifest_path.as_path()));
+
+        let via_index = service
+            .find_existing_person_manifest_path("lux-002286", "Changed Name")
+            .await?;
+        assert_eq!(via_index.as_deref(), Some(manifest_path.as_path()));
+
+        drop(guard);
+        tokio::fs::remove_dir(&blocked_bucket).await?;
+
+        assert_eq!(
+            service
+                .find_existing_person_manifest_path("lux-999999", "Missing")
+                .await?,
+            None
+        );
+
+        tokio::fs::create_dir_all(&blocked_bucket).await?;
+        std::fs::set_permissions(&blocked_bucket, std::fs::Permissions::from_mode(0o000))?;
+        let _guard2 = PermissionResetGuard(blocked_bucket);
+
+        assert_eq!(
+            service
+                .find_existing_person_manifest_path("lux-888888", "Missing Two")
+                .await?,
+            None
+        );
+
+        service
+            .set_person_field_locks("lux-777777", &["name".to_owned()], "{}")
+            .await?;
+        let created =
+            lux_person_directory(config.path(), "lux-777777", "lux-777777")?.join(PERSON_MANIFEST);
+        assert_eq!(
+            service
+                .find_existing_person_manifest_path("lux-777777", "Different Name")
+                .await?
+                .as_deref(),
+            Some(created.as_path())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_existing_person_manifest_path_finds_legacy_custom_dir_without_lux_suffix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        let custom_dir = metadata_root(config.path())
+            .join("people")
+            .join("person")
+            .join("Z")
+            .join("custom-legacy-dir");
+        tokio::fs::create_dir_all(&custom_dir).await?;
+        let manifest_path = custom_dir.join(PERSON_MANIFEST);
+        let manifest = PersonManifest {
+            schema_version: PERSON_MANIFEST_SCHEMA_VERSION,
+            generation: 1,
+            lux_person_id: "lux-555555".to_owned(),
+            display_name: "Legacy Actor".to_owned(),
+            ..PersonManifest::default()
+        };
+        tokio::fs::write(&manifest_path, serde_json::to_vec(&manifest)?).await?;
+
+        let found = service
+            .find_existing_person_manifest_path("lux-555555", "Custom Name")
+            .await?;
+        assert_eq!(found.as_deref(), Some(manifest_path.as_path()));
         Ok(())
     }
 }
