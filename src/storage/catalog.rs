@@ -174,6 +174,8 @@ struct CatalogListRow {
     stream_is_forced: Option<i64>,
     #[sqlx(default)]
     resume_total: Option<i64>,
+    #[sqlx(default)]
+    recent_playback_score: Option<i64>,
 }
 
 impl From<CatalogListRow> for StoredCatalogRow {
@@ -223,6 +225,7 @@ impl From<CatalogListRow> for StoredCatalogRow {
             stream_is_external: row.stream_is_external.map(|value| value != 0),
             stream_is_default: row.stream_is_default.map(|value| value != 0),
             stream_is_forced: row.stream_is_forced.map(|value| value != 0),
+            has_recent_playback: row.recent_playback_score.unwrap_or(0) > 0,
         }
     }
 }
@@ -1754,7 +1757,11 @@ impl Database {
             "DELETE FROM recommendation_daily_batches
              WHERE batch_key < ?",
         )
-        .bind(batch_key)
+        .bind(
+            batch_key.saturating_sub(
+                crate::application::recommendations::RECOMMENDATION_COOLDOWN_BATCHES,
+            ),
+        )
         .execute(&mut *transaction)
         .await
         .map_err(self.sqlx_err())?;
@@ -1786,6 +1793,40 @@ impl Database {
         serde_json::from_str(&item_ids_json)
             .map(Some)
             .map_err(|error| StorageError::Serialization(error.to_string()))
+    }
+
+    pub(crate) async fn list_recent_recommendation_daily_batches(
+        &self,
+        user_id: &str,
+        library_scope_key: &str,
+        min_batch_key: i64,
+        before_batch_key: i64,
+    ) -> Result<Vec<(i64, Vec<String>)>, StorageError> {
+        if min_batch_key >= before_batch_key {
+            return Ok(Vec::new());
+        }
+        let rows = self
+            .query_as::<(i64, String)>(
+                "SELECT batch_key, item_ids_json
+                 FROM recommendation_daily_batches
+                 WHERE user_id = ? AND library_scope_key = ?
+                   AND batch_key >= ? AND batch_key < ?
+                 ORDER BY batch_key DESC",
+            )
+            .bind(user_id)
+            .bind(library_scope_key)
+            .bind(min_batch_key)
+            .bind(before_batch_key)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        let mut batches = Vec::with_capacity(rows.len());
+        for (batch_key, item_ids_json) in rows {
+            let item_ids = serde_json::from_str(&item_ids_json)
+                .map_err(|error| StorageError::Serialization(error.to_string()))?;
+            batches.push((batch_key, item_ids));
+        }
+        Ok(batches)
     }
 
     pub(crate) async fn save_recommendation_daily_batch(
@@ -2742,7 +2783,7 @@ impl Database {
                                 COALESCE(mi.rating, ?) * 5.0))
                             + COALESCE(rs.recent_playback_score, 0)
                             + {min_function}(7, {max_function}(0, 7 - CAST((unixepoch() - mi.added_at) / 86400 AS INTEGER)))
-                            + CASE WHEN us.last_played_at IS NULL THEN 0 ELSE
+                            + CASE WHEN us.last_played_at IS NULL OR COALESCE(us.is_played, 0) = 1 THEN 0 ELSE
                                 {min_function}(30, {max_function}(0, 30 - CAST((unixepoch() - us.last_played_at) / 86400 AS INTEGER)))
                               END
                         ) AS recommendation_score,
@@ -2757,24 +2798,9 @@ impl Database {
                    AND mi.item_type IN ('MOVIE', 'SERIES')
                    AND mi.library_id IN ({catalog_placeholders}){content_restriction_predicate}
              ),
-             playback_top AS (
-                 SELECT scored.*
-                 FROM scored
-                 WHERE recent_playback_score > 0
-                 ORDER BY recommendation_score DESC, added_at DESC,
-                          sort_title, id
-                 LIMIT 5
-             ),
-             paged AS (
-                 SELECT * FROM playback_top
-                 UNION ALL
-                 SELECT *
-                 FROM scored
-                 WHERE recent_playback_score = 0
-             ),
              ranked AS (
                  SELECT *
-                 FROM paged
+                 FROM scored
                  ORDER BY recommendation_score DESC, added_at DESC,
                           sort_title, id
                  LIMIT ? OFFSET ?
@@ -2784,6 +2810,7 @@ impl Database {
                     mi.title, mi.sort_title, mi.original_title, mi.overview,
                     mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
                     mi.added_at, mi.updated_at,
+                    ranked.recent_playback_score,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'

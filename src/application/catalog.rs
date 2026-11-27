@@ -15,9 +15,9 @@ use crate::{
     application::access::{AccessError, AccessPrincipal, MediaAccessService},
     application::catalog_read_model::{catalog_items_consumer, user_series_next_consumer},
     application::recommendations::{
-        RECOMMENDATION_CANDIDATE_POOL, RECOMMENDATION_FEATURED_LIMIT, RecommendationCandidate,
-        current_recommendation_batch_key, daily_recommendation_items,
-        recommendation_library_scope_key,
+        RECOMMENDATION_CANDIDATE_POOL, RECOMMENDATION_COOLDOWN_BATCHES,
+        RECOMMENDATION_FEATURED_LIMIT, RecommendationCandidate, current_recommendation_batch_key,
+        daily_recommendation_items_with_cooldown, recommendation_library_scope_key,
     },
     storage::{
         CatalogFilterQuery, CatalogSearchQuery, CatalogSort as StorageCatalogSort, Database,
@@ -2976,6 +2976,15 @@ impl CatalogService {
             // Global recommendation statistics are refreshed by ScheduledTaskService. This
             // request path must remain read-first so a new user's home page cannot wait on the
             // full refresh transaction while a migration or scan is writing to the database.
+            let recent_batches = service
+                .database
+                .list_recent_recommendation_daily_batches(
+                    &user_id,
+                    &library_scope_key,
+                    batch_key.saturating_sub(RECOMMENDATION_COOLDOWN_BATCHES),
+                    batch_key,
+                )
+                .await?;
             let rows = service
                 .database
                 .list_recommended_catalog_rows_with_restrictions(
@@ -2986,12 +2995,13 @@ impl CatalogService {
                     content_restrictions.as_ref(),
                 )
                 .await?;
-            let items = daily_recommendation_items(
+            let items = daily_recommendation_items_with_cooldown(
                 assemble_items(rows),
                 &user_id,
                 batch_key,
                 RECOMMENDATION_FEATURED_LIMIT,
                 RECOMMENDATION_CANDIDATE_POOL as usize,
+                &recent_batches,
             );
             let item_ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
             let inserted = service
@@ -3918,6 +3928,7 @@ pub struct CatalogItem {
     pub art_image_tag: Option<String>,
     pub wallpaper_image_tag: Option<String>,
     pub media_sources: Vec<CatalogSource>,
+    pub(crate) has_recent_playback: bool,
 }
 
 impl RecommendationCandidate for CatalogItem {
@@ -3927,6 +3938,10 @@ impl RecommendationCandidate for CatalogItem {
 
     fn candidate_kind(&self) -> &str {
         &self.item_type
+    }
+
+    fn has_recent_playback(&self) -> bool {
+        self.has_recent_playback
     }
 }
 
@@ -4135,6 +4150,7 @@ fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
                     art_image_tag: None,
                     wallpaper_image_tag: None,
                     media_sources: Vec::new(),
+                    has_recent_playback: row.has_recent_playback,
                 });
                 items.len() - 1
             }
@@ -4561,6 +4577,7 @@ mod tests {
             art_image_tag: None,
             wallpaper_image_tag: None,
             media_sources: Vec::new(),
+            has_recent_playback: false,
         }
     }
 
@@ -4600,19 +4617,11 @@ mod tests {
         let day_one = daily_recommendation_items(items(), "user-1", 20, 3, 6);
         let same_day = daily_recommendation_items(items(), "user-1", 20, 3, 6);
         assert_eq!(day_one, same_day);
-        // The anchored leaders lead every batch; the weighted draw behind them is what rotates.
-        assert_eq!(
-            day_one
-                .iter()
-                .take(2)
-                .map(|item| item.id.as_str())
-                .collect::<Vec<_>>(),
-            ["item-0", "item-1"]
-        );
         let distinct = (20..30)
             .map(|batch_key| {
                 daily_recommendation_items(items(), "user-1", batch_key, 3, 6)
                     .iter()
+                    .take(3)
                     .map(|item| item.id.clone())
                     .collect::<Vec<_>>()
             })
@@ -4620,6 +4629,10 @@ mod tests {
         assert!(
             distinct.windows(2).any(|pair| pair[0] != pair[1]),
             "a new batch must change the recommendation"
+        );
+        assert!(
+            distinct.windows(2).any(|pair| pair[0][0] != pair[1][0]),
+            "the leading carousel slot must also rotate across batches"
         );
     }
 

@@ -1,5 +1,12 @@
-import { describe, expect, it } from "vitest";
-import { heroSlides, heroTitleScale } from "../src/features/home/carousel";
+// @vitest-environment jsdom
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  clearHomeCarouselCache,
+  heroSlides,
+  heroTitleScale,
+  readHomeCarouselCache,
+  writeHomeCarouselCache,
+} from "../src/features/home/carousel";
 
 const item = (id: string, itemType = "MOVIE") => ({ id, title: id, itemType });
 
@@ -59,5 +66,30 @@ describe("heroTitleScale", () => {
 
   it("treats an empty title as a short title", () => {
     expect(heroTitleScale("   ")).toBe("default");
+  });
+});
+
+describe("homeCarouselCache", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    clearHomeCarouselCache();
+  });
+
+  it("reuses cached recommendations within the same UTC 02:00 batch and TTL", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-27T01:55:00Z"));
+    writeHomeCarouselCache("user-1", { recommended: [item("slide-1")] });
+
+    vi.setSystemTime(new Date("2026-11-27T01:58:00Z"));
+    expect(readHomeCarouselCache("user-1")?.data.recommended.map((entry) => entry.id)).toEqual(["slide-1"]);
+  });
+
+  it("invalidates cached recommendations immediately when crossing the UTC 02:00 batch boundary", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-27T01:59:50Z"));
+    writeHomeCarouselCache("user-1", { recommended: [item("yesterday-slide")] });
+
+    vi.setSystemTime(new Date("2026-11-27T02:00:05Z"));
+    expect(readHomeCarouselCache("user-1")).toBeUndefined();
   });
 });

@@ -1178,6 +1178,7 @@ fn core_row_without_source(core: &ReadModelCoreRow) -> StoredCatalogRow {
         stream_is_external: None,
         stream_is_default: None,
         stream_is_forced: None,
+        has_recent_playback: false,
     }
 }
 

@@ -7,6 +7,10 @@ const HOME_CAROUSEL_CACHE_TTL_MS = 5 * 60_000;
 const HOME_CAROUSEL_CACHE_PREFIX = "lux.home-carousel.v2:";
 const LEGACY_HOME_CACHE_PREFIX = "lux.home.v1:";
 
+export function recommendationBatchKeyAt(timestampMs: number): number {
+  return Math.floor((Math.floor(timestampMs / 1_000) - 2 * 3_600) / 86_400);
+}
+
 export function readHomeCarouselCache(
   userId: string,
 ): { data: HomeCarouselResponse; savedAt: number } | undefined {
@@ -19,7 +23,9 @@ export function readHomeCarouselCache(
     if (!isRecord(parsed) || parsed.version !== HOME_CAROUSEL_CACHE_VERSION || !isRecord(parsed.data)) return undefined;
     if (!Array.isArray(parsed.data.recommended)) return undefined;
     if (typeof parsed.savedAt !== "number" || !Number.isFinite(parsed.savedAt)) return undefined;
-    if (Date.now() - parsed.savedAt > HOME_CAROUSEL_CACHE_TTL_MS) return undefined;
+    const now = Date.now();
+    if (now - parsed.savedAt > HOME_CAROUSEL_CACHE_TTL_MS) return undefined;
+    if (recommendationBatchKeyAt(parsed.savedAt) !== recommendationBatchKeyAt(now)) return undefined;
     return { data: parsed.data as HomeCarouselResponse, savedAt: parsed.savedAt };
   } catch {
     return undefined;

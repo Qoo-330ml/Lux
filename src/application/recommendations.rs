@@ -11,11 +11,9 @@ use std::{
 
 /// Candidate rows fetched from the scoring query for one daily batch.
 ///
-/// The batch only needs [`RECOMMENDATION_FEATURED_LIMIT`] curated slots, so the pool only has to
-/// be deep enough for the weighted draw and the per-type cap to have material to work with. 40
-/// keeps the whole ranking tail reachable (0-based rank 39 still draws at ~5% of the top weight)
-/// while fetching a third fewer scored rows than the previous pool of 60.
-pub(crate) const RECOMMENDATION_CANDIDATE_POOL: i64 = 40;
+/// A pool of 100 keeps seven days of non-repeating seven-slot carousels well supplied while still
+/// letting the ranking tail surface (`0`-based rank 99 draws at ~2.5% of rank 0's weight).
+pub(crate) const RECOMMENDATION_CANDIDATE_POOL: i64 = 100;
 
 /// Leading home-carousel slots selected by [`daily_recommendation_items`].
 ///
@@ -23,10 +21,9 @@ pub(crate) const RECOMMENDATION_CANDIDATE_POOL: i64 = 40;
 /// curated prefix so any consumer with a limit up to seven receives the diversified picks.
 pub(crate) const RECOMMENDATION_FEATURED_LIMIT: usize = 7;
 
-/// The two best-scored candidates are anchored at the front of every batch, so the most relevant
-/// items never lose the lottery against the rest of the pool. Anchors are exempt from the type cap
-/// (they are always included); the cap applies to the slots drawn after them.
-const ANCHOR_COUNT: usize = 2;
+/// Number of preceding daily batches retained and consulted to avoid repeating recently featured
+/// carousel items before fresher candidates have had a turn.
+pub(crate) const RECOMMENDATION_COOLDOWN_BATCHES: i64 = 7;
 
 /// Exponent of the rank-derived sampling weight.
 ///
@@ -34,8 +31,8 @@ const ANCHOR_COUNT: usize = 2;
 /// rank position instead: `weight = 1 / (rank + 1)^0.8`, where `rank` is the 0-based position in
 /// the score-ordered pool. `0.8` is a sublinear Zipf-like profile: it decays fast enough that the
 /// head dominates (0-based rank 2 keeps ~42% of the top weight, rank 6 ~24%) but slowly enough
-/// that the tail stays reachable (0-based rank 30 keeps ~6.4%), which is what makes the carousel
-/// rotate instead of freezing on the top few rows.
+/// that the tail stays reachable, which is what makes the carousel rotate instead of freezing on
+/// the top few rows.
 const RANK_WEIGHT_EXPONENT: f64 = 0.8;
 
 /// Lower bound for a rank weight so the logarithmic sampling key stays finite.
@@ -45,6 +42,10 @@ const MIN_RANK_WEIGHT: f64 = 1e-6;
 /// and series, so the cap leaves room for both kinds in a seven-slot carousel; it is relaxed when
 /// the pool cannot satisfy it.
 const MAX_FEATURED_PER_ITEM_TYPE: usize = 4;
+
+/// Items carrying 180-day playback engagement (`recent_playback_score > 0`) may occupy at most
+/// this many featured slots, relaxed only when fresher candidates cannot fill the carousel.
+const MAX_FEATURED_RECENT_PLAYBACK: usize = 5;
 
 /// The catalog fields the daily selection needs. Catalog rows are ranked by the SQL query; this
 /// trait exposes only the stable identity and the type dimension of a candidate.
@@ -57,6 +58,11 @@ pub(crate) trait RecommendationCandidate {
 
     /// `item_type` (for example `MOVIE` or `SERIES`) used by the per-type cap.
     fn candidate_kind(&self) -> &str;
+
+    /// True when the item has recent 180-day playback activity (`recent_playback_score > 0`).
+    fn has_recent_playback(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) fn current_recommendation_batch_key() -> i64 {
@@ -81,6 +87,9 @@ pub(crate) fn recommendation_library_scope_key(library_ids: &[String]) -> String
 /// order) and continues with the remaining candidates in their original score order, so callers
 /// that read the whole batch still receive a complete, meaningful list. A caller asking for at
 /// most [`RECOMMENDATION_FEATURED_LIMIT`] items therefore gets the diversified picks.
+/// Convenience wrapper without cooldown history, used by unit tests that examine single-batch
+/// weighting and cap behavior in isolation.
+#[cfg(test)]
 pub(crate) fn daily_recommendation_items<T: RecommendationCandidate>(
     items: Vec<T>,
     user_id: &str,
@@ -88,12 +97,31 @@ pub(crate) fn daily_recommendation_items<T: RecommendationCandidate>(
     featured_limit: usize,
     batch_limit: usize,
 ) -> Vec<T> {
+    daily_recommendation_items_with_cooldown(
+        items,
+        user_id,
+        batch_key,
+        featured_limit,
+        batch_limit,
+        &[],
+    )
+}
+
+pub(crate) fn daily_recommendation_items_with_cooldown<T: RecommendationCandidate>(
+    items: Vec<T>,
+    user_id: &str,
+    batch_key: i64,
+    featured_limit: usize,
+    batch_limit: usize,
+    recent_batches: &[(i64, Vec<String>)],
+) -> Vec<T> {
     let batch_limit = batch_limit.min(items.len());
     if batch_limit == 0 {
         return Vec::new();
     }
     let featured_limit = featured_limit.min(batch_limit);
-    let curated = curated_prefix_indices(&items, user_id, batch_key, featured_limit);
+    let curated =
+        curated_prefix_indices(&items, user_id, batch_key, featured_limit, recent_batches);
 
     let mut in_prefix = vec![false; items.len()];
     for index in &curated {
@@ -126,31 +154,41 @@ pub(crate) fn daily_recommendation_items<T: RecommendationCandidate>(
     result
 }
 
-/// Picks the curated prefix: the anchored leaders first, then a weighted draw without replacement.
+/// Picks the curated prefix via weighted sampling without replacement and recent-batch cooldown.
 ///
-/// At most [`MAX_FEATURED_PER_ITEM_TYPE`] items per type are drawn. The cap relaxes in a second
-/// pass so a thin pool still fills every slot instead of returning a short prefix.
+/// Candidates not featured in the preceding [`RECOMMENDATION_COOLDOWN_BATCHES`] batches are
+/// considered first; when a smaller library runs out of fresh items, older cooldown batches are
+/// revisited before yesterday's batch so consecutive days still avoid back-to-back repeats.
 fn curated_prefix_indices<T: RecommendationCandidate>(
     items: &[T],
     user_id: &str,
     batch_key: i64,
     featured_limit: usize,
+    recent_batches: &[(i64, Vec<String>)],
 ) -> Vec<usize> {
     let featured_limit = featured_limit.min(items.len());
-    let anchor_count = ANCHOR_COUNT.min(featured_limit);
-    let mut selected = (0..anchor_count).collect::<Vec<_>>();
-    if selected.len() >= featured_limit {
-        return selected;
+    if featured_limit == 0 {
+        return Vec::new();
     }
 
-    let mut type_counts: HashMap<&str, usize> = HashMap::new();
-    for index in &selected {
-        if let Some(item) = items.get(*index) {
-            *type_counts.entry(item.candidate_kind()).or_default() += 1;
+    let mut recent_age: HashMap<&str, i64> = HashMap::new();
+    for (past_batch_key, past_ids) in recent_batches {
+        if *past_batch_key >= batch_key {
+            continue;
+        }
+        let age = batch_key.saturating_sub(*past_batch_key);
+        if age > RECOMMENDATION_COOLDOWN_BATCHES {
+            continue;
+        }
+        for item_id in past_ids.iter().take(featured_limit) {
+            recent_age
+                .entry(item_id.as_str())
+                .and_modify(|existing| *existing = (*existing).min(age))
+                .or_insert(age);
         }
     }
 
-    let mut drawn = (anchor_count..items.len())
+    let mut drawn = (0..items.len())
         .filter_map(|rank| {
             let item = items.get(rank)?;
             let weight = rank_weight(rank);
@@ -162,43 +200,82 @@ fn curated_prefix_indices<T: RecommendationCandidate>(
     // order total so equal keys cannot depend on the sort implementation.
     drawn.sort_by(|left, right| right.0.total_cmp(&left.0).then(left.1.cmp(&right.1)));
 
-    let mut chosen = vec![false; items.len()];
-    for index in &selected {
-        if let Some(slot) = chosen.get_mut(*index) {
-            *slot = true;
+    let mut fresh = Vec::with_capacity(drawn.len());
+    let mut older_cooldown = Vec::new();
+    let mut yesterday_cooldown = Vec::new();
+    for (sampling_key, rank) in drawn {
+        let Some(item) = items.get(rank) else {
+            continue;
+        };
+        match recent_age.get(item.candidate_key()).copied() {
+            None => fresh.push(rank),
+            Some(1) => yesterday_cooldown.push(rank),
+            Some(age) => older_cooldown.push((age, sampling_key, rank)),
         }
     }
+    older_cooldown.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then(right.1.total_cmp(&left.1))
+            .then(left.2.cmp(&right.2))
+    });
+    let older_cooldown_ranks = older_cooldown
+        .into_iter()
+        .map(|(_, _, rank)| rank)
+        .collect::<Vec<_>>();
 
-    // Strict pass first, then the same draw without the type cap. The relaxed pass only revisits
-    // candidates the strict one rejected, so a thin pool still fills every slot.
-    for relaxation in [Relaxation::Strict, Relaxation::TypeCapRelaxed] {
+    let mut selected = Vec::with_capacity(featured_limit);
+    let mut chosen = vec![false; items.len()];
+    let mut type_counts: HashMap<&str, usize> = HashMap::new();
+    let mut recent_playback_count = 0_usize;
+
+    for tier in [&fresh, &older_cooldown_ranks, &yesterday_cooldown] {
         if selected.len() >= featured_limit {
             break;
         }
-        for (_, index) in &drawn {
+        for relaxation in [
+            Relaxation::Strict,
+            Relaxation::TypeCapRelaxed,
+            Relaxation::AllCapsRelaxed,
+        ] {
             if selected.len() >= featured_limit {
                 break;
             }
-            if chosen.get(*index).copied().unwrap_or_default() {
-                continue;
+            for index in tier {
+                if selected.len() >= featured_limit {
+                    break;
+                }
+                if chosen.get(*index).copied().unwrap_or_default() {
+                    continue;
+                }
+                let Some(item) = items.get(*index) else {
+                    continue;
+                };
+                let type_count = type_counts
+                    .get(item.candidate_kind())
+                    .copied()
+                    .unwrap_or_default();
+                let type_allowed =
+                    relaxation != Relaxation::Strict || type_count < MAX_FEATURED_PER_ITEM_TYPE;
+                if !type_allowed {
+                    continue;
+                }
+                let playback_allowed = relaxation == Relaxation::AllCapsRelaxed
+                    || !item.has_recent_playback()
+                    || recent_playback_count < MAX_FEATURED_RECENT_PLAYBACK;
+                if !playback_allowed {
+                    continue;
+                }
+                if let Some(slot) = chosen.get_mut(*index) {
+                    *slot = true;
+                }
+                *type_counts.entry(item.candidate_kind()).or_default() += 1;
+                if item.has_recent_playback() {
+                    recent_playback_count += 1;
+                }
+                selected.push(*index);
             }
-            let Some(item) = items.get(*index) else {
-                continue;
-            };
-            let type_count = type_counts
-                .get(item.candidate_kind())
-                .copied()
-                .unwrap_or_default();
-            let type_allowed =
-                relaxation == Relaxation::TypeCapRelaxed || type_count < MAX_FEATURED_PER_ITEM_TYPE;
-            if !type_allowed {
-                continue;
-            }
-            if let Some(slot) = chosen.get_mut(*index) {
-                *slot = true;
-            }
-            *type_counts.entry(item.candidate_kind()).or_default() += 1;
-            selected.push(*index);
         }
     }
 
@@ -207,10 +284,12 @@ fn curated_prefix_indices<T: RecommendationCandidate>(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Relaxation {
-    /// The per-type cap applies.
+    /// Both the per-type cap and the recent-playback cap apply.
     Strict,
-    /// The per-type cap is ignored so the prefix is filled rather than returned short.
+    /// The per-type cap is ignored while the recent-playback cap still applies.
     TypeCapRelaxed,
+    /// All diversity caps are relaxed so a thin tier still fills every slot.
+    AllCapsRelaxed,
 }
 
 /// Rank-derived sampling weight: `1 / (rank + 1)^[`RANK_WEIGHT_EXPONENT`]`.
@@ -278,9 +357,10 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
+        RECOMMENDATION_CANDIDATE_POOL, RECOMMENDATION_COOLDOWN_BATCHES,
         RECOMMENDATION_FEATURED_LIMIT, RecommendationCandidate, daily_recommendation_items,
-        deterministic_unit_interval, rank_weight, recommendation_library_scope_key,
-        weighted_sampling_key,
+        daily_recommendation_items_with_cooldown, deterministic_unit_interval, rank_weight,
+        recommendation_library_scope_key, weighted_sampling_key,
     };
 
     #[test]
@@ -307,6 +387,7 @@ mod tests {
     struct TestItem {
         id: String,
         kind: &'static str,
+        recent_playback: bool,
     }
 
     impl RecommendationCandidate for TestItem {
@@ -317,19 +398,33 @@ mod tests {
         fn candidate_kind(&self) -> &str {
             self.kind
         }
+
+        fn has_recent_playback(&self) -> bool {
+            self.recent_playback
+        }
     }
 
     fn movie(index: usize) -> TestItem {
         TestItem {
-            id: format!("item-{index:02}"),
+            id: format!("item-{index:03}"),
             kind: "MOVIE",
+            recent_playback: false,
         }
     }
 
     fn series_item(index: usize) -> TestItem {
         TestItem {
-            id: format!("item-{index:02}"),
+            id: format!("item-{index:03}"),
             kind: "SERIES",
+            recent_playback: false,
+        }
+    }
+
+    fn recent_playback_movie(index: usize) -> TestItem {
+        TestItem {
+            id: format!("item-{index:03}"),
+            kind: "MOVIE",
+            recent_playback: true,
         }
     }
 
@@ -387,58 +482,189 @@ mod tests {
     }
 
     #[test]
-    fn daily_recommendations_always_lead_with_the_top_two_ranked_items() {
-        for batch_key in 0..50 {
-            let ordered = daily_recommendation_items(
-                mixed_items(40),
-                "user-1",
-                batch_key,
-                RECOMMENDATION_FEATURED_LIMIT,
-                40,
-            );
-            assert_eq!(
-                ordered.first().map(|item| item.id.as_str()),
-                Some("item-00")
-            );
-            assert_eq!(ordered.get(1).map(|item| item.id.as_str()), Some("item-01"));
-        }
+    fn candidate_pool_depth_is_one_hundred() {
+        assert_eq!(RECOMMENDATION_CANDIDATE_POOL, 100);
+        assert_eq!(RECOMMENDATION_COOLDOWN_BATCHES, 7);
     }
 
     #[test]
-    fn daily_recommendations_show_the_top_rank_every_day_and_the_tail_rarely() {
+    fn daily_recommendations_rotate_leading_slots_instead_of_pinning_anchors() {
+        let mut first_slots = HashSet::new();
+        let mut second_slots = HashSet::new();
+        for batch_key in 0..30 {
+            let ordered = daily_recommendation_items(
+                mixed_items(100),
+                "user-1",
+                batch_key,
+                RECOMMENDATION_FEATURED_LIMIT,
+                100,
+            );
+            if let Some(first) = ordered.first() {
+                first_slots.insert(first.id.clone());
+            }
+            if let Some(second) = ordered.get(1) {
+                second_slots.insert(second.id.clone());
+            }
+        }
+        assert!(
+            first_slots.len() > 1,
+            "slot 0 must not stay pinned to one item across batches: {first_slots:?}"
+        );
+        assert!(
+            second_slots.len() > 1,
+            "slot 1 must not stay pinned to one item across batches: {second_slots:?}"
+        );
+    }
+
+    #[test]
+    fn daily_recommendations_favor_higher_ranks_while_keeping_the_tail_reachable() {
         const BATCHES: i64 = 240;
         let mut head = 0_u32;
         let mut middle = 0_u32;
         let mut tail = 0_u32;
         for batch_key in 0..BATCHES {
             let ordered = daily_recommendation_items(
-                mixed_items(40),
+                mixed_items(100),
                 "user-1",
                 batch_key,
                 RECOMMENDATION_FEATURED_LIMIT,
-                40,
+                100,
             );
             let featured = &ordered[..RECOMMENDATION_FEATURED_LIMIT];
-            if featured.iter().any(|item| item.id == "item-00") {
+            if featured.iter().any(|item| item.id == "item-000") {
                 head += 1;
             }
-            if featured.iter().any(|item| item.id == "item-02") {
+            if featured.iter().any(|item| item.id == "item-004") {
                 middle += 1;
             }
-            if featured.iter().any(|item| item.id == "item-30") {
+            if featured.iter().any(|item| item.id == "item-060") {
                 tail += 1;
             }
         }
-        assert_eq!(head, BATCHES as u32, "the top candidate is an anchor");
+        assert!(
+            head < BATCHES as u32,
+            "the top candidate must not be pinned on every single day: {head}/{BATCHES}"
+        );
+        assert!(
+            head > middle,
+            "rank 0 should surface more often than rank 4: head={head} middle={middle}"
+        );
         assert!(tail > 0, "the deep tail never surfaced: {tail}/{BATCHES}");
         assert!(
-            tail < BATCHES as u32 * 3 / 8,
-            "the deep tail surfaced too often: {tail}/{BATCHES}"
-        );
-        assert!(
             middle > tail,
-            "ranking weights must favour the middle of the pool: middle={middle} tail={tail}"
+            "ranking weights must favour higher ranks over the tail: middle={middle} tail={tail}"
         );
+    }
+
+    #[test]
+    fn daily_recommendations_avoid_repeating_items_featured_within_seven_batches() {
+        let mut history: Vec<(i64, Vec<String>)> = Vec::new();
+        let mut seen_featured = HashSet::new();
+        for batch_key in 100..107 {
+            let ordered = daily_recommendation_items_with_cooldown(
+                mixed_items(100),
+                "user-1",
+                batch_key,
+                RECOMMENDATION_FEATURED_LIMIT,
+                100,
+                &history,
+            );
+            let batch_ids = ids(&ordered);
+            for featured_id in batch_ids.iter().take(RECOMMENDATION_FEATURED_LIMIT) {
+                assert!(
+                    seen_featured.insert(featured_id.clone()),
+                    "item {featured_id} repeated within 7 daily batches on batch {batch_key}"
+                );
+            }
+            history.push((batch_key, batch_ids));
+        }
+        assert_eq!(seen_featured.len(), 7 * RECOMMENDATION_FEATURED_LIMIT);
+    }
+
+    #[test]
+    fn daily_recommendations_fall_back_to_oldest_shown_items_when_pool_is_small() {
+        let pool = mixed_items(18);
+        let mut history: Vec<(i64, Vec<String>)> = Vec::new();
+        let mut daily_featured: Vec<Vec<String>> = Vec::new();
+
+        for batch_key in 200..205 {
+            let ordered = daily_recommendation_items_with_cooldown(
+                pool.clone(),
+                "user-1",
+                batch_key,
+                RECOMMENDATION_FEATURED_LIMIT,
+                pool.len(),
+                &history,
+            );
+            let batch_ids = ids(&ordered);
+            let featured = batch_ids[..RECOMMENDATION_FEATURED_LIMIT].to_vec();
+            assert_eq!(featured.len(), RECOMMENDATION_FEATURED_LIMIT);
+            if let Some(yesterday) = daily_featured.last() {
+                let overlap = featured
+                    .iter()
+                    .filter(|id| yesterday.contains(id))
+                    .collect::<Vec<_>>();
+                assert!(
+                    overlap.is_empty(),
+                    "18-item pool should never repeat yesterday's items on batch {batch_key}: {overlap:?}"
+                );
+            }
+            daily_featured.push(featured);
+            history.push((batch_key, batch_ids));
+        }
+
+        // Day 1 (7) + Day 2 (7) leave 4 fresh items for Day 3, so Day 3's 3 fallback items must
+        // come from Day 1 (oldest shown), never Day 2.
+        let day1: HashSet<_> = daily_featured[0].iter().cloned().collect();
+        let day2: HashSet<_> = daily_featured[1].iter().cloned().collect();
+        let day3_reused = daily_featured[2]
+            .iter()
+            .filter(|id| day1.contains(*id) || day2.contains(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(day3_reused.len(), 3);
+        assert!(day3_reused.iter().all(|id| day1.contains(id)));
+    }
+
+    #[test]
+    fn daily_recommendations_cap_recent_playback_items_at_five_and_relax_when_needed() {
+        let mut items = (0..12)
+            .map(|index| {
+                let mut item = recent_playback_movie(index);
+                if index % 2 == 1 {
+                    item.kind = "SERIES";
+                }
+                item
+            })
+            .collect::<Vec<_>>();
+        items.extend((12..30).map(|index| {
+            if index % 2 == 0 {
+                movie(index)
+            } else {
+                series_item(index)
+            }
+        }));
+
+        for batch_key in 0..20 {
+            let ordered = daily_recommendation_items(
+                items.clone(),
+                "user-1",
+                batch_key,
+                RECOMMENDATION_FEATURED_LIMIT,
+                items.len(),
+            );
+            let featured = &ordered[..RECOMMENDATION_FEATURED_LIMIT];
+            let recent_playback_count = featured.iter().filter(|item| item.recent_playback).count();
+            assert!(
+                recent_playback_count <= 5,
+                "featured slots exceeded 5 recent-playback items: {recent_playback_count}"
+            );
+        }
+
+        let all_recent = (0..10).map(recent_playback_movie).collect::<Vec<_>>();
+        let relaxed =
+            daily_recommendation_items(all_recent, "user-1", 20, RECOMMENDATION_FEATURED_LIMIT, 10);
+        assert_eq!(relaxed[..RECOMMENDATION_FEATURED_LIMIT].len(), 7);
     }
 
     #[test]
@@ -514,19 +740,16 @@ mod tests {
         assert!(daily_recommendation_items(Vec::<TestItem>::new(), "user-1", 20, 7, 40).is_empty());
 
         let single = daily_recommendation_items(vec![movie(0)], "user-1", 20, 7, 40);
-        assert_eq!(ids(&single), ["item-00"]);
+        assert_eq!(ids(&single), ["item-000"]);
 
         let shorter_than_featured =
             daily_recommendation_items((0..3).map(movie).collect(), "user-1", 20, 7, 40);
-        assert_eq!(
-            ids(&shorter_than_featured),
-            ["item-00", "item-01", "item-02"]
-        );
+        assert_eq!(shorter_than_featured.len(), 3);
 
         let no_featured_slots = daily_recommendation_items(mixed_items(4), "user-1", 20, 0, 40);
         assert_eq!(
             ids(&no_featured_slots),
-            ["item-00", "item-01", "item-02", "item-03"]
+            ["item-000", "item-001", "item-002", "item-003"]
         );
 
         let capped_batch = daily_recommendation_items(mixed_items(20), "user-1", 20, 7, 12);

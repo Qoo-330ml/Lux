@@ -3558,6 +3558,116 @@ async fn recommendation_daily_batch_is_stable_until_the_next_batch() {
 }
 
 #[tokio::test]
+async fn catalog_recommendations_do_not_repeat_across_seven_batches_and_cap_recent_playback() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let user = SetupService::new(database.clone())
+        .expect("setup service")
+        .complete("Admin", "Admin", "correct password")
+        .await
+        .expect("setup");
+    let library = LibraryService::new(database.clone())
+        .create_library("Recommendations", LibraryKind::Mixed, false)
+        .await
+        .expect("library");
+    let now: i64 = sqlx::query_scalar("SELECT unixepoch()")
+        .fetch_one(database.pool())
+        .await
+        .expect("current timestamp");
+    let library_id = library.id.to_string();
+    let user_id = user.id.to_string();
+
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('other-viewer', 'other-viewer', 'Other Viewer', 'test')",
+    )
+    .execute(database.pool())
+    .await
+    .expect("other viewer");
+
+    for index in 0..60 {
+        let item_id = format!("pool-item-{index:02}");
+        let item_type = if index % 2 == 0 { "MOVIE" } else { "SERIES" };
+        let rating = 9.5 - (index as f64 * 0.05);
+        sqlx::query(
+            "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title,
+                    identification_status, added_at, has_available_source, rating
+                 ) VALUES (?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?, 1, ?)",
+        )
+        .bind(&item_id)
+        .bind(&library_id)
+        .bind(item_type)
+        .bind(&item_id)
+        .bind(&item_id)
+        .bind(now - 10 * 86_400)
+        .bind(rating)
+        .execute(database.pool())
+        .await
+        .expect("pool media item");
+
+        if index < 10 {
+            sqlx::query(
+                "INSERT INTO user_item_state (user_id, item_id, last_played_at)
+                 VALUES ('other-viewer', ?, ?)",
+            )
+            .bind(&item_id)
+            .bind(now)
+            .execute(database.pool())
+            .await
+            .expect("other viewer playback");
+        }
+    }
+    refresh_recommendation_stats(&database).await;
+
+    let service = CatalogService::new(database.clone(), MediaAccessService::new(database.clone()));
+    let mut seen = std::collections::HashSet::new();
+    for day in 0..7 {
+        if day > 0 {
+            sqlx::query(
+                "UPDATE recommendation_daily_batches
+                 SET batch_key = batch_key - 1
+                 WHERE user_id = ?",
+            )
+            .bind(&user_id)
+            .execute(database.pool())
+            .await
+            .expect("shift stored daily batches back one day");
+        }
+        let featured = service
+            .list_recommended_for_library_ids(std::slice::from_ref(&library_id), &user_id, 7)
+            .await
+            .expect("daily carousel recommendations");
+        assert_eq!(featured.len(), 7);
+        let recent_playback_in_featured = featured
+            .iter()
+            .filter(|item| {
+                item.id
+                    .strip_prefix("pool-item-")
+                    .and_then(|raw| raw.parse::<usize>().ok())
+                    .is_some_and(|index| index < 10)
+            })
+            .count();
+        assert!(
+            recent_playback_in_featured <= 5,
+            "day {day} featured more than 5 recent-playback items: {recent_playback_in_featured}"
+        );
+        for item in featured {
+            assert!(
+                seen.insert(item.id.clone()),
+                "day {day} repeated carousel item {} within a 7-day window",
+                item.id
+            );
+        }
+    }
+    assert_eq!(seen.len(), 49);
+}
+
+#[tokio::test]
 async fn listing_recommendations_does_not_refresh_global_stats_synchronously() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
@@ -11021,23 +11131,175 @@ async fn recommended_catalog_rows_limit_recent_playback_items_and_remove_old_sta
     refresh_recommendation_stats(&database).await;
 
     let rows = database
-        .list_recommended_catalog_rows(&user_id, &[library_id], 0, 7)
+        .list_recommended_catalog_rows(&user_id, &[library_id], 0, 9)
+        .await
+        .expect("recommended catalog rows");
+
+    let mut unique_ids = Vec::new();
+    for row in &rows {
+        if !unique_ids.contains(&row.item_id.as_str()) {
+            unique_ids.push(row.item_id.as_str());
+        }
+        assert_eq!(
+            row.has_recent_playback,
+            row.item_id.starts_with("active-"),
+            "candidate row {} must expose recent_playback activity to the sampling layer",
+            row.item_id
+        );
+    }
+    assert_eq!(
+        unique_ids,
+        [
+            "active-1",
+            "active-2",
+            "active-3",
+            "active-4",
+            "active-5",
+            "active-6",
+            "unplayed-1",
+            "unplayed-2",
+            "favorite-only",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn recommended_catalog_rows_do_not_grant_recent_playback_freshness_to_played_items() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let user = SetupService::new(database.clone())
+        .expect("setup service")
+        .complete("Admin", "Admin", "correct password")
+        .await
+        .expect("setup");
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let now: i64 = sqlx::query_scalar("SELECT unixepoch()")
+        .fetch_one(database.pool())
+        .await
+        .expect("current timestamp");
+    let library_id = library.id.to_string();
+    let user_id = user.id.to_string();
+
+    for (item_id, rating) in [
+        ("unplayed-low", 0.0_f64),
+        ("in-progress-today", 0.0_f64),
+        ("played-today", 8.0_f64),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title,
+                    identification_status, added_at, has_available_source, rating
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', ?, 1, ?)",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .bind(now - 15 * 86_400)
+        .bind(rating)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+    }
+
+    sqlx::query(
+        "INSERT INTO user_item_state (user_id, item_id, is_played, position_ticks, last_played_at)
+         VALUES (?, 'in-progress-today', 0, 100, ?),
+                (?, 'played-today', 1, 0, ?)",
+    )
+    .bind(&user_id)
+    .bind(now)
+    .bind(&user_id)
+    .bind(now)
+    .execute(database.pool())
+    .await
+    .expect("user item states");
+    refresh_recommendation_stats(&database).await;
+
+    let rows = database
+        .list_recommended_catalog_rows(&user_id, &[library_id], 0, 3)
         .await
         .expect("recommended catalog rows");
 
     assert_eq!(
         rows.iter()
             .map(|row| row.item_id.as_str())
-            .collect::<std::collections::HashSet<_>>(),
-        std::collections::HashSet::from([
-            "active-1",
-            "active-2",
-            "active-3",
-            "active-4",
-            "active-5",
-            "unplayed-1",
-            "unplayed-2",
-        ])
+            .collect::<Vec<_>>(),
+        ["unplayed-low", "in-progress-today", "played-today"]
+    );
+}
+
+#[tokio::test]
+async fn refresh_recommendation_stats_retains_seven_recent_batches_and_prunes_older_ones() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let user = SetupService::new(database.clone())
+        .expect("setup service")
+        .complete("Admin", "Admin", "correct password")
+        .await
+        .expect("setup");
+    let user_id = user.id.to_string();
+    let now: i64 = sqlx::query_scalar("SELECT unixepoch()")
+        .fetch_one(database.pool())
+        .await
+        .expect("current timestamp");
+    let current_batch = recommendation_batch_key_at(now);
+
+    for offset in [8_i64, 7, 3, 1, 0] {
+        let key = current_batch - offset;
+        let ids = vec![format!("item-offset-{offset}")];
+        database
+            .save_recommendation_daily_batch(&user_id, "scope-a", key, &ids)
+            .await
+            .expect("save batch");
+    }
+
+    refresh_recommendation_stats(&database).await;
+
+    assert!(
+        database
+            .find_recommendation_daily_batch(&user_id, "scope-a", current_batch - 8)
+            .await
+            .expect("lookup pruned batch")
+            .is_none(),
+        "batches older than 7 days must be pruned"
+    );
+    assert!(
+        database
+            .find_recommendation_daily_batch(&user_id, "scope-a", current_batch - 7)
+            .await
+            .expect("lookup boundary batch")
+            .is_some(),
+        "7-day-old batch must be retained for cooldown"
+    );
+
+    let history = database
+        .list_recent_recommendation_daily_batches(
+            &user_id,
+            "scope-a",
+            current_batch - 7,
+            current_batch,
+        )
+        .await
+        .expect("recent daily batches");
+    assert_eq!(
+        history,
+        vec![
+            (current_batch - 1, vec!["item-offset-1".to_owned()]),
+            (current_batch - 3, vec!["item-offset-3".to_owned()]),
+            (current_batch - 7, vec!["item-offset-7".to_owned()]),
+        ]
     );
 }
 

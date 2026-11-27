@@ -4513,6 +4513,7 @@ pub(crate) struct StoredCatalogRow {
     pub(crate) stream_is_external: Option<bool>,
     pub(crate) stream_is_default: Option<bool>,
     pub(crate) stream_is_forced: Option<bool>,
+    pub(crate) has_recent_playback: bool,
 }
 
 #[derive(Debug)]

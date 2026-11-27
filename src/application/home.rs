@@ -8,6 +8,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+use std::sync::atomic::AtomicI64;
+
 use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::application::{
@@ -85,15 +88,24 @@ struct CachedSnapshot {
     /// Permission counters the snapshot was built under, so a revoked library or a tightened
     /// policy invalidates the cached home without a dedicated call site.
     access_epoch: AccessEpoch,
+    /// Daily recommendation batch key (`UTC 02:00` boundary) the carousel was computed for.
+    recommendation_batch_key: i64,
     refreshed_at: Instant,
     snapshot: Arc<HomeSnapshot>,
 }
 
 impl CachedSnapshot {
-    fn matches(&self, generation: u64, user_generation: u64, access_epoch: AccessEpoch) -> bool {
+    fn matches(
+        &self,
+        generation: u64,
+        user_generation: u64,
+        access_epoch: AccessEpoch,
+        recommendation_batch_key: i64,
+    ) -> bool {
         self.generation == generation
             && self.user_generation == user_generation
             && self.access_epoch == access_epoch
+            && self.recommendation_batch_key == recommendation_batch_key
     }
 }
 
@@ -120,6 +132,8 @@ struct HomeServiceInner {
     invalidation_debounce_pending: AtomicBool,
     #[cfg(test)]
     invalidation_notification_count: AtomicU64,
+    #[cfg(test)]
+    recommendation_batch_key_override: AtomicI64,
     invalidation_notify: Notify,
 }
 
@@ -144,6 +158,8 @@ impl HomeService {
             invalidation_debounce_pending: AtomicBool::new(false),
             #[cfg(test)]
             invalidation_notification_count: AtomicU64::new(0),
+            #[cfg(test)]
+            recommendation_batch_key_override: AtomicI64::new(i64::MIN),
             invalidation_notify: Notify::new(),
         });
         let worker_inner = Arc::downgrade(&inner);
@@ -225,6 +241,27 @@ impl HomeService {
             .await
     }
 
+    #[cfg(test)]
+    fn set_recommendation_batch_key_for_test(&self, batch_key: Option<i64>) {
+        self.inner
+            .recommendation_batch_key_override
+            .store(batch_key.unwrap_or(i64::MIN), Ordering::Release);
+    }
+
+    fn current_recommendation_batch_key(&self) -> i64 {
+        #[cfg(test)]
+        {
+            let override_key = self
+                .inner
+                .recommendation_batch_key_override
+                .load(Ordering::Acquire);
+            if override_key != i64::MIN {
+                return override_key;
+            }
+        }
+        crate::application::recommendations::current_recommendation_batch_key()
+    }
+
     /// Returns the cached home snapshot for this principal, building it under the entry lock when
     /// any of the directory generation, the user's own generation or the permission epoch moved.
     async fn cached_home_snapshot(
@@ -249,8 +286,15 @@ impl HomeService {
             let generation = self.inner.generation.load(Ordering::Acquire);
             let user_generation = self.user_generation(&user_id);
             let access_epoch = self.access_epoch(&user_id);
+            let recommendation_batch_key = self.current_recommendation_batch_key();
             if let Some(snapshot) = self
-                .cached_value(&entry, generation, user_generation, access_epoch)
+                .cached_value(
+                    &entry,
+                    generation,
+                    user_generation,
+                    access_epoch,
+                    recommendation_batch_key,
+                )
                 .await
             {
                 return Ok(snapshot);
@@ -261,8 +305,15 @@ impl HomeService {
             let scan_refresh_epoch = self.inner.scan_refresh_epoch.load(Ordering::Acquire);
             let user_generation = self.user_generation(&user_id);
             let access_epoch = self.access_epoch(&user_id);
+            let recommendation_batch_key = self.current_recommendation_batch_key();
             if let Some(snapshot) = self
-                .cached_value(&entry, generation, user_generation, access_epoch)
+                .cached_value(
+                    &entry,
+                    generation,
+                    user_generation,
+                    access_epoch,
+                    recommendation_batch_key,
+                )
                 .await
             {
                 return Ok(snapshot);
@@ -276,6 +327,7 @@ impl HomeService {
                 || self.inner.scan_refresh_epoch.load(Ordering::Acquire) != scan_refresh_epoch
                 || self.user_generation(&user_id) != user_generation
                 || self.access_epoch(&user_id) != access_epoch
+                || self.current_recommendation_batch_key() != recommendation_batch_key
             {
                 continue;
             }
@@ -283,6 +335,7 @@ impl HomeService {
                 generation,
                 user_generation,
                 access_epoch,
+                recommendation_batch_key,
                 refreshed_at: Instant::now(),
                 snapshot: snapshot.clone(),
             });
@@ -299,10 +352,16 @@ impl HomeService {
         generation: u64,
         user_generation: u64,
         access_epoch: AccessEpoch,
+        recommendation_batch_key: i64,
     ) -> Option<Arc<HomeSnapshot>> {
         let cached = entry.value.lock().await;
         let cached = cached.as_ref()?;
-        if !cached.matches(generation, user_generation, access_epoch) {
+        if !cached.matches(
+            generation,
+            user_generation,
+            access_epoch,
+            recommendation_batch_key,
+        ) {
             return None;
         }
         if cached.refreshed_at.elapsed() >= HOME_USER_CACHE_TTL {
@@ -507,6 +566,7 @@ impl HomeService {
             let entry_generation = self.inner.generation.load(Ordering::Acquire);
             let entry_user_generation = self.user_generation(&user_id);
             let entry_access_epoch = self.access_epoch(&user_id);
+            let entry_batch_key = self.current_recommendation_batch_key();
             let entry_scan_refresh_epoch = self.inner.scan_refresh_epoch.load(Ordering::Acquire);
             if force
                 && (entry_generation != generation
@@ -518,8 +578,12 @@ impl HomeService {
             let cached = entry.value.lock().await;
             if !force
                 && cached.as_ref().is_some_and(|cached| {
-                    cached.matches(entry_generation, entry_user_generation, entry_access_epoch)
-                        && cached.refreshed_at.elapsed() < HOME_USER_CACHE_TTL
+                    cached.matches(
+                        entry_generation,
+                        entry_user_generation,
+                        entry_access_epoch,
+                        entry_batch_key,
+                    ) && cached.refreshed_at.elapsed() < HOME_USER_CACHE_TTL
                 })
             {
                 continue;
@@ -540,12 +604,14 @@ impl HomeService {
                         && self.inner.scan_refresh_epoch.load(Ordering::Acquire)
                             == entry_scan_refresh_epoch
                         && self.user_generation(&user_id) == entry_user_generation
-                        && self.access_epoch(&user_id) == entry_access_epoch =>
+                        && self.access_epoch(&user_id) == entry_access_epoch
+                        && self.current_recommendation_batch_key() == entry_batch_key =>
                 {
                     *entry.value.lock().await = Some(CachedSnapshot {
                         generation: entry_generation,
                         user_generation: entry_user_generation,
                         access_epoch: entry_access_epoch,
+                        recommendation_batch_key: entry_batch_key,
                         refreshed_at: Instant::now(),
                         snapshot: Arc::new(snapshot),
                     });
@@ -737,6 +803,43 @@ mod tests {
 
         assert!(std::ptr::eq(first.as_ref(), reused.as_ref()));
         assert!(!std::ptr::eq(first.as_ref(), isolated.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn carousel_cache_rebuilds_immediately_when_recommendation_batch_changes() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let access = MediaAccessService::new(database.clone());
+        let home = HomeService::new(
+            CatalogService::new(database.clone(), access),
+            LibraryService::new(database),
+        );
+        let principal = AccessPrincipal::new(UserId::new(), false);
+
+        home.set_recommendation_batch_key_for_test(Some(20_000));
+        let day_one = home
+            .cached_snapshot(principal, &[])
+            .await
+            .expect("day one snapshot");
+        let same_day = home
+            .cached_snapshot(principal, &[])
+            .await
+            .expect("same day snapshot");
+        assert!(std::ptr::eq(day_one.as_ref(), same_day.as_ref()));
+
+        home.set_recommendation_batch_key_for_test(Some(20_001));
+        let day_two = home
+            .cached_snapshot(principal, &[])
+            .await
+            .expect("day two snapshot");
+        assert!(
+            !std::ptr::eq(day_one.as_ref(), day_two.as_ref()),
+            "crossing the daily recommendation batch boundary must invalidate the cached carousel immediately"
+        );
     }
 
     #[tokio::test]
