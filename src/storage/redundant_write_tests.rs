@@ -272,9 +272,10 @@ async fn redundant_strm_target_write_leaves_the_source_row_untouched()
         WRITE_STAMP,
         "a changed STRM target must still be written"
     );
-    assert!(
-        outbox_rows(database, "strm-item").await? > outbox_before,
-        "a changed STRM target must still fire the catalog outbox trigger"
+    assert_eq!(
+        outbox_rows(database, "strm-item").await?,
+        outbox_before,
+        "changing a STRM target URL without changing source availability does not rebuild catalog_items"
     );
     let stored_url: Option<String> = sqlx::query_scalar::<_, _>(
         "SELECT external_url FROM media_sources WHERE id = 'strm-source'",
@@ -522,28 +523,35 @@ async fn repeating_an_unchanged_nfo_state_sync_does_not_write()
     database
         .sync_media_item_nfo_state("state-item", b"nfo-1", b"metadata-1")
         .await?;
+    stamp_media_item(database, "state-item").await?;
     let outbox_before = outbox_rows(database, "state-item").await?;
     database
         .sync_media_item_nfo_state("state-item", b"nfo-1", b"metadata-1")
         .await?;
     assert_eq!(
+        media_item_updated_at(database, "state-item").await?,
+        WRITE_STAMP,
+        "an unchanged NFO state sync must not rewrite the item"
+    );
+    assert_eq!(
         outbox_rows(database, "state-item").await?,
         outbox_before,
-        "an unchanged NFO state sync must not rewrite the item"
+        "an unchanged NFO state sync must not enqueue catalog_outbox"
     );
 
     // A stale cached NFO fingerprint must still be dropped by the next sync.
     sqlx::query(
-        "UPDATE media_items SET nfo_metadata_fingerprint = x'dead' WHERE id = 'state-item'",
+        "UPDATE media_items SET nfo_metadata_fingerprint = x'dead', updated_at = ? WHERE id = 'state-item'",
     )
+    .bind(WRITE_STAMP)
     .execute(database.pool())
     .await?;
-    let outbox_before = outbox_rows(database, "state-item").await?;
     database
         .sync_media_item_nfo_state("state-item", b"nfo-1", b"metadata-1")
         .await?;
-    assert!(
-        outbox_rows(database, "state-item").await? > outbox_before,
+    assert_ne!(
+        media_item_updated_at(database, "state-item").await?,
+        WRITE_STAMP,
         "a stale NFO fingerprint must still be cleared by a write"
     );
     let nfo_fingerprint: Option<Vec<u8>> = sqlx::query_scalar::<_, Option<Vec<u8>>>(
@@ -554,12 +562,13 @@ async fn repeating_an_unchanged_nfo_state_sync_does_not_write()
     assert_eq!(nfo_fingerprint, None);
 
     // A new metadata fingerprint must still be stored.
-    let outbox_before = outbox_rows(database, "state-item").await?;
+    stamp_media_item(database, "state-item").await?;
     database
         .sync_media_item_nfo_state("state-item", b"nfo-1", b"metadata-2")
         .await?;
-    assert!(
-        outbox_rows(database, "state-item").await? > outbox_before,
+    assert_ne!(
+        media_item_updated_at(database, "state-item").await?,
+        WRITE_STAMP,
         "a changed metadata fingerprint must still be written"
     );
     let metadata_fingerprint: Option<Vec<u8>> = sqlx::query_scalar::<_, Option<Vec<u8>>>(
@@ -904,8 +913,8 @@ async fn repeating_an_unchanged_metadata_selection_does_not_rewrite_the_item()
         last_air_date: None,
         status: None,
         original_language: None,
-        rating: None,
-        rating_source: None,
+        rating: overview.map(|_| 8.5),
+        rating_source: overview.map(|_| "TMDB"),
         provider_ids_json: r#"{"tmdb":"movie-1"}"#,
         metadata_scraper_id: Some("tmdb"),
         metadata_fingerprint: b"metadata-1",

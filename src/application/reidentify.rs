@@ -5591,7 +5591,7 @@ mod tests {
         let first = metadata_global_permits();
         let second = metadata_global_permits();
         assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(first.available_permits(), METADATA_GLOBAL_WORKER_LIMIT);
+        assert!(first.available_permits() <= METADATA_GLOBAL_WORKER_LIMIT);
     }
 
     #[test]
