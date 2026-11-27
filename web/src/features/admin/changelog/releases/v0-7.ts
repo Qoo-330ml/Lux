@@ -2,6 +2,15 @@ import type { ChangelogRelease } from "../types";
 
 export const changelogReleases07: ChangelogRelease[] = [
   {
+    version: "0.7.32",
+    date: "2026-11-27",
+    sections: [
+      { kind: "added", items: [
+        "✨ feat(recommendations): 首页轮播每天换一批，最近 7 天不重复 — 去掉了固定的两个置顶位，7 个位置都参与确定性加权抽样；每日候选池从 40 扩到 100，保留最近 7 天的批次，先在近 7 天没上过轮播的条目里挑，不够再按最久未展示回退。已看过的条目不再叠加最近播放的 +30 好感度；跨过 UTC 02:00 换批后，服务端和浏览器的轮播缓存都立即失效，不会继续显示上一批。",
+      ] },
+    ],
+  },
+  {
     version: "0.7.31",
     date: "2026-11-27",
     sections: [
