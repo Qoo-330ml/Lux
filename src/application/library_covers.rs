@@ -1,13 +1,14 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     io::Cursor,
     path::{Component, Path, PathBuf},
+    sync::OnceLock,
 };
 
-use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont};
+use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use image::{
-    DynamicImage, ImageFormat as RasterFormat, Rgba, RgbaImage,
+    DynamicImage, ImageFormat as RasterFormat, ImageReader, Rgb, Rgba, RgbaImage,
     imageops::{self, FilterType},
 };
 use imageproc::{
@@ -30,6 +31,10 @@ pub const MAX_LIBRARY_COVER_BYTES: u64 = 5 * 1024 * 1024;
 pub const AUTO_LIBRARY_COVER_TASK_TYPE: &str = "AUTO_LIBRARY_COVER";
 pub const AUTO_LIBRARY_COVER_POSTER_COUNT: usize = 9;
 const AUTO_LIBRARY_COVER_CANDIDATE_LIMIT: i64 = 64;
+const AUTO_LIBRARY_COVER_PATH_PREFETCH: usize = 18;
+const MAX_COVER_SOURCE_POSTER_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_COVER_POSTER_DIMENSION: u32 = 16_384;
+const MAX_COVER_POSTER_ALLOC_BYTES: u64 = 128 * 1024 * 1024;
 const AUTO_LIBRARY_COVER_DESIGN_WIDTH: f32 = 1920.0;
 const AUTO_LIBRARY_COVER_WIDTH: u32 = 1280;
 const AUTO_LIBRARY_COVER_HEIGHT: u32 = 720;
@@ -83,8 +88,8 @@ impl LibraryCoverService {
             return Ok(AutoLibraryCoverResult::ExistingCover);
         }
 
-        let poster_bytes = self.load_posters(&library_id_text).await?;
-        if poster_bytes.len() < AUTO_LIBRARY_COVER_POSTER_COUNT {
+        let poster_paths = self.resolve_poster_paths(&library_id_text).await?;
+        if poster_paths.len() < AUTO_LIBRARY_COVER_POSTER_COUNT {
             return Ok(AutoLibraryCoverResult::BelowThreshold);
         }
 
@@ -105,7 +110,8 @@ impl LibraryCoverService {
             return Ok(AutoLibraryCoverResult::ExistingCover);
         }
         let job = self.create_job(library_id, false).await?;
-        self.run_job(&job.id).await
+        self.run_job_with_poster_paths(&job.id, Some(poster_paths))
+            .await
     }
 
     pub async fn reconcile_auto_library_covers(&self) -> Result<usize, LibraryCoverError> {
@@ -227,6 +233,14 @@ impl LibraryCoverService {
     }
 
     pub async fn run_job(&self, job_id: &str) -> Result<AutoLibraryCoverResult, LibraryCoverError> {
+        self.run_job_with_poster_paths(job_id, None).await
+    }
+
+    async fn run_job_with_poster_paths(
+        &self,
+        job_id: &str,
+        prefetched_poster_paths: Option<Vec<PathBuf>>,
+    ) -> Result<AutoLibraryCoverResult, LibraryCoverError> {
         let job = self
             .database
             .find_library_cover_job(job_id)
@@ -238,7 +252,7 @@ impl LibraryCoverService {
         if !matches!(job.status.as_str(), "PENDING" | "RUNNING") {
             return Ok(AutoLibraryCoverResult::AlreadyHandled);
         }
-        let result = self.run_generation(&job).await;
+        let result = self.run_generation(&job, prefetched_poster_paths).await;
         match result {
             Ok(value) => {
                 self.database
@@ -263,6 +277,7 @@ impl LibraryCoverService {
     async fn run_generation(
         &self,
         job: &StoredLibraryCoverJob,
+        prefetched_poster_paths: Option<Vec<PathBuf>>,
     ) -> Result<AutoLibraryCoverResult, LibraryCoverError> {
         let _permit = self
             .generation_lock
@@ -291,15 +306,23 @@ impl LibraryCoverService {
             return Ok(AutoLibraryCoverResult::ExistingCover);
         }
 
-        let poster_bytes = self.load_posters(&library_id_text).await?;
-        if poster_bytes.len() < AUTO_LIBRARY_COVER_POSTER_COUNT {
+        let poster_paths = match prefetched_poster_paths {
+            Some(paths) => paths,
+            None => self.resolve_poster_paths(&library_id_text).await?,
+        };
+        if poster_paths.len() < AUTO_LIBRARY_COVER_POSTER_COUNT {
             return Ok(AutoLibraryCoverResult::BelowThreshold);
         }
-        let font_bytes = self.load_font_bytes().await?;
+        let font_source = self.load_font_source().await?;
         let library_subtitle = library_kind_subtitle(&library.kind);
         let library_name = library.name;
         let bytes = tokio::task::spawn_blocking(move || {
-            render_auto_library_cover(&library_name, library_subtitle, &poster_bytes, &font_bytes)
+            render_auto_library_cover_from_paths(
+                &library_name,
+                library_subtitle,
+                &poster_paths,
+                font_source,
+            )
         })
         .await
         .map_err(|_| LibraryCoverError::RenderPanicked)??;
@@ -341,51 +364,80 @@ impl LibraryCoverService {
         Ok(self.database.list_active_library_cover_job_ids().await?)
     }
 
-    async fn load_posters(&self, library_id: &str) -> Result<Vec<Vec<u8>>, LibraryCoverError> {
+    async fn resolve_poster_paths(
+        &self,
+        library_id: &str,
+    ) -> Result<Vec<PathBuf>, LibraryCoverError> {
         let candidates = self
             .database
             .list_random_library_poster_paths(library_id, AUTO_LIBRARY_COVER_CANDIDATE_LIMIT)
             .await?;
-        let metadata_root = match self.metadata_directory.as_ref() {
-            Some(directory) => fs::canonicalize(directory).await.ok(),
-            None => None,
-        };
-        let mut poster_bytes = Vec::with_capacity(AUTO_LIBRARY_COVER_POSTER_COUNT);
+        let mut metadata_root: Option<Option<PathBuf>> = None;
+        let mut canonical_roots = HashMap::<PathBuf, Option<PathBuf>>::new();
+        let mut poster_paths = Vec::with_capacity(AUTO_LIBRARY_COVER_PATH_PREFETCH);
         let mut seen_items = HashSet::new();
         for candidate in candidates {
             if !seen_items.insert(candidate.item_id) {
                 continue;
             }
-            let Ok(root_path) = fs::canonicalize(&candidate.root_path).await else {
-                continue;
+            let raw_root = PathBuf::from(&candidate.root_path);
+            let canonical_root = if let Some(cached) = canonical_roots.get(&raw_root) {
+                cached.clone()
+            } else {
+                let resolved = fs::canonicalize(&raw_root).await.ok();
+                canonical_roots.insert(raw_root, resolved.clone());
+                resolved
             };
             let Ok(poster_path) = fs::canonicalize(&candidate.local_path).await else {
                 continue;
             };
-            let in_media_root = poster_path != root_path && poster_path.starts_with(&root_path);
-            let in_metadata_root = metadata_root
+            let in_media_root = canonical_root
                 .as_ref()
-                .is_some_and(|root| poster_path != root.as_path() && poster_path.starts_with(root));
+                .is_some_and(|root| poster_path != *root && poster_path.starts_with(root));
+            let in_metadata_root = if in_media_root {
+                false
+            } else {
+                let resolved_metadata_root = match &metadata_root {
+                    Some(root) => root,
+                    None => {
+                        let loaded = match self.metadata_directory.as_ref() {
+                            Some(directory) => fs::canonicalize(directory).await.ok(),
+                            None => None,
+                        };
+                        metadata_root.insert(loaded)
+                    }
+                };
+                resolved_metadata_root.as_ref().is_some_and(|root| {
+                    poster_path != root.as_path() && poster_path.starts_with(root)
+                })
+            };
             if !in_media_root && !in_metadata_root {
                 continue;
             }
-            let Ok(bytes) = fs::read(&poster_path).await else {
+            let Ok(metadata) = fs::metadata(&poster_path).await else {
                 continue;
             };
-            poster_bytes.push(bytes);
-            if poster_bytes.len() == AUTO_LIBRARY_COVER_POSTER_COUNT {
+            if !metadata.is_file()
+                || metadata.len() == 0
+                || metadata.len() > MAX_COVER_SOURCE_POSTER_BYTES
+            {
+                continue;
+            }
+            poster_paths.push(poster_path);
+            if poster_paths.len() == AUTO_LIBRARY_COVER_PATH_PREFETCH {
                 break;
             }
         }
-        Ok(poster_bytes)
+        Ok(poster_paths)
     }
 
-    async fn load_font_bytes(&self) -> Result<Vec<u8>, LibraryCoverError> {
+    async fn load_font_source(&self) -> Result<CoverFontSource, LibraryCoverError> {
         let Some(font_path) = self.font_path.as_ref() else {
-            return Ok(bundled_cover_font().to_vec());
+            return Ok(CoverFontSource::Bundled);
         };
         fs::read(font_path)
             .await
+            .map(CoverFontSource::Custom)
             .map_err(|source| image_io_error(font_path, source))
     }
 
@@ -798,49 +850,113 @@ fn configured_cover_font() -> Option<PathBuf> {
     std::env::var_os("LUX_COVER_FONT_PATH").map(PathBuf::from)
 }
 
+#[cfg(test)]
 fn bundled_cover_font() -> &'static [u8] {
     SMILEY_SANS_FONT
 }
 
-fn render_auto_library_cover(
+enum CoverFontSource {
+    Bundled,
+    Custom(Vec<u8>),
+}
+
+static BUNDLED_COVER_FONT: OnceLock<Option<FontArc>> = OnceLock::new();
+
+fn resolve_cover_font(source: CoverFontSource) -> Result<FontArc, LibraryCoverError> {
+    match source {
+        CoverFontSource::Bundled => BUNDLED_COVER_FONT
+            .get_or_init(|| FontArc::try_from_slice(SMILEY_SANS_FONT).ok())
+            .clone()
+            .ok_or_else(|| LibraryCoverError::Render("cover font could not be loaded".to_owned())),
+        CoverFontSource::Custom(bytes) => match FontArc::try_from_vec(bytes) {
+            Ok(font) => Ok(font),
+            Err(bytes_err) => {
+                // `FontArc::try_from_vec` fails only when the file is a TTC collection or invalid;
+                // avoid copying 2+ MiB up front on the common single-font path.
+                let _ = bytes_err;
+                Err(LibraryCoverError::Render(
+                    "cover font could not be loaded".to_owned(),
+                ))
+            }
+        },
+    }
+}
+
+fn decode_poster_card(
+    path: &Path,
+    card_width: u32,
+    card_height: u32,
+    corner_radius: u32,
+    shadow_offset: i32,
+    shadow_blur: f32,
+) -> Option<(RgbaImage, Rgb<u8>)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_COVER_SOURCE_POSTER_BYTES
+    {
+        return None;
+    }
+    let reader = ImageReader::open(path).ok()?.with_guessed_format().ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_COVER_POSTER_DIMENSION);
+    limits.max_image_height = Some(MAX_COVER_POSTER_DIMENSION);
+    limits.max_alloc = Some(MAX_COVER_POSTER_ALLOC_BYTES);
+    let mut reader = reader;
+    reader.limits(limits);
+    let poster = reader.decode().ok()?;
+    let card = fit_cover(&poster, card_width, card_height);
+    let sample_image = DynamicImage::ImageRgba8(card.clone())
+        .resize(1, 1, FilterType::Triangle)
+        .to_rgb8();
+    let sample = *sample_image.get_pixel(0, 0);
+    drop(poster);
+    let shadowed = add_shadow(
+        &rounded_corners(card, corner_radius),
+        shadow_offset,
+        shadow_offset,
+        shadow_blur,
+    );
+    Some((shadowed, sample))
+}
+
+fn render_auto_library_cover_from_paths(
     library_name: &str,
     library_subtitle: &str,
-    poster_bytes: &[Vec<u8>],
-    font_bytes: &[u8],
+    poster_paths: &[PathBuf],
+    font_source: CoverFontSource,
 ) -> Result<Vec<u8>, LibraryCoverError> {
-    let mut posters = poster_bytes
-        .iter()
-        .filter_map(|bytes| image::load_from_memory(bytes).ok())
-        .collect::<Vec<_>>();
-    if posters.len() < AUTO_LIBRARY_COVER_POSTER_COUNT {
-        return Err(LibraryCoverError::Render(
-            "fewer than nine valid poster images were available".to_owned(),
-        ));
-    }
-    shuffle(&mut posters);
-    posters.truncate(AUTO_LIBRARY_COVER_POSTER_COUNT);
-
-    let mut canvas = gradient_background(&posters[0]);
     let card_width = scale_cover_dimension(410);
     let card_height = scale_cover_dimension(610);
     let corner_radius = scale_cover_dimension(46);
     let shadow_offset = scale_cover_coordinate(15);
     let shadow_blur = scale_cover_font_size(15.0);
-    let mut processed = posters
-        .iter()
-        .map(|poster| {
-            let card = fit_cover(poster, card_width, card_height);
-            add_shadow(
-                &rounded_corners(card, corner_radius),
-                shadow_offset,
-                shadow_offset,
-                shadow_blur,
-            )
-        })
-        .collect::<Vec<_>>();
+    // Decode one source poster at a time and resize immediately to card dimensions so nine
+    // full-resolution posters are never retained simultaneously in memory.
+    let mut cards = Vec::with_capacity(AUTO_LIBRARY_COVER_POSTER_COUNT);
+    for path in poster_paths {
+        if let Some(card) = decode_poster_card(
+            path,
+            card_width,
+            card_height,
+            corner_radius,
+            shadow_offset,
+            shadow_blur,
+        ) {
+            cards.push(card);
+            if cards.len() == AUTO_LIBRARY_COVER_POSTER_COUNT {
+                break;
+            }
+        }
+    }
+    if cards.len() < AUTO_LIBRARY_COVER_POSTER_COUNT {
+        return Err(LibraryCoverError::Render(
+            "fewer than nine valid poster images were available".to_owned(),
+        ));
+    }
+    shuffle(&mut cards);
 
-    let card_w = processed[0].width();
-    let card_h = processed[0].height();
+    let mut canvas = gradient_background_from_sample(cards[0].1);
+    let card_w = cards[0].0.width();
+    let card_h = cards[0].0.height();
     let stack_gap = scale_cover_coordinate(-30);
     let margin_y = scale_cover_dimension(22);
     let column_height = card_h
@@ -851,18 +967,16 @@ fn render_auto_library_cover(
         for row in 0..3 {
             let index = column * 3 + row;
             let y = i64::from(row as u32 * card_h) + i64::from(stack_gap * row as i32);
-            overlay(&mut stack, &processed[index], 0, y as i32);
+            overlay(&mut stack, &cards[index].0, 0, y as i32);
         }
         let rotated = rotate_cover_column(&stack);
         let x = scale_cover_coordinate(350 + column as i32 * 410);
         let y = scale_cover_coordinate(-200 - column as i32 * 80);
         overlay(&mut canvas, &rotated, x, y);
     }
-    processed.clear();
+    cards.clear();
 
-    let font = FontArc::try_from_vec(font_bytes.to_vec())
-        .or_else(|_| FontVec::try_from_vec_and_index(font_bytes.to_vec(), 0).map(Into::into))
-        .map_err(|_| LibraryCoverError::Render("cover font could not be loaded".to_owned()))?;
+    let font = resolve_cover_font(font_source)?;
     draw_library_text(&mut canvas, library_name, library_subtitle, &font);
 
     let mut output = Vec::new();
@@ -908,9 +1022,7 @@ fn rotate_cover_column(column: &RgbaImage) -> RgbaImage {
     rotated
 }
 
-fn gradient_background(first_poster: &DynamicImage) -> RgbaImage {
-    let sample_image = first_poster.resize(1, 1, FilterType::Triangle).to_rgb8();
-    let sample = *sample_image.get_pixel(0, 0);
+fn gradient_background_from_sample(sample: Rgb<u8>) -> RgbaImage {
     let left = [
         (u16::from(sample[0]) * 3 / 5) as u8,
         (u16::from(sample[1]) * 3 / 5) as u8,
@@ -951,7 +1063,7 @@ fn fit_cover(image: &DynamicImage, width: u32, height: u32) -> RgbaImage {
         &image.to_rgba8(),
         resized_width,
         resized_height,
-        FilterType::Lanczos3,
+        FilterType::CatmullRom,
     );
     let x = resized.width().saturating_sub(width) / 2;
     let y = resized.height().saturating_sub(height) / 2;

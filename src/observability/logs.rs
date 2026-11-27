@@ -1939,155 +1939,304 @@ pub async fn export_logs(
     store.initialize().await.map_err(LogExportError::Io)?;
     let config_dir = config_dir.to_path_buf();
     let manager = Arc::clone(&store.manager);
-    let files = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let _manager = manager
             .lock()
             .map_err(|_| LogExportError::Worker("日志 writer 状态不可用".to_owned()))?;
-        read_log_files(&config_dir, range)
+        export_logs_blocking(&config_dir, range)
     })
     .await
-    .map_err(|error| LogExportError::Worker(error.to_string()))??;
-    if files.is_empty() {
-        return Err(LogExportError::NoLogs);
+    .map_err(|error| LogExportError::Worker(error.to_string()))?
+}
+
+fn export_logs_blocking(
+    config_dir: &Path,
+    range: LogDateRange,
+) -> Result<LogExport, LogExportError> {
+    let directory = log_dir(config_dir);
+    let archive_directory = archive_dir(config_dir);
+    let mut archives_by_prefix = BTreeMap::<String, Vec<(String, PathBuf)>>::new();
+    match fs::read_dir(&archive_directory) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(LogExportError::Io)?;
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if let Some((prefix, _)) = name
+                    .strip_suffix(".log.zip")
+                    .and_then(|stem| stem.split_once(".part-"))
+                {
+                    archives_by_prefix
+                        .entry(prefix.to_owned())
+                        .or_default()
+                        .push((name.to_owned(), path));
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(LogExportError::Io(error)),
     }
+    for paths in archives_by_prefix.values_mut() {
+        paths.sort_by(|left, right| left.0.cmp(&right.0));
+    }
+
+    let mut total_bytes = 0_u64;
+    let mut line_buf = Vec::with_capacity(8 * 1024);
+    let mut saw_any_source = false;
 
     if range.from == range.to {
-        let filename = log_file_name(range.from);
         let mut contents = Vec::new();
-        for (_, segment) in files {
-            contents.extend_from_slice(&segment);
+        let mut daily_bytes = 0_u64;
+        saw_any_source |= stream_day_logs_into(
+            &directory,
+            &archives_by_prefix,
+            range.from,
+            &mut contents,
+            &mut line_buf,
+            &mut daily_bytes,
+            &mut total_bytes,
+        )?;
+        if !saw_any_source {
+            return Err(LogExportError::NoLogs);
         }
-        return Ok(LogExport::Daily { contents, filename });
+        return Ok(LogExport::Daily {
+            contents,
+            filename: log_file_name(range.from),
+        });
     }
 
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    for date in range.dates() {
+        let date_prefix = format!("lux.{}", format_log_date(date));
+        let daily_name = log_file_name(date);
+        let active_path = directory.join(&daily_name);
+        let has_active = match fs::metadata(&active_path) {
+            Ok(metadata) => metadata.is_file(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(LogExportError::Io(error)),
+        };
+        let has_archives = archives_by_prefix
+            .get(&date_prefix)
+            .is_some_and(|list| !list.is_empty());
+        if !has_active && !has_archives {
+            continue;
+        }
+        let mut day_started = false;
+        let mut daily_bytes = 0_u64;
+        if let Some(archive_list) = archives_by_prefix.get(&date_prefix) {
+            for (_, archive_path) in archive_list {
+                let archive_file = fs::File::open(archive_path).map_err(LogExportError::Io)?;
+                let mut archive = ZipArchive::new(archive_file)
+                    .map_err(|error| LogExportError::Archive(error.to_string()))?;
+                let mut member_names = Vec::new();
+                for index in 0..archive.len() {
+                    let member = archive
+                        .by_index(index)
+                        .map_err(|error| LogExportError::Archive(error.to_string()))?;
+                    let member_name = member.name().to_owned();
+                    if member_name.starts_with(&format!("{date_prefix}.part-"))
+                        && member_name.ends_with(".log")
+                    {
+                        member_names.push(member_name);
+                    }
+                }
+                member_names.sort();
+                for member_name in member_names {
+                    if !day_started {
+                        writer
+                            .start_file(&daily_name, options)
+                            .map_err(|error| LogExportError::Archive(error.to_string()))?;
+                        day_started = true;
+                        saw_any_source = true;
+                    }
+                    let member = archive
+                        .by_name(&member_name)
+                        .map_err(|error| LogExportError::Archive(error.to_string()))?;
+                    stream_redacted_jsonl_to_zip(
+                        member,
+                        &mut writer,
+                        &mut line_buf,
+                        &mut daily_bytes,
+                        &mut total_bytes,
+                    )?;
+                }
+            }
+        }
+        if has_active {
+            let active_file = fs::File::open(&active_path).map_err(LogExportError::Io)?;
+            if !day_started {
+                writer
+                    .start_file(&daily_name, options)
+                    .map_err(|error| LogExportError::Archive(error.to_string()))?;
+                saw_any_source = true;
+            }
+            stream_redacted_jsonl_to_zip(
+                active_file,
+                &mut writer,
+                &mut line_buf,
+                &mut daily_bytes,
+                &mut total_bytes,
+            )?;
+        }
+    }
+    if !saw_any_source {
+        return Err(LogExportError::NoLogs);
+    }
+    let contents = writer
+        .finish()
+        .map(|cursor| cursor.into_inner())
+        .map_err(|error| LogExportError::Archive(error.to_string()))?;
     let filename = format!(
         "lux-logs-{}-{}.zip",
         compact_date(range.from),
         compact_date(range.to)
     );
-    let archive = tokio::task::spawn_blocking(move || create_archive(files))
-        .await
-        .map_err(|error| LogExportError::Worker(error.to_string()))??;
-    Ok(LogExport::Archive {
-        contents: archive,
-        filename,
-    })
+    Ok(LogExport::Archive { contents, filename })
 }
 
-fn read_log_files(
-    config_dir: &Path,
-    range: LogDateRange,
-) -> Result<Vec<(String, Vec<u8>)>, LogExportError> {
-    let directory = log_dir(config_dir);
-    let archive_directory = archive_dir(config_dir);
-    let mut files = Vec::new();
-    let mut daily_bytes = 0_u64;
-    let mut total_bytes = 0_u64;
-    for date in range.dates() {
-        let date_prefix = format!("lux.{}", format_log_date(date));
-        let mut archived = Vec::new();
-        match fs::read_dir(&archive_directory) {
-            Ok(entries) => {
-                for entry in entries {
-                    let entry = entry.map_err(LogExportError::Io)?;
-                    let path = entry.path();
-                    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                        continue;
-                    };
-                    if !name.starts_with(&format!("{date_prefix}.part-"))
-                        || !name.ends_with(".log.zip")
-                    {
-                        continue;
-                    }
-                    let archive_file = fs::File::open(&path).map_err(LogExportError::Io)?;
-                    let mut archive = ZipArchive::new(archive_file)
-                        .map_err(|error| LogExportError::Archive(error.to_string()))?;
-                    for index in 0..archive.len() {
-                        let mut member = archive
-                            .by_index(index)
-                            .map_err(|error| LogExportError::Archive(error.to_string()))?;
-                        let member_name = member.name().to_owned();
-                        if !member_name.starts_with(&format!("{date_prefix}.part-"))
-                            || !member_name.ends_with(".log")
-                        {
-                            continue;
-                        }
-                        let mut contents = Vec::new();
-                        member
-                            .read_to_end(&mut contents)
-                            .map_err(LogExportError::Io)?;
-                        archived.push((member_name, contents));
-                    }
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(LogExportError::Io(error)),
-        }
-        archived.sort_by(|left, right| left.0.cmp(&right.0));
-        for (name, contents) in archived {
-            add_export_file(
-                &mut files,
-                &mut daily_bytes,
-                &mut total_bytes,
-                name,
-                contents,
-            )?;
-        }
-
-        let name = log_file_name(date);
-        match fs::read(directory.join(&name)) {
-            Ok(contents) => add_export_file(
-                &mut files,
-                &mut daily_bytes,
-                &mut total_bytes,
-                name,
-                contents,
-            )?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(LogExportError::Io(error)),
-        }
-    }
-    // Export bundles leave the server, so redact every JSON line once here instead of trusting
-    // each producer (tracing lines included) to have done it.
-    Ok(files
-        .into_iter()
-        .map(|(name, bytes)| (name, redact_jsonl_bytes(&bytes)))
-        .collect())
-}
-
-fn redact_jsonl_bytes(bytes: &[u8]) -> Vec<u8> {
-    let mut output = Vec::with_capacity(bytes.len());
-    for chunk in bytes.split_inclusive(|byte| *byte == b'\n') {
-        let line = chunk.strip_suffix(b"\n").unwrap_or(chunk);
-        match serde_json::from_slice::<Value>(line) {
-            Ok(value) => match serde_json::to_vec(&redact_sensitive_log_values(value)) {
-                Ok(encoded) => {
-                    output.extend_from_slice(&encoded);
-                    output.push(b'\n');
-                }
-                Err(_) => output.extend_from_slice(chunk),
-            },
-            Err(_) => output.extend_from_slice(chunk),
-        }
-    }
-    output
-}
-
-fn add_export_file(
-    files: &mut Vec<(String, Vec<u8>)>,
+fn stream_day_logs_into(
+    directory: &Path,
+    archives_by_prefix: &BTreeMap<String, Vec<(String, PathBuf)>>,
+    date: Date,
+    output: &mut Vec<u8>,
+    line_buf: &mut Vec<u8>,
     daily_bytes: &mut u64,
     total_bytes: &mut u64,
-    name: String,
-    contents: Vec<u8>,
-) -> Result<(), LogExportError> {
-    let size = u64::try_from(contents.len()).unwrap_or(u64::MAX);
-    *daily_bytes = daily_bytes.saturating_add(size);
-    *total_bytes = total_bytes.saturating_add(size);
-    if *daily_bytes > MAX_DAILY_LOG_BYTES || *total_bytes > MAX_EXPORT_BYTES {
-        return Err(LogExportError::ExportTooLarge);
+) -> Result<bool, LogExportError> {
+    let date_prefix = format!("lux.{}", format_log_date(date));
+    let mut saw_any = false;
+    if let Some(archive_list) = archives_by_prefix.get(&date_prefix) {
+        for (_, archive_path) in archive_list {
+            let archive_file = fs::File::open(archive_path).map_err(LogExportError::Io)?;
+            let mut archive = ZipArchive::new(archive_file)
+                .map_err(|error| LogExportError::Archive(error.to_string()))?;
+            let mut member_names = Vec::new();
+            for index in 0..archive.len() {
+                let member = archive
+                    .by_index(index)
+                    .map_err(|error| LogExportError::Archive(error.to_string()))?;
+                let member_name = member.name().to_owned();
+                if member_name.starts_with(&format!("{date_prefix}.part-"))
+                    && member_name.ends_with(".log")
+                {
+                    member_names.push(member_name);
+                }
+            }
+            member_names.sort();
+            for member_name in member_names {
+                saw_any = true;
+                let member = archive
+                    .by_name(&member_name)
+                    .map_err(|error| LogExportError::Archive(error.to_string()))?;
+                stream_redacted_jsonl_to_vec(member, output, line_buf, daily_bytes, total_bytes)?;
+            }
+        }
     }
-    files.push((name, contents));
+    let daily_name = log_file_name(date);
+    match fs::File::open(directory.join(&daily_name)) {
+        Ok(file) => {
+            saw_any = true;
+            stream_redacted_jsonl_to_vec(file, output, line_buf, daily_bytes, total_bytes)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(LogExportError::Io(error)),
+    }
+    Ok(saw_any)
+}
+
+fn stream_redacted_jsonl_to_vec<R: Read>(
+    reader: R,
+    output: &mut Vec<u8>,
+    line_buf: &mut Vec<u8>,
+    daily_bytes: &mut u64,
+    total_bytes: &mut u64,
+) -> Result<(), LogExportError> {
+    let remaining_cap = MAX_DAILY_LOG_BYTES
+        .saturating_sub(*daily_bytes)
+        .min(MAX_EXPORT_BYTES.saturating_sub(*total_bytes))
+        .saturating_add(1);
+    let mut buffered = io::BufReader::new(reader.take(remaining_cap));
+    loop {
+        line_buf.clear();
+        let read_len =
+            io::BufRead::read_until(&mut buffered, b'\n', line_buf).map_err(LogExportError::Io)?;
+        if read_len == 0 {
+            break;
+        }
+        let chunk_size = u64::try_from(read_len).unwrap_or(u64::MAX);
+        *daily_bytes = daily_bytes.saturating_add(chunk_size);
+        *total_bytes = total_bytes.saturating_add(chunk_size);
+        if *daily_bytes > MAX_DAILY_LOG_BYTES || *total_bytes > MAX_EXPORT_BYTES {
+            return Err(LogExportError::ExportTooLarge);
+        }
+        write_redacted_line(line_buf, output).map_err(LogExportError::Io)?;
+    }
     Ok(())
+}
+
+fn stream_redacted_jsonl_to_zip<R: Read, W: Write + Seek>(
+    reader: R,
+    writer: &mut ZipWriter<W>,
+    line_buf: &mut Vec<u8>,
+    daily_bytes: &mut u64,
+    total_bytes: &mut u64,
+) -> Result<(), LogExportError> {
+    let remaining_cap = MAX_DAILY_LOG_BYTES
+        .saturating_sub(*daily_bytes)
+        .min(MAX_EXPORT_BYTES.saturating_sub(*total_bytes))
+        .saturating_add(1);
+    let mut buffered = io::BufReader::new(reader.take(remaining_cap));
+    loop {
+        line_buf.clear();
+        let read_len =
+            io::BufRead::read_until(&mut buffered, b'\n', line_buf).map_err(LogExportError::Io)?;
+        if read_len == 0 {
+            break;
+        }
+        let chunk_size = u64::try_from(read_len).unwrap_or(u64::MAX);
+        *daily_bytes = daily_bytes.saturating_add(chunk_size);
+        *total_bytes = total_bytes.saturating_add(chunk_size);
+        if *daily_bytes > MAX_DAILY_LOG_BYTES || *total_bytes > MAX_EXPORT_BYTES {
+            return Err(LogExportError::ExportTooLarge);
+        }
+        write_redacted_line(line_buf, writer)
+            .map_err(|error| LogExportError::Archive(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn write_redacted_line<W: Write>(chunk: &[u8], out: &mut W) -> io::Result<()> {
+    let line = chunk.strip_suffix(b"\n").unwrap_or(chunk);
+    match serde_json::from_slice::<Value>(line) {
+        Ok(value) => match serde_json::to_vec(&redact_sensitive_log_values(value)) {
+            Ok(encoded) => {
+                out.write_all(&encoded)?;
+                out.write_all(b"\n")
+            }
+            Err(_) => out.write_all(chunk),
+        },
+        Err(_) => out.write_all(chunk),
+    }
+}
+
+#[cfg(test)]
+fn redact_jsonl_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut line_buf = Vec::new();
+    let mut daily_bytes = 0_u64;
+    let mut total_bytes = 0_u64;
+    stream_redacted_jsonl_to_vec(
+        Cursor::new(bytes),
+        &mut output,
+        &mut line_buf,
+        &mut daily_bytes,
+        &mut total_bytes,
+    )
+    .expect("test slice fits export limit");
+    output
 }
 
 fn log_segment_file_name(date: Date, sequence: u64) -> String {
@@ -2119,38 +2268,6 @@ fn verify_archive(path: &Path, member_name: &str) -> io::Result<()> {
 
 fn zip_io_error(error: zip::result::ZipError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
-}
-
-fn create_archive(files: Vec<(String, Vec<u8>)>) -> Result<Vec<u8>, LogExportError> {
-    let mut daily_files = BTreeMap::<String, Vec<u8>>::new();
-    for (name, contents) in files {
-        let date = export_file_date(&name)
-            .ok_or_else(|| LogExportError::Archive("日志分段文件名无效".to_owned()))?;
-        daily_files
-            .entry(log_file_name(date))
-            .or_default()
-            .extend_from_slice(&contents);
-    }
-    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
-    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-    for (name, contents) in daily_files {
-        writer
-            .start_file(name, options)
-            .map_err(|error| LogExportError::Archive(error.to_string()))?;
-        writer
-            .write_all(&contents)
-            .map_err(|error| LogExportError::Archive(error.to_string()))?;
-    }
-    writer
-        .finish()
-        .map(|cursor| cursor.into_inner())
-        .map_err(|error| LogExportError::Archive(error.to_string()))
-}
-
-fn export_file_date(name: &str) -> Option<Date> {
-    let date_and_part = name.strip_prefix("lux.")?.strip_suffix(".log")?;
-    let date = date_and_part.split(".part-").next()?;
-    parse_date(date).ok()
 }
 
 fn parse_date(value: &str) -> Result<Date, LogExportError> {
@@ -3693,6 +3810,68 @@ mod export_redaction_tests {
         assert!(output.contains("plain text line"));
         assert!(output.contains("\"requestId\":\"abc\""));
         assert_eq!(output.lines().count(), 3);
+    }
+
+    #[tokio::test]
+    async fn multi_day_archive_redacts_secrets_and_merges_segments_without_raw_copies() {
+        use std::io::{Cursor, Read, Write};
+        use zip::ZipArchive;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config_dir = temp.path().join("config");
+        let log_dir = super::log_dir(&config_dir);
+        let archive_dir = super::archive_dir(&config_dir);
+        std::fs::create_dir_all(&archive_dir).expect("archive dir");
+
+        let archive_path = archive_dir.join("lux.2026-08-08.part-000001.log.zip");
+        let archive_file = std::fs::File::create(&archive_path).expect("create zip");
+        let mut zip_writer = zip::ZipWriter::new(archive_file);
+        zip_writer
+            .start_file(
+                "lux.2026-08-08.part-000001.log",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .expect("start member");
+        zip_writer
+            .write_all(b"{\"message\":\"part1\",\"password\":\"secret-archive\"}\n")
+            .expect("write part1");
+        zip_writer.finish().expect("finish zip");
+
+        std::fs::write(
+            log_dir.join("lux.2026-08-08.log"),
+            b"{\"message\":\"part2\",\"url\":\"https://secret.example/path\"}\n",
+        )
+        .expect("write active");
+        std::fs::write(
+            log_dir.join("lux.2026-08-09.log"),
+            b"{\"message\":\"day2\"}\n",
+        )
+        .expect("write day2");
+
+        let from = time::Date::from_calendar_date(2026, time::Month::August, 8).expect("date");
+        let to = time::Date::from_calendar_date(2026, time::Month::August, 9).expect("date");
+        let export = super::export_logs(
+            &config_dir,
+            super::LogDateRange::new(from, to).expect("range"),
+        )
+        .await
+        .expect("export");
+        let super::LogExport::Archive { contents, .. } = export else {
+            panic!("expected zip archive");
+        };
+        let mut out_zip = ZipArchive::new(Cursor::new(contents)).expect("open exported zip");
+        assert_eq!(out_zip.len(), 2);
+        let mut day1 = String::new();
+        out_zip
+            .by_name("lux.2026-08-08.log")
+            .expect("day1 member")
+            .read_to_string(&mut day1)
+            .expect("read day1");
+        assert!(day1.contains("\"part1\""));
+        assert!(day1.contains("\"part2\""));
+        assert!(!day1.contains("secret-archive"));
+        assert!(!day1.contains("secret.example"));
     }
 }
 

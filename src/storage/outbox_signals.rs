@@ -27,10 +27,11 @@ pub(crate) struct OutboxSignals {
     catalog_items: Notify,
     search_reindex: Notify,
     collections: Notify,
+    identity_merge: Notify,
 }
 
 impl OutboxSignals {
-    /// An authoritative metadata write committed; any of the three streams may hold new rows.
+    /// An authoritative metadata write committed; any of the streams may hold new rows.
     ///
     /// Every signal is sent unconditionally: deciding which trigger fired would mean repeating the
     /// trigger predicates at the write site, and a redundant wake-up is much cheaper than a missed
@@ -39,6 +40,7 @@ impl OutboxSignals {
         self.catalog_items.notify_one();
         self.search_reindex.notify_one();
         self.collections.notify_one();
+        self.identity_merge.notify_one();
     }
 
     /// Resolves once a write signalled the `catalog_items` consumer.
@@ -54,6 +56,11 @@ impl OutboxSignals {
     /// Resolves once a write signalled the global collection sync worker.
     pub(crate) fn notified_collections(&self) -> Notified<'_> {
         self.collections.notified()
+    }
+
+    /// Resolves once a write signalled the automatic identity merge worker.
+    pub(crate) fn notified_identity_merge(&self) -> Notified<'_> {
+        self.identity_merge.notified()
     }
 }
 
