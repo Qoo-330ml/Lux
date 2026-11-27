@@ -91,4 +91,48 @@ describe("LuxPlayer caption overlay timing", () => {
     expect(container.textContent).toContain("上层");
     expect(container.querySelector("strong")).toBeNull();
   });
+
+  it("terminates the one-shot subtitle parser worker immediately after parsing completes", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      headers: new Headers({ "content-length": "42" }),
+      body: null,
+      text: async () => "1\n00:00:01,000 --> 00:00:03,000\n即时销毁测试",
+    }));
+    const terminateSpy = vi.fn();
+    class MockWorker {
+      onmessage: ((event: MessageEvent) => void) | null = null;
+      onerror: ((event: ErrorEvent) => void) | null = null;
+      postMessage(request: { requestId: number }) {
+        queueMicrotask(() => {
+          this.onmessage?.({
+            data: {
+              type: "PARSED",
+              requestId: request.requestId,
+              cues: [{ id: "1", start: 1, end: 3, text: "即时销毁测试" }],
+            },
+          } as MessageEvent);
+        });
+      }
+      terminate = terminateSpy;
+    }
+    vi.stubGlobal("Worker", MockWorker);
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      root?.render(
+        <PlayerCaptionOverlay
+          source={{ id: "caption-w", label: "中文", format: "srt", src: "/caption.srt" }}
+          currentTime={2}
+        />,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector(".lux-player-caption-text")?.textContent).toBe("即时销毁测试");
+    expect(terminateSpy).toHaveBeenCalledTimes(1);
+  });
 });

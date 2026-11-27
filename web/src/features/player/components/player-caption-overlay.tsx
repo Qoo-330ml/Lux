@@ -87,10 +87,19 @@ export function PlayerCaptionOverlay({
           complete(parseCaptionWorkerRequest(request));
           return;
         }
-        worker = new Worker(new URL("../caption-parser-worker.ts", import.meta.url), { type: "module" });
-        worker.onmessage = (event: MessageEvent<CaptionWorkerResponse>) => complete(event.data);
-        worker.onerror = () => fail("字幕解析失败");
-        worker.postMessage(request);
+        const activeWorker = new Worker(new URL("../caption-parser-worker.ts", import.meta.url), { type: "module" });
+        worker = activeWorker;
+        activeWorker.onmessage = (event: MessageEvent<CaptionWorkerResponse>) => {
+          activeWorker.terminate();
+          if (worker === activeWorker) worker = null;
+          complete(event.data);
+        };
+        activeWorker.onerror = () => {
+          activeWorker.terminate();
+          if (worker === activeWorker) worker = null;
+          fail("字幕解析失败");
+        };
+        activeWorker.postMessage(request);
       } catch (error) {
         if (!controller.signal.aborted) fail(error instanceof Error && error.message === "字幕文件过大" ? error.message : "字幕加载失败");
       }

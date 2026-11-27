@@ -36,6 +36,7 @@ export function useMediaEpisodes(item: MediaItem) {
       seasonId: episodeSeasonId,
     }),
     initialPageParam: 1,
+    maxPages: 5,
     getNextPageParam: (lastPage) => {
       const page = lastPage.page ?? 1;
       const pageSize = lastPage.pageSize ?? 100;

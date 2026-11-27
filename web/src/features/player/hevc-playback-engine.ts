@@ -2,6 +2,9 @@ import { TranscodeWorkerClient } from "@hevcjs/core";
 import { createFile } from "mp4box";
 import { PLAYBACK_PERFORMANCE_EVENT, summarizePlaybackPerformance, type PlaybackEngine, type PlaybackPerformance, type PlaybackSnapshot } from "./playback-engine";
 import { isHevcCodec } from "./media-codec";
+import { SourceBufferQueue, waitForBufferDrain } from "./mse-buffer-control";
+
+const MAX_IN_FLIGHT_HEVC_SEGMENTS = 6;
 
 export type HevcRuntimeAssets = {
   workerUrl: string;
@@ -68,45 +71,6 @@ export function normalizeFragmentCompositionOffsets(data: ArrayBuffer) {
   return normalized;
 }
 
-class SourceBufferQueue {
-  private chain = Promise.resolve();
-
-  constructor(private readonly sourceBuffer: SourceBuffer) {}
-
-  append(data: Uint8Array) {
-    const next = this.chain.then(() => this.appendNow(data));
-    this.chain = next.catch(() => undefined);
-    return next;
-  }
-
-  private appendNow(data: Uint8Array) {
-    return new Promise<void>((resolve, reject) => {
-      const cleanup = () => {
-        this.sourceBuffer.removeEventListener("updateend", onUpdateEnd);
-        this.sourceBuffer.removeEventListener("error", onError);
-      };
-      const onUpdateEnd = () => {
-        cleanup();
-        resolve();
-      };
-      const onError = () => {
-        cleanup();
-        reject(new Error("MSE SourceBuffer append failed"));
-      };
-      this.sourceBuffer.addEventListener("updateend", onUpdateEnd, { once: true });
-      this.sourceBuffer.addEventListener("error", onError, { once: true });
-      try {
-        const copy = new Uint8Array(data.byteLength);
-        copy.set(data);
-        this.sourceBuffer.appendBuffer(copy.buffer);
-      } catch (error) {
-        cleanup();
-        reject(error instanceof Error ? error : new Error(String(error)));
-      }
-    });
-  }
-}
-
 export class ClientHevcEngine implements PlaybackEngine {
   readonly kind = "client-hevc" as const;
   performance: PlaybackPerformance | null = null;
@@ -153,9 +117,39 @@ export class ClientHevcEngine implements PlaybackEngine {
       if (!response.ok) throw new Error(`客户端媒体读取失败：HTTP ${response.status}`);
       if (!response.body) throw new Error("客户端媒体读取失败：浏览器不支持流式读取");
 
-      const file = createFile();
+      const file = createFile() as ReturnType<typeof createFile> & {
+        releaseUsedSamples?: (id: number, sampleNum: number) => void;
+      };
       const segmentChains = new Map<number, Promise<void>>();
       const trackKinds = new Map<number, Mp4Track["type"]>();
+      let inFlightSegments = 0;
+      const segmentSlotWaiters: Array<() => void> = [];
+      const notifySegmentDrained = () => {
+        while (inFlightSegments < MAX_IN_FLIGHT_HEVC_SEGMENTS && segmentSlotWaiters.length > 0) {
+          segmentSlotWaiters.shift()?.();
+        }
+      };
+      const waitForSegmentSlot = (signal: AbortSignal) => {
+        if (signal.aborted) {
+          return Promise.reject(new DOMException("播放已取消", "AbortError"));
+        }
+        if (inFlightSegments < MAX_IN_FLIGHT_HEVC_SEGMENTS) {
+          return Promise.resolve();
+        }
+        return new Promise<void>((resolve, reject) => {
+          const onAbort = () => {
+            const index = segmentSlotWaiters.indexOf(onRelease);
+            if (index >= 0) segmentSlotWaiters.splice(index, 1);
+            reject(new DOMException("播放已取消", "AbortError"));
+          };
+          const onRelease = () => {
+            signal.removeEventListener("abort", onAbort);
+            resolve();
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+          segmentSlotWaiters.push(onRelease);
+        });
+      };
       let resolveInitialization: () => void = () => undefined;
       let rejectInitialization: (error: unknown) => void = () => undefined;
       const initialization = new Promise<void>((resolve, reject) => {
@@ -184,9 +178,21 @@ export class ClientHevcEngine implements PlaybackEngine {
         rejectTracksReady(failure);
         if (!playbackReady) rejectPlaybackReady(failure);
       };
-      file.onSegment = (id: number, _user: unknown, buffer: ArrayBuffer) => {
+      file.onSegment = (id: number, _user: unknown, buffer: ArrayBuffer, sampleNumber?: number) => {
+        if (typeof sampleNumber === "number") {
+          file.releaseUsedSamples?.(id, sampleNumber);
+        }
+        inFlightSegments += 1;
         const previous = segmentChains.get(id) ?? Promise.resolve();
-        const next = previous.then(() => this.processSegment(id, buffer, trackKinds, initialization, resolvePlaybackReady));
+        const next = previous
+          .then(() => this.processSegment(id, buffer, trackKinds, initialization, resolvePlaybackReady))
+          .finally(() => {
+            inFlightSegments = Math.max(0, inFlightSegments - 1);
+            if (segmentChains.get(id) === next) {
+              segmentChains.delete(id);
+            }
+            notifySegmentDrained();
+          });
         segmentChains.set(id, next);
       };
       file.onReady = (info) => {
@@ -201,7 +207,19 @@ export class ClientHevcEngine implements PlaybackEngine {
         resolveTracksReady();
       };
 
-      void this.consumeSource(response.body, file, segmentChains, tracksReady, initialization, mediaSource, generation, () => playbackReady, rejectPlaybackReady);
+      void this.consumeSource(
+        response.body,
+        file,
+        segmentChains,
+        tracksReady,
+        initialization,
+        mediaSource,
+        generation,
+        this.abortController.signal,
+        waitForSegmentSlot,
+        () => playbackReady,
+        rejectPlaybackReady,
+      );
       await playbackReadyPromise;
     } catch (error) {
       this.destroy();
@@ -217,6 +235,8 @@ export class ClientHevcEngine implements PlaybackEngine {
     initialization: Promise<void>,
     mediaSource: MediaSource,
     generation: number,
+    signal: AbortSignal,
+    waitForSegmentSlot: (signal: AbortSignal) => Promise<void>,
     isPlaybackReady: () => boolean,
     rejectPlaybackReady: (error: unknown) => void,
   ) {
@@ -224,6 +244,10 @@ export class ClientHevcEngine implements PlaybackEngine {
       const reader = body.getReader();
       let offset = 0;
       while (true) {
+        if (isPlaybackReady()) {
+          await waitForSegmentSlot(signal);
+          await waitForBufferDrain(this.element, signal);
+        }
         const chunk = await reader.read();
         if (chunk.done) break;
         if (generation !== this.generation) throw new DOMException("播放已取消", "AbortError");
@@ -325,7 +349,10 @@ export class ClientHevcEngine implements PlaybackEngine {
   ) {
     await initialization;
     if (trackKinds.get(id) === "audio") {
-      if (this.audioQueue) await this.audioQueue.append(normalizeFragmentCompositionOffsets(buffer));
+      if (this.audioQueue) {
+        await this.audioQueue.append(normalizeFragmentCompositionOffsets(buffer));
+        await this.audioQueue.trimBefore(this.element.currentTime);
+      }
       return;
     }
     if (!this.worker || !this.videoQueue) throw new Error("客户端 fallback 尚未初始化");
@@ -339,6 +366,7 @@ export class ClientHevcEngine implements PlaybackEngine {
     }
     if (transcoded) {
       await this.videoQueue.append(transcoded);
+      await this.videoQueue.trimBefore(this.element.currentTime);
       resolvePlaybackReady();
     }
   }

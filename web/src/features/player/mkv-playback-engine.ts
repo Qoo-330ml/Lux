@@ -4,6 +4,7 @@ import { isHevcCodec } from "./media-codec";
 import type { HevcRuntimeAssets } from "./hevc-playback-engine";
 import { MatroskaRangeReader } from "./matroska-range-reader";
 import { hasMatroskaSeekHead } from "./matroska-range-index";
+import { SourceBufferQueue, waitForBufferDrain } from "./mse-buffer-control";
 
 type WorkerResponse =
   | { type: "ready" }
@@ -13,33 +14,6 @@ type WorkerResponse =
   | { type: "caption"; trackId: string; startMs: number; endMs: number; text: string; layer?: number; alignment?: number; position?: { x: number; y: number }; style?: { color?: string; bold?: boolean; italic?: boolean; marginL?: number; marginR?: number; marginV?: number }; runs?: readonly { text: string; color?: string; bold?: boolean; italic?: boolean }[] }
   | { type: "done" }
   | { type: "error"; message: string };
-
-class SourceBufferQueue {
-  private chain = Promise.resolve();
-
-  constructor(private readonly sourceBuffer: SourceBuffer) {}
-
-  append(data: ArrayBuffer) {
-    const next = this.chain.then(() => new Promise<void>((resolve, reject) => {
-      const cleanup = () => {
-        this.sourceBuffer.removeEventListener("updateend", onUpdateEnd);
-        this.sourceBuffer.removeEventListener("error", onError);
-      };
-      const onUpdateEnd = () => { cleanup(); resolve(); };
-      const onError = () => { cleanup(); reject(new Error("MKV MSE SourceBuffer append failed")); };
-      this.sourceBuffer.addEventListener("updateend", onUpdateEnd, { once: true });
-      this.sourceBuffer.addEventListener("error", onError, { once: true });
-      try {
-        this.sourceBuffer.appendBuffer(data);
-      } catch (error) {
-        cleanup();
-        reject(error instanceof Error ? error : new Error(String(error)));
-      }
-    }));
-    this.chain = next.catch(() => undefined);
-    return next;
-  }
-}
 
 export class ClientMkvEngine implements PlaybackEngine {
   readonly kind = "client-mkv" as const;
@@ -124,6 +98,10 @@ export class ClientMkvEngine implements PlaybackEngine {
       let firstRange = true;
       for await (const chunk of rangeReader.chunks(abortController.signal)) {
         if (generation !== this.generation) return;
+        if (!firstRange && playbackStarted) {
+          await waitForBufferDrain(this.element, abortController.signal);
+          if (generation !== this.generation) return;
+        }
         if (firstRange && !hasMatroskaSeekHead(chunk.data, chunk.range.total)) {
           throw new Error("客户端媒体索引不可用：缺少有效 SeekHead");
         }
@@ -168,11 +146,12 @@ export class ClientMkvEngine implements PlaybackEngine {
         if (typeof MediaSource.isTypeSupported === "function" && !MediaSource.isTypeSupported(mime)) {
           throw new Error(`客户端 MSE 不支持当前编码组合：${message.codec}`);
         }
-        this.sourceBuffer = new SourceBufferQueue(mediaSource.addSourceBuffer(mime));
+        this.sourceBuffer = new SourceBufferQueue(mediaSource.addSourceBuffer(mime), "MKV MSE SourceBuffer");
         await this.sourceBuffer.append(message.initSegment);
       } else if (message.type === "segment") {
         if (!this.sourceBuffer) throw new Error("MKV fallback 缺少 MSE 初始化片段");
         await this.sourceBuffer.append(message.mediaSegment);
+        await this.sourceBuffer.trimBefore(this.element.currentTime);
         this.transcodedMediaDurationMs += message.mediaDurationMs;
         this.transcodedProcessingDurationMs = message.processingDurationMs;
         this.performance = summarizePlaybackPerformance(this.transcodedMediaDurationMs, this.transcodedProcessingDurationMs);

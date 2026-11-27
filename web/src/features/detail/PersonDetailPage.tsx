@@ -48,6 +48,7 @@ export function PersonDetailPage({ user }: PersonDetailPageProps) {
     queryKey: queryKeys.personItems(personId),
     queryFn: ({ pageParam }) => api.personItems(personId, pageParam),
     initialPageParam: 1,
+    maxPages: 5,
     enabled: Boolean(personId && person.data),
     getNextPageParam: (lastPage) => {
       const page = lastPage.page ?? 1;

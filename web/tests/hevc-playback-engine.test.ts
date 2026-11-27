@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { copySegmentBytes, normalizeFragmentCompositionOffsets, segmentSampleCount, segmentSampleCountForTracks } from "../src/features/player/hevc-playback-engine";
 import { isHevcCodec } from "../src/features/player/media-codec";
+import { SourceBufferQueue, bufferedAheadSeconds, evictableBufferEnd, waitForBufferDrain } from "../src/features/player/mse-buffer-control";
 
 describe("HEVC playback engine helpers", () => {
   it("recognizes HEVC codec labels without confusing Dolby Vision metadata", () => {
@@ -49,5 +50,66 @@ describe("HEVC playback engine helpers", () => {
     expect(normalized[24]).toBe(1);
     expect(new DataView(normalized.buffer).getUint32(32)).toBe(0xffffffff);
     expect(normalized.buffer).not.toBe(fragment.buffer);
+  });
+
+  it("computes buffered ahead window including slight initial PTS offset and back-buffer eviction", async () => {
+    const makeRanges = (ranges: Array<[number, number]>): TimeRanges => ({
+      length: ranges.length,
+      start: (index: number) => ranges[index]![0],
+      end: (index: number) => ranges[index]![1],
+    });
+
+    expect(bufferedAheadSeconds({ currentTime: 0, buffered: makeRanges([[0.083, 72]]) })).toBe(72);
+    expect(bufferedAheadSeconds({ currentTime: 25, buffered: makeRanges([[0, 72]]) })).toBe(47);
+    expect(evictableBufferEnd(makeRanges([[0, 120]]), 50)).toBeNull();
+    expect(evictableBufferEnd(makeRanges([[0, 140]]), 100)).toBe(40);
+    expect(evictableBufferEnd(makeRanges([[30, 140]]), 100)).toBeNull();
+
+    let currentAheadEnd = 80;
+    const listeners = new Map<string, Set<EventListener>>();
+    const mockVideo = {
+      currentTime: 0,
+      get buffered() {
+        return makeRanges([[0, currentAheadEnd]]);
+      },
+      addEventListener: (event: string, listener: EventListener) => {
+        if (!listeners.has(event)) listeners.set(event, new Set());
+        listeners.get(event)!.add(listener);
+      },
+      removeEventListener: (event: string, listener: EventListener) => {
+        listeners.get(event)?.delete(listener);
+      },
+    } as unknown as HTMLMediaElement;
+
+    const abort = new AbortController();
+    let drained = false;
+    const drainPromise = waitForBufferDrain(mockVideo, abort.signal).then(() => {
+      drained = true;
+    });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+
+    mockVideo.currentTime = 55;
+    listeners.get("timeupdate")?.forEach((cb) => cb(new Event("timeupdate")));
+    await drainPromise;
+    expect(drained).toBe(true);
+
+    const removed: Array<[number, number]> = [];
+    const sbTarget = new EventTarget();
+    const mockSourceBuffer = Object.assign(sbTarget, {
+      buffered: makeRanges([[0, 130]]),
+      appendBuffer: vi.fn(() => {
+        queueMicrotask(() => sbTarget.dispatchEvent(new Event("updateend")));
+      }),
+      remove: vi.fn((start: number, end: number) => {
+        removed.push([start, end]);
+        queueMicrotask(() => sbTarget.dispatchEvent(new Event("updateend")));
+      }),
+    }) as unknown as SourceBuffer;
+
+    const queue = new SourceBufferQueue(mockSourceBuffer);
+    await queue.append(new Uint8Array([1, 2, 3]));
+    await queue.trimBefore(110);
+    expect(removed).toEqual([[0, 50]]);
   });
 });

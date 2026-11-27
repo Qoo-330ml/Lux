@@ -27,6 +27,7 @@ export function CollectionDetailPage() {
     queryKey: queryKeys.collection(collectionId),
     queryFn: ({ pageParam }) => api.collection(collectionId, pageParam, COLLECTION_PAGE_SIZE),
     initialPageParam: 1,
+    maxPages: 5,
     enabled: Boolean(collectionId),
     getNextPageParam: (lastPage) => {
       const page = lastPage.page ?? 1;
