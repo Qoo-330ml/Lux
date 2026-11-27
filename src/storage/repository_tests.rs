@@ -23687,6 +23687,27 @@ async fn catalog_items_incremental_tracks_inserts_updates_images_merges_and_dele
 }
 
 #[tokio::test]
+async fn retired_device_pairings_table_is_dropped_while_access_token_device_type_stays()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let pairing_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'device_pairings'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(pairing_tables, 0);
+
+    let access_token_columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('access_tokens')")
+            .fetch_all(database.pool())
+            .await?;
+    assert!(access_token_columns.iter().any(|col| col == "device_type"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn catalog_read_model_drops_unused_stats_table_columns_and_indexes()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::storage::test_database;
@@ -30882,7 +30903,7 @@ async fn user_device_observations_merge_monotonically_and_are_user_scoped()
             device_id: "shared-device",
             device_name: Some("Phone Updated"),
             device_type: Some("Mobile"),
-            client_name: "Lux Prism",
+            client_name: "Lux Client",
             client_version: Some("2.0"),
             last_remote_ip: Some("198.51.100.2"),
             seen_at: 200,
@@ -30906,7 +30927,7 @@ async fn user_device_observations_merge_monotonically_and_are_user_scoped()
             device_id: "shared-device",
             device_name: None,
             device_type: None,
-            client_name: "Lux Prism",
+            client_name: "Lux Client",
             client_version: None,
             last_remote_ip: None,
             seen_at: 250,
@@ -30943,7 +30964,7 @@ async fn user_device_observations_merge_monotonically_and_are_user_scoped()
     .await?;
     assert_eq!(owner_record.0.as_deref(), Some("Phone Updated"));
     assert_eq!(owner_record.1.as_deref(), Some("Mobile"));
-    assert_eq!(owner_record.2, "Lux Prism");
+    assert_eq!(owner_record.2, "Lux Client");
     assert_eq!(owner_record.3.as_deref(), Some("2.0"));
     assert_eq!(owner_record.4, 50);
     assert_eq!(owner_record.5, 250);

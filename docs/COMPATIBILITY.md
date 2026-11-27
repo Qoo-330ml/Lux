@@ -812,8 +812,8 @@ FNOS 部署新镜像后用 FileBar 的普通用户 115 秒传场景验证实际�
 Lux 服务端监听 UDP `7359`，对大小写不敏感的 `who is EmbyServer?` UTF-8/UTF-16LE 请求返回 Emby 兼容的
 `Address`、`Id`、`Name` JSON。`LUX_DISCOVERY_ADVERTISE_URL` 可为 Docker、反向代理和多网卡部署指定客户端可达的
 HTTP(S) 基地址；未设置时服务端按请求来源选择本机接口和 HTTP 端口。协议、地址校验、无关包过滤和关闭生命周期已有
-`tests/discovery.rs` 与 `discovery` 模块单测覆盖。该记录只证明 Lux 服务端协议，不宣称 Prism 或其他客户端已完成真实
-局域网发现；Docker 多网卡/广播验证和客户端以 `Id` 去重、并行探测两个地址的行为待 Prism 阶段验证。
+`tests/discovery.rs` 与 `discovery` 模块单测覆盖。该记录只证明 Lux 服务端协议，不宣称第三方客户端已完成真实
+局域网发现；Docker 多网卡/广播验证和客户端以 `Id` 去重、并行探测两个地址的行为待客户端实机验证。
 
 ## LUX-254 Emby 客户端服务端转码（2026-09-15）
 

@@ -2218,7 +2218,6 @@ services:
 | LUX-243 | docs/COMPATIBILITY.md、scripts/player-matroska-smoke.mjs、web/tests/；远程 Matroska 客户端管线历史阶段门（当前不实施） |
 | LUX-245 | web/src/features/player/playback-selection.ts、web/src/features/player/PlayerPage.tsx、web/src/features/player/remote-mkv-caption-reader.ts、web/tests/；远程 STRM 浏览器直连与客户端解码 fallback |
 | LUX-247 | docs/LUX-DEVELOPMENT.md、docs/COMPATIBILITY.md、src/discovery.rs、src/main.rs、compose.yaml、docs/DEPLOYMENT.md；Emby 兼容局域网发现 |
-| LUX-248 | docs/LUX-DEVELOPMENT.md、docs/decisions/041-device-pairing.md、migrations/0119_device_pairings.sql、migrations-postgres/0119_device_pairings.sql、src/auth/device_pairings.rs、src/security.rs、src/storage/device_pairings.rs、src/storage/catalog.rs、src/storage/repository.rs、src/storage/users.rs、src/storage/mod.rs、src/auth/emby.rs、src/auth/mod.rs、src/api/legacy.rs、src/api/routes.rs、src/api/users.rs、tests/device_pairings.rs、tests/admin_health.rs、tests/danmaku.rs、tests/ready_version.rs、tests/scanner.rs、tests/storage.rs；Lux Prism 一次性设备配对 |
 | LUX-249 | docs/LUX-DEVELOPMENT.md、docs/COMPATIBILITY.md、src/application/scraper.rs、src/application/images.rs、src/application/candidates.rs、src/storage/media.rs、src/storage/repository.rs、web/src/features/admin/AdminPluginsPage.tsx、web/tests/plugin-library.test.ts；TMDb 原语言文字与图片模式 |
 | LUX-250 | docs/LUX-DEVELOPMENT.md、web/src/features/home/media.tsx、web/src/features/detail/MediaDetailPage.tsx、web/tests/home-media.test.tsx、web/tests/media-detail.test.tsx；季海报缺失时回退父剧海报 |
 | LUX-251 | docs/LUX-DEVELOPMENT.md、docs/LUX-251-PLAN.md、migrations/0120_manual_item_merges.sql、migrations-postgres/0120_manual_item_merges.sql、src/storage/media_merge.rs、src/storage/repository.rs、src/storage/mod.rs、src/storage/catalog.rs、src/application/item_merge.rs、src/application/mod.rs、src/application/scanner.rs、src/api/legacy.rs、src/api/admin.rs、src/api/admin_handlers.rs、web/src/features/library/LibraryPage.tsx、web/src/lib/api/client.ts、web/src/lib/api/types.ts、tests/item_merge.rs、web/tests/library-page.test.ts；管理员手动合并媒体条目为多版本 |
@@ -6230,7 +6229,7 @@ PostgreSQL 集成测试目标已编译，但其 4 个运行测试因本机没有
 
 #### LUX-247：Emby 兼容局域网发现
 
-为 Lux Prism 的局域网服务器发现增加独立 UDP 服务。服务监听 UDP `7359`，仅处理包含
+为客户端的局域网服务器发现增加独立 UDP 服务。服务监听 UDP `7359`，仅处理包含
 `who is EmbyServer?` 的 UTF-8 或 UTF-16LE 请求，并返回 Emby 兼容的 JSON：
 
 ```json
@@ -6246,7 +6245,7 @@ PostgreSQL 集成测试目标已编译，但其 4 个运行测试因本机没有
 拒绝 userinfo、query 和 fragment。监听地址可用 `LUX_DISCOVERY_BIND_ADDR` 覆盖，默认
 `0.0.0.0:7359`，主要用于测试和受限网络部署。
 
-Prism 必须校验发现 JSON 中的地址，并同时探测返回的 `Address` 与 UDP 响应包来源地址加 Lux HTTP
+客户端应校验发现 JSON 中的地址，并同时探测返回的 `Address` 与 UDP 响应包来源地址加 Lux HTTP
 端口；以 `Id` 去重，不得把 UDP 返回的地址直接当作已验证的连接地址。发现服务不接触认证令牌，
 不记录完整 UDP 数据包或地址中的凭据。
 
@@ -6266,7 +6265,7 @@ UDP 请求、响应和来源地址候选。记录 `uname -m`；本机 ARM64 结�
 
 明确不做：
 
-- 不在本任务实现 Prism 客户端、服务器 ID 去重逻辑或二维码设备配对；后者属于 LUX-248。
+- 不在本任务实现客户端侧服务器 ID 去重逻辑。
 - 不新增认证、广播加密、通用 UDP 代理或额外 Emby 端点。
 
 验证记录（2026-09-09，`uname -m=arm64`）：`cargo test --locked --test discovery`（3 passed）、
@@ -6284,97 +6283,6 @@ UDP 请求、响应和来源地址候选。记录 `uname -m`；本机 ARM64 结�
 处理；`media_items` 未发现可安全删除的明确冗余索引，因此保持不变。新增测试会先运行 1–117
 迁移、写入代表性旧数据，再单独运行 118，确认扫描条目、扫描目标和外键约束均被保留。
 该验证覆盖 SQLite 的真实升级路径；PostgreSQL 仍需在可用实例上运行被忽略的集成测试。
-
-#### LUX-248：Lux Prism 一次性设备配对
-
-为 Lux Prism 提供仅限 Lux 的一次性设备配对合同。Web 登录会话通过
-`POST /api/v1/auth/device-pairings` 创建一个有效期 5 分钟的票据；创建接口必须同时
-验证 `lux_session` 会话和 `x-csrf-token`，不接受共享管理员 API Key。服务端只保存随机
-`secret` 的 SHA-256 哈希，不保存或记录完整二维码 URI。Web 使用当前页面 origin 拼接
-二维码 URI：
-
-```text
-lux-prism://pair?v=1&server=<percent-encoded-origin>&id=<pairingId>&secret=<secret>&expiresAt=<unix-seconds>
-```
-
-`server` 必须是二维码生成页面的当前 HTTP(S) origin；Prism 扫码后应展示服务器名称和
-地址，用户确认后向该地址调用兑换接口。Emby 不生成此二维码。
-
-创建响应为：
-
-```json
-{
-  "pairingId": "019...",
-  "secret": "url-safe-random-secret",
-  "expiresAt": 1770000000
-}
-```
-
-Prism 通过 `POST /api/v1/device-pairings/{pairingId}/redeem` 兑换，提交：
-
-```json
-{
-  "secret": "url-safe-random-secret",
-  "deviceId": "stable-prism-device-id",
-  "deviceName": "Qoo's Mac",
-  "platform": "macOS",
-  "version": "0.1.0"
-}
-```
-
-服务端在一个数据库事务中校验票据、原子标记已消费并创建已有 Emby
-`access_tokens` 记录；新记录的 `client_name` 固定为 `Lux Prism`，`device_type` 保存
-`platform`。兑换成功响应为：
-
-```json
-{
-  "accessToken": "returned-once",
-  "userId": "user-id",
-  "serverId": "server-id"
-}
-```
-
-`accessToken` 只在成功兑换响应中返回，不能写入日志、SQLite/PostgreSQL 或二维码缓存。
-兑换不需要 Web session，但必须提交有效 secret；票据不存在、secret 错误、已过期、已取消
-或已消费分别返回稳定的 `DEVICE_PAIRING_NOT_FOUND`、`DEVICE_PAIRING_INVALID_SECRET`、
-`DEVICE_PAIRING_EXPIRED`、`DEVICE_PAIRING_CANCELLED` 和 `DEVICE_PAIRING_CONSUMED` 错误码。
-取消使用 `DELETE /api/v1/auth/device-pairings/{pairingId}`，同样要求当前创建者的 Web
-session + CSRF，且不能取消其他用户的票据。
-
-创建和兑换分别按用户/来源地址限流；超限返回 `429 TOO MANY REQUESTS`、错误码
-`RATE_LIMITED` 和不超过 60 秒的 `Retry-After`。所有设备字段在 API 边界限制长度并拒绝空值，
-请求体限制为 16 KiB。取消是显式资源操作：不存在、已取消或已消费的票据不再产生新的 token。
-
-验收：
-
-- [x] 从空 SQLite 和已有 SQLite 数据库升级到 0119；PostgreSQL 迁移保持相同表、字段和约束。
-- [x] 未登录、缺少/错误 CSRF 或仅使用共享 API Key 不能创建/取消票据。
-- [x] 创建返回 5 分钟有效的票据和一次性 secret，数据库只保存 secret 哈希。
-- [x] 错误 secret、过期、取消、已消费和不存在票据分别返回上面定义的错误码；设备字段越界被拒绝。
-- [x] 两个并发兑换请求至多一个成功，成功者获得可调用 Emby API 的 AccessToken，另一个得到已消费错误。
-- [x] 兑换事务失败时票据和 AccessToken 一起回滚；取消权限按创建用户隔离。
-- [x] 创建和兑换限流可验证，限流响应不包含 secret、token 或完整 URI。
-- [x] 运行 `cargo test --locked --test device_pairings`、`cargo test --locked --lib security`、
-  `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`，
-  并在可用 PostgreSQL 环境运行对应迁移/并发测试。
-
-验证记录（2026-09-09，`uname -m=arm64`）：`cargo test --locked --test device_pairings`
-（8 passed）、`cargo test --locked --lib security`（3 passed）、`cargo build --locked`、
-`cargo test --locked --all-targets`（所有目标通过；库测试 437 passed、4 ignored）、
-`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`
-和 `git diff --check` 均通过。测试期间发现观测子进程并行启动会争用 LUX-247 的默认 UDP
-`7359`，已让观测测试使用 `127.0.0.1:0` 的临时发现端口；生产默认监听地址未改变。
-PostgreSQL 集成测试目标已编译，但本机没有可用 PostgreSQL 实例，4 个测试保持 ignored，
-因此真实 PostgreSQL 迁移/并发证据仍待可用环境复测。本机 ARM64 结果不外推 Windows、NAS
-或 x86_64 性能。
-
-依赖：LUX-247。
-
-明确不做：
-
-- 不支持 Emby 的二维码配对，不在 Prism 或服务器保存相机画面。
-- 不改变现有 Web session 或普通 Emby 登录合同，不引入离线写队列。
-- 不在本任务实现 Prism 客户端、二维码渲染组件、摄像头权限或系统凭据库存储。
 
 #### LUX-249：TMDb 原语言文字与图片模式
 

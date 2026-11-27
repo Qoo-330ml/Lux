@@ -10,7 +10,7 @@
 |---|---|---|---|
 | `--test admin` | 管理后台、日志导出、可观测性与运维事件 | 14 | 60 |
 | `--test api_web` | HTTP 契约（错误/限流/压缩/健康/远程策略）、Web 会话、Webhook | 13 | 57 |
-| `--test auth_users` | 认证、会话、登录背景、用户与用户设置、设备配对、界面偏好迁移 | 10 | 73 |
+| `--test auth_users` | 认证、会话、登录背景、用户与用户设置、界面偏好迁移 | 9 | 65 |
 | `--test emby` | Emby 兼容层（认证、系统信息、增量刷新、发现、多段播放、检索、下载、WebSocket、查询参数大小写、季作用域、管理员任务与识别/图片端点） | 20 | 111 |
 | `--test scanner` | 媒体库扫描、增量/混合扫描、计划任务、作业事件与关停 | 7 | 152 |
 | `--test library` | 媒体库生命周期、合并/拆分、集合、目录与系列 API | 12 | 62 |
@@ -71,7 +71,6 @@ cargo test --locked --test <新 target> <旧名>::
 | `webhooks_api` | 1 | `cargo test --locked --test api_web webhooks_api::` |
 | `account_preferences_migration` | 2 | `cargo test --locked --test auth_users account_preferences_migration::` |
 | `auth` | 2 | `cargo test --locked --test auth_users auth::` |
-| `device_pairings` | 8 | `cargo test --locked --test auth_users device_pairings::` |
 | `login_background` | 4 | `cargo test --locked --test auth_users login_background::` |
 | `lux_api_auth` | 1 | `cargo test --locked --test auth_users lux_api_auth::` |
 | `resume_favorites` | 6 | `cargo test --locked --test auth_users resume_favorites::` |

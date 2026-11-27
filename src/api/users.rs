@@ -1,6 +1,5 @@
 use super::*;
 
-use crate::auth::device_pairings::{DevicePairingError, PrismDeviceInfo};
 use crate::{
     application::settings::{
         DEFAULT_LOGIN_BACKGROUND_SOURCE, RECENTLY_ADDED_LOGIN_BACKGROUND_SOURCE,
@@ -22,10 +21,6 @@ use crate::{
         submit_public_user_registration, verify_public_user_registration_email,
     },
     auth::sessions::AuthenticatedSession,
-    security::{
-        DEVICE_PAIRING_CREATE_LIMIT, DEVICE_PAIRING_REDEEM_LIMIT,
-        DEVICE_PAIRING_RETRY_AFTER_SECONDS,
-    },
 };
 
 const MAX_LOGIN_BACKGROUND_IMAGES: i64 = 40;
@@ -1377,7 +1372,7 @@ pub(super) async fn auth_submit_public_user_registration(
     match submit_public_user_registration(
         database,
         config_dir,
-        &state.device_pairing_rate_limiter,
+        &state.keyed_rate_limiter,
         connection_peer,
         SubmitUserRegistrationInput {
             email: &request.email,
@@ -1434,7 +1429,7 @@ pub(super) async fn auth_verify_public_user_registration_email(
     match verify_public_user_registration_email(
         database,
         config_dir,
-        &state.device_pairing_rate_limiter,
+        &state.keyed_rate_limiter,
         connection_peer,
         &request.token,
         super::playback::current_unix_timestamp(),
@@ -1491,7 +1486,7 @@ pub(super) async fn auth_resend_public_user_registration_email(
 
     match resend_public_user_registration_email(
         database,
-        &state.device_pairing_rate_limiter,
+        &state.keyed_rate_limiter,
         connection_peer,
         &request.email,
         idempotency_key,
@@ -1686,7 +1681,7 @@ pub(super) async fn auth_update_account_profile(
                 if let Err(error) = request_user_email_change(
                     database,
                     config_dir,
-                    &state.device_pairing_rate_limiter,
+                    &state.keyed_rate_limiter,
                     &user_id,
                     email,
                     super::playback::current_unix_timestamp(),
@@ -1776,7 +1771,7 @@ pub(super) async fn auth_resend_account_email_change(
     match resend_user_email_change(
         database,
         config_dir,
-        &state.device_pairing_rate_limiter,
+        &state.keyed_rate_limiter,
         &user_id,
         &pending,
         super::playback::current_unix_timestamp(),
@@ -1832,353 +1827,6 @@ pub(super) async fn auth_verify_account_email_change(
             .into_response(),
         Err(error) => user_email_verification_error(&headers, error),
     }
-}
-
-pub(super) async fn auth_create_device_pairing(
-    headers: HeaderMap,
-    State(state): State<ReadyAppState>,
-) -> Response {
-    let session = match require_web_session_csrf(&headers, &state).await {
-        Ok(session) => session,
-        Err(response) => return response,
-    };
-    let client_ip = pairing_rate_limit_client_ip(&headers, &state).await;
-    let rate_key = format!("create:{}:{client_ip}", session.user.id);
-    if !state
-        .device_pairing_rate_limiter
-        .try_acquire(&rate_key, DEVICE_PAIRING_CREATE_LIMIT)
-        .await
-    {
-        return rate_limited_response(&headers);
-    }
-    let service = state.device_pairings();
-    match service.create(&session.user.id.to_string()).await {
-        Ok(pairing) => (
-            StatusCode::CREATED,
-            [("Cache-Control", "no-store")],
-            Json(json!({
-                "pairingId": pairing.pairing_id,
-                "secret": pairing.secret,
-                "expiresAt": pairing.expires_at,
-            })),
-        )
-            .into_response(),
-        Err(_) => api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "设备配对暂时不可用",
-        )
-        .into_response(),
-    }
-}
-
-pub(super) async fn auth_cancel_device_pairing(
-    headers: HeaderMap,
-    Path(pairing_id): Path<String>,
-    State(state): State<ReadyAppState>,
-) -> Response {
-    let session = match require_web_session_csrf(&headers, &state).await {
-        Ok(session) => session,
-        Err(response) => return response,
-    };
-    if uuid::Uuid::parse_str(&pairing_id).is_err() {
-        return api_error(
-            &headers,
-            StatusCode::BAD_REQUEST,
-            lux::ApiErrorCode::InvalidRequest,
-            "配对 ID 无效",
-        )
-        .into_response();
-    }
-    let service = state.device_pairings();
-    match service
-        .cancel(&session.user.id.to_string(), &pairing_id)
-        .await
-    {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => api_error(
-            &headers,
-            StatusCode::NOT_FOUND,
-            lux::ApiErrorCode::DevicePairingNotFound,
-            "设备配对不存在",
-        )
-        .into_response(),
-        Err(_) => api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "设备配对暂时不可用",
-        )
-        .into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct DevicePairingRedeemRequest {
-    secret: String,
-    device_id: String,
-    device_name: String,
-    platform: String,
-    version: String,
-}
-
-pub(super) async fn redeem_device_pairing(
-    headers: HeaderMap,
-    Path(pairing_id): Path<String>,
-    State(state): State<ReadyAppState>,
-    Json(request): Json<DevicePairingRedeemRequest>,
-) -> Response {
-    let client_ip = pairing_rate_limit_client_ip(&headers, &state).await;
-    if !state
-        .device_pairing_rate_limiter
-        .try_acquire(&format!("redeem:{client_ip}"), DEVICE_PAIRING_REDEEM_LIMIT)
-        .await
-    {
-        return rate_limited_response(&headers);
-    }
-    if uuid::Uuid::parse_str(&pairing_id).is_err()
-        || bounded_non_empty(&request.secret, 128).is_none()
-        || bounded_non_empty(&request.device_id, 128).is_none()
-        || bounded_non_empty(&request.device_name, 128).is_none()
-        || bounded_non_empty(&request.platform, 64).is_none()
-        || bounded_non_empty(&request.version, 64).is_none()
-    {
-        return api_error(
-            &headers,
-            StatusCode::BAD_REQUEST,
-            lux::ApiErrorCode::InvalidRequest,
-            "设备配对请求无效",
-        )
-        .into_response();
-    }
-    let service = state.device_pairings();
-    let device = PrismDeviceInfo {
-        device_id: request.device_id.trim(),
-        device_name: request.device_name.trim(),
-        platform: request.platform.trim(),
-        version: request.version.trim(),
-    };
-    match service
-        .redeem(&pairing_id, request.secret.trim(), &device)
-        .await
-    {
-        Ok(redemption) => {
-            // Redemption mints a client token, so it is a login entry point of its own: a remote
-            // request may not hand a device a credential for an account whose remote access is
-            // withdrawn. `Ok(false)` is the policy refusal; `Err(())` means the answer could not
-            // be established, which fails closed.
-            let policy = match super::request_is_remote(&headers, &state).await {
-                Ok(false) => Ok(true),
-                Ok(true) => match UserStore::new(state.database().clone()) {
-                    // An account that no longer exists cannot use the token either.
-                    Ok(users) => users
-                        .find_by_id(&redemption.user_id)
-                        .await
-                        .map(|user| user.is_some_and(|user| user.can_remote_access))
-                        .map_err(|_| ()),
-                    Err(_) => Err(()),
-                },
-                Err(_) => Err(()),
-            };
-            match policy {
-                Ok(true) => {}
-                Ok(false) => {
-                    let _ = state.emby_auth().logout(&redemption.access_token).await;
-                    return api_error(
-                        &headers,
-                        StatusCode::FORBIDDEN,
-                        lux::ApiErrorCode::PermissionDenied,
-                        "当前账户不允许远程访问",
-                    )
-                    .into_response();
-                }
-                Err(()) => {
-                    // Revoke before answering so the pairing cannot be replayed into a token the
-                    // caller never learns the fate of.
-                    let _ = state.emby_auth().logout(&redemption.access_token).await;
-                    return api_error(
-                        &headers,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        lux::ApiErrorCode::DatabaseUnavailable,
-                        "设备配对暂时不可用",
-                    )
-                    .into_response();
-                }
-            }
-            (
-                StatusCode::OK,
-                [("Cache-Control", "no-store")],
-                Json(json!({
-                    "accessToken": redemption.access_token,
-                    "userId": redemption.user_id,
-                    "serverId": state.server_id,
-                })),
-            )
-                .into_response()
-        }
-        Err(error) => device_pairing_error(&headers, error),
-    }
-}
-
-async fn require_web_session_csrf(
-    headers: &HeaderMap,
-    state: &ReadyAppState,
-) -> Result<AuthenticatedSession, Response> {
-    let auth = state.auth();
-    let Some(session_token) = request_cookie(headers, "lux_session") else {
-        return Err(api_error(
-            headers,
-            StatusCode::UNAUTHORIZED,
-            lux::ApiErrorCode::AuthenticationRequired,
-            "需要登录",
-        )
-        .into_response());
-    };
-    let session = match resolve_web_session_for_request(headers, state, auth, &session_token).await
-    {
-        Ok(Some(session)) => session,
-        Ok(None) => {
-            return Err(api_error(
-                headers,
-                StatusCode::UNAUTHORIZED,
-                lux::ApiErrorCode::AuthenticationRequired,
-                "需要登录",
-            )
-            .into_response());
-        }
-        Err(_) => {
-            return Err(api_error(
-                headers,
-                StatusCode::SERVICE_UNAVAILABLE,
-                lux::ApiErrorCode::DatabaseUnavailable,
-                "认证暂时不可用",
-            )
-            .into_response());
-        }
-    };
-    let remote = match super::request_is_remote(headers, state).await {
-        Ok(remote) => remote,
-        Err(_) => {
-            return Err(api_error(
-                headers,
-                StatusCode::SERVICE_UNAVAILABLE,
-                lux::ApiErrorCode::DatabaseUnavailable,
-                "认证暂时不可用",
-            )
-            .into_response());
-        }
-    };
-    if remote && !session.user.can_remote_access {
-        return Err(api_error(
-            headers,
-            StatusCode::FORBIDDEN,
-            lux::ApiErrorCode::PermissionDenied,
-            "当前账户不允许远程访问",
-        )
-        .into_response());
-    }
-    let Some(csrf_token) = headers
-        .get("x-csrf-token")
-        .and_then(|value| value.to_str().ok())
-    else {
-        return Err(api_error(
-            headers,
-            StatusCode::FORBIDDEN,
-            lux::ApiErrorCode::CsrfFailed,
-            "CSRF 校验失败",
-        )
-        .into_response());
-    };
-    if !auth.verify_csrf(&session, csrf_token) {
-        return Err(api_error(
-            headers,
-            StatusCode::FORBIDDEN,
-            lux::ApiErrorCode::CsrfFailed,
-            "CSRF 校验失败",
-        )
-        .into_response());
-    }
-    let user_id = session.user.id.to_string();
-    let device_id = session
-        .device_id
-        .clone()
-        .or_else(|| web_login_device_id(headers));
-    let remote_ip = super::request_access_ip(headers, state)
-        .await
-        .ok()
-        .flatten();
-    record_web_device_observation(state, &user_id, device_id.as_deref(), remote_ip).await;
-    Ok(session)
-}
-
-fn bounded_non_empty(value: &str, max_bytes: usize) -> Option<&str> {
-    let value = value.trim();
-    (!value.is_empty() && value.len() <= max_bytes).then_some(value)
-}
-
-async fn pairing_rate_limit_client_ip(headers: &HeaderMap, state: &ReadyAppState) -> String {
-    request_client_ip(headers, state)
-        .await
-        .unwrap_or_else(|| "local".to_owned())
-}
-
-fn rate_limited_response(headers: &HeaderMap) -> Response {
-    let (status, body) = api_error(
-        headers,
-        StatusCode::TOO_MANY_REQUESTS,
-        lux::ApiErrorCode::RateLimited,
-        "请求过于频繁，请稍后重试",
-    );
-    (
-        status,
-        [
-            (
-                "Retry-After",
-                DEVICE_PAIRING_RETRY_AFTER_SECONDS.to_string(),
-            ),
-            ("Cache-Control", "no-store".to_owned()),
-        ],
-        body,
-    )
-        .into_response()
-}
-
-fn device_pairing_error(headers: &HeaderMap, error: DevicePairingError) -> Response {
-    let (status, code, message) = match error {
-        DevicePairingError::NotFound => (
-            StatusCode::NOT_FOUND,
-            lux::ApiErrorCode::DevicePairingNotFound,
-            "设备配对不存在",
-        ),
-        DevicePairingError::InvalidSecret => (
-            StatusCode::BAD_REQUEST,
-            lux::ApiErrorCode::DevicePairingInvalidSecret,
-            "设备配对密钥无效",
-        ),
-        DevicePairingError::Expired => (
-            StatusCode::GONE,
-            lux::ApiErrorCode::DevicePairingExpired,
-            "设备配对已过期",
-        ),
-        DevicePairingError::Cancelled => (
-            StatusCode::GONE,
-            lux::ApiErrorCode::DevicePairingCancelled,
-            "设备配对已取消",
-        ),
-        DevicePairingError::Consumed => (
-            StatusCode::CONFLICT,
-            lux::ApiErrorCode::DevicePairingConsumed,
-            "设备配对已使用",
-        ),
-        DevicePairingError::Storage(_) | DevicePairingError::TokenGeneration(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "设备配对暂时不可用",
-        ),
-    };
-    api_error(headers, status, code, message).into_response()
 }
 
 pub(super) async fn auth_settings(
@@ -3384,18 +3032,6 @@ pub(super) fn api_routes() -> Router<ReadyAppState> {
         .route(
             "/api/v1/auth/profile/email-verification/verify",
             post(users::auth_verify_account_email_change).layer(DefaultBodyLimit::max(16 * 1024)),
-        )
-        .route(
-            "/api/v1/auth/device-pairings",
-            post(users::auth_create_device_pairing),
-        )
-        .route(
-            "/api/v1/auth/device-pairings/{pairing_id}",
-            delete(users::auth_cancel_device_pairing),
-        )
-        .route(
-            "/api/v1/device-pairings/{pairing_id}/redeem",
-            post(users::redeem_device_pairing).layer(DefaultBodyLimit::max(16 * 1024)),
         )
         .route(
             "/api/v1/auth/settings",

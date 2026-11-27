@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::{
     application::mail::{MailChallengeSigner, hash_mail_challenge_token},
-    security::DevicePairingRateLimiter,
+    security::KeyedRateLimiter,
     storage::{
         Database, MailChallengeKind, MailOutboxTemplateKind, NewMailChallenge,
         NewMailOutboxMessage, UserEmailChangeCreateResult, UserEmailChangeVerifyResult,
@@ -74,7 +74,7 @@ pub(crate) async fn clear_user_email_change(
 pub(crate) async fn request_user_email_change(
     database: &Database,
     config_dir: &Path,
-    rate_limiter: &DevicePairingRateLimiter,
+    rate_limiter: &KeyedRateLimiter,
     user_id: &str,
     email: &str,
     now: i64,
@@ -95,7 +95,7 @@ pub(crate) async fn request_user_email_change(
 pub(crate) async fn resend_user_email_change(
     database: &Database,
     config_dir: &Path,
-    rate_limiter: &DevicePairingRateLimiter,
+    rate_limiter: &KeyedRateLimiter,
     user_id: &str,
     pending: &PendingUserEmailChange,
     now: i64,
@@ -116,7 +116,7 @@ pub(crate) async fn resend_user_email_change(
 async fn request_user_email_change_with_expected_pending(
     database: &Database,
     config_dir: &Path,
-    rate_limiter: &DevicePairingRateLimiter,
+    rate_limiter: &KeyedRateLimiter,
     user_id: &str,
     email: &str,
     expected_pending_challenge_id: Option<&str>,
@@ -312,7 +312,7 @@ mod tests {
                 verify_user_email_change,
             },
         },
-        security::DevicePairingRateLimiter,
+        security::KeyedRateLimiter,
         storage::{Database, MailChallengeKind, NewStoredUser},
     };
 
@@ -369,7 +369,7 @@ mod tests {
         let config_dir = directory.path().join("config");
         add_user(&database, "email-owner", "old@example.test").await?;
         add_user(&database, "email-other", "other@example.test").await?;
-        let limiter = DevicePairingRateLimiter::default();
+        let limiter = KeyedRateLimiter::default();
 
         let requested = request_user_email_change(
             &database,
@@ -500,7 +500,7 @@ mod tests {
     async fn account_and_recipient_email_rate_limits_are_enforced() -> Result<(), Box<dyn Error>> {
         let (directory, database) = test_database().await?;
         let config_dir = directory.path().join("config");
-        let limiter = DevicePairingRateLimiter::default();
+        let limiter = KeyedRateLimiter::default();
         add_user(&database, "account-limited", "account@example.test").await?;
         for index in 0..5 {
             request_user_email_change(
@@ -526,7 +526,7 @@ mod tests {
             Err(UserEmailVerificationError::RateLimited)
         );
 
-        let shared_limiter = DevicePairingRateLimiter::default();
+        let shared_limiter = KeyedRateLimiter::default();
         for index in 0..6 {
             let user_id = format!("shared-email-{index}");
             add_user(&database, &user_id, &format!("{user_id}@example.test")).await?;
@@ -566,7 +566,7 @@ mod tests {
             request_user_email_change(
                 &database,
                 &config_dir,
-                &DevicePairingRateLimiter::default(),
+                &KeyedRateLimiter::default(),
                 "email-queue-failure",
                 "new@example.test",
                 1_000,

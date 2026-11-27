@@ -21,7 +21,7 @@ LUX_DISCOVERY_ADVERTISE_URL=https://lux.example.internal
 
 该值只接受 HTTP/HTTPS，不得包含用户名、密码、查询参数或 fragment。`LUX_DISCOVERY_BIND_ADDR`
 可用于受限网络部署，默认是 `0.0.0.0:7359`；它只影响 UDP 监听，不改变 HTTP 监听地址。发现响应不携带
-认证信息，Prism 仍须验证响应地址，并额外探测 UDP 来源地址对应的 HTTP 端点。
+认证信息，客户端仍须验证响应地址，并额外探测 UDP 来源地址对应的 HTTP 端点。
 
 Compose 默认把 Lux 容器的内存硬上限设为 `2g`。这不是正常内存预算；Lux 的默认扫描常驻内存目标仍是
 750 MB 以下。有限的 cgroup 上限让 Lux 能读取真实的容器内存压力：使用率达到 70% 时后台 worker

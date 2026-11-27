@@ -9,7 +9,7 @@ use crate::{
         settings::{NewUserPermissions, read_new_user_permissions, read_registration_mode},
     },
     auth::password::PasswordService,
-    security::DevicePairingRateLimiter,
+    security::KeyedRateLimiter,
     storage::{
         Database, MailChallengeKind, MailOutboxTemplateKind, NewMailChallenge,
         NewMailOutboxMessage, NewUserRegistrationRequest, RegistrationMode,
@@ -247,7 +247,7 @@ pub(crate) async fn reject_pending_user_registration(
 pub(crate) async fn submit_public_user_registration(
     database: &Database,
     config_dir: &Path,
-    rate_limiter: &DevicePairingRateLimiter,
+    rate_limiter: &KeyedRateLimiter,
     connection_peer: IpAddr,
     input: SubmitUserRegistrationInput<'_>,
     now: i64,
@@ -376,7 +376,7 @@ pub(crate) async fn submit_public_user_registration(
 
 pub(crate) async fn resend_public_user_registration_email(
     database: &Database,
-    rate_limiter: &DevicePairingRateLimiter,
+    rate_limiter: &KeyedRateLimiter,
     connection_peer: IpAddr,
     email: &str,
     idempotency_key: &str,
@@ -434,7 +434,7 @@ fn normalize_registration_email(value: &str) -> Result<String, UserRegistrationE
 pub(crate) async fn verify_public_user_registration_email(
     database: &Database,
     config_dir: &Path,
-    rate_limiter: &DevicePairingRateLimiter,
+    rate_limiter: &KeyedRateLimiter,
     connection_peer: IpAddr,
     token: &str,
     now: i64,
@@ -490,7 +490,7 @@ mod tests {
         application::{
             mail::MailChallengeSigner, settings::NewUserPermissions, user_registration::*,
         },
-        security::DevicePairingRateLimiter,
+        security::KeyedRateLimiter,
         storage::{Database, MailChallengeKind, MailOutboxTemplateKind},
     };
 
@@ -529,7 +529,7 @@ mod tests {
     async fn submit(
         database: &Database,
         directory: &tempfile::TempDir,
-        limiter: &DevicePairingRateLimiter,
+        limiter: &KeyedRateLimiter,
         peer: IpAddr,
         email: &str,
         username: &str,
@@ -571,7 +571,7 @@ mod tests {
         submit_public_user_registration(
             &database,
             &directory.path().join("config"),
-            &DevicePairingRateLimiter::default(),
+            &KeyedRateLimiter::default(),
             IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)),
             SubmitUserRegistrationInput {
                 email: " User@Example.Test ",
@@ -636,7 +636,7 @@ mod tests {
         crate::application::settings::update_registration_mode(&database, "PUBLIC_EMAIL", 0)
             .await
             .map_err(|_| "could not enable public email registration")?;
-        let limiter = DevicePairingRateLimiter::default();
+        let limiter = KeyedRateLimiter::default();
         let peer = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
         for (email, username, now) in [
             ("verified@example.test", "verified-user", 1_000),
@@ -758,7 +758,7 @@ mod tests {
     async fn closed_mode_rejects_submission_and_duplicate_email_is_indistinguishable()
     -> Result<(), Box<dyn std::error::Error>> {
         let (directory, database) = test_database().await?;
-        let limiter = DevicePairingRateLimiter::default();
+        let limiter = KeyedRateLimiter::default();
         let peer = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
         assert_eq!(
             submit(
@@ -880,7 +880,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let (directory, database) = test_database().await?;
         enable_public_registration(&database).await?;
-        let limiter = DevicePairingRateLimiter::default();
+        let limiter = KeyedRateLimiter::default();
         let peer = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11));
         for index in 0..USER_REGISTRATION_EMAIL_RATE_LIMIT {
             submit(
@@ -944,7 +944,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let (directory, database) = test_database().await?;
         enable_public_registration(&database).await?;
-        let limiter = DevicePairingRateLimiter::default();
+        let limiter = KeyedRateLimiter::default();
         let peer = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 20));
         submit(
             &database,
@@ -1042,7 +1042,7 @@ mod tests {
     async fn resend_applies_registration_rate_limits() -> Result<(), Box<dyn std::error::Error>> {
         let (directory, database) = test_database().await?;
         enable_public_registration(&database).await?;
-        let limiter = DevicePairingRateLimiter::default();
+        let limiter = KeyedRateLimiter::default();
         let peer = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 21));
         submit(
             &database,

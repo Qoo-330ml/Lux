@@ -11,11 +11,8 @@ const WINDOW: Duration = Duration::from_secs(60);
 const MAX_FAILURES: u8 = 5;
 const MAX_ENTRIES: usize = 10_000;
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
-const DEVICE_PAIRING_WINDOW: Duration = Duration::from_secs(60);
-const DEVICE_PAIRING_MAX_ENTRIES: usize = 10_000;
-pub const DEVICE_PAIRING_CREATE_LIMIT: u32 = 10;
-pub const DEVICE_PAIRING_REDEEM_LIMIT: u32 = 10;
-pub const DEVICE_PAIRING_RETRY_AFTER_SECONDS: u64 = 60;
+const KEYED_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const KEYED_RATE_LIMIT_MAX_ENTRIES: usize = 10_000;
 
 #[derive(Clone)]
 pub struct LoginRateLimiter {
@@ -110,14 +107,14 @@ impl LoginRateLimiter {
 }
 
 #[derive(Clone)]
-pub struct DevicePairingRateLimiter {
-    state: Arc<Mutex<DevicePairingRateLimiterState>>,
+pub struct KeyedRateLimiter {
+    state: Arc<Mutex<KeyedRateLimiterState>>,
 }
 
-impl Default for DevicePairingRateLimiter {
+impl Default for KeyedRateLimiter {
     fn default() -> Self {
         Self {
-            state: Arc::new(Mutex::new(DevicePairingRateLimiterState {
+            state: Arc::new(Mutex::new(KeyedRateLimiterState {
                 attempts: HashMap::new(),
                 last_cleanup: Instant::now(),
             })),
@@ -125,14 +122,14 @@ impl Default for DevicePairingRateLimiter {
     }
 }
 
-impl DevicePairingRateLimiter {
+impl KeyedRateLimiter {
     pub async fn try_acquire(&self, key: &str, limit: u32) -> bool {
         let mut state = self.state.lock().await;
         let now = Instant::now();
-        cleanup_device_pairing_attempts(&mut state, now);
+        cleanup_keyed_rate_limit_attempts(&mut state, now);
         let key = key_digest(key);
         if let Some(attempt) = state.attempts.get_mut(&key) {
-            if now.saturating_duration_since(attempt.started_at) >= DEVICE_PAIRING_WINDOW {
+            if now.saturating_duration_since(attempt.started_at) >= KEYED_RATE_LIMIT_WINDOW {
                 attempt.started_at = now;
                 attempt.count = 0;
             }
@@ -142,12 +139,12 @@ impl DevicePairingRateLimiter {
             attempt.count = attempt.count.saturating_add(1);
             return true;
         }
-        if state.attempts.len() >= DEVICE_PAIRING_MAX_ENTRIES {
+        if state.attempts.len() >= KEYED_RATE_LIMIT_MAX_ENTRIES {
             return false;
         }
         state.attempts.insert(
             key,
-            DevicePairingAttempt {
+            KeyedRateLimitAttempt {
                 started_at: now,
                 count: 1,
             },
@@ -166,12 +163,12 @@ struct LoginAttempt {
     failures: u8,
 }
 
-struct DevicePairingRateLimiterState {
-    attempts: HashMap<[u8; 32], DevicePairingAttempt>,
+struct KeyedRateLimiterState {
+    attempts: HashMap<[u8; 32], KeyedRateLimitAttempt>,
     last_cleanup: Instant,
 }
 
-struct DevicePairingAttempt {
+struct KeyedRateLimitAttempt {
     started_at: Instant,
     count: u32,
 }
@@ -186,12 +183,12 @@ fn maybe_cleanup(state: &mut LoginRateLimiterState, now: Instant) {
     state.last_cleanup = now;
 }
 
-fn cleanup_device_pairing_attempts(state: &mut DevicePairingRateLimiterState, now: Instant) {
+fn cleanup_keyed_rate_limit_attempts(state: &mut KeyedRateLimiterState, now: Instant) {
     if now.saturating_duration_since(state.last_cleanup) < CLEANUP_INTERVAL {
         return;
     }
     state.attempts.retain(|_, attempt| {
-        now.saturating_duration_since(attempt.started_at) < DEVICE_PAIRING_WINDOW
+        now.saturating_duration_since(attempt.started_at) < KEYED_RATE_LIMIT_WINDOW
     });
     state.last_cleanup = now;
 }
@@ -342,7 +339,7 @@ struct RequestWindow {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLEANUP_INTERVAL, DanmakuSearchRateLimiter, DevicePairingRateLimiter, LoginAttempt,
+        CLEANUP_INTERVAL, DanmakuSearchRateLimiter, KeyedRateLimiter, LoginAttempt,
         LoginRateLimiter, MAX_ENTRIES, MAX_FAILURES, RequestRateLimiter, WINDOW, key_digest,
     };
     use std::{
@@ -492,8 +489,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn device_pairing_rate_limiter_applies_per_key_limits() {
-        let limiter = DevicePairingRateLimiter::default();
+    async fn keyed_rate_limiter_applies_per_key_limits() {
+        let limiter = KeyedRateLimiter::default();
         assert!(limiter.try_acquire("client-a", 2).await);
         assert!(limiter.try_acquire("client-a", 2).await);
         assert!(!limiter.try_acquire("client-a", 2).await);

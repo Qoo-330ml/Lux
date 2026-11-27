@@ -48,8 +48,6 @@ pub use database_maintenance::{
     DEFAULT_MAINTENANCE_INITIAL_DELAY_SECONDS, DEFAULT_MAINTENANCE_INTERVAL_SECONDS,
     MaintenanceCandidate, MaintenanceReport, SqliteStatisticsRefresh,
 };
-#[path = "device_pairings.rs"]
-mod device_pairings;
 #[path = "emby_migration.rs"]
 mod emby_migration;
 #[path = "jobs.rs"]
@@ -353,7 +351,6 @@ mod manifest_positive_index_batch_tests {
 }
 
 pub use database_cleanup::DatabaseLifecycleCleanupReport;
-pub(crate) use device_pairings::DevicePairingRedeemResult;
 
 pub(crate) use emby_migration::{
     EmbyMigrationHandledItemBatch, EmbyMigrationImportRecordBatch, EmbyMigrationItemMatchBatch,
@@ -6228,23 +6225,6 @@ pub(crate) struct NewPlaybackAccessToken<'a> {
     pub(crate) client_version: &'a str,
     pub(crate) playback_session_id: &'a str,
     pub(crate) expires_at: i64,
-}
-
-pub(crate) struct NewDevicePairing<'a> {
-    pub(crate) id: &'a str,
-    pub(crate) user_id: &'a str,
-    pub(crate) secret_hash: &'a [u8],
-    pub(crate) expires_at: i64,
-}
-
-pub(crate) struct NewDeviceAccessToken<'a> {
-    pub(crate) id: &'a str,
-    pub(crate) token_hash: &'a [u8],
-    pub(crate) device_id: &'a str,
-    pub(crate) client_name: &'a str,
-    pub(crate) device_name: &'a str,
-    pub(crate) client_version: &'a str,
-    pub(crate) device_type: Option<&'a str>,
 }
 
 pub(crate) struct NewLibrary<'a> {

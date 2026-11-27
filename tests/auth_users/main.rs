@@ -1,6 +1,5 @@
 mod account_preferences_migration;
 mod auth;
-mod device_pairings;
 mod login_background;
 mod lux_api_auth;
 mod resume_favorites;
