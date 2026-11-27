@@ -2907,14 +2907,7 @@ impl Database {
                ON child.item_type = 'EPISODE' AND child.removed_at IS NULL
               AND ((parent.item_type = 'SERIES' AND child.series_id = parent.id)
                 OR (parent.item_type = 'SEASON' AND child.parent_id = parent.id))
-              AND EXISTS (
-                  SELECT 1
-                  FROM media_sources child_source
-                  JOIN filesystem_entries child_entry
-                    ON child_entry.id = child_source.filesystem_entry_id
-                  WHERE child_source.item_id = child.id
-                    AND child_entry.is_missing = 0
-              ){content_restriction_predicate}
+              AND child.has_available_source = 1{content_restriction_predicate}
              WHERE parent.id IN ({placeholders})
                AND parent.item_type IN ('SERIES', 'SEASON')
                AND parent.removed_at IS NULL
@@ -4635,7 +4628,42 @@ impl Database {
         &self,
         item_ids: &[String],
     ) -> Result<HashMap<String, StoredCatalogDetail>, StorageError> {
+        self.list_catalog_details_by_ids_internal(item_ids, true)
+            .await
+    }
+
+    /// Variant for callers that compute `episode_count` separately via [`Self::list_episode_counts`]
+    /// (which enforces source availability and user content restrictions), skipping a redundant
+    /// `COUNT(DISTINCT ...)` correlated subquery per container row.
+    pub(crate) async fn list_catalog_details_without_episode_counts_by_ids(
+        &self,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, StoredCatalogDetail>, StorageError> {
+        self.list_catalog_details_by_ids_internal(item_ids, false)
+            .await
+    }
+
+    async fn list_catalog_details_by_ids_internal(
+        &self,
+        item_ids: &[String],
+        include_episode_count: bool,
+    ) -> Result<HashMap<String, StoredCatalogDetail>, StorageError> {
         let mut details = HashMap::with_capacity(item_ids.len());
+        let episode_count_expr = if include_episode_count {
+            "(SELECT COUNT(DISTINCT CASE
+                        WHEN mi.item_type = 'SERIES' THEN
+                            COALESCE(CAST(child.season_number AS TEXT), '') || ':' ||
+                            COALESCE(CAST(child.episode_number AS TEXT), child.id)
+                        ELSE COALESCE(CAST(child.episode_number AS TEXT), child.id)
+                    END)
+             FROM media_items child
+             WHERE child.item_type = 'EPISODE'
+               AND child.removed_at IS NULL
+               AND ((mi.item_type = 'SERIES' AND child.series_id = mi.id)
+                 OR (mi.item_type = 'SEASON' AND child.parent_id = mi.id)))"
+        } else {
+            "0"
+        };
         for item_ids in item_ids.chunks(500) {
             if item_ids.is_empty() {
                 continue;
@@ -4656,17 +4684,7 @@ impl Database {
                         (SELECT COUNT(*) FROM media_items child
                          WHERE child.parent_id = mi.id AND child.item_type = 'SEASON'
                            AND child.removed_at IS NULL) AS season_count,
-                        (SELECT COUNT(DISTINCT CASE
-                                    WHEN mi.item_type = 'SERIES' THEN
-                                        COALESCE(CAST(child.season_number AS TEXT), '') || ':' ||
-                                        COALESCE(CAST(child.episode_number AS TEXT), child.id)
-                                    ELSE COALESCE(CAST(child.episode_number AS TEXT), child.id)
-                                END)
-                         FROM media_items child
-                         WHERE child.item_type = 'EPISODE'
-                           AND child.removed_at IS NULL
-                           AND ((mi.item_type = 'SERIES' AND child.series_id = mi.id)
-                             OR (mi.item_type = 'SEASON' AND child.parent_id = mi.id))) AS episode_count
+                        {episode_count_expr} AS episode_count
                  FROM media_items mi
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                  WHERE mi.id IN ({placeholders}) AND mi.removed_at IS NULL"
@@ -10065,10 +10083,21 @@ impl Database {
         } else if fingerprint_changed {
             self.query(
                 "UPDATE media_items
-                 SET nfo_metadata_fingerprint = ?, updated_at = unixepoch()
+                 SET nfo_metadata_json = NULL,
+                     nfo_metadata_fingerprint = ?, updated_at = unixepoch()
                  WHERE id = ?",
             )
             .bind(source_fingerprint)
+            .bind(item_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())?;
+        } else {
+            self.query(
+                "UPDATE media_items
+                 SET nfo_metadata_json = NULL
+                 WHERE id = ? AND nfo_metadata_json IS NOT NULL",
+            )
             .bind(item_id)
             .execute(&mut **transaction)
             .await

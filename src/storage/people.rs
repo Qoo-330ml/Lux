@@ -1892,12 +1892,16 @@ impl Database {
         .await
         .map_err(self.sqlx_err())?;
 
-        self.query("UPDATE person_credits SET lux_person_id = ? WHERE lux_person_id = ?")
-            .bind(target_person_id)
-            .bind(source_person_id)
-            .execute(&mut **transaction)
-            .await
-            .map_err(self.sqlx_err())?;
+        self.query(
+            "UPDATE person_credits
+             SET lux_person_id = ?
+             WHERE lux_person_id = ? AND lux_person_id IS NOT NULL",
+        )
+        .bind(target_person_id)
+        .bind(source_person_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(self.sqlx_err())?;
 
         self.migrate_user_person_state_in_transaction(
             transaction,
@@ -1930,7 +1934,7 @@ impl Database {
         self.query(
             "UPDATE person_match_candidates
              SET previous_person_id = ?
-             WHERE previous_person_id = ?",
+             WHERE previous_person_id = ? AND previous_person_id IS NOT NULL",
         )
         .bind(target_person_id)
         .bind(source_person_id)

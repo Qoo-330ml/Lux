@@ -919,6 +919,11 @@
       "name": "slim_catalog_read_model_and_guard_triggers",
       "sqlite": 253,
       "postgres": 253
+    },
+    {
+      "name": "index_series_next_people_merge_and_clear_legacy_nfo_json",
+      "sqlite": 254,
+      "postgres": 254
     }
   ],
   "sqlite_only": [
@@ -1271,7 +1276,7 @@
     }
   ],
   "ordering": {
-    "shared_names": 184,
+    "shared_names": 185,
     "rank_mismatches": 84,
     "note": "Migration histories evolved with different SQLite-only/PostgreSQL-only interleaving, so the shared names are not in the same relative order. New migrations must keep a pair adjacent in both directories, which keeps this count from growing."
   }

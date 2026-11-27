@@ -23889,6 +23889,101 @@ async fn catalog_outbox_and_availability_triggers_skip_unrelated_or_noop_writes(
 }
 
 #[tokio::test]
+async fn series_next_and_people_merge_queries_use_dedicated_indexes()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    for (sql, expected_index) in [
+        (
+            "EXPLAIN QUERY PLAN SELECT 1 FROM user_series_next WHERE series_id = 's1'",
+            "idx_user_series_next_series",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT 1 FROM user_series_next WHERE next_item_id = 'e1'",
+            "idx_user_series_next_item",
+        ),
+        (
+            "EXPLAIN QUERY PLAN UPDATE person_credits SET lux_person_id = 'p2' WHERE lux_person_id = 'p1' AND lux_person_id IS NOT NULL",
+            "idx_person_credits_lux_person_id",
+        ),
+        (
+            "EXPLAIN QUERY PLAN SELECT user_id FROM user_person_state WHERE person_id = 'p1'",
+            "idx_user_person_state_person",
+        ),
+        (
+            "EXPLAIN QUERY PLAN UPDATE emby_migration_person_favorites SET lux_person_id = 'p2' WHERE lux_person_id = 'p1'",
+            "idx_emby_migration_person_favorites_person",
+        ),
+        (
+            "EXPLAIN QUERY PLAN UPDATE person_match_candidates SET previous_person_id = 'p2' WHERE previous_person_id = 'p1' AND previous_person_id IS NOT NULL",
+            "idx_person_match_candidates_previous",
+        ),
+    ] {
+        let details: Vec<String> = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .fetch_all(database.pool())
+            .await?
+            .into_iter()
+            .filter_map(|row| row.try_get::<String, _>(3).ok())
+            .collect();
+        assert!(
+            details.iter().any(|line| line.contains(expected_index)),
+            "expected {expected_index} in query plan for `{sql}`, got {details:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn fingerprint_only_nfo_update_clears_legacy_inline_nfo_metadata_json()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::application::libraries::LibraryService;
+    use crate::library::LibraryKind;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Legacy NFO", LibraryKind::Movie, false)
+        .await?;
+    let json = r#"{"title":"Legacy"}"#;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             nfo_metadata_json, nfo_metadata_fingerprint
+         ) VALUES ('legacy-nfo-item', ?, 'MOVIE', 'Legacy', 'legacy', 'LOCAL_CONFIRMED', ?, ?)",
+    )
+    .bind(library.id.to_string())
+    .bind(json)
+    .bind(&[1_u8][..])
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_item_nfo_cache (item_id, fingerprint, json, bytes)
+         VALUES ('legacy-nfo-item', ?, ?, ?)",
+    )
+    .bind(&[1_u8][..])
+    .bind(json)
+    .bind(json.len() as i64)
+    .execute(database.pool())
+    .await?;
+
+    database
+        .update_media_item_nfo_metadata("legacy-nfo-item", Some(json), Some(&[2_u8]))
+        .await?;
+
+    let inline_json: Option<String> = sqlx::query_scalar(
+        "SELECT nfo_metadata_json FROM media_items WHERE id = 'legacy-nfo-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        inline_json, None,
+        "fingerprint-only NFO update must clear legacy inline nfo_metadata_json"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn catalog_read_model_rebuild_copies_authoritative_fields_and_validates()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::application::libraries::LibraryService;

@@ -3029,7 +3029,10 @@ impl CatalogService {
             .database
             .list_episode_counts(&item_ids, content_restrictions)
             .await?;
-        let details = self.database.list_catalog_details_by_ids(&item_ids).await?;
+        let details = self
+            .database
+            .list_catalog_details_without_episode_counts_by_ids(&item_ids)
+            .await?;
         for item in &mut *items {
             if let Some(detail) = details.get(&item.id) {
                 item.season_count = Some(detail.season_count);
@@ -3052,7 +3055,8 @@ impl CatalogService {
             .map(|item| item.id.clone())
             .collect::<Vec<_>>();
         let (details, episode_counts) = tokio::try_join!(
-            self.database.list_catalog_details_by_ids(&item_ids),
+            self.database
+                .list_catalog_details_without_episode_counts_by_ids(&item_ids),
             self.database
                 .list_episode_counts(&episode_item_ids, content_restrictions),
         )?;
