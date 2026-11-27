@@ -2,6 +2,23 @@ import type { ChangelogRelease } from "../types";
 
 export const changelogReleases07: ChangelogRelease[] = [
   {
+    version: "0.7.31",
+    date: "2026-11-27",
+    sections: [
+      { kind: "added", items: [
+        "✨ feat(emby): 搜索按 ParentId 限定范围，新增条目祖先链 — /Items、/Users/{id}/Items 与 /Search/Hints 带 SearchTerm 时只在请求的媒体库或子树里搜，并照旧执行媒体库权限；新增 /Items/{id}/Ancestors 返回直到所属媒体库的父链；/Library/VirtualFolders 的 ItemCount 改成一次聚合，不再逐库查询。",
+      ] },
+      { kind: "changed", items: [
+        "💥 breaking(auth): 退役的 Lux Prism 桌面客户端与设备配对整体删除 — 配对接口、device_pairings 表、两份 ADR 和前端入口都移除了，迁移 0255 会直接删表；还在用旧桌面客户端或自己调配对接口的部署需要改用 Web 或 Emby 兼容登录。",
+        "⚡ perf(storage): 读模型瘦身与新索引 — 迁移 0253 删掉没人读的统计表、两个多余索引和 catalog_items 上 11 个无读者列，outbox 触发器改成只在该变的列变化时才级联；0254 补了 series_next 与人物合并相关索引，并清掉 0228 之后重复保存的 NFO 内联 JSON。",
+        "⚡ perf(cache): 缓存都加了字节上限 — 插件响应缓存、目录页缓存、弹幕流式校验结论和共享 API Key 哈希缓存都按预算淘汰、令牌撤销即失效，长时间运行不再缓慢涨内存。",
+        "⚡ perf(api): 图片与 Emby 路由更快 — 图片解析与变体生成走短路，Emby 字段投影减少重复分配，黑名单合成一条查询、可信代理 CIDR 做缓存，Tokio 线程池按负载配置。",
+        "⚡ perf(runtime): 内存与热路径 — Linux 容器里给 jemalloc 配 decay/arena，PeopleService 的锁表与 manifest 映射会淘汰，扫描任务终态回收，STRM 与 webhook 复用固定地址的客户端池，身份合并改成事件驱动。",
+        "⚡ perf(web): 播放器 MSE 缓冲加背压 — 按缓冲水位做背压与分段淘汰，字幕 worker 停止时真正退出，详情页无限查询加上限，长时间播放不再一路吃内存。",
+      ] },
+    ],
+  },
+  {
     version: "0.7.30",
     date: "2026-11-24",
     sections: [

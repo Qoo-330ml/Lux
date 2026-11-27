@@ -8,6 +8,62 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 >
 > 发版时两处都要改：本文档，以及应用内「设置 → 更新日志」页面使用的内置列表：新版本条目追加到 `web/src/features/admin/changelog/releases/` 下对应大版本的文件（如 `v0-7.ts`）；新大版本需新增文件，并在 `releases/index.ts` 中按倒序插入（该页面不读取本文件）。
 
+## [0.7.31] - 2026-11-27
+
+这版是一次大扫除式的性能版本：数据库读模型瘦身并加了守卫触发器、补了两轮索引，几个缓存都加了字节上限，Web 播放器的 MSE
+缓冲有了背压和淘汰，还有一批热路径从「每次都查 / 每次都写」改成事件驱动或缓存命中。功能上补齐 Emby 的搜索作用域、条目祖先
+链和虚拟文件夹条目数；同时删掉了已退役的 Lux Prism 桌面客户端与设备配对子系统。
+
+### 💥 BREAKING CHANGES
+
+* **auth:** 删除退役的 Lux Prism 桌面客户端与设备配对子系统
+
+  配对相关的接口、存储、安全辅助与前端入口整体移除（`src/auth/device_pairings.rs`、`src/storage/device_pairings.rs`、
+  `tests/auth_users/device_pairings.rs`，以及 ADR-041、ADR-047），迁移 0255 直接删除 `device_pairings` 表。仍在使用旧桌面
+  客户端或自行调用配对接口的部署需要改用 Web 或 Emby 兼容登录。
+
+### ✨ feat
+
+* **emby:** 搜索结果按 `ParentId` 限定范围，新增条目祖先链与虚拟文件夹条目数
+
+  `GET /Items`、`GET /Users/{userId}/Items` 与 `/Search/Hints` 带 `SearchTerm` 时只在请求的 `ParentId` 子树内搜索（媒体库，
+  或下属的剧集/季/文件夹/合集子树），并照旧执行媒体库 ACL；实现是一条 SQLite/PostgreSQL 通用的 `WITH RECURSIVE` CTE，没有
+  新增后端分支。新增 `GET /Items/{id}/Ancestors`（含 `/emby` 前缀），按标准 `BaseItemDto` 返回直到所属媒体库的父链，鉴权
+  与 ACL 一致，条目不存在或无权返回 404。`GET /Library/VirtualFolders` 的 `ItemCount` 改成一次 `GROUP BY` 聚合，电影、剧集、
+  混合与家庭视频库都不再逐库查询。
+
+### ⚡ perf
+
+* **storage:** 读模型瘦身与新索引（迁移 0253、0254）
+
+  0253 删掉没有读者的 `catalog_item_stats`、两个多余索引和 `catalog_items` 上 11 个无读者的列，退役两套不再驱动任何列的
+  outbox 触发器，其余触发器补上列清单与 `WHEN` 守卫，只在层级、可用性或入库时间真的变化时才级联刷新；SQLite 的
+  `has_available_source` 触发器也加了空操作守卫，避免把没变的行标脏。0254 给 `user_series_next` 的外键和 `people` 合并相关
+  列补索引，并清理 `media_items.nfo_metadata_json` 里 0228 之后就重复保存的内联 JSON。
+
+* **api/images:** 图片解析与 Emby 字段投影提速
+
+  图片解析与变体生成走更短的路径，Emby 路由与字段投影减少重复分配，Tokio 线程池按负载配置；黑名单查询合并成一条，解析好的
+  可信代理 CIDR 做缓存，中间件开销进一步削减。
+
+* **cache:** 缓存全部加上字节上限
+
+  `ProviderResponseCache` 有总字节预算并把磁盘持久化改成流式；目录页缓存共享 `Arc<CatalogPage>` 且按字节封顶；弹幕播放 XML
+  改为流式输出并缓存流式校验结论；共享管理员 API Key 的哈希做带 epoch 失效的缓存，令牌撤销时整批失效。
+
+* **runtime:** 内存与热路径
+
+  Linux 容器里给 jemalloc 配置 decay 与 arena 上限；`PeopleService` 的锁表与 manifest 映射会淘汰，扫描任务的终态记录也会
+  回收；STRM 播放与 webhook 复用固定地址的 reqwest 客户端池；身份合并改成事件驱动、封面与日志缓冲改成流式；设备观察写入按
+  设备时间窗节流；推荐统计的空闲检查不再取锁、也不唤醒 outbox；`choose_preferred_canonical_person` 改成只读查询。
+
+* **web:** MSE 播放缓冲加背压与淘汰
+
+  HEVC/MKV 播放引擎给 MSE 加上按缓冲水位的背压与分段淘汰，字幕 worker 在停止时真正终止，详情页的无限查询加上上限，避免
+  长时间播放或反复切换后内存一路涨。
+
+迁移 0253–0255 会在升级时自动执行；0255 删除 `device_pairings` 表，回滚只能靠备份。
+
 ## [0.7.30] - 2026-11-24
 
 这版几乎全是安全与稳定性收紧：图片、STRM、webhook 与 Emby 迁移四条访问外部地址的路径统一到同一套「解析一次、只连校验过的
