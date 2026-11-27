@@ -23687,6 +23687,208 @@ async fn catalog_items_incremental_tracks_inserts_updates_images_merges_and_dele
 }
 
 #[tokio::test]
+async fn catalog_read_model_drops_unused_stats_table_columns_and_indexes()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let stats_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'catalog_item_stats'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        stats_tables, 0,
+        "dead catalog_item_stats table must be dropped"
+    );
+
+    let redundant_indexes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index'
+           AND name IN ('idx_catalog_items_recent', 'idx_catalog_items_restriction')",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        redundant_indexes, 0,
+        "redundant/unused catalog_items indexes must be dropped"
+    );
+
+    let columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('catalog_items')")
+            .fetch_all(database.pool())
+            .await?;
+    for dropped in [
+        "updated_at",
+        "default_source_id",
+        "season_count",
+        "episode_count",
+        "latest_child_added_at",
+        "latest_episode_added_at",
+        "latest_episode_added_at_sort",
+        "restriction_code",
+        "metadata_state",
+        "nfo_fingerprint",
+        "applied_seq",
+    ] {
+        assert!(
+            !columns.iter().any(|col| col == dropped),
+            "unread column {dropped} must be dropped from catalog_items"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_outbox_and_availability_triggers_skip_unrelated_or_noop_writes()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::application::libraries::LibraryService;
+    use crate::library::LibraryKind;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let media_dir = tempfile::tempdir()?;
+    let library_service = LibraryService::new(database.clone());
+    let library = library_service
+        .create_library("Trigger Guard", LibraryKind::Mixed, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let root = library_service
+        .add_root(
+            library.id,
+            media_dir.path().to_str().ok_or("non-utf8 media root")?,
+        )
+        .await?
+        .root;
+    let root_id = root.id.to_string();
+
+    sqlx::query(
+        "INSERT INTO filesystem_entries (
+             id, library_root_id, relative_path, entry_kind, size, modified_at,
+             last_seen_generation, is_missing
+         ) VALUES
+             ('tg-fe-1', ?, 'movie-1080p.mkv', 'FILE', 1, 1, 'gen-1', 0),
+             ('tg-fe-2', ?, 'movie-2160p.mkv', 'FILE', 1, 1, 'gen-1', 0)",
+    )
+    .bind(&root_id)
+    .bind(&root_id)
+    .execute(database.pool())
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, parent_id, series_id, title, sort_title,
+             identification_status, has_available_source, added_at
+         ) VALUES
+             ('tg-movie', ?, 'MOVIE', NULL, NULL, 'Movie', 'movie', 'LOCAL_CONFIRMED', 0, 100),
+             ('tg-series', ?, 'SERIES', NULL, NULL, 'Series', 'series', 'LOCAL_CONFIRMED', 0, 100),
+             ('tg-season', ?, 'SEASON', 'tg-series', 'tg-series', 'Season 1', 'season 1', 'LOCAL_CONFIRMED', 0, 100),
+             ('tg-episode', ?, 'EPISODE', 'tg-season', 'tg-series', 'Episode 1', 'episode 1', 'LOCAL_CONFIRMED', 1, 110)",
+    )
+    .bind(&library_id)
+    .bind(&library_id)
+    .bind(&library_id)
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, filesystem_entry_id, source_kind, is_default)
+         VALUES
+             ('tg-src-1', 'tg-movie', 'tg-fe-1', 'LOCAL_FILE', 1),
+             ('tg-src-2', 'tg-movie', 'tg-fe-2', 'LOCAL_FILE', 0)",
+    )
+    .execute(database.pool())
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO item_images (id, item_id, image_type, image_index, local_path)
+         VALUES ('tg-poster', 'tg-movie', 'POSTER', 0, 'poster.jpg')",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let ids = vec![
+        "tg-movie".to_owned(),
+        "tg-series".to_owned(),
+        "tg-season".to_owned(),
+        "tg-episode".to_owned(),
+    ];
+    assert_eq!(database.upsert_catalog_items_by_ids(&ids).await?, 4);
+    assert_eq!(
+        database.upsert_catalog_items_by_ids(&ids).await?,
+        0,
+        "re-upserting unchanged derived rows must skip writing catalog_items"
+    );
+
+    sqlx::query("DELETE FROM catalog_outbox")
+        .execute(database.pool())
+        .await?;
+
+    // Updating non-catalog columns on media_items must not enqueue catalog_outbox.
+    sqlx::query(
+        "UPDATE media_items
+         SET overview = 'Updated overview',
+             provider_ids_json = '{\"tmdb\":\"123\"}',
+             nfo_collection_reference_key = 'col-1',
+             metadata_fingerprint = X'0102',
+             nfo_metadata_fingerprint = X'0304',
+             updated_at = unixepoch() + 10
+         WHERE id = 'tg-movie'",
+    )
+    .execute(database.pool())
+    .await?;
+    let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM catalog_outbox")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        queued, 0,
+        "non-derived media_items column updates must not fan out into catalog_outbox"
+    );
+
+    // Updating an episode's title only affects the episode itself, not parent/series containers.
+    sqlx::query("UPDATE media_items SET title = 'Episode 1 Renamed' WHERE id = 'tg-episode'")
+        .execute(database.pool())
+        .await?;
+    let queued_items: Vec<String> =
+        sqlx::query_scalar("SELECT item_id FROM catalog_outbox ORDER BY id")
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(
+        queued_items,
+        vec!["tg-episode".to_owned()],
+        "renaming an episode must not enqueue its season or series containers"
+    );
+    sqlx::query("DELETE FROM catalog_outbox")
+        .execute(database.pool())
+        .await?;
+
+    // Probe updates on media_sources and dimension updates on item_images must not enqueue outbox.
+    sqlx::query(
+        "UPDATE media_sources
+         SET probe_status = 'READY', bitrate = 8000000, duration_ticks = 36000000000
+         WHERE id = 'tg-src-1'",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query("UPDATE item_images SET width = 1000, height = 1500 WHERE id = 'tg-poster'")
+        .execute(database.pool())
+        .await?;
+    // Deleting one of two available sources leaves has_available_source = 1, so media_items is untouched.
+    sqlx::query("DELETE FROM media_sources WHERE id = 'tg-src-2'")
+        .execute(database.pool())
+        .await?;
+    let queued_after_noop_source: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM catalog_outbox")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        queued_after_noop_source, 0,
+        "probe updates, image dimension updates, and redundant source deletes must not enqueue catalog_outbox"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn catalog_read_model_rebuild_copies_authoritative_fields_and_validates()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::application::libraries::LibraryService;
@@ -35316,6 +35518,7 @@ async fn search_pages_past_the_end_still_report_the_real_total()
             like_query: "%Zebra%",
             item_types: &["MOVIE".to_owned()],
             library_ids: Some(std::slice::from_ref(&library_id)),
+            parent_item_id: None,
             offset: 10,
             limit: 5,
             content_restrictions: None,
@@ -35366,6 +35569,7 @@ async fn search_movie_page(
             like_query,
             item_types: &["MOVIE".to_owned()],
             library_ids: None,
+            parent_item_id: None,
             offset,
             limit,
             content_restrictions: None,

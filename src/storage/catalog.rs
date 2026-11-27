@@ -983,12 +983,13 @@ impl From<MediaInfoChapterRow> for StoredMediaChapter {
     }
 }
 
-/// Row of `count_catalog_root_items_by_library`: the root MOVIE/SERIES counts of one library.
+/// Row of `count_catalog_root_items_by_library`: the root MOVIE/SERIES/VIDEO counts of one library.
 #[derive(Debug, sqlx::FromRow)]
 struct LibraryCatalogCountRow {
     library_id: String,
     movie_count: i64,
     series_count: i64,
+    video_count: i64,
     item_count: i64,
 }
 
@@ -1007,6 +1008,7 @@ impl From<CatalogItemTypeCountRow> for StoredCatalogItemCounts {
         Self {
             movie_count: row.movie_count,
             series_count: row.series_count,
+            video_count: 0,
             episode_count: row.episode_count,
             box_set_count: row.box_set_count,
             item_count: row.item_count,
@@ -1128,6 +1130,7 @@ const RECOMMENDATION_STATS_CLEANUP_QUERY: &str = "DELETE FROM recommendation_ite
 
 #[derive(Clone, Copy)]
 struct CatalogSearchPageBindings<'a> {
+    parent_item_id: Option<&'a str>,
     fts_query: Option<&'a str>,
     like_query: Option<&'a str>,
     item_types: &'a [String],
@@ -1142,6 +1145,34 @@ struct CatalogSearchPageBindings<'a> {
 /// Number of `like_query` bindings in the fallback search branch: display title, original title,
 /// canonical sort title and the alias subquery share the same pattern.
 const SEARCH_LIKE_BINDS: usize = 4;
+
+/// Number of `parent_item_id` bindings in [`SCOPED_SEARCH_CTE`]: direct `parent_id`, direct
+/// `series_id`, and collection container `collections.item_id`.
+const SEARCH_PARENT_SCOPE_BINDS: usize = 3;
+
+/// Portable SQLite/PostgreSQL recursive CTE that collects all active descendants of one container
+/// item (or collection members when the parent is a `BOX_SET`) without backend-specific syntax.
+const SCOPED_SEARCH_CTE: &str = "WITH RECURSIVE scoped_descendants(id) AS (
+     SELECT child.id
+     FROM media_items child
+     WHERE child.removed_at IS NULL
+       AND (child.parent_id = ? OR child.series_id = ?)
+     UNION
+     SELECT child.id
+     FROM media_items child
+     JOIN scoped_descendants parent ON child.parent_id = parent.id
+     WHERE child.removed_at IS NULL
+ ),
+ scoped_items(id) AS (
+     SELECT id FROM scoped_descendants
+     UNION
+     SELECT ci.item_id
+     FROM collections c
+     JOIN collection_items ci ON ci.collection_id = c.id
+     WHERE c.item_id = ?
+ ) ";
+
+const SCOPED_SEARCH_PREDICATE: &str = " AND mi.id IN (SELECT id FROM scoped_items)";
 
 /// Server-side upper bound for one search page. Both HTTP front ends validate their own, smaller
 /// bounds (100 for the Lux API, `EMBY_MAX_PAGE_LIMIT` for Emby), so this cap never changes a
@@ -1824,12 +1855,13 @@ impl Database {
             "SELECT mi.library_id,
                     COUNT(CASE WHEN mi.item_type = 'MOVIE' THEN 1 END) AS movie_count,
                     COUNT(CASE WHEN mi.item_type = 'SERIES' THEN 1 END) AS series_count,
+                    COUNT(CASE WHEN mi.item_type = 'VIDEO' THEN 1 END) AS video_count,
                     COUNT(*) AS item_count
              FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
              WHERE mi.removed_at IS NULL
                AND mi.library_id IN ({placeholders})
-               AND mi.item_type IN ('MOVIE', 'SERIES')
+               AND mi.item_type IN ('MOVIE', 'SERIES', 'VIDEO')
                {CATALOG_VISIBLE_PREDICATE}
              GROUP BY mi.library_id"
         );
@@ -1848,6 +1880,7 @@ impl Database {
                             StoredCatalogItemCounts {
                                 movie_count: row.movie_count,
                                 series_count: row.series_count,
+                                video_count: row.video_count,
                                 item_count: row.item_count,
                                 ..StoredCatalogItemCounts::default()
                             },
@@ -2112,6 +2145,10 @@ impl Database {
                     .join(", ")
             )
         });
+        let parent_scope_cte = search.parent_item_id.map_or("", |_| SCOPED_SEARCH_CTE);
+        let parent_scope_filter = search
+            .parent_item_id
+            .map_or("", |_| SCOPED_SEARCH_PREDICATE);
         let item_type_filter = format!(
             " AND mi.item_type IN ({})",
             std::iter::repeat_n("?", item_types.len())
@@ -2131,7 +2168,7 @@ impl Database {
              JOIN libraries l ON l.id = mi.library_id
                                AND l.is_enabled = 1 AND l.system_kind IS NULL
              WHERE media_search MATCH ? AND mi.removed_at IS NULL
-               {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}{content_restriction_predicate}",
+               {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}{parent_scope_filter}{content_restriction_predicate}",
             library_filter.as_deref().unwrap_or_default(),
         );
         // Complete-token searches are served by FTS alone. The LIKE branch remains
@@ -2141,13 +2178,14 @@ impl Database {
         // `media_items` again: the join only repeated a row lookup per match (tens of thousands
         // when a common token matches most of the library) to re-read a column that was in hand.
         let fts_page_query = format!(
-            "SELECT matches.id{total_projection} FROM ({fts_query}) matches
+            "{parent_scope_cte}SELECT matches.id{total_projection} FROM ({fts_query}) matches
              ORDER BY matches.sort_title, matches.id LIMIT ? OFFSET ?"
         );
         let fts_page = self
             .fetch_catalog_search_page(
                 &fts_page_query,
                 CatalogSearchPageBindings {
+                    parent_item_id: search.parent_item_id,
                     fts_query: Some(query),
                     like_query: None,
                     item_types,
@@ -2172,13 +2210,13 @@ impl Database {
                     OR EXISTS (SELECT 1 FROM item_aliases ia
                                WHERE ia.item_id = mi.id AND ia.alias LIKE ? ESCAPE '!'))
              AND mi.removed_at IS NULL
-               {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}{content_restriction_predicate}",
+               {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}{parent_scope_filter}{content_restriction_predicate}",
             library_filter.as_deref().unwrap_or_default(),
         );
         // `sort_title` is part of both UNION branches so the union still merges rows by item id:
         // one item id always carries one sort title.
         let like_page_query = format!(
-            "SELECT matches.id{total_projection} FROM ({like_query_sql}) matches
+            "{parent_scope_cte}SELECT matches.id{total_projection} FROM ({like_query_sql}) matches
              ORDER BY matches.sort_title, matches.id LIMIT ? OFFSET ?"
         );
         if offset == 0 {
@@ -2186,6 +2224,7 @@ impl Database {
                 .fetch_catalog_search_page(
                     &like_page_query,
                     CatalogSearchPageBindings {
+                        parent_item_id: search.parent_item_id,
                         fts_query: None,
                         like_query: Some(like_query),
                         item_types,
@@ -2201,12 +2240,13 @@ impl Database {
 
         let union_query = format!("{fts_query} UNION {like_query_sql}");
         let union_page_query = format!(
-            "SELECT matches.id{total_projection} FROM ({union_query}) matches
+            "{parent_scope_cte}SELECT matches.id{total_projection} FROM ({union_query}) matches
              ORDER BY matches.sort_title, matches.id LIMIT ? OFFSET ?"
         );
         self.fetch_catalog_search_page(
             &union_page_query,
             CatalogSearchPageBindings {
+                parent_item_id: search.parent_item_id,
                 fts_query: Some(query),
                 like_query: Some(like_query),
                 item_types,
@@ -2248,6 +2288,10 @@ impl Database {
                     .join(", ")
             )
         });
+        let parent_scope_cte = search.parent_item_id.map_or("", |_| SCOPED_SEARCH_CTE);
+        let parent_scope_filter = search
+            .parent_item_id
+            .map_or("", |_| SCOPED_SEARCH_PREDICATE);
         let item_type_filter = format!(
             " AND mi.item_type IN ({})",
             std::iter::repeat_n("?", item_types.len())
@@ -2271,16 +2315,17 @@ impl Database {
              WHERE (ms.title ILIKE ? OR ms.original_title ILIKE ? OR ms.sort_title ILIKE ?
                     OR ms.aliases ILIKE ?)
                AND mi.removed_at IS NULL
-               {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}{content_restriction_predicate}",
+               {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}{parent_scope_filter}{content_restriction_predicate}",
             library_filter.as_deref().unwrap_or_default(),
         );
         let page_query = format!(
-            "SELECT matches.id{total_projection} FROM ({like_query_sql}) matches
+            "{parent_scope_cte}SELECT matches.id{total_projection} FROM ({like_query_sql}) matches
              ORDER BY matches.sort_title, matches.id LIMIT ? OFFSET ?"
         );
         self.fetch_catalog_search_page(
             &page_query,
             CatalogSearchPageBindings {
+                parent_item_id: search.parent_item_id,
                 fts_query: None,
                 like_query: Some(like_query),
                 item_types,
@@ -2300,6 +2345,11 @@ impl Database {
         bindings: CatalogSearchPageBindings<'_>,
     ) -> Result<(Vec<String>, i64), StorageError> {
         let mut statement = self.query(sqlx::AssertSqlSafe(query));
+        if let Some(parent_item_id) = bindings.parent_item_id {
+            for _ in 0..SEARCH_PARENT_SCOPE_BINDS {
+                statement = statement.bind(parent_item_id);
+            }
+        }
         if let Some(fts_query) = bindings.fts_query {
             statement = statement.bind(fts_query);
             for item_type in bindings.item_types {
@@ -4458,6 +4508,108 @@ impl Database {
                  LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
                  WHERE mi.id IN ({placeholders})
                    AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
+                 ORDER BY mi.sort_title, mi.id, ms.id, mt.stream_index"
+            );
+            let binds = item_ids
+                .iter()
+                .map(|item_id| CatalogBind::Text(item_id))
+                .collect::<Vec<_>>();
+            rows.extend(self.fetch_catalog_rows(&query, &binds).await?);
+        }
+        Ok(rows)
+    }
+
+    /// Walks `parent_id` (falling back to `series_id` when `parent_id` is absent) upward from
+    /// `item_id` within the same library, returning ancestor item IDs ordered from direct parent
+    /// up to the top-most container item (excluding `item_id` itself).
+    pub(crate) async fn list_ancestor_item_ids(
+        &self,
+        item_id: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        let rows = self
+            .query(
+                "WITH RECURSIVE ancestor_chain(id, library_id, parent_id, series_id, depth) AS (
+                     SELECT mi.id, mi.library_id, mi.parent_id, mi.series_id, 0
+                     FROM media_items mi
+                     WHERE mi.id = ?
+                       AND mi.removed_at IS NULL
+                     UNION ALL
+                     SELECT parent.id, parent.library_id, parent.parent_id, parent.series_id,
+                            chain.depth + 1
+                     FROM ancestor_chain chain
+                     JOIN media_items parent
+                       ON parent.id = COALESCE(chain.parent_id, chain.series_id)
+                     WHERE chain.depth < 32
+                       AND parent.library_id = chain.library_id
+                       AND parent.id <> chain.id
+                       AND parent.removed_at IS NULL
+                       AND parent.merged_into_item_id IS NULL
+                 )
+                 SELECT id
+                 FROM ancestor_chain
+                 WHERE depth > 0
+                 ORDER BY depth ASC",
+            )
+            .bind(item_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        Ok(rows.into_iter().map(|row| row.get("id")).collect())
+    }
+
+    /// Hydrates ancestor container rows already resolved from an authorized visible child item.
+    /// Intermediate folders (e.g. a directory containing only subdirectories) may not carry a
+    /// direct playable child, so this omits `CATALOG_VISIBLE_PREDICATE` while still enforcing
+    /// enabled library, active (`removed_at IS NULL`), and non-merged checks.
+    pub(crate) async fn list_ancestor_catalog_rows_by_ids(
+        &self,
+        item_ids: &[String],
+    ) -> Result<Vec<StoredCatalogRow>, StorageError> {
+        let mut rows = Vec::new();
+        for item_ids in item_ids.chunks(500) {
+            if item_ids.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", item_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
+                        mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
+                        mi.title, mi.sort_title, mi.original_title, mi.overview,
+                        mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
+                        mi.added_at, mi.updated_at,
+                        (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
+                         ORDER BY image_index LIMIT 1) AS poster_image_tag,
+                        (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
+                         ORDER BY image_index LIMIT 1) AS fanart_image_tag,
+                        (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'THUMB'
+                         ORDER BY image_index LIMIT 1) AS thumb_image_tag,
+                        (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
+                         ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                        (SELECT fe.relative_path FROM filesystem_entries fe
+                         WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
+                        ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
+                        ms.edition_name, ms.quality_label,
+                        ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
+                        mt.id AS stream_id, mt.stream_index, mt.stream_type,
+                        mt.codec, mt.language, mt.title AS stream_title,
+                        mt.details_json AS stream_details_json,
+                        mt.is_external AS stream_is_external,
+                        mt.is_default AS stream_is_default,
+                        mt.is_forced AS stream_is_forced
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 LEFT JOIN media_sources ms
+                   ON ms.item_id = mi.id
+                  AND EXISTS (
+                      SELECT 1 FROM filesystem_entries fe
+                      WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
+                  )
+                 LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
+                 WHERE mi.id IN ({placeholders})
+                   AND mi.removed_at IS NULL
+                   AND mi.merged_into_item_id IS NULL
                  ORDER BY mi.sort_title, mi.id, ms.id, mt.stream_index"
             );
             let binds = item_ids
@@ -15643,6 +15795,114 @@ mod catalog_id_projection_decoding_tests {
             .await?;
         assert!(recent_total >= 1);
         assert!(recent_ids.contains(&"ids-series".to_owned()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scoped_search_ancestors_and_batched_root_counts_work_without_n_plus_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        database
+            .query(
+                "INSERT INTO libraries (id, name, kind) VALUES
+                     ('lib-movies', 'Movies', 'MOVIE'),
+                     ('lib-shows', 'Shows', 'SERIES'),
+                     ('lib-home', 'Home Videos', 'HOMEVIDEOS');
+                 INSERT INTO media_items (
+                     id, library_id, item_type, parent_id, series_id, title, sort_title,
+                     identification_status, has_available_source
+                 ) VALUES
+                     ('m-1', 'lib-movies', 'MOVIE', NULL, NULL, 'Signal Movie', 'signal movie', 'LOCAL_CONFIRMED', 1),
+                     ('s-1', 'lib-shows', 'SERIES', NULL, NULL, 'Show One', 'show one', 'LOCAL_CONFIRMED', 1),
+                     ('se-1', 'lib-shows', 'SEASON', NULL, 's-1', 'Season 1', 'season 1', 'LOCAL_CONFIRMED', 1),
+                     ('ep-1', 'lib-shows', 'EPISODE', 'se-1', 's-1', 'Signal Ep One', 'signal ep one', 'LOCAL_CONFIRMED', 1),
+                     ('ep-2', 'lib-shows', 'EPISODE', 'se-1', 's-1', 'Signal Ep Two', 'signal ep two', 'LOCAL_CONFIRMED', 1),
+                     ('s-2', 'lib-shows', 'SERIES', NULL, NULL, 'Show Two', 'show two', 'LOCAL_CONFIRMED', 1),
+                     ('ep-other', 'lib-shows', 'EPISODE', 's-2', 's-2', 'Signal Ep Other', 'signal ep other', 'LOCAL_CONFIRMED', 1),
+                     ('hv-folder-1', 'lib-home', 'FOLDER', NULL, NULL, 'Trips', 'trips', 'LOCAL_CONFIRMED', 0),
+                     ('hv-folder-2', 'lib-home', 'FOLDER', 'hv-folder-1', NULL, '2024', '2024', 'LOCAL_CONFIRMED', 1),
+                     ('hv-video-1', 'lib-home', 'VIDEO', 'hv-folder-2', NULL, 'Signal Clip', 'signal clip', 'LOCAL_CONFIRMED', 1),
+                     ('hv-video-2', 'lib-home', 'VIDEO', NULL, NULL, 'Root Clip', 'root clip', 'LOCAL_CONFIRMED', 1);",
+            )
+            .execute(database.pool())
+            .await?;
+
+        // Single batched GROUP BY query covers Movie, Series, and HomeVideos VIDEO counts.
+        database.reset_query_count();
+        let root_counts = database
+            .count_catalog_root_items_by_library(&[
+                "lib-movies".to_owned(),
+                "lib-shows".to_owned(),
+                "lib-home".to_owned(),
+            ])
+            .await?;
+        assert_eq!(database.query_count(), 1);
+        assert_eq!(root_counts["lib-movies"].movie_count, 1);
+        assert_eq!(root_counts["lib-shows"].series_count, 2);
+        assert_eq!(root_counts["lib-home"].video_count, 2);
+
+        // Recursive ancestor walk resolves both explicit parent_id and series_id fallback.
+        assert_eq!(
+            database.list_ancestor_item_ids("ep-1").await?,
+            vec!["se-1".to_owned(), "s-1".to_owned()]
+        );
+        assert_eq!(
+            database.list_ancestor_item_ids("hv-video-1").await?,
+            vec!["hv-folder-2".to_owned(), "hv-folder-1".to_owned()]
+        );
+        assert!(database.list_ancestor_item_ids("m-1").await?.is_empty());
+
+        // Scoped search within a series subtree returns only that series's episodes across pages.
+        database.drain_search_reindex(100).await?;
+        let (ep_ids, ep_total) = database
+            .search_catalog_item_ids(&crate::storage::CatalogSearchQuery {
+                query: "\"Signal\"",
+                like_query: "%Signal%",
+                item_types: &["EPISODE".to_owned()],
+                library_ids: Some(&["lib-shows".to_owned()]),
+                parent_item_id: Some("s-1"),
+                offset: 0,
+                limit: 10,
+                content_restrictions: None,
+                include_total: true,
+            })
+            .await?;
+        assert_eq!(ep_total, 2);
+        assert_eq!(ep_ids, vec!["ep-1".to_owned(), "ep-2".to_owned()]);
+
+        // Partial substring fallback with offset > 0 (UNION branch) still respects parent_item_id.
+        let (paged_ids, paged_total) = database
+            .search_catalog_item_ids(&crate::storage::CatalogSearchQuery {
+                query: "\"ign\"",
+                like_query: "%ign%",
+                item_types: &["EPISODE".to_owned()],
+                library_ids: Some(&["lib-shows".to_owned()]),
+                parent_item_id: Some("s-1"),
+                offset: 1,
+                limit: 10,
+                content_restrictions: None,
+                include_total: true,
+            })
+            .await?;
+        assert_eq!(paged_total, 2);
+        assert_eq!(paged_ids, vec!["ep-2".to_owned()]);
+
+        // Recursive folder scope finds nested video under hv-folder-1.
+        let (folder_ids, folder_total) = database
+            .search_catalog_item_ids(&crate::storage::CatalogSearchQuery {
+                query: "\"Signal\"",
+                like_query: "%Signal%",
+                item_types: &["VIDEO".to_owned()],
+                library_ids: Some(&["lib-home".to_owned()]),
+                parent_item_id: Some("hv-folder-1"),
+                offset: 0,
+                limit: 10,
+                content_restrictions: None,
+                include_total: true,
+            })
+            .await?;
+        assert_eq!(folder_total, 1);
+        assert_eq!(folder_ids, vec!["hv-video-1".to_owned()]);
         Ok(())
     }
 }

@@ -57,8 +57,9 @@ use crate::{
             MetadataSelectionError, MetadataSelectionMode, MetadataSelectionService,
         },
         catalog::{
-            CatalogError, CatalogFilter, CatalogItem, CatalogPage, CatalogService, CatalogSort,
-            CatalogSource, normalize_search_like_query, normalize_search_query,
+            CatalogError, CatalogFilter, CatalogItem, CatalogPage, CatalogSearchScope,
+            CatalogService, CatalogSort, CatalogSource, normalize_search_like_query,
+            normalize_search_query,
         },
         chapter_detector::{ChapterDetectionError, ChapterDetectionService},
         collections::{CollectionError, CollectionService, GlobalCollectionSyncWorker},
@@ -139,8 +140,11 @@ use emby_handlers::*;
 #[path = "emby_admin_media.rs"]
 mod emby_admin_media;
 use emby_admin_media::*;
+#[path = "emby_ancestors.rs"]
+mod emby_ancestors;
 #[path = "emby_catalog.rs"]
 mod emby_catalog;
+use emby_ancestors::*;
 #[path = "emby_similar.rs"]
 mod emby_similar;
 use emby_similar::*;

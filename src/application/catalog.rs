@@ -184,6 +184,7 @@ struct SearchFlightKey {
     user_id: String,
     is_admin: bool,
     library_ids: Option<Vec<String>>,
+    parent_item_id: Option<String>,
     query: String,
     like_query: String,
     item_types: Vec<String>,
@@ -191,6 +192,15 @@ struct SearchFlightKey {
     offset: i64,
     limit: i64,
     include_total: bool,
+}
+
+/// Optional scope narrowing a catalog search to a single library or a parent container subtree.
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+pub enum CatalogSearchScope {
+    #[default]
+    AllAccessible,
+    Library(String),
+    ParentItem(String),
 }
 
 struct SearchFlight {
@@ -757,6 +767,7 @@ fn take_recent_entries<T>(mut entries: Vec<(Instant, T)>, limit: usize) -> Vec<T
 pub struct CatalogItemCounts {
     pub movie_count: i64,
     pub series_count: i64,
+    pub video_count: i64,
     pub episode_count: i64,
     pub box_set_count: i64,
     pub item_count: i64,
@@ -1236,6 +1247,7 @@ impl CatalogService {
         Ok(CatalogItemCounts {
             movie_count: counts.movie_count,
             series_count: counts.series_count,
+            video_count: counts.video_count,
             episode_count: counts.episode_count,
             box_set_count: counts.box_set_count + global_collection_count,
             item_count: counts.item_count + global_collection_count,
@@ -1258,6 +1270,7 @@ impl CatalogService {
                     CatalogItemCounts {
                         movie_count: count.movie_count,
                         series_count: count.series_count,
+                        video_count: count.video_count,
                         episode_count: count.episode_count,
                         box_set_count: count.box_set_count,
                         item_count: count.item_count,
@@ -3458,11 +3471,70 @@ impl CatalogService {
         limit: i64,
         include_total: bool,
     ) -> Result<CatalogPage, CatalogError> {
+        self.search_items_scoped(
+            principal,
+            CatalogSearchScope::AllAccessible,
+            query,
+            like_query,
+            item_types,
+            offset,
+            limit,
+            include_total,
+        )
+        .await
+    }
+
+    /// Scoped catalog search bounded by [`CatalogSearchScope`]: all accessible libraries, a single
+    /// verified library, or the descendant subtree / collection membership of one visible item.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_items_scoped(
+        &self,
+        principal: AccessPrincipal,
+        scope: CatalogSearchScope,
+        query: &str,
+        like_query: &str,
+        item_types: Vec<String>,
+        offset: i64,
+        limit: i64,
+        include_total: bool,
+    ) -> Result<CatalogPage, CatalogError> {
         self.apply_pending_search_reindex().await;
-        let library_ids = if principal.is_admin {
-            None
-        } else {
-            Some(self.access.accessible_library_ids(principal).await?)
+        let (library_ids, parent_item_id) = match scope {
+            CatalogSearchScope::AllAccessible => {
+                let ids = if principal.is_admin {
+                    None
+                } else {
+                    Some(self.access.accessible_library_ids(principal).await?)
+                };
+                (ids, None)
+            }
+            CatalogSearchScope::Library(library_id) => {
+                let Some(library) = self.database.find_library(&library_id).await? else {
+                    return Err(CatalogError::LibraryNotFound);
+                };
+                if !library.is_enabled {
+                    return Err(CatalogError::LibraryNotFound);
+                }
+                if !self.access.can_view_library(principal, &library_id).await? {
+                    return Err(CatalogError::AccessDenied);
+                }
+                (Some(vec![library_id]), None)
+            }
+            CatalogSearchScope::ParentItem(parent_id) => {
+                let Some(parent) = self.find_item(principal, &parent_id).await? else {
+                    return Err(CatalogError::LibraryNotFound);
+                };
+                let ids = if parent.library_id == GLOBAL_COLLECTION_LIBRARY_ID {
+                    if principal.is_admin {
+                        None
+                    } else {
+                        Some(self.access.accessible_library_ids(principal).await?)
+                    }
+                } else {
+                    Some(vec![parent.library_id])
+                };
+                (ids, Some(parent.id))
+            }
         };
         let content_restrictions = if principal.is_admin {
             None
@@ -3475,6 +3547,7 @@ impl CatalogService {
             user_id: principal.user_id_string(),
             is_admin: principal.is_admin,
             library_ids: library_ids.clone(),
+            parent_item_id: parent_item_id.clone(),
             query: query.to_owned(),
             like_query: like_query.to_owned(),
             item_types: item_types.clone(),
@@ -3495,6 +3568,7 @@ impl CatalogService {
                 let task_query = query.to_owned();
                 let task_like_query = like_query.to_owned();
                 let task_library_ids = library_ids.clone();
+                let task_parent_item_id = parent_item_id.clone();
                 let task_item_types = item_types.clone();
                 let task_content_restrictions = content_restrictions.clone();
                 let task = tokio::spawn(async move {
@@ -3504,6 +3578,7 @@ impl CatalogService {
                             like_query: &task_like_query,
                             item_types: &task_item_types,
                             library_ids: task_library_ids.as_deref(),
+                            parent_item_id: task_parent_item_id.as_deref(),
                             offset,
                             limit,
                             content_restrictions: task_content_restrictions.as_ref(),
@@ -3533,6 +3608,7 @@ impl CatalogService {
                     like_query,
                     item_types: &item_types,
                     library_ids: library_ids.as_deref(),
+                    parent_item_id: parent_item_id.as_deref(),
                     offset,
                     limit,
                     content_restrictions: content_restrictions.as_ref(),
@@ -3546,6 +3622,7 @@ impl CatalogService {
                     like_query,
                     item_types: &item_types,
                     library_ids: library_ids.as_deref(),
+                    parent_item_id: parent_item_id.as_deref(),
                     offset,
                     limit,
                     content_restrictions: content_restrictions.as_ref(),
@@ -3554,6 +3631,51 @@ impl CatalogService {
                 .await
             }
         }
+    }
+
+    /// Resolves the authorized item and its ordered item-level ancestors (direct parent upward).
+    /// Returns `Ok(None)` when the item does not exist or `principal` cannot view it.
+    pub async fn list_item_ancestors(
+        &self,
+        principal: AccessPrincipal,
+        item_id: &str,
+    ) -> Result<Option<(CatalogItem, Vec<CatalogItem>)>, CatalogError> {
+        let Some(item) = self.find_item(principal, item_id).await? else {
+            return Ok(None);
+        };
+        let raw_ancestor_ids = self.database.list_ancestor_item_ids(&item.id).await?;
+        let mut seen = HashSet::with_capacity(raw_ancestor_ids.len() + 1);
+        seen.insert(item.id.clone());
+        let ancestor_ids = raw_ancestor_ids
+            .into_iter()
+            .filter(|id| seen.insert(id.clone()))
+            .collect::<Vec<_>>();
+        if ancestor_ids.is_empty() {
+            return Ok(Some((item, Vec::new())));
+        }
+        let rows = self
+            .database
+            .list_ancestor_catalog_rows_by_ids(&ancestor_ids)
+            .await?;
+        let mut items_by_id = assemble_items(rows)
+            .into_iter()
+            .map(|ancestor| (ancestor.id.clone(), ancestor))
+            .collect::<HashMap<_, _>>();
+        let details = self
+            .database
+            .list_catalog_details_by_ids(&ancestor_ids)
+            .await?;
+        let mut ancestors = Vec::with_capacity(ancestor_ids.len());
+        for ancestor_id in ancestor_ids {
+            let Some(mut ancestor) = items_by_id.remove(&ancestor_id) else {
+                continue;
+            };
+            if let Some(detail) = details.get(&ancestor_id) {
+                apply_catalog_detail(&mut ancestor, detail);
+            }
+            ancestors.push(ancestor);
+        }
+        Ok(Some((item, ancestors)))
     }
 
     /// Applies queued search-reindex events before the query so a write made just before the
@@ -4524,6 +4646,7 @@ mod tests {
             user_id: "user-1".to_owned(),
             is_admin: false,
             library_ids: Some(vec!["library-1".to_owned()]),
+            parent_item_id: None,
             query: "query".to_owned(),
             like_query: "%query%".to_owned(),
             item_types: vec!["MOVIE".to_owned(), "SERIES".to_owned()],

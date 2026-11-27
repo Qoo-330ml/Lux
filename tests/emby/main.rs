@@ -12,6 +12,7 @@ mod emby_global_collection_playback;
 mod emby_incremental_refresh;
 mod emby_item_filters;
 mod emby_multi_part_playback;
+mod emby_scoped_search_ancestors_vf;
 mod emby_season_scope;
 mod emby_similar;
 mod emby_system;
