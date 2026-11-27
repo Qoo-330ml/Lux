@@ -503,8 +503,9 @@ impl Default for RequestSlots {
 }
 
 struct EmbyRoutePatterns {
-    path_templates: Vec<String>,
-    static_prefixes: Vec<String>,
+    by_first_segment:
+        std::collections::HashMap<String, std::collections::HashMap<usize, Vec<String>>>,
+    by_slashes_fallback: Option<std::collections::HashMap<usize, Vec<String>>>,
 }
 
 impl EmbyRoutePatterns {
@@ -516,34 +517,75 @@ impl EmbyRoutePatterns {
                 .cmp(&right.matches('{').count())
                 .then_with(|| right.len().cmp(&left.len()))
         });
-        let mut static_prefixes = Vec::new();
-        for template in &path_templates {
-            let mut prefix = String::new();
-            for segment in template.split('/').skip(1) {
-                if segment.contains('{') {
-                    break;
-                }
-                prefix.push('/');
-                prefix.push_str(segment);
+        let has_wildcard_first = path_templates.iter().any(|template| {
+            template
+                .strip_prefix('/')
+                .and_then(|rest| rest.split('/').next())
+                .is_none_or(|segment| segment.is_empty() || segment.contains('{'))
+        });
+        if has_wildcard_first {
+            let mut by_slashes = std::collections::HashMap::<usize, Vec<String>>::new();
+            for template in path_templates {
+                let slash_count = template.as_bytes().iter().filter(|&&b| b == b'/').count();
+                by_slashes.entry(slash_count).or_default().push(template);
             }
-            if !prefix.is_empty() && !static_prefixes.contains(&prefix) {
-                static_prefixes.push(prefix);
-            }
+            return Self {
+                by_first_segment: std::collections::HashMap::new(),
+                by_slashes_fallback: Some(by_slashes),
+            };
+        }
+
+        let mut by_first_segment = std::collections::HashMap::<
+            String,
+            std::collections::HashMap<usize, Vec<String>>,
+        >::new();
+        for template in path_templates {
+            let Some(after_slash) = template.strip_prefix('/') else {
+                continue;
+            };
+            let first_segment = after_slash.split('/').next().unwrap_or_default();
+            let slash_count = template.as_bytes().iter().filter(|&&b| b == b'/').count();
+            by_first_segment
+                .entry(first_segment.to_ascii_lowercase())
+                .or_default()
+                .entry(slash_count)
+                .or_default()
+                .push(template);
         }
         Self {
-            path_templates,
-            static_prefixes,
+            by_first_segment,
+            by_slashes_fallback: None,
         }
     }
 
-    fn matches_static_prefix(&self, path: &str) -> bool {
-        self.static_prefixes.iter().any(|prefix| {
-            path.get(..prefix.len())
-                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
-                && path
-                    .get(prefix.len()..)
-                    .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
-        })
+    fn matching_templates(&self, route_path: &str) -> &[String] {
+        let Some(after_slash) = route_path.strip_prefix('/') else {
+            return &[];
+        };
+        if let Some(by_slashes) = &self.by_slashes_fallback {
+            let slash_count = route_path.as_bytes().iter().filter(|&&b| b == b'/').count();
+            return by_slashes.get(&slash_count).map_or(&[], Vec::as_slice);
+        }
+        let first_segment = after_slash.split('/').next().unwrap_or_default();
+        if first_segment.is_empty() {
+            return &[];
+        }
+        let mut stack_lower = [0_u8; 64];
+        let owned_lower;
+        let first_lower = if first_segment.len() <= stack_lower.len() && first_segment.is_ascii() {
+            for (dst, &src) in stack_lower.iter_mut().zip(first_segment.as_bytes()) {
+                *dst = src.to_ascii_lowercase();
+            }
+            std::str::from_utf8(&stack_lower[..first_segment.len()]).unwrap_or_default()
+        } else {
+            owned_lower = first_segment.to_ascii_lowercase();
+            owned_lower.as_str()
+        };
+        let Some(by_slashes) = self.by_first_segment.get(first_lower) else {
+            return &[];
+        };
+        let slash_count = route_path.as_bytes().iter().filter(|&&b| b == b'/').count();
+        by_slashes.get(&slash_count).map_or(&[], Vec::as_slice)
     }
 }
 
@@ -603,17 +645,24 @@ fn normalize_emby_request_path(uri: &mut axum::http::Uri, path_patterns: &EmbyRo
     } else {
         ("", path)
     };
-    if !path_patterns.matches_static_prefix(route_path) {
+    let candidates = path_patterns.matching_templates(route_path);
+    if candidates.is_empty() {
         return;
     }
-    let Some(normalized_route_path) = path_patterns
-        .path_templates
+    let Some(normalized_route_path) = candidates
         .iter()
         .find_map(|template| normalize_route_path(route_path, template))
     else {
         return;
     };
-    let normalized_path = format!("{prefix}{normalized_route_path}");
+    if normalized_route_path == route_path && emby_prefix.is_none_or(|raw| raw == "/emby") {
+        return;
+    }
+    let normalized_path = if prefix.is_empty() {
+        normalized_route_path
+    } else {
+        format!("{prefix}{normalized_route_path}")
+    };
     if normalized_path == path {
         return;
     }
@@ -635,7 +684,7 @@ fn normalize_emby_request_path(uri: &mut axum::http::Uri, path_patterns: &EmbyRo
 fn normalize_route_path(path: &str, template: &str) -> Option<String> {
     let mut path_segments = path.split('/');
     let mut template_segments = template.split('/');
-    let mut normalized_path = String::new();
+    let mut normalized_path = String::with_capacity(path.len());
     let mut index = 0;
     loop {
         match (path_segments.next(), template_segments.next()) {
@@ -643,7 +692,13 @@ fn normalize_route_path(path: &str, template: &str) -> Option<String> {
                 if index > 0 {
                     normalized_path.push('/');
                 }
-                normalized_path.push_str(&normalize_route_segment(path_segment, template_segment)?);
+                if !normalize_route_segment_into(
+                    path_segment,
+                    template_segment,
+                    &mut normalized_path,
+                ) {
+                    return None;
+                }
                 index += 1;
             }
             (None, None) => return Some(normalized_path),
@@ -652,8 +707,7 @@ fn normalize_route_path(path: &str, template: &str) -> Option<String> {
     }
 }
 
-fn normalize_route_segment(path: &str, template: &str) -> Option<String> {
-    let mut normalized = String::new();
+fn normalize_route_segment_into(path: &str, template: &str, normalized: &mut String) -> bool {
     let mut path_offset = 0;
     let mut template_offset = 0;
 
@@ -661,9 +715,11 @@ fn normalize_route_segment(path: &str, template: &str) -> Option<String> {
         let template_remaining = &template[template_offset..];
         let Some(parameter_start) = template_remaining.find('{') else {
             let static_suffix = template_remaining;
-            let path_suffix = path.get(path_offset..)?;
+            let Some(path_suffix) = path.get(path_offset..) else {
+                return false;
+            };
             if !path_suffix.eq_ignore_ascii_case(static_suffix) {
-                return None;
+                return false;
             }
             normalized.push_str(static_suffix);
             path_offset = path.len();
@@ -672,32 +728,46 @@ fn normalize_route_segment(path: &str, template: &str) -> Option<String> {
         };
 
         let static_prefix = &template_remaining[..parameter_start];
-        let path_static_prefix = path.get(path_offset..path_offset + static_prefix.len())?;
+        let Some(path_static_prefix) = path.get(path_offset..path_offset + static_prefix.len())
+        else {
+            return false;
+        };
         if !path_static_prefix.eq_ignore_ascii_case(static_prefix) {
-            return None;
+            return false;
         }
         normalized.push_str(static_prefix);
         path_offset += static_prefix.len();
         template_offset += parameter_start;
 
-        let parameter_end = template[template_offset + 1..].find('}')? + template_offset + 1;
+        let Some(rel_end) = template[template_offset + 1..].find('}') else {
+            return false;
+        };
+        let parameter_end = rel_end + template_offset + 1;
         let suffix_start = parameter_end + 1;
         let static_suffix = &template[suffix_start..];
-        let path_remaining = path.get(path_offset..)?;
+        let Some(path_remaining) = path.get(path_offset..) else {
+            return false;
+        };
         let parameter_length = if static_suffix.is_empty() {
             path_remaining.len()
         } else {
-            find_ascii_case_insensitive(path_remaining, static_suffix)?
+            let Some(len) = find_ascii_case_insensitive(path_remaining, static_suffix) else {
+                return false;
+            };
+            len
         };
         if parameter_length == 0 {
-            return None;
+            return false;
         }
-        normalized.push_str(path_remaining.get(..parameter_length)?);
+        let Some(param_slice) = path_remaining.get(..parameter_length) else {
+            return false;
+        };
+        normalized.push_str(param_slice);
         path_offset += parameter_length;
         template_offset = suffix_start;
     }
 
-    (path_offset == path.len()).then_some(normalized)
+    path_offset == path.len()
 }
 
 fn find_ascii_case_insensitive(value: &str, needle: &str) -> Option<usize> {
@@ -1558,5 +1628,34 @@ mod tests {
                 .expect("Emby 404 body")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn emby_route_patterns_dispatch_by_first_segment_and_preserve_priority() {
+        let (_, templates) = super::emby::api_routes();
+        let patterns = super::EmbyRoutePatterns::new(templates);
+
+        assert!(patterns.matching_templates("/health/live").is_empty());
+        assert!(
+            patterns
+                .matching_templates("/api/v1/items/1/images/poster")
+                .is_empty()
+        );
+
+        let mut uri: axum::http::Uri = "/EMBY/users/Me?Fields=Overview".parse().expect("uri");
+        super::normalize_emby_request_path(&mut uri, &patterns);
+        assert_eq!(uri.to_string(), "/emby/Users/Me?Fields=Overview");
+
+        // `/Users/Me` (0 braces) must win over `/Users/{user_id}` (1 brace), while arbitrary user
+        // IDs keep their original case.
+        let mut user_uri: axum::http::Uri =
+            "/users/CustomUserId/items/ItemAbc".parse().expect("uri");
+        super::normalize_emby_request_path(&mut user_uri, &patterns);
+        assert_eq!(user_uri.to_string(), "/Users/CustomUserId/Items/ItemAbc");
+
+        let mut stream_uri: axum::http::Uri =
+            "/videos/item-1/src-1/STREAM.mkv".parse().expect("uri");
+        super::normalize_emby_request_path(&mut stream_uri, &patterns);
+        assert_eq!(stream_uri.to_string(), "/Videos/item-1/src-1/stream.mkv");
     }
 }

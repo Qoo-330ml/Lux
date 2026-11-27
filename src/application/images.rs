@@ -3796,7 +3796,7 @@ impl ImageService {
             return Ok(None);
         }
 
-        let metadata_root = self.canonical_metadata_root().await;
+        let mut metadata_root: Option<Option<PathBuf>> = None;
         let mut canonical_roots = HashMap::<PathBuf, Option<PathBuf>>::new();
         let mut canonical_paths = HashMap::<PathBuf, Option<PathBuf>>::new();
         let mut saw_outside_root = false;
@@ -3830,9 +3830,17 @@ impl ImageService {
             let in_media_root = canonical_root
                 .as_ref()
                 .is_some_and(|root| canonical_path.starts_with(root) && canonical_path != *root);
-            let in_metadata_root = metadata_root
-                .as_ref()
-                .is_some_and(|root| canonical_path.starts_with(root) && canonical_path != *root);
+            let in_metadata_root = if in_media_root {
+                false
+            } else {
+                let resolved_metadata_root = match &metadata_root {
+                    Some(root) => root,
+                    None => metadata_root.insert(self.canonical_metadata_root().await),
+                };
+                resolved_metadata_root
+                    .as_ref()
+                    .is_some_and(|root| canonical_path.starts_with(root) && canonical_path != *root)
+            };
             if !in_media_root && !in_metadata_root {
                 saw_outside_root = true;
                 continue;
@@ -6176,6 +6184,38 @@ mod tests {
             1,
             "the metadata root is canonicalized once and reused"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn media_root_and_cached_resolutions_skip_metadata_root_canonicalization()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let config_dir = temp.path().join("config");
+        let metadata_root = config_dir.join("metadata");
+        tokio::fs::create_dir_all(&metadata_root).await?;
+        let service = image_service_for_tests(&config_dir).await?;
+        let root = temp.path().join("Movies");
+        let movie_dir = root.join("Sample (2024)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        let poster = movie_dir.join("poster.jpg");
+        tokio::fs::write(&poster, b"poster-bytes").await?;
+
+        for _ in 0..2 {
+            service
+                .resolve_candidates(vec![stored_image_candidate(
+                    "image-1", &poster, &root, "tag-1",
+                )])
+                .await?
+                .ok_or("media-root image resolution")?;
+        }
+
+        assert_eq!(
+            service.metadata_root_canonicalization_count(),
+            0,
+            "media-root and cached hits must not canonicalize metadata_root"
+        );
+        assert_eq!(service.cache_hit_count(), 1);
         Ok(())
     }
 

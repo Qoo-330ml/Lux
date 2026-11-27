@@ -25,8 +25,18 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-#[tokio::main]
-async fn main() -> Result<(), BoxError> {
+fn main() -> Result<(), BoxError> {
+    let (worker_threads, max_blocking_threads) =
+        observability::resources::tokio_runtime_thread_budget();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .max_blocking_threads(max_blocking_threads)
+        .enable_all()
+        .build()?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), BoxError> {
     let config = Config::from_env()?;
     let discovery_config = DiscoveryConfig::from_env(config.http_addr)?;
     let (_logging_guard, _log_store) = observability::init(&config.config_dir).await;

@@ -18,6 +18,24 @@ pub(crate) async fn automatic_probe_concurrency() -> usize {
     cpu_capacity::automatic_probe_concurrency().await
 }
 
+/// Returns `(worker_threads, max_blocking_threads)` for the process Tokio runtime, bounded by
+/// container cgroup CPU quota/cpuset and capped at 128 blocking threads unless overridden via
+/// `LUX_TOKIO_WORKER_THREADS` / `LUX_TOKIO_MAX_BLOCKING_THREADS`.
+pub fn tokio_runtime_thread_budget() -> (usize, usize) {
+    let capacity = cpu_capacity::discover_cpu_capacity_sync();
+    let worker_override = std::env::var("LUX_TOKIO_WORKER_THREADS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok());
+    let blocking_override = std::env::var("LUX_TOKIO_MAX_BLOCKING_THREADS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok());
+    cpu_capacity::runtime_thread_budget_for_cores(
+        capacity.effective_cores,
+        worker_override,
+        blocking_override,
+    )
+}
+
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const MEDIA_PATH: &str = "/media";
 const HOME_LATENCY_SAMPLE_CAPACITY: usize = 64;

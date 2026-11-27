@@ -264,7 +264,296 @@ pub(super) fn emby_internal_source_id(id: &str) -> String {
     id.to_owned()
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum EmbyField {
+    BasicSyncInfo = 0,
+    BackdropImageTags = 1,
+    BirthDate = 2,
+    Bitrate = 3,
+    CanDelete = 4,
+    CanDownload = 5,
+    Chapters = 6,
+    ChildCount = 7,
+    CommunityRating = 8,
+    Container = 9,
+    DateCreated = 10,
+    DateLastSaved = 11,
+    DateModified = 12,
+    DeathDate = 13,
+    EndDate = 14,
+    ExternalUrls = 15,
+    GenreItems = 16,
+    Genres = 17,
+    HomePageUrl = 18,
+    ImageTags = 19,
+    KnownForDepartment = 20,
+    MediaSources = 21,
+    MediaStreams = 22,
+    OfficialRating = 23,
+    OriginalLanguage = 24,
+    Overview = 25,
+    Path = 26,
+    People = 27,
+    PlaceOfBirth = 28,
+    PremiereDate = 29,
+    PrimaryImageAspectRatio = 30,
+    PrimaryImageItemId = 31,
+    PrimaryImageTag = 32,
+    ProductionLocations = 33,
+    ProductionYear = 34,
+    ProviderIds = 35,
+    RecursiveItemCount = 36,
+    RemoteTrailers = 37,
+    Role = 38,
+    RunTimeTicks = 39,
+    Size = 40,
+    Status = 41,
+    Studios = 42,
+    Taglines = 43,
+    Tags = 44,
+}
+
+impl EmbyField {
+    const fn bit(self) -> u64 {
+        1_u64 << (self as u8)
+    }
+
+    fn from_name(raw: &str) -> Option<Self> {
+        // Dispatch by byte length first so each comma-separated token touches at most a few
+        // ASCII case-insensitive comparisons with zero heap allocations.
+        match raw.len() {
+            4 => {
+                if raw.eq_ignore_ascii_case("Path") {
+                    Some(Self::Path)
+                } else if raw.eq_ignore_ascii_case("Role") {
+                    Some(Self::Role)
+                } else if raw.eq_ignore_ascii_case("Size") {
+                    Some(Self::Size)
+                } else if raw.eq_ignore_ascii_case("Tags") {
+                    Some(Self::Tags)
+                } else {
+                    None
+                }
+            }
+            6 => {
+                if raw.eq_ignore_ascii_case("Genres") {
+                    Some(Self::Genres)
+                } else if raw.eq_ignore_ascii_case("People") {
+                    Some(Self::People)
+                } else if raw.eq_ignore_ascii_case("Status") {
+                    Some(Self::Status)
+                } else {
+                    None
+                }
+            }
+            7 => {
+                if raw.eq_ignore_ascii_case("Bitrate") {
+                    Some(Self::Bitrate)
+                } else if raw.eq_ignore_ascii_case("EndDate") {
+                    Some(Self::EndDate)
+                } else if raw.eq_ignore_ascii_case("Studios") {
+                    Some(Self::Studios)
+                } else {
+                    None
+                }
+            }
+            8 => {
+                if raw.eq_ignore_ascii_case("Chapters") {
+                    Some(Self::Chapters)
+                } else if raw.eq_ignore_ascii_case("Overview") {
+                    Some(Self::Overview)
+                } else if raw.eq_ignore_ascii_case("Taglines") {
+                    Some(Self::Taglines)
+                } else {
+                    None
+                }
+            }
+            9 => {
+                if raw.eq_ignore_ascii_case("BirthDate") {
+                    Some(Self::BirthDate)
+                } else if raw.eq_ignore_ascii_case("CanDelete") {
+                    Some(Self::CanDelete)
+                } else if raw.eq_ignore_ascii_case("Container") {
+                    Some(Self::Container)
+                } else if raw.eq_ignore_ascii_case("DeathDate") {
+                    Some(Self::DeathDate)
+                } else if raw.eq_ignore_ascii_case("ImageTags") {
+                    Some(Self::ImageTags)
+                } else {
+                    None
+                }
+            }
+            10 => {
+                if raw.eq_ignore_ascii_case("ChildCount") {
+                    Some(Self::ChildCount)
+                } else if raw.eq_ignore_ascii_case("GenreItems") {
+                    Some(Self::GenreItems)
+                } else {
+                    None
+                }
+            }
+            11 => {
+                if raw.eq_ignore_ascii_case("CanDownload") {
+                    Some(Self::CanDownload)
+                } else if raw.eq_ignore_ascii_case("DateCreated") {
+                    Some(Self::DateCreated)
+                } else if raw.eq_ignore_ascii_case("HomePageUrl") {
+                    Some(Self::HomePageUrl)
+                } else if raw.eq_ignore_ascii_case("ProviderIds") {
+                    Some(Self::ProviderIds)
+                } else {
+                    None
+                }
+            }
+            12 => {
+                if raw.eq_ignore_ascii_case("DateModified") {
+                    Some(Self::DateModified)
+                } else if raw.eq_ignore_ascii_case("ExternalUrls") {
+                    Some(Self::ExternalUrls)
+                } else if raw.eq_ignore_ascii_case("MediaSources") {
+                    Some(Self::MediaSources)
+                } else if raw.eq_ignore_ascii_case("MediaStreams") {
+                    Some(Self::MediaStreams)
+                } else if raw.eq_ignore_ascii_case("PlaceOfBirth") {
+                    Some(Self::PlaceOfBirth)
+                } else if raw.eq_ignore_ascii_case("PremiereDate") {
+                    Some(Self::PremiereDate)
+                } else if raw.eq_ignore_ascii_case("RunTimeTicks") {
+                    Some(Self::RunTimeTicks)
+                } else {
+                    None
+                }
+            }
+            13 => {
+                if raw.eq_ignore_ascii_case("BasicSyncInfo") {
+                    Some(Self::BasicSyncInfo)
+                } else if raw.eq_ignore_ascii_case("DateLastSaved") {
+                    Some(Self::DateLastSaved)
+                } else {
+                    None
+                }
+            }
+            14 => {
+                if raw.eq_ignore_ascii_case("OfficialRating") {
+                    Some(Self::OfficialRating)
+                } else if raw.eq_ignore_ascii_case("ProductionYear") {
+                    Some(Self::ProductionYear)
+                } else if raw.eq_ignore_ascii_case("RemoteTrailers") {
+                    Some(Self::RemoteTrailers)
+                } else {
+                    None
+                }
+            }
+            15 => {
+                if raw.eq_ignore_ascii_case("CommunityRating") {
+                    Some(Self::CommunityRating)
+                } else if raw.eq_ignore_ascii_case("PrimaryImageTag") {
+                    Some(Self::PrimaryImageTag)
+                } else {
+                    None
+                }
+            }
+            16 => raw
+                .eq_ignore_ascii_case("OriginalLanguage")
+                .then_some(Self::OriginalLanguage),
+            17 => raw
+                .eq_ignore_ascii_case("BackdropImageTags")
+                .then_some(Self::BackdropImageTags),
+            18 => {
+                if raw.eq_ignore_ascii_case("KnownForDepartment") {
+                    Some(Self::KnownForDepartment)
+                } else if raw.eq_ignore_ascii_case("PrimaryImageItemId") {
+                    Some(Self::PrimaryImageItemId)
+                } else if raw.eq_ignore_ascii_case("RecursiveItemCount") {
+                    Some(Self::RecursiveItemCount)
+                } else {
+                    None
+                }
+            }
+            19 => raw
+                .eq_ignore_ascii_case("ProductionLocations")
+                .then_some(Self::ProductionLocations),
+            23 => raw
+                .eq_ignore_ascii_case("PrimaryImageAspectRatio")
+                .then_some(Self::PrimaryImageAspectRatio),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct EmbyFieldSet {
+    bits: u64,
+    explicit: bool,
+}
+
+impl EmbyFieldSet {
+    const NFO_MASK: u64 = EmbyField::CommunityRating.bit()
+        | EmbyField::PremiereDate.bit()
+        | EmbyField::EndDate.bit()
+        | EmbyField::RunTimeTicks.bit()
+        | EmbyField::OriginalLanguage.bit()
+        | EmbyField::Status.bit()
+        | EmbyField::OfficialRating.bit()
+        | EmbyField::ProviderIds.bit()
+        | EmbyField::Taglines.bit()
+        | EmbyField::Genres.bit()
+        | EmbyField::GenreItems.bit()
+        | EmbyField::Studios.bit()
+        | EmbyField::RemoteTrailers.bit()
+        | EmbyField::ExternalUrls.bit()
+        | EmbyField::HomePageUrl.bit()
+        | EmbyField::People.bit();
+
+    pub(super) fn parse(fields: Option<&str>) -> Self {
+        let Some(fields) = fields else {
+            return Self {
+                bits: u64::MAX,
+                explicit: false,
+            };
+        };
+        let mut bits = 0_u64;
+        for token in fields.split(',') {
+            let trimmed = token.trim();
+            if !trimmed.is_empty()
+                && let Some(field) = EmbyField::from_name(trimmed)
+            {
+                bits |= field.bit();
+            }
+        }
+        Self {
+            bits,
+            explicit: true,
+        }
+    }
+
+    #[inline]
+    pub(super) const fn is_all(self) -> bool {
+        !self.explicit
+    }
+
+    #[inline]
+    pub(super) const fn includes(self, field: EmbyField) -> bool {
+        (self.bits & field.bit()) != 0
+    }
+
+    #[inline]
+    pub(super) const fn explicitly_includes(self, field: EmbyField) -> bool {
+        self.explicit && self.includes(field)
+    }
+
+    #[inline]
+    pub(super) const fn nfo_fields_requested(self) -> bool {
+        (self.bits & Self::NFO_MASK) != 0
+    }
+}
+
+#[allow(dead_code)]
 pub(super) fn emby_fields_include(fields: Option<&str>, field: &str) -> bool {
+    if let Some(known) = EmbyField::from_name(field) {
+        return EmbyFieldSet::parse(fields).includes(known);
+    }
     fields.is_none_or(|fields| {
         fields
             .split(',')
@@ -2048,13 +2337,15 @@ pub(super) async fn emby_catalog_items_for_user_with_preferred_source(
             Ok(counts) => counts,
             Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
         };
-    if emby_fields_include(fields, "Chapters")
+    let field_set = EmbyFieldSet::parse(fields);
+    if field_set.includes(EmbyField::Chapters)
         && catalog.populate_chapters(&mut catalog_items).await.is_err()
     {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    let include_nfo = emby_nfo_fields_requested(fields);
-    let include_people = fields.is_some_and(|fields| emby_fields_include(Some(fields), "People"));
+    let include_nfo = field_set.nfo_fields_requested();
+    let include_people = field_set.explicitly_includes(EmbyField::People);
+    let include_top_level_media_streams = field_set.explicitly_includes(EmbyField::MediaStreams);
     let extras = load_emby_item_extras(
         Some(state.local_nfo().clone()),
         Some(state.people().clone()),
@@ -2078,8 +2369,7 @@ pub(super) async fn emby_catalog_items_for_user_with_preferred_source(
                 // List responses project the top-level MediaStreams only when the caller names it
                 // explicitly: an absent Fields parameter keeps the compact default response. The
                 // data already rides along with the media sources, so this adds no query.
-                include_top_level_media_streams: fields
-                    .is_some_and(|fields| emby_fields_include(Some(fields), "MediaStreams")),
+                include_top_level_media_streams,
                 unplayed_item_count: unplayed_item_counts.get(&item.id).copied(),
             },
         );
@@ -2525,8 +2815,9 @@ pub(super) async fn emby_single_id_lookup_response(
         Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => (None, None),
     };
     let mut item = item?;
+    let field_set = EmbyFieldSet::parse(query.fields.as_deref());
     if preferred_source_id.is_some()
-        && emby_fields_include(query.fields.as_deref(), "Chapters")
+        && field_set.includes(EmbyField::Chapters)
         && catalog
             .populate_chapters(std::slice::from_mut(&mut item))
             .await
@@ -2544,7 +2835,7 @@ pub(super) async fn emby_single_id_lookup_response(
         return Some(StatusCode::SERVICE_UNAVAILABLE.into_response());
     }
     let database = Some(state.database())?;
-    let nfo = if emby_nfo_fields_requested(query.fields.as_deref()) {
+    let nfo = if field_set.nfo_fields_requested() {
         read_local_nfo_details(state, &item.id).await
     } else {
         None
@@ -2571,10 +2862,7 @@ pub(super) async fn emby_single_id_lookup_response(
             can_delete,
             fields: query.fields.as_deref(),
             primary_image_aspect_ratio: None,
-            include_top_level_media_streams: query
-                .fields
-                .as_deref()
-                .is_some_and(|fields| emby_fields_include(Some(fields), "MediaStreams")),
+            include_top_level_media_streams: field_set.explicitly_includes(EmbyField::MediaStreams),
             unplayed_item_count,
         },
     );
@@ -2602,7 +2890,7 @@ pub(super) async fn emby_single_id_lookup_response(
     {
         return Some(StatusCode::SERVICE_UNAVAILABLE.into_response());
     }
-    if emby_fields_include(query.fields.as_deref(), "People") {
+    if field_set.includes(EmbyField::People) {
         let actors = {
             let people = state.people();
             match people.list_item_actors(&item.id).await {
@@ -3903,7 +4191,7 @@ pub(super) fn emby_person_json_with_fields(
         .image_url
         .as_ref()
         .map(|_| emby_person_image_tag(&actor.id));
-    let include = |field| fields.is_none_or(|fields| emby_fields_include(Some(fields), field));
+    let field_set = EmbyFieldSet::parse(fields);
     let image_tags = image_tag
         .clone()
         .map(|tag| json!({"Primary": tag}))
@@ -3916,70 +4204,70 @@ pub(super) fn emby_person_json_with_fields(
         ("ImageTags".to_owned(), image_tags),
         ("BackdropImageTags".to_owned(), json!([])),
     ]);
-    if include("Role")
+    if field_set.includes(EmbyField::Role)
         && let Some(role) = actor.character
     {
         object.insert("Role".to_owned(), json!(role));
     }
-    if include("PrimaryImageTag")
+    if field_set.includes(EmbyField::PrimaryImageTag)
         && let Some(image_tag) = image_tag
     {
         object.insert("PrimaryImageTag".to_owned(), json!(image_tag));
     }
-    if include("Overview")
+    if field_set.includes(EmbyField::Overview)
         && let Some(overview) = actor.biography
     {
         object.insert("Overview".to_owned(), json!(overview));
     }
-    if include("BirthDate")
+    if field_set.includes(EmbyField::BirthDate)
         && let Some(birthday) = actor.birthday
     {
         object.insert("BirthDate".to_owned(), json!(birthday));
     }
-    if include("DeathDate")
+    if field_set.includes(EmbyField::DeathDate)
         && let Some(deathday) = actor.deathday
     {
         object.insert("DeathDate".to_owned(), json!(deathday));
     }
-    if include("KnownForDepartment")
+    if field_set.includes(EmbyField::KnownForDepartment)
         && let Some(known_for_department) = actor.known_for_department
     {
         object.insert("KnownForDepartment".to_owned(), json!(known_for_department));
     }
-    if include("PlaceOfBirth")
+    if field_set.includes(EmbyField::PlaceOfBirth)
         && let Some(place_of_birth) = actor.place_of_birth
     {
         object.insert("PlaceOfBirth".to_owned(), json!(place_of_birth));
     }
-    if include("ProviderIds") {
+    if field_set.includes(EmbyField::ProviderIds) {
         object.insert("ProviderIds".to_owned(), json!(actor.provider_ids));
     }
-    if include("Genres") {
+    if field_set.includes(EmbyField::Genres) {
         object.insert("Genres".to_owned(), json!(actor.genres));
     }
-    if include("Tags") {
+    if field_set.includes(EmbyField::Tags) {
         object.insert("Tags".to_owned(), json!(actor.tags));
     }
-    if include("ProductionLocations") {
+    if field_set.includes(EmbyField::ProductionLocations) {
         object.insert(
             "ProductionLocations".to_owned(),
             json!(actor.production_locations),
         );
     }
-    if include("PremiereDate")
+    if field_set.includes(EmbyField::PremiereDate)
         && let Some(premiere_date) = actor.premiere_date
     {
         object.insert("PremiereDate".to_owned(), json!(premiere_date));
     }
-    if include("ProductionYear")
+    if field_set.includes(EmbyField::ProductionYear)
         && let Some(production_year) = actor.production_year
     {
         object.insert("ProductionYear".to_owned(), json!(production_year));
     }
-    if include("Taglines") {
+    if field_set.includes(EmbyField::Taglines) {
         object.insert("Taglines".to_owned(), json!(actor.taglines));
     }
-    if include("DateCreated")
+    if field_set.includes(EmbyField::DateCreated)
         && let Some(date_created) = actor.date_created.and_then(emby_timestamp)
     {
         object.insert("DateCreated".to_owned(), Value::String(date_created));
@@ -4038,30 +4326,9 @@ pub(super) async fn read_local_nfo_details(
     }
 }
 
+#[cfg(test)]
 pub(super) fn emby_nfo_fields_requested(fields: Option<&str>) -> bool {
-    const NFO_FIELDS: [&str; 16] = [
-        "CommunityRating",
-        "PremiereDate",
-        "EndDate",
-        "RunTimeTicks",
-        "OriginalLanguage",
-        "Status",
-        "OfficialRating",
-        "ProviderIds",
-        "Taglines",
-        "Genres",
-        "GenreItems",
-        "Studios",
-        "RemoteTrailers",
-        "ExternalUrls",
-        "HomePageUrl",
-        "People",
-    ];
-    fields.is_none_or(|fields| {
-        NFO_FIELDS
-            .iter()
-            .any(|field| emby_fields_include(Some(fields), field))
-    })
+    EmbyFieldSet::parse(fields).nfo_fields_requested()
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -4080,15 +4347,15 @@ pub(super) fn emby_item_detail_work_plan(fields: Option<&str>) -> EmbyItemDetail
     let fields = normalized_fields.as_deref();
     let lightweight_media_source_lookup =
         fields.is_some_and(is_lightweight_media_source_lookup_fields);
+    let field_set = EmbyFieldSet::parse(fields);
     EmbyItemDetailWorkPlan {
         populate_image_tags: !lightweight_media_source_lookup
-            && (fields.is_none()
-                || emby_fields_include(fields, "ImageTags")
-                || emby_fields_include(fields, "BackdropImageTags")
-                || emby_fields_include(fields, "PrimaryImageItemId")),
-        read_nfo: !lightweight_media_source_lookup && emby_nfo_fields_requested(fields),
+            && (field_set.includes(EmbyField::ImageTags)
+                || field_set.includes(EmbyField::BackdropImageTags)
+                || field_set.includes(EmbyField::PrimaryImageItemId)),
+        read_nfo: !lightweight_media_source_lookup && field_set.nfo_fields_requested(),
         read_primary_image_aspect_ratio: !lightweight_media_source_lookup
-            && (fields.is_none() || emby_fields_include(fields, "PrimaryImageAspectRatio")),
+            && field_set.includes(EmbyField::PrimaryImageAspectRatio),
         // Existing Emby detail responses include People even when the caller's
         // field list omits it. Preserve that compatibility behavior except for
         // the narrowly-scoped Redia media-source lookup.
@@ -4325,11 +4592,11 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
         item.item_type.as_str(),
         "SERIES" | "SEASON" | "BOX_SET" | "FOLDER"
     );
+    let field_set = EmbyFieldSet::parse(fields);
     // Emby advertises sync capability on item details for playable media and
     // series containers. The list projection intentionally keeps the legacy
     // compact capability shape used by existing clients.
-    let basic_sync_requested =
-        fields.is_some_and(|fields| emby_fields_include(Some(fields), "BasicSyncInfo"));
+    let basic_sync_requested = field_set.explicitly_includes(EmbyField::BasicSyncInfo);
     let supports_sync = (!is_folder || item.item_type == "SERIES")
         && (include_top_level_media_streams
             || (basic_sync_requested && item.item_type == "EPISODE"));
@@ -4687,49 +4954,49 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
                 );
             }
         }
-        if emby_fields_include(fields, "BasicSyncInfo") {
+        if field_set.includes(EmbyField::BasicSyncInfo) {
             object.insert("SupportsSync".to_owned(), json!(supports_sync));
         }
-        if emby_fields_include(fields, "DateModified")
+        if field_set.includes(EmbyField::DateModified)
             && let Some(modified) = emby_timestamp(item.updated_at)
         {
             object.insert("DateModified".to_owned(), json!(modified));
         }
-        if (emby_fields_include(fields, "DateCreated")
-            || emby_fields_include(fields, "DateLastSaved"))
+        if (field_set.includes(EmbyField::DateCreated)
+            || field_set.includes(EmbyField::DateLastSaved))
             && let Some(created) = emby_timestamp(item.added_at)
         {
-            if emby_fields_include(fields, "DateCreated") {
+            if field_set.includes(EmbyField::DateCreated) {
                 object.insert("DateCreated".to_owned(), json!(created.clone()));
             }
-            if emby_fields_include(fields, "DateLastSaved") {
+            if field_set.includes(EmbyField::DateLastSaved) {
                 object.insert(
                     "DateLastSaved".to_owned(),
                     json!(emby_timestamp(item.updated_at).unwrap_or(created)),
                 );
             }
         }
-        if emby_fields_include(fields, "Path") {
+        if field_set.includes(EmbyField::Path) {
             object.insert(
                 "Path".to_owned(),
                 json!(emby_safe_path(item, default_source)),
             );
         }
-        if emby_fields_include(fields, "CanDownload") {
+        if field_set.includes(EmbyField::CanDownload) {
             object.insert("CanDownload".to_owned(), json!(can_download && !is_folder));
         }
-        if emby_fields_include(fields, "CanDelete") {
+        if field_set.includes(EmbyField::CanDelete) {
             object.insert("CanDelete".to_owned(), json!(can_delete));
         }
-        if emby_fields_include(fields, "Overview") {
+        if field_set.includes(EmbyField::Overview) {
             emby_insert_optional(
                 &mut object,
                 "Overview",
                 item.overview.clone().map(Value::from),
             );
         }
-        if emby_fields_include(fields, "PremiereDate")
-            || (item.item_type == "EPISODE" && emby_fields_include(fields, "MediaSources"))
+        if field_set.includes(EmbyField::PremiereDate)
+            || (item.item_type == "EPISODE" && field_set.includes(EmbyField::MediaSources))
         {
             emby_insert_optional(
                 &mut object,
@@ -4737,67 +5004,60 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
                 emby_datetime(item.premiere_date.as_deref()),
             );
         }
-        if emby_fields_include(fields, "ProviderIds") {
+        if field_set.includes(EmbyField::ProviderIds) {
             object.insert(
                 "ProviderIds".to_owned(),
                 json!(emby_provider_ids(&item.provider_ids)),
             );
         }
-        if emby_fields_include(fields, "People") {
+        if field_set.includes(EmbyField::People) {
             // Catalog pages do not load the potentially large people snapshot;
             // preserve Emby's non-null collection contract for clients that
             // map this field eagerly. Full item details add the populated list.
             object.insert("People".to_owned(), json!([]));
         }
-        if emby_fields_include(fields, "Genres") {
+        if field_set.includes(EmbyField::Genres) {
             object.insert("Genres".to_owned(), json!([]));
             object.insert("GenreItems".to_owned(), json!([]));
-        } else if emby_fields_include(fields, "GenreItems") {
+        } else if field_set.includes(EmbyField::GenreItems) {
             object.insert("GenreItems".to_owned(), json!([]));
         }
-        if emby_fields_include(fields, "ProductionYear") {
+        if field_set.includes(EmbyField::ProductionYear) {
             emby_insert_optional(
                 &mut object,
                 "ProductionYear",
                 item.production_year.map(|value| json!(value)),
             );
         }
-        if emby_fields_include(fields, "PremiereDate") {
-            emby_insert_optional(
-                &mut object,
-                "PremiereDate",
-                emby_datetime(item.premiere_date.as_deref()),
-            );
-        }
-        if emby_fields_include(fields, "CommunityRating") {
+        if field_set.includes(EmbyField::CommunityRating) {
             emby_insert_optional(
                 &mut object,
                 "CommunityRating",
                 item.rating.map(|value| json!(value)),
             );
         }
-        if emby_fields_include(fields, "RunTimeTicks") {
+        if field_set.includes(EmbyField::RunTimeTicks) {
             emby_insert_optional(
                 &mut object,
                 "RunTimeTicks",
                 runtime_ticks.map(|value| json!(value)),
             );
         }
-        if emby_fields_include(fields, "ChildCount") {
+        if field_set.includes(EmbyField::ChildCount) {
             emby_insert_optional(
                 &mut object,
                 "ChildCount",
                 child_count.map(|value| json!(value)),
             );
         }
-        if emby_fields_include(fields, "RecursiveItemCount") {
+        if field_set.includes(EmbyField::RecursiveItemCount) {
             emby_insert_optional(
                 &mut object,
                 "RecursiveItemCount",
                 recursive_item_count.map(|value| json!(value)),
             );
         }
-        if emby_fields_include(fields, "Container") || emby_fields_include(fields, "MediaSources") {
+        if field_set.includes(EmbyField::Container) || field_set.includes(EmbyField::MediaSources) {
             emby_insert_optional(
                 &mut object,
                 "Container",
@@ -4806,7 +5066,7 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
                     .map(|value| json!(emby_container_name(&value))),
             );
         }
-        if emby_fields_include(fields, "Size") {
+        if field_set.includes(EmbyField::Size) {
             emby_insert_optional(
                 &mut object,
                 "Size",
@@ -4815,7 +5075,7 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
                     .map(|value| json!(value)),
             );
         }
-        if emby_fields_include(fields, "Bitrate") || emby_fields_include(fields, "MediaSources") {
+        if field_set.includes(EmbyField::Bitrate) || field_set.includes(EmbyField::MediaSources) {
             emby_insert_optional(
                 &mut object,
                 "Bitrate",
@@ -4841,7 +5101,7 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
                 series_id.as_ref().map(|value| json!(value)),
             );
         }
-        if emby_fields_include(fields, "PrimaryImageAspectRatio") {
+        if field_set.includes(EmbyField::PrimaryImageAspectRatio) {
             emby_insert_optional(
                 &mut object,
                 "PrimaryImageAspectRatio",
@@ -4851,13 +5111,14 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
     }
     let mut value = Value::Object(object);
     let include_media_streams = !is_folder
-        && (fields.is_none()
-            || emby_fields_include(fields, "MediaStreams")
-            || emby_fields_include(fields, "MediaSources"));
+        && (field_set.is_all()
+            || field_set.includes(EmbyField::MediaStreams)
+            || field_set.includes(EmbyField::MediaSources));
     if !is_folder
-        && emby_fields_include(fields, "MediaSources")
+        && field_set.includes(EmbyField::MediaSources)
         && let Value::Object(object) = &mut value
     {
+        let include_chapters = field_set.includes(EmbyField::Chapters);
         object.insert(
             "MediaSources".to_owned(),
             Value::Array(
@@ -4869,7 +5130,7 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
                             source,
                             include_media_streams,
                             false,
-                            emby_fields_include(fields, "Chapters"),
+                            include_chapters,
                         );
                         if let Value::Object(object) = &mut value {
                             object.insert(
@@ -4905,7 +5166,7 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
         );
     }
     if !is_folder
-        && emby_fields_include(fields, "Chapters")
+        && field_set.includes(EmbyField::Chapters)
         && let Value::Object(object) = &mut value
     {
         object.insert(
@@ -4917,15 +5178,25 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
             ),
         );
     }
-    apply_emby_nfo_details(&mut value, item, nfo, fields);
+    apply_emby_nfo_details_with_field_set(&mut value, item, nfo, field_set);
     value
 }
 
+#[allow(dead_code)]
 pub(super) fn apply_emby_nfo_details(
     value: &mut Value,
     item: &CatalogItem,
     nfo: Option<&LocalNfoDetails>,
     fields: Option<&str>,
+) {
+    apply_emby_nfo_details_with_field_set(value, item, nfo, EmbyFieldSet::parse(fields));
+}
+
+fn apply_emby_nfo_details_with_field_set(
+    value: &mut Value,
+    item: &CatalogItem,
+    nfo: Option<&LocalNfoDetails>,
+    field_set: EmbyFieldSet,
 ) {
     let Some(nfo) = nfo else {
         return;
@@ -4933,14 +5204,13 @@ pub(super) fn apply_emby_nfo_details(
     let Some(object) = value.as_object_mut() else {
         return;
     };
-    let include = |field: &str| emby_fields_include(fields, field);
 
-    if include("CommunityRating")
+    if field_set.includes(EmbyField::CommunityRating)
         && let Some(rating) = nfo.rating
     {
         object.insert("CommunityRating".to_owned(), json!(rating));
     }
-    if include("PremiereDate")
+    if field_set.includes(EmbyField::PremiereDate)
         && let Some(date) = nfo
             .premiered
             .as_deref()
@@ -4953,7 +5223,7 @@ pub(super) fn apply_emby_nfo_details(
             emby_datetime(Some(date)).unwrap_or(Value::Null),
         );
     }
-    if include("EndDate")
+    if field_set.includes(EmbyField::EndDate)
         && let Some(date) = nfo.last_air_date.as_deref()
     {
         object.insert(
@@ -4961,7 +5231,7 @@ pub(super) fn apply_emby_nfo_details(
             emby_datetime(Some(date)).unwrap_or(Value::Null),
         );
     }
-    if include("RunTimeTicks")
+    if field_set.includes(EmbyField::RunTimeTicks)
         && let Some(runtime) = nfo.runtime
         && let Some(runtime_ticks) = i64::from(runtime)
             .checked_mul(60)
@@ -4969,22 +5239,22 @@ pub(super) fn apply_emby_nfo_details(
     {
         object.insert("RunTimeTicks".to_owned(), json!(runtime_ticks));
     }
-    if include("OriginalLanguage")
+    if field_set.includes(EmbyField::OriginalLanguage)
         && let Some(language) = nfo.original_language.as_deref()
     {
         object.insert("OriginalLanguage".to_owned(), json!(language));
     }
-    if include("Status")
+    if field_set.includes(EmbyField::Status)
         && let Some(status) = nfo.status.as_deref()
     {
         object.insert("Status".to_owned(), json!(status));
     }
-    if include("OfficialRating")
+    if field_set.includes(EmbyField::OfficialRating)
         && let Some(certification) = nfo.certification.as_deref()
     {
         object.insert("OfficialRating".to_owned(), json!(certification));
     }
-    if include("ProviderIds") {
+    if field_set.includes(EmbyField::ProviderIds) {
         let mut provider_ids = item.provider_ids.clone();
         provider_ids.extend(nfo.provider_ids.clone());
         object.insert(
@@ -4992,13 +5262,15 @@ pub(super) fn apply_emby_nfo_details(
             json!(emby_provider_ids(&provider_ids)),
         );
     }
-    if include("Taglines") && !nfo.tagline.as_deref().unwrap_or_default().is_empty() {
+    if field_set.includes(EmbyField::Taglines)
+        && !nfo.tagline.as_deref().unwrap_or_default().is_empty()
+    {
         object.insert("Taglines".to_owned(), json!([nfo.tagline]));
     }
-    if include("Genres") && !nfo.genres.is_empty() {
+    if field_set.includes(EmbyField::Genres) && !nfo.genres.is_empty() {
         object.insert("Genres".to_owned(), json!(nfo.genres));
     }
-    if include("GenreItems") && !nfo.genres.is_empty() {
+    if field_set.includes(EmbyField::GenreItems) && !nfo.genres.is_empty() {
         object.insert(
             "GenreItems".to_owned(),
             json!(
@@ -5014,7 +5286,7 @@ pub(super) fn apply_emby_nfo_details(
             ),
         );
     }
-    if include("Studios") && !nfo.studios.is_empty() {
+    if field_set.includes(EmbyField::Studios) && !nfo.studios.is_empty() {
         object.insert(
             "Studios".to_owned(),
             json!(
@@ -5030,7 +5302,7 @@ pub(super) fn apply_emby_nfo_details(
             ),
         );
     }
-    if include("RemoteTrailers") && !nfo.trailers.is_empty() {
+    if field_set.includes(EmbyField::RemoteTrailers) && !nfo.trailers.is_empty() {
         let trailers = nfo
             .trailers
             .iter()
@@ -5039,7 +5311,7 @@ pub(super) fn apply_emby_nfo_details(
             .collect::<Vec<_>>();
         object.insert("RemoteTrailers".to_owned(), json!(trailers));
     }
-    if (include("ExternalUrls") || include("HomePageUrl"))
+    if (field_set.includes(EmbyField::ExternalUrls) || field_set.includes(EmbyField::HomePageUrl))
         && let Some(website) = nfo.website.as_deref()
     {
         object.insert(
@@ -7605,6 +7877,30 @@ mod tests {
             );
         }
         assert_eq!(image_options[6]["Limit"], json!(4));
+    }
+
+    #[test]
+    fn emby_field_set_parses_case_insensitively_and_distinguishes_absent_from_explicit() {
+        use super::{EmbyField, EmbyFieldSet, emby_fields_include, emby_nfo_fields_requested};
+
+        let all = EmbyFieldSet::parse(None);
+        assert!(all.is_all());
+        assert!(all.includes(EmbyField::PremiereDate));
+        assert!(!all.explicitly_includes(EmbyField::MediaStreams));
+        assert!(all.nfo_fields_requested());
+
+        let subset =
+            EmbyFieldSet::parse(Some(" overview , mediaStreams , primaryImageAspectRatio "));
+        assert!(!subset.is_all());
+        assert!(subset.includes(EmbyField::Overview));
+        assert!(subset.explicitly_includes(EmbyField::MediaStreams));
+        assert!(subset.includes(EmbyField::PrimaryImageAspectRatio));
+        assert!(!subset.includes(EmbyField::PremiereDate));
+        assert!(!subset.nfo_fields_requested());
+
+        assert!(emby_nfo_fields_requested(Some("Path,HomePageUrl")));
+        assert!(!emby_nfo_fields_requested(Some("Path,CanDownload")));
+        assert!(emby_fields_include(Some("Foo,CustomField"), "customfield"));
     }
 }
 

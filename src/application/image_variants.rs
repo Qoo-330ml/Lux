@@ -62,6 +62,7 @@ struct LruEntry {
 #[derive(Default)]
 struct LruIndex {
     entries: HashMap<VariantKey, LruEntry>,
+    order: std::collections::BTreeMap<u64, VariantKey>,
     total_files: usize,
     total_bytes: u64,
     clock: u64,
@@ -72,12 +73,14 @@ impl LruIndex {
         self.clock = self.clock.wrapping_add(1);
         match self.entries.get_mut(key) {
             Some(entry) => {
+                self.order.remove(&entry.last_hit);
                 self.total_bytes = self
                     .total_bytes
                     .saturating_sub(entry.bytes)
                     .saturating_add(bytes);
                 entry.bytes = bytes;
                 entry.last_hit = self.clock;
+                self.order.insert(self.clock, key.clone());
             }
             None => {
                 self.entries.insert(
@@ -87,6 +90,7 @@ impl LruIndex {
                         last_hit: self.clock,
                     },
                 );
+                self.order.insert(self.clock, key.clone());
                 self.total_files = self.total_files.saturating_add(1);
                 self.total_bytes = self.total_bytes.saturating_add(bytes);
             }
@@ -101,21 +105,17 @@ impl LruIndex {
         let max_files = usize::try_from(settings.max_files).unwrap_or(usize::MAX);
         let mut evicted = Vec::new();
         while self.total_files > max_files || self.total_bytes > settings.max_bytes {
-            let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(key, entry)| (entry.last_hit, *key == keep))
-                .map(|(key, entry)| (key.clone(), entry.clone()))
-            else {
+            let Some((&oldest_clock, _)) = self.order.iter().find(|(_, key)| *key != keep) else {
                 break;
             };
-            if self.entries.len() <= 1 && oldest.0 == *keep {
+            let Some(oldest_key) = self.order.remove(&oldest_clock) else {
                 break;
+            };
+            if let Some(removed) = self.entries.remove(&oldest_key) {
+                self.total_files = self.total_files.saturating_sub(1);
+                self.total_bytes = self.total_bytes.saturating_sub(removed.bytes);
             }
-            self.entries.remove(&oldest.0);
-            self.total_files = self.total_files.saturating_sub(1);
-            self.total_bytes = self.total_bytes.saturating_sub(oldest.1.bytes);
-            evicted.push(oldest.0);
+            evicted.push(oldest_key);
         }
         evicted
     }
@@ -886,11 +886,14 @@ fn generate_variant_blocking(
     let mut decoder = reader
         .into_decoder()
         .map_err(|_| VariantGenerationError::Decode)?;
-    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
-    // Reject oversized images from their header and cap the decoder allocation before any
-    // pixel data is materialized; checking after DynamicImage::from_decoder would let a small
-    // file with huge declared dimensions allocate hundreds of megabytes first.
+    // Reject oversized or already-small images from their header and cap the decoder allocation
+    // before any pixel data is materialized; max(width, height) is invariant across all EXIF
+    // orientations, so sources within target_width skip pixel decoding completely.
     let (width, height) = check_variant_dimensions(decoder.dimensions())?;
+    if width.max(height) <= target_width {
+        return Err(VariantGenerationError::NoResize);
+    }
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(width);
     limits.max_image_height = Some(height);
@@ -901,10 +904,7 @@ fn generate_variant_blocking(
     let mut image =
         DynamicImage::from_decoder(decoder).map_err(|_| VariantGenerationError::Decode)?;
     image.apply_orientation(orientation);
-    if image.width().max(image.height()) <= target_width {
-        return Err(VariantGenerationError::NoResize);
-    }
-    let resized = image.resize(target_width, target_width, FilterType::Lanczos3);
+    let resized = image.resize(target_width, target_width, FilterType::CatmullRom);
     let rgb = resized.to_rgb8();
     let mut encoded = Vec::new();
     let mut encoder = JpegEncoder::new_with_quality(&mut encoded, IMAGE_VARIANT_JPEG_QUALITY);
@@ -1509,6 +1509,56 @@ mod tests {
         limits.max_bytes = limit;
         service.apply_settings(limits);
         assert!(service.stats().bytes >= second_variant.content_length);
+    }
+
+    #[test]
+    fn header_dimensions_short_circuit_no_resize_before_pixel_decode() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let valid = temp.path().join("small.png");
+        let image = RgbImage::from_pixel(300, 200, Rgb([20, 40, 80]));
+        image
+            .save_with_format(&valid, ImageFormat::Png)
+            .expect("valid png");
+        let full_bytes = fs::read(&valid).expect("png bytes");
+        // Keep the PNG signature + IHDR chunk and truncate IDAT/IEND so full pixel decoding would
+        // fail with `Decode` if `DynamicImage::from_decoder` ran.
+        let truncated = temp.path().join("truncated-small.png");
+        fs::write(&truncated, &full_bytes[..45.min(full_bytes.len())]).expect("truncated png");
+        let target = temp.path().join("out.jpg");
+
+        let err = generate_variant_blocking(&truncated, &target, 360)
+            .expect_err("small image must not be upscaled");
+        assert!(
+            matches!(err, VariantGenerationError::NoResize),
+            "expected NoResize before pixel decode, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn lru_index_evicts_least_recently_hit_entries_in_order() {
+        let mut lru = LruIndex::default();
+        let key = |id: &str| VariantKey {
+            item_directory: PathBuf::from(id),
+            content_tag: "a".repeat(64),
+            width: 360,
+        };
+        let k1 = key("item-1");
+        let k2 = key("item-2");
+        let k3 = key("item-3");
+        lru.record_hit(&k1, 100);
+        lru.record_hit(&k2, 200);
+        lru.record_hit(&k3, 300);
+        // Refresh k1 so k2 becomes the oldest entry, with updated byte size.
+        lru.record_hit(&k1, 150);
+        assert_eq!(lru.total_files, 3);
+        assert_eq!(lru.total_bytes, 650);
+
+        let mut budget = settings(true);
+        budget.max_files = 1;
+        let evicted = lru.eviction_candidates(&budget, &k1);
+        assert_eq!(evicted, vec![k2, k3]);
+        assert_eq!(lru.total_files, 1);
+        assert_eq!(lru.total_bytes, 150);
     }
 
     #[tokio::test]

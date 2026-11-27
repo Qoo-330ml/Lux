@@ -98,6 +98,60 @@ pub(crate) async fn automatic_probe_concurrency() -> usize {
     automatic_probe_budget(capacity.effective_cores)
 }
 
+pub(crate) fn discover_cpu_capacity_sync() -> CpuCapacity {
+    let cache = CPU_CAPACITY_CACHE.get_or_init(CpuCapacityCache::new);
+    let now = Instant::now();
+    if let Some(value) = cache.snapshot()
+        && now.saturating_duration_since(value.observed_at) < CPU_CAPACITY_CACHE_TTL
+    {
+        return value;
+    }
+
+    let available = thread::available_parallelism()
+        .ok()
+        .map(|parallelism| parallelism.get());
+    #[cfg(target_os = "linux")]
+    let (quotas, cpusets) = linux_cgroup_constraints_sync();
+    #[cfg(not(target_os = "linux"))]
+    let (quotas, cpusets) = (Vec::new(), Vec::new());
+
+    let effective_cores = effective_capacity(available, &quotas, &cpusets);
+    let source = if !quotas.is_empty() || !cpusets.is_empty() {
+        CpuCapacitySource::Cgroup
+    } else if available.is_some() {
+        CpuCapacitySource::AvailableParallelism
+    } else {
+        CpuCapacitySource::Fallback
+    };
+    let value = CpuCapacity {
+        effective_cores,
+        source,
+        observed_at: Instant::now(),
+    };
+    cache.store(value.clone());
+    value
+}
+
+pub(crate) fn runtime_thread_budget_for_cores(
+    effective_cores: f64,
+    worker_override: Option<usize>,
+    blocking_override: Option<usize>,
+) -> (usize, usize) {
+    let auto_workers = if effective_cores.is_finite() && effective_cores > 0.0 {
+        (effective_cores.ceil() as usize).clamp(2, 256)
+    } else {
+        2
+    };
+    let worker_threads = worker_override
+        .filter(|&count| count > 0)
+        .map_or(auto_workers, |count| count.clamp(1, 512));
+    let auto_blocking = worker_threads.saturating_mul(8).clamp(32, 128);
+    let max_blocking_threads = blocking_override
+        .filter(|&count| count > 0)
+        .map_or(auto_blocking, |count| count.clamp(1, 512));
+    (worker_threads, max_blocking_threads)
+}
+
 async fn discover_cpu_capacity() -> CpuCapacity {
     let available = tokio::task::spawn_blocking(|| {
         thread::available_parallelism()
@@ -448,6 +502,97 @@ async fn read_bounded(path: impl AsRef<Path>, max_bytes: usize) -> Option<String
     String::from_utf8(bytes).ok()
 }
 
+#[cfg(target_os = "linux")]
+fn linux_cgroup_constraints_sync() -> (Vec<f64>, Vec<usize>) {
+    let Some(membership_text) = read_bounded_sync("/proc/self/cgroup", MAX_PROC_FILE_BYTES) else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(mount_text) = read_bounded_sync("/proc/self/mountinfo", MAX_PROC_FILE_BYTES) else {
+        return (Vec::new(), Vec::new());
+    };
+    let memberships = parse_cgroup_memberships(&membership_text);
+    let mounts = parse_cgroup_mounts(&mount_text);
+    let mut quotas = Vec::new();
+    let mut cpusets = Vec::new();
+
+    for membership in &memberships {
+        for mount in mounts
+            .iter()
+            .filter(|mount| mount_matches(membership, mount))
+        {
+            let Some(base) = cgroup_directory(membership, mount) else {
+                continue;
+            };
+            let Some(ancestors) = ancestor_directories(&base, &mount.mount_point) else {
+                continue;
+            };
+            if membership.version == CgroupVersion::V2 {
+                for directory in &ancestors {
+                    if let Some(value) =
+                        read_bounded_sync(directory.join("cpu.max"), MAX_CGROUP_FILE_BYTES)
+                        && let Some(limit) = parse_cpu_quota_v2(&value)
+                    {
+                        quotas.push(limit);
+                    }
+                }
+            } else if membership.controllers.contains("cpu") {
+                for directory in &ancestors {
+                    let quota = read_bounded_sync(
+                        directory.join("cpu.cfs_quota_us"),
+                        MAX_CGROUP_FILE_BYTES,
+                    );
+                    let period = read_bounded_sync(
+                        directory.join("cpu.cfs_period_us"),
+                        MAX_CGROUP_FILE_BYTES,
+                    );
+                    if let (Some(quota), Some(period)) = (quota, period)
+                        && let Some(limit) = parse_cpu_quota_v1(&quota, &period)
+                    {
+                        quotas.push(limit);
+                    }
+                }
+            }
+
+            let cpuset_files: &[&str] = if membership.version == CgroupVersion::V2 {
+                &["cpuset.cpus.effective", "cpuset.cpus"]
+            } else {
+                &["cpuset.effective_cpus", "cpuset.cpus"]
+            };
+            for directory in &ancestors {
+                let mut found = false;
+                for name in cpuset_files {
+                    if let Some(value) =
+                        read_bounded_sync(directory.join(name), MAX_CGROUP_FILE_BYTES)
+                        && let Some(count) = parse_cpuset(&value)
+                    {
+                        cpusets.push(count);
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    break;
+                }
+            }
+        }
+    }
+    (quotas, cpusets)
+}
+
+#[cfg(target_os = "linux")]
+fn read_bounded_sync(path: impl AsRef<Path>, max_bytes: usize) -> Option<String> {
+    use std::io::Read as _;
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut limited = file.take(u64::try_from(max_bytes.saturating_add(1)).ok()?);
+    let mut bytes = Vec::new();
+    limited.read_to_end(&mut bytes).ok()?;
+    if bytes.len() > max_bytes {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -565,5 +710,23 @@ mod tests {
             ])
         );
         assert!(parse_cgroup_memberships("0::/../escape").is_empty());
+    }
+
+    #[test]
+    fn runtime_thread_budget_respects_cgroup_cores_and_caps_blocking_pool() {
+        use super::runtime_thread_budget_for_cores;
+
+        assert_eq!(runtime_thread_budget_for_cores(0.5, None, None), (2, 32));
+        assert_eq!(runtime_thread_budget_for_cores(1.5, None, None), (2, 32));
+        assert_eq!(runtime_thread_budget_for_cores(6.0, None, None), (6, 48));
+        assert_eq!(runtime_thread_budget_for_cores(32.0, None, None), (32, 128));
+        assert_eq!(
+            runtime_thread_budget_for_cores(2.0, Some(4), Some(64)),
+            (4, 64)
+        );
+        assert_eq!(
+            runtime_thread_budget_for_cores(2.0, Some(0), Some(0)),
+            (2, 32)
+        );
     }
 }
