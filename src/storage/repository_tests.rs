@@ -2632,17 +2632,17 @@ async fn postgres_catalog_read_model_rebuild_and_stats_are_consistent()
         }
         let (processed, _) = database.rebuild_catalog_items_batch(None, 100).await?;
         assert_eq!(processed, 3);
-        // Run twice: the counters are replaced inside one transaction each time.
-        database.rebuild_catalog_item_stats().await?;
-        database.rebuild_catalog_item_stats().await?;
-        let global: i64 = database
-            .query_scalar(
-                "SELECT total FROM catalog_item_stats
-                 WHERE scope = 'global' AND item_type = 'MOVIE'",
-            )
-            .fetch_one(database.pool())
-            .await?;
-        assert_eq!(global, 3);
+        let ids = vec![
+            "read-model-0".to_owned(),
+            "read-model-1".to_owned(),
+            "read-model-2".to_owned(),
+        ];
+        assert_eq!(
+            database.upsert_catalog_items_by_ids(&ids).await?,
+            0,
+            "unchanged PostgreSQL catalog_items rows must skip redundant writes"
+        );
+        assert_eq!(database.catalog_items_count().await?, 3);
         Ok(())
     })
     .await
@@ -23963,37 +23963,19 @@ async fn catalog_read_model_rebuild_copies_authoritative_fields_and_validates()
     assert_eq!(processed, 4);
     assert_eq!(database.catalog_items_count().await?, 4);
 
-    let movie: (Option<String>, Option<String>, Option<String>, i64, i64) = sqlx::query_as(
-        "SELECT poster_tag, default_source_id, restriction_code, season_count, episode_count
-         FROM catalog_items WHERE item_id = 'rm-movie'",
-    )
-    .fetch_one(database.pool())
-    .await?;
-    assert_eq!(movie.0.as_deref(), Some("rm-poster"));
-    assert_eq!(movie.1.as_deref(), Some("rm-source"));
-    assert_eq!(movie.2.as_deref(), Some("PG-13"));
+    let movie_poster: Option<String> =
+        sqlx::query_scalar("SELECT poster_tag FROM catalog_items WHERE item_id = 'rm-movie'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(movie_poster.as_deref(), Some("rm-poster"));
 
-    let series: (i64, i64, Option<i64>) = sqlx::query_as(
-        "SELECT season_count, episode_count, latest_child_added_at
+    let series_dates: (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT latest_added_at, recent_added_at
          FROM catalog_items WHERE item_id = 'rm-series'",
     )
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(series, (1, 1, Some(110)));
-
-    database.rebuild_catalog_item_stats().await?;
-    let totals: Vec<(String, String, String, i64)> = sqlx::query_as(
-        "SELECT scope, scope_id, item_type, total FROM catalog_item_stats
-         WHERE scope = 'library' ORDER BY item_type",
-    )
-    .fetch_all(database.pool())
-    .await?;
-    assert_eq!(totals.len(), 4);
-    assert!(
-        totals
-            .iter()
-            .all(|(_, scope_id, _, total)| scope_id == &library_id && *total == 1)
-    );
+    assert_eq!(series_dates, (Some(110), Some(110)));
 
     let first = database.catalog_items_checksum().await?;
     assert_eq!(first.item_count, 4);

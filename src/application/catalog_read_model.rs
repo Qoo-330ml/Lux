@@ -63,7 +63,6 @@ async fn rebuild_catalog_read_model_from(
         }
         after = last;
     }
-    database.rebuild_catalog_item_stats().await?;
     let summary = database.catalog_items_checksum().await?;
     // Marks the rebuild as complete; an interrupted rebuild leaves no watermark and is retried.
     database
@@ -152,9 +151,6 @@ const CATALOG_ITEMS_TRIM_BATCH: i64 = 2_000;
 /// batches, a few batches per pass, until none are left.
 const LEGACY_SEARCH_PURGE_BATCH: i64 = 2_000;
 const LEGACY_SEARCH_PURGE_BATCHES_PER_PASS: usize = 10;
-/// Counters are recomputed at most this often: the grouping scans the whole derived table, while a
-/// stale count is only cosmetic for a few seconds.
-const CATALOG_ITEMS_STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How long an idle outbox consumer sleeps before it checks the queue on its own.
 ///
@@ -231,9 +227,7 @@ async fn run_catalog_items_incremental_worker(
     fallback: Duration,
 ) {
     let signals = database.outbox_signals();
-    let mut stats_dirty = false;
     let mut legacy_search_purged = false;
-    let mut last_stats_refresh = std::time::Instant::now();
     loop {
         if *shutdown.borrow() {
             return;
@@ -267,7 +261,6 @@ async fn run_catalog_items_incremental_worker(
                 match catalog_items_step(&database).await {
                     Ok(0) => break,
                     Ok(items) => {
-                        stats_dirty = true;
                         worked = true;
                         tracing::debug!(items, "catalog read model applied");
                     }
@@ -285,32 +278,14 @@ async fn run_catalog_items_incremental_worker(
                 }
             }
         }
-        // The counters are rebuilt at most once per interval, but a pending refresh must not wait
-        // for the much longer idle fallback.
-        let mut wait = fallback;
-        if stats_dirty {
-            let elapsed = last_stats_refresh.elapsed();
-            if elapsed >= CATALOG_ITEMS_STATS_REFRESH_INTERVAL {
-                match database.rebuild_catalog_item_stats().await {
-                    Ok(()) => {
-                        stats_dirty = false;
-                        last_stats_refresh = std::time::Instant::now();
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "catalog item stats refresh failed");
-                        failed = true;
-                    }
-                }
-            } else if !worked {
-                wait = wait.min(CATALOG_ITEMS_STATS_REFRESH_INTERVAL - elapsed);
-            }
-        }
         if worked {
             continue;
         }
-        if failed {
-            wait = wait.min(OUTBOX_STEP_ERROR_RETRY);
-        }
+        let wait = if failed {
+            fallback.min(OUTBOX_STEP_ERROR_RETRY)
+        } else {
+            fallback
+        };
         tokio::select! {
             () = signals.notified_catalog_items() => {}
             () = tokio::time::sleep(wait) => {}
@@ -593,9 +568,17 @@ mod tests {
         ));
         let drained = drained_watermark(&database, CATALOG_ITEMS_INCREMENTAL_CONSUMER).await?;
 
-        // A storage write signals the consumers when it changed a row.
+        // A storage write that changes a derived catalog column queues a catalog_outbox row and
+        // signals the consumer on commit.
         database
-            .adopt_media_item_identity("signalled-movie", "signalled-movie")
+            .update_unconfirmed_hierarchy_item(
+                "signalled-movie",
+                "Signalled Movie",
+                "signalled movie",
+                None,
+                None,
+                None,
+            )
             .await?;
 
         waits_for_watermark(&database, CATALOG_ITEMS_INCREMENTAL_CONSUMER, drained).await?;

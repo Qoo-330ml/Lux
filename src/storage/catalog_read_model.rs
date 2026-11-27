@@ -425,17 +425,17 @@ impl Database {
             return Ok((0, None));
         }
         let last = rows.last().cloned();
+        let processed = rows.len() as u64;
         let upsert_sql = format!(
             "{CATALOG_ITEM_UPSERT_SELECT}mi.id > ? AND mi.id <= ?{CATALOG_ITEM_UPSERT_CONFLICT}"
         );
-        let upsert = self
-            .query(sqlx::AssertSqlSafe(upsert_sql))
+        self.query(sqlx::AssertSqlSafe(upsert_sql))
             .bind(after)
             .bind(last.as_deref())
             .execute(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        Ok((upsert.rows_affected(), last))
+        Ok((processed, last))
     }
 
     /// Re-derives the `catalog_items` row of every given item from the authoritative tables.
@@ -526,45 +526,8 @@ impl Database {
         Ok(item_ids.len())
     }
 
-    /// Recomputes the library/global counters in one transaction, so a concurrent reader never
-    /// sees the table emptied between the delete and the inserts.
-    pub(crate) async fn rebuild_catalog_item_stats(&self) -> Result<(), StorageError> {
-        let sqlx_error = |source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        };
-        let mut transaction = self.pool.begin().await.map_err(sqlx_error)?;
-        self.query("DELETE FROM catalog_item_stats")
-            .execute(&mut *transaction)
-            .await
-            .map_err(sqlx_error)?;
-        self.query(
-            "INSERT INTO catalog_item_stats (scope, scope_id, item_type, total)
-             SELECT 'library', library_id, item_type, COUNT(*)
-             FROM catalog_items WHERE removed_at IS NULL
-             GROUP BY library_id, item_type",
-        )
-        .execute(&mut *transaction)
-        .await
-        .map_err(sqlx_error)?;
-        self.query(
-            "INSERT INTO catalog_item_stats (scope, scope_id, item_type, total)
-             SELECT 'global', '', item_type, COUNT(*)
-             FROM catalog_items WHERE removed_at IS NULL
-             GROUP BY item_type",
-        )
-        .execute(&mut *transaction)
-        .await
-        .map_err(sqlx_error)?;
-        transaction.commit().await.map_err(sqlx_error)
-    }
-
     #[cfg(test)]
     pub(crate) async fn truncate_catalog_read_model(&self) -> Result<(), StorageError> {
-        self.query("DELETE FROM catalog_item_stats")
-            .execute(&self.pool)
-            .await
-            .map_err(self.sqlx_err())?;
         self.query("DELETE FROM catalog_items")
             .execute(&self.pool)
             .await
@@ -1100,7 +1063,7 @@ impl Database {
                     ci.season_number, ci.episode_number, ci.title, ci.sort_title,
                     ci.original_title, mi.overview, mi.rating_source,
                     ci.production_year, ci.rating, ci.runtime_ticks,
-                    ci.added_at, ci.updated_at, ci.poster_tag, ci.backdrop_tag,
+                    ci.added_at, mi.updated_at, ci.poster_tag, ci.backdrop_tag,
                     ci.thumb_tag, ci.logo_tag,
                     (SELECT s.title FROM media_items s WHERE s.id = ci.series_id) AS series_name
              FROM catalog_items ci
@@ -1250,21 +1213,17 @@ fn core_row_with_source(core: &ReadModelCoreRow, source: &ReadModelSourceRow) ->
 const CATALOG_ITEM_UPSERT_SELECT: &str = "INSERT INTO catalog_items (
                      item_id, library_id, item_type, parent_id, series_id, season_number,
                      episode_number, title, sort_title, original_title, production_year,
-                     rating, runtime_ticks, added_at, effective_added_at, updated_at,
-                     removed_at, merged_into, has_available_source, default_source_id,
-                     poster_tag, backdrop_tag, thumb_tag, logo_tag, season_count,
-                     episode_count, latest_child_added_at, latest_episode_added_at,
-                     latest_added_at, recent_added_at, latest_episode_added_at_sort,
-                     restriction_code, metadata_state, nfo_fingerprint, applied_seq
+                     rating, runtime_ticks, added_at, effective_added_at,
+                     removed_at, merged_into, has_available_source,
+                     poster_tag, backdrop_tag, thumb_tag, logo_tag,
+                     latest_added_at, recent_added_at
                  )
                  SELECT
                      mi.id, mi.library_id, mi.item_type, mi.parent_id, mi.series_id,
                      mi.season_number, mi.episode_number, mi.title, mi.sort_title,
                      mi.original_title, mi.production_year, mi.rating, mi.runtime_ticks,
-                     mi.added_at, mi.added_at, mi.updated_at, mi.removed_at,
+                     mi.added_at, mi.added_at, mi.removed_at,
                      mi.merged_into_item_id, mi.has_available_source,
-                     (SELECT ms.id FROM media_sources ms WHERE ms.item_id = mi.id
-                       ORDER BY ms.is_default DESC, ms.id LIMIT 1),
                      (SELECT ii.id FROM item_images ii
                        WHERE ii.item_id = mi.id AND ii.image_type = 'POSTER'
                        ORDER BY ii.image_index, ii.id LIMIT 1),
@@ -1277,18 +1236,6 @@ const CATALOG_ITEM_UPSERT_SELECT: &str = "INSERT INTO catalog_items (
                      (SELECT ii.id FROM item_images ii
                        WHERE ii.item_id = mi.id AND ii.image_type = 'LOGO'
                        ORDER BY ii.image_index, ii.id LIMIT 1),
-                     (SELECT COUNT(*) FROM media_items child
-                       WHERE child.series_id = mi.id AND child.item_type = 'SEASON'),
-                     (SELECT COUNT(*) FROM media_items child
-                       WHERE child.item_type = 'EPISODE'
-                         AND (child.series_id = mi.id OR child.parent_id = mi.id)),
-                     (SELECT MAX(child.added_at) FROM media_items child
-                       WHERE child.parent_id = mi.id OR child.series_id = mi.id),
-                     (SELECT MAX(child.added_at) FROM media_items child
-                       WHERE child.item_type = 'EPISODE'
-                         AND child.removed_at IS NULL
-                         AND child.has_available_source = 1
-                         AND (child.series_id = mi.id OR child.parent_id = mi.id)),
                      CASE WHEN mi.item_type = 'SERIES' THEN COALESCE(
                          (SELECT MAX(child.added_at) FROM media_items child
                           WHERE child.item_type = 'EPISODE'
@@ -1307,18 +1254,7 @@ const CATALOG_ITEM_UPSERT_SELECT: &str = "INSERT INTO catalog_items (
                             AND (recent_episode.series_id = mi.id
                                  OR recent_episode.parent_id = mi.id)),
                          mi.added_at)
-                     ELSE mi.added_at END,
-                     (SELECT MAX(sort_episode.added_at)
-                      FROM media_items sort_episode
-                      WHERE sort_episode.item_type = 'EPISODE'
-                        AND sort_episode.removed_at IS NULL
-                        AND sort_episode.has_available_source = 1
-                        AND sort_episode.merged_into_item_id IS NULL
-                        AND (sort_episode.series_id = mi.id
-                             OR sort_episode.parent_id = mi.id)),
-                     (SELECT cri.certification_code FROM media_content_restriction_index cri
-                       WHERE cri.item_id = mi.id LIMIT 1),
-                     mi.identification_status, mi.nfo_metadata_fingerprint, 0
+                     ELSE mi.added_at END
                  FROM media_items mi
                  WHERE ";
 
@@ -1337,23 +1273,35 @@ const CATALOG_ITEM_UPSERT_CONFLICT: &str = " ON CONFLICT(item_id) DO UPDATE SET
                      runtime_ticks = excluded.runtime_ticks,
                      added_at = excluded.added_at,
                      effective_added_at = excluded.effective_added_at,
-                     updated_at = excluded.updated_at,
                      removed_at = excluded.removed_at,
                      merged_into = excluded.merged_into,
                      has_available_source = excluded.has_available_source,
-                     default_source_id = excluded.default_source_id,
                      poster_tag = excluded.poster_tag,
                      backdrop_tag = excluded.backdrop_tag,
                      thumb_tag = excluded.thumb_tag,
                      logo_tag = excluded.logo_tag,
-                     season_count = excluded.season_count,
-                     episode_count = excluded.episode_count,
-                     latest_child_added_at = excluded.latest_child_added_at,
-                     latest_episode_added_at = excluded.latest_episode_added_at,
                      latest_added_at = excluded.latest_added_at,
-                     recent_added_at = excluded.recent_added_at,
-                     latest_episode_added_at_sort = excluded.latest_episode_added_at_sort,
-                     restriction_code = excluded.restriction_code,
-                     metadata_state = excluded.metadata_state,
-                     nfo_fingerprint = excluded.nfo_fingerprint,
-                     applied_seq = excluded.applied_seq";
+                     recent_added_at = excluded.recent_added_at
+                 WHERE catalog_items.library_id IS DISTINCT FROM excluded.library_id
+                    OR catalog_items.item_type IS DISTINCT FROM excluded.item_type
+                    OR catalog_items.parent_id IS DISTINCT FROM excluded.parent_id
+                    OR catalog_items.series_id IS DISTINCT FROM excluded.series_id
+                    OR catalog_items.season_number IS DISTINCT FROM excluded.season_number
+                    OR catalog_items.episode_number IS DISTINCT FROM excluded.episode_number
+                    OR catalog_items.title IS DISTINCT FROM excluded.title
+                    OR catalog_items.sort_title IS DISTINCT FROM excluded.sort_title
+                    OR catalog_items.original_title IS DISTINCT FROM excluded.original_title
+                    OR catalog_items.production_year IS DISTINCT FROM excluded.production_year
+                    OR catalog_items.rating IS DISTINCT FROM excluded.rating
+                    OR catalog_items.runtime_ticks IS DISTINCT FROM excluded.runtime_ticks
+                    OR catalog_items.added_at IS DISTINCT FROM excluded.added_at
+                    OR catalog_items.effective_added_at IS DISTINCT FROM excluded.effective_added_at
+                    OR catalog_items.removed_at IS DISTINCT FROM excluded.removed_at
+                    OR catalog_items.merged_into IS DISTINCT FROM excluded.merged_into
+                    OR catalog_items.has_available_source IS DISTINCT FROM excluded.has_available_source
+                    OR catalog_items.poster_tag IS DISTINCT FROM excluded.poster_tag
+                    OR catalog_items.backdrop_tag IS DISTINCT FROM excluded.backdrop_tag
+                    OR catalog_items.thumb_tag IS DISTINCT FROM excluded.thumb_tag
+                    OR catalog_items.logo_tag IS DISTINCT FROM excluded.logo_tag
+                    OR catalog_items.latest_added_at IS DISTINCT FROM excluded.latest_added_at
+                    OR catalog_items.recent_added_at IS DISTINCT FROM excluded.recent_added_at";
