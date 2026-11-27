@@ -1479,10 +1479,12 @@ fn is_catalog_aggregation_path(path: &str) -> bool {
 }
 
 async fn normalize_empty_api_service_unavailable(request: Request<Body>, next: Next) -> Response {
-    let is_lux_api = request.uri().path().starts_with("/api/v1/");
-    let request_headers = request.headers().clone();
+    if !request.uri().path().starts_with("/api/v1/") {
+        return next.run(request).await;
+    }
+    let request_id = request.headers().get("x-request-id").cloned();
     let response = next.run(request).await;
-    if !is_lux_api || response.status() != StatusCode::SERVICE_UNAVAILABLE {
+    if response.status() != StatusCode::SERVICE_UNAVAILABLE {
         return response;
     }
 
@@ -1497,9 +1499,9 @@ async fn normalize_empty_api_service_unavailable(request: Request<Body>, next: N
         }
     }
 
-    let mut error_headers = request_headers;
-    if let Some(request_id) = parts.headers.get("x-request-id") {
-        error_headers.insert("x-request-id", request_id.clone());
+    let mut error_headers = HeaderMap::new();
+    if let Some(id) = parts.headers.get("x-request-id").cloned().or(request_id) {
+        error_headers.insert("x-request-id", id);
     }
     let mut normalized = api_error(
         &error_headers,
@@ -1929,13 +1931,13 @@ async fn request_access_ip(
         .database
         .as_ref()
         .ok_or(AccessIpResolutionError::TrustedProxySettingsUnavailable)?;
-    let trusted_proxy_values = cached_trusted_proxy_cidrs(state, database)
+    let configured_proxies = cached_trusted_proxy_cidrs(state, database)
         .await
         .map_err(|_| AccessIpResolutionError::TrustedProxySettingsUnavailable)?;
-    let trusted_proxies = trusted_proxy_networks(
-        &trusted_proxy_values,
+    let trusted_proxies = merge_trusted_proxy_networks(
+        &configured_proxies,
         crate::application::container_gateway::implicit_trusted_proxy(),
-    )?;
+    );
     crate::application::user_access_rules::resolve_client_ip_from_trusted_proxies(
         peer,
         &forwarded_for_values,
@@ -1959,25 +1961,30 @@ async fn request_access_ip(
 /// * a failed read is not cached, so a corrupt or unreadable setting keeps failing closed instead
 ///   of being served from a previous value.
 ///
-/// Only the normalized list is cached. Which addresses are treated as trusted proxies, and which
+/// Only the parsed CIDR slice is cached. Which addresses are treated as trusted proxies, and which
 /// forwarded hops are then accepted, is still decided per request by
 /// `resolve_client_ip_from_trusted_proxies`; raw forwarded values never bypass that step.
 async fn cached_trusted_proxy_cidrs(
     state: &CoreState,
     database: &Database,
-) -> Result<Vec<String>, ()> {
+) -> Result<Arc<[crate::application::user_access_rules::IpCidr]>, ()> {
     let epochs = database.access_changes();
     let epoch = epochs.trusted_proxy_cidrs_epoch();
     if let Some(values) = state.trusted_proxy_cidrs.get(database.server_id(), epoch) {
         return Ok(values);
     }
     let values = crate::application::settings::read_trusted_proxy_cidrs(database).await?;
+    let parsed: Arc<[crate::application::user_access_rules::IpCidr]> = values
+        .iter()
+        .map(|value| crate::application::user_access_rules::IpCidr::parse(value).map_err(|_| ()))
+        .collect::<Result<Vec<_>, ()>>()?
+        .into();
     if epochs.trusted_proxy_cidrs_epoch() == epoch {
         state
             .trusted_proxy_cidrs
-            .insert(database.server_id(), epoch, values.clone());
+            .insert(database.server_id(), epoch, Arc::clone(&parsed));
     }
-    Ok(values)
+    Ok(parsed)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1987,29 +1994,35 @@ pub(super) enum AccessIpResolutionError {
     MalformedForwardedFor,
 }
 
+fn merge_trusted_proxy_networks(
+    configured: &[crate::application::user_access_rules::IpCidr],
+    implicit_gateway: Option<crate::application::user_access_rules::IpCidr>,
+) -> std::borrow::Cow<'_, [crate::application::user_access_rules::IpCidr]> {
+    match implicit_gateway {
+        Some(gateway) if !configured.contains(&gateway) => {
+            let mut merged = Vec::with_capacity(configured.len() + 1);
+            merged.extend_from_slice(configured);
+            merged.push(gateway);
+            std::borrow::Cow::Owned(merged)
+        }
+        _ => std::borrow::Cow::Borrowed(configured),
+    }
+}
+
 /// Merge the administrator-configured trusted proxy CIDRs with the container runtime gateway.
-///
-/// A container runtime rewrites the source address of published-port traffic to the bridge
-/// gateway, so the configured list alone never matches the connection peer. The detected gateway
-/// is additive and limited to a single host address; administrator-supplied CIDRs keep their
-/// meaning, and a deployment without container detection behaves exactly as before.
+#[cfg_attr(not(test), allow(dead_code))]
 fn trusted_proxy_networks(
     configured: &[String],
     implicit_gateway: Option<crate::application::user_access_rules::IpCidr>,
 ) -> Result<Vec<crate::application::user_access_rules::IpCidr>, AccessIpResolutionError> {
-    let mut networks = configured
+    let parsed = configured
         .iter()
         .map(|value| {
             crate::application::user_access_rules::IpCidr::parse(value)
                 .map_err(|_| AccessIpResolutionError::TrustedProxySettingsUnavailable)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if let Some(gateway) = implicit_gateway {
-        if !networks.contains(&gateway) {
-            networks.push(gateway);
-        }
-    }
-    Ok(networks)
+    Ok(merge_trusted_proxy_networks(&parsed, implicit_gateway).into_owned())
 }
 /// Identity half of a login bucket for an account the handler resolved to a user row.
 ///

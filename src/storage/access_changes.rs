@@ -114,6 +114,8 @@ impl AccessChangeEpochs {
 ///
 /// The cache returns the normalized list, exactly what a database read returns; it does not change
 /// which forwarded values the resolver accepts.
+use crate::application::user_access_rules::IpCidr;
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TrustedProxyCidrCache {
     cached: Arc<Mutex<Option<CachedTrustedProxyCidrs>>>,
@@ -125,27 +127,27 @@ struct CachedTrustedProxyCidrs {
     database: String,
     /// The epoch the value was read under.
     epoch: u64,
-    /// The normalized list the database returned.
-    values: Vec<String>,
+    /// The parsed CIDR networks for the database setting, shared via `Arc` without re-parsing.
+    values: Arc<[IpCidr]>,
 }
 
 impl TrustedProxyCidrCache {
     /// The cached list, when it was read from `database` under `epoch`.
-    pub(crate) fn get(&self, database: &str, epoch: u64) -> Option<Vec<String>> {
+    pub(crate) fn get(&self, database: &str, epoch: u64) -> Option<Arc<[IpCidr]>> {
         let cached = self
             .cached
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = cached.as_ref()?;
-        (entry.epoch == epoch && entry.database == database).then(|| entry.values.clone())
+        (entry.epoch == epoch && entry.database == database).then(|| Arc::clone(&entry.values))
     }
 
-    /// Publishes a freshly read list for `database` under `epoch`.
+    /// Publishes a freshly parsed list for `database` under `epoch`.
     ///
     /// Callers must only pass an epoch that is still current; a value stored under an outdated
     /// epoch is unreachable but would make the invariant harder to audit, so the caller checks
     /// [`AccessChangeEpochs::trusted_proxy_cidrs_epoch`] again before calling this.
-    pub(crate) fn insert(&self, database: &str, epoch: u64, values: Vec<String>) {
+    pub(crate) fn insert(&self, database: &str, epoch: u64, values: Arc<[IpCidr]>) {
         let mut cached = self
             .cached
             .lock()
@@ -160,7 +162,10 @@ impl TrustedProxyCidrCache {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{AccessChangeEpochs, TrustedProxyCidrCache};
+    use crate::application::user_access_rules::IpCidr;
 
     #[test]
     fn user_invalidation_only_moves_that_users_epoch() {
@@ -214,11 +219,14 @@ mod tests {
         let cache = TrustedProxyCidrCache::default();
         assert_eq!(cache.get("database-a", 7), None);
 
-        cache.insert("database-a", 7, vec!["10.0.0.0/8".to_owned()]);
+        let cidrs: Arc<[IpCidr]> = Arc::from([IpCidr::parse("10.0.0.0/8").expect("valid cidr")]);
+        cache.insert("database-a", 7, Arc::clone(&cidrs));
 
-        assert_eq!(
-            cache.get("database-a", 7),
-            Some(vec!["10.0.0.0/8".to_owned()])
+        let hit = cache.get("database-a", 7).expect("cache hit");
+        assert_eq!(hit, cidrs);
+        assert!(
+            Arc::ptr_eq(&hit, &cidrs),
+            "cache hits must share the parsed slice via Arc without cloning"
         );
         assert_eq!(
             cache.get("database-a", 8),
@@ -236,11 +244,9 @@ mod tests {
     fn a_clone_of_the_trusted_proxy_cache_shares_its_entries() {
         let cache = TrustedProxyCidrCache::default();
         let clone = cache.clone();
-        cache.insert("database-a", 1, vec!["192.0.2.0/24".to_owned()]);
+        let cidrs: Arc<[IpCidr]> = Arc::from([IpCidr::parse("192.0.2.0/24").expect("valid cidr")]);
+        cache.insert("database-a", 1, Arc::clone(&cidrs));
 
-        assert_eq!(
-            clone.get("database-a", 1),
-            Some(vec!["192.0.2.0/24".to_owned()])
-        );
+        assert_eq!(clone.get("database-a", 1), Some(cidrs));
     }
 }

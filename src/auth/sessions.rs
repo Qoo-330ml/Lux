@@ -12,7 +12,8 @@ use subtle::ConstantTimeEq;
 
 use crate::{
     application::user_access_rules::{
-        MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST, ip_blacklist_rules_match_address,
+        MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST, ip_blacklist_rule_strs_match_address,
+        ip_blacklist_rules_match_address,
     },
     auth::{
         password::PasswordError,
@@ -164,6 +165,7 @@ pub(crate) enum PrincipalResolution {
 /// the cache means no rule change can ever be served stale.
 struct CachedWebPrincipal {
     session: AuthenticatedSession,
+    user_id: String,
     /// Captured before the session row was read; a hit is only served while it is still current.
     snapshot: AuthCacheEpochSnapshot,
 }
@@ -374,19 +376,24 @@ impl WebAuthService {
         let Some(principal) = self.web_principal(&token_hash).await? else {
             return Ok(PrincipalResolution::Unauthenticated);
         };
-        let rules = self.rule_snapshot(principal.session.user.id).await?;
-        let ip_rules = rules
+        let rules = self.rule_snapshot(&principal.user_id).await?;
+        let ip_rule_count = rules
             .iter()
             .filter(|(rule_type, _)| rule_type == "IP_CIDR")
-            .map(|(_, value)| value.clone())
-            .collect::<Vec<_>>();
-        if ip_rules.len() > MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST {
+            .count();
+        if ip_rule_count > MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST {
             return Err(WebAuthError::AccessRulesUnavailable);
         }
-        if !ip_rules.is_empty() {
+        if ip_rule_count > 0 {
             let blocked = match client_ip {
-                Some(client_ip) => ip_blacklist_rules_match_address(client_ip, &ip_rules)
-                    .map_err(|_| WebAuthError::AccessRulesUnavailable)?,
+                Some(client_ip) => ip_blacklist_rule_strs_match_address(
+                    client_ip,
+                    rules
+                        .iter()
+                        .filter(|(rule_type, _)| rule_type == "IP_CIDR")
+                        .map(|(_, value)| value.as_str()),
+                )
+                .map_err(|_| WebAuthError::AccessRulesUnavailable)?,
                 // Without a resolvable client address the rule cannot be proven satisfied.
                 None => true,
             };
@@ -431,24 +438,30 @@ impl WebAuthService {
             return Ok(None);
         }
         let session = authenticated_session_from_stored(stored)?;
+        let user_id = session.user.id.to_string();
         if epochs.principal_is_current(snapshot) {
             self.principal_cache.store(
                 token_hash.to_vec(),
                 CachedWebPrincipal {
                     session: session.clone(),
+                    user_id: user_id.clone(),
                     snapshot,
                 },
                 Instant::now(),
             );
         }
-        Ok(Some(Arc::new(CachedWebPrincipal { session, snapshot })))
+        Ok(Some(Arc::new(CachedWebPrincipal {
+            session,
+            user_id,
+            snapshot,
+        })))
     }
 
     /// Reads the enabled access rules that apply to a user (including global rules).
-    async fn rule_snapshot(&self, user_id: UserId) -> Result<Vec<(String, String)>, WebAuthError> {
+    async fn rule_snapshot(&self, user_id: &str) -> Result<Vec<(String, String)>, WebAuthError> {
         Ok(self
             .database
-            .user_access_blacklist_rules_for_user(&user_id.to_string(), ACCESS_RULE_SNAPSHOT_LIMIT)
+            .user_access_blacklist_rules_for_user(user_id, ACCESS_RULE_SNAPSHOT_LIMIT)
             .await?)
     }
 

@@ -21,7 +21,7 @@ async fn json_response_etag(request: Request<Body>, next: Next) -> Response {
     if !matches!(*request.method(), Method::GET | Method::HEAD) {
         return next.run(request).await;
     }
-    let request_headers = request.headers().clone();
+    let if_none_match = request.headers().get(header::IF_NONE_MATCH).cloned();
     let response = next.run(request).await;
     if !response.status().is_success() || !is_json_response(&response) {
         return response;
@@ -53,12 +53,19 @@ async fn json_response_etag(request: Request<Body>, next: Next) -> Response {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let etag = format!("\"{}\"", json_etag_hex(&bytes));
-    if if_none_match_matches(&request_headers, &etag) {
+    let etag_buf = json_etag_quoted(&bytes);
+    let etag = std::str::from_utf8(&etag_buf).unwrap_or("\"\"");
+    let etag_header = axum::http::HeaderValue::from_bytes(&etag_buf)
+        .unwrap_or_else(|_| axum::http::HeaderValue::from_static(""));
+    if if_none_match.as_ref().is_some_and(|value| {
+        let mut temp_headers = HeaderMap::with_capacity(1);
+        temp_headers.insert(header::IF_NONE_MATCH, value.clone());
+        if_none_match_matches(&temp_headers, etag)
+    }) {
         let mut not_modified = Response::new(Body::empty());
         *not_modified.status_mut() = StatusCode::NOT_MODIFIED;
         let headers = not_modified.headers_mut();
-        headers.insert(header::ETAG, header_value(&etag));
+        headers.insert(header::ETAG, etag_header);
         for name in [
             header::CACHE_CONTROL,
             header::VARY,
@@ -70,7 +77,7 @@ async fn json_response_etag(request: Request<Body>, next: Next) -> Response {
         }
         return not_modified;
     }
-    parts.headers.insert(header::ETAG, header_value(&etag));
+    parts.headers.insert(header::ETAG, etag_header);
     if existing_cache_control.is_none() {
         parts
             .headers
@@ -87,13 +94,17 @@ fn is_json_response(response: &Response) -> bool {
         .is_some_and(|value| value.starts_with("application/json"))
 }
 
-fn json_etag_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(bytes)
-        .iter()
-        .take(16)
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+fn json_etag_quoted(bytes: &[u8]) -> [u8; 34] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = xxhash_rust::xxh3::xxh3_128(bytes).to_be_bytes();
+    let mut out = [0_u8; 34];
+    out[0] = b'"';
+    for (index, &byte) in digest.iter().enumerate() {
+        out[1 + index * 2] = HEX[(byte >> 4) as usize];
+        out[2 + index * 2] = HEX[(byte & 0x0f) as usize];
+    }
+    out[33] = b'"';
+    out
 }
 
 fn header_value(value: &str) -> axum::http::HeaderValue {
@@ -297,8 +308,11 @@ fn apply_common_layers(router: Router, core: &CoreState, slots: RequestSlots) ->
         .layer(middleware::from_fn(json_response_etag))
         .layer(
             // JSON responses only: media streams, images, the SPA fallback and server-sent events
-            // must reach the client untouched.
-            CompressionLayer::new().compress_when(CompressJsonResponses),
+            // must reach the client untouched. Level 1 cuts compression CPU ~3-4x on large JSON
+            // catalog payloads with negligible ratio loss.
+            CompressionLayer::new()
+                .quality(tower_http::CompressionLevel::Fastest)
+                .compress_when(CompressJsonResponses),
         )
         .layer(middleware::from_fn_with_state(
             request_rate_limiter,
@@ -310,53 +324,62 @@ fn apply_common_layers(router: Router, core: &CoreState, slots: RequestSlots) ->
                 let catalog_workers = catalog_workers.clone();
                 let home_workers = home_workers.clone();
                 async move {
+                    if !is_catalog_aggregation_path(request.uri().path()) {
+                        return next.run(request).await;
+                    }
                     let path = request.uri().path().to_owned();
-                    let request_headers = request.headers().clone();
-                    let request_slot = if is_catalog_aggregation_path(&path) {
-                        match catalog_request_slots.try_acquire_owned() {
-                            Ok(permit) => Some(permit),
-                            Err(_) => return catalog_busy_response(&path, &request_headers),
-                        }
-                    } else {
-                        None
+                    let request_slot = match catalog_request_slots.try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => return catalog_busy_response(&path, request.headers()),
                     };
-                    let mut worker_wait_us = 0_u64;
-                    let worker_permit = if request_slot.is_some() {
-                        let workers =
-                            select_catalog_worker_pool(&path, catalog_workers, home_workers);
-                        let (acquire_result, wait_duration) =
-                            acquire_catalog_worker_with_wait(workers, CATALOG_WORKER_WAIT_TIMEOUT)
-                                .await;
-                        worker_wait_us =
-                            u64::try_from(wait_duration.as_micros()).unwrap_or(u64::MAX);
-                        match acquire_result {
-                            Ok(permit) => Some(permit),
-                            Err(CatalogWorkerWaitError::TimedOut) => {
-                                tracing::warn!(
-                                    request_id = request_headers
-                                        .get("x-request-id")
-                                        .and_then(|value| value.to_str().ok())
-                                        .unwrap_or("unknown"),
-                                    route_class = catalog_route_class(&path),
-                                    wait_ms = u64::try_from(wait_duration.as_millis())
-                                        .unwrap_or(u64::MAX),
-                                    "catalog worker queue wait timed out"
-                                );
-                                return catalog_busy_response(&path, &request_headers);
+                    let probe_requested = request
+                        .headers()
+                        .get(PERFORMANCE_PROBE_HEADER)
+                        .is_some_and(|value| value == PERFORMANCE_PROBE_VALUE);
+                    let request_id = request.headers().get("x-request-id").cloned();
+                    let workers = select_catalog_worker_pool(&path, catalog_workers, home_workers);
+                    let (acquire_result, wait_duration) =
+                        acquire_catalog_worker_with_wait(workers, CATALOG_WORKER_WAIT_TIMEOUT)
+                            .await;
+                    let worker_wait_us =
+                        u64::try_from(wait_duration.as_micros()).unwrap_or(u64::MAX);
+                    let worker_permit = match acquire_result {
+                        Ok(permit) => permit,
+                        Err(CatalogWorkerWaitError::TimedOut) => {
+                            tracing::warn!(
+                                request_id = request_id
+                                    .as_ref()
+                                    .and_then(|value| value.to_str().ok())
+                                    .unwrap_or("unknown"),
+                                route_class = catalog_route_class(&path),
+                                wait_ms =
+                                    u64::try_from(wait_duration.as_millis()).unwrap_or(u64::MAX),
+                                "catalog worker queue wait timed out"
+                            );
+                            let mut err_headers = HeaderMap::new();
+                            if let Some(id) = request_id {
+                                err_headers.insert("x-request-id", id);
                             }
-                            Err(CatalogWorkerWaitError::Closed) => {
-                                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-                            }
+                            return catalog_busy_response(&path, &err_headers);
                         }
-                    } else {
-                        None
+                        Err(CatalogWorkerWaitError::Closed) => {
+                            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
                     };
                     let handler_started = Instant::now();
                     let mut response = next.run(request).await;
-                    if request_slot.is_some() {
+                    if probe_requested {
+                        let mut probe_headers = HeaderMap::with_capacity(2);
+                        probe_headers.insert(
+                            PERFORMANCE_PROBE_HEADER,
+                            HeaderValue::from_static(PERFORMANCE_PROBE_VALUE),
+                        );
+                        if let Some(id) = request_id {
+                            probe_headers.insert("x-request-id", id);
+                        }
                         add_performance_probe_headers(
                             &mut response,
-                            &request_headers,
+                            &probe_headers,
                             &path,
                             worker_wait_us,
                             u64::try_from(handler_started.elapsed().as_micros())
@@ -729,12 +752,14 @@ async fn limit_request_rate(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let peer = request
+    let allowed = match request
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|connect| connect.0.ip().to_string())
-        .unwrap_or_else(|| "local".to_owned());
-    if limiter.allow(&peer).await {
+    {
+        Some(connect) => limiter.allow_ip(connect.0.ip()),
+        None => limiter.allow("local").await,
+    };
+    if allowed {
         return next.run(request).await;
     }
     let mut response = api_error(

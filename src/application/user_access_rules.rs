@@ -237,18 +237,31 @@ pub(crate) fn ip_blacklist_rules_match_address(
     address: IpAddr,
     rules: &[String],
 ) -> Result<bool, IpBlacklistEvaluationError> {
-    if rules.len() > MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST {
-        return Err(IpBlacklistEvaluationError::TooManyRules);
-    }
+    ip_blacklist_rule_strs_match_address(address, rules.iter().map(String::as_str))
+}
 
+pub(crate) fn ip_blacklist_rule_strs_match_address<'a, I>(
+    address: IpAddr,
+    rules: I,
+) -> Result<bool, IpBlacklistEvaluationError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let address = normalize_mapped_ipv4(address);
+    let mut count = 0usize;
+    let mut matched = false;
     for rule in rules {
+        count = count.saturating_add(1);
+        if count > MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST {
+            return Err(IpBlacklistEvaluationError::TooManyRules);
+        }
         let cidr =
             IpCidr::parse(rule).map_err(|_| IpBlacklistEvaluationError::InvalidStoredRule)?;
-        if cidr.contains(address) {
-            return Ok(true);
+        if !matched && cidr.contains(address) {
+            matched = true;
         }
     }
-    Ok(false)
+    Ok(matched)
 }
 
 /// Loopback or private-LAN address, used to keep pre-setup management endpoints local.

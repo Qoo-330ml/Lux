@@ -215,7 +215,7 @@ pub const DANMAKU_SEARCH_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct RequestRateLimiter {
-    state: Arc<Mutex<RequestRateLimiterState>>,
+    state: Arc<std::sync::Mutex<RequestRateLimiterState>>,
     limit: u32,
     window: Duration,
 }
@@ -234,7 +234,7 @@ impl RequestRateLimiter {
     /// Builds a limiter with a shorter or longer window than the default minute.
     pub fn with_window(limit: u32, window: Duration) -> Self {
         Self {
-            state: Arc::new(Mutex::new(RequestRateLimiterState {
+            state: Arc::new(std::sync::Mutex::new(RequestRateLimiterState {
                 entries: HashMap::new(),
                 last_cleanup: Instant::now(),
             })),
@@ -245,15 +245,38 @@ impl RequestRateLimiter {
 
     /// Counts one request for `key`; returns false once the window budget is exhausted.
     pub async fn allow(&self, key: &str) -> bool {
+        self.allow_digest(xxhash_rust::xxh3::xxh3_128(key.as_bytes()))
+    }
+
+    /// Counts one request for `ip` without heap-formatting the address string.
+    pub fn allow_ip(&self, ip: std::net::IpAddr) -> bool {
+        let digest = match ip {
+            std::net::IpAddr::V4(v4) => {
+                let [a, b, c, d] = v4.octets();
+                xxhash_rust::xxh3::xxh3_128(&[4, a, b, c, d])
+            }
+            std::net::IpAddr::V6(v6) => {
+                let mut buf = [0_u8; 17];
+                buf[0] = 6;
+                buf[1..].copy_from_slice(&v6.octets());
+                xxhash_rust::xxh3::xxh3_128(&buf)
+            }
+        };
+        self.allow_digest(digest)
+    }
+
+    fn allow_digest(&self, key: u128) -> bool {
         let now = Instant::now();
-        let mut state = self.state.lock().await;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if now.saturating_duration_since(state.last_cleanup) >= self.window {
             state
                 .entries
                 .retain(|_, entry| now.saturating_duration_since(entry.started_at) < self.window);
             state.last_cleanup = now;
         }
-        let key = key_digest(key);
         if let Some(entry) = state.entries.get_mut(&key) {
             if now.saturating_duration_since(entry.started_at) >= self.window {
                 *entry = RequestWindow {
@@ -307,7 +330,7 @@ impl DanmakuSearchRateLimiter {
 }
 
 struct RequestRateLimiterState {
-    entries: HashMap<[u8; 32], RequestWindow>,
+    entries: HashMap<u128, RequestWindow>,
     last_cleanup: Instant,
 }
 

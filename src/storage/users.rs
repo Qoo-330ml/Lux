@@ -2174,6 +2174,67 @@ impl Database {
         Ok(rows)
     }
 
+    /// Evaluates both `IP_CIDR` rule extraction (bounded at `ip_limit` so over-limit sets fail
+    /// closed) and `DEVICE`/`CLIENT` `EXISTS` matching in a single round-trip.
+    pub(crate) async fn evaluate_user_access_blacklist_snapshot(
+        &self,
+        user_id: &str,
+        device_id: Option<&str>,
+        client_name: Option<&str>,
+        ip_limit: i64,
+    ) -> Result<(Vec<String>, bool), StorageError> {
+        let rows: Vec<(String, String)> = self
+            .query_as(
+                "SELECT rule_type, match_value
+                 FROM (
+                     SELECT 'IP_CIDR' AS rule_type, match_value
+                     FROM user_access_blacklist_rules
+                     WHERE is_enabled = 1
+                       AND rule_type = 'IP_CIDR'
+                       AND (user_id IS NULL OR user_id = ?)
+                     ORDER BY CASE WHEN user_id IS NULL THEN 0 ELSE 1 END,
+                              created_at ASC, id ASC
+                     LIMIT ?
+                 ) AS ip_rules
+                 UNION ALL
+                 SELECT 'MATCH' AS rule_type, '' AS match_value
+                 FROM (SELECT 1) AS single_row
+                 WHERE (? IS NOT NULL OR ? IS NOT NULL)
+                   AND EXISTS (
+                       SELECT 1
+                       FROM user_access_blacklist_rules
+                       WHERE is_enabled = 1
+                         AND (user_id IS NULL OR user_id = ?)
+                         AND (
+                             (rule_type = 'DEVICE' AND ? IS NOT NULL AND match_value = ?)
+                             OR (rule_type = 'CLIENT' AND ? IS NOT NULL AND match_value = ?)
+                         )
+                   )",
+            )
+            .bind(user_id)
+            .bind(ip_limit.clamp(1, 201))
+            .bind(device_id)
+            .bind(client_name)
+            .bind(user_id)
+            .bind(device_id)
+            .bind(device_id)
+            .bind(client_name)
+            .bind(client_name)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        let mut ip_rules = Vec::new();
+        let mut device_or_client_matched = false;
+        for (rule_type, match_value) in rows {
+            if rule_type == "MATCH" {
+                device_or_client_matched = true;
+            } else {
+                ip_rules.push(match_value);
+            }
+        }
+        Ok((ip_rules, device_or_client_matched))
+    }
+
     pub(crate) async fn set_user_access_blacklist_rule_enabled(
         &self,
         scope: UserAccessBlacklistRuleScope<'_>,

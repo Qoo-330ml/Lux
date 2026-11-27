@@ -90,7 +90,9 @@ impl EmbyActivityCache {
 /// a rule change can never be served stale.
 struct CachedEmbyPrincipal {
     user: UserRecord,
-    device: EmbyDeviceInfo,
+    user_id: String,
+    normalized_device_id: Option<String>,
+    normalized_client_name: Option<String>,
     /// Captured before the credential was read; a hit is only served while it is still current.
     snapshot: AuthCacheEpochSnapshot,
 }
@@ -446,19 +448,33 @@ impl EmbyAuthService {
             // string would still open a write transaction on every request.
             return Ok(None);
         };
-        let user_id = principal.user.id.to_string();
-        // Both checks keep the baseline query shape: the IP rules are counted on their own (with
-        // `MAX + 1` rows so an over-limit rule set fails closed) and the device/client rules are
-        // matched by one EXISTS query. A shared rule snapshot ordered by rule type would truncate
-        // the `IP_CIDR` rows first and let a blocked client through.
-        if self.is_user_ip_blacklisted(&user_id, client_ip).await? {
-            self.database.revoke_access_token(&token_hash).await?;
-            return Ok(None);
+        // Evaluate IP rules (bounded at `MAX + 1` rows so an over-limit rule set fails closed) and
+        // device/client `EXISTS` matching in one round-trip, without truncating `IP_CIDR` rows.
+        let (ip_rules, device_or_client_matched) = self
+            .database
+            .evaluate_user_access_blacklist_snapshot(
+                &principal.user_id,
+                principal.normalized_device_id.as_deref(),
+                principal.normalized_client_name.as_deref(),
+                MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST as i64 + 1,
+            )
+            .await
+            .map_err(|_| EmbyAuthError::AccessRulesUnavailable)?;
+        if ip_rules.len() > MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST {
+            return Err(EmbyAuthError::AccessRulesUnavailable);
         }
-        if self
-            .user_access_blacklist_matches(&user_id, &principal.device)
-            .await?
-        {
+        if !ip_rules.is_empty() {
+            let ip_blocked = match client_ip {
+                Some(client_ip) => ip_blacklist_rules_match_address(client_ip, &ip_rules)
+                    .map_err(|_| EmbyAuthError::AccessRulesUnavailable)?,
+                None => true,
+            };
+            if ip_blocked {
+                self.database.revoke_access_token(&token_hash).await?;
+                return Ok(None);
+            }
+        }
+        if device_or_client_matched {
             self.database.revoke_access_token(&token_hash).await?;
             return Ok(None);
         }
@@ -499,19 +515,25 @@ impl EmbyAuthService {
             return Ok(None);
         }
         let user = user_record(stored.user)?;
-        let device = EmbyDeviceInfo {
-            client: stored.device.client_name,
-            device: stored.device.device_name,
-            device_id: stored.device.device_id,
-            version: stored.device.client_version,
-            user_id: None,
-        };
+        let user_id = user.id.to_string();
+        let normalized_device_id = normalize_user_access_blacklist_value(
+            UserAccessBlacklistRuleType::Device,
+            &stored.device.device_id,
+        )
+        .ok();
+        let normalized_client_name = normalize_user_access_blacklist_value(
+            UserAccessBlacklistRuleType::Client,
+            &stored.device.client_name,
+        )
+        .ok();
         if epochs.principal_is_current(snapshot) {
             self.principal_cache.store(
                 cache_key,
                 CachedEmbyPrincipal {
                     user: user.clone(),
-                    device: device.clone(),
+                    user_id: user_id.clone(),
+                    normalized_device_id: normalized_device_id.clone(),
+                    normalized_client_name: normalized_client_name.clone(),
                     snapshot,
                 },
                 Instant::now(),
@@ -519,7 +541,9 @@ impl EmbyAuthService {
         }
         Ok(Some(Arc::new(CachedEmbyPrincipal {
             user,
-            device,
+            user_id,
+            normalized_device_id,
+            normalized_client_name,
             snapshot,
         })))
     }
@@ -870,8 +894,8 @@ mod route_token_tests {
         assert!(service.resolve_token(&token).await?.is_some());
         assert_eq!(
             database.query_count(),
-            4,
-            "one JOIN for the credential and device, one IP-rule read, one device/client match, \
+            3,
+            "one JOIN for the credential and device, one combined blacklist snapshot read, \
              one throttled activity touch"
         );
         Ok(())
@@ -886,8 +910,8 @@ mod route_token_tests {
         assert!(service.resolve_token(&token).await?.is_some());
         assert_eq!(
             database.query_count(),
-            2,
-            "the credential is cached; the two rule checks are still read per request"
+            1,
+            "the credential is cached; IP and device/client rule checks share a single query"
         );
 
         service.logout(&token).await?;
@@ -907,7 +931,7 @@ mod route_token_tests {
         assert!(service.resolve_token(&token).await?.is_some());
         database.reset_query_count();
         assert!(service.resolve_token(&token).await?.is_some());
-        assert_eq!(database.query_count(), 2);
+        assert_eq!(database.query_count(), 1);
 
         add_rule(&database, Some(&user_id), "DEVICE", "device-cache").await;
         database.reset_query_count();
@@ -992,7 +1016,7 @@ mod route_token_tests {
                 .await?
                 .is_some()
         );
-        assert_eq!(database.query_count(), 2);
+        assert_eq!(database.query_count(), 1);
 
         assert_eq!(
             database
@@ -1017,7 +1041,7 @@ mod route_token_tests {
         assert!(service.resolve_token(&token).await?.is_some());
         database.reset_query_count();
         assert!(service.resolve_token(&token).await?.is_some());
-        assert_eq!(database.query_count(), 2);
+        assert_eq!(database.query_count(), 1);
 
         add_rule(&database, None, "CLIENT", "emby client").await;
         assert!(
@@ -1034,7 +1058,7 @@ mod route_token_tests {
         assert!(service.resolve_token(&token).await?.is_some());
         database.reset_query_count();
         assert!(service.resolve_token(&token).await?.is_some());
-        assert_eq!(database.query_count(), 2);
+        assert_eq!(database.query_count(), 1);
 
         database
             .update_user(
@@ -1067,7 +1091,7 @@ mod route_token_tests {
         assert!(service.resolve_token(&token).await?.is_some());
         database.reset_query_count();
         assert!(service.resolve_token(&token).await?.is_some());
-        assert_eq!(database.query_count(), 2);
+        assert_eq!(database.query_count(), 1);
 
         assert!(database.delete_user(&user_id).await?);
         assert!(service.resolve_token(&token).await?.is_none());
@@ -1092,7 +1116,7 @@ mod route_token_tests {
                 .await?
                 .is_some()
         );
-        assert_eq!(database.query_count(), 2);
+        assert_eq!(database.query_count(), 1);
 
         assert!(
             service
